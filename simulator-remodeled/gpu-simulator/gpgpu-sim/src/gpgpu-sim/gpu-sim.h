@@ -784,6 +784,18 @@ class gpgpu_sim : public gpgpu_t {
   void update_stats();
   void deadlock_check();
   void inc_completed_cta() { gpu_completed_cta++; }
+
+  // Track first completed CTA for ground truth validation
+  void record_first_completed_cta(unsigned global_cta_id, unsigned sm_id) {
+    if (!m_first_cta_recorded) {
+      m_first_completed_global_cta_id = global_cta_id;
+      m_first_completed_sm_id = sm_id;
+      m_first_cta_recorded = true;
+    }
+  }
+  unsigned get_first_completed_cta_id() const { return m_first_completed_global_cta_id; }
+  unsigned get_first_completed_sm_id() const { return m_first_completed_sm_id; }
+  bool is_first_cta_recorded() const { return m_first_cta_recorded; }
   void get_pdom_stack_top_info(unsigned sid, unsigned tid, unsigned *pc,
                                unsigned *rpc);
 
@@ -903,6 +915,11 @@ class gpgpu_sim : public gpgpu_t {
   unsigned long long m_total_cta_launched;
   unsigned long long gpu_tot_issued_cta;
   unsigned gpu_completed_cta;
+
+  // Track first completed CTA for ground truth validation
+  unsigned m_first_completed_global_cta_id;
+  unsigned m_first_completed_sm_id;
+  bool m_first_cta_recorded;
 
   unsigned m_last_cluster_issue;
   float *average_pipeline_duty_cycle;

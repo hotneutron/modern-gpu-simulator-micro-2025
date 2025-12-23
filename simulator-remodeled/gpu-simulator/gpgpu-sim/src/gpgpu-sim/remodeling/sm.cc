@@ -901,6 +901,10 @@ void SM::register_cta_thread_exit(unsigned cta_num, kernel_info_t *kernel) {
   assert(m_cta_status[cta_num] > 0);
   m_cta_status[cta_num]--;
   if (!m_cta_status[cta_num]) {
+    // Record first completed CTA for ground truth validation
+    unsigned global_cta_id = m_local_to_global_cta_id[cta_num];
+    m_gpu->record_first_completed_cta(global_cta_id, m_sm_id);
+
     // Increment the completed CTAs
     m_sm_stats.m_stats_map["ctas_completed"]->increment_with_integer(1);
     m_n_active_cta--;
@@ -1285,6 +1289,8 @@ void SM::issue_block2core(kernel_info_t &kernel) {
   function_info *kernel_func_info = kernel.entry();
   symbol_table *symtab = kernel_func_info->get_symtab();
   unsigned ctaid = kernel.get_next_cta_id_single();
+  // Record local→global CTA ID mapping for ground truth validation
+  m_local_to_global_cta_id[free_cta_hw_id] = ctaid;
   std::unique_ptr<checkpoint> g_checkpoint = std::make_unique<checkpoint>();
   for (unsigned i = start_thread; i < end_thread; i++) {
     m_threadState[i].m_cta_id = free_cta_hw_id;
