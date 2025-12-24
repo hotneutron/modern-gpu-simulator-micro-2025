@@ -20,9 +20,12 @@ int find_closest_point_to_cluster(int seed_point, int latest_point, char *Ai_mas
             float dist_to_new_point = 0, diameter = 0;
 
             float curr_dist_to_clust = dist_to_clust[i+tid];
+#ifndef DISABLE_TEXTURE_MEMORY
             if( can_use_texture ){
                 dist_to_new_point = tex2D(texDistance, float(latest_point)+0.5f, float(pnt2_indx)+0.5f );
-            }else{
+            }else
+#endif
+            {
                 dist_to_new_point = work[pnt2_indx*N0 + latest_point];
             }
             if(dist_to_new_point > curr_dist_to_clust){
@@ -55,11 +58,8 @@ do{ \
                     float dist_to_new_point = 0, diameter = 0; \
  \
                     float curr_dist_to_clust = _CAND_PNT_DIST_; \
-                    if( can_use_texture ){\
-                    dist_to_new_point = tex2D(texDistance, float(latest_point)+0.5f, float( (_CAND_PNT_) )+0.5f ); \
-                    }else{\
+                    (void)can_use_texture; \
                     dist_to_new_point = work[ (_CAND_PNT_) * N0 + latest_point]; \
-                    }\
                     if(dist_to_new_point > curr_dist_to_clust){ \
                         _CAND_PNT_DIST_ = dist_to_new_point; \
                         diameter = dist_to_new_point; \

@@ -22,7 +22,9 @@
 
 #include "comm.h"
 
+#ifndef DISABLE_TEXTURE_MEMORY
 texture<float, 2, cudaReadModeElementType> texDistance;
+#endif
 
 using namespace std;
 
@@ -399,6 +401,7 @@ void QTC(const string& name, ResultDatabase &resultDB, OptionParser& op, int mat
     cardinalities = pmsAllocHostBuffer<int>(2);
     output = pmsAllocHostBuffer<int>(max_degree);
 
+#ifndef DISABLE_TEXTURE_MEMORY
     if( can_use_texture ){
         texDistance.addressMode[0] = cudaAddressModeClamp;
         texDistance.addressMode[1] = cudaAddressModeClamp;
@@ -408,7 +411,9 @@ void QTC(const string& name, ResultDatabase &resultDB, OptionParser& op, int mat
         printf("Allocating: %luMB (%lux%lux%lu) bytes in texture memory\n", dst_matrix_elems*sizeof(float)/(1024*1024),
                                                                         dst_matrix_elems/point_count, point_count, (long unsigned int)sizeof(float));
         cudaMallocArray(&distance_matrix_txt, &texDistance.channelDesc, dst_matrix_elems/point_count, point_count);
-    }else{
+    }else
+#endif
+    {
         allocDeviceBuffer(&distance_matrix_gmem, dst_matrix_elems*sizeof(float));
     }
     CHECK_CUDA_ERROR();
@@ -427,11 +432,14 @@ void QTC(const string& name, ResultDatabase &resultDB, OptionParser& op, int mat
     // Copy to device, and record transfer time
     int pcie_TH = Timer::Start();
 
+#ifndef DISABLE_TEXTURE_MEMORY
     if( can_use_texture ){
         cudaMemcpyToArray(distance_matrix_txt, 0, 0, dist_source, dst_matrix_elems*sizeof(float), cudaMemcpyHostToDevice);
         CHECK_CUDA_ERROR();
         cudaBindTextureToArray(texDistance, distance_matrix_txt);
-    }else{
+    }else
+#endif
+    {
         copyToDevice(distance_matrix_gmem, dist_source, dst_matrix_elems*sizeof(float));
     }
 
@@ -472,9 +480,12 @@ void QTC(const string& name, ResultDatabase &resultDB, OptionParser& op, int mat
 
     tpb = THREADSPERBLOCK;
 
+#ifndef DISABLE_TEXTURE_MEMORY
     if( can_use_texture ){
         distance_matrix = distance_matrix_txt;
-    }else{
+    }else
+#endif
+    {
         distance_matrix = distance_matrix_gmem;
     }
 
@@ -604,10 +615,13 @@ void QTC(const string& name, ResultDatabase &resultDB, OptionParser& op, int mat
 
     pmsFreeHostBuffer(dist_source);
     pmsFreeHostBuffer(indr_mtrx_host);
+#ifndef DISABLE_TEXTURE_MEMORY
     if( can_use_texture ){
         cudaFreeArray(distance_matrix_txt);
         cudaUnbindTexture(texDistance);
-    }else{
+    }else
+#endif
+    {
         freeDeviceBuffer(distance_matrix_gmem);
     }
 
