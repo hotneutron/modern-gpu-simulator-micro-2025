@@ -4,8 +4,13 @@
 #include <iostream>
 #ifdef _WIN32
 #define restrict __restrict
+#elif defined(__CUDACC__)
+#define restrict __restrict__
 #else
 #include "config.h"
+#ifndef restrict
+#define restrict
+#endif
 #endif
 
 #include "PMSMemMgr.h"

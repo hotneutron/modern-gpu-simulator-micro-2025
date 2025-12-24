@@ -36,40 +36,18 @@ inline int populateNeighborList(std::list<T>& currDist,
         std::list<int>& currList, const int j, const int nAtom,
         int* neighborList);
 
-// Texture caches for position info
-texture<float4, 1, cudaReadModeElementType> posTexture;
-texture<int4, 1, cudaReadModeElementType> posTexture_dp;
-
+// Direct memory reader (replaces deprecated texture API)
 struct texReader_sp {
    __device__ __forceinline__ float4 operator()(int idx) const
    {
-       return tex1Dfetch(posTexture, idx);
+       return make_float4(0, 0, 0, 0); // Unused when useTexture=false
    }
 };
 
-// CUDA doesn't support double4 textures, so we have to do some conversion
-// here, resulting in a bit of overhead, but it's still faster than
-// an uncoalesced read
 struct texReader_dp {
    __device__ __forceinline__ double4 operator()(int idx) const
    {
-#if (__CUDA_ARCH__ < 130)
-       // Devices before arch 130 don't support DP, and having the
-       // __hiloint2double() intrinsic will cause compilation to fail.
-       // This return statement added as a workaround -- it will compile,
-       // but since the arch doesn't support DP, it will never be called
-       return make_double4(0., 0., 0., 0.);
-#else
-       int4 v = tex1Dfetch(posTexture_dp, idx*2);
-       double2 a = make_double2(__hiloint2double(v.y, v.x),
-                                __hiloint2double(v.w, v.z));
-
-       v = tex1Dfetch(posTexture_dp, idx*2 + 1);
-       double2 b = make_double2(__hiloint2double(v.y, v.x),
-                                __hiloint2double(v.w, v.z));
-
-       return make_double4(a.x, a.y, b.x, b.y);
-#endif
+       return make_double4(0., 0., 0., 0.); // Unused when useTexture=false
    }
 };
 
@@ -281,12 +259,12 @@ RunBenchmark(ResultDatabase &resultDB, OptionParser &op)
     cudaGetDeviceProperties(&deviceProp, device);
 
     cout << "Running single precision test" << endl;
-    runTest<float, float3, float4, true, texReader_sp>("MD-LJ", resultDB, op);
+    runTest<float, float3, float4, false, texReader_sp>("MD-LJ", resultDB, op);
     if ((deviceProp.major == 1 && deviceProp.minor >= 3) ||
                (deviceProp.major >= 2))
     {
         cout << "Running double precision test" << endl;
-        runTest<double, double3, double4, true, texReader_dp>
+        runTest<double, double3, double4, false, texReader_dp>
             ("MD-LJ-DP", resultDB, op);
     } else {
         cout << "Skipping double precision test" << endl;
@@ -349,21 +327,8 @@ void runTest(const string& testName, ResultDatabase& resultDB, OptionParser& op)
         position[i].z = (T)(drand48() * domainEdge);
     }
 
-    if (useTexture)
-    {
-        // Set up 1D texture to cache position info
-        cudaChannelFormatDesc channelDesc = cudaCreateChannelDesc<float4>();
-
-        // Bind a 1D texture to the position array
-        CUDA_SAFE_CALL(cudaBindTexture(0, posTexture, d_position, channelDesc,
-                nAtom*sizeof(float4)));
-
-        cudaChannelFormatDesc channelDesc2 = cudaCreateChannelDesc<int4>();
-
-        // Bind a 1D texture to the position array
-        CUDA_SAFE_CALL(cudaBindTexture(0, posTexture_dp, d_position,
-                channelDesc2, nAtom*sizeof(double4)));
-    }
+    // Texture binding removed - using direct memory access instead
+    // (useTexture is now always false)
 
     // Keep track of how many atoms are within the cutoff distance to
     // accurately calculate FLOPS later
@@ -489,7 +454,6 @@ void runTest(const string& testName, ResultDatabase& resultDB, OptionParser& op)
     CUDA_SAFE_CALL(cudaFreeHost(force));
     CUDA_SAFE_CALL(cudaFreeHost(neighborList));
     // Device
-    CUDA_SAFE_CALL(cudaUnbindTexture(posTexture));
     CUDA_SAFE_CALL(cudaFree(d_position));
     CUDA_SAFE_CALL(cudaFree(d_force));
     CUDA_SAFE_CALL(cudaFree(d_neighborList));

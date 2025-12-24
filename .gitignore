@@ -1,0 +1,11 @@
+# Compiled executables and build artifacts
+*.o
+*.a
+*.so
+*.exe
+**/build/
+**/bin/
+
+# Benchmark compiled binaries (specific patterns)
+# These are executables without extensions created during build
+gpgpu_inst_stats.txt

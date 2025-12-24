@@ -10,30 +10,22 @@
 
 using namespace std;
 
-texture<float, 1> vecTex;  // vector textures
-texture<int2, 1>  vecTexD;
+// Device pointers for vector data (replacing deprecated texture API)
+__device__ float* d_vecSP_ptr;
+__device__ double* d_vecDP_ptr;
 
-// Texture Readers (used so kernels can be templated)
+// Direct memory readers (replacing deprecated texture API)
 struct texReaderSP {
    __device__ __forceinline__ float operator()(const int idx) const
    {
-       return tex1Dfetch(vecTex, idx);
+       return d_vecSP_ptr[idx];
    }
 };
 
 struct texReaderDP {
    __device__ __forceinline__ double operator()(const int idx) const
    {
-       int2 v = tex1Dfetch(vecTexD, idx);
-#if (__CUDA_ARCH__ < 130)
-       // Devices before arch 130 don't support DP, and having the
-       // __hiloint2double() intrinsic will cause compilation to fail.
-       // This return statement added as a workaround -- it will compile,
-       // but since the arch doesn't support DP, it will never be called
-       return 0;
-#else
-       return __hiloint2double(v.y, v.x);
-#endif
+       return d_vecDP_ptr[idx];
    }
 };
 
@@ -214,19 +206,17 @@ void csrTest(ResultDatabase& resultDB, OptionParser& op, floatType* h_val,
       CUDA_SAFE_CALL(cudaEventElapsedTime(&iTransferTime, start, stop));
       iTransferTime *= 1.e-3;
 
-      // Bind texture for position
+      // Set device pointer for vector access (replacing texture binding)
       string suffix;
       if (sizeof(floatType) == sizeof(float))
       {
-          cudaChannelFormatDesc channelDesc = cudaCreateChannelDesc<float>();
-          CUDA_SAFE_CALL(cudaBindTexture(0, vecTex, d_vec, channelDesc,
-                  numRows * sizeof(float)));
+          float* vecPtr = (float*)d_vec;
+          CUDA_SAFE_CALL(cudaMemcpyToSymbol(d_vecSP_ptr, &vecPtr, sizeof(float*)));
           suffix = "-SP";
       }
       else {
-          cudaChannelFormatDesc channelDesc = cudaCreateChannelDesc<int2>();
-          CUDA_SAFE_CALL(cudaBindTexture(0, vecTexD, d_vec, channelDesc,
-                  numRows * sizeof(int2)));
+          double* vecPtr = (double*)d_vec;
+          CUDA_SAFE_CALL(cudaMemcpyToSymbol(d_vecDP_ptr, &vecPtr, sizeof(double*)));
           suffix = "-DP";
       }
 
@@ -318,8 +308,6 @@ void csrTest(ResultDatabase& resultDB, OptionParser& op, floatType* h_val,
       CUDA_SAFE_CALL(cudaFree(d_out));
       CUDA_SAFE_CALL(cudaFree(d_val));
       CUDA_SAFE_CALL(cudaFree(d_cols));
-      CUDA_SAFE_CALL(cudaUnbindTexture(vecTexD));
-      CUDA_SAFE_CALL(cudaUnbindTexture(vecTex));
       CUDA_SAFE_CALL(cudaEventDestroy(start));
       CUDA_SAFE_CALL(cudaEventDestroy(stop));
 }
@@ -376,18 +364,16 @@ void ellPackTest(ResultDatabase& resultDB, OptionParser& op, floatType* h_val,
     CUDA_SAFE_CALL(cudaMemcpy(d_rowLengths, h_rowLengths,
             cmSize * sizeof(int), cudaMemcpyHostToDevice));
 
-    // Bind texture for position
+    // Set device pointer for vector access (replacing texture binding)
     if (sizeof(floatType) == sizeof(float))
     {
-        cudaChannelFormatDesc channelDesc = cudaCreateChannelDesc<float>();
-        CUDA_SAFE_CALL(cudaBindTexture(0, vecTex, d_vec, channelDesc,
-                numRows * sizeof(float)));
+        float* vecPtr = (float*)d_vec;
+        CUDA_SAFE_CALL(cudaMemcpyToSymbol(d_vecSP_ptr, &vecPtr, sizeof(float*)));
     }
     else
     {
-        cudaChannelFormatDesc channelDesc = cudaCreateChannelDesc<int2>();
-        CUDA_SAFE_CALL(cudaBindTexture(0, vecTexD, d_vec, channelDesc,
-                numRows * sizeof(int2)));
+        double* vecPtr = (double*)d_vec;
+        CUDA_SAFE_CALL(cudaMemcpyToSymbol(d_vecDP_ptr, &vecPtr, sizeof(double*)));
     }
     int nBlocks = (int) ceil((floatType) cmSize / BLOCK_SIZE);
     int passes = op.getOptionInt("passes");
@@ -433,14 +419,6 @@ void ellPackTest(ResultDatabase& resultDB, OptionParser& op, floatType* h_val,
     CUDA_SAFE_CALL(cudaFree(d_out));
     CUDA_SAFE_CALL(cudaFree(d_val));
     CUDA_SAFE_CALL(cudaFree(d_cols));
-    if (sizeof(floatType) == sizeof(double))
-    {
-        CUDA_SAFE_CALL(cudaUnbindTexture(vecTexD));
-    }
-    else
-    {
-        CUDA_SAFE_CALL(cudaUnbindTexture(vecTex));
-    }
     CUDA_SAFE_CALL(cudaEventDestroy(start));
     CUDA_SAFE_CALL(cudaEventDestroy(stop));
     CUDA_SAFE_CALL(cudaFreeHost(h_rowLengths));
