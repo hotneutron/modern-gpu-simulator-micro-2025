@@ -32,6 +32,7 @@
 #include "../../../gpu-simulator/trace-parser/trace_parser.h"
 #include "../../../gpu-simulator/ISA_Def/ampere_opcode.h"
 #include "../../../gpu-simulator/ISA_Def/blackwell_opcode.h"
+#include "../../../gpu-simulator/ISA_Def/hopper_opcode.h"
 #include "../../../gpu-simulator/ISA_Def/pascal_opcode.h"
 #include "../../../gpu-simulator/ISA_Def/turing_opcode.h"
 #include "../../../gpu-simulator/ISA_Def/volta_opcode.h"
@@ -56,6 +57,10 @@ void get_opcode_map(const std::unordered_map<std::string, OpcodeChar> *&OpcodeMa
     OpcodeMap = &Kepler_OpcodeMap;
   else if (binary_verion == TURING_BINART_VERSION)
     OpcodeMap = &Turing_OpcodeMap;
+  else if(binary_verion == HOPPER_BINART_VERSION)
+    OpcodeMap = &Hopper_OpcodeMap;
+  else if(binary_verion == 89)  // Ada uses same ISA as Ampere
+    OpcodeMap = &Ampere_OpcodeMap;
   else {
     printf("unsupported binary version: %d\n",
            binary_verion);

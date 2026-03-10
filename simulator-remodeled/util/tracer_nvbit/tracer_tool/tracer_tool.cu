@@ -160,6 +160,19 @@ std::set<int> opcodes_id_ldgsts;
 int threshold_unique_kernel_checking;
 std::string variant_delimiter_str = "___";
 
+// =============================================================================
+// Incremental Flush Feature - prevents memory explosion for large kernels
+// =============================================================================
+// When a threadblock accumulates more than FLUSH_THRESHOLD instructions,
+// it is immediately written to disk to prevent memory exhaustion.
+// Enable via: INCREMENTAL_FLUSH_THRESHOLD=50000 (0 = disabled)
+int incremental_flush_threshold = 0;  // 0 means disabled
+std::unordered_map<std::string, uint64_t> tb_instruction_count;  // per-TB instruction counter
+std::unordered_map<std::string, int> tb_flush_part_count;  // per-TB part file counter
+uint64_t total_incremental_flushes = 0;  // stats counter
+uint64_t total_instructions_flushed = 0;  // stats counter
+// =============================================================================
+
 struct traced_operand_instrument {
   traced_operand_instrument() = default; // Add this default constructor
   traced_operand_instrument(TRACED_REG_TYPE reg_type, int num_regs, int first_reg_id) {
@@ -250,6 +263,166 @@ unsigned int& get_remaining_injects_to_current_instruction(std::string tb_key, u
   }
   return remaining_injects_to_current_instruction[tb_key][warp_id];
 }
+
+// =============================================================================
+// Incremental Flush: Write a single threadblock to disk immediately
+// =============================================================================
+// This function is called when a threadblock's instruction count exceeds the
+// threshold. It writes the threadblock to disk and clears it from memory.
+// Returns true if flush was successful.
+bool flush_threadblock_immediate(const std::string& tb_string_id,
+                                  dynamic_trace::threadblock& tb,
+                                  int device_id, int stream_id, int kern_id) {
+  // Create hierarchical folder structure
+  std::string device_folder = threadblock_trace_path + "/device_" + std::to_string(device_id);
+  std::string stream_folder = device_folder + "/stream_" + std::to_string(stream_id);
+  std::string kernel_folder = stream_folder + "/kernel_" + std::to_string(kern_id);
+
+  // Create folders (create_folder handles existing folders)
+  mkdir(device_folder.c_str(), S_IRWXU | S_IRWXG | S_IROTH | S_IXOTH);
+  mkdir(stream_folder.c_str(), S_IRWXU | S_IRWXG | S_IROTH | S_IXOTH);
+  mkdir(kernel_folder.c_str(), S_IRWXU | S_IRWXG | S_IROTH | S_IXOTH);
+
+  // Get current part number for this TB
+  int part_num = tb_flush_part_count[tb_string_id]++;
+
+  // Write threadblock to PART file (e.g., tb_id.part0.pb)
+  std::string tb_file = kernel_folder + "/" + tb_string_id + ".part" + std::to_string(part_num) + ".pb";
+  std::ofstream ofs_tb(tb_file, std::ios::out | std::ios::binary);
+
+  if (!tb.SerializeToOstream(&ofs_tb)) {
+    std::cerr << "[INCREMENTAL_FLUSH] ERROR: Failed to write " << tb_file << std::endl;
+    return false;
+  }
+
+  ofs_tb.close();
+
+  // Get instruction count for stats
+  uint64_t inst_count = tb_instruction_count[tb_string_id];
+
+  // Update stats
+  total_incremental_flushes++;
+  total_instructions_flushed += inst_count;
+
+  // Debug output
+  if (verbose) {
+    printf("[INCREMENTAL_FLUSH] Flushed %s part %d (%lu instructions) -> %s\n",
+           tb_string_id.c_str(), part_num, inst_count, tb_file.c_str());
+  }
+
+  // Clear the threadblock from memory
+  tb.Clear();
+
+  // Reset instruction counter for this TB
+  tb_instruction_count[tb_string_id] = 0;
+
+  // Also clear remaining_injects state for this TB
+  remaining_injects_to_current_instruction.erase(tb_string_id);
+
+  return true;
+}
+
+// =============================================================================
+// Merge all part files with remaining in-memory data into final file
+// =============================================================================
+void merge_and_write_threadblock(const std::string& tb_string_id,
+                                  dynamic_trace::threadblock& tb_remaining,
+                                  const std::string& kernel_folder) {
+  int num_parts = tb_flush_part_count[tb_string_id];
+
+  if (num_parts == 0) {
+    // No incremental flushes - just write the remaining data directly
+    std::string tb_file = kernel_folder + "/" + tb_string_id + ".pb";
+    std::ofstream ofs_tb(tb_file, std::ios::out | std::ios::binary);
+    if (!tb_remaining.SerializeToOstream(&ofs_tb)) {
+      std::cerr << "Failed to write threadblock content." << std::endl;
+      abort();
+    }
+    ofs_tb.close();
+    return;
+  }
+
+  // Create merged threadblock starting with the remaining in-memory data
+  dynamic_trace::threadblock merged_tb;
+
+  // Copy block_id from remaining (or first part)
+  if (tb_remaining.has_block_id()) {
+    *merged_tb.mutable_block_id() = tb_remaining.block_id();
+  }
+
+  // Read and merge all part files in order
+  for (int i = 0; i < num_parts; i++) {
+    std::string part_file = kernel_folder + "/" + tb_string_id + ".part" + std::to_string(i) + ".pb";
+    std::ifstream ifs_part(part_file, std::ios::in | std::ios::binary);
+
+    if (!ifs_part.is_open()) {
+      std::cerr << "[INCREMENTAL_FLUSH] ERROR: Cannot open part file " << part_file << std::endl;
+      abort();
+    }
+
+    dynamic_trace::threadblock part_tb;
+    if (!part_tb.ParseFromIstream(&ifs_part)) {
+      std::cerr << "[INCREMENTAL_FLUSH] ERROR: Cannot parse part file " << part_file << std::endl;
+      abort();
+    }
+    ifs_part.close();
+
+    // Copy block_id if not set
+    if (!merged_tb.has_block_id() && part_tb.has_block_id()) {
+      *merged_tb.mutable_block_id() = part_tb.block_id();
+    }
+
+    // Merge warps: append instructions from part to merged
+    for (const auto& warp_pair : part_tb.warps()) {
+      int warp_id = warp_pair.first;
+      const dynamic_trace::warp& part_warp = warp_pair.second;
+
+      // Get or create warp in merged
+      dynamic_trace::warp* merged_warp = &(*merged_tb.mutable_warps())[warp_id];
+      merged_warp->set_id(warp_id);
+
+      // Append all instructions from part to merged
+      for (const auto& inst : part_warp.instructions()) {
+        *merged_warp->add_instructions() = inst;
+      }
+    }
+
+    // Delete part file
+    std::remove(part_file.c_str());
+  }
+
+  // Now merge remaining in-memory data
+  for (const auto& warp_pair : tb_remaining.warps()) {
+    int warp_id = warp_pair.first;
+    const dynamic_trace::warp& remaining_warp = warp_pair.second;
+
+    // Get or create warp in merged
+    dynamic_trace::warp* merged_warp = &(*merged_tb.mutable_warps())[warp_id];
+    merged_warp->set_id(warp_id);
+
+    // Append all instructions from remaining to merged
+    for (const auto& inst : remaining_warp.instructions()) {
+      *merged_warp->add_instructions() = inst;
+    }
+  }
+
+  // Write final merged file
+  std::string tb_file = kernel_folder + "/" + tb_string_id + ".pb";
+  std::ofstream ofs_tb(tb_file, std::ios::out | std::ios::binary);
+  if (!merged_tb.SerializeToOstream(&ofs_tb)) {
+    std::cerr << "Failed to write merged threadblock content." << std::endl;
+    abort();
+  }
+  ofs_tb.close();
+
+  if (verbose) {
+    printf("[INCREMENTAL_FLUSH] Merged %d parts + remaining -> %s\n", num_parts, tb_file.c_str());
+  }
+
+  // Clear part count for this TB
+  tb_flush_part_count.erase(tb_string_id);
+}
+// =============================================================================
 
 void create_folder(const char * folder_path) {
   if (mkdir(folder_path, S_IRWXU | S_IRWXG | S_IROTH | S_IXOTH) == -1) {
@@ -616,8 +789,17 @@ void nvbit_at_init() {
   GET_VAR_INT(threshold_unique_kernel_checking, "THRESHOLD_UNIQUE_KERNEL_CHECKING", 10,
               "Number of instructions used to check if kernels with the same name are different");
   GET_VAR_INT(gather_registers, "GATHER_REGISTERS", 0, "Enable gathering of GPU register values. Not available in this version.");
+  GET_VAR_INT(incremental_flush_threshold, "INCREMENTAL_FLUSH_THRESHOLD", 0,
+              "Flush threadblocks to disk when instruction count exceeds this threshold. "
+              "0 = disabled (default). Recommended: 50000-100000 for large kernels.");
   std::string pad(100, '-');
   printf("%s\n", pad.c_str());
+
+  // Print incremental flush status
+  if (incremental_flush_threshold > 0) {
+    printf("[INCREMENTAL_FLUSH] Enabled with threshold = %d instructions per threadblock\n",
+           incremental_flush_threshold);
+  }
 
   if (active_from_start == 0) {
     active_region = false;
@@ -1200,22 +1382,18 @@ void nvbit_at_cuda_event(CUcontext ctx, int is_exit, nvbit_api_cuda_t cbid,
             std::string device_folder = threadblock_trace_path + "/device_" + std::to_string(tb_info.device_id);
             std::string stream_folder = device_folder + "/stream_" + std::to_string(tb_info.stream_id);
             std::string kernel_folder = stream_folder + "/kernel_" + std::to_string(tb_info.kernel_id);
-            
+
             create_folder(device_folder.c_str());
             create_folder(stream_folder.c_str());
             create_folder(kernel_folder.c_str());
-            
+
             dynamic_trace::threadblock &tb = it_tb->second;
-            std::string tb_file = kernel_folder + "/" + tb_string_id + ".pb";
-            std::ofstream ofs_tb(tb_file, std::ios::out | std::ios::binary);
-            if (!tb.SerializeToOstream(&ofs_tb)) {
-              std::cerr << "Failed to write threadblock content." << std::endl;
-              fflush(stdout);
-              abort();
-            }else {
-              tb.Clear();
-            }
-            ofs_tb.close();
+
+            // Use merge_and_write_threadblock to handle incremental flush parts
+            // This will merge any part files with remaining in-memory data
+            merge_and_write_threadblock(tb_string_id, tb, kernel_folder);
+            tb.Clear();
+
             it_tb = threadblocks.erase(it_tb);
           }else {
             it_tb++;
@@ -1450,11 +1628,42 @@ void *recv_thread_fun(void *args) {
             }
           }
         }
+
+        // =============================================================================
+        // Incremental Flush Check: Flush threadblock if instruction count exceeds threshold
+        // =============================================================================
+        if (incremental_flush_threshold > 0) {
+          // Increment instruction count for this threadblock
+          tb_instruction_count[tb_string_id]++;
+
+          // Check if we need to flush
+          if (tb_instruction_count[tb_string_id] >= (uint64_t)incremental_flush_threshold) {
+            // Ensure trace folder structure exists
+            create_folder(threadblock_trace_path.c_str());
+
+            // Flush this threadblock immediately
+            int kern_id = kernel_id[device_id] - 1;  // kernel_id is already incremented
+            int stream_id = current_stream_id[device_id];
+            flush_threadblock_immediate(tb_string_id, tb, device_id, stream_id, kern_id);
+
+            // Note: tb is now cleared but still in map - subsequent instructions
+            // will add to fresh TB, and final flush at kernel end will write remainder
+          }
+        }
+        // =============================================================================
+
         num_processed_bytes += sizeof(inst_trace_t);
       }
     }
   }
   free(recv_buffer);
+
+  // Print incremental flush stats at thread end
+  if (incremental_flush_threshold > 0 && total_incremental_flushes > 0) {
+    printf("[INCREMENTAL_FLUSH] Stats: %lu flushes, %lu instructions flushed to disk during kernel execution\n",
+           total_incremental_flushes, total_instructions_flushed);
+  }
+
   ctx_state->recv_thread_done = RecvThreadState::FINISHED;
   return NULL;
 }

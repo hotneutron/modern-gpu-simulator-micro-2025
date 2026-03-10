@@ -67,6 +67,7 @@
 #include <memory>
 
 #include "../ISA_Def/blackwell_opcode.h"
+#include "../ISA_Def/hopper_opcode.h"
 #include "../ISA_Def/ampere_opcode.h"
 #include "../ISA_Def/kepler_opcode.h"
 #include "../ISA_Def/pascal_opcode.h"

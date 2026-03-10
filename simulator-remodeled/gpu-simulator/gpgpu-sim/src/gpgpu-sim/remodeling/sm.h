@@ -388,6 +388,7 @@ class SM : public core_t, public shader_core_ctx_wrapper {
   unsigned int m_n_active_cta;  // number of Cooperative Thread Arrays (blocks)
                                 // currently running on this shader.
   unsigned int m_cta_status[MAX_CTA_PER_SHADER];  // CTAs status
+  unsigned int m_local_to_global_cta_id[MAX_CTA_PER_SHADER];  // Map local CTA slot to global CTA ID
   unsigned int m_not_completed;  // number of threads to be completed (==0 when all
                              // thread on this core completed)
   

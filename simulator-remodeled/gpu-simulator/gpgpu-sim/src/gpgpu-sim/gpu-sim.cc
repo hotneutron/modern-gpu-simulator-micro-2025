@@ -1698,6 +1698,10 @@ gpgpu_sim::gpgpu_sim(const gpgpu_sim_config &config, gpgpu_context *ctx)
   gpu_tot_sim_insn = 0;
   gpu_tot_issued_cta = 0;
   gpu_completed_cta = 0;
+  // Initialize first completed CTA tracking
+  m_first_completed_global_cta_id = 0;
+  m_first_completed_sm_id = 0;
+  m_first_cta_recorded = false;
   m_total_cta_launched = 0;
   gpu_deadlock = false;
 
@@ -2273,6 +2277,12 @@ void gpgpu_sim::gpu_print_stat() {
                                        (gpu_tot_sim_cycle + gpu_sim_cycle));
   printf("gpu_tot_issued_cta = %lld\n",
          gpu_tot_issued_cta + m_total_cta_launched);
+  printf("gpu_completed_cta = %u\n", gpu_completed_cta);
+  // First completed CTA tracking for ground truth validation
+  if (m_first_cta_recorded) {
+    printf("gpu_first_completed_cta_id = %u\n", m_first_completed_global_cta_id);
+    printf("gpu_first_completed_sm_id = %u\n", m_first_completed_sm_id);
+  }
   printf("gpu_occupancy = %.4f%% \n", gpu_occupancy.get_occ_fraction() * 100);
   printf("gpu_tot_occupancy = %.4f%% \n",
          (gpu_occupancy + gpu_tot_occupancy).get_occ_fraction() * 100);
