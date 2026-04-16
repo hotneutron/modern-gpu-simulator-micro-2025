@@ -130,9 +130,6 @@ traced_operand::traced_operand(std::string operand_string)
     }else if(operand_string.find("{") != std::string::npos) {
         m_operand_type = TraceEnhancedOperandType::SB;
         is_other_wait_barriers_identifiers = true;
-    }else if ((operand_string.rfind("gsb", 0) == 0) || (operand_string.rfind("GSB", 0) == 0)) {
-        m_operand_type = TraceEnhancedOperandType::GENERIC;
-        skip_idx_inc = true;
     }
     else if (operand_string.find("desc") != std::string::npos)
     {
