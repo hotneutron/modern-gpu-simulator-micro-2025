@@ -891,3 +891,10 @@ lonestargpu-2.0:
               accel-sim-mem: 15G
               qos: big
               openmp-cpus: 6
+
+microbench:
+    exec_dir: "$GPUAPPS_ROOT/src/cuda/microbench"
+    data_dirs: ""
+    execs:
+        - tensorcore_test:
+            - args:
