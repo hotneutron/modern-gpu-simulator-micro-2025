@@ -39,111 +39,7 @@
 #include "../../../gpu-simulator/ISA_Def/kepler_opcode.h"
 
 #include <iostream>
-#include <algorithm>
-#include <cctype>
 #include <regex>
-
-namespace {
-std::string to_upper_ascii(std::string value) {
-  std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
-    return static_cast<char>(std::toupper(c));
-  });
-  return value;
-}
-
-bool is_warpgroup_tensor_opcode(const std::string &op_code) {
-  const std::string upper = to_upper_ascii(op_code);
-  return upper.find("WGMMA") != std::string::npos ||
-         upper.find("HGMMA") != std::string::npos ||
-         upper.find("BGMMA") != std::string::npos ||
-         upper.find("IGMMA") != std::string::npos ||
-         upper.find("QGMMA") != std::string::npos;
-}
-
-bool parse_named_tensor_shape(const std::string &op_code, unsigned int &size_m,
-                              unsigned int &size_n, unsigned int &size_k) {
-  std::smatch matches;
-  std::regex pattern(R"([mM](\d+)[nN](\d+)[kK](\d+))");
-  if (!std::regex_search(op_code, matches, pattern)) {
-    return false;
-  }
-  size_m = std::stoul(matches[1].str());
-  size_n = std::stoul(matches[2].str());
-  size_k = std::stoul(matches[3].str());
-  return true;
-}
-
-bool parse_x_tensor_shape(const std::string &op_code, unsigned int &size_m,
-                          unsigned int &size_n, unsigned int &size_k) {
-  std::smatch matches;
-  std::regex pattern(R"((\d+)[xX](\d+)[xX](\d+))");
-  if (!std::regex_search(op_code, matches, pattern)) {
-    return false;
-  }
-  size_m = std::stoul(matches[1].str());
-  size_n = std::stoul(matches[2].str());
-  size_k = std::stoul(matches[3].str());
-  return true;
-}
-
-bool parse_legacy_tensor_shape(const std::vector<std::string> &numbers,
-                               unsigned int &size_m, unsigned int &size_n,
-                               unsigned int &size_k) {
-  if (numbers.empty()) {
-    return false;
-  }
-  const std::string &mma_shape = numbers[0];
-  if (mma_shape.size() < 3) {
-    return false;
-  }
-  unsigned int pos_n = 1;
-  if (mma_shape.rfind("8", 0) == 0) {
-    size_m = 8;
-  } else if (mma_shape.rfind("16", 0) == 0) {
-    size_m = 16;
-    pos_n = 2;
-  } else {
-    return false;
-  }
-  if (mma_shape.size() <= pos_n + 1 || mma_shape.substr(pos_n, 1) != "8") {
-    return false;
-  }
-  size_n = 8;
-  size_k = std::stoul(mma_shape.substr(pos_n + 1));
-  return true;
-}
-
-unsigned int infer_tensor_operand_bit_size(const std::string &op_code,
-                                           const std::vector<std::string> &numbers,
-                                           bool used_legacy_shape) {
-  if (used_legacy_shape && numbers.size() > 1) {
-    return std::stoul(numbers[1]);
-  }
-  const std::string upper = to_upper_ascii(op_code);
-  if (upper.find("BF16") != std::string::npos || upper.find("F16") != std::string::npos) {
-    return 16;
-  }
-  if (upper.find("TF32") != std::string::npos || upper.find("F32") != std::string::npos) {
-    return 32;
-  }
-  if (upper.find("F64") != std::string::npos) {
-    return 64;
-  }
-  if (upper.find("FP8") != std::string::npos || upper.find("F8") != std::string::npos ||
-      upper.find("E4M3") != std::string::npos || upper.find("E5M2") != std::string::npos ||
-      upper.find("S8") != std::string::npos || upper.find("U8") != std::string::npos ||
-      upper.find("I8") != std::string::npos) {
-    return 8;
-  }
-  if (upper.find("S4") != std::string::npos || upper.find("U4") != std::string::npos) {
-    return 4;
-  }
-  if (upper.find("B1") != std::string::npos) {
-    return 1;
-  }
-  return 16;
-}
-}
 
 void get_opcode_map(const std::unordered_map<std::string, OpcodeChar> *&OpcodeMap, int binary_verion) {
     if(binary_verion == BLACKWELL_RTX_BINART_VERSION)
@@ -244,26 +140,19 @@ unsigned int get_number_of_uses_per_operand(traced_instruction &trace_inst, unsi
       }
     }else if(trace_inst.is_tensor_core_op()) {
       assert(trace_inst.get_tensor_core_instruction_info().is_set);
-      if(is_warpgroup_tensor_opcode(trace_inst.get_op_code())) {
-        if((operand_pos == 0) || (operand_pos == 3)) {
-          num_uses = 4;
-        }else if((operand_pos == 1) || (operand_pos == 2)) {
-          num_uses = 2;
+      if((operand_pos == 0) || (operand_pos == 3)) {
+        unsigned int operand_bit_size = trace_inst.get_tensor_core_instruction_info().operand_bit_size;
+        if( (trace_inst.get_op_code().find("BMMA") != std::string::npos) || trace_inst.get_op_code().find("IMMA") != std::string::npos) {
+          operand_bit_size = 32;
         }
-      } else {
-        if((operand_pos == 0) || (operand_pos == 3)) {
-          unsigned int operand_bit_size = trace_inst.get_tensor_core_instruction_info().operand_bit_size;
-          if( (trace_inst.get_op_code().find("BMMA") != std::string::npos) || trace_inst.get_op_code().find("IMMA") != std::string::npos) {
-            operand_bit_size = 32;
-          }
-          num_uses = (trace_inst.get_tensor_core_instruction_info().size_m * trace_inst.get_tensor_core_instruction_info().size_n * operand_bit_size) / 1024;
-        }else if(operand_pos == 1) {
-          num_uses = (trace_inst.get_tensor_core_instruction_info().size_m * trace_inst.get_tensor_core_instruction_info().size_k * trace_inst.get_tensor_core_instruction_info().operand_bit_size) / 1024;
-          num_uses = num_uses / 2;
-        }else if(operand_pos == 2) {
-          num_uses = (trace_inst.get_tensor_core_instruction_info().size_k * trace_inst.get_tensor_core_instruction_info().size_n * trace_inst.get_tensor_core_instruction_info().operand_bit_size) / 1024;
-          num_uses = num_uses / 2;
-        }
+        num_uses = (trace_inst.get_tensor_core_instruction_info().size_m * trace_inst.get_tensor_core_instruction_info().size_n * operand_bit_size) / 1024;
+        
+      }else if(operand_pos == 1) {
+        num_uses = (trace_inst.get_tensor_core_instruction_info().size_m * trace_inst.get_tensor_core_instruction_info().size_k * trace_inst.get_tensor_core_instruction_info().operand_bit_size) / 1024;
+        num_uses = num_uses / 2;
+      }else if(operand_pos == 2) {
+        num_uses = (trace_inst.get_tensor_core_instruction_info().size_k * trace_inst.get_tensor_core_instruction_info().size_n * trace_inst.get_tensor_core_instruction_info().operand_bit_size) / 1024;
+        num_uses = num_uses / 2;
       }
     }else if( (trace_inst.get_op_code().find("F2") != std::string::npos) || (trace_inst.get_op_code().find("2F") != std::string::npos)) {
       std::size_t size64pos = trace_inst.get_op_code().find("64");
@@ -535,6 +424,7 @@ Tensor_core_instruction_information& traced_instruction::get_tensor_core_instruc
 void traced_instruction::set_tensor_core_instruction_info() {
   assert(is_tensor_core_op());
   if(!m_tensor_core_instruction_info.is_set) {
+    std::smatch matches;
     std::string op_code = get_op_code();
     std::regex pattern(R"(\d+)");
     std::vector<std::string> numbers;
@@ -545,58 +435,36 @@ void traced_instruction::set_tensor_core_instruction_info() {
         std::smatch match = *i;
         numbers.push_back(match.str());
     }
-    unsigned int size_m = 0;
-    unsigned int size_n = 0;
-    unsigned int size_k = 0;
-    bool used_legacy_shape = parse_legacy_tensor_shape(numbers, size_m, size_n, size_k);
-    bool shape_found = used_legacy_shape ||
-                       parse_named_tensor_shape(op_code, size_m, size_n, size_k) ||
-                       parse_x_tensor_shape(op_code, size_m, size_n, size_k);
-    if(!shape_found) {
-      if(is_warpgroup_tensor_opcode(op_code)) {
-        size_m = 64;
-        size_n = 8;
-        size_k = 16;
-      } else {
-        size_m = 16;
-        size_n = 8;
-        size_k = 16;
-      }
+    unsigned int operand_bit_size = 1;
+    if(numbers.size() > 1) {
+      operand_bit_size = std::stoi(numbers[1]);
     }
-    unsigned int operand_bit_size = infer_tensor_operand_bit_size(op_code, numbers, used_legacy_shape);
+    unsigned int size_m = 0;
+    unsigned int size_n = 8;
+    unsigned int size_k = 0;
+    unsigned int pos_n = 1;
+    if(numbers[0].substr(0, 1) == "8") {
+      size_m = 8;
+    }else if(numbers[0].substr(0, 2) == "16") {
+      size_m = 16;
+      pos_n = 2;
+    }else{
+      assert("Invalid size_m in tensor core instruction. " && false);
+    }
+    assert(numbers[0].substr(pos_n, 1) == "8");
+    size_k = std::stoi(numbers[0].substr(pos_n + 1));
     m_tensor_core_instruction_info = Tensor_core_instruction_information(size_m, size_n, size_k, operand_bit_size, is_sparse, is_16816_fp32_1688_fp32);
   }
 }
 
 void traced_instruction::set_simulation_opcode(const std::unordered_map<std::string, OpcodeChar> *OpcodeMap, std::string str_op) {
     std::vector<std::string> opcode_tokens = get_opcode_tokens(str_op);
-    if(opcode_tokens.empty()) {
-        return;
-    }
     std::string opcode1 = opcode_tokens[0];
-    std::string opcode1_upper = to_upper_ascii(opcode1);
-
-    if(opcode1_upper == "WGMMA" && opcode_tokens.size() > 1) {
-        std::string opcode2_upper = to_upper_ascii(opcode_tokens[1]);
-        if(opcode2_upper.find("WAIT") != std::string::npos) {
-            m_simulation_opcode = BARRIER_OP;
-            return;
-        }
-        if(opcode2_upper.find("COMMIT") != std::string::npos) {
-            m_simulation_opcode = MISCELLANEOUS_NO_QUEUE_OP;
-            return;
-        }
-    }
 
     std::unordered_map<std::string, OpcodeChar>::const_iterator it =
     OpcodeMap->find(opcode1);
     if (it != OpcodeMap->end()) {
         m_simulation_opcode = (op_type)(it->second.opcode_category);
-        return;
-    }
-
-    if(opcode1_upper.find("GMMA") != std::string::npos) {
-        m_simulation_opcode = TENSOR_CORE_OP;
     }
 }
 
