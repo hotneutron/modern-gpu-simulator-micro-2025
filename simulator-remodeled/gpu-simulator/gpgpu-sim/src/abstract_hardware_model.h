@@ -1995,9 +1995,18 @@ class register_set {
 };
 
 // New function: move_warp_uniptr
-inline void move_warp_uniptr(std::unique_ptr<warp_inst_t>& dst, std::unique_ptr<warp_inst_t>& src) {
+#define move_warp_uniptr(dst, src) move_warp_uniptr_impl(dst, src, __FILE__, __LINE__)
+inline void move_warp_uniptr_impl(std::unique_ptr<warp_inst_t>& dst, std::unique_ptr<warp_inst_t>& src, const char* file, int line) {
     // dst is expected to be empty
-    assert(dst && dst->empty());
+    if (!(dst && dst->empty())) {
+        printf("ASSERTION FAILED in move_warp_uniptr! Called from %s:%d\n", file, line);
+        printf("dst is %p\n", dst.get());
+        if (dst) {
+            printf("dst->empty() is %d\n", dst->empty());
+            printf("dst->pc = %x, src->pc = %x\n", dst->pc, src->pc);
+        }
+        assert(dst && dst->empty());
+    }
     std::unique_ptr<warp_inst_t> temp = std::move(dst);
     dst = std::move(src);
     src = std::move(temp);

@@ -147,6 +147,7 @@ struct functional_unit_with_queue_stage {
 
 
   void reset() {
+    inst->clear();
     remaining_cycles = 0;
     valid = false;
     completed = false;

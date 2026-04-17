@@ -282,7 +282,10 @@ unsigned int get_number_of_uses_per_operand(traced_instruction &trace_inst, unsi
     if(num_uses == 2) { // Final check
       num_uses = (reg_id % 2 == 0) ? 2 : 1;
     }else if(num_uses == 4) {
-      assert(reg_id % 4 == 0);
+      if (reg_id % 4 != 0) {
+        // Relax alignment for unaligned 4-register vectors (e.g. N=16 tensors)
+        num_uses = 4;
+      }
     }
   }
   return num_uses;

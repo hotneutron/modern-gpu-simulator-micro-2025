@@ -136,7 +136,7 @@ void functional_unit::add_extra_cycle_initiation_interval() {
 
 bool functional_unit::can_issue(const warp_inst_t *inst) const {
   assert(!m_has_queue);
-  return m_dispatch_pending_reserved_cycles == 0;
+  return m_dispatch_pending_reserved_cycles == 0 && m_dispatch_reg->empty();
 }
 
 unsigned int functional_unit::get_rf_read_width_per_operand() const {
@@ -171,6 +171,9 @@ void functional_unit::issue(register_set_uniptr &source_reg) {
     }
 
     m_sm->incexecstat(ready_reg);
+    if (!m_dispatch_reg->empty()) {
+      printf("WARNING: Overwriting m_dispatch_reg! Pipeline structural stall bug. Old inst: PC=0x%x, New inst: PC=0x%x\n", m_dispatch_reg->pc, ready_reg->pc);
+    }
     source_reg.move_out_to(m_dispatch_reg);
   }
 }
@@ -293,6 +296,7 @@ void functional_unit::cycle() {
     if (!m_dispatch_reg->dispatch_delay()) {
       int start_stage = m_dispatch_reg->latency -1;
       assert(start_stage >= 0);
+      assert((unsigned)start_stage < m_pipeline_depth);
       if (m_pipeline_reg[start_stage]->empty()) {
         if(!is_fixed_latency_unit()){
           release_read_barrier(m_dispatch_reg);
@@ -538,6 +542,8 @@ void functional_unit_shared_sm_part::cycle() {
     if (!m_dispatch_reg->dispatch_delay()) {
       int start_stage = m_dispatch_reg->latency -
                         m_dispatch_reg->initiation_interval;
+      assert(start_stage >= 0);
+      assert((unsigned)start_stage < m_pipeline_depth);
       if (m_pipeline_reg[start_stage]->empty()) {
         m_current_queue_size--;
         move_warp_uniptr(m_pipeline_reg[start_stage], m_dispatch_reg);
