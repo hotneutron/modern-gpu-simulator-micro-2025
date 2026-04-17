@@ -168,6 +168,8 @@ kernel_trace_t::kernel_trace_t() {
   local_base_addr = 0;
   binary_verion = 0;
   trace_verion = 0;
+  sampled_cta_idx = 0;
+  cta_sampling_weight = 1.0f;
 }
 
 void inst_memadd_info_t::base_stride_decompress(

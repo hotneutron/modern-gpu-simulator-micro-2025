@@ -29,10 +29,12 @@
 #include <fstream>
 #include <iostream>
 #include <math.h>
+#include <set>
 #include <sstream>
 #include <stdio.h>
 #include <string>
 #include <time.h>
+#include <tuple>
 #include <vector>
 
 #include "gpgpu_context.h"
@@ -61,6 +63,38 @@ gpgpu_sim *gpgpu_trace_sim_init_perf_model(int argc, const char *argv[],
 trace_kernel_info_t *create_kernel_info( kernel_trace_t* kernel_trace_info,
 		                      gpgpu_context *m_gpgpu_context, class trace_config *config,
 							  trace_parser *parser);
+
+// Coordinate-based CTA heuristic: selects boundary (corners, edge-midpoints) and
+// one interior representative. Works best for regular compute kernels (GEMM, conv,
+// stencil) where CTA behavior varies only at grid boundaries.
+static std::vector<std::tuple<unsigned,unsigned,unsigned>>
+compute_sampled_ctas(unsigned gx, unsigned gy, unsigned gz) {
+  std::set<std::tuple<unsigned,unsigned,unsigned>> seen;
+  auto add = [&](unsigned x, unsigned y, unsigned z) {
+    x = std::min(x, gx - 1);
+    y = std::min(y, gy - 1);
+    z = std::min(z, gz - 1);
+    seen.insert({x, y, z});
+  };
+
+  // corners
+  for (unsigned z : {0u, gz - 1}) {
+    for (unsigned y : {0u, gy - 1}) {
+      for (unsigned x : {0u, gx - 1}) {
+        add(x, y, z);
+      }
+    }
+  }
+  // mid-edge representatives and interior
+  add(gx / 2, 0,      0);       add(gx / 2, gy - 1, 0);
+  add(0,      gy / 2, 0);       add(gx - 1, gy / 2, 0);
+  add(gx / 2, gy / 2, 0);      // interior (z=0 face)
+  if (gz > 1) {
+    add(gx / 2, gy / 2, gz / 2); // interior z
+    add(gx / 2, gy / 2, gz - 1);
+  }
+  return std::vector<std::tuple<unsigned,unsigned,unsigned>>(seen.begin(), seen.end());
+}
 
 
 void handler(int sig) {
@@ -197,6 +231,7 @@ int main(int argc, const char **argv) {
     if ( (finished_kernel_uid || m_gpgpu_sim->cycle_insn_cta_max_hit()
         || !m_gpgpu_sim->active()) && !kernels_info.empty() ) {
       trace_kernel_info_t* k = NULL;
+      float finished_kernel_cta_weight = 1.0f;
       for (unsigned j = 0; j < kernels_info.size(); j++) {
         k = kernels_info.at(j);
         if (k->get_uid() == finished_kernel_uid || m_gpgpu_sim->cycle_insn_cta_max_hit()
@@ -207,6 +242,7 @@ int main(int argc, const char **argv) {
               break;
             }
           }
+          finished_kernel_cta_weight = k->get_trace_info()->cta_sampling_weight;
           tracer.kernel_finalizer(k->get_trace_info());
           delete k->entry();
           delete k;
@@ -216,6 +252,7 @@ int main(int argc, const char **argv) {
         }
       }
       assert(k);
+      m_gpgpu_sim->set_cta_sampling_weight(finished_kernel_cta_weight);
       m_gpgpu_sim->print_stats();
     }
 
@@ -250,8 +287,33 @@ trace_kernel_info_t *create_kernel_info( kernel_trace_t* kernel_trace_info,
   gpgpu_ptx_sim_info info;
   info.smem = kernel_trace_info->shmem;
   info.regs = kernel_trace_info->nregs;
-  dim3 gridDim(kernel_trace_info->grid_dim_x, kernel_trace_info->grid_dim_y, kernel_trace_info->grid_dim_z);
   dim3 blockDim(kernel_trace_info->tb_dim_x, kernel_trace_info->tb_dim_y, kernel_trace_info->tb_dim_z);
+
+  unsigned gx = kernel_trace_info->grid_dim_x;
+  unsigned gy = kernel_trace_info->grid_dim_y;
+  unsigned gz = kernel_trace_info->grid_dim_z;
+  unsigned total_ctas = gx * gy * gz;
+
+  dim3 gridDim(gx, gy, gz);
+
+  if (config->get_cta_sampling_mode() == 1 && total_ctas > 1) {
+    auto sampled = compute_sampled_ctas(gx, gy, gz);
+    unsigned k = (unsigned)sampled.size();
+    kernel_trace_info->sampled_ctas = sampled;
+    kernel_trace_info->sampled_cta_idx = 0;
+    kernel_trace_info->cta_sampling_weight = (float)total_ctas / (float)k;
+    // set first representative as the starting trace position
+    kernel_trace_info->next_tb_to_parse_x = std::get<0>(sampled[0]);
+    kernel_trace_info->next_tb_to_parse_y = std::get<1>(sampled[0]);
+    kernel_trace_info->next_tb_to_parse_z = std::get<2>(sampled[0]);
+    // tell the simulator the kernel has only K CTAs so dispatch terminates after K
+    gridDim = dim3(k, 1, 1);
+    std::cout << "CTA sampling: kernel " << kernel_trace_info->kernel_name
+              << " grid=(" << gx << "," << gy << "," << gz << ") total=" << total_ctas
+              << " sampled=" << k << " weight=" << kernel_trace_info->cta_sampling_weight
+              << "\n";
+  }
+
   trace_function_info *function_info =
       new trace_function_info(info, m_gpgpu_context);
   function_info->set_name(kernel_trace_info->kernel_name.c_str());

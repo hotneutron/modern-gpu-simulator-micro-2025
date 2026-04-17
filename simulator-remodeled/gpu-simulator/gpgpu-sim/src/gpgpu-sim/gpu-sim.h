@@ -784,6 +784,7 @@ class gpgpu_sim : public gpgpu_t {
   void update_stats();
   void deadlock_check();
   void inc_completed_cta() { gpu_completed_cta++; }
+  void set_cta_sampling_weight(float w) { m_cta_sampling_weight = w; }
   void get_pdom_stack_top_info(unsigned sid, unsigned tid, unsigned *pc,
                                unsigned *rpc);
 
@@ -903,6 +904,7 @@ class gpgpu_sim : public gpgpu_t {
   unsigned long long m_total_cta_launched;
   unsigned long long gpu_tot_issued_cta;
   unsigned gpu_completed_cta;
+  float m_cta_sampling_weight; // 1.0 normally; >1.0 when CTA sampling is active
 
   unsigned m_last_cluster_issue;
   float *average_pipeline_duty_cycle;

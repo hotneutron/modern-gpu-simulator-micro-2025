@@ -31,6 +31,7 @@
 #include <stdlib.h>
 #include <string>
 #include <vector>
+#include <tuple>
 #include <memory>
 #include <zlib.h> // MOD. Improved tracer
 #include "../gpgpu-sim/src/constants.h" // MOD. Do not duplicate somo constants declarations
@@ -143,6 +144,11 @@ struct kernel_trace_t {
   unsigned long long local_base_addr;
   unsigned int func_unique_id;
   bool is_cap_from_binary;
+
+  // CTA sampling: when non-empty, simulation uses only these representative CTAs
+  std::vector<std::tuple<unsigned, unsigned, unsigned>> sampled_ctas;
+  unsigned sampled_cta_idx;
+  float cta_sampling_weight; // = total_ctas / sampled_ctas.size()
 };
 
 class trace_parser {

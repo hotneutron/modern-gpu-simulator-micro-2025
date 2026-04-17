@@ -157,6 +157,7 @@ class trace_config {
   char *get_traces_filename() { return g_traces_filename; }
 
   bool get_is_extra_traces_enabled(){ return is_extra_traces_enabled; } // MOD. Improved tracer
+  int get_cta_sampling_mode() const { return cta_sampling_mode; }
 
   unsigned int get_int_latency() const { return int_latency; }
   unsigned int get_fp_latency() const { return fp_latency; }
@@ -215,6 +216,7 @@ class trace_config {
   char *trace_opcode_latency_initiation_specialized_op[SPECIALIZED_UNIT_NUM];
 
   bool is_extra_traces_enabled; // MOD. Improved tracer
+  int cta_sampling_mode; // 0=disabled, 1=coordinate-heuristic
 
 };
 

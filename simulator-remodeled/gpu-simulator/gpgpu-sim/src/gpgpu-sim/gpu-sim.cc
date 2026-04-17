@@ -1699,6 +1699,7 @@ gpgpu_sim::gpgpu_sim(const gpgpu_sim_config &config, gpgpu_context *ctx)
   gpu_tot_issued_cta = 0;
   gpu_completed_cta = 0;
   m_total_cta_launched = 0;
+  m_cta_sampling_weight = 1.0f;
   gpu_deadlock = false;
 
   gpu_stall_dramfull = 0;
@@ -2040,9 +2041,12 @@ void gpgpu_sim::init() {
 
 void gpgpu_sim::update_stats() {
   m_memory_stats->memlatstat_lat_pw();
-  gpu_tot_sim_cycle += gpu_sim_cycle;
-  gpu_tot_sim_insn += gpu_sim_insn;
-  gpu_tot_issued_cta += m_total_cta_launched;
+  // When CTA sampling is active, scale cycle/insn counts to reflect the full
+  // kernel (all CTAs) rather than just the sampled subset. Linear scaling is
+  // an approximation; accuracy improves when sampled CTAs >= num_SMs.
+  gpu_tot_sim_cycle += (unsigned long long)(gpu_sim_cycle * m_cta_sampling_weight);
+  gpu_tot_sim_insn += (unsigned long long)(gpu_sim_insn * m_cta_sampling_weight);
+  gpu_tot_issued_cta += (unsigned long long)(m_total_cta_launched * m_cta_sampling_weight);
   partiton_reqs_in_parallel_total += partiton_reqs_in_parallel;
   partiton_replys_in_parallel_total += partiton_replys_in_parallel;
   partiton_reqs_in_parallel_util_total += partiton_reqs_in_parallel_util;
@@ -2058,6 +2062,7 @@ void gpgpu_sim::update_stats() {
   gpu_sim_insn = 0;
   m_total_cta_launched = 0;
   gpu_completed_cta = 0;
+  m_cta_sampling_weight = 1.0f;
   gpu_occupancy = occupancy_stats();
 }
 

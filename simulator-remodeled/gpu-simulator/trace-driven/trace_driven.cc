@@ -91,8 +91,18 @@
 
 
 void advance_trace_cta_id(kernel_trace_t *kernel_trace_info) {
+  if (!kernel_trace_info->sampled_ctas.empty()) {
+    kernel_trace_info->sampled_cta_idx++;
+    if (kernel_trace_info->sampled_cta_idx < kernel_trace_info->sampled_ctas.size()) {
+      auto &cta = kernel_trace_info->sampled_ctas[kernel_trace_info->sampled_cta_idx];
+      kernel_trace_info->next_tb_to_parse_x = std::get<0>(cta);
+      kernel_trace_info->next_tb_to_parse_y = std::get<1>(cta);
+      kernel_trace_info->next_tb_to_parse_z = std::get<2>(cta);
+    }
+    return;
+  }
   if(kernel_trace_info->next_tb_to_parse_x < (kernel_trace_info->grid_dim_x - 1)){
-    kernel_trace_info->next_tb_to_parse_x++; 
+    kernel_trace_info->next_tb_to_parse_x++;
   }else if(kernel_trace_info->next_tb_to_parse_y < (kernel_trace_info->grid_dim_y - 1)){
     kernel_trace_info->next_tb_to_parse_x = 0;
     kernel_trace_info->next_tb_to_parse_y++;
@@ -561,7 +571,7 @@ bool trace_warp_inst_t::parse_from_trace_struct(
   return true;
 }
 
-trace_config::trace_config() {}
+trace_config::trace_config() { cta_sampling_mode = 0; }
 
 void trace_config::reg_options(option_parser_t opp) {
   option_parser_register(opp, "-trace", OPT_CSTR, &g_traces_filename,
@@ -643,6 +653,12 @@ void trace_config::reg_options(option_parser_t opp) {
                          "is_extra_traces_enabled (default = disabled)",
                          "0");
   // MOD. End. Improved tracer.
+
+  option_parser_register(opp, "-cta_sampling_mode", OPT_INT32,
+                         &cta_sampling_mode,
+                         "CTA sampling mode: 0=disabled, 1=coordinate-heuristic "
+                         "(samples boundary+interior CTAs, scales stats by total/sampled)",
+                         "0");
 }
 
 void trace_config::parse_config() {
