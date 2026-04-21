@@ -2041,10 +2041,7 @@ void gpgpu_sim::init() {
 
 void gpgpu_sim::update_stats() {
   m_memory_stats->memlatstat_lat_pw();
-  // When CTA sampling is active, scale cycle/insn counts to reflect the full
-  // kernel (all CTAs) rather than just the sampled subset. Linear scaling is
-  // an approximation; accuracy improves when sampled CTAs >= num_SMs.
-  gpu_tot_sim_cycle += (unsigned long long)(gpu_sim_cycle * m_cta_sampling_weight);
+  gpu_tot_sim_cycle += gpu_sim_cycle;
   gpu_tot_sim_insn += (unsigned long long)(gpu_sim_insn * m_cta_sampling_weight);
   gpu_tot_issued_cta += (unsigned long long)(m_total_cta_launched * m_cta_sampling_weight);
   partiton_reqs_in_parallel_total += partiton_reqs_in_parallel;
@@ -2273,11 +2270,11 @@ void gpgpu_sim::gpu_print_stat() {
   m_gpu_per_sm_stats.m_stats_map["gpu_sim_insn"]->print(statfout);
   printf("gpu_ipc = %12.4f\n", (float)gpu_sim_insn / gpu_sim_cycle);
   printf("gpu_tot_sim_cycle = %lld\n", gpu_tot_sim_cycle + gpu_sim_cycle);
-  printf("gpu_tot_sim_insn = %lld\n", gpu_tot_sim_insn + gpu_sim_insn);
+  printf("gpu_tot_sim_insn = %lld\n", gpu_tot_sim_insn + (unsigned long long)(gpu_sim_insn * m_cta_sampling_weight));
   printf("gpu_tot_ipc = %12.4f\n", (float)(gpu_tot_sim_insn + gpu_sim_insn) /
                                        (gpu_tot_sim_cycle + gpu_sim_cycle));
   printf("gpu_tot_issued_cta = %lld\n",
-         gpu_tot_issued_cta + m_total_cta_launched);
+         gpu_tot_issued_cta + (unsigned long long)(m_total_cta_launched * m_cta_sampling_weight));
   printf("gpu_occupancy = %.4f%% \n", gpu_occupancy.get_occ_fraction() * 100);
   printf("gpu_tot_occupancy = %.4f%% \n",
          (gpu_occupancy + gpu_tot_occupancy).get_occ_fraction() * 100);
