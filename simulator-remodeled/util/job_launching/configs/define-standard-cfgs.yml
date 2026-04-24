@@ -11,6 +11,12 @@ RTX5070_TI:
 RTX3080_TI:
     base_file: "$GPGPUSIM_ROOT/configs/tested-cfgs/SM86_RTX3080_TI/gpgpusim.config"
 
+H100_80GB:
+    base_file: "$GPGPUSIM_ROOT/configs/tested-cfgs/SM90_H100_L2_50MB_80GB/gpgpusim.config"
+
+H100_94GB:
+    base_file: "$GPGPUSIM_ROOT/configs/tested-cfgs/SM90_H100_L2_50MB_94GB/gpgpusim.config"
+
 RTX3080:
     base_file: "$GPGPUSIM_ROOT/configs/tested-cfgs/SM86_RTX3080/gpgpusim.config"
 
