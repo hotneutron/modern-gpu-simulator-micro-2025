@@ -751,7 +751,19 @@ void ldst_unit_sm::reset_is_this_l1d_bank_allocated_this_cycle() {
 }
 
 void ldst_unit_sm::solve_next_missed_access(cache_t *cache, bool is_constant) {
-  if(cache->access_ready()) {
+  // Ensure this function is only called for the SM's L1 caches
+  assert(cache == (cache_t*)m_L1D || cache == (cache_t*)m_L1C || cache == (cache_t*)m_L1T);
+
+  unsigned int count = 0;
+  unsigned int limit = 1; // Default to 1 for L1T and L1C
+
+  // If this is the L1 Data Cache, use the higher bandwidth limit
+  if (cache == (cache_t*)m_L1D) {
+    limit = m_config->memory_l1d_max_lookups_per_cycle_per_bank * 
+            m_config->m_L1D_config.l1_banks;
+  }
+
+  while(cache->access_ready() && count < limit) {
     mem_fetch *mf = cache->next_access();
     warp_inst_t &inst = mf->get_inst();
     if(is_constant) {
@@ -759,6 +771,7 @@ void ldst_unit_sm::solve_next_missed_access(cache_t *cache, bool is_constant) {
     }
     pending_access_logic(mf->get_access().get_access_coal_info().m_prts_requesting);
     delete mf;
+    count++;
   }
 }
 

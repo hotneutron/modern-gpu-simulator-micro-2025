@@ -891,3 +891,31 @@ lonestargpu-2.0:
               accel-sim-mem: 15G
               qos: big
               openmp-cpus: 6
+microbench:
+    exec_dir: "$GPUAPPS_ROOT/src/cuda/microbench"
+    data_dirs: ""
+    execs:
+        - tensorcore_test:
+            - args: "256 512 1024"
+            - args: "128 128 128"
+            - args: "1024 512 256"
+microbench_large:
+    exec_dir: "$GPUAPPS_ROOT/src/cuda/microbench"
+    data_dirs: ""
+    execs:
+        - tensorcore_test:
+            - args: "16 16 16"
+            - args: "16 32 64"
+            - args: "32 32 32"
+            - args: "32 64 128"
+            - args: "64 32 16"
+            - args: "64 64 64"
+            - args: "64 128 256"
+            - args: "128 64 32"
+            - args: "128 128 128"
+            - args: "256 128 64"
+            - args: "256 256 256"
+            - args: "256 512 1024"
+            - args: "512 512 512"
+            - args: "1024 512 256"
+            - args: "1024 1024 1024"
