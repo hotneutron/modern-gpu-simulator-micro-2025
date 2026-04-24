@@ -226,8 +226,12 @@ void inst_trace_t::parse_memref(unsigned int idx, unsigned int mem_width, const 
     unsigned int last_addr_parsed = 0;
     for (int s = 0; s < WARP_SIZE; s++) {
       if (mask_bits.test(s)) {
-        memadd_info[idx]->addrs[s] = addr_info.addrs(last_addr_parsed);
-        last_addr_parsed++;
+        if (last_addr_parsed < addr_info.addrs_size()) {
+          memadd_info[idx]->addrs[s] = addr_info.addrs(last_addr_parsed);
+          last_addr_parsed++;
+        } else {
+          memadd_info[idx]->addrs[s] = (last_addr_parsed > 0) ? addr_info.addrs(last_addr_parsed - 1) : 0;
+        }
       }else {
         memadd_info[idx]->addrs[s] = 0;
       }

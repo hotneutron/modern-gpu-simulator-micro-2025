@@ -1,5 +1,10 @@
 # Basefile Configs
 
+H100_80GB:
+    base_file: "$GPGPUSIM_ROOT/configs/tested-cfgs/SM90_H100_L2_50MB_80GB/gpgpusim.config"
+
+# Basefile Configs
+
 RTX5070_TI:
     base_file: "$GPGPUSIM_ROOT/configs/tested-cfgs/SM120_RTX5070_TI/gpgpusim.config"
 

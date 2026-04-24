@@ -218,17 +218,17 @@ for idx, app_and_args in enumerate(apps_and_args):
             count += 1
             if count >= MAX_LINES:
                 break
-            gpgpu_build_match = re.match(".*GPGPU-Sim.*\[build\s+(.*)\].*", line)
+            gpgpu_build_match = re.match(r".*GPGPU-Sim.*\[build\s+(.*)\].*", line)
             if gpgpu_build_match:
                 stat_map["all_kernels" + app_and_args + config + "GPGPU-Sim-build"] = gpgpu_build_match.group(1)
                 break
-            accelsim_build_match = re.match("Accel-Sim.*\[build\s+(.*)\].*", line)
+            accelsim_build_match = re.match(r"Accel-Sim.*\[build\s+(.*)\].*", line)
             if accelsim_build_match:
                 stat_map["all_kernels" + app_and_args + config + "Accel-Sim-build"] = accelsim_build_match.group(1)
         f.close()
 
         # Do a quick 10000-line reverse pass to make sure the simualtion thread finished
-        SIM_EXIT_STRING = "GPGPU-Sim: \*\*\* exit detected \*\*\*"
+        SIM_EXIT_STRING = r"GPGPU-Sim: \*\*\* exit detected \*\*\*"
         exit_success = False
         MAX_LINES = 10000
         BYTES_TO_READ = int(250 * 1024 * 1024)
@@ -310,14 +310,14 @@ for idx, app_and_args in enumerate(apps_and_args):
             for line in f:
                 # If we ended simulation due to too many insn - ignore the last kernel launch, as it is no complete.
                 # Note: This only appies if we are doing kernel-by-kernel stats
-                last_kernel_break = re.match("GPGPU-Sim: \*\* break due to reaching the maximum cycles \(or instructions\) \*\*", line)
+                last_kernel_break = re.match(r"GPGPU-Sim: \*\* break due to reaching the maximum cycles \(or instructions\) \*\*", line)
                 if last_kernel_break:
                     print("NOTE::::: Found Max Insn reached in {0} - ignoring last kernel.".format(outfile), file=sys.stderr)
                     for stat_name in stats_to_pull.keys():
                         if current_kernel + app_and_args + config + stat_name in stat_map:
                             del stat_map[current_kernel + app_and_args + config + stat_name]
 
-                kernel_match = re.match("kernel_name\s+=\s+(.*)", line);
+                kernel_match = re.match(r"kernel_name\s+=\s+(.*)", line);
                 if kernel_match:
                     last_kernel = current_kernel
                     current_kernel = kernel_match.group(1).strip()

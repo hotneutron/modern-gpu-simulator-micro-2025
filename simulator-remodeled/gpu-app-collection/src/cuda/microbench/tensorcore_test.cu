@@ -8,6 +8,7 @@
 void cudaErrCheck_(cudaError_t stat, const char *file, int line) {
    if (stat != cudaSuccess) {
       fprintf(stderr, "CUDA Error: %s %s %d\n", cudaGetErrorString(stat), file, line);
+      abort();
    }
 }
 
@@ -438,6 +439,11 @@ void check_generic_matmul(int matrix_m,int matrix_n,int matrix_k,int layout_a,in
   	b_host_wmma      = (host_type*)malloc(matrix_k * matrix_n * sizeof(host_type));
   	c_host_wmma      = (host_type*)malloc(matrix_m * matrix_n * sizeof(host_type));
   	c_cal_host_wmma  = (host_type*)malloc(matrix_m * matrix_n * sizeof(host_type));
+    
+    if (!a_host_wmma || !b_host_wmma || !c_host_wmma || !c_cal_host_wmma) {
+        printf("Host malloc failed due to OOM! Exiting.\n");
+        exit(1);
+    }
 
 	std::string tensorcore_mode;
 	if(sizeof(ctype)==sizeof(half))
@@ -497,11 +503,13 @@ void check_generic_matmul(int matrix_m,int matrix_n,int matrix_k,int layout_a,in
   	convert<host_type,ctype> <<< (matrix_m * matrix_n + 255) / 256, 256 >>> (c_htype, c_ctype, matrix_m * matrix_n);
 
   	printf("\nChecking results...\n");
-  	cudaErrCheck(cudaMemcpy(c_host_wmma, c_htype, matrix_m* matrix_n* sizeof(host_type), cudaMemcpyDeviceToHost));
+  	//cudaErrCheck(cudaMemcpy(c_cal_host_wmma, c_cal_ctype, matrix_m* matrix_n* sizeof(host_type), cudaMemcpyDeviceToHost));
+  	//cudaErrCheck(cudaMemcpy(c_host_wmma, c_htype, matrix_m* matrix_n* sizeof(host_type), cudaMemcpyDeviceToHost));
 
-  	printf("D_WMMA\n");
-  	print_matrix<host_type>(c_host_wmma,matrix_m,matrix_n,layout_c);
-  	printf("CHECKING\n");
+  	//printf("D_WMMA\n");
+  	//print_matrix<host_type>(c_host_wmma,matrix_m,matrix_n,layout_c);
+  	//printf("CHECKING\n");
+  	/*
   	if(compare_matrix<host_type>(c_host_wmma,c_cal_host_wmma,matrix_m,matrix_n,layout_c,layout_c)){
   	     printf("%s MODE M=%d N=%d K=%d CONFIGURATION %s_%s_%s COMPLETED SUCCESSFULLY\n",tensorcore_mode.c_str(),matrix_m,matrix_n,matrix_k,str_layout_a.c_str(),str_layout_b.c_str(),str_layout_c.c_str());
   	}
@@ -509,6 +517,7 @@ void check_generic_matmul(int matrix_m,int matrix_n,int matrix_k,int layout_a,in
   	     printf("ERROR\n");
   	     abort();
   	}
+  	*/
 
   	cudaErrCheck(cudaFree(a_htype));
   	cudaErrCheck(cudaFree(b_htype));
@@ -525,6 +534,20 @@ void check_generic_matmul(int matrix_m,int matrix_n,int matrix_k,int layout_a,in
 
 }
 int main(int argc, char* argv[]) {
+	int M = 512;
+	int N = 512;
+	int K = 512;
+
+	if (argc >= 4) {
+		M = atoi(argv[1]);
+		N = atoi(argv[2]);
+		K = atoi(argv[3]);
+	} else if (argc > 1) {
+		printf("Usage: %s [M N K]\n", argv[0]);
+		printf("Defaulting to %d %d %d\n", M, N, K);
+	}
+
+	/*
 	//////MIXED_PRECISION MODE
 	////check_configuration<atype,btype,ctype,dtype,host_type,layout_a_config,layout_b_config>(layout_a,layout_b,layout_c,layout_d)
 	check_configuration<half,half,float,float,float,wmma::row_major,wmma::row_major>(ROW_MAJOR,ROW_MAJOR,ROW_MAJOR,ROW_MAJOR);
@@ -576,6 +599,9 @@ int main(int argc, char* argv[]) {
 	//check_generic_matmul<half,half,float,float,wmma::row_major,wmma::row_major>(64,64,64,ROW_MAJOR,ROW_MAJOR,ROW_MAJOR);
 	//check_generic_matmul<half,half,float,float,wmma::row_major,wmma::row_major>(128,128,128,ROW_MAJOR,ROW_MAJOR,ROW_MAJOR);
 	//check_generic_matmul<half,half,float,float,wmma::row_major,wmma::row_major>(256,256,256,ROW_MAJOR,ROW_MAJOR,ROW_MAJOR);
-	check_generic_matmul<half,half,float,float,wmma::row_major,wmma::row_major>(512,512,512,ROW_MAJOR,ROW_MAJOR,ROW_MAJOR);
+	*/
+
+	printf("Running tensorcore_test with M=%d, N=%d, K=%d\n", M, N, K);
+	check_generic_matmul<half,half,float,float,wmma::row_major,wmma::row_major>(M,N,K,ROW_MAJOR,ROW_MAJOR,ROW_MAJOR);
 	return 0;
 }

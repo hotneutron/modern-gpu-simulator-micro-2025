@@ -186,7 +186,6 @@ static const std::unordered_map<std::string, OpcodeChar> Hopper_OpcodeMap = {
     {"UIADD3.64", OpcodeChar(OP_UIADD3_64, UNIFORM_OP)},
 
     // Warpgroup Matrix Operations (Tensor Core) - Hopper new
-    {"WGMMA", OpcodeChar(OP_HGMMA, TENSOR_CORE_OP)},
     {"BGMMA", OpcodeChar(OP_BGMMA, TENSOR_CORE_OP)},
     {"HGMMA", OpcodeChar(OP_HGMMA, TENSOR_CORE_OP)},
     {"IGMMA", OpcodeChar(OP_IGMMA, TENSOR_CORE_OP)},
