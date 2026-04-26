@@ -31,6 +31,7 @@
 #include <fstream>
 #include <iostream>
 #include <math.h>
+#include <random>
 #include <set>
 #include <sstream>
 #include <stdio.h>
@@ -136,6 +137,31 @@ static unsigned compute_initial_sim_ctas(kernel_class kc, unsigned k_reps,
   if (target > total_ctas) target = total_ctas;
   if (target < k_reps) target = k_reps;  // never below K
   return target;
+}
+
+// Stratified replication of K representative CTAs into a target-slot list.
+// Each rep gets ceil(target/K) or floor(target/K) slots; the order is then
+// deterministically Fisher-Yates shuffled (seeded) to break alignment with
+// L2-set / DRAM-bank striping that pure round-robin replication would create.
+static std::vector<std::tuple<unsigned,unsigned,unsigned>>
+expand_sampled_ctas(const std::vector<std::tuple<unsigned,unsigned,unsigned>>& reps,
+                    unsigned target_sim_ctas, unsigned seed) {
+  unsigned K = (unsigned)reps.size();
+  if (K == 0 || target_sim_ctas <= K) return reps;
+  std::vector<std::tuple<unsigned,unsigned,unsigned>> out;
+  out.reserve(target_sim_ctas);
+  unsigned per_rep = target_sim_ctas / K;
+  unsigned remainder = target_sim_ctas % K;
+  for (unsigned i = 0; i < K; ++i) {
+    unsigned count = per_rep + (i < remainder ? 1u : 0u);
+    for (unsigned c = 0; c < count; ++c) out.push_back(reps[i]);
+  }
+  std::mt19937 rng(seed);
+  for (size_t i = out.size() - 1; i > 0; --i) {
+    std::uniform_int_distribution<size_t> dist(0, i);
+    std::swap(out[i], out[dist(rng)]);
+  }
+  return out;
 }
 
 // Coordinate-based CTA heuristic: selects boundary (corners, edge-midpoints) and
@@ -413,20 +439,34 @@ trace_kernel_info_t *create_kernel_info( kernel_trace_t* kernel_trace_info,
   dim3 gridDim(gx, gy, gz);
 
   if (config->get_cta_sampling_mode() == 1 && total_ctas > 1) {
-    auto sampled = compute_sampled_ctas(gx, gy, gz);
-    unsigned k = (unsigned)sampled.size();
+    auto reps = compute_sampled_ctas(gx, gy, gz);
+    unsigned k = (unsigned)reps.size();
+    // Optional stratified-shuffle expansion to fill more SMs / approach full
+    // inter-CTA contention. Weight stays total/K (each replica represents
+    // 1/K of the original grid's stat contribution).
+    unsigned target = config->get_cta_sampling_target_ctas();
+    std::vector<std::tuple<unsigned,unsigned,unsigned>> sampled;
+    if (target > k && target <= total_ctas) {
+      sampled = expand_sampled_ctas(reps, target, config->get_cta_sampling_seed());
+    } else {
+      sampled = reps;
+    }
+    unsigned n_slots = (unsigned)sampled.size();
     kernel_trace_info->sampled_ctas = sampled;
     kernel_trace_info->sampled_cta_idx = 0;
-    kernel_trace_info->cta_sampling_weight = (float)total_ctas / (float)k;
-    // set first representative as the starting trace position
+    // Weight scales recorded per-CTA stats up to the full grid. With n_slots
+    // simulated CTAs, the simulator records n_slots * per_cta_avg work, so
+    // weight = total_ctas / n_slots gives back total_ctas * per_cta_avg.
+    kernel_trace_info->cta_sampling_weight = (float)total_ctas / (float)n_slots;
     kernel_trace_info->next_tb_to_parse_x = std::get<0>(sampled[0]);
     kernel_trace_info->next_tb_to_parse_y = std::get<1>(sampled[0]);
     kernel_trace_info->next_tb_to_parse_z = std::get<2>(sampled[0]);
-    // tell the simulator the kernel has only K CTAs so dispatch terminates after K
-    gridDim = dim3(k, 1, 1);
+    gridDim = dim3(n_slots, 1, 1);
     std::cout << "CTA sampling: kernel " << kernel_trace_info->kernel_name
               << " grid=(" << gx << "," << gy << "," << gz << ") total=" << total_ctas
-              << " sampled=" << k << " weight=" << kernel_trace_info->cta_sampling_weight
+              << " sampled=" << k
+              << (n_slots != k ? " (expanded to " + std::to_string(n_slots) + ")" : "")
+              << " weight=" << kernel_trace_info->cta_sampling_weight
               << "\n";
   }
 

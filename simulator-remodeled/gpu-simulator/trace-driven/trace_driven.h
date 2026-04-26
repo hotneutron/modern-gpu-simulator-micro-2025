@@ -163,6 +163,9 @@ class trace_config {
   double get_cta_sampling_t_high() const { return cta_sampling_t_high; }
   double get_cta_sampling_pressure_bw()    const { return cta_sampling_pressure_bw; }
   double get_cta_sampling_pressure_queue() const { return cta_sampling_pressure_queue; }
+  // 0 => no expansion (run only K reps); >K => stratified-shuffle replicate K reps to N slots.
+  unsigned get_cta_sampling_target_ctas() const { return cta_sampling_target_ctas; }
+  unsigned get_cta_sampling_seed() const { return cta_sampling_seed; }
 
   unsigned int get_int_latency() const { return int_latency; }
   unsigned int get_fp_latency() const { return fp_latency; }
@@ -229,6 +232,8 @@ class trace_config {
   double cta_sampling_t_high;         // ridge_ratio >= t_high (and pressure low) => compute
   double cta_sampling_pressure_bw;    // achieved_bw_ratio above this => high mem pressure
   double cta_sampling_pressure_queue; // dram_queue_occupancy_avg above this => high mem pressure
+  unsigned cta_sampling_target_ctas;  // 0 = no expansion; >K = replicate K reps to N slots
+  unsigned cta_sampling_seed;         // PRNG seed for stratified shuffle
 
 };
 

@@ -577,6 +577,8 @@ trace_config::trace_config() {
   cta_sampling_t_high = 1.3;
   cta_sampling_pressure_bw = 0.6;
   cta_sampling_pressure_queue = 0.5;
+  cta_sampling_target_ctas = 0;
+  cta_sampling_seed = 1;
 }
 
 void trace_config::reg_options(option_parser_t opp) {
@@ -685,6 +687,17 @@ void trace_config::reg_options(option_parser_t opp) {
                          "Roofline classifier: dram_queue_occupancy_avg above "
                          "this is treated as high memory pressure",
                          "0.5");
+  option_parser_register(opp, "-cta_sampling_target_ctas", OPT_UINT32,
+                         &cta_sampling_target_ctas,
+                         "If > K, stratified-shuffle replicate K reps to this "
+                         "many CTAs to fill more SMs and approach the contention "
+                         "the full kernel would see (single-shot; pilot loop "
+                         "drives this dynamically when active). 0 = K reps only.",
+                         "0");
+  option_parser_register(opp, "-cta_sampling_seed", OPT_UINT32,
+                         &cta_sampling_seed,
+                         "PRNG seed for the stratified shuffle of replicated reps",
+                         "1");
 }
 
 void trace_config::parse_config() {
