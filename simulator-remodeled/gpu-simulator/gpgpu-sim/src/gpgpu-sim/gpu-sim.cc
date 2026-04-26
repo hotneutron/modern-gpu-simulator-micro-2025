@@ -2063,10 +2063,20 @@ void gpgpu_sim::snapshot_pressure_signals_kernel_start() {
   }
 }
 
-void gpgpu_sim::compute_kernel_pressure_signals(pressure_signals_t& s) const {
+void gpgpu_sim::compute_kernel_pressure_signals(pressure_signals_t& s) {
   s = pressure_signals_t{};
   s.sim_cycles    = gpu_sim_cycle;
-  s.sim_insns     = gpu_sim_insn;
+  // gpu_sim_insn is the cached projection of the per-SM aggregate; it is only
+  // refreshed inside print_stats(). For pilot iterations we may compute
+  // pressure signals BEFORE print_stats runs (or skip print_stats entirely on
+  // rejected iters), so gather it here from the per-SM stats.
+  gather_gpu_per_sm_single_stat("gpu_sim_insn");
+  auto it = m_gpu_per_sm_stats.m_stats_map.find("gpu_sim_insn");
+  if (it != m_gpu_per_sm_stats.m_stats_map.end() && it->second) {
+    s.sim_insns = it->second->get_value();
+  } else {
+    s.sim_insns = gpu_sim_insn;
+  }
   s.ctas_launched = m_total_cta_launched;
 
   // Sum DRAM cumulative counters; subtract launch snapshot to get per-kernel deltas.
@@ -2133,6 +2143,26 @@ void gpgpu_sim::compute_kernel_pressure_signals(pressure_signals_t& s) const {
   s.ridge_ratio = (s.ridge_point_flop_per_byte > 0.0)
       ? s.kernel_ai / s.ridge_point_flop_per_byte
       : 0.0;
+}
+
+void gpgpu_sim::pilot_snapshot(pilot_stats_snapshot_t& s) const {
+  s.gpu_tot_sim_cycle                  = gpu_tot_sim_cycle;
+  s.gpu_tot_sim_insn                   = gpu_tot_sim_insn;
+  s.gpu_tot_issued_cta                 = gpu_tot_issued_cta;
+  s.partiton_reqs_in_parallel_total    = partiton_reqs_in_parallel_total;
+  s.partiton_replys_in_parallel_total  = partiton_replys_in_parallel_total;
+  s.partiton_reqs_in_parallel_util_total = partiton_reqs_in_parallel_util_total;
+  s.gpu_tot_sim_cycle_parition_util    = gpu_tot_sim_cycle_parition_util;
+}
+
+void gpgpu_sim::pilot_restore(const pilot_stats_snapshot_t& s) {
+  gpu_tot_sim_cycle                    = s.gpu_tot_sim_cycle;
+  gpu_tot_sim_insn                     = s.gpu_tot_sim_insn;
+  gpu_tot_issued_cta                   = s.gpu_tot_issued_cta;
+  partiton_reqs_in_parallel_total      = s.partiton_reqs_in_parallel_total;
+  partiton_replys_in_parallel_total    = s.partiton_replys_in_parallel_total;
+  partiton_reqs_in_parallel_util_total = s.partiton_reqs_in_parallel_util_total;
+  gpu_tot_sim_cycle_parition_util      = s.gpu_tot_sim_cycle_parition_util;
 }
 
 void gpgpu_sim::update_stats() {

@@ -30,6 +30,7 @@
 #include <cmath>
 #include <fstream>
 #include <iostream>
+#include <map>
 #include <math.h>
 #include <random>
 #include <set>
@@ -139,6 +140,61 @@ static unsigned compute_initial_sim_ctas(kernel_class kc, unsigned k_reps,
   return target;
 }
 
+// Per-kernel state carried across iterations of the adaptive pilot loop.
+struct pilot_state_t {
+  unsigned iter;            // 0 = K-rep run; 1+ = expansion / doubling iters
+  unsigned target_sim_ctas; // current iter's target
+  unsigned k_reps;          // K (constant per-kernel)
+  unsigned total_ctas;      // grid total (constant per-kernel)
+  pilot_stats_snapshot_t snapshot;  // gpu_tot_* before this iter's contribution
+  pressure_signals_t prev_signals;  // for stability check
+  bool prev_signals_valid;
+};
+
+// Mutate kernel_trace_info's sampling fields for the next pilot iteration.
+// target == 0 leaves sampling off (mode 0); target == K uses the K-rep list;
+// target > K stratified-shuffle replicates.
+static void update_sampling_on_trace_info(kernel_trace_t* ti, unsigned target, unsigned seed);
+
+// Decide whether to accept this iteration's run.
+//   iter 0 (K-rep): accept only if classifier says COMPUTE (no expansion needed).
+//   iter > 0: accept on stop_bw_target reached, or stable deltas, or hit the
+//   doublings cap, or sim_ctas == total_ctas.
+static bool pilot_decide_accept(const pilot_state_t& pst, const pressure_signals_t& ps,
+                                kernel_class kc, const trace_config& tc) {
+  if (pst.iter == 0) return kc == KCLASS_COMPUTE;
+  if (pst.target_sim_ctas >= pst.total_ctas) return true;
+  if (pst.iter > tc.get_cta_sampling_pilot_max_doublings()) return true;
+  if (ps.achieved_bw_ratio >= tc.get_cta_sampling_pilot_stop_bw_target()) return true;
+  if (pst.prev_signals_valid) {
+    double tol = tc.get_cta_sampling_pilot_stop_delta();
+    double bw_delta = std::fabs(ps.achieved_bw_ratio -
+                                pst.prev_signals.achieved_bw_ratio);
+    double ipc_prev = pst.prev_signals.sim_cycles
+        ? (double)pst.prev_signals.sim_insns / (double)pst.prev_signals.sim_cycles : 0.0;
+    double ipc_curr = ps.sim_cycles
+        ? (double)ps.sim_insns / (double)ps.sim_cycles : 0.0;
+    double ipc_delta = (ipc_prev > 0.0)
+        ? std::fabs(ipc_curr - ipc_prev) / ipc_prev : 0.0;
+    if (bw_delta < tol && ipc_delta < tol) return true;
+  }
+  return false;
+}
+
+// Choose sim_ctas for the next iteration. iter 0 -> classifier-driven initial
+// target; subsequent iters double the previous target.
+static unsigned pilot_next_target(const pilot_state_t& pst,
+                                  const pressure_signals_t& ps, kernel_class kc,
+                                  unsigned total_sms) {
+  if (pst.iter == 0) {
+    unsigned n_sat = compute_n_sat_est(ps, pst.k_reps);
+    return compute_initial_sim_ctas(kc, pst.k_reps, pst.total_ctas, total_sms, n_sat);
+  }
+  unsigned next = pst.target_sim_ctas * 2u;
+  if (next > pst.total_ctas) next = pst.total_ctas;
+  return next;
+}
+
 // Stratified replication of K representative CTAs into a target-slot list.
 // Each rep gets ceil(target/K) or floor(target/K) slots; the order is then
 // deterministically Fisher-Yates shuffled (seeded) to break alignment with
@@ -197,6 +253,29 @@ compute_sampled_ctas(unsigned gx, unsigned gy, unsigned gz) {
 }
 
 
+// Implementation: rebuild sampled_ctas for a target sim_ctas count.
+static void update_sampling_on_trace_info(kernel_trace_t* ti, unsigned target,
+                                          unsigned seed) {
+  unsigned gx = ti->grid_dim_x, gy = ti->grid_dim_y, gz = ti->grid_dim_z;
+  unsigned total_ctas = gx * gy * gz;
+  if (total_ctas <= 1) return;
+  auto reps = compute_sampled_ctas(gx, gy, gz);
+  unsigned k = (unsigned)reps.size();
+  std::vector<std::tuple<unsigned,unsigned,unsigned>> sampled;
+  if (target > k && target <= total_ctas) {
+    sampled = expand_sampled_ctas(reps, target, seed);
+  } else {
+    sampled = reps;
+  }
+  unsigned n_slots = (unsigned)sampled.size();
+  ti->sampled_ctas = sampled;
+  ti->sampled_cta_idx = 0;
+  ti->cta_sampling_weight = (float)total_ctas / (float)n_slots;
+  ti->next_tb_to_parse_x = std::get<0>(sampled[0]);
+  ti->next_tb_to_parse_y = std::get<1>(sampled[0]);
+  ti->next_tb_to_parse_z = std::get<2>(sampled[0]);
+}
+
 void handler(int sig) {
   void *array[50];
   size_t size;
@@ -252,6 +331,19 @@ int main(int argc, const char **argv) {
   bool is_cta_max_hit = false;
   bool can_continue_simulation = true;
 
+  // Adaptive pilot loop state: keyed by kernel_trace_t* (stable across pilot
+  // iterations of the same kernel; the trace_t is only freed on accept).
+  std::map<kernel_trace_t*, pilot_state_t> pilot_states;
+  bool pilot_loop_enabled = (tconfig.get_cta_sampling_mode() == 1) &&
+                            (tconfig.get_cta_sampling_pilot_max_doublings() > 0);
+  if (pilot_loop_enabled && window_size != 1) {
+    fprintf(stderr,
+            "CTA sampling: pilot loop disabled because window_size=%u (>1); "
+            "concurrent kernels are not supported by the pilot loop.\n",
+            window_size);
+    pilot_loop_enabled = false;
+  }
+
   unsigned i = 0;
   signal(SIGSEGV, handler);
   signal(SIGILL, handler);
@@ -278,6 +370,17 @@ int main(int argc, const char **argv) {
         kernel_trace_t* kernel_trace_info = tracer.parse_kernel_info(commandlist[i].command_string, m_gpgpu_sim->get_extra_trace_info());
         kernel_info = create_kernel_info(kernel_trace_info, m_gpgpu_context, &tconfig, &tracer);
         kernels_info.push_back(kernel_info);
+        if (pilot_loop_enabled) {
+          // Initialize pilot state for this kernel. Iter 0 = K-rep run.
+          pilot_state_t& pst = pilot_states[kernel_trace_info];
+          pst.iter = 0;
+          pst.k_reps = (unsigned)kernel_trace_info->sampled_ctas.size();
+          pst.total_ctas = kernel_trace_info->grid_dim_x
+                         * kernel_trace_info->grid_dim_y
+                         * kernel_trace_info->grid_dim_z;
+          pst.target_sim_ctas = pst.k_reps;
+          pst.prev_signals_valid = false;
+        }
         std::cout << "Header info loaded for kernel command : " << commandlist[i].command_string << std::endl;
         i++;
       }
@@ -296,6 +399,13 @@ int main(int argc, const char **argv) {
       }
       if (!stream_busy && m_gpgpu_sim->can_start_kernel() && !k->was_launched()) {
         std::cout << "launching kernel name: " << k->get_name() << " uid: " << k->get_uid() << std::endl;
+        // Capture gpu_tot_* baseline before this iteration's contribution so a
+        // rejected pilot iteration can be rolled back. snapshot_pressure_signals
+        // (DRAM/L2 baseline for delta-extraction) is taken inside launch().
+        if (pilot_loop_enabled) {
+          auto it = pilot_states.find(k->get_trace_info());
+          if (it != pilot_states.end()) m_gpgpu_sim->pilot_snapshot(it->second.snapshot);
+        }
         m_gpgpu_sim->launch(k);
         k->set_launched();
         busy_streams.push_back(k->get_cuda_stream_id());
@@ -327,51 +437,38 @@ int main(int argc, const char **argv) {
       }
     }
 
-    // cleanup finished kernel
+    // cleanup finished kernel — but capture pressure signals first so the
+    // pilot loop can re-launch this kernel before kernel_finalizer wipes the
+    // trace_info. The classification + selector logging happens for both
+    // accepted and pilot iterations so the trace is visible end-to-end.
     unsigned finished_kernel_total_ctas = 0;
     unsigned finished_kernel_k_reps = 0;
+    bool kernel_finished_this_iter = false;
+    trace_kernel_info_t* finished_k = nullptr;
+    unsigned finished_idx_in_kernels_info = 0;
     if ( (finished_kernel_uid || m_gpgpu_sim->cycle_insn_cta_max_hit()
         || !m_gpgpu_sim->active()) && !kernels_info.empty() ) {
-      trace_kernel_info_t* k = NULL;
-      float finished_kernel_cta_weight = 1.0f;
       for (unsigned j = 0; j < kernels_info.size(); j++) {
-        k = kernels_info.at(j);
+        trace_kernel_info_t* k = kernels_info.at(j);
         if (k->get_uid() == finished_kernel_uid || m_gpgpu_sim->cycle_insn_cta_max_hit()
             || !m_gpgpu_sim->active()) {
-          for (std::size_t l = 0; l < busy_streams.size(); l++) {
-            if (busy_streams.at(l) == k->get_cuda_stream_id()) {
-              busy_streams.erase(busy_streams.begin()+l);
-              break;
-            }
-          }
-          finished_kernel_cta_weight = k->get_trace_info()->cta_sampling_weight;
-          // Capture original grid info before kernel_finalizer frees trace_info.
+          finished_k = k;
+          finished_idx_in_kernels_info = j;
           finished_kernel_total_ctas = k->get_trace_info()->grid_dim_x
                                      * k->get_trace_info()->grid_dim_y
                                      * k->get_trace_info()->grid_dim_z;
           finished_kernel_k_reps = (unsigned)k->get_trace_info()->sampled_ctas.size();
-          tracer.kernel_finalizer(k->get_trace_info());
-          delete k->entry();
-          delete k;
-          kernels_info.erase(kernels_info.begin()+j);
+          kernel_finished_this_iter = true;
           if (!m_gpgpu_sim->cycle_insn_cta_max_hit() && m_gpgpu_sim->active())
             break;
         }
       }
-      assert(k);
-      m_gpgpu_sim->set_cta_sampling_weight(finished_kernel_cta_weight);
-      m_gpgpu_sim->print_stats();
     }
 
-    if (sim_cycles) {
-      // CTA sampling: capture per-kernel pressure signals before update_stats
-      // resets the per-kernel counters. Always logged so the values are
-      // available even when sampling is off (sanity check + roofline view).
+    if (sim_cycles && kernel_finished_this_iter) {
       pressure_signals_t ps;
       m_gpgpu_sim->compute_kernel_pressure_signals(ps);
       kernel_class kc = classify_kernel(ps, tconfig);
-      // K reps: when sampling is off, treat the kernel as if K = total_ctas
-      // so the selector returns total_ctas and "no expansion needed".
       unsigned k_reps = finished_kernel_k_reps
           ? finished_kernel_k_reps
           : finished_kernel_total_ctas;
@@ -379,6 +476,18 @@ int main(int argc, const char **argv) {
       unsigned n_sat_est = compute_n_sat_est(ps, k_reps);
       unsigned target_sim_ctas = compute_initial_sim_ctas(
           kc, k_reps, finished_kernel_total_ctas, total_sms, n_sat_est);
+
+      // Pilot decide
+      bool accept = true;
+      pilot_state_t* pst = nullptr;
+      if (pilot_loop_enabled) {
+        auto it = pilot_states.find(finished_k->get_trace_info());
+        if (it != pilot_states.end()) {
+          pst = &it->second;
+          accept = pilot_decide_accept(*pst, ps, kc, tconfig);
+        }
+      }
+
       printf("CTA_PRESSURE_SIGNALS:"
              " sim_cycles=%llu sim_insns=%llu ctas_launched=%llu"
              " dram_bytes=%llu dram_reqs=%llu"
@@ -388,7 +497,8 @@ int main(int argc, const char **argv) {
              " ridge_point_flop_per_byte=%.4f"
              " kernel_ai=%.4f ridge_ratio=%.4f"
              " class=%s k_reps=%u total_ctas=%u total_sms=%u"
-             " n_sat_est=%u target_sim_ctas=%u\n",
+             " n_sat_est=%u target_sim_ctas=%u"
+             " pilot_iter=%u pilot_accepted=%d\n",
              ps.sim_cycles, ps.sim_insns, ps.ctas_launched,
              ps.dram_bytes, ps.dram_reqs,
              ps.l2_accesses, ps.l2_misses, ps.l2_miss_rate,
@@ -397,8 +507,62 @@ int main(int argc, const char **argv) {
              ps.ridge_point_flop_per_byte,
              ps.kernel_ai, ps.ridge_ratio,
              kernel_class_name(kc), k_reps, finished_kernel_total_ctas, total_sms,
-             n_sat_est, target_sim_ctas);
+             n_sat_est, target_sim_ctas,
+             pst ? pst->iter : 0u, accept ? 1 : 0);
       fflush(stdout);
+
+      if (accept) {
+        // Final iteration — finalize the kernel and update gpu_tot_* normally.
+        for (std::size_t l = 0; l < busy_streams.size(); l++) {
+          if (busy_streams.at(l) == finished_k->get_cuda_stream_id()) {
+            busy_streams.erase(busy_streams.begin()+l);
+            break;
+          }
+        }
+        float weight = finished_k->get_trace_info()->cta_sampling_weight;
+        kernel_trace_t* trace_info = finished_k->get_trace_info();
+        m_gpgpu_sim->set_cta_sampling_weight(weight);
+        m_gpgpu_sim->print_stats();
+        if (pst) pilot_states.erase(trace_info);
+        tracer.kernel_finalizer(trace_info);
+        delete finished_k->entry();
+        delete finished_k;
+        kernels_info.erase(kernels_info.begin() + finished_idx_in_kernels_info);
+        m_gpgpu_sim->update_stats();
+        m_gpgpu_context->print_simulation_time();
+      } else {
+        // Pilot reject — pick next target, rebuild kernel_info from the same
+        // trace_info, replace in kernels_info, restore gpu_tot_* and reset
+        // per-kernel state so the next iteration starts clean.
+        unsigned next_target = pilot_next_target(*pst, ps, kc, total_sms);
+        pst->iter += 1;
+        pst->target_sim_ctas = next_target;
+        pst->prev_signals = ps;
+        pst->prev_signals_valid = true;
+        kernel_trace_t* trace_info = finished_k->get_trace_info();
+        update_sampling_on_trace_info(trace_info, next_target,
+                                      tconfig.get_cta_sampling_seed());
+        trace_kernel_info_t* new_k = create_kernel_info(
+            trace_info, m_gpgpu_context, &tconfig, &tracer);
+        kernels_info[finished_idx_in_kernels_info] = new_k;
+        for (std::size_t l = 0; l < busy_streams.size(); l++) {
+          if (busy_streams.at(l) == finished_k->get_cuda_stream_id()) {
+            busy_streams.erase(busy_streams.begin()+l);
+            break;
+          }
+        }
+        delete finished_k->entry();
+        delete finished_k;
+        // update_stats moves gpu_sim_* into gpu_tot_*; pilot_restore then
+        // undoes that increment so the rejected iteration has zero net effect
+        // on cross-kernel totals.
+        m_gpgpu_sim->update_stats();
+        m_gpgpu_sim->pilot_restore(pst->snapshot);
+        m_gpgpu_context->print_simulation_time();
+      }
+    } else if (sim_cycles) {
+      // No finished kernel found this iteration but we did sim cycles
+      // (e.g. cta_max_hit). Preserve original behavior: just update stats.
       m_gpgpu_sim->update_stats();
       m_gpgpu_context->print_simulation_time();
     }
@@ -439,17 +603,26 @@ trace_kernel_info_t *create_kernel_info( kernel_trace_t* kernel_trace_info,
   dim3 gridDim(gx, gy, gz);
 
   if (config->get_cta_sampling_mode() == 1 && total_ctas > 1) {
-    auto reps = compute_sampled_ctas(gx, gy, gz);
-    unsigned k = (unsigned)reps.size();
-    // Optional stratified-shuffle expansion to fill more SMs / approach full
-    // inter-CTA contention. Weight stays total/K (each replica represents
-    // 1/K of the original grid's stat contribution).
-    unsigned target = config->get_cta_sampling_target_ctas();
     std::vector<std::tuple<unsigned,unsigned,unsigned>> sampled;
-    if (target > k && target <= total_ctas) {
-      sampled = expand_sampled_ctas(reps, target, config->get_cta_sampling_seed());
+    unsigned k;
+    if (!kernel_trace_info->sampled_ctas.empty()) {
+      // Pilot loop has already populated sampled_ctas via
+      // update_sampling_on_trace_info; honor it instead of recomputing.
+      sampled = kernel_trace_info->sampled_ctas;
+      // K (the original heuristic count) is recoverable from
+      // total_ctas / cta_sampling_weight, but we only need it for logging.
+      k = kernel_trace_info->cta_sampling_weight > 0.0f
+          ? (unsigned)((float)total_ctas / kernel_trace_info->cta_sampling_weight)
+          : (unsigned)sampled.size();
     } else {
-      sampled = reps;
+      auto reps = compute_sampled_ctas(gx, gy, gz);
+      k = (unsigned)reps.size();
+      unsigned target = config->get_cta_sampling_target_ctas();
+      if (target > k && target <= total_ctas) {
+        sampled = expand_sampled_ctas(reps, target, config->get_cta_sampling_seed());
+      } else {
+        sampled = reps;
+      }
     }
     unsigned n_slots = (unsigned)sampled.size();
     kernel_trace_info->sampled_ctas = sampled;

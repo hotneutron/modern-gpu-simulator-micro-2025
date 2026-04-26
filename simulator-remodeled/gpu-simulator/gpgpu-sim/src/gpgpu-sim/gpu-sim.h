@@ -785,6 +785,19 @@ struct pressure_snapshot_t {
   unsigned long long l2_misses;
 };
 
+// gpu_tot_* snapshot used to roll back a pilot iteration so its contribution
+// does not pollute the accumulated cross-kernel totals when the iteration is
+// rejected by the adaptive sim_ctas loop.
+struct pilot_stats_snapshot_t {
+  unsigned long long gpu_tot_sim_cycle;
+  unsigned long long gpu_tot_sim_insn;
+  unsigned long long gpu_tot_issued_cta;
+  unsigned long long partiton_reqs_in_parallel_total;
+  unsigned long long partiton_replys_in_parallel_total;
+  unsigned long long partiton_reqs_in_parallel_util_total;
+  unsigned long long gpu_tot_sim_cycle_parition_util;
+};
+
 class gpgpu_sim : public gpgpu_t {
  public:
   gpgpu_sim(const gpgpu_sim_config &config, gpgpu_context *ctx);
@@ -828,7 +841,12 @@ class gpgpu_sim : public gpgpu_t {
   // compute_kernel_pressure_signals can return per-kernel deltas. Call from
   // launch() (or just before the per-kernel cycle loop).
   void snapshot_pressure_signals_kernel_start();
-  void compute_kernel_pressure_signals(pressure_signals_t& out) const;
+  // Non-const because it gathers per-SM stats before reading them.
+  void compute_kernel_pressure_signals(pressure_signals_t& out);
+  // Pilot-iteration support: snapshot/restore gpu_tot_* across rejected pilot
+  // iterations of the adaptive sim_ctas loop.
+  void pilot_snapshot(pilot_stats_snapshot_t& out) const;
+  void pilot_restore(const pilot_stats_snapshot_t& in);
   void get_pdom_stack_top_info(unsigned sid, unsigned tid, unsigned *pc,
                                unsigned *rpc);
 

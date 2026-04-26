@@ -166,6 +166,12 @@ class trace_config {
   // 0 => no expansion (run only K reps); >K => stratified-shuffle replicate K reps to N slots.
   unsigned get_cta_sampling_target_ctas() const { return cta_sampling_target_ctas; }
   unsigned get_cta_sampling_seed() const { return cta_sampling_seed; }
+  // Adaptive pilot loop. 0 => disabled (single-shot); >0 => after the K-rep run,
+  // expand to the classifier's target then re-run, doubling sim_ctas up to
+  // pilot_max_doublings times until pressure stabilizes or sim_ctas == total.
+  unsigned get_cta_sampling_pilot_max_doublings() const { return cta_sampling_pilot_max_doublings; }
+  double get_cta_sampling_pilot_stop_bw_target() const { return cta_sampling_pilot_stop_bw_target; }
+  double get_cta_sampling_pilot_stop_delta() const { return cta_sampling_pilot_stop_delta; }
 
   unsigned int get_int_latency() const { return int_latency; }
   unsigned int get_fp_latency() const { return fp_latency; }
@@ -234,6 +240,9 @@ class trace_config {
   double cta_sampling_pressure_queue; // dram_queue_occupancy_avg above this => high mem pressure
   unsigned cta_sampling_target_ctas;  // 0 = no expansion; >K = replicate K reps to N slots
   unsigned cta_sampling_seed;         // PRNG seed for stratified shuffle
+  unsigned cta_sampling_pilot_max_doublings;
+  double   cta_sampling_pilot_stop_bw_target; // accept once achieved_bw_ratio >= this
+  double   cta_sampling_pilot_stop_delta;     // and pressure deltas vs. previous iter < this
 
 };
 

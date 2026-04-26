@@ -579,6 +579,9 @@ trace_config::trace_config() {
   cta_sampling_pressure_queue = 0.5;
   cta_sampling_target_ctas = 0;
   cta_sampling_seed = 1;
+  cta_sampling_pilot_max_doublings = 0;
+  cta_sampling_pilot_stop_bw_target = 0.8;
+  cta_sampling_pilot_stop_delta = 0.05;
 }
 
 void trace_config::reg_options(option_parser_t opp) {
@@ -698,6 +701,22 @@ void trace_config::reg_options(option_parser_t opp) {
                          &cta_sampling_seed,
                          "PRNG seed for the stratified shuffle of replicated reps",
                          "1");
+  option_parser_register(opp, "-cta_sampling_pilot_max_doublings", OPT_UINT32,
+                         &cta_sampling_pilot_max_doublings,
+                         "Adaptive pilot loop: after the K-rep run, expand to "
+                         "the classifier's target then re-run; double sim_ctas "
+                         "up to N times until pressure stabilizes. 0 = disabled.",
+                         "0");
+  option_parser_register(opp, "-cta_sampling_pilot_stop_bw_target", OPT_DOUBLE,
+                         &cta_sampling_pilot_stop_bw_target,
+                         "Pilot loop accept condition: achieved_bw_ratio at or "
+                         "above this is considered DRAM-saturated",
+                         "0.8");
+  option_parser_register(opp, "-cta_sampling_pilot_stop_delta", OPT_DOUBLE,
+                         &cta_sampling_pilot_stop_delta,
+                         "Pilot loop accept condition: relative change in IPC "
+                         "and achieved_bw_ratio vs. previous iteration below this",
+                         "0.05");
 }
 
 void trace_config::parse_config() {
