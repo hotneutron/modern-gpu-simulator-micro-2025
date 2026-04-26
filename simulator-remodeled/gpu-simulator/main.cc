@@ -257,6 +257,27 @@ int main(int argc, const char **argv) {
     }
 
     if (sim_cycles) {
+      // CTA sampling: capture per-kernel pressure signals before update_stats
+      // resets the per-kernel counters. Always logged so the values are
+      // available even when sampling is off (sanity check + roofline view).
+      pressure_signals_t ps;
+      m_gpgpu_sim->compute_kernel_pressure_signals(ps);
+      printf("CTA_PRESSURE_SIGNALS:"
+             " sim_cycles=%llu sim_insns=%llu ctas_launched=%llu"
+             " dram_bytes=%llu dram_reqs=%llu"
+             " l2_accesses=%llu l2_misses=%llu l2_miss_rate=%.4f"
+             " dram_queue_occupancy_avg=%.4f achieved_bw_ratio=%.4f"
+             " peak_dram_bw_bytes_per_cycle=%.2f peak_flops_per_cycle=%.2f"
+             " ridge_point_flop_per_byte=%.4f"
+             " kernel_ai=%.4f ridge_ratio=%.4f\n",
+             ps.sim_cycles, ps.sim_insns, ps.ctas_launched,
+             ps.dram_bytes, ps.dram_reqs,
+             ps.l2_accesses, ps.l2_misses, ps.l2_miss_rate,
+             ps.dram_queue_occupancy_avg, ps.achieved_bw_ratio,
+             ps.peak_dram_bw_bytes_per_cycle, ps.peak_flops_per_cycle,
+             ps.ridge_point_flop_per_byte,
+             ps.kernel_ai, ps.ridge_ratio);
+      fflush(stdout);
       m_gpgpu_sim->update_stats();
       m_gpgpu_context->print_simulation_time();
     }

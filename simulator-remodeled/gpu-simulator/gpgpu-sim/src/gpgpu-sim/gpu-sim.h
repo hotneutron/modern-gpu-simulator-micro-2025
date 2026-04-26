@@ -747,6 +747,44 @@ struct grid_barrier_status {
   std::set<unsigned int> sm_ids_to_notify;
 };
 
+// Per-kernel pressure signals for the CTA-sampling roofline classifier and
+// adaptive sim_ctas loop. Filled by gpgpu_sim::compute_kernel_pressure_signals
+// after a kernel completes; values reflect deltas since the kernel's launch
+// snapshot. kernel_ai uses gpu_sim_insn as an ALU/FLOP proxy and so
+// over-estimates for memory-heavy kernels.
+struct pressure_signals_t {
+  // raw per-kernel deltas
+  unsigned long long sim_cycles;
+  unsigned long long sim_insns;
+  unsigned long long ctas_launched;
+  unsigned long long dram_bytes;
+  unsigned long long dram_reqs;
+  unsigned long long l2_accesses;
+  unsigned long long l2_misses;
+  double dram_queue_occupancy_avg;
+
+  // hardware priors (constant per GPU)
+  double peak_dram_bw_bytes_per_cycle;
+  double peak_flops_per_cycle;
+  double ridge_point_flop_per_byte;
+
+  // derived
+  double achieved_bw_ratio;
+  double l2_miss_rate;
+  double kernel_ai;
+  double ridge_ratio;
+};
+
+// Cumulative-counter snapshot taken at kernel launch so per-kernel deltas can
+// be computed even though dram_t and L2 counters accumulate across kernels.
+struct pressure_snapshot_t {
+  unsigned long long bwutil_sum;
+  unsigned long long n_req_sum;
+  unsigned long long ave_mrqs_sum;
+  unsigned long long l2_accesses;
+  unsigned long long l2_misses;
+};
+
 class gpgpu_sim : public gpgpu_t {
  public:
   gpgpu_sim(const gpgpu_sim_config &config, gpgpu_context *ctx);
@@ -785,6 +823,12 @@ class gpgpu_sim : public gpgpu_t {
   void deadlock_check();
   void inc_completed_cta() { gpu_completed_cta++; }
   void set_cta_sampling_weight(float w) { m_cta_sampling_weight = w; }
+
+  // CTA sampling: snapshot cumulative DRAM/L2 counters so that
+  // compute_kernel_pressure_signals can return per-kernel deltas. Call from
+  // launch() (or just before the per-kernel cycle loop).
+  void snapshot_pressure_signals_kernel_start();
+  void compute_kernel_pressure_signals(pressure_signals_t& out) const;
   void get_pdom_stack_top_info(unsigned sid, unsigned tid, unsigned *pc,
                                unsigned *rpc);
 
@@ -905,6 +949,7 @@ class gpgpu_sim : public gpgpu_t {
   unsigned long long gpu_tot_issued_cta;
   unsigned gpu_completed_cta;
   float m_cta_sampling_weight; // 1.0 normally; >1.0 when CTA sampling is active
+  pressure_snapshot_t m_pressure_snapshot;  // baseline at kernel launch for per-kernel deltas
 
   unsigned m_last_cluster_issue;
   float *average_pipeline_duty_cycle;

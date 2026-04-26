@@ -1541,6 +1541,9 @@ void gpgpu_sim::launch(kernel_info_t *kinfo) {
   m_shader_stats->allocate_for_a_new_kernel(); // MOD. Custom Stats
   m_shader_stats->num_kernel_not_in_binary += !kinfo->is_captured_from_binary;
   m_grid_barrier_status[kinfo->get_uid()] = grid_barrier_status(kinfo->get_uid(), 0);
+  // CTA sampling: record cumulative DRAM/L2 baseline so per-kernel pressure
+  // signals can be derived as deltas. Single-concurrent-kernel assumption.
+  snapshot_pressure_signals_kernel_start();
   assert(n < m_running_kernels.size());
 }
 
@@ -2037,6 +2040,99 @@ void gpgpu_sim::init() {
   }
 
   if (g_network_mode) icnt_init(0);
+}
+
+// Snapshot cumulative DRAM and L2 counters so per-kernel deltas can be derived
+// even though those counters accumulate across kernels in the simulator.
+void gpgpu_sim::snapshot_pressure_signals_kernel_start() {
+  m_pressure_snapshot = pressure_snapshot_t{};
+  for (unsigned i = 0; i < m_memory_config->m_n_mem; i++) {
+    const dram_t* d = m_memory_partition_unit[i]->get_dram_ro();
+    m_pressure_snapshot.bwutil_sum   += d->get_bwutil();
+    m_pressure_snapshot.n_req_sum    += d->get_n_req();
+    m_pressure_snapshot.ave_mrqs_sum += d->get_ave_mrqs();
+  }
+  if (!m_memory_config->m_L2_config.disabled()) {
+    for (unsigned i = 0; i < m_memory_config->m_n_mem_sub_partition; i++) {
+      cache_sub_stats l2_css;
+      l2_css.clear();
+      m_memory_sub_partition[i]->get_L2cache_sub_stats(l2_css);
+      m_pressure_snapshot.l2_accesses += l2_css.accesses;
+      m_pressure_snapshot.l2_misses   += l2_css.misses;
+    }
+  }
+}
+
+void gpgpu_sim::compute_kernel_pressure_signals(pressure_signals_t& s) const {
+  s = pressure_signals_t{};
+  s.sim_cycles    = gpu_sim_cycle;
+  s.sim_insns     = gpu_sim_insn;
+  s.ctas_launched = m_total_cta_launched;
+
+  // Sum DRAM cumulative counters; subtract launch snapshot to get per-kernel deltas.
+  unsigned long long bwutil_sum = 0, n_req_sum = 0, ave_mrqs_sum = 0;
+  for (unsigned i = 0; i < m_memory_config->m_n_mem; i++) {
+    const dram_t* d = m_memory_partition_unit[i]->get_dram_ro();
+    bwutil_sum   += d->get_bwutil();
+    n_req_sum    += d->get_n_req();
+    ave_mrqs_sum += d->get_ave_mrqs();
+  }
+  bwutil_sum   -= m_pressure_snapshot.bwutil_sum;
+  n_req_sum    -= m_pressure_snapshot.n_req_sum;
+  ave_mrqs_sum -= m_pressure_snapshot.ave_mrqs_sum;
+
+  // Per-access bytes = BL × busW; bwutil increments by BL/data_command_freq_ratio per access.
+  // So bytes ≈ bwutil × busW × data_command_freq_ratio.
+  s.dram_bytes = bwutil_sum
+               * (unsigned long long)m_memory_config->busW
+               * (unsigned long long)m_memory_config->data_command_freq_ratio;
+  s.dram_reqs  = n_req_sum;
+  s.dram_queue_occupancy_avg =
+      (s.sim_cycles > 0 && m_memory_config->m_n_mem > 0)
+          ? (double)ave_mrqs_sum / (double)s.sim_cycles / (double)m_memory_config->m_n_mem
+          : 0.0;
+
+  // L2 deltas
+  unsigned long long l2_acc = 0, l2_miss = 0;
+  if (!m_memory_config->m_L2_config.disabled()) {
+    for (unsigned i = 0; i < m_memory_config->m_n_mem_sub_partition; i++) {
+      cache_sub_stats l2_css;
+      l2_css.clear();
+      m_memory_sub_partition[i]->get_L2cache_sub_stats(l2_css);
+      l2_acc  += l2_css.accesses;
+      l2_miss += l2_css.misses;
+    }
+  }
+  s.l2_accesses  = l2_acc  - m_pressure_snapshot.l2_accesses;
+  s.l2_misses    = l2_miss - m_pressure_snapshot.l2_misses;
+  s.l2_miss_rate = s.l2_accesses
+                       ? (double)s.l2_misses / (double)s.l2_accesses
+                       : 0.0;
+
+  // Hardware priors
+  s.peak_dram_bw_bytes_per_cycle =
+      (double)m_memory_config->m_n_mem
+    * (double)m_memory_config->busW
+    * (double)m_memory_config->data_command_freq_ratio;
+  // Peak FP throughput proxy: num_sm × num_sp_units (FP32 ops/cycle, ignores FMA factor and tensor cores).
+  s.peak_flops_per_cycle =
+      (double)m_shader_config->num_shader()
+    * (double)m_shader_config->gpgpu_num_sp_units;
+  s.ridge_point_flop_per_byte = (s.peak_dram_bw_bytes_per_cycle > 0.0)
+      ? s.peak_flops_per_cycle / s.peak_dram_bw_bytes_per_cycle
+      : 0.0;
+
+  // Derived
+  s.achieved_bw_ratio = (s.sim_cycles > 0 && s.peak_dram_bw_bytes_per_cycle > 0.0)
+      ? ((double)s.dram_bytes / (double)s.sim_cycles) / s.peak_dram_bw_bytes_per_cycle
+      : 0.0;
+  // kernel_AI proxy uses gpu_sim_insn (overestimates: includes mem ops, doesn't count tensor/SFU correctly).
+  s.kernel_ai = (s.dram_bytes > 0)
+      ? (double)s.sim_insns / (double)s.dram_bytes
+      : 0.0;
+  s.ridge_ratio = (s.ridge_point_flop_per_byte > 0.0)
+      ? s.kernel_ai / s.ridge_point_flop_per_byte
+      : 0.0;
 }
 
 void gpgpu_sim::update_stats() {

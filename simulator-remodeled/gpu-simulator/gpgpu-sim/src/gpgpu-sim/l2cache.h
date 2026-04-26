@@ -111,6 +111,7 @@ class memory_partition_unit {
   }
 
   memory_stats_t* get_memory_partition_stats() { return m_stats; };
+  const class dram_t* get_dram_ro() const { return m_dram; }
 
  private:
   unsigned m_id;

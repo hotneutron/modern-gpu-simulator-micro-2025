@@ -143,6 +143,11 @@ class dram_t {
 
   const memory_config *m_config;
 
+  // Read-only accessors used by gpgpu_sim::compute_kernel_pressure_signals.
+  unsigned long long get_n_req()  const { return n_req; }
+  unsigned int       get_bwutil() const { return bwutil; }
+  unsigned int       get_ave_mrqs() const { return ave_mrqs; }
+
  private:
   bankgrp_t **bkgrp;
 
