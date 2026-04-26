@@ -64,6 +64,35 @@ trace_kernel_info_t *create_kernel_info( kernel_trace_t* kernel_trace_info,
 		                      gpgpu_context *m_gpgpu_context, class trace_config *config,
 							  trace_parser *parser);
 
+// Roofline classification for the adaptive sim_ctas selector.
+enum kernel_class { KCLASS_COMPUTE, KCLASS_MEMORY, KCLASS_MIXED };
+
+static const char* kernel_class_name(kernel_class c) {
+  switch (c) {
+    case KCLASS_COMPUTE: return "compute";
+    case KCLASS_MEMORY:  return "memory";
+    case KCLASS_MIXED:   return "mixed";
+  }
+  return "unknown";
+}
+
+// Three-way classifier: ridge_ratio + DRAM-side pressure proxies.
+// "Pressure-high" beats ridge_ratio: a kernel reading at >=60% peak BW is
+// effectively memory-bound regardless of where its AI puts it on roofline.
+// Note: K-rep pressure signals are biased low (under-fills caches/queues),
+// so borderline cases are biased toward MEMORY by design.
+static kernel_class classify_kernel(const pressure_signals_t& s,
+                                    const trace_config& tc) {
+  bool memory_pressure_high =
+      (s.achieved_bw_ratio >= tc.get_cta_sampling_pressure_bw()) ||
+      (s.dram_queue_occupancy_avg >= tc.get_cta_sampling_pressure_queue());
+  if (s.ridge_ratio >= tc.get_cta_sampling_t_high() && !memory_pressure_high)
+    return KCLASS_COMPUTE;
+  if (s.ridge_ratio <= tc.get_cta_sampling_t_low() || memory_pressure_high)
+    return KCLASS_MEMORY;
+  return KCLASS_MIXED;
+}
+
 // Coordinate-based CTA heuristic: selects boundary (corners, edge-midpoints) and
 // one interior representative. Works best for regular compute kernels (GEMM, conv,
 // stencil) where CTA behavior varies only at grid boundaries.
@@ -262,6 +291,7 @@ int main(int argc, const char **argv) {
       // available even when sampling is off (sanity check + roofline view).
       pressure_signals_t ps;
       m_gpgpu_sim->compute_kernel_pressure_signals(ps);
+      kernel_class kc = classify_kernel(ps, tconfig);
       printf("CTA_PRESSURE_SIGNALS:"
              " sim_cycles=%llu sim_insns=%llu ctas_launched=%llu"
              " dram_bytes=%llu dram_reqs=%llu"
@@ -269,14 +299,16 @@ int main(int argc, const char **argv) {
              " dram_queue_occupancy_avg=%.4f achieved_bw_ratio=%.4f"
              " peak_dram_bw_bytes_per_cycle=%.2f peak_flops_per_cycle=%.2f"
              " ridge_point_flop_per_byte=%.4f"
-             " kernel_ai=%.4f ridge_ratio=%.4f\n",
+             " kernel_ai=%.4f ridge_ratio=%.4f"
+             " class=%s\n",
              ps.sim_cycles, ps.sim_insns, ps.ctas_launched,
              ps.dram_bytes, ps.dram_reqs,
              ps.l2_accesses, ps.l2_misses, ps.l2_miss_rate,
              ps.dram_queue_occupancy_avg, ps.achieved_bw_ratio,
              ps.peak_dram_bw_bytes_per_cycle, ps.peak_flops_per_cycle,
              ps.ridge_point_flop_per_byte,
-             ps.kernel_ai, ps.ridge_ratio);
+             ps.kernel_ai, ps.ridge_ratio,
+             kernel_class_name(kc));
       fflush(stdout);
       m_gpgpu_sim->update_stats();
       m_gpgpu_context->print_simulation_time();

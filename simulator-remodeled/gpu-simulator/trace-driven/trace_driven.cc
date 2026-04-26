@@ -571,7 +571,13 @@ bool trace_warp_inst_t::parse_from_trace_struct(
   return true;
 }
 
-trace_config::trace_config() { cta_sampling_mode = 0; }
+trace_config::trace_config() {
+  cta_sampling_mode = 0;
+  cta_sampling_t_low = 0.9;
+  cta_sampling_t_high = 1.3;
+  cta_sampling_pressure_bw = 0.6;
+  cta_sampling_pressure_queue = 0.5;
+}
 
 void trace_config::reg_options(option_parser_t opp) {
   option_parser_register(opp, "-trace", OPT_CSTR, &g_traces_filename,
@@ -659,6 +665,26 @@ void trace_config::reg_options(option_parser_t opp) {
                          "CTA sampling mode: 0=disabled, 1=coordinate-heuristic "
                          "(samples boundary+interior CTAs, scales stats by total/sampled)",
                          "0");
+  option_parser_register(opp, "-cta_sampling_t_low", OPT_DOUBLE,
+                         &cta_sampling_t_low,
+                         "Roofline classifier: ridge_ratio at or below this "
+                         "is treated as memory-bound",
+                         "0.9");
+  option_parser_register(opp, "-cta_sampling_t_high", OPT_DOUBLE,
+                         &cta_sampling_t_high,
+                         "Roofline classifier: ridge_ratio at or above this "
+                         "(with low memory pressure) is treated as compute-bound",
+                         "1.3");
+  option_parser_register(opp, "-cta_sampling_pressure_bw", OPT_DOUBLE,
+                         &cta_sampling_pressure_bw,
+                         "Roofline classifier: achieved_bw_ratio above this "
+                         "is treated as high memory pressure",
+                         "0.6");
+  option_parser_register(opp, "-cta_sampling_pressure_queue", OPT_DOUBLE,
+                         &cta_sampling_pressure_queue,
+                         "Roofline classifier: dram_queue_occupancy_avg above "
+                         "this is treated as high memory pressure",
+                         "0.5");
 }
 
 void trace_config::parse_config() {

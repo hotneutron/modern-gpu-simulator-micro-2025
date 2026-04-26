@@ -158,6 +158,11 @@ class trace_config {
 
   bool get_is_extra_traces_enabled(){ return is_extra_traces_enabled; } // MOD. Improved tracer
   int get_cta_sampling_mode() const { return cta_sampling_mode; }
+  // Roofline classifier knobs
+  double get_cta_sampling_t_low()  const { return cta_sampling_t_low; }
+  double get_cta_sampling_t_high() const { return cta_sampling_t_high; }
+  double get_cta_sampling_pressure_bw()    const { return cta_sampling_pressure_bw; }
+  double get_cta_sampling_pressure_queue() const { return cta_sampling_pressure_queue; }
 
   unsigned int get_int_latency() const { return int_latency; }
   unsigned int get_fp_latency() const { return fp_latency; }
@@ -217,6 +222,13 @@ class trace_config {
 
   bool is_extra_traces_enabled; // MOD. Improved tracer
   int cta_sampling_mode; // 0=disabled, 1=coordinate-heuristic
+  // Roofline classifier thresholds. ridge_ratio = kernel_AI / ridge_point;
+  // pressure_* are achieved-DRAM-BW and DRAM-queue-occupancy fractions above
+  // which a kernel is treated as memory-pressured even if its AI suggests compute.
+  double cta_sampling_t_low;          // ridge_ratio <= t_low => memory
+  double cta_sampling_t_high;         // ridge_ratio >= t_high (and pressure low) => compute
+  double cta_sampling_pressure_bw;    // achieved_bw_ratio above this => high mem pressure
+  double cta_sampling_pressure_queue; // dram_queue_occupancy_avg above this => high mem pressure
 
 };
 
