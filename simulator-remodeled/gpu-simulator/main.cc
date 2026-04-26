@@ -26,6 +26,8 @@
 // ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 // POSSIBILITY OF SUCH DAMAGE.
 
+#include <algorithm>
+#include <cmath>
 #include <fstream>
 #include <iostream>
 #include <math.h>
@@ -91,6 +93,49 @@ static kernel_class classify_kernel(const pressure_signals_t& s,
   if (s.ridge_ratio <= tc.get_cta_sampling_t_low() || memory_pressure_high)
     return KCLASS_MEMORY;
   return KCLASS_MIXED;
+}
+
+// Estimate the number of CTAs/SMs needed to saturate DRAM bandwidth based on
+// the K-rep run. per_sm_bw_est = (dram_bytes/sim_cycles)/k_reps; N_sat_est =
+// ceil(peak_dram_bw / per_sm_bw_est). Plan acknowledges this is noisy: peak
+// DRAM BW as denominator over-estimates required SMs for latency-limited
+// kernels and under-estimates for partition-camped traffic. The pilot loop
+// (later commit) corrects via doubling.
+static unsigned compute_n_sat_est(const pressure_signals_t& s, unsigned k_reps) {
+  if (s.dram_bytes == 0 || s.sim_cycles == 0 || k_reps == 0)
+    return 1;
+  double per_sm_bw = ((double)s.dram_bytes / (double)s.sim_cycles) /
+                     (double)k_reps;
+  if (per_sm_bw <= 0.0 || s.peak_dram_bw_bytes_per_cycle <= 0.0)
+    return 1;
+  double n = s.peak_dram_bw_bytes_per_cycle / per_sm_bw;
+  if (!std::isfinite(n) || n < 1.0) return 1;
+  return (unsigned)std::ceil(n);
+}
+
+// Pick an initial sim_ctas from the classification. Memory => N_sat_est;
+// mixed => 1.5x; compute => sms_floor_compute (half the GPU is sufficient for
+// per-SM effects without needing DRAM saturation).
+static unsigned compute_initial_sim_ctas(kernel_class kc, unsigned k_reps,
+                                         unsigned total_ctas, unsigned total_sms,
+                                         unsigned n_sat_est) {
+  unsigned target = k_reps;
+  switch (kc) {
+    case KCLASS_COMPUTE:
+      target = std::max(k_reps, total_sms / 2u);
+      break;
+    case KCLASS_MEMORY:
+      target = std::max(k_reps, n_sat_est);
+      break;
+    case KCLASS_MIXED:
+      target = std::max(k_reps,
+                        (unsigned)std::ceil(1.5 * (double)n_sat_est));
+      break;
+  }
+  if (total_sms > 0 && target > total_sms) target = total_sms;
+  if (target > total_ctas) target = total_ctas;
+  if (target < k_reps) target = k_reps;  // never below K
+  return target;
 }
 
 // Coordinate-based CTA heuristic: selects boundary (corners, edge-midpoints) and
@@ -257,6 +302,8 @@ int main(int argc, const char **argv) {
     }
 
     // cleanup finished kernel
+    unsigned finished_kernel_total_ctas = 0;
+    unsigned finished_kernel_k_reps = 0;
     if ( (finished_kernel_uid || m_gpgpu_sim->cycle_insn_cta_max_hit()
         || !m_gpgpu_sim->active()) && !kernels_info.empty() ) {
       trace_kernel_info_t* k = NULL;
@@ -272,6 +319,11 @@ int main(int argc, const char **argv) {
             }
           }
           finished_kernel_cta_weight = k->get_trace_info()->cta_sampling_weight;
+          // Capture original grid info before kernel_finalizer frees trace_info.
+          finished_kernel_total_ctas = k->get_trace_info()->grid_dim_x
+                                     * k->get_trace_info()->grid_dim_y
+                                     * k->get_trace_info()->grid_dim_z;
+          finished_kernel_k_reps = (unsigned)k->get_trace_info()->sampled_ctas.size();
           tracer.kernel_finalizer(k->get_trace_info());
           delete k->entry();
           delete k;
@@ -292,6 +344,15 @@ int main(int argc, const char **argv) {
       pressure_signals_t ps;
       m_gpgpu_sim->compute_kernel_pressure_signals(ps);
       kernel_class kc = classify_kernel(ps, tconfig);
+      // K reps: when sampling is off, treat the kernel as if K = total_ctas
+      // so the selector returns total_ctas and "no expansion needed".
+      unsigned k_reps = finished_kernel_k_reps
+          ? finished_kernel_k_reps
+          : finished_kernel_total_ctas;
+      unsigned total_sms = m_gpgpu_sim->get_config().num_shader();
+      unsigned n_sat_est = compute_n_sat_est(ps, k_reps);
+      unsigned target_sim_ctas = compute_initial_sim_ctas(
+          kc, k_reps, finished_kernel_total_ctas, total_sms, n_sat_est);
       printf("CTA_PRESSURE_SIGNALS:"
              " sim_cycles=%llu sim_insns=%llu ctas_launched=%llu"
              " dram_bytes=%llu dram_reqs=%llu"
@@ -300,7 +361,8 @@ int main(int argc, const char **argv) {
              " peak_dram_bw_bytes_per_cycle=%.2f peak_flops_per_cycle=%.2f"
              " ridge_point_flop_per_byte=%.4f"
              " kernel_ai=%.4f ridge_ratio=%.4f"
-             " class=%s\n",
+             " class=%s k_reps=%u total_ctas=%u total_sms=%u"
+             " n_sat_est=%u target_sim_ctas=%u\n",
              ps.sim_cycles, ps.sim_insns, ps.ctas_launched,
              ps.dram_bytes, ps.dram_reqs,
              ps.l2_accesses, ps.l2_misses, ps.l2_miss_rate,
@@ -308,7 +370,8 @@ int main(int argc, const char **argv) {
              ps.peak_dram_bw_bytes_per_cycle, ps.peak_flops_per_cycle,
              ps.ridge_point_flop_per_byte,
              ps.kernel_ai, ps.ridge_ratio,
-             kernel_class_name(kc));
+             kernel_class_name(kc), k_reps, finished_kernel_total_ctas, total_sms,
+             n_sat_est, target_sim_ctas);
       fflush(stdout);
       m_gpgpu_sim->update_stats();
       m_gpgpu_context->print_simulation_time();
