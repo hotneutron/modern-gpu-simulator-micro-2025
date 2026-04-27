@@ -159,12 +159,33 @@ struct pilot_state_t {
 static void update_sampling_on_trace_info(kernel_trace_t* ti, unsigned target, unsigned seed);
 
 // Decide whether to accept this iteration's run.
-//   iter 0 (K-rep): accept only if classifier says COMPUTE (no expansion needed).
+//   iter 0 (K-rep): accept if classifier says COMPUTE AND the K-rep sample
+//     is large enough to be representative. The K-rep heuristic collapses
+//     to ~3 CTAs on 1D grids (e.g. backprop's 256x1x1 kernels), and at that
+//     size a 1-CTA-per-SM sample misses the steady-state SM concurrency that
+//     the full grid sees -- with high mem_stall_frac (memory-latency-bound),
+//     concurrent CTAs hide latency and raise per-SM throughput in ways the
+//     1-CTA-per-SM sample can't measure. Force at least one pilot expansion
+//     in that regime so the next iteration has more representative
+//     concurrency.
 //   iter > 0: accept on stop_bw_target reached, or stable deltas, or hit the
-//   doublings cap, or sim_ctas == total_ctas.
+//     doublings cap, or sim_ctas == total_ctas.
 static bool pilot_decide_accept(const pilot_state_t& pst, const pressure_signals_t& ps,
                                 kernel_class kc, const trace_config& tc) {
-  if (pst.iter == 0) return kc == KCLASS_COMPUTE;
+  if (pst.iter == 0) {
+    if (kc != KCLASS_COMPUTE) return false;
+    // If K-rep happens to cover all CTAs, expansion is a no-op -- accept.
+    if (ps.ctas_launched >= pst.total_ctas) return true;
+    // Force expansion when the sample under-covers SMs AND the kernel shows
+    // a memory-stall signal. The threshold pair below was picked to spare
+    // hotspot-style 9-CTA-on-9-SM-with-mem_stall=0 samples (already accurate
+    // under the throughput formula) while catching backprop-style 3-CTA-on-
+    // 3-SM-with-mem_stall=0.3 samples (which under-utilize SM concurrency).
+    bool undersized = (ps.ctas_launched * 2u < pst.total_ctas)
+                   && (ps.ctas_launched < 8u);
+    if (undersized && ps.mem_stall_frac > 0.10) return false;
+    return true;
+  }
   if (pst.target_sim_ctas >= pst.total_ctas) return true;
   if (pst.iter > tc.get_cta_sampling_pilot_max_doublings()) return true;
   if (ps.achieved_bw_ratio >= tc.get_cta_sampling_pilot_stop_bw_target()) return true;
