@@ -820,6 +820,21 @@ struct pressure_snapshot_t {
   unsigned long long stall_no_warps_ready;
 };
 
+// Whole-kernel cycle/IPC estimation context, set by main.cc after the pilot
+// loop finalizes the sim_ctas target for a kernel and read by print_stats()
+// to project a credible whole-grid cycle count from the sampled wave's
+// wall-clock. kernel_class_int: -1 unset, 0 compute, 1 memory, 2 mixed.
+// max_cta_per_core / total_sms come from the gpu-sim config; total_ctas is
+// the full-grid product of the kernel_trace_t.grid_dim_*.
+struct last_kernel_wave_info_t {
+  int      kernel_class_int     = -1;
+  unsigned target_sim_ctas      = 0;
+  unsigned sampled_ctas         = 0;
+  unsigned total_ctas           = 0;
+  unsigned max_cta_per_core     = 0;
+  unsigned total_sms            = 0;
+};
+
 // gpu_tot_* snapshot used to roll back a pilot iteration so its contribution
 // does not pollute the accumulated cross-kernel totals when the iteration is
 // rejected by the adaptive sim_ctas loop.
@@ -887,6 +902,12 @@ class gpgpu_sim : public gpgpu_t {
   // without touching the gpu-aggregate. Returns 0 for stats not registered or
   // for SM models that don't expose per-SM stats.
   unsigned long long sum_sm_stat_value(const std::string& name) const;
+  // Phase B: tell gpu-sim about the last kernel's pilot-final state so
+  // print_stats() can project a whole-grid cycle estimate. Called from main.cc
+  // right after the pilot loop accepts.
+  void set_last_kernel_wave_info(const last_kernel_wave_info_t& info) {
+    m_last_wave_info = info;
+  }
   // Pilot-iteration support: snapshot/restore gpu_tot_* across rejected pilot
   // iterations of the adaptive sim_ctas loop.
   void pilot_snapshot(pilot_stats_snapshot_t& out) const;
@@ -1012,6 +1033,7 @@ class gpgpu_sim : public gpgpu_t {
   unsigned gpu_completed_cta;
   float m_cta_sampling_weight; // 1.0 normally; >1.0 when CTA sampling is active
   pressure_snapshot_t m_pressure_snapshot;  // baseline at kernel launch for per-kernel deltas
+  last_kernel_wave_info_t m_last_wave_info;  // pilot-final state for whole-kernel cycle estimation
 
   unsigned m_last_cluster_issue;
   float *average_pipeline_duty_cycle;

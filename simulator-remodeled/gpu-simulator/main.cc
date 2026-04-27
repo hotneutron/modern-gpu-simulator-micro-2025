@@ -540,6 +540,16 @@ int main(int argc, const char **argv) {
         float weight = finished_k->get_trace_info()->cta_sampling_weight;
         kernel_trace_t* trace_info = finished_k->get_trace_info();
         m_gpgpu_sim->set_cta_sampling_weight(weight);
+        // Phase B: hand the pilot-final wave context to gpu-sim so print_stats
+        // can project a whole-grid cycle estimate from the sampled-wave clock.
+        last_kernel_wave_info_t wave_info;
+        wave_info.kernel_class_int = (int)kc;
+        wave_info.target_sim_ctas  = target_sim_ctas;
+        wave_info.sampled_ctas     = (unsigned)ps.ctas_launched;
+        wave_info.total_ctas       = finished_kernel_total_ctas;
+        wave_info.max_cta_per_core = (unsigned)m_gpgpu_sim->max_cta_per_core();
+        wave_info.total_sms        = total_sms;
+        m_gpgpu_sim->set_last_kernel_wave_info(wave_info);
         m_gpgpu_sim->print_stats();
         if (pst) pilot_states.erase(trace_info);
         tracer.kernel_finalizer(trace_info);
