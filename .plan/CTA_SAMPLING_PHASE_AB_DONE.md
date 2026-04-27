@@ -100,14 +100,19 @@ recompile and pass the hotspot smoke test in isolation.
   MEMORY, and the pilot loop expands it to iter 1 with
   `pilot_accepted=1`. Hotspot/backprop/pathfinder retain their
   pre-existing behavior; `insn_err%` does not regress.
-- **Phase B** (cycle projection): both targets now met after the
-  post-Phase-B accuracy push. Three follow-up commits replaced the
+- **Phase B** (cycle projection): targets met on the original 6
+  workloads but a wider 10-workload sweep reveals 3 distinct failure
+  modes outside that subset. Four follow-up commits replaced the
   ceil-based per-CTA / steady-state formulas with a unified
   throughput-conservation formula (`8af3c98`), added a force-expansion
-  heuristic for the K-rep undersampling pathology that hits 1D / low-dim
-  grids (`c3204ec`), and added a log-fit concurrency-throughput model
-  that uses the pilot iteration history to extrapolate per-SM throughput
-  to the full-grid CTAs-per-SM density (`5ea3114`). After all three:
+  heuristic for the K-rep undersampling pathology on 1D / low-dim
+  grids (`c3204ec`), added a log-fit concurrency-throughput model that
+  uses the pilot iteration history to extrapolate per-SM throughput
+  to the full-grid CTAs-per-SM density (`5ea3114`), and extended the
+  force-expand condition to cover high projection-ratio kernels
+  regardless of `mem_stall_frac` (`d27f968`).
+
+  **Original 6-workload sweep (targets met):**
   ```
   workload    cycle_err%   estimation_mode
   hotspot     +14.7        throughput_compute  (1 iter, no fit)
@@ -117,11 +122,53 @@ recompile and pass the hotspot smoke test in isolation.
   srad_v2     +17.3        throughput_mixed    (sampled==total, scale=1)
   lud          -0.1        throughput_compute  (small grid)
   ```
-  **p50 = 12.3% (<15% target, met). p90 = 17.3% (<25% target, met).**
-  The log fit gracefully falls back to constant-throughput when fewer
-  than 2 distinct CTAs-per-SM densities are in the pilot history (i.e.,
-  the pilot accepted iter 0 alone or expanded only at 1 CTA/SM), so
-  small-grid and iter-0-accepted kernels see no behavior change.
+  p50 = 12.3% (<15%, met); p90 = 17.3% (<25%, met).
+
+  **Wider 10-workload sweep (3 new failures):**
+  ```
+  workload      cycle_err%   notes
+  hotspot       +14.7
+  backprop      -15.4
+  pathfinder     -2.6
+  bfs            -9.9
+  srad_v2       +17.3
+  lud            -0.1
+  heartwall     -28.7   K-rep collapses to 3 corner CTAs on 1D 51x1x1
+                        grid; pilot expands to target=51 by replicating
+                        those 3, so the "full kernel run" is 51 instances
+                        of 3 corners, not 51 unique CTAs.
+  nn           +103.5   4 kernels x 938 CTAs each. Force-expand is now
+                        triggered (was +1006% before d27f968), but the
+                        log-shape extrapolation from N=2 CTAs/SM to N=23
+                        underestimates the actual per-SM throughput
+                        growth, so cycle estimate stays ~2x high.
+  nw            +56.8   1-8 CTA kernels; pilot iter-0 + iter-1 sequence
+                        with cache-state pollution makes the accepted
+                        iter slower than baseline, plus pilot-overhead
+                        is large fraction of tiny-kernel runtime.
+  streamcluster  -1.5
+  ```
+  p50 = 15.0% (just over <15%); p90 = 56.8% (over <25%).
+
+  **Diagnosis.** The 3 failures map to three distinct residual issues:
+  1. **K-rep replication misrepresents work distribution** (heartwall):
+     when K-rep collapses to a tiny set on low-dim grids and the pilot
+     expands by replicating those reps, the sampled "full-grid" is
+     actually `target_sim_ctas` copies of 2-3 corner CTAs, biased
+     toward edge-case work. A clustering-based selector (follow-up #4)
+     would naturally cover the per-CTA work distribution.
+  2. **Log-fit under-extrapolates large CTAs/SM gaps** (nn): with
+     `pilot_max_doublings=2` the pilot reaches 80 CTAs sampled (2
+     CTAs/SM) but the full grid is at 23 CTAs/SM. Extrapolating
+     `T(N) = a + b*log(N+1)` past the sampled range underestimates the
+     actual throughput growth. Either deeper expansion (sample 4+
+     CTAs/SM) or a different functional form is needed.
+  3. **Pilot overhead + state pollution dominates tiny kernels** (nw):
+     1-8-CTA kernels run for ~7-15k cycles each; pilot's iter-0 reject
+     + iter-1 accept doubles that, and cache-state pollution from
+     iter-0 makes iter-1 itself slower than a clean baseline run. Not
+     a formula error -- the pilot speedup is negative below some grid
+     size threshold.
 
 ## Files changed
 
@@ -135,20 +182,36 @@ recompile and pass the hotspot smoke test in isolation.
 | `simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/subcore.cc` | A2 |
 | `simulator-remodeled/gpu-simulator/trace-driven/trace_driven.h` | A1b, A3 |
 | `simulator-remodeled/gpu-simulator/trace-driven/trace_driven.cc` | A1b, A3 |
-| `simulator-remodeled/gpu-simulator/main.cc` | A1b, A3, B1, force-expand, log-fit |
-| `simulator-remodeled/util/cta_sampling/validate.py` | A4, B3 |
+| `simulator-remodeled/gpu-simulator/main.cc` | A1b, A3, B1, force-expand, log-fit, ratio-expand |
+| `simulator-remodeled/util/cta_sampling/validate.py` | A4, B3, wider-validation |
 
-## Follow-ups (post-accuracy push)
+## Follow-ups (post-wider-validation)
 
-1. **Wider validation set**. The current 6 workloads come from
-   rodinia2 on Turing. Targets met for that set, but the log-fit only
-   exercises one workload (backprop) — adding GEMM-like / sparse /
-   large-grid kernels would stress the fit on more diverse concurrency
-   profiles and reveal whether the `T(N) = a + b*log(N+1)` shape
-   generalizes. Likely the highest-value next step now that the
-   targets are met on the existing set.
+1. **Deeper pilot expansion for high-projection kernels**. nn shows
+   the log-fit under-extrapolates when the pilot's deepest sample
+   (2 CTAs/SM) is far from the full-grid density (23 CTAs/SM). Two
+   options: (a) bump `pilot_max_doublings` adaptively when the
+   force-expand condition fires (sample at 4+ CTAs/SM gives the log
+   fit a wider range); (b) try a different functional form (e.g.,
+   power law `T(N) = a*N^b` or saturating `T(N) = T_max*(1-exp(-N/τ))`)
+   though both need ≥3 distinct densities to fit reliably. Option (a)
+   trades sim-time for accuracy and is the simpler experiment.
 
-2. **AI weight calibration** (open decision **D2**): fit `W_dp`,
+2. **K-rep clustering replacement** (was follow-up #4). The heartwall
+   regression is now the clearest case for replacing the corner +
+   midpoint heuristic with k-means or similar over per-CTA features
+   (instruction counts, memory access patterns), so the sampled set
+   covers the actual work distribution rather than just grid corners.
+
+3. **Skip-sampling threshold for tiny kernels** (nw). When
+   `total_ctas < some_threshold` (e.g., < 2 * total_sms) the pilot
+   overhead is larger than any sampling speedup, and cache-state
+   pollution between rejected and accepted iters makes the accepted
+   sample slower than a clean baseline run. Adding a `if (total_ctas <
+   threshold) skip pilot, run baseline` short-circuit would prevent
+   regressions on tiny-kernel workloads.
+
+4. **AI weight calibration** (open decision **D2**): fit `W_dp`,
    `W_tc`, `W_sfu` against a known-FLOPs kernel (a tiled GEMM is
    ideal) instead of shipping the 2/8/4 guesses. Tangential to cycle
    accuracy now that the formula is class-independent — only matters
@@ -156,7 +219,7 @@ recompile and pass the hotspot smoke test in isolation.
    classification (which it does, indirectly, through
    `compute_initial_sim_ctas`).
 
-3. **Pilot-rejected iteration cleanup**: `pilot_restore` undoes
+5. **Pilot-rejected iteration cleanup**: `pilot_restore` undoes
    `gpu_tot_sim_*` but does not roll back the per-SM aggregates
    (`m_gpu_per_sm_stats`, the legacy `shader_core_stats` POD arrays,
    the per-SM `m_sm_stats` for stall counters). For long pilot
@@ -164,13 +227,6 @@ recompile and pass the hotspot smoke test in isolation.
    `gpu_tot_ipc_estimated` numerator (sums insns from rejected iters
    too) but **not** the cycle estimate. Pre-existing behavior; only
    tackle if IPC numbers start mattering as a primary signal.
-
-4. **Drop the K-rep coordinate heuristic** in favor of clustering
-   (the larger redesign noted in the plan's "out of scope" section).
-   The K-rep collapse on 1D grids (3 unique CTAs for backprop's
-   256x1x1 layout) is what triggered the force-expansion heuristic;
-   a clustering-based selector would naturally cover the per-CTA
-   work distribution and likely sample more representatively.
 
 ## Build / run notes
 
