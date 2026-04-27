@@ -41,6 +41,8 @@ SOURCES=$(wildcard *.cu)
 OBJECTS=$(SOURCES:.cu=.o)
 ifeq ($(ARCH),x86_64)
 ARCH=all
+else ifeq ($(ARCH),aarch64)
+ARCH=all
 else
 ARCH?=all
 endif
