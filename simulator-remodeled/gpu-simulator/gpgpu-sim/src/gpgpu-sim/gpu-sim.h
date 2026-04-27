@@ -750,8 +750,8 @@ struct grid_barrier_status {
 // Per-kernel pressure signals for the CTA-sampling roofline classifier and
 // adaptive sim_ctas loop. Filled by gpgpu_sim::compute_kernel_pressure_signals
 // after a kernel completes; values reflect deltas since the kernel's launch
-// snapshot. kernel_ai uses gpu_sim_insn as an ALU/FLOP proxy and so
-// over-estimates for memory-heavy kernels.
+// snapshot. The per-class instruction counters drive a refined kernel_ai
+// formula in a follow-up commit; here they are populated for logging.
 struct pressure_signals_t {
   // raw per-kernel deltas
   unsigned long long sim_cycles;
@@ -762,6 +762,15 @@ struct pressure_signals_t {
   unsigned long long l2_accesses;
   unsigned long long l2_misses;
   double dram_queue_occupancy_avg;
+
+  // per-class instruction deltas (raw, before AI weighting)
+  unsigned long long n_fp_decoded;
+  unsigned long long n_int_decoded;
+  double             n_dp_acc;
+  double             n_tc_acc;
+  double             n_sfu_acc;
+  unsigned long long n_load_insn;
+  unsigned long long n_store_insn;
 
   // hardware priors (constant per GPU)
   double peak_dram_bw_bytes_per_cycle;
@@ -783,6 +792,14 @@ struct pressure_snapshot_t {
   unsigned long long ave_mrqs_sum;
   unsigned long long l2_accesses;
   unsigned long long l2_misses;
+  // per-class instruction baselines (legacy shader_core_stats arrays sum across SMs)
+  unsigned long long n_fp_decoded;
+  unsigned long long n_int_decoded;
+  double             n_dp_acc;
+  double             n_tc_acc;
+  double             n_sfu_acc;
+  unsigned long long n_load_insn;
+  unsigned long long n_store_insn;
 };
 
 // gpu_tot_* snapshot used to roll back a pilot iteration so its contribution
@@ -843,6 +860,10 @@ class gpgpu_sim : public gpgpu_t {
   void snapshot_pressure_signals_kernel_start();
   // Non-const because it gathers per-SM stats before reading them.
   void compute_kernel_pressure_signals(pressure_signals_t& out);
+  // Sum a per-SM stat (out of each SM's m_sm_stats) across all clusters/SMs
+  // without touching the gpu-aggregate. Returns 0 for stats not registered or
+  // for SM models that don't expose per-SM stats.
+  unsigned long long sum_sm_stat_value(const std::string& name) const;
   // Pilot-iteration support: snapshot/restore gpu_tot_* across rejected pilot
   // iterations of the adaptive sim_ctas loop.
   void pilot_snapshot(pilot_stats_snapshot_t& out) const;

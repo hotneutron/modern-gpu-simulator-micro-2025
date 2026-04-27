@@ -2061,6 +2061,39 @@ void gpgpu_sim::snapshot_pressure_signals_kernel_start() {
       m_pressure_snapshot.l2_misses   += l2_css.misses;
     }
   }
+  // Per-class instruction counters live on the legacy shader_core_stats
+  // (per-SM POD arrays). They are cumulative across kernels so we snapshot
+  // a sum-across-SMs baseline at launch.
+  if (m_shader_stats) {
+    unsigned ns = m_shader_config->num_shader();
+    unsigned long long fp = 0, in = 0;
+    double dp = 0.0, tc = 0.0, sf = 0.0;
+    for (unsigned i = 0; i < ns; i++) {
+      fp += m_shader_stats->m_num_FPdecoded_insn[i];
+      in += m_shader_stats->m_num_INTdecoded_insn[i];
+      dp += m_shader_stats->m_num_dp_acesses[i];
+      tc += m_shader_stats->m_num_tensor_core_acesses[i];
+      sf += m_shader_stats->m_num_sfu_acesses[i];
+    }
+    m_pressure_snapshot.n_fp_decoded  = fp;
+    m_pressure_snapshot.n_int_decoded = in;
+    m_pressure_snapshot.n_dp_acc      = dp;
+    m_pressure_snapshot.n_tc_acc      = tc;
+    m_pressure_snapshot.n_sfu_acc     = sf;
+  }
+  // gpgpu_n_load_insn / gpgpu_n_store_insn live on each SM's m_sm_stats in
+  // the remodeling code path (the m_shader_stats scalar field is no longer
+  // updated). Sum directly across SMs.
+  m_pressure_snapshot.n_load_insn  = sum_sm_stat_value("gpgpu_n_load_insn");
+  m_pressure_snapshot.n_store_insn = sum_sm_stat_value("gpgpu_n_store_insn");
+}
+
+unsigned long long gpgpu_sim::sum_sm_stat_value(const std::string& name) const {
+  unsigned long long sum = 0ull;
+  for (unsigned i = 0; i < m_shader_config->n_simt_clusters; i++) {
+    sum += m_cluster[i]->sum_sm_stat_value(name);
+  }
+  return sum;
 }
 
 void gpgpu_sim::compute_kernel_pressure_signals(pressure_signals_t& s) {
@@ -2118,6 +2151,32 @@ void gpgpu_sim::compute_kernel_pressure_signals(pressure_signals_t& s) {
   s.l2_miss_rate = s.l2_accesses
                        ? (double)s.l2_misses / (double)s.l2_accesses
                        : 0.0;
+
+  // Per-class instruction deltas (raw FP/INT decode counts and dp/tc/sfu
+  // weighted-access counters). These live on the legacy shader_core_stats POD
+  // arrays and accumulate across kernels, so we sum-across-SMs and subtract
+  // the launch-time baseline.
+  if (m_shader_stats) {
+    unsigned ns = m_shader_config->num_shader();
+    unsigned long long fp = 0, in = 0;
+    double dp = 0.0, tc = 0.0, sf = 0.0;
+    for (unsigned i = 0; i < ns; i++) {
+      fp += m_shader_stats->m_num_FPdecoded_insn[i];
+      in += m_shader_stats->m_num_INTdecoded_insn[i];
+      dp += m_shader_stats->m_num_dp_acesses[i];
+      tc += m_shader_stats->m_num_tensor_core_acesses[i];
+      sf += m_shader_stats->m_num_sfu_acesses[i];
+    }
+    s.n_fp_decoded  = (fp >= m_pressure_snapshot.n_fp_decoded)  ? (fp - m_pressure_snapshot.n_fp_decoded)  : 0ull;
+    s.n_int_decoded = (in >= m_pressure_snapshot.n_int_decoded) ? (in - m_pressure_snapshot.n_int_decoded) : 0ull;
+    s.n_dp_acc      = std::max(0.0, dp - m_pressure_snapshot.n_dp_acc);
+    s.n_tc_acc      = std::max(0.0, tc - m_pressure_snapshot.n_tc_acc);
+    s.n_sfu_acc     = std::max(0.0, sf - m_pressure_snapshot.n_sfu_acc);
+  }
+  unsigned long long ld_now = sum_sm_stat_value("gpgpu_n_load_insn");
+  unsigned long long st_now = sum_sm_stat_value("gpgpu_n_store_insn");
+  s.n_load_insn  = (ld_now >= m_pressure_snapshot.n_load_insn)  ? (ld_now - m_pressure_snapshot.n_load_insn)  : 0ull;
+  s.n_store_insn = (st_now >= m_pressure_snapshot.n_store_insn) ? (st_now - m_pressure_snapshot.n_store_insn) : 0ull;
 
   // Hardware priors
   s.peak_dram_bw_bytes_per_cycle =

@@ -161,4 +161,11 @@ class shader_core_ctx_wrapper {
   virtual void gather_gpu_per_sm_stats(Element_stats &all_stats, coalescingStatsAcrossSms& coal_stats_l1d, coalescingStatsAcrossSms& coal_stats_const, coalescingStatsAcrossSms& coal_stats_sharedmem) = 0;
   virtual void gather_gpu_per_sm_single_stat(Element_stats &all_stats, std::string stat_name) = 0;
   virtual void increment_sm_stat_by_integer(std::string stat_name, int val_to_increment) = 0;
+  // Read the SM-local cumulative value of a stat without touching the
+  // gpu-aggregate. Returns 0 if the stat is not registered on this SM (the
+  // legacy shader_core_ctx returns 0 unconditionally; only the remodeling SM
+  // tracks per-SM stats this way). Used by the CTA-sampling pressure-signal
+  // snapshot/delta path so it can avoid the gather-side double-counting that
+  // affects stats registered with is_erase_after_gather_in_sm=false.
+  virtual unsigned long long read_sm_stat_value(const std::string& stat_name) const { return 0ull; }
 };

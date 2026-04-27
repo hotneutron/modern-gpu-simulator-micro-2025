@@ -325,7 +325,13 @@ class SM : public core_t, public shader_core_ctx_wrapper {
   void gather_gpu_per_sm_single_stat(Element_stats &all_stats, std::string stat_name) override;
 
   void increment_sm_stat_by_integer(std::string stat_name, int val_to_increment) override;
-  
+
+  unsigned long long read_sm_stat_value(const std::string& stat_name) const override {
+    auto it = m_sm_stats.m_stats_map.find(stat_name);
+    if (it == m_sm_stats.m_stats_map.end() || !it->second) return 0ull;
+    return it->second->get_value();
+  }
+
   bool is_using_interwarp_coal_warps_waiting_dep_counter();
 
   InterWarp_Coalescing_Waiting_Dep_Counters *m_interwarp_coal_warps_waiting_dep_counter;

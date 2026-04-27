@@ -3586,6 +3586,14 @@ class simt_core_cluster {
     }
   }
 
+  unsigned long long sum_sm_stat_value(const std::string& name) const {
+    unsigned long long sum = 0ull;
+    for (unsigned i = 0; i < m_core.size(); i++) {
+      sum += m_core[i]->read_sm_stat_value(name);
+    }
+    return sum;
+  }
+
   traffic_breakdown& get_incomming_traffic_stats() { return m_incoming_traffic_stats; }
   traffic_breakdown& get_outgoing_traffic_stats() { return m_outgoing_traffic_stats; }
 
