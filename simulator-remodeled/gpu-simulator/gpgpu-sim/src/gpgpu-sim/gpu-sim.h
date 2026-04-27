@@ -776,6 +776,13 @@ struct pressure_signals_t {
   // total memory ops (load + store)
   unsigned long long mem_ops;
 
+  // issue-stage stall fractions (denominator: cycles the issue stage was evaluated)
+  unsigned long long issue_eval_cycles;
+  unsigned long long stall_l1c_cycles;       // l1c-wait stall cycles
+  unsigned long long stall_total_cycles;     // sum of all non-issuing categories
+  double             mem_stall_frac;
+  double             total_stall_frac;
+
   // hardware priors (constant per GPU)
   double peak_dram_bw_bytes_per_cycle;
   double peak_flops_per_cycle;
@@ -804,6 +811,13 @@ struct pressure_snapshot_t {
   double             n_sfu_acc;
   unsigned long long n_load_insn;
   unsigned long long n_store_insn;
+  // issue-stage stall baselines (from m_gpu_per_sm_stats)
+  unsigned long long issue_eval_cycles;
+  unsigned long long stall_l1c_cycles;
+  unsigned long long stall_next_stage;
+  unsigned long long stall_issue_port_busy;
+  unsigned long long stall_no_valid_instruction;
+  unsigned long long stall_no_warps_ready;
 };
 
 // gpu_tot_* snapshot used to roll back a pilot iteration so its contribution

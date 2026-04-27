@@ -360,7 +360,7 @@ void Subcore::issue(SM *shared_sm) {
   // bool is_any_waiting_in_wait_barrier = false;
   // bool is_any_waiting_in_yield = false;
   // bool is_any_waiting_in_fu_occupied = false;
-  // bool is_any_waiting_l1c = false;
+  bool is_any_waiting_l1c = false;
 
   modify_warp_state();
   if(m_num_pending_cycles_with_issue_port_busy > 0) {
@@ -481,15 +481,15 @@ void Subcore::issue(SM *shared_sm) {
             // if(!are_wait_barriers_ready) {
             //   is_any_waiting_in_wait_barrier = true;
             // }
-            // if(!is_l1c_ready) {
-            //   is_any_waiting_l1c = true;
-            // }
+            if(!is_l1c_ready) {
+              is_any_waiting_l1c = true;
+            }
           }else {
             if(!is_the_greedy_warp || (can_l1c_switch_warp)) {
               // has_been_possible_to_switch_warp = true;
-              // if(!is_l1c_ready) {
-              //   is_any_waiting_l1c = true;
-              // }
+              if(!is_l1c_ready) {
+                is_any_waiting_l1c = true;
+              }
             }else {
               // has_been_possible_to_switch_warp = false;
               break;
@@ -519,7 +519,14 @@ void Subcore::issue(SM *shared_sm) {
     // m_stats->total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_yield += is_any_waiting_in_yield;
     // m_stats->total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_stall_count += is_any_waiting_in_stall_count;
     // m_stats->total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_wait_barrier += is_any_waiting_in_wait_barrier;
-    // m_stats->total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_l1c += is_any_waiting_l1c;
+  }
+  // Memory-stall proxy used by the CTA-sampling classifier: count any cycle in
+  // which at least one warp was kept from issuing because its constant-cache
+  // (l1c) operand wasn't ready. Tracked independently of the mutually-exclusive
+  // categories above so it can also fire alongside the stall_no_warps_ready
+  // bucket (l1c-wait is a subset of "no warp ready to issue").
+  if(!is_issued_inst && is_any_waiting_l1c) {
+    shared_sm->m_sm_stats.m_stats_map["total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_l1c"]->increment_with_integer(1);
   }
   shared_sm->m_sm_stats.m_stats_map["total_num_cycles_issue_stage_evaluated"]->increment_with_integer(1);
 

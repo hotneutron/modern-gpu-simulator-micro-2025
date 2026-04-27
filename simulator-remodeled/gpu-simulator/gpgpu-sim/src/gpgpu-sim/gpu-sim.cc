@@ -1831,6 +1831,7 @@ void gpgpu_sim::create_gpu_per_sm_stats() {
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_issue_stage_stall_issue_port_busy", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_issue_stage_stall_no_valid_instruction", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_issue_stage_stall_no_warps_ready", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_l1c", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_issue_stage_evaluated", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_register_file_cache_hits", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_register_file_cache_allocations", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
@@ -2086,6 +2087,21 @@ void gpgpu_sim::snapshot_pressure_signals_kernel_start() {
   // updated). Sum directly across SMs.
   m_pressure_snapshot.n_load_insn  = sum_sm_stat_value("gpgpu_n_load_insn");
   m_pressure_snapshot.n_store_insn = sum_sm_stat_value("gpgpu_n_store_insn");
+  // Issue-stage stall counters live in each SM's m_sm_stats. We sum directly
+  // across SMs rather than going through gather_gpu_per_sm_single_stat, which
+  // would double-count stats registered with is_erase_after_gather_in_sm=false.
+  m_pressure_snapshot.issue_eval_cycles =
+      sum_sm_stat_value("total_num_cycles_issue_stage_evaluated");
+  m_pressure_snapshot.stall_l1c_cycles =
+      sum_sm_stat_value("total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_l1c");
+  m_pressure_snapshot.stall_next_stage =
+      sum_sm_stat_value("total_num_cycles_issue_stage_stall_next_stage_not_available");
+  m_pressure_snapshot.stall_issue_port_busy =
+      sum_sm_stat_value("total_num_cycles_issue_stage_stall_issue_port_busy");
+  m_pressure_snapshot.stall_no_valid_instruction =
+      sum_sm_stat_value("total_num_cycles_issue_stage_stall_no_valid_instruction");
+  m_pressure_snapshot.stall_no_warps_ready =
+      sum_sm_stat_value("total_num_cycles_issue_stage_stall_no_warps_ready");
 }
 
 unsigned long long gpgpu_sim::sum_sm_stat_value(const std::string& name) const {
@@ -2185,6 +2201,28 @@ void gpgpu_sim::compute_kernel_pressure_signals(pressure_signals_t& s,
                 + ai_w_tc  * s.n_tc_acc
                 + ai_w_sfu * s.n_sfu_acc;
   s.mem_ops = s.n_load_insn + s.n_store_insn;
+
+  // Issue-stage stall deltas (sum-across-SMs, baseline-subtracted).
+  auto delta = [](unsigned long long now, unsigned long long base) {
+    return (now >= base) ? (now - base) : 0ull;
+  };
+  unsigned long long issue_eval_now = sum_sm_stat_value("total_num_cycles_issue_stage_evaluated");
+  unsigned long long stall_l1c_now  = sum_sm_stat_value("total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_l1c");
+  unsigned long long stall_next_now = sum_sm_stat_value("total_num_cycles_issue_stage_stall_next_stage_not_available");
+  unsigned long long stall_port_now = sum_sm_stat_value("total_num_cycles_issue_stage_stall_issue_port_busy");
+  unsigned long long stall_novalid_now = sum_sm_stat_value("total_num_cycles_issue_stage_stall_no_valid_instruction");
+  unsigned long long stall_nowarps_now = sum_sm_stat_value("total_num_cycles_issue_stage_stall_no_warps_ready");
+  s.issue_eval_cycles = delta(issue_eval_now, m_pressure_snapshot.issue_eval_cycles);
+  s.stall_l1c_cycles  = delta(stall_l1c_now,  m_pressure_snapshot.stall_l1c_cycles);
+  s.stall_total_cycles =
+      delta(stall_next_now,    m_pressure_snapshot.stall_next_stage)
+    + delta(stall_port_now,    m_pressure_snapshot.stall_issue_port_busy)
+    + delta(stall_novalid_now, m_pressure_snapshot.stall_no_valid_instruction)
+    + delta(stall_nowarps_now, m_pressure_snapshot.stall_no_warps_ready);
+  s.mem_stall_frac   = (s.issue_eval_cycles > 0)
+      ? (double)s.stall_l1c_cycles   / (double)s.issue_eval_cycles : 0.0;
+  s.total_stall_frac = (s.issue_eval_cycles > 0)
+      ? (double)s.stall_total_cycles / (double)s.issue_eval_cycles : 0.0;
 
   // Hardware priors
   s.peak_dram_bw_bytes_per_cycle =
