@@ -1,6 +1,6 @@
 # CTA sampling — Phase A + Phase B status
 
-This is the post-execution writeup for `.plan/CTA_SAMPLING_NEXT_STEPS.md`.
+This is the post-execution writeup of the CTA-sampling Phase A + B work.
 Both phases shipped to the `cta-sampling` branch as 8 layered commits
 matching the per-commit shape in A5/B6 of that plan.
 

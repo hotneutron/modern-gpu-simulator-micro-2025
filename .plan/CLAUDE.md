@@ -115,4 +115,4 @@ Three benchmarks cannot build with `sm_86` (tracked in `KNOWN_BUILD_FAILURES.md`
 
 ## Active Work
 
-**Branch `cta-sampling`:** Design for CTA-level sampling to speed up simulation (see `CTA_SAMPLING.md`). Two approaches proposed: (1) coordinate-based heuristic sampling for regular kernels; (2) two-pass Nsight Compute profiling + K-Means clustering + selective NVBit tracing. Implementation would wire into `gpu-sim.cc:2041–2085` for stat aggregation.
+**Branch `cta-sampling`:** CTA-level sampling to speed up simulation. Phases A (refined classifier) and B (whole-kernel cycle estimator with throughput-conservation + log-fit concurrency model) are implemented and validated. See `CTA_SAMPLING_PHASE_AB_DONE.md` for the post-execution writeup with results, formulas, and the prioritized follow-up list, and `CTA_SAMPLING_WALKTHROUGH.md` for a presentation-friendly walkthrough of the optimization journey.
