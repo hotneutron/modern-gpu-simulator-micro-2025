@@ -2526,50 +2526,45 @@ void gpgpu_sim::gpu_print_stat() {
     const char* est_mode = "none";
     if (w.kernel_class_int >= 0 && w.total_ctas > 0 && w.sampled_ctas > 0
         && sampled_cycles > 0) {
-      // COMPUTE -> per-CTA model. Otherwise -> steady-state wave model.
-      bool per_cta = (w.kernel_class_int == 0);
-      if (per_cta) {
-        // Sampled wave runs sampled_ctas CTAs across active_sms SMs. Each SM
-        // runs ceil(sampled_ctas/active_sms) CTAs sequentially in
-        // sampled_cycles wall-time. Per-CTA wall-clock is therefore
-        // sampled_cycles / rounds_per_sm_sampled. Project to the full grid by
-        // multiplying by ceil(total_ctas/total_sms) rounds-per-SM.
-        unsigned active_sms_in_sample = std::min(w.target_sim_ctas, w.total_sms);
-        if (active_sms_in_sample == 0) active_sms_in_sample = std::min(w.sampled_ctas, w.total_sms);
-        if (active_sms_in_sample == 0) active_sms_in_sample = 1;
-        unsigned rounds_per_sm_sampled =
-            (w.sampled_ctas + active_sms_in_sample - 1) / active_sms_in_sample;
-        if (rounds_per_sm_sampled == 0) rounds_per_sm_sampled = 1;
-        double cyc_per_cta = (double)sampled_cycles / (double)rounds_per_sm_sampled;
-        unsigned rounds_per_sm_full = (w.total_sms > 0)
-            ? (unsigned)((w.total_ctas + w.total_sms - 1) / w.total_sms) : 0;
-        if (rounds_per_sm_full > 0) {
-          est_cycles = (unsigned long long)(cyc_per_cta * (double)rounds_per_sm_full);
-          est_mode   = "per_cta";
-        }
-      } else {
-        unsigned per_wave_full =
-            (w.max_cta_per_core > 0)
-                ? w.total_sms * w.max_cta_per_core
-                : w.total_sms;
-        unsigned active_sms_in_sample = std::min(w.target_sim_ctas, w.total_sms);
-        if (active_sms_in_sample == 0) active_sms_in_sample = 1;
-        unsigned per_wave_sample =
-            (w.max_cta_per_core > 0)
-                ? active_sms_in_sample * w.max_cta_per_core
-                : active_sms_in_sample;
-        if (per_wave_full > 0 && per_wave_sample > 0) {
-          unsigned long long n_waves_full =
-              (w.total_ctas + per_wave_full - 1) / per_wave_full;
-          unsigned long long n_waves_sample =
-              (w.sampled_ctas + per_wave_sample - 1) / per_wave_sample;
-          if (n_waves_sample > 0) {
-            est_cycles = (unsigned long long)(
-                (double)sampled_cycles * (double)n_waves_full / (double)n_waves_sample);
-            est_mode = "steady_state";
-          }
-        }
-      }
+      // Unified throughput-conservation formula. The previous per-CTA model
+      // used cyc_per_round * ceil(total_ctas/total_sms), which over-counts
+      // partial last waves (CTAs finish at staggered times, so a partial wave
+      // doesn't take a full round's wall-clock). The throughput model assumes
+      // per-SM-cycle issue throughput is constant during the sample and
+      // projects total wall-clock from total work / total parallelism.
+      //
+      // Active SMs is capped at total_sms (the hardware count), NOT at
+      // total_sms * max_cta_per_core. max_cta_per_core lets multiple CTAs
+      // share an SM concurrently, but they share that SM's issue bandwidth,
+      // so per-SM throughput stays the same — adding more concurrent CTAs
+      // per SM doesn't add parallelism for this projection.
+      //
+      //   sampled_active = min(sampled_ctas, total_sms)
+      //   full_active    = min(total_ctas,   total_sms)
+      //   scale          = (total_ctas / full_active)
+      //                  / (sampled_ctas / sampled_active)
+      //   est_cycles     = sampled_cycles * scale
+      //
+      // When sampled_ctas == total_ctas (kernel ran end-to-end, e.g. pilot
+      // expanded to whole grid), scale collapses to 1 and the raw cycle is
+      // reported as the estimate.
+      //
+      // The classification still drives pilot expansion (memory kernels run
+      // longer to reach DRAM saturation, compute kernels accept early), but
+      // the formula itself is class-independent.
+      unsigned total_sms = w.total_sms ? w.total_sms : 1;
+      unsigned sampled_active = std::min(w.sampled_ctas, total_sms);
+      if (sampled_active == 0) sampled_active = 1;
+      unsigned full_active = std::min(w.total_ctas, total_sms);
+      if (full_active == 0) full_active = 1;
+      double scale = ((double)w.total_ctas / (double)full_active)
+                   / ((double)w.sampled_ctas / (double)sampled_active);
+      est_cycles = (unsigned long long)((double)sampled_cycles * scale);
+      // Label the estimation per kernel class so the pilot's expansion target
+      // is still visible in the log; the underlying formula is the same.
+      est_mode = (w.kernel_class_int == 0) ? "throughput_compute"
+               : (w.kernel_class_int == 1) ? "throughput_memory"
+               : "throughput_mixed";
     }
     // Cumulative total: prior kernels' estimates (tracked across print_stats
     // calls) plus this kernel's estimate. Falls back to the raw sampled-wave
