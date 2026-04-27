@@ -100,60 +100,53 @@ recompile and pass the hotspot smoke test in isolation.
   MEMORY, and the pilot loop expands it to iter 1 with
   `pilot_accepted=1`. Hotspot/backprop/pathfinder retain their
   pre-existing behavior; `insn_err%` does not regress.
-- **Phase B** (cycle projection): met p50 target after the post-Phase-B
-  accuracy push. Two follow-up commits replaced the ceil-based per-CTA
-  / steady-state formulas with a unified throughput-conservation
-  formula (`8af3c98`) and added a force-expansion heuristic for the
-  K-rep undersampling pathology that hits 1D / low-dim grids
-  (`c3204ec`). After both:
+- **Phase B** (cycle projection): both targets now met after the
+  post-Phase-B accuracy push. Three follow-up commits replaced the
+  ceil-based per-CTA / steady-state formulas with a unified
+  throughput-conservation formula (`8af3c98`), added a force-expansion
+  heuristic for the K-rep undersampling pathology that hits 1D / low-dim
+  grids (`c3204ec`), and added a log-fit concurrency-throughput model
+  that uses the pilot iteration history to extrapolate per-SM throughput
+  to the full-grid CTAs-per-SM density (`5ea3114`). After all three:
   ```
-  workload    cycle_err%
-  hotspot     +14.7
-  backprop    +30.5
-  pathfinder   -2.6
-  bfs          -9.9
-  srad_v2     +17.3
-  lud          -0.1
+  workload    cycle_err%   estimation_mode
+  hotspot     +14.7        throughput_compute  (1 iter, no fit)
+  backprop    -15.4        log_fit_compute     (4 distinct N values)
+  pathfinder   -2.6        throughput_memory   (small grid)
+  bfs          -9.9        throughput_mixed    (small grid)
+  srad_v2     +17.3        throughput_mixed    (sampled==total, scale=1)
+  lud          -0.1        throughput_compute  (small grid)
   ```
-  p50 = 12.3% (target <15%, met). p90 = 30.5% (target <25%, close).
-  Backprop is the residual: when pilot expands to N CTAs/SM,
-  per-SM throughput grows nonlinearly (log-shaped) with concurrent CTA
-  count due to memory-latency hiding, and the throughput formula's
-  constant-per-SM-throughput assumption misses ~30% on the
-  2-CTA-per-SM-sample → 6.4-CTA-per-SM-full-grid extrapolation. See
-  follow-up #1 below.
+  **p50 = 12.3% (<15% target, met). p90 = 17.3% (<25% target, met).**
+  The log fit gracefully falls back to constant-throughput when fewer
+  than 2 distinct CTAs-per-SM densities are in the pilot history (i.e.,
+  the pilot accepted iter 0 alone or expanded only at 1 CTA/SM), so
+  small-grid and iter-0-accepted kernels see no behavior change.
 
 ## Files changed
 
 | Path | Touched in commits |
 |---|---|
-| `simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/gpu-sim.h` | A1a, A1b, A2, B1, B2 |
-| `simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/gpu-sim.cc` | A1a, A1b, A2, B2 |
+| `simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/gpu-sim.h` | A1a, A1b, A2, B1, B2, log-fit |
+| `simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/gpu-sim.cc` | A1a, A1b, A2, B2, throughput-fix, log-fit |
 | `simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/shader.h` | A1a |
 | `simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/shader_core_wrapper.h` | A1a |
 | `simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/sm.h` | A1a |
 | `simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/subcore.cc` | A2 |
 | `simulator-remodeled/gpu-simulator/trace-driven/trace_driven.h` | A1b, A3 |
 | `simulator-remodeled/gpu-simulator/trace-driven/trace_driven.cc` | A1b, A3 |
-| `simulator-remodeled/gpu-simulator/main.cc` | A1b, A3, B1 |
+| `simulator-remodeled/gpu-simulator/main.cc` | A1b, A3, B1, force-expand, log-fit |
 | `simulator-remodeled/util/cta_sampling/validate.py` | A4, B3 |
 
 ## Follow-ups (post-accuracy push)
 
-1. **Concurrency-throughput model** to close the p90 gap. Per-SM
-   throughput grows log-shaped with CTAs-per-SM in the sample
-   (memory-latency hiding scales sub-linearly). The pilot already
-   produces multiple iterations at different CTA-per-SM densities;
-   fitting a 2-parameter model `T(N) = a + b * log(N+1)` to the
-   accepted iterations would let the estimator extrapolate to the
-   full-grid CTAs-per-SM density rather than assuming throughput is
-   constant. Worked on backprop's data: predicted -10% vs the current
-   +30% from constant-throughput extrapolation. Needs:
-   - Storing the per-iter `(sampled_ctas, sampled_cycles)` history in
-     `pilot_state_t`.
-   - Fitting at accept time, falling back to the constant-throughput
-     formula when there are fewer than 2 distinct CTAs-per-SM
-     densities (e.g., kernels that accept iter 0).
+1. **Wider validation set**. The current 6 workloads come from
+   rodinia2 on Turing. Targets met for that set, but the log-fit only
+   exercises one workload (backprop) — adding GEMM-like / sparse /
+   large-grid kernels would stress the fit on more diverse concurrency
+   profiles and reveal whether the `T(N) = a + b*log(N+1)` shape
+   generalizes. Likely the highest-value next step now that the
+   targets are met on the existing set.
 
 2. **AI weight calibration** (open decision **D2**): fit `W_dp`,
    `W_tc`, `W_sfu` against a known-FLOPs kernel (a tiled GEMM is
