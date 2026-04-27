@@ -100,13 +100,28 @@ recompile and pass the hotspot smoke test in isolation.
   MEMORY, and the pilot loop expands it to iter 1 with
   `pilot_accepted=1`. Hotspot/backprop/pathfinder retain their
   pre-existing behavior; `insn_err%` does not regress.
-- **Phase B** (cycle projection): structurally complete. Hotspot
-  estimates 159k cycles vs baseline 111k (+43% over) — the per-CTA
-  model assumes a perfectly compute-bound full-grid wall-clock that
-  scales linearly with rounds-per-SM, which over-counts when partial
-  waves run faster than full ones. Pathfinder is within 3%. The plan
-  reset acceptance to p50 < 15% / p90 < 25% across the extended
-  validation set; running the full sweep is the first follow-up below.
+- **Phase B** (cycle projection): met p50 target after the post-Phase-B
+  accuracy push. Two follow-up commits replaced the ceil-based per-CTA
+  / steady-state formulas with a unified throughput-conservation
+  formula (`8af3c98`) and added a force-expansion heuristic for the
+  K-rep undersampling pathology that hits 1D / low-dim grids
+  (`c3204ec`). After both:
+  ```
+  workload    cycle_err%
+  hotspot     +14.7
+  backprop    +30.5
+  pathfinder   -2.6
+  bfs          -9.9
+  srad_v2     +17.3
+  lud          -0.1
+  ```
+  p50 = 12.3% (target <15%, met). p90 = 30.5% (target <25%, close).
+  Backprop is the residual: when pilot expands to N CTAs/SM,
+  per-SM throughput grows nonlinearly (log-shaped) with concurrent CTA
+  count due to memory-latency hiding, and the throughput formula's
+  constant-per-SM-throughput assumption misses ~30% on the
+  2-CTA-per-SM-sample → 6.4-CTA-per-SM-full-grid extrapolation. See
+  follow-up #1 below.
 
 ## Files changed
 
@@ -123,31 +138,46 @@ recompile and pass the hotspot smoke test in isolation.
 | `simulator-remodeled/gpu-simulator/main.cc` | A1b, A3, B1 |
 | `simulator-remodeled/util/cta_sampling/validate.py` | A4, B3 |
 
-## Follow-ups (not done — listed by priority)
+## Follow-ups (post-accuracy push)
 
-1. **Run the full validation sweep** across hotspot, backprop,
-   pathfinder, bfs, srad_v2, lud and check whether
-   `gpu_tot_sim_cycle_estimated` meets p50 < 15% / p90 < 25%. Hotspot
-   already shows +43% (per-CTA model overshoots), so the per-CTA
-   formula likely needs an empirical tweak (or a class-aware blend
-   between per-CTA and steady-state).
-2. **Calibrate AI weights** (open decision **D2**): fit `W_dp`,
+1. **Concurrency-throughput model** to close the p90 gap. Per-SM
+   throughput grows log-shaped with CTAs-per-SM in the sample
+   (memory-latency hiding scales sub-linearly). The pilot already
+   produces multiple iterations at different CTA-per-SM densities;
+   fitting a 2-parameter model `T(N) = a + b * log(N+1)` to the
+   accepted iterations would let the estimator extrapolate to the
+   full-grid CTAs-per-SM density rather than assuming throughput is
+   constant. Worked on backprop's data: predicted -10% vs the current
+   +30% from constant-throughput extrapolation. Needs:
+   - Storing the per-iter `(sampled_ctas, sampled_cycles)` history in
+     `pilot_state_t`.
+   - Fitting at accept time, falling back to the constant-throughput
+     formula when there are fewer than 2 distinct CTAs-per-SM
+     densities (e.g., kernels that accept iter 0).
+
+2. **AI weight calibration** (open decision **D2**): fit `W_dp`,
    `W_tc`, `W_sfu` against a known-FLOPs kernel (a tiled GEMM is
-   ideal) instead of shipping the 2/8/4 guesses.
-3. **Concurrent-kernel pilot** (limitation #3, explicitly out of
-   scope here): the pilot loop assumes `window_size == 1`. Extending
-   it to a window of running kernels needs careful pressure-signal
-   composition since kernel deltas would overlap.
-4. **Pilot-rejected iteration cleanup**: `pilot_restore` undoes
+   ideal) instead of shipping the 2/8/4 guesses. Tangential to cycle
+   accuracy now that the formula is class-independent — only matters
+   when the pilot picks a different expansion target based on
+   classification (which it does, indirectly, through
+   `compute_initial_sim_ctas`).
+
+3. **Pilot-rejected iteration cleanup**: `pilot_restore` undoes
    `gpu_tot_sim_*` but does not roll back the per-SM aggregates
    (`m_gpu_per_sm_stats`, the legacy `shader_core_stats` POD arrays,
    the per-SM `m_sm_stats` for stall counters). For long pilot
-   sweeps with many rejected iterations this can pollute the cycle
-   estimate's denominator. Pre-existing behavior, but worth a
-   targeted fix once cycle accuracy is being chased.
-5. **Drop the K-rep coordinate heuristic** in favor of clustering
+   sweeps with many rejected iterations this pollutes the
+   `gpu_tot_ipc_estimated` numerator (sums insns from rejected iters
+   too) but **not** the cycle estimate. Pre-existing behavior; only
+   tackle if IPC numbers start mattering as a primary signal.
+
+4. **Drop the K-rep coordinate heuristic** in favor of clustering
    (the larger redesign noted in the plan's "out of scope" section).
-   Only worth doing once Phase B's cycle-error targets are firm.
+   The K-rep collapse on 1D grids (3 unique CTAs for backprop's
+   256x1x1 layout) is what triggered the force-expansion heuristic;
+   a clustering-based selector would naturally cover the per-CTA
+   work distribution and likely sample more representatively.
 
 ## Build / run notes
 
