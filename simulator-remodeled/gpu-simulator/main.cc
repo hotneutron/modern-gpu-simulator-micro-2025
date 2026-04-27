@@ -142,6 +142,17 @@ static unsigned compute_initial_sim_ctas(kernel_class kc, unsigned k_reps,
   return target;
 }
 
+// One pilot iteration's measurement, captured for the concurrency-throughput
+// fit. Per-SM throughput grows nonlinearly with concurrent CTAs/SM (memory
+// latency hiding), and the constant-throughput cycle estimator under-counts
+// that growth. After 2+ iterations at distinct CTAs/SM densities we fit a
+// log model to extrapolate to the full-grid density.
+struct pilot_iter_obs_t {
+  unsigned long long sampled_cycles;  // gpu_sim_cycle for this iter
+  unsigned           sampled_ctas;    // ps.ctas_launched
+  unsigned           active_sms;      // min(sampled_ctas, total_sms)
+};
+
 // Per-kernel state carried across iterations of the adaptive pilot loop.
 struct pilot_state_t {
   unsigned iter;            // 0 = K-rep run; 1+ = expansion / doubling iters
@@ -151,12 +162,68 @@ struct pilot_state_t {
   pilot_stats_snapshot_t snapshot;  // gpu_tot_* before this iter's contribution
   pressure_signals_t prev_signals;  // for stability check
   bool prev_signals_valid;
+  // Log of every iteration's measurement (rejected and accepted alike), so
+  // the concurrency-throughput fit at accept time can use all data points.
+  std::vector<pilot_iter_obs_t> history;
 };
 
 // Mutate kernel_trace_info's sampling fields for the next pilot iteration.
 // target == 0 leaves sampling off (mode 0); target == K uses the K-rep list;
 // target > K stratified-shuffle replicates.
 static void update_sampling_on_trace_info(kernel_trace_t* ti, unsigned target, unsigned seed);
+
+// Fit T(N) = a + b*log(N+1) to per-SM throughput vs CTAs-per-SM, where
+// throughput is sampled_ctas/(active_sms * sampled_cycles) and N is
+// sampled_ctas/active_sms (CTAs per SM in that iteration). Per-SM
+// throughput grows nonlinearly with concurrent CTAs/SM (memory-latency
+// hiding), and a constant-throughput extrapolation under-counts that
+// growth on memory-stall-bound kernels (notably backprop's 1D-grid
+// kernels where K-rep collapses to 1-CTA-per-SM samples).
+//
+// Requires at least 2 distinct CTAs-per-SM densities in the history to
+// fit a slope. Returns false (no fit) when fewer densities are present
+// or the fit yields a non-monotone slope. When multiple iterations share
+// a density the per-SM throughputs are averaged before fitting.
+static bool pilot_fit_log_throughput(const std::vector<pilot_iter_obs_t>& history,
+                                     double& fit_a, double& fit_b) {
+  fit_a = 0.0; fit_b = 0.0;
+  if (history.size() < 2) return false;
+  // Aggregate by CTAs-per-SM (rounded to nearest integer). Average the
+  // throughputs at each density.
+  std::map<unsigned, std::pair<double, unsigned>> agg;  // N -> (sum_T, count)
+  for (const auto& obs : history) {
+    if (obs.active_sms == 0 || obs.sampled_cycles == 0) continue;
+    unsigned ctas_per_sm = obs.sampled_ctas / obs.active_sms;
+    if (ctas_per_sm == 0) ctas_per_sm = 1;
+    double t = (double)obs.sampled_ctas
+             / ((double)obs.active_sms * (double)obs.sampled_cycles);
+    auto& entry = agg[ctas_per_sm];
+    entry.first += t;
+    entry.second += 1;
+  }
+  if (agg.size() < 2) return false;
+  // Least-squares fit on (log(N+1), T_avg) pairs.
+  std::vector<std::pair<double,double>> pts;
+  pts.reserve(agg.size());
+  for (auto& kv : agg) {
+    double x = std::log((double)kv.first + 1.0);
+    double y = kv.second.first / (double)kv.second.second;
+    pts.push_back({x, y});
+  }
+  double n = (double)pts.size();
+  double sx = 0.0, sy = 0.0, sxx = 0.0, sxy = 0.0;
+  for (auto& p : pts) { sx += p.first; sy += p.second;
+                        sxx += p.first*p.first; sxy += p.first*p.second; }
+  double denom = n*sxx - sx*sx;
+  if (std::fabs(denom) < 1e-30) return false;
+  fit_b = (n*sxy - sx*sy) / denom;
+  fit_a = (sy - fit_b*sx) / n;
+  // Reject non-monotone (decreasing) fits -- those mean per-SM throughput
+  // dropped as we added concurrency, which is a noisy signal we shouldn't
+  // extrapolate from.
+  if (fit_b <= 0.0) return false;
+  return true;
+}
 
 // Decide whether to accept this iteration's run.
 //   iter 0 (K-rep): accept if classifier says COMPUTE AND the K-rep sample
@@ -511,6 +578,15 @@ int main(int argc, const char **argv) {
         auto it = pilot_states.find(finished_k->get_trace_info());
         if (it != pilot_states.end()) {
           pst = &it->second;
+          // Record this iteration's measurement for the concurrency-throughput
+          // fit. Done before the accept decision so a forced-expansion path
+          // still preserves the data point.
+          pilot_iter_obs_t obs;
+          obs.sampled_cycles = ps.sim_cycles;
+          obs.sampled_ctas   = (unsigned)ps.ctas_launched;
+          obs.active_sms     = std::min((unsigned)ps.ctas_launched, total_sms);
+          if (obs.active_sms == 0) obs.active_sms = 1;
+          pst->history.push_back(obs);
           accept = pilot_decide_accept(*pst, ps, kc, tconfig);
         }
       }
@@ -570,6 +646,18 @@ int main(int argc, const char **argv) {
         wave_info.total_ctas       = finished_kernel_total_ctas;
         wave_info.max_cta_per_core = (unsigned)m_gpgpu_sim->max_cta_per_core();
         wave_info.total_sms        = total_sms;
+        // Concurrency-throughput fit: if the pilot ran multiple iterations at
+        // distinct CTAs-per-SM densities, fit a log model so the estimator
+        // can extrapolate per-SM throughput to the full-grid density rather
+        // than assuming it stays constant.
+        if (pst) {
+          double a = 0.0, b = 0.0;
+          if (pilot_fit_log_throughput(pst->history, a, b)) {
+            wave_info.has_log_fit = true;
+            wave_info.log_fit_a   = a;
+            wave_info.log_fit_b   = b;
+          }
+        }
         m_gpgpu_sim->set_last_kernel_wave_info(wave_info);
         m_gpgpu_sim->print_stats();
         if (pst) pilot_states.erase(trace_info);

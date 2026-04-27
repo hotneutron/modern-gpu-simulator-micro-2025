@@ -833,6 +833,15 @@ struct last_kernel_wave_info_t {
   unsigned total_ctas           = 0;
   unsigned max_cta_per_core     = 0;
   unsigned total_sms            = 0;
+  // Concurrency-throughput log fit, populated when the pilot ran 2+
+  // iterations at distinct CTAs-per-SM densities. Per-SM throughput
+  // (CTAs/cycle/SM) is modeled as T(N) = log_fit_a + log_fit_b * log(N+1)
+  // where N = CTAs-per-SM; the cycle estimator extrapolates T to the
+  // full-grid density. has_log_fit=false falls back to constant-per-SM
+  // throughput (the prior formula).
+  bool   has_log_fit            = false;
+  double log_fit_a              = 0.0;
+  double log_fit_b              = 0.0;
 };
 
 // gpu_tot_* snapshot used to roll back a pilot iteration so its contribution

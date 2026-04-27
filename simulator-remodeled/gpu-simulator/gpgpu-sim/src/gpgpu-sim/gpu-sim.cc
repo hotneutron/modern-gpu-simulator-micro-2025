@@ -2526,45 +2526,59 @@ void gpgpu_sim::gpu_print_stat() {
     const char* est_mode = "none";
     if (w.kernel_class_int >= 0 && w.total_ctas > 0 && w.sampled_ctas > 0
         && sampled_cycles > 0) {
-      // Unified throughput-conservation formula. The previous per-CTA model
-      // used cyc_per_round * ceil(total_ctas/total_sms), which over-counts
-      // partial last waves (CTAs finish at staggered times, so a partial wave
-      // doesn't take a full round's wall-clock). The throughput model assumes
-      // per-SM-cycle issue throughput is constant during the sample and
-      // projects total wall-clock from total work / total parallelism.
-      //
-      // Active SMs is capped at total_sms (the hardware count), NOT at
-      // total_sms * max_cta_per_core. max_cta_per_core lets multiple CTAs
-      // share an SM concurrently, but they share that SM's issue bandwidth,
-      // so per-SM throughput stays the same — adding more concurrent CTAs
-      // per SM doesn't add parallelism for this projection.
-      //
-      //   sampled_active = min(sampled_ctas, total_sms)
-      //   full_active    = min(total_ctas,   total_sms)
-      //   scale          = (total_ctas / full_active)
-      //                  / (sampled_ctas / sampled_active)
-      //   est_cycles     = sampled_cycles * scale
-      //
-      // When sampled_ctas == total_ctas (kernel ran end-to-end, e.g. pilot
-      // expanded to whole grid), scale collapses to 1 and the raw cycle is
-      // reported as the estimate.
-      //
-      // The classification still drives pilot expansion (memory kernels run
-      // longer to reach DRAM saturation, compute kernels accept early), but
-      // the formula itself is class-independent.
+      // Throughput-conservation formula. Active SMs are capped at total_sms
+      // (the hardware count) -- max_cta_per_core lets multiple CTAs share an
+      // SM concurrently but they share that SM's issue bandwidth, so adding
+      // more resident CTAs/SM doesn't add parallelism for this projection.
+      // The per-SM throughput term, however, *does* grow with CTAs/SM (memory
+      // latency hiding); when a log-fit is available from the pilot history
+      // we use it, otherwise we fall back to constant per-SM throughput.
       unsigned total_sms = w.total_sms ? w.total_sms : 1;
       unsigned sampled_active = std::min(w.sampled_ctas, total_sms);
       if (sampled_active == 0) sampled_active = 1;
       unsigned full_active = std::min(w.total_ctas, total_sms);
       if (full_active == 0) full_active = 1;
-      double scale = ((double)w.total_ctas / (double)full_active)
-                   / ((double)w.sampled_ctas / (double)sampled_active);
-      est_cycles = (unsigned long long)((double)sampled_cycles * scale);
-      // Label the estimation per kernel class so the pilot's expansion target
-      // is still visible in the log; the underlying formula is the same.
-      est_mode = (w.kernel_class_int == 0) ? "throughput_compute"
-               : (w.kernel_class_int == 1) ? "throughput_memory"
-               : "throughput_mixed";
+
+      double cls_label_compute = (w.kernel_class_int == 0);
+      double cls_label_memory  = (w.kernel_class_int == 1);
+      (void)cls_label_compute; (void)cls_label_memory;
+
+      if (w.has_log_fit) {
+        // Predicted per-SM throughput at the full-grid CTAs-per-SM density.
+        // The fit was T(N) = a + b*log(N+1) where N is CTAs/SM; clamp to a
+        // floor of the sampled-iteration throughput to avoid the fit
+        // extrapolating below the measured point (defensive: fit_b is
+        // already required > 0 in main.cc).
+        double full_n = (double)w.total_ctas / (double)full_active;
+        double sample_n = (double)w.sampled_ctas / (double)sampled_active;
+        double T_full = w.log_fit_a + w.log_fit_b * std::log(full_n + 1.0);
+        double T_sample = (double)w.sampled_ctas
+                        / ((double)sampled_active * (double)sampled_cycles);
+        if (!(T_full > T_sample)) T_full = T_sample;  // never extrapolate downward
+        // est_cycles = total_ctas / (full_active * T_full).
+        if (T_full > 0.0) {
+          est_cycles = (unsigned long long)
+              ((double)w.total_ctas / ((double)full_active * T_full));
+        } else {
+          est_cycles = sampled_cycles;
+        }
+        (void)sample_n;
+        est_mode = (w.kernel_class_int == 0) ? "log_fit_compute"
+                 : (w.kernel_class_int == 1) ? "log_fit_memory"
+                 : "log_fit_mixed";
+      } else {
+        // Constant per-SM throughput fallback:
+        //   scale      = (total_ctas / full_active) / (sampled_ctas / sampled_active)
+        //   est_cycles = sampled_cycles * scale
+        // When sampled_ctas == total_ctas the scale collapses to 1 (no
+        // extrapolation) and the raw cycle is reported.
+        double scale = ((double)w.total_ctas / (double)full_active)
+                     / ((double)w.sampled_ctas / (double)sampled_active);
+        est_cycles = (unsigned long long)((double)sampled_cycles * scale);
+        est_mode = (w.kernel_class_int == 0) ? "throughput_compute"
+                 : (w.kernel_class_int == 1) ? "throughput_memory"
+                 : "throughput_mixed";
+      }
     }
     // Cumulative total: prior kernels' estimates (tracked across print_stats
     // calls) plus this kernel's estimate. Falls back to the raw sampled-wave
