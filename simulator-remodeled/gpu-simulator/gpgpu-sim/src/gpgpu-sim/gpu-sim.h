@@ -1034,6 +1034,10 @@ class gpgpu_sim : public gpgpu_t {
   float m_cta_sampling_weight; // 1.0 normally; >1.0 when CTA sampling is active
   pressure_snapshot_t m_pressure_snapshot;  // baseline at kernel launch for per-kernel deltas
   last_kernel_wave_info_t m_last_wave_info;  // pilot-final state for whole-kernel cycle estimation
+  // Cumulative whole-kernel cycle estimate (Phase B). Updated in print_stats()
+  // after each kernel finalizes. Independent from gpu_tot_sim_cycle, which
+  // remains the wall-clock of sampled waves.
+  unsigned long long gpu_tot_sim_cycle_estimated = 0;
 
   unsigned m_last_cluster_issue;
   float *average_pipeline_duty_cycle;

@@ -2509,6 +2509,80 @@ void gpgpu_sim::gpu_print_stat() {
                                        (gpu_tot_sim_cycle + gpu_sim_cycle));
   printf("gpu_tot_issued_cta = %lld\n",
          gpu_tot_issued_cta + (unsigned long long)(m_total_cta_launched * m_cta_sampling_weight));
+
+  // Phase B: whole-kernel cycle estimation. The raw gpu_tot_sim_cycle remains
+  // the wall-clock of the *sampled wave* (deliberate); the new
+  // gpu_tot_sim_cycle_estimated projects a whole-grid cycle count using one of
+  // two first-order models, auto-selected by kernel class:
+  //   COMPUTE -> per-CTA: cycles_per_cta_walltime * ceil(total_ctas/total_sms)
+  //               where cycles_per_cta_walltime = sampled_cycles / rounds_per_sm_sampled
+  //   MEMORY/MIXED -> steady-state: sampled_cycles * N_waves_full / N_waves_sample
+  // Skipped (estimation_mode=none) when no pilot context has been recorded
+  // (e.g. sampling disabled, or the pilot loop is off).
+  {
+    const last_kernel_wave_info_t& w = m_last_wave_info;
+    unsigned long long sampled_cycles = gpu_sim_cycle;  // this kernel's wall-clock
+    unsigned long long est_cycles = 0;
+    const char* est_mode = "none";
+    if (w.kernel_class_int >= 0 && w.total_ctas > 0 && w.sampled_ctas > 0
+        && sampled_cycles > 0) {
+      // COMPUTE -> per-CTA model. Otherwise -> steady-state wave model.
+      bool per_cta = (w.kernel_class_int == 0);
+      if (per_cta) {
+        // Sampled wave runs sampled_ctas CTAs across active_sms SMs. Each SM
+        // runs ceil(sampled_ctas/active_sms) CTAs sequentially in
+        // sampled_cycles wall-time. Per-CTA wall-clock is therefore
+        // sampled_cycles / rounds_per_sm_sampled. Project to the full grid by
+        // multiplying by ceil(total_ctas/total_sms) rounds-per-SM.
+        unsigned active_sms_in_sample = std::min(w.target_sim_ctas, w.total_sms);
+        if (active_sms_in_sample == 0) active_sms_in_sample = std::min(w.sampled_ctas, w.total_sms);
+        if (active_sms_in_sample == 0) active_sms_in_sample = 1;
+        unsigned rounds_per_sm_sampled =
+            (w.sampled_ctas + active_sms_in_sample - 1) / active_sms_in_sample;
+        if (rounds_per_sm_sampled == 0) rounds_per_sm_sampled = 1;
+        double cyc_per_cta = (double)sampled_cycles / (double)rounds_per_sm_sampled;
+        unsigned rounds_per_sm_full = (w.total_sms > 0)
+            ? (unsigned)((w.total_ctas + w.total_sms - 1) / w.total_sms) : 0;
+        if (rounds_per_sm_full > 0) {
+          est_cycles = (unsigned long long)(cyc_per_cta * (double)rounds_per_sm_full);
+          est_mode   = "per_cta";
+        }
+      } else {
+        unsigned per_wave_full =
+            (w.max_cta_per_core > 0)
+                ? w.total_sms * w.max_cta_per_core
+                : w.total_sms;
+        unsigned active_sms_in_sample = std::min(w.target_sim_ctas, w.total_sms);
+        if (active_sms_in_sample == 0) active_sms_in_sample = 1;
+        unsigned per_wave_sample =
+            (w.max_cta_per_core > 0)
+                ? active_sms_in_sample * w.max_cta_per_core
+                : active_sms_in_sample;
+        if (per_wave_full > 0 && per_wave_sample > 0) {
+          unsigned long long n_waves_full =
+              (w.total_ctas + per_wave_full - 1) / per_wave_full;
+          unsigned long long n_waves_sample =
+              (w.sampled_ctas + per_wave_sample - 1) / per_wave_sample;
+          if (n_waves_sample > 0) {
+            est_cycles = (unsigned long long)(
+                (double)sampled_cycles * (double)n_waves_full / (double)n_waves_sample);
+            est_mode = "steady_state";
+          }
+        }
+      }
+    }
+    // Cumulative total: prior kernels' estimates (tracked across print_stats
+    // calls) plus this kernel's estimate. Falls back to the raw sampled-wave
+    // cycle if the estimator declined.
+    gpu_tot_sim_cycle_estimated += (est_cycles > 0 ? est_cycles : sampled_cycles);
+    unsigned long long est_total = gpu_tot_sim_cycle_estimated;
+    double tot_insn = (double)(gpu_tot_sim_insn
+                       + (unsigned long long)(gpu_sim_insn * m_cta_sampling_weight));
+    printf("gpu_tot_sim_cycle_estimated = %llu\n", (unsigned long long)est_total);
+    printf("gpu_tot_sim_cycle_estimation_mode = %s\n", est_mode);
+    printf("gpu_tot_ipc_estimated = %12.4f\n",
+           (est_total > 0) ? (float)(tot_insn / (double)est_total) : 0.0f);
+  }
   printf("gpu_occupancy = %.4f%% \n", gpu_occupancy.get_occ_fraction() * 100);
   printf("gpu_tot_occupancy = %.4f%% \n",
          (gpu_occupancy + gpu_tot_occupancy).get_occ_fraction() * 100);
