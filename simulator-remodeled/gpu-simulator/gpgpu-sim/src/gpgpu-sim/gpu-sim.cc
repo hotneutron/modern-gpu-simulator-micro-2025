@@ -2096,7 +2096,10 @@ unsigned long long gpgpu_sim::sum_sm_stat_value(const std::string& name) const {
   return sum;
 }
 
-void gpgpu_sim::compute_kernel_pressure_signals(pressure_signals_t& s) {
+void gpgpu_sim::compute_kernel_pressure_signals(pressure_signals_t& s,
+                                                double ai_w_dp,
+                                                double ai_w_tc,
+                                                double ai_w_sfu) {
   s = pressure_signals_t{};
   s.sim_cycles    = gpu_sim_cycle;
   // gpu_sim_insn is the cached projection of the per-SM aggregate; it is only
@@ -2177,6 +2180,11 @@ void gpgpu_sim::compute_kernel_pressure_signals(pressure_signals_t& s) {
   unsigned long long st_now = sum_sm_stat_value("gpgpu_n_store_insn");
   s.n_load_insn  = (ld_now >= m_pressure_snapshot.n_load_insn)  ? (ld_now - m_pressure_snapshot.n_load_insn)  : 0ull;
   s.n_store_insn = (st_now >= m_pressure_snapshot.n_store_insn) ? (st_now - m_pressure_snapshot.n_store_insn) : 0ull;
+  s.compute_ops = (double)s.n_fp_decoded + (double)s.n_int_decoded
+                + ai_w_dp  * s.n_dp_acc
+                + ai_w_tc  * s.n_tc_acc
+                + ai_w_sfu * s.n_sfu_acc;
+  s.mem_ops = s.n_load_insn + s.n_store_insn;
 
   // Hardware priors
   s.peak_dram_bw_bytes_per_cycle =
@@ -2195,9 +2203,12 @@ void gpgpu_sim::compute_kernel_pressure_signals(pressure_signals_t& s) {
   s.achieved_bw_ratio = (s.sim_cycles > 0 && s.peak_dram_bw_bytes_per_cycle > 0.0)
       ? ((double)s.dram_bytes / (double)s.sim_cycles) / s.peak_dram_bw_bytes_per_cycle
       : 0.0;
-  // kernel_AI proxy uses gpu_sim_insn (overestimates: includes mem ops, doesn't count tensor/SFU correctly).
+  // Refined AI: weighted compute-ops (FP+INT decoded + W_dp*dp + W_tc*tc + W_sfu*sfu)
+  // divided by DRAM bytes. Replaces the gpu_sim_insn-based proxy that included
+  // load/store/index-arith ops in the numerator, mis-classifying memory-heavy
+  // kernels as compute-bound.
   s.kernel_ai = (s.dram_bytes > 0)
-      ? (double)s.sim_insns / (double)s.dram_bytes
+      ? s.compute_ops / (double)s.dram_bytes
       : 0.0;
   s.ridge_ratio = (s.ridge_point_flop_per_byte > 0.0)
       ? s.kernel_ai / s.ridge_point_flop_per_byte

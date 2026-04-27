@@ -771,6 +771,10 @@ struct pressure_signals_t {
   double             n_sfu_acc;
   unsigned long long n_load_insn;
   unsigned long long n_store_insn;
+  // weighted compute-ops total (FP_decoded + INT_decoded + W_dp*dp + W_tc*tc + W_sfu*sfu)
+  double             compute_ops;
+  // total memory ops (load + store)
+  unsigned long long mem_ops;
 
   // hardware priors (constant per GPU)
   double peak_dram_bw_bytes_per_cycle;
@@ -859,7 +863,12 @@ class gpgpu_sim : public gpgpu_t {
   // launch() (or just before the per-kernel cycle loop).
   void snapshot_pressure_signals_kernel_start();
   // Non-const because it gathers per-SM stats before reading them.
-  void compute_kernel_pressure_signals(pressure_signals_t& out);
+  // ai_w_dp/tc/sfu are weights applied to per-class instruction counters when
+  // computing compute_ops (the AI numerator).
+  void compute_kernel_pressure_signals(pressure_signals_t& out,
+                                       double ai_w_dp = 2.0,
+                                       double ai_w_tc = 8.0,
+                                       double ai_w_sfu = 4.0);
   // Sum a per-SM stat (out of each SM's m_sm_stats) across all clusters/SMs
   // without touching the gpu-aggregate. Returns 0 for stats not registered or
   // for SM models that don't expose per-SM stats.

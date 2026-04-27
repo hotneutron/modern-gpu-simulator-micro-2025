@@ -582,6 +582,9 @@ trace_config::trace_config() {
   cta_sampling_pilot_max_doublings = 0;
   cta_sampling_pilot_stop_bw_target = 0.8;
   cta_sampling_pilot_stop_delta = 0.05;
+  cta_sampling_ai_w_dp  = 2.0;
+  cta_sampling_ai_w_tc  = 8.0;
+  cta_sampling_ai_w_sfu = 4.0;
 }
 
 void trace_config::reg_options(option_parser_t opp) {
@@ -717,6 +720,21 @@ void trace_config::reg_options(option_parser_t opp) {
                          "Pilot loop accept condition: relative change in IPC "
                          "and achieved_bw_ratio vs. previous iteration below this",
                          "0.05");
+  option_parser_register(opp, "-cta_sampling_ai_w_dp", OPT_DOUBLE,
+                         &cta_sampling_ai_w_dp,
+                         "Refined AI: weight on m_num_dp_acesses contributing to "
+                         "compute_ops (numerator of kernel_ai)",
+                         "2.0");
+  option_parser_register(opp, "-cta_sampling_ai_w_tc", OPT_DOUBLE,
+                         &cta_sampling_ai_w_tc,
+                         "Refined AI: weight on m_num_tensor_core_acesses contributing "
+                         "to compute_ops",
+                         "8.0");
+  option_parser_register(opp, "-cta_sampling_ai_w_sfu", OPT_DOUBLE,
+                         &cta_sampling_ai_w_sfu,
+                         "Refined AI: weight on m_num_sfu_acesses contributing to "
+                         "compute_ops",
+                         "4.0");
 }
 
 void trace_config::parse_config() {

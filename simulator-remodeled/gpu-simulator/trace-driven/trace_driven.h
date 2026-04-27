@@ -172,6 +172,10 @@ class trace_config {
   unsigned get_cta_sampling_pilot_max_doublings() const { return cta_sampling_pilot_max_doublings; }
   double get_cta_sampling_pilot_stop_bw_target() const { return cta_sampling_pilot_stop_bw_target; }
   double get_cta_sampling_pilot_stop_delta() const { return cta_sampling_pilot_stop_delta; }
+  // AI weights: compute_ops = FP_decoded + INT_decoded + W_dp*dp + W_tc*tc + W_sfu*sfu
+  double get_cta_sampling_ai_w_dp()  const { return cta_sampling_ai_w_dp; }
+  double get_cta_sampling_ai_w_tc()  const { return cta_sampling_ai_w_tc; }
+  double get_cta_sampling_ai_w_sfu() const { return cta_sampling_ai_w_sfu; }
 
   unsigned int get_int_latency() const { return int_latency; }
   unsigned int get_fp_latency() const { return fp_latency; }
@@ -243,6 +247,9 @@ class trace_config {
   unsigned cta_sampling_pilot_max_doublings;
   double   cta_sampling_pilot_stop_bw_target; // accept once achieved_bw_ratio >= this
   double   cta_sampling_pilot_stop_delta;     // and pressure deltas vs. previous iter < this
+  double   cta_sampling_ai_w_dp;              // weight on m_num_dp_acesses for compute_ops
+  double   cta_sampling_ai_w_tc;              // weight on m_num_tensor_core_acesses
+  double   cta_sampling_ai_w_sfu;             // weight on m_num_sfu_acesses
 
 };
 

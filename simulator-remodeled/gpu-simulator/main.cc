@@ -467,7 +467,11 @@ int main(int argc, const char **argv) {
 
     if (sim_cycles && kernel_finished_this_iter) {
       pressure_signals_t ps;
-      m_gpgpu_sim->compute_kernel_pressure_signals(ps);
+      m_gpgpu_sim->compute_kernel_pressure_signals(
+          ps,
+          tconfig.get_cta_sampling_ai_w_dp(),
+          tconfig.get_cta_sampling_ai_w_tc(),
+          tconfig.get_cta_sampling_ai_w_sfu());
       kernel_class kc = classify_kernel(ps, tconfig);
       unsigned k_reps = finished_kernel_k_reps
           ? finished_kernel_k_reps
