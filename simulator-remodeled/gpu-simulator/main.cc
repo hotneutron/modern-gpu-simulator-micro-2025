@@ -80,16 +80,18 @@ static const char* kernel_class_name(kernel_class c) {
   return "unknown";
 }
 
-// Three-way classifier: ridge_ratio + DRAM-side pressure proxies.
-// "Pressure-high" beats ridge_ratio: a kernel reading at >=60% peak BW is
+// Three-way classifier: ridge_ratio + DRAM-side pressure proxies + issue-stage
+// memory-stall fraction. "Pressure-high" beats ridge_ratio: a kernel reading
+// at >=60% peak BW or stalling on l1c-wait above the mstall threshold is
 // effectively memory-bound regardless of where its AI puts it on roofline.
-// Note: K-rep pressure signals are biased low (under-fills caches/queues),
-// so borderline cases are biased toward MEMORY by design.
+// Note: K-rep pressure signals are biased low (under-fills caches/queues), so
+// borderline cases are biased toward MEMORY by design.
 static kernel_class classify_kernel(const pressure_signals_t& s,
                                     const trace_config& tc) {
   bool memory_pressure_high =
-      (s.achieved_bw_ratio >= tc.get_cta_sampling_pressure_bw()) ||
-      (s.dram_queue_occupancy_avg >= tc.get_cta_sampling_pressure_queue());
+      (s.achieved_bw_ratio        >= tc.get_cta_sampling_pressure_bw())     ||
+      (s.dram_queue_occupancy_avg >= tc.get_cta_sampling_pressure_queue())  ||
+      (s.mem_stall_frac           >= tc.get_cta_sampling_pressure_mstall());
   if (s.ridge_ratio >= tc.get_cta_sampling_t_high() && !memory_pressure_high)
     return KCLASS_COMPUTE;
   if (s.ridge_ratio <= tc.get_cta_sampling_t_low() || memory_pressure_high)
@@ -499,6 +501,12 @@ int main(int argc, const char **argv) {
              " dram_queue_occupancy_avg=%.4f achieved_bw_ratio=%.4f"
              " peak_dram_bw_bytes_per_cycle=%.2f peak_flops_per_cycle=%.2f"
              " ridge_point_flop_per_byte=%.4f"
+             " n_fp_decoded=%llu n_int_decoded=%llu"
+             " n_dp_acc=%.0f n_tc_acc=%.0f n_sfu_acc=%.0f"
+             " n_load_insn=%llu n_store_insn=%llu"
+             " compute_ops=%.0f mem_ops=%llu"
+             " issue_eval_cycles=%llu stall_l1c_cycles=%llu stall_total_cycles=%llu"
+             " mem_stall_frac=%.4f total_stall_frac=%.4f"
              " kernel_ai=%.4f ridge_ratio=%.4f"
              " class=%s k_reps=%u total_ctas=%u total_sms=%u"
              " n_sat_est=%u target_sim_ctas=%u"
@@ -509,6 +517,12 @@ int main(int argc, const char **argv) {
              ps.dram_queue_occupancy_avg, ps.achieved_bw_ratio,
              ps.peak_dram_bw_bytes_per_cycle, ps.peak_flops_per_cycle,
              ps.ridge_point_flop_per_byte,
+             ps.n_fp_decoded, ps.n_int_decoded,
+             ps.n_dp_acc, ps.n_tc_acc, ps.n_sfu_acc,
+             ps.n_load_insn, ps.n_store_insn,
+             ps.compute_ops, ps.mem_ops,
+             ps.issue_eval_cycles, ps.stall_l1c_cycles, ps.stall_total_cycles,
+             ps.mem_stall_frac, ps.total_stall_frac,
              ps.kernel_ai, ps.ridge_ratio,
              kernel_class_name(kc), k_reps, finished_kernel_total_ctas, total_sms,
              n_sat_est, target_sim_ctas,

@@ -585,6 +585,7 @@ trace_config::trace_config() {
   cta_sampling_ai_w_dp  = 2.0;
   cta_sampling_ai_w_tc  = 8.0;
   cta_sampling_ai_w_sfu = 4.0;
+  cta_sampling_pressure_mstall = 0.4;
 }
 
 void trace_config::reg_options(option_parser_t opp) {
@@ -735,6 +736,11 @@ void trace_config::reg_options(option_parser_t opp) {
                          "Refined AI: weight on m_num_sfu_acesses contributing to "
                          "compute_ops",
                          "4.0");
+  option_parser_register(opp, "-cta_sampling_pressure_mstall", OPT_DOUBLE,
+                         &cta_sampling_pressure_mstall,
+                         "Roofline classifier: mem_stall_frac (issue-stage l1c-wait "
+                         "/ issue_eval) above this is treated as high memory pressure",
+                         "0.4");
 }
 
 void trace_config::parse_config() {

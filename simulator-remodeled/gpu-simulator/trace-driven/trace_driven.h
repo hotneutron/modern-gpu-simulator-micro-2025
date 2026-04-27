@@ -176,6 +176,8 @@ class trace_config {
   double get_cta_sampling_ai_w_dp()  const { return cta_sampling_ai_w_dp; }
   double get_cta_sampling_ai_w_tc()  const { return cta_sampling_ai_w_tc; }
   double get_cta_sampling_ai_w_sfu() const { return cta_sampling_ai_w_sfu; }
+  // Memory-stall fraction threshold (issue-stage l1c-wait cycles / issue_eval cycles)
+  double get_cta_sampling_pressure_mstall() const { return cta_sampling_pressure_mstall; }
 
   unsigned int get_int_latency() const { return int_latency; }
   unsigned int get_fp_latency() const { return fp_latency; }
@@ -250,6 +252,7 @@ class trace_config {
   double   cta_sampling_ai_w_dp;              // weight on m_num_dp_acesses for compute_ops
   double   cta_sampling_ai_w_tc;              // weight on m_num_tensor_core_acesses
   double   cta_sampling_ai_w_sfu;             // weight on m_num_sfu_acesses
+  double   cta_sampling_pressure_mstall;      // mem_stall_frac above this => high mem pressure
 
 };
 
