@@ -75,7 +75,13 @@ STAT_PATTERNS = {
     "gpu_tot_sim_insn":   re.compile(r"^gpu_tot_sim_insn\s*=\s*(\d+)", re.M),
     "gpu_tot_issued_cta": re.compile(r"^gpu_tot_issued_cta\s*=\s*(\d+)", re.M),
     "gpu_tot_ipc":        re.compile(r"^gpu_tot_ipc\s*=\s*([0-9.]+)", re.M),
+    # Phase B: whole-kernel projected cycles + IPC. Distinct from the raw
+    # gpu_tot_sim_cycle, which is the sampled-wave wall-clock.
+    "gpu_tot_sim_cycle_estimated": re.compile(r"^gpu_tot_sim_cycle_estimated\s*=\s*(\d+)", re.M),
+    "gpu_tot_ipc_estimated":       re.compile(r"^gpu_tot_ipc_estimated\s*=\s*([0-9.]+)", re.M),
 }
+# Captured separately because the value is a string (per_cta | steady_state | none).
+ESTIMATION_MODE_PAT = re.compile(r"^gpu_tot_sim_cycle_estimation_mode\s*=\s*(\S+)", re.M)
 
 # Per-kernel pressure-signal fields parsed out of the CTA_PRESSURE_SIGNALS log
 # line. We keep the *last* observed value per field (i.e. the final accepted
@@ -108,6 +114,8 @@ def run_one(label, workload, trace_path, gcfg, tcfg, extra_args, out_dir, env):
         # Last match is the post-final-kernel cumulative.
         matches = pat.findall(text)
         stats[k] = float(matches[-1]) if matches else None
+    em = ESTIMATION_MODE_PAT.findall(text)
+    stats["estimation_mode"] = em[-1] if em else None
     # Pressure-signal fields from the last accepted CTA_PRESSURE_SIGNALS line.
     # We restrict to lines marked pilot_accepted=1 so we get the final-iteration
     # signals rather than the K-rep iteration of an expanded pilot run.
@@ -197,10 +205,13 @@ def main():
             per_mode[label] = stats
         rows.append((wl, descr, per_mode))
 
-    # Comparison table
-    header = ["workload", "mode", "cycles", "insn", "ipc", "ctas",
-              "cycle_err%", "insn_err%", "ipc_err%", "wall_s"]
-    widths = [12, 11, 12, 14, 8, 8, 11, 11, 11, 7]
+    # Comparison table. cycle_err% compares the *estimated* whole-kernel cycle
+    # count (gpu_tot_sim_cycle_estimated) against the baseline's raw cycle
+    # count -- the baseline didn't sample, so its raw equals its estimate.
+    # cycle_err_raw% compares the un-estimated sampled-wave cycle for context.
+    header = ["workload", "mode", "cycles_est", "cycles_raw", "insn", "ipc_est",
+              "ctas", "cycle_err%", "cycle_err_raw%", "insn_err%", "wall_s"]
+    widths = [12, 14, 12, 12, 14, 9, 8, 11, 14, 11, 7]
     line = "  ".join(h.ljust(w) for h, w in zip(header, widths))
     sep = "-" * len(line)
     print()
@@ -209,26 +220,31 @@ def main():
     print(sep)
     for wl, descr, per_mode in rows:
         base = per_mode.get("baseline", {})
+        # Compare against baseline's raw cycle count (the baseline did not
+        # sample, so its raw == its estimate).
+        base_cycle_ref = base.get("gpu_tot_sim_cycle")
         for label, _ in MODES:
             stats = per_mode.get(label, {})
-            cycles = stats.get("gpu_tot_sim_cycle")
-            insns  = stats.get("gpu_tot_sim_insn")
-            ipc    = stats.get("gpu_tot_ipc")
-            ctas   = stats.get("gpu_tot_issued_cta")
+            cycles_raw = stats.get("gpu_tot_sim_cycle")
+            cycles_est = stats.get("gpu_tot_sim_cycle_estimated") or cycles_raw
+            insns      = stats.get("gpu_tot_sim_insn")
+            ipc_est    = stats.get("gpu_tot_ipc_estimated") or stats.get("gpu_tot_ipc")
+            ctas       = stats.get("gpu_tot_issued_cta")
             cell = [wl, label,
-                    fmt(cycles, "{:>12}"),
+                    fmt(cycles_est, "{:>12}"),
+                    fmt(cycles_raw, "{:>12}"),
                     fmt(insns, "{:>14}"),
-                    fmt(ipc, "{:>8}"),
+                    fmt(ipc_est, "{:>9}"),
                     fmt(ctas, "{:>8}")]
             if label != "baseline":
-                cell.append(fmt(err_pct(cycles, base.get("gpu_tot_sim_cycle")), "{:>11}"))
-                cell.append(fmt(err_pct(insns,  base.get("gpu_tot_sim_insn")),  "{:>11}"))
-                cell.append(fmt(err_pct(ipc,    base.get("gpu_tot_ipc")),       "{:>11}"))
+                cell.append(fmt(err_pct(cycles_est, base_cycle_ref), "{:>11}"))
+                cell.append(fmt(err_pct(cycles_raw, base_cycle_ref), "{:>14}"))
+                cell.append(fmt(err_pct(insns,  base.get("gpu_tot_sim_insn")), "{:>11}"))
             else:
-                cell += ["{:>11}".format("-")] * 3
+                cell += ["{:>11}".format("-"), "{:>14}".format("-"), "{:>11}".format("-")]
             cell.append(fmt(stats.get("wall_sec"), "{:>7}"))
             print("  ".join(c.ljust(w) for c, w in zip([cell[0].ljust(12),
-                                                         cell[1].ljust(11)] +
+                                                         cell[1].ljust(14)] +
                                                         cell[2:], widths)))
         print(sep)
     # Pressure-signal table: class transitions and the new Phase A fields per
