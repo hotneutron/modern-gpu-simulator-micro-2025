@@ -159,6 +159,7 @@ struct pilot_state_t {
   unsigned target_sim_ctas; // current iter's target
   unsigned k_reps;          // K (constant per-kernel)
   unsigned total_ctas;      // grid total (constant per-kernel)
+  unsigned total_sms;       // hardware SM count (constant per kernel)
   pilot_stats_snapshot_t snapshot;  // gpu_tot_* before this iter's contribution
   pressure_signals_t prev_signals;  // for stability check
   bool prev_signals_valid;
@@ -243,11 +244,27 @@ static bool pilot_decide_accept(const pilot_state_t& pst, const pressure_signals
     if (kc != KCLASS_COMPUTE) return false;
     // If K-rep happens to cover all CTAs, expansion is a no-op -- accept.
     if (ps.ctas_launched >= pst.total_ctas) return true;
-    // Force expansion when the sample under-covers SMs AND the kernel shows
-    // a memory-stall signal. The threshold pair below was picked to spare
-    // hotspot-style 9-CTA-on-9-SM-with-mem_stall=0 samples (already accurate
-    // under the throughput formula) while catching backprop-style 3-CTA-on-
-    // 3-SM-with-mem_stall=0.3 samples (which under-utilize SM concurrency).
+    // Force expansion when projecting the sample to the full grid would
+    // cross a large concurrency gap. The cycle estimator's
+    // constant-per-SM-throughput assumption breaks badly when the full grid
+    // runs at >>1 CTA/SM while the sample runs at 1 CTA/SM -- per-SM
+    // throughput grows nonlinearly with CTAs/SM (memory + functional-unit
+    // latency hiding). Trigger on EITHER:
+    //   (a) high projection ratio -- full_ctas_per_sm > 4 * sampled_per_sm.
+    //       Threshold catches backprop (6.4×), nn (23×), and other large-
+    //       grid kernels but spares hotspot (1.6×) and lud-like grids
+    //       where the full-grid concurrency is close to the sample's.
+    //   (b) memory-stall signal -- legacy heuristic for grids that aren't
+    //       large but show high mem_stall_frac, where even modest
+    //       concurrency increases shift throughput materially.
+    unsigned tsms = pst.total_sms ? pst.total_sms : 1;
+    unsigned sampled_active = std::min((unsigned)ps.ctas_launched, tsms);
+    if (sampled_active == 0) sampled_active = 1;
+    unsigned full_active = std::min(pst.total_ctas, tsms);
+    if (full_active == 0) full_active = 1;
+    double sampled_per_sm = (double)ps.ctas_launched / (double)sampled_active;
+    double full_per_sm    = (double)pst.total_ctas / (double)full_active;
+    if (full_per_sm > 4.0 * sampled_per_sm) return false;
     bool undersized = (ps.ctas_launched * 2u < pst.total_ctas)
                    && (ps.ctas_launched < 8u);
     if (undersized && ps.mem_stall_frac > 0.10) return false;
@@ -469,6 +486,7 @@ int main(int argc, const char **argv) {
                          * kernel_trace_info->grid_dim_y
                          * kernel_trace_info->grid_dim_z;
           pst.target_sim_ctas = pst.k_reps;
+          pst.total_sms = m_gpgpu_sim->get_config().num_shader();
           pst.prev_signals_valid = false;
         }
         std::cout << "Header info loaded for kernel command : " << commandlist[i].command_string << std::endl;

@@ -42,6 +42,19 @@ DEFAULT_WORKLOADS = {
                    "memory-bound stencil"),
     "lud":        ("lud-rodinia-2.0-ft/_v__b__i___data_64_dat/traces/dynamic_trace.pb",
                    "LU decomposition (GEMM-like dense)"),
+    # Wider validation: the 4 unused rodinia2/Turing kernels exercise
+    # different concurrency profiles than the original 6 -- heartwall has
+    # heavy template-matching loops (compute-heavy), nn is k-NN (irregular
+    # memory), nw is dynamic-programming sweeps (low parallelism), and
+    # streamcluster has heavy DRAM traffic with mid-sized grids.
+    "heartwall":     ("heartwall-rodinia-2.0-ft/__data_test_avi_1___data_result_1_txt/traces/dynamic_trace.pb",
+                      "template-match image processing (compute-heavy)"),
+    "nn":            ("nn-rodinia-2.0-ft/__data_filelist_4_3_30_90___data_filelist_4_3_30_90_result_txt/traces/dynamic_trace.pb",
+                      "k-nearest-neighbors (irregular memory)"),
+    "nw":            ("nw-rodinia-2.0-ft/128_10___data_result_128_10_txt/traces/dynamic_trace.pb",
+                      "Needleman-Wunsch DP (low parallelism)"),
+    "streamcluster": ("streamcluster-rodinia-2.0-ft/3_6_16_1024_1024_100_none_output_txt_1___data_result_3_6_16_1024_1024_100_none_1_txt/traces/dynamic_trace.pb",
+                      "k-means clustering (memory-bound)"),
 }
 
 REPO = Path(__file__).resolve().parents[2]
@@ -158,7 +171,8 @@ def err_pct(sampled, baseline):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--workloads",
-                    default="hotspot,backprop,pathfinder,bfs,srad_v2,lud",
+                    default="hotspot,backprop,pathfinder,bfs,srad_v2,lud,"
+                            "heartwall,nn,nw,streamcluster",
                     help="Comma-separated workload keys")
     ap.add_argument("--trace-root", default=str(DEFAULT_TRACE_ROOT))
     ap.add_argument("--gcfg", default=str(DEFAULT_GCFG))
