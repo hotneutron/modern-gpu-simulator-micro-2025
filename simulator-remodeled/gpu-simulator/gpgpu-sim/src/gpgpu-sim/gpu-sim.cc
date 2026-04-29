@@ -1846,6 +1846,8 @@ void gpgpu_sim::create_gpu_per_sm_stats() {
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_accesses", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_accesses_coalesced", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_accesses_not_coalesced", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_l1d_precache_merges", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_l1d_precache_merged_requesters", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
   
   for(unsigned int i = 0; i < N_MEM_STAGE_ACCESS_TYPE; i++) {
     for(unsigned int j = 0; j < N_MEM_STAGE_STALL_TYPE; j++) {

@@ -211,6 +211,7 @@ class ldst_unit_sm : public functional_unit_shared_sm_part {
 
   read_only_cache *get_L1C();
   l1_cache *get_L1D();
+  unsigned get_sid() const;
 
   SM* get_SM();
 
@@ -329,6 +330,9 @@ class ldst_unit_sm : public functional_unit_shared_sm_part {
   void shared_dispatch();
   void execute_miscellaneous_dispatch();
   void execute_cache_dispatch(AccessQueue *qu, cache_t *cache, std::function<mem_stage_stall_type(cache_t&, mem_access_t*)> func_process);  
+  bool can_merge_with_queued_l1d_access(mem_fetch *queued_mf, const mem_access_t *acc) const;
+  void merge_access_requesters(AccessCoalescingInformation &dst, const AccessCoalescingInformation &src);
+  bool try_merge_into_l1d_latency_queue(mem_access_t *acc);
   mem_stage_stall_type dispatch_to_memory_access_queue_l1Dcache(cache_t &cache, mem_access_t *acc);
   mem_stage_stall_type dispatch_to_memory_access_queue_l1Ccache(cache_t &cache, mem_access_t *acc);
   mem_stage_stall_type dispatch_to_memory_access_queue_l1Tcache(cache_t &cache, mem_access_t *acc);

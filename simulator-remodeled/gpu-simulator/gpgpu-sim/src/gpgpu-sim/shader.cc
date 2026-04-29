@@ -1184,12 +1184,26 @@ void shader_core_stats::print_coalescing_stats(FILE *out) {
   unsigned long long total_accesses_coalesced = m_gpu-> m_gpu_per_sm_stats.m_stats_map["total_accesses_coalesced"]->get_value();
   unsigned long long total_accesses_not_coalesced = m_gpu-> m_gpu_per_sm_stats.m_stats_map["total_accesses_not_coalesced"]->get_value();
   unsigned long long total_accesses = m_gpu-> m_gpu_per_sm_stats.m_stats_map["total_accesses"]->get_value();
+  unsigned long long total_l1d_precache_merges = m_gpu->m_gpu_per_sm_stats.m_stats_map["total_l1d_precache_merges"]->get_value();
+  unsigned long long total_l1d_precache_merged_requesters =
+      m_gpu->m_gpu_per_sm_stats.m_stats_map["total_l1d_precache_merged_requesters"]->get_value();
   unsigned long long total_accesses_candidate_to_coalesce = total_accesses_coalesced + total_accesses_not_coalesced;
   long double total_percentage_accesses_candidate_to_coalesce = total_accesses ? ( ( ((double) total_accesses_candidate_to_coalesce)/ total_accesses) * 100 ) : 0; // Avoid NaN
   long double total_percentage_accesses_coalesced = total_accesses_candidate_to_coalesce ? ( ( ((double) total_accesses_coalesced)/ total_accesses_candidate_to_coalesce) * 100 ) : 0; // Avoid NaN
+  long double average_l1d_precache_merged_requesters =
+      total_l1d_precache_merges
+          ? (((long double)total_l1d_precache_merged_requesters) /
+             total_l1d_precache_merges)
+          : 0;
 
   fprintf(out, "total_percentage_accesses_candidate_to_coalesce = %.4Lf\n", total_percentage_accesses_candidate_to_coalesce);
   fprintf(out, "total_percentage_accesses_coalesced = %.4Lf\n", total_percentage_accesses_coalesced);
+  fprintf(out, "total_l1d_precache_merges = %llu\n",
+          total_l1d_precache_merges);
+  fprintf(out, "total_l1d_precache_merged_requesters = %llu\n",
+          total_l1d_precache_merged_requesters);
+  fprintf(out, "average_l1d_precache_merged_requesters = %.4Lf\n",
+          average_l1d_precache_merged_requesters);
 }
 
 // MOD. Begin. Remodeling
