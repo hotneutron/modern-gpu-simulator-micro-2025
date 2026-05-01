@@ -1007,6 +1007,25 @@ void Subcore::fetch(SM *shared_sm) {
           status = m_L0I->access((new_addr_type)global_pc_addr, mf,
                                  shared_sm->get_current_gpu_cycle(),
                                  events);
+          if ((status == HIT) && !m_inst_fetch_decode_latch.m_valid &&
+              m_L0I->is_first_access_ready()) {
+            mem_fetch *hit_mf = m_L0I->next_first_access();
+            unsigned int hit_unique_function_id =
+                hit_mf->get_unique_function_id();
+            unsigned int hit_subcore_warp_id =
+                translate_warp_id_of_sm_to_subcore(
+                    hit_mf->get_wid(), shared_sm->get_num_subcores());
+            address_type local_pc_response =
+                shared_sm->from_global_pc_address_to_local_pc(
+                    hit_mf->get_addr(), hit_unique_function_id);
+            m_inst_fetch_decode_latch = ifetch_buffer_t(
+                local_pc_response, hit_mf->get_access_size(),
+                hit_subcore_warp_id);
+            m_inst_fetch_decode_latch.m_valid = true;
+            m_warps_of_subcore[hit_subcore_warp_id]->set_last_fetch(
+                shared_sm->get_gpu()->gpu_sim_cycle);
+            delete hit_mf;
+          }
         }
         
         // if(shared_sm->get_sid() == 1 && m_subcore_id == 0) {
