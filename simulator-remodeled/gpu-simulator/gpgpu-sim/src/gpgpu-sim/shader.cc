@@ -1216,10 +1216,27 @@ void shader_core_stats::print_remodeling_stats(FILE *fout) {
   long double total_percentage_dp_instructions = total_num_dp_instructions ? ( ( ((double) total_num_dp_instructions)/ total_num_warp_instructions) * 100 ) : 0; // Avoid NaN
   fprintf(fout, "total_percentage_dp_instructions = %.4Lf\n", total_percentage_dp_instructions);
   total_num_cycles_issue_stage_issuing = m_gpu-> m_gpu_per_sm_stats.m_stats_map["total_num_cycles_issue_stage_issuing"]->get_value();
+  unsigned long long total_num_cycles_issue_stage_stall_issue_port_busy = m_gpu-> m_gpu_per_sm_stats.m_stats_map["total_num_cycles_issue_stage_stall_issue_port_busy"]->get_value();
+  unsigned long long total_num_cycles_issue_stage_stall_no_valid_instruction = m_gpu-> m_gpu_per_sm_stats.m_stats_map["total_num_cycles_issue_stage_stall_no_valid_instruction"]->get_value();
+  unsigned long long total_num_cycles_issue_stage_stall_no_warps_ready = m_gpu-> m_gpu_per_sm_stats.m_stats_map["total_num_cycles_issue_stage_stall_no_warps_ready"]->get_value();
   unsigned long long total_num_cycles_issue_stage_stall_next_stage_not_available = m_gpu-> m_gpu_per_sm_stats.m_stats_map["total_num_cycles_issue_stage_stall_next_stage_not_available"]->get_value();
   total_num_cycles_issue_stage_evaluated = m_gpu-> m_gpu_per_sm_stats.m_stats_map["total_num_cycles_issue_stage_evaluated"]->get_value();
-  fprintf(fout, "total_percentage_cycles_issue_stage_issuing = %.4Lf\n", ((long double) total_num_cycles_issue_stage_issuing / total_num_cycles_issue_stage_evaluated) * 100);
-  fprintf(fout, "total_percentage_cycles_issue_stage_not_issuing_stall_next_stage_not_available = %.4Lf\n", ((long double) total_num_cycles_issue_stage_stall_next_stage_not_available / total_num_cycles_issue_stage_evaluated) * 100);
+  fprintf(fout, "total_num_cycles_issue_stage_evaluated = %llu\n", total_num_cycles_issue_stage_evaluated);
+  fprintf(fout, "total_num_cycles_issue_stage_issuing = %llu\n", total_num_cycles_issue_stage_issuing);
+  fprintf(fout, "total_num_cycles_issue_stage_stall_next_stage_not_available = %llu\n", total_num_cycles_issue_stage_stall_next_stage_not_available);
+  fprintf(fout, "total_num_cycles_issue_stage_stall_issue_port_busy = %llu\n", total_num_cycles_issue_stage_stall_issue_port_busy);
+  fprintf(fout, "total_num_cycles_issue_stage_stall_no_valid_instruction = %llu\n", total_num_cycles_issue_stage_stall_no_valid_instruction);
+  fprintf(fout, "total_num_cycles_issue_stage_stall_no_warps_ready = %llu\n", total_num_cycles_issue_stage_stall_no_warps_ready);
+  long double total_percentage_cycles_issue_stage_issuing = total_num_cycles_issue_stage_evaluated ? (((long double) total_num_cycles_issue_stage_issuing / total_num_cycles_issue_stage_evaluated) * 100) : 0;
+  long double total_percentage_cycles_issue_stage_stall_next_stage_not_available = total_num_cycles_issue_stage_evaluated ? (((long double) total_num_cycles_issue_stage_stall_next_stage_not_available / total_num_cycles_issue_stage_evaluated) * 100) : 0;
+  long double total_percentage_cycles_issue_stage_stall_issue_port_busy = total_num_cycles_issue_stage_evaluated ? (((long double) total_num_cycles_issue_stage_stall_issue_port_busy / total_num_cycles_issue_stage_evaluated) * 100) : 0;
+  long double total_percentage_cycles_issue_stage_stall_no_valid_instruction = total_num_cycles_issue_stage_evaluated ? (((long double) total_num_cycles_issue_stage_stall_no_valid_instruction / total_num_cycles_issue_stage_evaluated) * 100) : 0;
+  long double total_percentage_cycles_issue_stage_stall_no_warps_ready = total_num_cycles_issue_stage_evaluated ? (((long double) total_num_cycles_issue_stage_stall_no_warps_ready / total_num_cycles_issue_stage_evaluated) * 100) : 0;
+  fprintf(fout, "total_percentage_cycles_issue_stage_issuing = %.4Lf\n", total_percentage_cycles_issue_stage_issuing);
+  fprintf(fout, "total_percentage_cycles_issue_stage_not_issuing_stall_next_stage_not_available = %.4Lf\n", total_percentage_cycles_issue_stage_stall_next_stage_not_available);
+  fprintf(fout, "total_percentage_cycles_issue_stage_stall_issue_port_busy = %.4Lf\n", total_percentage_cycles_issue_stage_stall_issue_port_busy);
+  fprintf(fout, "total_percentage_cycles_issue_stage_stall_no_valid_instruction = %.4Lf\n", total_percentage_cycles_issue_stage_stall_no_valid_instruction);
+  fprintf(fout, "total_percentage_cycles_issue_stage_stall_no_warps_ready = %.4Lf\n", total_percentage_cycles_issue_stage_stall_no_warps_ready);
 
   fprintf(fout, "total_num_constant_cache_different_blocks = %zu\n", all_const_cache_accessed_blocks.size());
   fprintf(fout, "total_num_global_memory_blocks = %zu\n", all_global_memory_accessed_blocks.size());
@@ -1228,7 +1245,7 @@ void shader_core_stats::print_remodeling_stats(FILE *fout) {
 
   unsigned long long total_num_evals_rf = m_gpu-> m_gpu_per_sm_stats.m_stats_map["total_num_evals_rf"]->get_value();
   unsigned long long total_num_evals_rf_with_conflict = m_gpu-> m_gpu_per_sm_stats.m_stats_map["total_num_evals_rf_with_conflict"]->get_value();
-  fprintf(fout, "total_percentage_evals_rf_with_conflict = %.4Lf\n", ((long double) total_num_evals_rf_with_conflict / total_num_evals_rf) * 100);
+  fprintf(fout, "total_percentage_evals_rf_with_conflict = %.4Lf\n", total_num_evals_rf ? (((long double) total_num_evals_rf_with_conflict / total_num_evals_rf) * 100) : 0);
   // OLD
   // fprintf(fout, "total_num_register_file_cache_hits = %lld\n", total_num_register_file_cache_hits);
   // fprintf(fout, "total_num_register_file_cache_allocations = %lld\n", total_num_register_file_cache_allocations);
@@ -3135,6 +3152,13 @@ void gpgpu_sim::shader_print_cache_stats(FILE *fout) const {
             total_css.pending_hits);
     fprintf(fout, "\tL0I_total_cache_reservation_fails = %llu\n",
             total_css.res_fails);
+    fprintf(fout, "\tL0I_cache_port_available_cycles = %llu\n",
+            total_css.port_available_cycles);
+    fprintf(fout, "\tL0I_cache_data_port_busy_cycles = %llu\n",
+            total_css.data_port_busy_cycles);
+    fprintf(fout, "\tL0I_cache_fill_port_busy_cycles = %llu\n",
+            total_css.fill_port_busy_cycles);
+    total_css.print_port_stats(fout, "\tL0I_cache");
   }
   // MOD. End. L0I
 
@@ -3156,6 +3180,13 @@ void gpgpu_sim::shader_print_cache_stats(FILE *fout) const {
             total_css.pending_hits);
     fprintf(fout, "\tL1I_total_cache_reservation_fails = %llu\n",
             total_css.res_fails);
+    fprintf(fout, "\tL1I_cache_port_available_cycles = %llu\n",
+            total_css.port_available_cycles);
+    fprintf(fout, "\tL1I_cache_data_port_busy_cycles = %llu\n",
+            total_css.data_port_busy_cycles);
+    fprintf(fout, "\tL1I_cache_fill_port_busy_cycles = %llu\n",
+            total_css.fill_port_busy_cycles);
+    total_css.print_port_stats(fout, "\tL1I_cache");
   }
 
   // L1D
