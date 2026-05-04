@@ -160,6 +160,14 @@ struct pilot_state_t {
   unsigned k_reps;          // K (constant per-kernel)
   unsigned total_ctas;      // grid total (constant per-kernel)
   unsigned total_sms;       // hardware SM count (constant per kernel)
+  // Per-kernel override of the global pilot_max_doublings cap. 0 = use
+  // global config. Bumped by C3a when iter 0 force-expand fires and the
+  // projection ratio (full_per_sm / sampled_per_sm) is large -- without a
+  // deeper sample, the log-fit's per-SM-throughput extrapolation goes too
+  // far past its calibration range and either under- or over-shoots the
+  // real full-grid behavior. Capped at PILOT_MAX_DOUBLINGS_CEILING so a
+  // pathologically large grid can't drive sim time through the floor.
+  unsigned effective_max_doublings;
   pilot_stats_snapshot_t snapshot;  // gpu_tot_* before this iter's contribution
   pressure_signals_t prev_signals;  // for stability check
   bool prev_signals_valid;
@@ -167,6 +175,14 @@ struct pilot_state_t {
   // the concurrency-throughput fit at accept time can use all data points.
   std::vector<pilot_iter_obs_t> history;
 };
+
+// Hard ceiling on the per-kernel doublings cap that C3a can adaptively bump
+// to. Keeps sim-time bounded: at this ceiling the pilot can run up to
+// (CEILING + 1) expansion iterations on top of K-rep. Picked at 5 so that
+// nn-class kernels (projection ratio ~23x, log2 ~4.5) reach a sample at
+// density 16 -- four log-fit data points at densities {1,2,4,8,16} bring
+// the extrapolation distance to full-grid density (~23) within 2x.
+static constexpr unsigned PILOT_MAX_DOUBLINGS_CEILING = 5u;
 
 // Mutate kernel_trace_info's sampling fields for the next pilot iteration.
 // target == 0 leaves sampling off (mode 0); target == K uses the K-rep list;
@@ -238,7 +254,7 @@ static bool pilot_fit_log_throughput(const std::vector<pilot_iter_obs_t>& histor
 //     concurrency.
 //   iter > 0: accept on stop_bw_target reached, or stable deltas, or hit the
 //     doublings cap, or sim_ctas == total_ctas.
-static bool pilot_decide_accept(const pilot_state_t& pst, const pressure_signals_t& ps,
+static bool pilot_decide_accept(pilot_state_t& pst, const pressure_signals_t& ps,
                                 kernel_class kc, const trace_config& tc) {
   if (pst.iter == 0) {
     // If K-rep happens to cover all CTAs, expansion is a no-op -- accept,
@@ -269,14 +285,33 @@ static bool pilot_decide_accept(const pilot_state_t& pst, const pressure_signals
     if (full_active == 0) full_active = 1;
     double sampled_per_sm = (double)ps.ctas_launched / (double)sampled_active;
     double full_per_sm    = (double)pst.total_ctas / (double)full_active;
-    if (full_per_sm > 4.0 * sampled_per_sm) return false;
+    if (full_per_sm > 4.0 * sampled_per_sm) {
+      // C3a: high projection ratio. The default doublings cap (typically 2)
+      // leaves the deepest pilot sample at densities far short of the full
+      // grid -- the log-fit's per-SM-throughput extrapolation then has to
+      // span an out-of-distribution range and predicts T_full poorly. Bump
+      // the per-kernel cap so subsequent doublings push the sample closer
+      // to the full-grid CTAs/SM density. Cap is ceil(log2(ratio)) so the
+      // deepest sample N is within ~2x of full_per_sm; held at
+      // PILOT_MAX_DOUBLINGS_CEILING (4) to keep sim-time bounded for very
+      // large grids (e.g. nn at ratio 23 would otherwise want 5 doublings).
+      double ratio = full_per_sm / sampled_per_sm;
+      unsigned needed = (unsigned)std::ceil(std::log2(ratio));
+      if (needed > PILOT_MAX_DOUBLINGS_CEILING) needed = PILOT_MAX_DOUBLINGS_CEILING;
+      unsigned global_cap = tc.get_cta_sampling_pilot_max_doublings();
+      pst.effective_max_doublings = std::max(global_cap, needed);
+      return false;
+    }
     bool undersized = (ps.ctas_launched * 2u < pst.total_ctas)
                    && (ps.ctas_launched < 8u);
     if (undersized && ps.mem_stall_frac > 0.10) return false;
     return true;
   }
   if (pst.target_sim_ctas >= pst.total_ctas) return true;
-  if (pst.iter > tc.get_cta_sampling_pilot_max_doublings()) return true;
+  unsigned cap = pst.effective_max_doublings
+               ? pst.effective_max_doublings
+               : tc.get_cta_sampling_pilot_max_doublings();
+  if (pst.iter > cap) return true;
   if (ps.achieved_bw_ratio >= tc.get_cta_sampling_pilot_stop_bw_target()) return true;
   if (pst.prev_signals_valid) {
     double tol = tc.get_cta_sampling_pilot_stop_delta();
@@ -565,6 +600,7 @@ int main(int argc, const char **argv) {
             pst.total_ctas = this_total;
             pst.target_sim_ctas = pst.k_reps;
             pst.total_sms = this_sms;
+            pst.effective_max_doublings = 0;  // 0 = use global config; C3a may bump
             pst.prev_signals_valid = false;
           }
         }
