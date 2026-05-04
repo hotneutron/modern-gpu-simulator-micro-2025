@@ -307,23 +307,85 @@ static unsigned pilot_next_target(const pilot_state_t& pst,
   return next;
 }
 
-// Stratified replication of K representative CTAs into a target-slot list.
-// Each rep gets ceil(target/K) or floor(target/K) slots; the order is then
-// deterministically Fisher-Yates shuffled (seeded) to break alignment with
-// L2-set / DRAM-bank striping that pure round-robin replication would create.
+// Build the list of CTAs to actually simulate from the K-rep "anchor" set.
+//
+// Three regimes:
+//   target <= K              : return reps as-is (sample is the K-rep set).
+//   target >= total_ctas     : C2a -- enumerate every unique CTA in the grid;
+//                              the sample IS the full grid. No replication.
+//   K < target < total_ctas  : C2b -- start from the K reps, then append
+//                              evenly-spaced *fresh* unique CTAs from across
+//                              the grid until we've hit target. Only fall
+//                              back to duplicating reps if the unique-CTA
+//                              pool is exhausted (which shouldn't happen
+//                              since target < total_ctas implies at least
+//                              target - K unique CTAs are available).
+//
+// The pre-C2 implementation always replicated reps to fill the target, which
+// means kernels like heartwall (51x1x1 grid, K-rep collapses to 3 corners,
+// pilot expanded to target=51) produced "51 copies of 3 corners" rather than
+// 51 unique CTAs -- the sampled "full grid" was biased toward boundary work
+// and didn't reflect the average per-CTA work distribution.
+//
+// The output is Fisher-Yates shuffled (seeded) to break alignment with
+// L2-set / DRAM-bank striping that pure linear ordering would create.
 static std::vector<std::tuple<unsigned,unsigned,unsigned>>
 expand_sampled_ctas(const std::vector<std::tuple<unsigned,unsigned,unsigned>>& reps,
-                    unsigned target_sim_ctas, unsigned seed) {
+                    unsigned target_sim_ctas, unsigned seed,
+                    unsigned gx, unsigned gy, unsigned gz) {
   unsigned K = (unsigned)reps.size();
+  unsigned total_ctas = gx * gy * gz;
   if (K == 0 || target_sim_ctas <= K) return reps;
+
   std::vector<std::tuple<unsigned,unsigned,unsigned>> out;
   out.reserve(target_sim_ctas);
-  unsigned per_rep = target_sim_ctas / K;
-  unsigned remainder = target_sim_ctas % K;
-  for (unsigned i = 0; i < K; ++i) {
-    unsigned count = per_rep + (i < remainder ? 1u : 0u);
-    for (unsigned c = 0; c < count; ++c) out.push_back(reps[i]);
+
+  if (target_sim_ctas >= total_ctas) {
+    // C2a: full-grid sample. Enumerate every CTA in the grid.
+    out.reserve(total_ctas);
+    for (unsigned z = 0; z < gz; ++z)
+      for (unsigned y = 0; y < gy; ++y)
+        for (unsigned x = 0; x < gx; ++x)
+          out.emplace_back(x, y, z);
+  } else {
+    // C2b: start with the K reps, supplement with fresh unique CTAs.
+    out = reps;
+    std::set<std::tuple<unsigned,unsigned,unsigned>> seen(reps.begin(), reps.end());
+
+    // Build the pool of non-rep coords in linearized order.
+    std::vector<std::tuple<unsigned,unsigned,unsigned>> pool;
+    pool.reserve(total_ctas - K);
+    for (unsigned z = 0; z < gz; ++z) {
+      for (unsigned y = 0; y < gy; ++y) {
+        for (unsigned x = 0; x < gx; ++x) {
+          auto coord = std::make_tuple(x, y, z);
+          if (seen.find(coord) == seen.end()) pool.push_back(coord);
+        }
+      }
+    }
+
+    // Pick (target - K) coords evenly spaced across the pool. Capped at the
+    // pool size; any remaining slots after the pool is exhausted fall back
+    // to duplication so the post-C2 invariant "out.size() == target_sim_ctas"
+    // still holds.
+    unsigned want = target_sim_ctas - K;
+    if (want > (unsigned)pool.size()) want = (unsigned)pool.size();
+    if (want > 0) {
+      double stride = (double)pool.size() / (double)want;
+      for (unsigned j = 0; j < want; ++j) {
+        unsigned idx = (unsigned)((double)j * stride);
+        if (idx >= pool.size()) idx = (unsigned)pool.size() - 1;
+        out.push_back(pool[idx]);
+      }
+    }
+    // Fallback to duplication if the unique pool wasn't enough (only
+    // possible when target_sim_ctas > total_ctas, which the regime check
+    // above already shunts to C2a -- so this path is defensive only).
+    while (out.size() < target_sim_ctas) {
+      out.push_back(reps[out.size() % K]);
+    }
   }
+
   std::mt19937 rng(seed);
   for (size_t i = out.size() - 1; i > 0; --i) {
     std::uniform_int_distribution<size_t> dist(0, i);
@@ -375,7 +437,7 @@ static void update_sampling_on_trace_info(kernel_trace_t* ti, unsigned target,
   unsigned k = (unsigned)reps.size();
   std::vector<std::tuple<unsigned,unsigned,unsigned>> sampled;
   if (target > k && target <= total_ctas) {
-    sampled = expand_sampled_ctas(reps, target, seed);
+    sampled = expand_sampled_ctas(reps, target, seed, gx, gy, gz);
   } else {
     sampled = reps;
   }
@@ -791,7 +853,8 @@ trace_kernel_info_t *create_kernel_info( kernel_trace_t* kernel_trace_info,
       k = (unsigned)reps.size();
       unsigned target = config->get_cta_sampling_target_ctas();
       if (target > k && target <= total_ctas) {
-        sampled = expand_sampled_ctas(reps, target, config->get_cta_sampling_seed());
+        sampled = expand_sampled_ctas(reps, target, config->get_cta_sampling_seed(),
+                                      gx, gy, gz);
       } else {
         sampled = reps;
       }
