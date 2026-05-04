@@ -241,9 +241,14 @@ static bool pilot_fit_log_throughput(const std::vector<pilot_iter_obs_t>& histor
 static bool pilot_decide_accept(const pilot_state_t& pst, const pressure_signals_t& ps,
                                 kernel_class kc, const trace_config& tc) {
   if (pst.iter == 0) {
-    if (kc != KCLASS_COMPUTE) return false;
-    // If K-rep happens to cover all CTAs, expansion is a no-op -- accept.
+    // If K-rep happens to cover all CTAs, expansion is a no-op -- accept,
+    // regardless of class. Without this hoist, memory- and mixed-classified
+    // kernels whose K-rep already saw the whole grid (e.g. nw's 1-CTA
+    // kernels) get pointlessly re-run at iter 1 with the same CTA set,
+    // adding pilot overhead and cache-state pollution that makes the
+    // accepted iter slower than baseline.
     if (ps.ctas_launched >= pst.total_ctas) return true;
+    if (kc != KCLASS_COMPUTE) return false;
     // Force expansion when projecting the sample to the full grid would
     // cross a large concurrency gap. The cycle estimator's
     // constant-per-SM-throughput assumption breaks badly when the full grid
@@ -479,15 +484,27 @@ int main(int argc, const char **argv) {
         kernels_info.push_back(kernel_info);
         if (pilot_loop_enabled) {
           // Initialize pilot state for this kernel. Iter 0 = K-rep run.
-          pilot_state_t& pst = pilot_states[kernel_trace_info];
-          pst.iter = 0;
-          pst.k_reps = (unsigned)kernel_trace_info->sampled_ctas.size();
-          pst.total_ctas = kernel_trace_info->grid_dim_x
-                         * kernel_trace_info->grid_dim_y
-                         * kernel_trace_info->grid_dim_z;
-          pst.target_sim_ctas = pst.k_reps;
-          pst.total_sms = m_gpgpu_sim->get_config().num_shader();
-          pst.prev_signals_valid = false;
+          // Skip the pilot for tiny grids (total_ctas < total_sms): the
+          // kernel runs in <= 1 SM-wave anyway so the achievable speedup
+          // ceiling is small, while the pilot's iter-0-reject + iter-1-
+          // accept sequence + cache-state pollution between iterations
+          // typically makes the accepted iter slower than baseline. With
+          // pst absent, the kernel falls through to a single K-rep run
+          // and accept defaults to true downstream. This was the nw
+          // failure mode (1-8 CTA kernels) on the wider validation.
+          unsigned this_total = kernel_trace_info->grid_dim_x
+                              * kernel_trace_info->grid_dim_y
+                              * kernel_trace_info->grid_dim_z;
+          unsigned this_sms = m_gpgpu_sim->get_config().num_shader();
+          if (this_total >= this_sms) {
+            pilot_state_t& pst = pilot_states[kernel_trace_info];
+            pst.iter = 0;
+            pst.k_reps = (unsigned)kernel_trace_info->sampled_ctas.size();
+            pst.total_ctas = this_total;
+            pst.target_sim_ctas = pst.k_reps;
+            pst.total_sms = this_sms;
+            pst.prev_signals_valid = false;
+          }
         }
         std::cout << "Header info loaded for kernel command : " << commandlist[i].command_string << std::endl;
         i++;
