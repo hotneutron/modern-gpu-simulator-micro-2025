@@ -176,11 +176,127 @@ unique CTAs first*
 
 ---
 
-## C3 — bound log-fit extrapolation + adaptive deeper expansion
+## C3 — adaptive deeper expansion (C3a only; C3b dropped)
 
 **Targets:** nn (+128.4% post-C2). Last of the three planned changes.
 
-### Code
+### C3b dropped before implementation — wrong direction
 
-(in progress)
+The plan's C3b would have clamped `T_full` to `T(4 × max_sampled_per_sm)`
+when the full-grid CTAs/SM density was beyond that range. Reasoning was
+defensive: don't trust extrapolation past the calibration range.
+
+But once we saw the actual numbers, C3b was clearly the wrong fix for
+nn. The log-fit shape `T(N) = a + b*log(N+1)` is monotone non-decreasing,
+so clamping `N_eval` to a *smaller* value would predict a *smaller*
+`T_full`, which means *more* cycles, which is the wrong direction --
+nn's failure is under-extrapolation (predicted T_full too low → too
+many cycles), not over-extrapolation. The C3b clamp would have made
+nn's overshoot even worse.
+
+C3b is deferred. If a workload later shows the opposite failure (real
+full-grid throughput *lower* than log-fit predicts, e.g. a kernel that
+hits a hard saturation at moderate concurrency), a clamp would help
+there. Currently no such workload in the validation set, so don't
+ship the bound speculatively.
+
+### C3a — adaptive `pilot_max_doublings` for high-projection kernels
+
+`simulator-remodeled/gpu-simulator/main.cc`, ~40 LOC:
+
+- Added `effective_max_doublings` to `pilot_state_t` (default 0 = use
+  global config).
+- In `pilot_decide_accept` iter-0 force-expand block, when
+  `full_per_sm > 4 * sampled_per_sm`, compute
+  `effective_cap = max(global_cap, ceil(log2(projection_ratio)))`,
+  bounded by `PILOT_MAX_DOUBLINGS_CEILING = 5` to keep sim-time finite.
+- Cap check at `iter > N` now reads `pst.effective_max_doublings` if
+  non-zero, falling back to global config.
+- `pilot_decide_accept` signature changed from
+  `(const pilot_state_t&)` to `(pilot_state_t&)` so the per-state
+  override can be set.
+
+For nn (full=23.45, sampled=1, ratio=23.45, ceil(log2)=5,
+ceiling-clamped to 5): cap = 5. Pilot now expands through densities
+{1, 1, 1, 2, 4, 8, 16}, giving the log fit 5 distinct N values to
+calibrate from. Extrapolation distance from N=16 to N=23.45 is just
+1.47× past the deepest sample.
+
+### Result
+
+```
+              | after C2 | after C3a (ceiling=5)
+hotspot       | +14.7    | +14.7    (unchanged; no force-expand)
+backprop      | -13.2    | -13.9    (cap bumped to 3; minor shift)
+pathfinder    |  -0.3    |  -0.3    (unchanged)
+bfs           |  +3.3    |  +3.3    (unchanged)
+srad_v2       | +18.1    | +18.1    (unchanged)
+lud           |  -0.0    |  -0.0    (unchanged)
+heartwall     | -23.4    | -23.4    (unchanged; cache pollution-bound)
+nn            | +128.4   | +10.1    <-- log-fit now spans N=1..16
+nw            |  +5.0    |  +5.0    (unchanged)
+              |          |
+p50           |  13.2%   |  10.1%   ✓ (target <15%)
+p90           | 128.4%   |  23.4%   ✓ (target <25%)
+```
+
+### Notes / surprises
+
+- **First try ceiling=4** gave nn +37%, not +10%. Bumping the safety
+  ceiling to 5 (one more doubling, density 16 in the deepest sample)
+  closed the remaining gap. Sim-time impact: nn pilot wall went from
+  4.9s baseline → 7s (ceiling=4) → 11.6s (ceiling=5). The pilot is
+  now slightly *slower* than baseline for nn specifically, which is
+  acceptable since the goal is accuracy, not raw simulator throughput.
+- backprop's projection ratio is 6.4× → log2 ≈ 2.68 → ceil=3. So
+  C3a bumped its cap from default 2 to 3 (one extra doubling). The
+  resulting iter-4 sample reaches density 8 (= 320 CTAs out of 256;
+  capped to total_ctas, so target=256 = full grid). With sampled ==
+  total_ctas the log fit isn't even consulted (scale=1 short-circuit
+  path). Slight err% shift from -13.2 to -13.9 is from the larger
+  sample's marginally-different stat aggregation, not the formula.
+- All non-force-expand kernels (hotspot, srad_v2, bfs, lud,
+  pathfinder, nw) have `effective_max_doublings == 0` and use the
+  global config exactly as before. No risk of regression on the
+  workloads that were already at target.
+
+### Commit
+
+`471ccd5` — *CTA sampling: C3a -- adaptive pilot doublings for
+high-projection kernels*
+
+---
+
+## Final summary
+
+```
+              | starting | C1     | C2     | C3a
+hotspot       | +14.7    | +14.7  | +14.7  | +14.7
+backprop      | -15.4    | -15.4  | -13.2  | -13.9
+pathfinder    |  -2.6    |  -0.3  |  -0.3  |  -0.3
+bfs           |  -9.9    |  +3.3  |  +3.3  |  +3.3
+srad_v2       | +17.3    | +17.3  | +18.1  | +18.1
+lud           |  -0.1    |  -0.0  |  -0.0  |  -0.0
+heartwall     | -28.7    | -28.7  | -23.4  | -23.4
+nn            | +103.5   | +103.5 | +128.4 | +10.1
+nw            |  +56.8   |   +5.0 |   +5.0 |   +5.0
+              |          |        |        |
+p50           |  15.0%   |   9.9% |  13.2% |  10.1%
+p90           |  56.8%   | 103.5% | 128.4% |  23.4%
+```
+
+**Both targets met on the wider 9-workload set: p50 < 15%, p90 < 25%.**
+
+Heartwall stays at −23.4% — the residual is cache-state pollution
+between pilot iters (rejected iter contents stay in L2, warming the
+accepted iter), not addressable by any of C1/C2/C3. Documented as a
+fixed limitation; falls within the p90 target so doesn't need closing.
+
+The big lesson: **C2 was correct on heartwall but exposed a previously-
+masked failure on nn** (corner-replica bias was canceling the log-fit
+extrapolation distance issue). The intermediate "regressed" sweep
+(after C2, before C3) was actually progress -- the failures became
+diagnostic. The plan's ordering (cheap → expensive, with each change
+independently shippable) made it easy to bisect what each change
+actually did.
 
