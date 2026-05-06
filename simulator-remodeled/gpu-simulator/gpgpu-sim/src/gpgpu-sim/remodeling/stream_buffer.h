@@ -44,13 +44,21 @@ struct stream_buffer_search_result {
     is_hit_requested_addr = false;
     is_hit_prefetch_addr = false;
     stream_buffer_id = std::numeric_limits<unsigned int>::max();
+    is_found_requested_addr_deeper_than_head = false;
+    is_found_requested_addr_deeper_than_head_ready = false;
   }
   stream_buffer_search_result(bool is_hit_requested_addr, bool is_hit_prefetch_addr, unsigned int stream_buffer_id)
-      : is_hit_requested_addr(is_hit_requested_addr), is_hit_prefetch_addr(is_hit_prefetch_addr), stream_buffer_id(stream_buffer_id) {}
+      : is_hit_requested_addr(is_hit_requested_addr),
+        is_hit_prefetch_addr(is_hit_prefetch_addr),
+        stream_buffer_id(stream_buffer_id),
+        is_found_requested_addr_deeper_than_head(false),
+        is_found_requested_addr_deeper_than_head_ready(false) {}
     
   bool is_hit_requested_addr;
   bool is_hit_prefetch_addr;
   unsigned int stream_buffer_id;
+  bool is_found_requested_addr_deeper_than_head;
+  bool is_found_requested_addr_deeper_than_head_ready;
 };
 
 struct prefetch_element {
@@ -59,16 +67,30 @@ struct prefetch_element {
     unique_function_id = std::numeric_limits<unsigned int>::max();
     is_ready = false;
     is_request_to_cache = false;
+    m_prefetch_issue_cycle = 0;
+    m_first_demand_cycle = 0;
+    m_has_first_demand = false;
+    m_prefetch_l1i_fate = 0;
   }
   prefetch_element(unsigned int sm_warp_id, unsigned int unique_function_id, bool is_ready, bool is_request_to_cache)
       : sm_warp_id(sm_warp_id),
         unique_function_id(unique_function_id),
         is_ready(is_ready),
-        is_request_to_cache(is_request_to_cache) {}
+        is_request_to_cache(is_request_to_cache),
+        m_prefetch_issue_cycle(0),
+        m_first_demand_cycle(0),
+        m_has_first_demand(false),
+        m_prefetch_l1i_fate(0) {}
   unsigned int sm_warp_id;
   unsigned int unique_function_id;
   bool is_ready;
   bool is_request_to_cache;
+  // Timing instrumentation: when was this prefetch sent to memory, and when
+  // did the first warp demand arrive for this SB head entry.
+  unsigned long long m_prefetch_issue_cycle;
+  unsigned long long m_first_demand_cycle;
+  bool m_has_first_demand;
+  unsigned int m_prefetch_l1i_fate;
   std::map<unsigned int, std::set<new_addr_type>> waiting_warp_ids_and_its_addrs;
   std::set<new_addr_type> waiting_addrs_of_the_block;
 };
@@ -89,17 +111,24 @@ class single_stream_buffer {
   
   bool is_active();
 
+  bool is_idle_for_replacement();
+
+  bool is_inactive_with_entries();
+
   bool is_full();
 
   bool is_a_pending_request(new_addr_type addr, unsigned long long gpu_cycle);
 
   bool is_hit(new_addr_type addr, unsigned long long gpu_cycle);
 
+  bool is_found_requested_addr_deeper_than_head(new_addr_type addr,
+                                                bool &is_ready) const;
+
   unsigned long long get_gpu_cycle_hit();
 
   void flush();
 
-  void set_new_stream(new_addr_type addr, unsigned int unique_function_id, unsigned long long gpu_cycle, unsigned int warp_id);
+  void set_new_stream(new_addr_type addr, unsigned int unique_function_id, unsigned long long gpu_cycle, unsigned int warp_id, bool is_early_trigger_candidate);
 
   void do_prefetch();
 
@@ -108,6 +137,10 @@ class single_stream_buffer {
   void set_waiting_fill_in_cache(new_addr_type base_addr, new_addr_type request_addr, unsigned int warp_id);
 
   bool send_to_cache();
+
+  bool has_ready_requested_head() const;
+
+  bool classify_waiting_requested_head(new_addr_type addr, bool &is_ready) const;
 
   private:
     bool m_is_enabled;
@@ -142,7 +175,7 @@ class multiple_stream_buffers {
 
   stream_buffer_search_result search(new_addr_type base_addr_request, new_addr_type base_addr_prefetch, unsigned long long gpu_cycle);
   
-  void set_new_stream(new_addr_type addr, unsigned int unique_function_id, unsigned long long gpu_cycle, unsigned int warp_id);
+  void set_new_stream(new_addr_type addr, unsigned int unique_function_id, unsigned long long gpu_cycle, unsigned int warp_id, bool is_early_trigger_candidate);
 
   void cycle(bool can_sb_send_to_cache);
 
@@ -153,6 +186,10 @@ class multiple_stream_buffers {
   bool is_already_allocated(new_addr_type addr, unsigned long long gpu_cycle, unsigned int stream_buffer_id);
 
   void set_waiting_fill_in_cache(unsigned int stream_buffer_id, new_addr_type base_addr, new_addr_type request_addr, unsigned int warp_id);
+
+  bool has_ready_requested_head() const;
+
+  bool classify_waiting_requested_head(new_addr_type base_addr, bool &is_ready) const;
 
   private:
     bool m_is_enabled;

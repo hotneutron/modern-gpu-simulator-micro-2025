@@ -31,6 +31,8 @@
 #include "../../abstract_hardware_model.h"
 
 #include <stdio.h>
+#include <queue>
+#include <set>
 #include <unordered_map>
 #include <vector>
 #include <stack>
@@ -327,6 +329,8 @@ class SM : public core_t, public shader_core_ctx_wrapper {
   void increment_sm_stat_by_integer(std::string stat_name, int val_to_increment) override;
   
   bool is_using_interwarp_coal_warps_waiting_dep_counter();
+  void enqueue_instruction_region_prewarm(kernel_info_t &kernel);
+  void issue_pending_instruction_region_prewarm();
 
   InterWarp_Coalescing_Waiting_Dep_Counters *m_interwarp_coal_warps_waiting_dep_counter;
 
@@ -391,6 +395,11 @@ class SM : public core_t, public shader_core_ctx_wrapper {
   unsigned int m_local_to_global_cta_id[MAX_CTA_PER_SHADER];  // Map local CTA slot to global CTA ID
   unsigned int m_not_completed;  // number of threads to be completed (==0 when all
                              // thread on this core completed)
+  std::queue<std::pair<new_addr_type, unsigned int>>
+      m_pending_instruction_region_prewarm;
+  std::set<std::pair<unsigned int, new_addr_type>>
+      m_activated_instruction_region_prewarm;
+  unsigned int m_next_instruction_region_prewarm_subcore = 0;
   
   // SM occupancy structures
   int m_active_warps;

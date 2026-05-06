@@ -106,13 +106,48 @@ class gpgpu_sim_wrapper {};
 
 #include <stdio.h>
 #include <string.h>
+#include <algorithm>
 #include <iostream>
+#include <mutex>
 #include <sstream>
 #include <string>
 
 bool g_interactive_debugger_enabled = false;
 
 tr1_hash_map<new_addr_type, unsigned> address_random_interleaving;
+
+template <typename K>
+static std::string format_top_histogram_entries(
+    const std::map<K, unsigned long long> &histogram, unsigned int top_n,
+    bool print_hex_key) {
+  if (histogram.empty()) {
+    return "none";
+  }
+  std::vector<std::pair<K, unsigned long long>> entries(histogram.begin(),
+                                                        histogram.end());
+  std::sort(entries.begin(), entries.end(),
+            [](const std::pair<K, unsigned long long> &lhs,
+               const std::pair<K, unsigned long long> &rhs) {
+              if (lhs.second != rhs.second) {
+                return lhs.second > rhs.second;
+              }
+              return lhs.first < rhs.first;
+            });
+  std::ostringstream oss;
+  unsigned int limit = std::min<unsigned int>(top_n, entries.size());
+  for (unsigned int i = 0; i < limit; ++i) {
+    if (i != 0) {
+      oss << ", ";
+    }
+    if (print_hex_key) {
+      oss << "0x" << std::hex << entries[i].first << std::dec;
+    } else {
+      oss << entries[i].first;
+    }
+    oss << ":" << entries[i].second;
+  }
+  return oss.str();
+}
 
 /* Clock Domains */
 
@@ -1215,6 +1250,31 @@ void shader_core_config::reg_options(class OptionParser *opp) {
                          &num_instruction_prefetches_per_cycle, "Number of blocks that the instruction cache prefetcher tries to prefetch every cycle. Only effective if -is_instruction_prefetching_enabled is enabled."
                          "Configure to any positive number (default=1)",
                          "1");
+  option_parser_register(opp, "-is_instruction_region_prewarm_enabled", OPT_BOOL,
+                         &is_instruction_region_prewarm_enabled,
+                         "If enabled, the simulator uses an online function-aware instruction region prewarm policy for shared L1I."
+                         "(default = disabled)",
+                         "0");
+  option_parser_register(opp, "-instruction_region_prewarm_min_late_miss_count", OPT_UINT32,
+                         &instruction_region_prewarm_min_late_miss_count,
+                         "Minimum accumulated late L1I miss observations before an instruction region becomes eligible for prewarm."
+                         "(default=16)",
+                         "16");
+  option_parser_register(opp, "-instruction_region_prewarm_min_observed_warps", OPT_UINT32,
+                         &instruction_region_prewarm_min_observed_warps,
+                         "Minimum number of distinct warps that must observe a late-miss-prone instruction region before prewarm."
+                         "(default=4)",
+                         "4");
+  option_parser_register(opp, "-instruction_region_prewarm_max_regions", OPT_UINT32,
+                         &instruction_region_prewarm_max_regions,
+                         "Maximum number of learned instruction regions to prewarm per function."
+                         "(default=1)",
+                         "1");
+  option_parser_register(opp, "-instruction_region_prewarm_max_lines_per_cycle", OPT_UINT32,
+                         &instruction_region_prewarm_max_lines_per_cycle,
+                         "Maximum number of instruction-region prewarm lines issued per cycle."
+                         "(default=1)",
+                         "1");
   option_parser_register(opp, "-is_rf_cache_enabled", OPT_BOOL,
                          &is_rf_cache_enabled,
                          "If enabled, Regular register file has the register file feature enabled."
@@ -1830,6 +1890,92 @@ void gpgpu_sim::create_gpu_per_sm_stats() {
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_issue_stage_stall_next_stage_not_available", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_issue_stage_stall_issue_port_busy", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_issue_stage_stall_no_valid_instruction", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_issue_stage_stall_no_valid_instruction_decode_pending", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_issue_stage_stall_no_valid_instruction_l0i_response_ready", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_issue_stage_stall_no_valid_instruction_head_invalid_waiting_frontend", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_issue_stage_stall_no_valid_instruction_head_invalid_waiting_frontend_miss", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_issue_stage_stall_no_valid_instruction_head_invalid_waiting_frontend_in_l0i_response_queue", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_issue_stage_stall_no_valid_instruction_head_invalid_waiting_frontend_in_l0i_response_queue_stream_buffer_wait", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_issue_stage_stall_no_valid_instruction_head_invalid_waiting_frontend_in_l0i_response_queue_stream_buffer_wait_prefetch_not_allocated", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_issue_stage_stall_no_valid_instruction_head_invalid_waiting_frontend_in_l0i_response_queue_stream_buffer_wait_prefetch_issued_not_ready", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_issue_stage_stall_no_valid_instruction_head_invalid_waiting_frontend_in_l0i_response_queue_stream_buffer_wait_prefetch_ready_not_promoted", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_issue_stage_stall_no_valid_instruction_head_invalid_waiting_frontend_in_l0i_response_queue_other", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_issue_stage_stall_no_valid_instruction_head_invalid_waiting_frontend_hit_status", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_issue_stage_stall_no_valid_instruction_ibuffer_empty", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_issue_stage_stall_no_valid_instruction_unknown", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_l0i_access_returns_in_l0i_response_queue_stream_buffer_wait", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_l0i_access_returns_in_l0i_response_queue_duplicate_request", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_l0i_stream_buffer_search_hit_requested_addr", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_l0i_stream_buffer_search_found_requested_addr_deeper_than_head", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_l0i_stream_buffer_search_found_requested_addr_deeper_than_head_ready", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_l0i_stream_buffer_search_found_requested_addr_deeper_than_head_not_ready", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_l0i_stream_buffer_search_hit_prefetch_addr", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_l0i_stream_buffer_early_trigger_threshold_reached", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_l0i_stream_buffer_early_trigger_candidate", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_l0i_stream_buffer_early_trigger_next_line_tag_hit", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_l0i_stream_buffer_early_trigger_next_line_mshr_hit", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_l0i_stream_buffer_early_trigger_selected_inactive_buffer", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_l0i_stream_buffer_early_trigger_selected_active_buffer", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_l0i_stream_buffer_early_trigger_set_new_stream_calls", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_l0i_stream_buffer_early_trigger_set_new_stream_accepted", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_l0i_stream_buffer_early_trigger_set_new_stream_accepted_idle_buffer", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_l0i_stream_buffer_early_trigger_set_new_stream_accepted_replace_active", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_l0i_stream_buffer_early_trigger_set_new_stream_rejected_head_waiting_for_cache", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_l0i_stream_buffer_early_trigger_set_new_stream_redundant_same_stream", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_l0i_stream_buffer_early_trigger_redundant_same_stream_active", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_l0i_stream_buffer_early_trigger_redundant_same_stream_inactive", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_sum_l0i_stream_buffer_early_trigger_redundant_same_stream_queue_depth", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_l0i_stream_buffer_early_trigger_redundant_same_stream_target_allocated", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_l0i_stream_buffer_early_trigger_redundant_same_stream_target_not_allocated", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_l0i_stream_buffer_early_trigger_redundant_same_stream_target_ready", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_l0i_stream_buffer_early_trigger_redundant_same_stream_target_not_ready", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_l0i_stream_buffer_new_stream_candidate", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_l0i_stream_buffer_new_stream_selection_saw_inactive_nonempty_buffer", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_l0i_stream_buffer_new_stream_selection_selected_idle_buffer", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_l0i_stream_buffer_new_stream_selection_selected_active_buffer", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_l0i_stream_buffer_new_stream_selection_selected_active_while_inactive_nonempty_exists", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_l0i_stream_buffer_new_stream_accepted", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_l0i_stream_buffer_new_stream_rejected_head_waiting_for_cache", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_l0i_stream_buffer_new_stream_flush_replaced_active_stream", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_l0i_stream_buffer_prefetch_issued", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_l0i_stream_buffer_prefetch_blocked_memport_full", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_l0i_stream_buffer_prefetch_blocked_sb_full", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_l0i_stream_buffer_prefetch_l1i_accesses", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_l0i_stream_buffer_prefetch_l1i_hits", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_l0i_stream_buffer_prefetch_l1i_misses", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_l0i_stream_buffer_prefetch_l1i_reservation_fails", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_l0i_stream_buffer_prefetch_l1i_miss_allocate_on_invalid", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_l0i_stream_buffer_prefetch_l1i_miss_allocate_on_valid", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_l0i_stream_buffer_prefetched_l1i_lines_evicted", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_l0i_stream_buffer_prefetched_l1i_lines_evicted_by_prefetch_miss", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_l0i_stream_buffer_prefetched_l1i_lines_evicted_by_nonprefetch_miss", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_l0i_stream_buffer_prefetch_l1i_miss_fill_matched", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_l0i_stream_buffer_prefetch_l1i_miss_fill_orphaned", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_l0i_sb_l1i_miss_head_demand_arrived_before_ready", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_l0i_sb_l1i_miss_head_demand_arrived_after_ready", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_l0i_stream_buffer_prefetch_stopped_tag_hit", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_l0i_stream_buffer_prefetch_stopped_reservation_fail", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_l0i_stream_buffer_prefetch_stopped_mshr_hit", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_l0i_stream_buffer_fill_matched", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_l0i_stream_buffer_fill_orphaned", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_l0i_stream_buffer_send_to_cache_attempts", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_l0i_stream_buffer_send_to_cache_partial_service", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_l0i_stream_buffer_send_to_cache_full_service", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_l0i_stream_buffer_waiters_served", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_l0i_stream_buffer_ready_head_blocked_by_response_slot", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_l0i_sb_head_first_demand_events", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_sum_cycles_l0i_sb_prefetch_issue_to_first_demand", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_l0i_sb_head_first_demand_before_ready_issue_age_samples", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_sum_cycles_l0i_sb_prefetch_issue_to_first_demand_before_ready", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_l0i_sb_head_demand_arrived_before_ready", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_sum_cycles_l0i_sb_demand_wait_for_ready", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_l0i_sb_head_demand_arrived_after_ready", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_ibuffer_entries_response_ready", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_ibuffer_entry_reserve_to_response_ready", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_ibuffer_entries_decoded", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_ibuffer_entry_reserve_to_decode", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_ibuffer_entries_decoded_with_response_ready_cycle", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_ibuffer_entry_response_ready_to_decode", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_issue_stage_stall_no_warps_ready", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_issue_stage_evaluated", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_register_file_cache_hits", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
@@ -1890,9 +2036,165 @@ void gpgpu_sim::gather_gpu_per_sm_single_stat(std::string stat_name) {
 }
 
 void gpgpu_sim::reset_gpu_per_sm_stats() {
+  std::lock_guard<std::mutex> lock(m_l1i_prefetch_tracking_mutex);
   for(auto stat_name : m_gpu_per_sm_stats.m_stats_name) {
     m_gpu_per_sm_stats.reset_stat(stat_name);
   }
+  m_l1i_prefetch_miss_block_histogram.clear();
+  m_l1i_prefetch_miss_block_unique_function_id.clear();
+  m_l1i_prefetch_miss_set_histogram.clear();
+  m_l1i_prefetch_evicted_prefetch_block_histogram.clear();
+  m_l1i_prefetch_resident_blocks.clear();
+}
+
+void gpgpu_sim::record_l1i_prefetch_miss_observation(
+    new_addr_type block_addr, unsigned int unique_function_id,
+    unsigned int set_idx, bool victim_valid,
+    new_addr_type victim_block_addr, bool victim_was_prefetch_resident,
+    bool evictor_is_prefetch) {
+  std::lock_guard<std::mutex> lock(m_l1i_prefetch_tracking_mutex);
+  m_l1i_prefetch_miss_block_histogram[block_addr]++;
+  m_l1i_prefetch_miss_block_unique_function_id[block_addr] = unique_function_id;
+  m_l1i_prefetch_miss_set_histogram[set_idx]++;
+  if (!victim_valid) {
+    m_gpu_per_sm_stats.m_stats_map["total_num_l0i_stream_buffer_prefetch_l1i_miss_allocate_on_invalid"]
+        ->increment_with_integer(1);
+    return;
+  }
+  m_gpu_per_sm_stats.m_stats_map["total_num_l0i_stream_buffer_prefetch_l1i_miss_allocate_on_valid"]
+      ->increment_with_integer(1);
+  if (victim_was_prefetch_resident) {
+    m_l1i_prefetch_evicted_prefetch_block_histogram[victim_block_addr]++;
+    m_l1i_prefetch_resident_blocks.erase(victim_block_addr);
+    m_gpu_per_sm_stats.m_stats_map["total_num_l0i_stream_buffer_prefetched_l1i_lines_evicted"]
+        ->increment_with_integer(1);
+    if (evictor_is_prefetch) {
+      m_gpu_per_sm_stats.m_stats_map["total_num_l0i_stream_buffer_prefetched_l1i_lines_evicted_by_prefetch_miss"]
+          ->increment_with_integer(1);
+    } else {
+      m_gpu_per_sm_stats.m_stats_map["total_num_l0i_stream_buffer_prefetched_l1i_lines_evicted_by_nonprefetch_miss"]
+          ->increment_with_integer(1);
+    }
+  }
+}
+
+void gpgpu_sim::record_l1i_prefetch_fill(new_addr_type block_addr) {
+  std::lock_guard<std::mutex> lock(m_l1i_prefetch_tracking_mutex);
+  m_l1i_prefetch_resident_blocks.insert(block_addr);
+}
+
+bool gpgpu_sim::is_l1i_prefetch_resident(new_addr_type block_addr) const {
+  std::lock_guard<std::mutex> lock(m_l1i_prefetch_tracking_mutex);
+  return m_l1i_prefetch_resident_blocks.count(block_addr) > 0;
+}
+
+void gpgpu_sim::record_l1i_prefetched_line_evicted(
+    new_addr_type block_addr, bool evictor_is_prefetch) {
+  std::lock_guard<std::mutex> lock(m_l1i_prefetch_tracking_mutex);
+  if (m_l1i_prefetch_resident_blocks.count(block_addr) == 0) {
+    return;
+  }
+  m_l1i_prefetch_resident_blocks.erase(block_addr);
+  m_l1i_prefetch_evicted_prefetch_block_histogram[block_addr]++;
+  m_gpu_per_sm_stats.m_stats_map["total_num_l0i_stream_buffer_prefetched_l1i_lines_evicted"]
+      ->increment_with_integer(1);
+  if (evictor_is_prefetch) {
+    m_gpu_per_sm_stats.m_stats_map["total_num_l0i_stream_buffer_prefetched_l1i_lines_evicted_by_prefetch_miss"]
+        ->increment_with_integer(1);
+  } else {
+    m_gpu_per_sm_stats.m_stats_map["total_num_l0i_stream_buffer_prefetched_l1i_lines_evicted_by_nonprefetch_miss"]
+        ->increment_with_integer(1);
+  }
+}
+
+std::string gpgpu_sim::get_l1i_prefetch_miss_top_block_addrs(
+    unsigned int top_n) const {
+  std::lock_guard<std::mutex> lock(m_l1i_prefetch_tracking_mutex);
+  return format_top_histogram_entries(m_l1i_prefetch_miss_block_histogram, top_n,
+                                      true);
+}
+
+std::string gpgpu_sim::get_l1i_prefetch_miss_top_set_indices(
+    unsigned int top_n) const {
+  std::lock_guard<std::mutex> lock(m_l1i_prefetch_tracking_mutex);
+  return format_top_histogram_entries(m_l1i_prefetch_miss_set_histogram, top_n,
+                                      false);
+}
+
+std::string gpgpu_sim::get_l1i_prefetch_evicted_prefetch_top_block_addrs(
+    unsigned int top_n) const {
+  std::lock_guard<std::mutex> lock(m_l1i_prefetch_tracking_mutex);
+  return format_top_histogram_entries(
+      m_l1i_prefetch_evicted_prefetch_block_histogram, top_n, true);
+}
+
+std::string gpgpu_sim::get_l1i_prefetch_miss_top_pc_opcodes(
+    unsigned int top_n) {
+  std::vector<std::pair<new_addr_type, unsigned long long>> entries;
+  std::map<new_addr_type, unsigned int> block_unique_function_id;
+  {
+    std::lock_guard<std::mutex> lock(m_l1i_prefetch_tracking_mutex);
+    if (m_l1i_prefetch_miss_block_histogram.empty()) {
+      return "none";
+    }
+    entries.assign(m_l1i_prefetch_miss_block_histogram.begin(),
+                   m_l1i_prefetch_miss_block_histogram.end());
+    block_unique_function_id = m_l1i_prefetch_miss_block_unique_function_id;
+  }
+  if (entries.empty()) {
+    return "none";
+  }
+  std::sort(entries.begin(), entries.end(),
+            [](const std::pair<new_addr_type, unsigned long long> &lhs,
+               const std::pair<new_addr_type, unsigned long long> &rhs) {
+              if (lhs.second != rhs.second) {
+                return lhs.second > rhs.second;
+              }
+              return lhs.first < rhs.first;
+            });
+  std::ostringstream oss;
+  unsigned int limit = std::min<unsigned int>(top_n, entries.size());
+  unsigned int line_sz = m_shader_config->m_L1I_L1_half_C_cache_config.get_line_sz();
+  for (unsigned int i = 0; i < limit; ++i) {
+    new_addr_type block_addr = entries[i].first;
+    unsigned int unique_function_id =
+        block_unique_function_id.at(block_addr);
+    traced_kernel &kernel =
+        get_extra_trace_info().get_kernel_by_unique_function_id(unique_function_id);
+    address_type first_pc_of_kernel = kernel.get_function_addr();
+    unsigned int local_block_pc = block_addr - first_pc_of_kernel;
+    bool tensor_in_line = false;
+    std::vector<std::string> opcodes;
+    for (unsigned int pc = local_block_pc; pc < local_block_pc + line_sz; pc += 16) {
+      std::shared_ptr<traced_instruction> inst = kernel.get_instruction_ptr(pc);
+      if (!inst) {
+        continue;
+      }
+      opcodes.push_back(inst->get_op_code());
+      if (inst->is_tensor_core_op()) {
+        tensor_in_line = true;
+      }
+    }
+    if (i != 0) {
+      oss << " | ";
+    }
+    oss << "0x" << std::hex << block_addr << std::dec
+        << "@pc=0x" << std::hex << local_block_pc << std::dec
+        << ":count=" << entries[i].second
+        << ":tensor=" << (tensor_in_line ? "yes" : "no")
+        << ":ops=";
+    if (opcodes.empty()) {
+      oss << "none";
+    } else {
+      for (unsigned int j = 0; j < opcodes.size(); ++j) {
+        if (j != 0) {
+          oss << "/";
+        }
+        oss << opcodes[j];
+      }
+    }
+  }
+  return oss.str();
 }
 
 int gpgpu_sim::shared_mem_size() const {

@@ -2138,6 +2138,11 @@ class shader_core_config : public core_config {
   unsigned int prefetch_per_stream_buffer_size;
   unsigned int prefetch_num_stream_buffers;
   unsigned int num_instruction_prefetches_per_cycle;
+  bool is_instruction_region_prewarm_enabled;
+  unsigned int instruction_region_prewarm_min_late_miss_count;
+  unsigned int instruction_region_prewarm_min_observed_warps;
+  unsigned int instruction_region_prewarm_max_regions;
+  unsigned int instruction_region_prewarm_max_lines_per_cycle;
 
   bool is_rf_cache_enabled;
   int max_operands_regular_register_file; 

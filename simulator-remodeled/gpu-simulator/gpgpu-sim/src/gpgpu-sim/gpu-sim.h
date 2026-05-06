@@ -66,6 +66,7 @@
 #include <fstream>
 #include <iostream>
 #include <list>
+#include <mutex>
 #include "../abstract_hardware_model.h"
 #include "../option_parser.h"
 #include "../trace.h"
@@ -862,6 +863,22 @@ class gpgpu_sim : public gpgpu_t {
 
   void parse_extra_trace_info(std::string filepath, bool is_extra_trace_enabled); // MOD. Improved tracer
 
+  void record_l1i_prefetch_miss_observation(new_addr_type block_addr,
+                                            unsigned int unique_function_id,
+                                            unsigned int set_idx,
+                                            bool victim_valid,
+                                            new_addr_type victim_block_addr,
+                                            bool victim_was_prefetch_resident,
+                                            bool evictor_is_prefetch);
+  void record_l1i_prefetch_fill(new_addr_type block_addr);
+  bool is_l1i_prefetch_resident(new_addr_type block_addr) const;
+  void record_l1i_prefetched_line_evicted(new_addr_type block_addr,
+                                          bool evictor_is_prefetch);
+  std::string get_l1i_prefetch_miss_top_block_addrs(unsigned int top_n) const;
+  std::string get_l1i_prefetch_miss_top_set_indices(unsigned int top_n) const;
+  std::string get_l1i_prefetch_evicted_prefetch_top_block_addrs(unsigned int top_n) const;
+  std::string get_l1i_prefetch_miss_top_pc_opcodes(unsigned int top_n);
+
   Element_stats m_gpu_per_sm_stats;
 
   coalescingStatsAcrossSms m_coalescing_stats_across_sms_l1d;
@@ -902,6 +919,12 @@ class gpgpu_sim : public gpgpu_t {
 
   std::map<std::string, address_type> m_first_pc_of_each_defined_kernel; // MOD. Fix requesting same address for different kernels
   traced_execution m_extra_trace_info;  // MOD. Improved tracer
+  std::map<new_addr_type, unsigned long long> m_l1i_prefetch_miss_block_histogram;
+  std::map<new_addr_type, unsigned int> m_l1i_prefetch_miss_block_unique_function_id;
+  std::map<unsigned int, unsigned long long> m_l1i_prefetch_miss_set_histogram;
+  std::map<new_addr_type, unsigned long long> m_l1i_prefetch_evicted_prefetch_block_histogram;
+  std::set<new_addr_type> m_l1i_prefetch_resident_blocks;
+  mutable std::mutex m_l1i_prefetch_tracking_mutex;
 
   std::vector<kernel_info_t *> m_running_kernels;
   unsigned m_last_issued_kernel;
