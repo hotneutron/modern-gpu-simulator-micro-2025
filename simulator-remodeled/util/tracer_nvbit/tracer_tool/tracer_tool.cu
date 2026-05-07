@@ -540,6 +540,37 @@ static std::string strip_variant_suffix(const std::string &kernel_name) {
   return kernel_name.substr(0, pos);
 }
 
+static std::string to_lower_ascii(std::string value);
+
+static std::string normalize_kernel_match_name(const std::string &kernel_name) {
+  return to_lower_ascii(strip_variant_suffix(strip_string(kernel_name)));
+}
+
+static int kernel_symbol_match_score(const std::string &symbol_name, const std::string &kernel_name) {
+  const std::string symbol_norm = normalize_kernel_match_name(symbol_name);
+  const std::string kernel_norm = normalize_kernel_match_name(kernel_name);
+  if (symbol_norm.empty() || kernel_norm.empty()) {
+    return 0;
+  }
+  if (symbol_norm == kernel_norm) {
+    return 1000;
+  }
+  if (symbol_norm.find(kernel_norm) != std::string::npos ||
+      kernel_norm.find(symbol_norm) != std::string::npos) {
+    return static_cast<int>(std::min(symbol_norm.size(), kernel_norm.size()));
+  }
+  return 0;
+}
+
+static int best_kernel_symbol_match_score(const std::string &symbol_name,
+                                          const std::unordered_set<std::string> &kernel_names) {
+  int best_score = 0;
+  for (const auto &kernel_name : kernel_names) {
+    best_score = std::max(best_score, kernel_symbol_match_score(symbol_name, kernel_name));
+  }
+  return best_score;
+}
+
 static std::string resolve_traced_kernel_key(const std::string &sass_kernel_name) {
   if (all_kernels_key_instructions_by_pc.find(sass_kernel_name) != all_kernels_key_instructions_by_pc.end()) {
     return sass_kernel_name;
@@ -595,7 +626,20 @@ bool has_the_kernel_been_traced(std::string kernel_name, std::map<int, std::stri
   return has_been_traced;
 }
 
-unsigned int parse_sass(int binary_version, const std::filesystem::directory_entry &entry) {
+struct parsed_sass_result {
+  unsigned int matched_kernels = 0;
+  std::unordered_set<std::string> matched_kernel_names;
+};
+
+static bool kernel_name_selected_for_rfu(const std::string &kernel_name,
+                                         const std::unordered_set<std::string> &target_kernel_names) {
+  if (target_kernel_names.empty()) {
+    return true;
+  }
+  return target_kernel_names.find(normalize_kernel_match_name(kernel_name)) != target_kernel_names.end();
+}
+
+parsed_sass_result parse_sass(int binary_version, const std::filesystem::directory_entry &entry) {
   std::string absolute_sass_path = make_abs_path(sass_path);
   std::string sass_file = absolute_sass_path + "/" + entry.path().stem().string() + ".sass";
   std::ifstream ifs_sass; // input file stream
@@ -607,7 +651,7 @@ unsigned int parse_sass(int binary_version, const std::filesystem::directory_ent
     abort();
   }
   
-  unsigned int matched_kernels = 0;
+  parsed_sass_result result;
   bool is_starting_reading_kernel = false;
   std::string kernel_name = "";
   traced_kernel *current_traced_kernel = nullptr;
@@ -649,7 +693,8 @@ unsigned int parse_sass(int binary_version, const std::filesystem::directory_ent
           current_traced_kernel->set_kernel_name(final_kernel_name);
           m_enhanced_traced_execution->add_traced_kernel(final_kernel_name, all_kernels_key_instructions_by_pc[kernel_key][variant_id].unique_function_id, current_traced_kernel, it_search_funct->second, true);
           current_traced_kernel = nullptr;
-          matched_kernels++;
+          result.matched_kernels++;
+          result.matched_kernel_names.insert(normalize_kernel_match_name(kernel_key));
         }else {
           delete current_traced_kernel;
         }
@@ -669,7 +714,7 @@ unsigned int parse_sass(int binary_version, const std::filesystem::directory_ent
     }
   }
   ifs_sass.close();
-  return matched_kernels;
+  return result;
 }
 
 std::string replaceEnclosedSubstring(std::string str, const std::string &replacement)
@@ -746,7 +791,8 @@ void parse_rfu_instruction_info(std::vector<std::string> splitted_text, std::vec
   }
 }
 
-void parse_rfu(const std::filesystem::directory_entry &entry) {
+void parse_rfu(const std::filesystem::directory_entry &entry,
+               const std::unordered_set<std::string> &target_kernel_names) {
   std::string absolute_rfu_path = make_abs_path(register_usage_path);
   std::string rfu_file = absolute_rfu_path + "/" + entry.path().stem().string() + ".rfu";
   std::ifstream ifs_rfu; // input file stream
@@ -760,6 +806,7 @@ void parse_rfu(const std::filesystem::directory_entry &entry) {
   
   bool is_starting_reading_kernel = false;
   bool is_code_region_started = false;
+  bool should_parse_current_kernel = false;
   std::string kernel_name = "";
   std::vector<std::string> reg_order;
   std::map<int, std::string> key_instructions_by_pc;
@@ -792,26 +839,29 @@ void parse_rfu(const std::filesystem::directory_entry &entry) {
       {
         is_starting_reading_kernel = false;
         is_code_region_started = false;
-        unsigned int variant_id = 0;
-        bool has_been_traced = has_the_kernel_been_traced(kernel_name, key_instructions_by_pc, full_call_or_ret_inst_by_pc, variant_id, true, true, call_or_ret_pcs_not_to_consider);
-        if(has_been_traced) {
-          std::string final_kernel_name = kernel_name + variant_delimiter_str + std::to_string(variant_id);
-          all_kernels_key_instructions_by_pc[kernel_name][variant_id].rfu_has_been_parsed = true;
-          m_enhanced_traced_execution->add_register_usage_to_a_kernel(final_kernel_name, reg_usage_by_pc, call_target_by_pc);
+        if (should_parse_current_kernel) {
+          unsigned int variant_id = 0;
+          bool has_been_traced = has_the_kernel_been_traced(kernel_name, key_instructions_by_pc, full_call_or_ret_inst_by_pc, variant_id, true, true, call_or_ret_pcs_not_to_consider);
+          if(has_been_traced) {
+            std::string final_kernel_name = kernel_name + variant_delimiter_str + std::to_string(variant_id);
+            all_kernels_key_instructions_by_pc[kernel_name][variant_id].rfu_has_been_parsed = true;
+            m_enhanced_traced_execution->add_register_usage_to_a_kernel(final_kernel_name, reg_usage_by_pc, call_target_by_pc);
+          }
         }
         key_instructions_by_pc.clear();
         reg_usage_by_pc.clear();
         call_target_by_pc.clear();
         full_call_or_ret_inst_by_pc.clear();
         call_or_ret_pcs_not_to_consider.clear();
+        should_parse_current_kernel = false;
       }else {
         std::vector<std::string> splitted_text = split_string(stripped_line, ' ');
         if(!splitted_text.empty()) {
-          if(is_code_region_started && (stripped_line.find(":") == std::string::npos) &&
+          if(should_parse_current_kernel && is_code_region_started && (stripped_line.find(":") == std::string::npos) &&
             (stripped_line.find(".weak") == std::string::npos) && (stripped_line.find(".type") == std::string::npos)
             && (stripped_line.find(".size") == std::string::npos)) {
             parse_rfu_instruction_info(splitted_text, reg_order, stripped_line, key_instructions_by_pc, reg_usage_by_pc, call_target_by_pc, full_call_or_ret_inst_by_pc, call_or_ret_pcs_not_to_consider);
-          }else if( (splitted_text[0].find("0000") != std::string::npos) && (stripped_line.find("//") != std::string::npos) && (stripped_line.find(":") == std::string::npos) &&
+          }else if( should_parse_current_kernel && (splitted_text[0].find("0000") != std::string::npos) && (stripped_line.find("//") != std::string::npos) && (stripped_line.find(":") == std::string::npos) &&
             (stripped_line.find(".weak") == std::string::npos) && (stripped_line.find(".type") == std::string::npos)
             && (stripped_line.find(".size") == std::string::npos)) {
             is_code_region_started = true;
@@ -819,6 +869,7 @@ void parse_rfu(const std::filesystem::directory_entry &entry) {
           }else if(splitted_text[0].find(".text") != std::string::npos) {
             kernel_name = splitted_text[0].substr(6);
             kernel_name.pop_back(); // Remove the last  : char
+            should_parse_current_kernel = kernel_name_selected_for_rfu(kernel_name, target_kernel_names);
           }
         }
       }
@@ -1792,10 +1843,13 @@ static std::vector<std::string> get_loaded_shared_objects() {
 }
 
 static int score_cubin_candidate(const std::string &path, bool include_torch_libs) {
-  const std::string base = get_basename(path);
   const std::string lower = to_lower_ascii(path);
+  const bool is_libtorch_cuda = (lower.find("libtorch_cuda") != std::string::npos);
   if (!include_torch_libs) {
-    if (lower.find("libtorch") != std::string::npos || lower.find("libc10") != std::string::npos) {
+    if (lower.find("libc10") != std::string::npos) {
+      return -1;
+    }
+    if (!is_libtorch_cuda && lower.find("libtorch") != std::string::npos) {
       return -1;
     }
   }
@@ -1808,7 +1862,7 @@ static int score_cubin_candidate(const std::string &path, bool include_torch_lib
   if (lower.find("cutlass") != std::string::npos) {
     return 90;
   }
-  if (lower.find("libtorch_cuda") != std::string::npos) {
+  if (is_libtorch_cuda) {
     return 70;
   }
   if (lower.find("libtorch") != std::string::npos) {
@@ -2001,7 +2055,7 @@ static bool extract_cubin_from_binary(const std::string &binary_path, unsigned i
     }
   }
 
-  std::unordered_set<int> needed_indices;
+  std::unordered_map<int, int> needed_index_scores;
   {
     std::unordered_set<std::string> kernel_names;
     kernel_names.reserve(all_kernels_key_instructions_by_pc.size() * 2 + 8);
@@ -2042,8 +2096,14 @@ static bool extract_cubin_from_binary(const std::string &binary_path, unsigned i
           continue;
         }
         std::string sym = line.substr(start + 1, end - start);
-        if (kernel_names.find(sym) != kernel_names.end()) {
-          needed_indices.insert(current_idx);
+        const int match_score = best_kernel_symbol_match_score(sym, kernel_names);
+        if (match_score > 0) {
+          auto it = needed_index_scores.find(current_idx);
+          if (it == needed_index_scores.end()) {
+            needed_index_scores[current_idx] = match_score;
+          } else {
+            it->second = std::max(it->second, match_score);
+          }
         }
       }
       pclose(pipe);
@@ -2059,8 +2119,15 @@ static bool extract_cubin_from_binary(const std::string &binary_path, unsigned i
     } catch (...) {
     }
   }
-  for (int idx : needed_indices) {
-    auto it = elf_by_index.find(idx);
+  std::vector<std::pair<int, int>> ranked_indices;
+  ranked_indices.reserve(needed_index_scores.size());
+  for (const auto &kv : needed_index_scores) {
+    ranked_indices.emplace_back(kv.second, kv.first);
+  }
+  std::sort(ranked_indices.begin(), ranked_indices.end(),
+            [](const auto &a, const auto &b) { return a.first > b.first; });
+  for (const auto &ranked_idx : ranked_indices) {
+    auto it = elf_by_index.find(ranked_idx.second);
     if (it == elf_by_index.end()) {
       continue;
     }
@@ -2167,12 +2234,12 @@ void enhanced_tracer() {
       std::string command_get_sass = "cd " + sass_path + " && cuobjdump -sass " + absolute_cubin_path + "/" + aux_cubin + " > " + base_name + ".sass";
       int call_code_sass = check_system_call(system(command_get_sass.c_str()), command_get_sass.c_str());
       if(call_code_sass == 0) {
-        unsigned int matched_kernels = parse_sass(binary_version, entry);
-        if(!skip_rfu && matched_kernels > 0) {
+        parsed_sass_result sass_result = parse_sass(binary_version, entry);
+        if(!skip_rfu && sass_result.matched_kernels > 0) {
           std::string command_get_register_usage = "cd " + register_usage_path + " && nvdisasm -lrm count " + absolute_cubin_path + "/" + aux_cubin + " > " + base_name + ".rfu";
           int call_code_rfu = check_system_call(system(command_get_register_usage.c_str()), command_get_register_usage.c_str());
           if(call_code_rfu == 0) {
-            parse_rfu(entry);
+            parse_rfu(entry, sass_result.matched_kernel_names);
           }
         }
       }
