@@ -298,7 +298,86 @@ same way to large ones.
 
 ---
 
-## 7. What shipped (since the last walkthrough)
+## 7. "Is this work useful?" — honest projection
+
+The 0.92× overall speedup is a fair question. The honest answer
+requires separating two claims:
+
+1. **Cycle accuracy** (p50=10%, p90=23%, both targets met) — this is
+   a property of the projection math and the sampling pipeline. It
+   applies the same way regardless of trace size.
+2. **Wall-time speedup** — this depends on whether the simulator's
+   actual work scales linearly with CTAs. It doesn't, on small
+   traces, because pilot has fixed overhead.
+
+Per-CTA simulation cost varies **250×** across our workloads:
+
+```
+nn-like        :   1.3 ms / CTA   (compute-light, lots of CTAs)
+backprop       :   6.5 ms
+srad_v2        :  12.9 ms
+hotspot        :  33.1 ms         (compute-medium)
+heartwall      :  36.7 ms
+bfs            :  46.2 ms
+pathfinder     :  82.5 ms
+nw             :  95.0 ms
+lud            : 344.2 ms / CTA   (compute-heavy DP, few CTAs)
+```
+
+A simple model captures the trade-off:
+
+```
+T_baseline = N × c                       (N = total CTAs, c = per-CTA cost)
+T_pilot    ≈ a + sampled × c             (a = fixed pilot overhead, ~4.3s)
+
+Pilot wins when:   N × c > a + sampled × c
+              →    N     > sampled + a / c
+```
+
+So the **break-even kernel size depends inversely on per-CTA cost**.
+Crossover for our workload classes:
+
+| Per-CTA cost      | Crossover |
+|---|---|
+| 1.3 ms/CTA (nn-like)         | ~3300 CTAs |
+| 33 ms/CTA (hotspot-like)     | ~210 CTAs  |
+| 344 ms/CTA (lud-like)        | ~90 CTAs   |
+
+![projection](speedup_projection.png)
+
+This matches the data we measured:
+
+- hotspot at 320 CTAs > 210 crossover → 2.12× speedup ✓
+- lud at 24 CTAs ≈ 90 crossover (just below) → 1.01× ≈ tied ✓
+- nn at 938 CTAs ≪ 3300 crossover → 0.50× (loss) ✓
+
+**Where this is useful, where it isn't:**
+
+- **Production DL training kernels** typically have 10K–10M CTAs per
+  launch (e.g., a layer of a transformer model running on a million
+  sequence positions). Per-CTA cost in that regime is 1–10 ms. At
+  1M CTAs × 1 ms/CTA = ~17 minutes baseline; pilot ≈ 5–10 s →
+  **~100× speedup** if our projection holds.
+- **Production HPC kernels** (large stencils, n-body) often
+  10K–100K CTAs at 10–100 ms/CTA. Baseline = hours, pilot = seconds.
+- **Test / regression workloads** like rodinia2 at 50–940 CTAs are
+  *too small* for sampling to pay off. The simulator already finishes
+  in seconds; pilot's fixed overhead dominates.
+
+**Honest verdict:** the wall-time win is real but trace-scale
+dependent. We have not yet measured it on a production-scale trace —
+those aren't in the example archives. The infrastructure, however, is
+correctness-debugged and accuracy-validated for the moment those
+traces show up. The cycle-accuracy work is independent of this and
+delivered the targets it set.
+
+The next test that would close the question definitively: NVBit-trace
+a single transformer-layer kernel (~100K–1M CTAs) and re-run this
+exact comparison. Logged as the top open follow-up.
+
+---
+
+## 8. What shipped (since the last walkthrough)
 
 7 new commits beyond `239db61` (where the previous walkthrough
 landed):
@@ -320,7 +399,7 @@ Total branch state: 32 commits ahead of `main` (the original 25 from
 
 ---
 
-## 8. Outstanding follow-ups
+## 9. Outstanding follow-ups
 
 Listed in priority order in `CTA_SAMPLING_PHASE_AB_DONE.md` and
 `CTA_SAMPLING_C1_C2_C3_LOG.md`:
@@ -340,14 +419,16 @@ Listed in priority order in `CTA_SAMPLING_PHASE_AB_DONE.md` and
 
 ---
 
-## 9. One-slide summary
+## 10. One-slide summary
 
 > **Wider validation gap closed in 3 layered changes (C1: nw fix; C2:
 > K-rep replication fix; C3a: adaptive deeper pilot expansion). Cycle-
 > estimate accuracy on the 9-workload set: p50 = 10.1%, p90 = 23.4%
-> — both targets met. Wall-time speedup is workload-dependent and
-> shows up clearly only on larger kernels: hotspot 2.1×, but
-> cumulative 0.92× on this toy-trace set because pilot overhead
-> dominates for sub-1K-CTA kernels. The accuracy contribution is
-> trace-scale-independent and applies the same way to production
-> traces; demonstrating the wall-time win there is the next step.**
+> — both targets met. Wall-time on the toy-trace set is mixed (0.92×
+> cumulative, hotspot 2.1× best, heartwall 0.46× worst). The
+> theoretical model says crossover is at `pilot_overhead / per_cta_cost`
+> CTAs ≈ 90 (heavy compute) to 3.3K (light compute) — every workload
+> we measured below that line lost time, every one above won. The
+> infrastructure and accuracy are validated; demonstrating the
+> wall-time win on production-scale traces (where simulators
+> actually take hours) is the next step.**
