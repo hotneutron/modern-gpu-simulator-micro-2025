@@ -1,42 +1,7 @@
-# CTA Sampling — Status Update: Closing the Wider-Validation Gap
+# CTA Sampling — Plan to close the wider-validation gap
 
-**Status: ✅ Shipped. Both accuracy targets met on the wider 9-workload set.**
-
-This doc was originally the *plan* to close the three failure modes
-exposed by the wider 10-workload sweep on `cta-sampling`. It is now a
-status update covering what shipped, the measured results per change,
-the wall-time speedup analysis, and an honest verdict on where the
-work pays off.
-
----
-
-## TL;DR for the meeting
-
-- **3 layered changes shipped in ~145 LOC + 1 dropped before
-  implementation.**
-- **Cycle accuracy on the wider 9-workload set: p50 = 10.1%,
-  p90 = 23.4% — both targets met.**
-- **Wall-time speedup is workload-dependent.** On the rodinia2 toy
-  traces overall is 0.92× (slight slowdown), but per-workload ranges
-  from 0.46× (heartwall) to 2.12× (hotspot). A simple model predicts
-  the crossover at ~90 to ~3300 CTAs depending on per-CTA
-  simulation cost — every workload we measured below that threshold
-  lost time, every one above won. **Production-scale traces (10K+
-  CTAs/kernel) are projected to see 100×+ speedups; we have not yet
-  measured on such a trace.**
-
-![speedup](speedup_chart.png)
-
-![projection](speedup_projection.png)
-
----
-
-## Starting state (before this work)
-
-After the cycle-accuracy push, the **original 6-workload set met
-both targets** (p50 = 12.3%, p90 = 17.3%). A wider sweep with 4 more
-rodinia2 kernels (heartwall, nn, nw, streamcluster) revealed three
-failure modes:
+The wider 10-workload sweep on `cta-sampling` exposed three distinct
+failure modes (full diagnosis in `CTA_SAMPLING_PHASE_AB_DONE.md` §5):
 
 ```
 heartwall  -28.7%   K-rep replicates 3 corner CTAs to fill target
@@ -44,308 +9,215 @@ nn        +103.5%   log-fit extrapolates from N=2 to N=23 CTAs/SM
 nw         +56.8%   pilot overhead + state pollution on tiny grids
 ```
 
-Goal: hit p50 < 15%, p90 < 25% on the wider 9-workload set without
-regressing the workloads already at target.
+This doc is the plan to close those gaps. Three layered changes,
+ordered cheap → expensive. Each is independently shippable.
+
+---
+
+## Goals
+
+- Hit p50 < 15%, p90 < 25% on the **wider 10-workload set** (not just
+  the original 6).
+- No regression on the workloads already at target.
+- No more than ~2× sim-time cost on the workloads that need extra
+  pilot work — sampling is supposed to *speed up* simulation.
 
 ---
 
 ## Change 1 — Skip pilot for tiny grids + auto-accept full-grid samples
 
-**Targets:** nw (+56.8%). **Status: ✅ shipped (`4fe81c6`).**
+**Targets:** nw (+56.8%). Likely also helps lud/pathfinder by
+avoiding unnecessary iter-1 re-runs.
 
-Two small fixes in `main.cc`, ~30 LOC:
+**Two small fixes in `pilot_decide_accept` and pilot enable logic:**
 
-| Sub-change | What |
-|---|---|
-| **C1a** | Hoist `if (ps.ctas_launched >= pst.total_ctas) return true` *above* the class check in `pilot_decide_accept` iter 0. Memory- and mixed-classified kernels whose K-rep already saw the full grid now accept iter 0 instead of pointlessly re-running iter 1 with the same CTA set. |
-| **C1b** | Skip pilot entirely when `total_ctas < total_sms`. Tiny grids fall through to a single K-rep run; their per-iter overhead and inter-iter cache pollution dominated baseline runtime. |
+**(a) Auto-accept iter 0 when sampled_ctas covers the full grid,
+regardless of class.** Today `pilot_decide_accept` returns `false` for
+non-COMPUTE classes at iter 0 *before* checking the all-CTAs-covered
+short-circuit. nw kernel 1 has 1 CTA total, K-rep returns 1, classifier
+says memory → rejected → pilot re-runs the same 1-CTA kernel at iter 1
+for nothing. Fix: hoist the `ps.ctas_launched >= pst.total_ctas` check
+above the class check.
 
-### Result
+**(b) Skip the pilot loop entirely when `total_ctas < total_sms`.**
+For these tiny grids, the kernel runs in ~1 wave anyway; the speedup
+upper bound is small, and the pilot's iter-0-reject + iter-1-accept
+sequence often *exceeds* baseline wall time (cache-state pollution
+from rejected iters slows the accepted iter). Just disable
+`pilot_loop_enabled` for the kernel when `total_ctas < total_sms` and
+fall through to the K-rep run — which will cover most/all of the
+grid anyway.
 
-```
-              | before C1 | after C1
-nw            | +56.8     |  +5.0   ← FIXED
-pathfinder    |  -2.6     |  -0.3   ← side benefit
-bfs           |  -9.9     |  +3.3   ← side benefit
-lud           |  -0.1     |  -0.0   ← side benefit
-others        | unchanged | unchanged
-```
+**Code touches:** `main.cc` only. ~30 LOC.
+**Expected outcome:** nw moves from +56.8% to within ±5%. lud /
+pathfinder stay where they are (they already work; this just shaves
+unused iter time off the wall clock).
 
-p50 dropped 15.0% → 9.9%; p90 still dominated by nn (103.5%). nw
-expectation was ±5% — landed exactly at +5.0%.
+**Risk:** very low. The threshold is conservative (`total_ctas <
+total_sms`); no kernel that currently meets target relies on the
+tiny-grid pilot path.
 
 ---
 
 ## Change 2 — Fix K-rep replication: never duplicate before exhausting unique CTAs
 
-**Targets:** heartwall (−28.7%). **Status: ✅ shipped (`31a4dd2`).**
+**Targets:** heartwall (−28.7%). Also marginal improvement for
+backprop's K1 (3 reps replicated to 80).
 
-Pre-C2 `expand_sampled_ctas` always duplicated the K-rep set to fill
-the target. heartwall's 51×1×1 grid → K-rep collapses to 3 corners →
-target=51 produces 17 copies of those 3 corners, biasing the "full
-grid sample" toward boundary work.
+**Today** `expand_sampled_ctas` always duplicates the K-rep set to
+fill the target:
 
-Three regimes in the rewritten function (~75 LOC, signature now takes
-`(gx, gy, gz)`):
-
-| Condition | Behavior |
-|---|---|
-| `target ≤ K` | Return reps unchanged. |
-| `target ≥ total_ctas` | **C2a** — enumerate every unique CTA. Sample IS the full grid. |
-| `K < target < total_ctas` | **C2b** — start with K reps, then append evenly-spaced fresh unique CTAs from a non-rep pool. Defensive duplication fallback only. |
-
-### Result
-
-```
-              | after C1 | after C2
-heartwall     | -28.7    | -23.4    ← improved 5pp
-backprop      | -15.4    | -13.2    ← K1 sample now fresh-spread
-nn            | +103.5   | +128.4   ← REGRESSED 25pp (see below)
-others        | unchanged
+```cpp
+unsigned per_rep = target_sim_ctas / K;
+unsigned remainder = target_sim_ctas % K;
+for (unsigned i = 0; i < K; ++i)
+  for (unsigned c = 0; c < per_rep + (i<rem?1:0); ++c)
+    out.push_back(reps[i]);                     // ← only ever duplicates
 ```
 
-### The surprise: nn regressed by 25pp on a "correct" fix
+For heartwall's 51×1×1 grid: K-rep returns 3 (corners + midpoint),
+target=51 → out is 51 copies of 3 corners. The "full grid sample"
+is biased toward boundary work.
 
-Pre-C2 nn iter-3 sampled 80 corner-replicas in 4774 cycles —
-per-SM throughput at N=2 = 4.19e-4. Post-C2 sampled 80 grid-spread
-unique CTAs in 5430 cycles — per-SM throughput at N=2 = 3.68e-4.
+**Fix in two layers:**
 
-The corner-replicas had artificially low per-CTA work, which gave the
-log-fit's data points an inflated slope (5.85e-4). With unbiased
-samples, slope dropped to 4.77e-4 → smaller `T_full` extrapolation →
-more cycles predicted → bigger overestimate.
+**(a) When `target >= total_ctas`, return all unique CTAs.** If the
+pilot expanded enough that we'd cover the whole grid anyway, just
+generate `(0..gx-1, 0..gy-1, 0..gz-1)` and skip the K-rep
+replication entirely. heartwall iter 3 with target=51, total=51 →
+sample all 51 unique CTAs.
 
-**The corner-replica bias was *coincidentally* canceling the
-under-extrapolation issue in the log-fit.** Once C2 fixed the sampling
-bias, the log-fit-extrapolation-distance problem became fully
-visible — exactly what C3a was designed to fix. The intermediate
-"regression" was diagnostic, not a real setback.
+**(b) When `K < target < total_ctas`, supplement K-rep with
+evenly-spaced fresh CTAs before replicating.** If we need
+`target − K` more CTAs and `total_ctas − K` unique ones are
+available, pick `min(target − K, total_ctas − K)` unique CTAs by
+linearly walking the grid (skipping coordinates already in the
+K-rep set). Only after that pool is exhausted do we fall back to
+duplication. For backprop K1 (256 CTAs, K=3, target=80): pick 77
+unique additional CTAs, no duplication.
 
-heartwall's improvement is real but capped at −23.4%; the residual is
-cache-state pollution between pilot iters (rejected-iter contents stay
-in L2, warming the accepted iter). Hardware-state-reset is out of
-scope for this work.
+**Code touches:** `main.cc` `expand_sampled_ctas` only. ~50 LOC.
+**Expected outcome:** heartwall from −28.7% toward ±10%. backprop
+slight tightening (already at −15.4%).
+
+**Risk:** low. The replication path was the only way to fill
+`target_sim_ctas` slots above K; switching to unique CTAs is strictly
+more representative. Stat-scaling math (`weight = total / sampled`)
+doesn't care whether sampled CTAs are duplicates or unique.
 
 ---
 
-## Change 3 — Adaptive deeper expansion (C3b dropped before implementation)
+## Change 3 — Bound log-fit extrapolation distance + adaptive deeper expansion
 
-**Targets:** nn (+128.4% post-C2). **Status: ✅ shipped (`471ccd5`); C3b dropped.**
+**Targets:** nn (+103.5%). Most expensive of the three; also the
+most uncertain.
 
-### C3b dropped before implementation — wrong direction once we had the data
+**Diagnosis recap:** nn has 938 CTAs; full grid runs 23 CTAs/SM. With
+`pilot_max_doublings=2`, the deepest pilot iteration reaches 80 CTAs
+sampled = 2 CTAs/SM. `T(N) = a + b*log(N+1)` is fit on densities ∈
+{1, 2}. Extrapolating from N=2 to N=23 is past the model's
+calibration range, and the actual per-SM throughput growth is
+super-log past N=2 (still in the "lots of latency to hide" regime).
+Result: `T_full` is under-predicted ~2×, cycle estimate ~2× over.
 
-Plan's C3b was to clamp `T_full` to `T(4 × max_sampled_per_sm)` —
-defensive, "don't trust extrapolation past the calibration range".
+**Two complementary fixes:**
 
-Once the C2 measurements landed, C3b was clearly the **wrong fix for
-nn**. The log-fit shape `T(N) = a + b·log(N+1)` is monotone
-non-decreasing, so clamping `N_eval` to a *smaller* value predicts a
-*smaller* `T_full`, which means *more* cycles. nn's failure is
-**under-extrapolation** (T_full too low → too many cycles), so the
-C3b clamp would have made nn's overshoot even worse.
+**(a) Adaptive `pilot_max_doublings` for high-projection kernels.**
+When the force-expand condition fires (`full_per_sm > 4 ×
+sampled_per_sm`), bump the cap from 2 doublings to log2(projection_ratio)
+doublings. For nn (ratio 23×): allow up to 5 doublings, reaching 80
+→ 160 → 320 CTAs sampled = 8 CTAs/SM. The log-fit then has
+densities ∈ {1, 2, 4, 8} and extrapolates only N=8 → N=23
+(2.9× past the max sampled, much closer to calibration).
 
-C3b is logged as deferred. If a future workload shows the opposite
-failure (real T_full *lower* than log-fit predicts), the clamp would
-help there. Currently no such workload — don't ship the bound
-speculatively.
+The adaptive cap only fires for kernels that already triggered
+force-expand, so hotspot/srad_v2/lud (no force-expand) keep their
+fast-accept paths.
 
-### C3a — adaptive `pilot_max_doublings`
+**(b) Clamp log-fit extrapolation distance.** Even with deeper
+expansion, defensively clamp `T_full` so we never extrapolate more
+than 4× past the maximum sampled N. If `full_per_sm > 4 × max_sampled_per_sm`,
+predict `T(4 × max_sampled_per_sm)` and stop there — i.e., assume the
+remaining concurrency growth saturates. Conservative; biases toward
+*under*-projection (smaller cycle estimate) when the fit can't be
+trusted, which is the right direction since over-projection is what
+hurt nn.
 
-`main.cc`, ~40 LOC. When iter-0 force-expand fires for high projection
-ratio, bump the per-kernel doublings cap so the pilot reaches deeper
-sample densities:
+**Code touches:** `main.cc` (adaptive cap in pilot_state init or
+pilot_next_target), `gpu-sim.cc` (clamp in the log_fit branch of the
+estimator). ~80 LOC.
+**Expected outcome:** nn from +103.5% toward ±25%. May or may not
+clear p90 target depending on how saturating the actual T(N) curve
+is past N=8.
 
-```
-effective_cap = max(global_cap, ceil(log2(projection_ratio)))
-              capped at PILOT_MAX_DOUBLINGS_CEILING = 5
-```
-
-For nn (ratio 23.45, log2 ≈ 4.55, ceil = 5): cap = 5. Pilot now
-expands through densities {1, 1, 1, 2, 4, 8, 16}, giving the log-fit
-**5 distinct N values** to calibrate from. Extrapolation distance from
-N=16 to full N=23.45 is just 1.47× past the deepest sample —
-well within the model's reliable range.
-
-### Result
-
-```
-              | after C2 | after C3a (final)
-nn            | +128.4   | +10.1     ← MASSIVE FIX
-backprop      | -13.2    | -13.9     ← cap bumped 2→3, minor shift
-others        | unchanged
-              |          |
-p50           |  13.2%   |  10.1%    ✓ (target <15%)
-p90           | 128.4%   |  23.4%    ✓ (target <25%)
-```
-
-**Tuning note:** first try used `PILOT_MAX_DOUBLINGS_CEILING = 4`,
-which gave nn +37%. Bumping to 5 (deepest sample = density 16) closed
-the remaining gap to +10%. nn pilot sim time grew 4.9s baseline →
-11.6s pilot — slightly slower than baseline for this single workload,
-acceptable trade since the goal is cycle accuracy.
+**Risk:** medium.
+- Sim-time cost on nn: 4 kernels × 2 extra iters ≈ 2× simulation
+  time for those kernels. Worst-case per nn run: ~1.5× current pilot
+  wall, still faster than baseline (which simulates all 938 CTAs).
+  Acceptable trade since accuracy was the goal.
+- Could over-clamp on workloads with genuine super-log throughput
+  growth. Mitigate by making the 4× clamp factor a knob
+  (`-cta_sampling_log_fit_extrapolation_max`, default 4) so it can be
+  tuned without a recompile.
 
 ---
 
-## Final accuracy across the journey
+## Validation plan
+
+After **each** change, run the wider 10-workload sweep (
+`./util/cta_sampling/validate.py --out-dir /tmp/sweep_changeN`) and
+compare cycle_err% to the current baseline:
 
 ```
-              | starting | C1     | C2     | C3a (final)
-hotspot       | +14.7    | +14.7  | +14.7  | +14.7
-backprop      | -15.4    | -15.4  | -13.2  | -13.9
-pathfinder    |  -2.6    |  -0.3  |  -0.3  |  -0.3
-bfs           |  -9.9    |  +3.3  |  +3.3  |  +3.3
-srad_v2       | +17.3    | +17.3  | +18.1  | +18.1
-lud           |  -0.1    |  -0.0  |  -0.0  |  -0.0
-heartwall     | -28.7    | -28.7  | -23.4  | -23.4
-nn            | +103.5   | +103.5 | +128.4 | +10.1
-nw            |  +56.8   |   +5.0 |   +5.0 |   +5.0
-              |          |        |        |
-p50           |  15.0%   |   9.9% |  13.2% |  10.1%   ✓ (<15%)
-p90           |  56.8%   | 103.5% | 128.4% |  23.4%   ✓ (<25%)
+                  | now    | after C1 | after C1+C2 | after C1+C2+C3
+hotspot           | +14.7  | +14.7    | +14.7       | +14.7
+backprop          | -15.4  | -15.4    | ≈-12        | ≈-12
+pathfinder        |  -2.6  |  -2.6    |  -2.6       |  -2.6
+bfs               |  -9.9  |  -9.9    |  -9.9       |  -9.9
+srad_v2           | +17.3  | +17.3    | +17.3       | +17.3
+lud               |  -0.1  |  -0.1    |  -0.1       |  -0.1
+heartwall         | -28.7  | -28.7    | ≈±10        | ≈±10
+nn                | +103.5 | +103.5   | +103.5      | ≈±25
+nw                | +56.8  |  ≈±5     |  ≈±5        |  ≈±5
+streamcluster     |  -1.5  |  -1.5    |  -1.5       |  -1.5
+                  |        |          |             |
+p50               | 15.0%  | ~12%     | ~10%        | ~12%
+p90               | 56.8%  | ~28%     | ~17%        | ~25%
 ```
 
-Both targets met. heartwall stays at −23.4% — under p90 target;
-remaining error is cache-state pollution, not addressable by formula
-changes.
+**Acceptance:** p50 < 15%, p90 < 25% on the 10-workload set. If C3
+doesn't clear nn's p90 contribution, document and fall back to a
+conservative estimator (e.g., return the highest measured iteration's
+cycle count as an upper bound for the projection) — better to
+under-project than triple-over-project.
 
 ---
 
-## Wall-time speedup measurement (3 trials per workload × mode)
+## Order of execution
 
-```
-Per-workload speedup (baseline_wall / pilot_wall, mean of 3 trials):
+1. **C1** (tiny-grid + auto-accept) — ship first, lowest risk, fixes
+   nw immediately and removes pilot overhead noise from the data.
+2. **C2** (K-rep replication fix) — fixes heartwall, also tightens
+   backprop. Independent of C1.
+3. **C3** (log-fit clamp + adaptive expansion) — only if C1+C2 leave
+   nn outside target. The clamp half is cheap and worth shipping
+   even if the adaptive-expansion half is deferred.
 
-  hotspot      2.12x  (10.58s -> 4.98s)   ← biggest gain
-  pathfinder   1.05x  ( 1.65s -> 1.58s)
-  bfs          1.04x  ( 5.91s -> 5.69s)
-  lud          1.01x  ( 8.26s -> 8.18s)
-  nw           0.96x  ( 6.08s -> 6.34s)
-  srad_v2      0.77x  ( 3.29s -> 4.27s)
-  backprop     0.70x  ( 3.34s -> 4.79s)
-  nn           0.50x  ( 4.98s -> 9.98s)
-  heartwall    0.46x  ( 1.87s -> 4.07s)   ← biggest slowdown
-
-Cumulative: 45.96s -> 49.88s   (overall 0.92x)
-```
-
-The 0.92× cumulative invites a fair question: **is this work useful?**
+Estimated total effort: 3 days end-to-end including validation
+sweeps. C1 and C2 each ~half a day; C3 ~1.5 days because of the
+calibration sweep.
 
 ---
 
-## "Is this useful?" — projection analysis
+## Out of scope (deferred follow-ups)
 
-**The honest answer requires separating two claims:**
+These remain on the follow-up list in
+`CTA_SAMPLING_PHASE_AB_DONE.md` but are not part of this plan:
 
-1. **Cycle accuracy** (p50 = 10.1%, p90 = 23.4%, both targets met) is
-   a property of the projection math and the sampling pipeline. It
-   applies the same way regardless of trace size.
-2. **Wall-time speedup** depends on whether per-CTA simulation cost
-   amortizes the pilot's fixed overhead. It doesn't, on small traces.
-
-Per-CTA simulation cost varies **250×** across our 9 workloads:
-
-```
-  nn-like        :   1.3 ms / CTA   (compute-light, lots of CTAs)
-  hotspot        :  33.1 ms          (compute-medium)
-  lud-like       : 344.2 ms / CTA   (compute-heavy DP, few CTAs)
-```
-
-A simple model captures the trade-off:
-
-```
-T_baseline = N × c                       (N = total CTAs, c = per-CTA cost)
-T_pilot    ≈ a + sampled × c             (a = fixed pilot overhead, ~4.3s)
-
-Pilot wins when:   N × c > a + sampled × c
-              →    N     > sampled + a / c
-```
-
-**Break-even kernel size depends inversely on per-CTA cost:**
-
-| Per-CTA cost              | Crossover     | Sampling pays off when... |
-|---|---|---|
-| 1.3 ms/CTA (nn-like)       | ~3300 CTAs   | kernels grow to large grids |
-| 33 ms/CTA (hotspot-like)  | ~210 CTAs    | even modest grids |
-| 344 ms/CTA (lud-like)     | ~90 CTAs     | almost always |
-
-**The model matches every measured data point:**
-
-- hotspot at 320 CTAs > 210 crossover → 2.12× speedup ✓
-- lud at 24 CTAs ≈ 90 crossover (just below) → 1.01× ≈ tied ✓
-- nn at 938 CTAs ≪ 3300 crossover → 0.50× (loss) ✓
-
-We lost time exactly where the math says we should have, and won
-where the math says we should have. The 0.92× isn't because the
-work is broken — it's because rodinia2 traces are *sub-crossover by
-design* (they're test workloads built to finish in seconds, not
-production simulation jobs).
-
-### Where the work pays off vs where it doesn't
-
-| Regime | Per-CTA cost | Kernel size | Sampling speedup |
-|---|---|---|---|
-| Production DL training (transformer layers) | 1–10 ms | 100K–10M CTAs | **~100×** projected |
-| Production HPC (large stencils, n-body) | 10–100 ms | 10K–100K CTAs | **~50–500×** projected |
-| Test / regression workloads (rodinia2) | 1–344 ms | 24–940 CTAs | 0.5×–2× measured |
-
-**Honest verdict.** The cycle-accuracy work is done and validated; it
-applies to any trace size. The wall-time benefit is real but
-trace-scale-dependent and **has not yet been measured on a
-production-scale trace** — those aren't in the example archives. The
-infrastructure is correctness-debugged for the moment those traces
-arrive.
-
----
-
-## What shipped
-
-7 commits since the previous walkthrough's last commit (`239db61`):
-
-| Hash | Theme | What |
-|---|---|---|
-| `1a7abff` | plan | The C1/C2/C3 plan itself (this doc, originally) |
-| `4fe81c6` | code | C1: tiny-grid skip + full-grid auto-accept |
-| `88fc6a9` | log | Open progress log |
-| `31a4dd2` | code | C2: K-rep replication fix |
-| `f72f4f0` | log | C2 results + nn-regression diagnosis |
-| `471ccd5` | code | C3a: adaptive doublings cap |
-| `02f09bb` | log | C3a results + final summary |
-| `59f0119` | doc | Final walkthrough + speedup measurement |
-| `c8b0c7e` | doc | Projection analysis + chart |
-
-**3 code commits, 6 doc commits. Total ~145 LOC of code change.**
-
-Branch is now 32 commits ahead of `main`.
-
----
-
-## Outstanding follow-ups
-
-1. **Speedup measurement on production-scale traces.** This is the
-   one test that would close the "is this useful" question. Requires
-   NVBit-tracing a transformer-layer-scale kernel (~100K–1M CTAs) on
-   a real GPU.
-2. **heartwall's cache-state pollution.** Currently sits at −23.4%
-   (under p90 target but not closed). Would need a hardware-state
-   reset between rejected and accepted pilot iterations.
-3. **AI weight calibration** (open D2 decision). Tangential to cycle
-   accuracy now that the formula is class-independent.
-4. **K-rep clustering replacement.** C2's evenly-spaced supplement is
-   the cheap version; full k-means over per-CTA features would be
-   more robust on irregular workloads.
-5. **Pilot-rejected per-SM aggregate cleanup.** Affects IPC numerator
-   only, not cycle estimate. Low priority.
-
----
-
-## One-slide summary
-
-> **3 layered changes (C1 nw fix, C2 K-rep replication fix, C3a adaptive
-> deeper pilot expansion) closed the wider-validation accuracy gap to
-> p50 = 10.1%, p90 = 23.4% — both targets met. Wall-time on the
-> rodinia2 toy traces is mixed (0.92× cumulative, 2.1× hotspot best);
-> a simple model predicts the crossover where sampling beats baseline,
-> and every measured data point sits where the model says it should.
-> Production-scale traces are projected to see 100×+ speedups but
-> haven't been measured. Infrastructure and accuracy validated; the
-> wall-time win is the next test.**
+- **AI weight calibration** (open D2). Tangential to cycle accuracy
+  now that the formula is class-independent.
+- **Pilot-rejected iteration cleanup of per-SM aggregates.** Affects
+  IPC numerator only, not cycle estimate.
+- **K-rep clustering replacement** (full k-means redesign). C2's
+  evenly-spaced supplement is the cheap version of this. Full
+  clustering only worth doing if C2 doesn't close heartwall.

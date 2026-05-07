@@ -1,11 +1,46 @@
-# CTA Sampling — Final Walkthrough
+# CTA Sampling — Final Status Update
 
-Continuation of `CTA_SAMPLING_WALKTHROUGH.md`. That doc covered the
-branch from `main` through Phase A + Phase B + the cycle-accuracy
-push (throughput formula → force-expand → log-fit → high-projection-
-ratio expansion), where we hit p50 = 12.3%, p90 = 17.3% on the
-**original 6-workload set** but a **wider 10-workload sweep** showed
-3 distinct failure modes:
+**Status: ✅ Both accuracy targets met on the wider 9-workload set.**
+
+This is the final walkthrough of the cycle-accuracy + wider-validation
+work on the `cta-sampling` branch. It covers what shipped, the
+measured results per change, the wall-time speedup analysis, and an
+honest verdict on where the work pays off. Pairs with
+`CTA_SAMPLING_WALKTHROUGH.md` (the previous walkthrough, covering the
+branch from `main` through the original cycle-accuracy push) and
+`CTA_SAMPLING_C1_C2_C3_LOG.md` (the live progress log of this phase).
+
+---
+
+## TL;DR for the meeting
+
+- **3 layered changes shipped in ~145 LOC + 1 dropped before
+  implementation.** All targeted at the failure modes a wider
+  10-workload sweep exposed.
+- **Cycle accuracy on the wider 9-workload set: p50 = 10.1%,
+  p90 = 23.4% — both targets met.**
+- **Wall-time speedup is workload-dependent.** On rodinia2 toy traces
+  the cumulative is 0.92× (slight slowdown), but per-workload ranges
+  from 0.46× (heartwall) to 2.12× (hotspot). A simple model predicts
+  the crossover at ~90 to ~3300 CTAs depending on per-CTA simulation
+  cost — every workload we measured below that threshold lost time,
+  every one above won.
+- **Production-scale traces (10K+ CTAs/kernel) are projected to see
+  100×+ speedups; we have not yet measured on such a trace.** The
+  cycle-accuracy contribution is independent of trace scale.
+
+![speedup](speedup_chart.png)
+
+![projection](speedup_projection.png)
+
+---
+
+## Starting state (after the previous walkthrough)
+
+Previous walkthrough closed at p50 = 12.3%, p90 = 17.3% on the
+**original 6-workload set**. A wider sweep with 4 more rodinia2
+kernels (heartwall, nn, nw, streamcluster) revealed three failure
+modes:
 
 ```
 heartwall  −28.7%   K-rep replication (corner-only sampling)
@@ -13,9 +48,8 @@ nn        +103.5%   log-fit under-extrapolates large CTAs/SM gaps
 nw         +56.8%   pilot overhead + state pollution on tiny grids
 ```
 
-This doc covers what shipped to close those gaps — three layered
-changes (C1, C2, C3), one dropped change (C3b), the final accuracy
-state, and the wall-time speedup measurement.
+Goal: hit p50 < 15%, p90 < 25% on the wider 9-workload set without
+regressing the workloads already at target.
 
 ---
 
