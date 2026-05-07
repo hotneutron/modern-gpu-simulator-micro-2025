@@ -148,9 +148,21 @@ class mem_fetch {
 
   void set_is_prefetch(bool is_prefetch) { m_is_prefetch = is_prefetch; }
 
+  bool get_is_instruction_region_prewarm() {
+    return m_is_instruction_region_prewarm;
+  }
+
+  void set_is_instruction_region_prewarm(bool is_instruction_region_prewarm) {
+    m_is_instruction_region_prewarm = is_instruction_region_prewarm;
+  }
+
   unsigned int get_stream_buffer_id() { return m_stream_buffer_id; }
 
   void set_stream_buffer_id(unsigned int stream_buffer_id) { m_stream_buffer_id = stream_buffer_id; }
+
+  unsigned int get_prefetch_l1i_fate() { return m_prefetch_l1i_fate; }
+
+  void set_prefetch_l1i_fate(unsigned int prefetch_l1i_fate) { m_prefetch_l1i_fate = prefetch_l1i_fate; }
 
   void set_kernel_id(unsigned int kernel_id) { m_kernel_id = kernel_id; }
   unsigned int get_kernel_id() { return m_kernel_id; }
@@ -173,7 +185,9 @@ class mem_fetch {
   int m_subcore; // MOD. Added L0I
   bool m_is_filling_L0; // MOD. Added L0I
   bool m_is_prefetch;
+  bool m_is_instruction_region_prewarm;
   unsigned int m_stream_buffer_id;
+  unsigned int m_prefetch_l1i_fate;
   bool m_is_fixed_latency_constant_access;
   unsigned int m_unique_function_id;
 

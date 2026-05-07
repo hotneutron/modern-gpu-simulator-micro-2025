@@ -75,7 +75,9 @@ mem_fetch::mem_fetch(const mem_access_t &access, const warp_inst_t *inst,
   m_is_fixed_latency_constant_access= false;
   m_unique_function_id = unique_function_id;
   m_is_prefetch = false;
+  m_is_instruction_region_prewarm = false;
   m_stream_buffer_id = std::numeric_limits<unsigned int>::max();
+  m_prefetch_l1i_fate = 0;
   m_kernel_id = 0;
 
   m_tlb_set_idx = -1;

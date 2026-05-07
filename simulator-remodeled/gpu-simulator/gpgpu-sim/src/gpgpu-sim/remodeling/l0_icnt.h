@@ -30,6 +30,7 @@
 
 #include "../../abstract_hardware_model.h"
 
+#include <string>
 #include <vector>
 #include <unordered_map>
 #include <queue>
@@ -44,6 +45,12 @@ class shader_core_ctx_wrapper;  // Definition to be allowed to compile. Code of 
 unsigned num_bytes_cache_req(unsigned line_size, address_type pc);
 
 address_type get_pc_of_request(address_type pc);
+std::string get_instruction_region_top_late_miss_regions(unsigned int top_n);
+std::string get_instruction_region_top_miss_regions(unsigned int top_n);
+std::vector<new_addr_type> get_instruction_regions_to_prewarm(
+    unsigned int unique_function_id, unsigned long long min_late_miss_count,
+    unsigned int min_observed_warps, unsigned int max_regions);
+unsigned int get_instruction_region_size_in_blocks();
 /**
  * @brief 
  * 
@@ -77,6 +84,9 @@ class L0_icnt : public mem_fetch_interface{
          * @param mf , pointer of the mem_fetch that is going to be requested to lower cache levels
          */
         virtual void push(mem_fetch *mf);
+        bool issue_instruction_prewarm(new_addr_type addr,
+                                       unsigned int unique_function_id,
+                                       unsigned int subcore_id);
         
         /**
          * @brief Method that checks if the icnt to make requests to L1 is full

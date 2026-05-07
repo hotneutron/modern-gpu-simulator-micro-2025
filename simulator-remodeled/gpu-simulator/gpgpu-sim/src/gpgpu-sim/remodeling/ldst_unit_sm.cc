@@ -27,10 +27,12 @@
 // POSSIBILITY OF SUCH DAMAGE.
 
 #include "ldst_unit_sm.h"
+#include <algorithm>
 #include <functional>
 #include <limits>
 #include "../gpu-sim.h"
 #include "../shader.h"
+#include "../shader_trace.h"
 #include "../stat-tool.h"
 #include "sm.h"
 #include "fusedMemory/coalescingStats.h"
@@ -316,6 +318,76 @@ mem_stage_stall_type ldst_unit_sm::process_memory_access_queue(cache_t &cache, m
   return process_cache_access(cache, mf->get_addr(), *(acc->get_inst()), events, mf, status);
 }
 
+bool ldst_unit_sm::can_merge_with_queued_l1d_access(mem_fetch *queued_mf,
+                                                    const mem_access_t *acc) const {
+  if (!queued_mf || !acc) return false;
+  if (acc->is_write() || queued_mf->get_is_write()) return false;
+  if (acc->get_inst()->isatomic() || queued_mf->isatomic()) return false;
+  if (acc->is_l1d_bypass()) return false;
+  if (queued_mf->get_access_type() != acc->get_type()) return false;
+  if (queued_mf->get_access().get_space() != acc->get_space()) return false;
+  if (queued_mf->get_access().get_l1d_bank() != acc->get_l1d_bank()) return false;
+  return m_config->m_L1D_config.mshr_addr(queued_mf->get_addr()) ==
+         m_config->m_L1D_config.mshr_addr(acc->get_addr());
+}
+
+void ldst_unit_sm::merge_access_requesters(AccessCoalescingInformation &dst,
+                                           const AccessCoalescingInformation &src) {
+  dst.m_pcs_requesting.insert(src.m_pcs_requesting.begin(),
+                              src.m_pcs_requesting.end());
+  dst.m_warp_id_requesting.insert(src.m_warp_id_requesting.begin(),
+                                  src.m_warp_id_requesting.end());
+  dst.m_dep_counters_id_requesting.insert(src.m_dep_counters_id_requesting.begin(),
+                                          src.m_dep_counters_id_requesting.end());
+  for (auto prt_id : src.m_prts_requesting) {
+    if (std::find(dst.m_prts_requesting.begin(), dst.m_prts_requesting.end(),
+                  prt_id) == dst.m_prts_requesting.end()) {
+      dst.m_prts_requesting.push_back(prt_id);
+    }
+  }
+}
+
+bool ldst_unit_sm::try_merge_into_l1d_latency_queue(mem_access_t *acc) {
+  if (!acc || acc->is_write() || acc->is_l1d_bypass() ||
+      acc->get_inst()->isatomic()) {
+    return false;
+  }
+  auto *m_gpu = m_core->get_gpu();
+  unsigned int acc_bank = acc->get_l1d_bank();
+  unsigned int inst_latency =
+      acc->get_inst()->m_latency_of_mem_operation_at_sm_structure;
+  unsigned int merged_requesters =
+      acc->get_access_coal_info().m_prts_requesting.size();
+  for (unsigned int stage = 0; stage < inst_latency; ++stage) {
+    auto &queue_elem = l1d_latency_queue[acc_bank][stage];
+    if (!queue_elem) continue;
+    for (mem_fetch *queued_mf : queue_elem->mfs) {
+      if (!can_merge_with_queued_l1d_access(queued_mf, acc)) continue;
+      mem_access_t &queued_access = queued_mf->get_access();
+      merge_access_requesters(queued_access.get_access_coal_info(),
+                              acc->get_access_coal_info());
+      queued_access.set_size(std::max(queued_access.get_size(), acc->get_size()));
+      queued_access.set_sector_mask(queued_access.get_sector_mask() |
+                                    acc->get_sector_mask());
+      SHADER_DPRINTF(
+          LIVENESS,
+          "L1D pre-cache merge bank=%u stage=%u block=0x%llx merged_requesters=%u total_requesters=%zu queued_sector_mask=%s new_sector_mask=%s\n",
+          acc_bank, stage,
+          (unsigned long long)m_config->m_L1D_config.mshr_addr(acc->get_addr()),
+          merged_requesters,
+          queued_access.get_access_coal_info().m_prts_requesting.size(),
+          queued_access.get_sector_mask().to_string().c_str(),
+          acc->get_sector_mask().to_string().c_str());
+      m_sm->m_sm_stats.m_stats_map["total_accesses_coalesced"]->increment_with_integer(1);
+      m_sm->m_sm_stats.m_stats_map["total_l1d_precache_merges"]->increment_with_integer(1);
+      m_sm->m_sm_stats.m_stats_map["total_l1d_precache_merged_requesters"]->increment_with_integer(
+          merged_requesters);
+      return true;
+    }
+  }
+  return false;
+}
+
 mem_stage_stall_type ldst_unit_sm::dispatch_to_memory_access_queue_l1Dcache(cache_t &cache, mem_access_t *acc) { 
   mem_stage_stall_type result = NO_RC_FAIL;
   if (m_config->maximum_l1d_latency_at_sm_structure > 0) {
@@ -325,7 +397,10 @@ mem_stage_stall_type ldst_unit_sm::dispatch_to_memory_access_queue_l1Dcache(cach
     unsigned int acc_bank = acc->get_l1d_bank();
     assert(acc_bank < m_config->m_L1D_config.l1_banks);
     bool inserted = false;
-    if(!l1d_latency_queue[acc_bank][inst_latency - 1]) {
+    bool merged = try_merge_into_l1d_latency_queue(acc);
+    if (merged) {
+      inserted = true;
+    } else if(!l1d_latency_queue[acc_bank][inst_latency - 1]) {
       l1d_latency_queue[acc_bank][inst_latency - 1] = std::make_shared<l1d_queue_element>();
       inserted = true;
     }else if(l1d_latency_queue[acc_bank][inst_latency - 1]->mfs.size() < m_config->memory_l1d_max_lookups_per_cycle_per_bank) {
@@ -334,7 +409,7 @@ mem_stage_stall_type ldst_unit_sm::dispatch_to_memory_access_queue_l1Dcache(cach
       is_a_bank_conflict = true;
     }
     
-    if(inserted) {
+    if(inserted && !merged) {
       mem_fetch *mf =
           m_mf_allocator->alloc(*(acc->get_inst()), *acc,
                                 m_core->get_gpu()->gpu_sim_cycle +
@@ -1165,6 +1240,7 @@ void ldst_unit_sm::global_shared_latency_queue_cycle() {
 
 read_only_cache *ldst_unit_sm::get_L1C() { return m_L1C; }
 l1_cache*ldst_unit_sm::get_L1D() { return m_L1D; }
+unsigned ldst_unit_sm::get_sid() const { return m_sid; }
 SM* ldst_unit_sm::get_SM() { return m_sm; }
 
 unsigned long long ldst_unit_sm::get_instruction_id(warp_inst_t* inst, unsigned int idx) {

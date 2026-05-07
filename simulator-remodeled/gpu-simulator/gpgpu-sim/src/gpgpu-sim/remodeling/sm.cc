@@ -175,6 +175,66 @@ bool SM::is_using_interwarp_coal_warps_waiting_dep_counter() {
   return res;
 }
 
+void SM::enqueue_instruction_region_prewarm(kernel_info_t &kernel) {
+  if (!m_config->is_instruction_region_prewarm_enabled) {
+    return;
+  }
+  if (!m_config->is_trace_mode) {
+    return;
+  }
+  if (kernel.function_unique_id == 0) {
+    return;
+  }
+  std::vector<new_addr_type> region_bases = get_instruction_regions_to_prewarm(
+      kernel.function_unique_id,
+      m_config->instruction_region_prewarm_min_late_miss_count,
+      m_config->instruction_region_prewarm_min_observed_warps,
+      m_config->instruction_region_prewarm_max_regions);
+  if (region_bases.empty()) {
+    return;
+  }
+  unsigned int line_size = m_config->m_L1I_L1_half_C_cache_config.get_line_sz();
+  unsigned int region_blocks = get_instruction_region_size_in_blocks();
+  for (new_addr_type region_base : region_bases) {
+    std::pair<unsigned int, new_addr_type> activation_key(
+        kernel.function_unique_id, region_base);
+    if (!m_activated_instruction_region_prewarm.insert(activation_key).second) {
+      continue;
+    }
+    for (unsigned int i = 0; i < region_blocks; ++i) {
+      m_pending_instruction_region_prewarm.push(
+          std::make_pair(region_base + static_cast<new_addr_type>(i) * line_size,
+                         kernel.function_unique_id));
+    }
+  }
+}
+
+void SM::issue_pending_instruction_region_prewarm() {
+  if (!m_config->is_instruction_region_prewarm_enabled) {
+    return;
+  }
+  if (m_pending_instruction_region_prewarm.empty()) {
+    return;
+  }
+  L0_icnt *l0_icnt = static_cast<L0_icnt *>(m_icnt_L0s);
+  for (unsigned int i = 0;
+       i < m_config->instruction_region_prewarm_max_lines_per_cycle &&
+       !m_pending_instruction_region_prewarm.empty();
+       ++i) {
+    std::pair<new_addr_type, unsigned int> entry =
+        m_pending_instruction_region_prewarm.front();
+    unsigned int subcore_id =
+        m_next_instruction_region_prewarm_subcore % m_num_subcores;
+    if (!l0_icnt->issue_instruction_prewarm(entry.first, entry.second,
+                                            subcore_id)) {
+      break;
+    }
+    m_next_instruction_region_prewarm_subcore =
+        (m_next_instruction_region_prewarm_subcore + 1) % m_num_subcores;
+    m_pending_instruction_region_prewarm.pop();
+  }
+}
+
 void SM::num_cycles_to_stall_SM(unsigned int num_cycles) {
   for(unsigned int i = 0; i < m_subcores.size(); i++) {
     m_subcores[i]->num_cycles_to_stall(num_cycles);
@@ -244,6 +304,11 @@ void SM::cycle() {
   // MOD. End. Custom Stats
 
   L0_icnt *l0_icnt = static_cast<L0_icnt *>(m_icnt_L0s);
+  if (m_config->is_instruction_region_prewarm_enabled &&
+      m_pending_instruction_region_prewarm.empty() && m_kernel != nullptr) {
+    enqueue_instruction_region_prewarm(*m_kernel);
+  }
+  issue_pending_instruction_region_prewarm();
   l0_icnt->cycle();
   m_L1I_L1_half_C_cache->cycle();
 
@@ -1078,6 +1143,10 @@ void SM::cache_flush() { m_ldst_unit_shared_of_sm->flush(); }
 void SM::cache_invalidate() { 
   m_ldst_unit_shared_of_sm->invalidate(); 
   if(m_config->invalidate_instruction_caches_at_kernel_end) {
+    while(!m_pending_instruction_region_prewarm.empty()) {
+      m_pending_instruction_region_prewarm.pop();
+    }
+    m_activated_instruction_region_prewarm.clear();
     m_icnt_L0s->flush();
     m_L1I_L1_half_C_cache->invalidate();
     for(auto subcore : m_subcores) {
@@ -1333,6 +1402,7 @@ void SM::issue_block2core(kernel_info_t &kernel) {
   m_barriers.allocate_barrier(free_cta_hw_id, warps);
 
   // initialize the SIMT stacks and fetch hardware
+  enqueue_instruction_region_prewarm(kernel);
   init_warps(free_cta_hw_id, start_thread, end_thread, ctaid, cta_size, kernel);
   m_n_active_cta++;
 

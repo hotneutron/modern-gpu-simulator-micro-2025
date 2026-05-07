@@ -354,6 +354,19 @@ void Subcore::issue(SM *shared_sm) {
   bool is_issued_inst = false;  // Achieved to issue an instruction?
   bool is_issue_port_busy = true;
   bool is_next_stage_availabe = true;
+  bool is_any_invalid_head_decode_pending = false;
+  bool is_any_invalid_head_l0i_response_ready = false;
+  bool is_any_invalid_head_waiting_frontend = false;
+  bool is_any_invalid_head_waiting_frontend_miss = false;
+  bool is_any_invalid_head_waiting_frontend_in_l0i_response_queue = false;
+  bool is_any_invalid_head_waiting_frontend_in_l0i_response_queue_stream_buffer_wait = false;
+  bool is_any_invalid_head_waiting_frontend_in_l0i_response_queue_stream_buffer_wait_prefetch_not_allocated = false;
+  bool is_any_invalid_head_waiting_frontend_in_l0i_response_queue_stream_buffer_wait_prefetch_issued_not_ready = false;
+  bool is_any_invalid_head_waiting_frontend_in_l0i_response_queue_stream_buffer_wait_prefetch_ready_not_promoted = false;
+  bool is_any_invalid_head_waiting_frontend_in_l0i_response_queue_other = false;
+  bool is_any_invalid_head_waiting_frontend_hit_status = false;
+  bool is_any_invalid_head_ibuffer_empty = false;
+  bool is_any_invalid_head_unknown = false;
   // bool has_been_possible_to_switch_warp = false;
   // bool is_any_waiting_in_inst_barrier = false;
   // bool is_any_waiting_in_stall_count = false;
@@ -382,6 +395,72 @@ void Subcore::issue(SM *shared_sm) {
       assert(c_warp_id == subcore_warp_id);
       bool is_valid_inst_in_the_warp =
           c_warp->get_IBuffer_remodeled()->is_next_valid();
+
+      if (!is_valid_inst_in_the_warp) {
+        IBuffer_Remodeled *ibuffer = c_warp->get_IBuffer_remodeled();
+        if (ibuffer->get_is_empty()) {
+          is_any_invalid_head_ibuffer_empty = true;
+          continue;
+        }
+
+        address_type local_pc_head = ibuffer->get_next_pc_to_issue();
+        if (m_inst_fetch_decode_latch.m_valid &&
+            (m_inst_fetch_decode_latch.m_warp_id == subcore_warp_id) &&
+            (m_inst_fetch_decode_latch.m_pc == local_pc_head)) {
+          is_any_invalid_head_decode_pending = true;
+          continue;
+        }
+
+        unsigned int unique_function_id =
+            c_warp->get_current_unique_function_id_call();
+        address_type global_pc_head =
+            shared_sm->from_local_pc_to_global_pc_address(local_pc_head,
+                                                          unique_function_id);
+        if (m_L0I->is_first_access_ready_for_warp_pc(sm_warp_id,
+                                                     global_pc_head)) {
+          is_any_invalid_head_l0i_response_ready = true;
+          continue;
+        }
+
+        cache_request_status head_status = RESERVATION_FAIL;
+        if (m_L0I->get_access_status_for_warp_pc(sm_warp_id, global_pc_head,
+                                                 head_status)) {
+          if (head_status == MISS) {
+            is_any_invalid_head_waiting_frontend = true;
+            is_any_invalid_head_waiting_frontend_miss = true;
+          } else if (head_status == IN_L0I_RESPONSE_QUEUE) {
+            is_any_invalid_head_waiting_frontend = true;
+            is_any_invalid_head_waiting_frontend_in_l0i_response_queue = true;
+            status_element::origin head_origin = status_element::NONE;
+            if (m_L0I->get_access_origin_for_warp_pc(sm_warp_id, global_pc_head,
+                                                     head_origin) &&
+                (head_origin == status_element::STREAM_BUFFER_WAIT)) {
+              is_any_invalid_head_waiting_frontend_in_l0i_response_queue_stream_buffer_wait = true;
+              bool is_prefetch_ready = false;
+              if (m_L0I->classify_stream_buffer_wait_state(global_pc_head,
+                                                           is_prefetch_ready)) {
+                if (is_prefetch_ready) {
+                  is_any_invalid_head_waiting_frontend_in_l0i_response_queue_stream_buffer_wait_prefetch_ready_not_promoted = true;
+                } else {
+                  is_any_invalid_head_waiting_frontend_in_l0i_response_queue_stream_buffer_wait_prefetch_issued_not_ready = true;
+                }
+              } else {
+                is_any_invalid_head_waiting_frontend_in_l0i_response_queue_stream_buffer_wait_prefetch_not_allocated = true;
+              }
+            } else {
+              is_any_invalid_head_waiting_frontend_in_l0i_response_queue_other = true;
+            }
+          } else if (head_status == HIT) {
+            is_any_invalid_head_waiting_frontend = true;
+            is_any_invalid_head_waiting_frontend_hit_status = true;
+          } else {
+            is_any_invalid_head_unknown = true;
+          }
+        } else {
+          is_any_invalid_head_unknown = true;
+        }
+        continue;
+      }
 
       if (is_valid_inst_in_the_warp) {
         is_valid_inst = true;
@@ -512,6 +591,19 @@ void Subcore::issue(SM *shared_sm) {
     shared_sm->m_sm_stats.m_stats_map["total_num_cycles_issue_stage_stall_issue_port_busy"]->increment_with_integer(1);
   }else if(!is_valid_inst) {
     shared_sm->m_sm_stats.m_stats_map["total_num_cycles_issue_stage_stall_no_valid_instruction"]->increment_with_integer(1);
+    shared_sm->m_sm_stats.m_stats_map["total_num_cycles_issue_stage_stall_no_valid_instruction_decode_pending"]->increment_with_integer(is_any_invalid_head_decode_pending);
+    shared_sm->m_sm_stats.m_stats_map["total_num_cycles_issue_stage_stall_no_valid_instruction_l0i_response_ready"]->increment_with_integer(is_any_invalid_head_l0i_response_ready);
+    shared_sm->m_sm_stats.m_stats_map["total_num_cycles_issue_stage_stall_no_valid_instruction_head_invalid_waiting_frontend"]->increment_with_integer(is_any_invalid_head_waiting_frontend);
+    shared_sm->m_sm_stats.m_stats_map["total_num_cycles_issue_stage_stall_no_valid_instruction_head_invalid_waiting_frontend_miss"]->increment_with_integer(is_any_invalid_head_waiting_frontend_miss);
+    shared_sm->m_sm_stats.m_stats_map["total_num_cycles_issue_stage_stall_no_valid_instruction_head_invalid_waiting_frontend_in_l0i_response_queue"]->increment_with_integer(is_any_invalid_head_waiting_frontend_in_l0i_response_queue);
+    shared_sm->m_sm_stats.m_stats_map["total_num_cycles_issue_stage_stall_no_valid_instruction_head_invalid_waiting_frontend_in_l0i_response_queue_stream_buffer_wait"]->increment_with_integer(is_any_invalid_head_waiting_frontend_in_l0i_response_queue_stream_buffer_wait);
+    shared_sm->m_sm_stats.m_stats_map["total_num_cycles_issue_stage_stall_no_valid_instruction_head_invalid_waiting_frontend_in_l0i_response_queue_stream_buffer_wait_prefetch_not_allocated"]->increment_with_integer(is_any_invalid_head_waiting_frontend_in_l0i_response_queue_stream_buffer_wait_prefetch_not_allocated);
+    shared_sm->m_sm_stats.m_stats_map["total_num_cycles_issue_stage_stall_no_valid_instruction_head_invalid_waiting_frontend_in_l0i_response_queue_stream_buffer_wait_prefetch_issued_not_ready"]->increment_with_integer(is_any_invalid_head_waiting_frontend_in_l0i_response_queue_stream_buffer_wait_prefetch_issued_not_ready);
+    shared_sm->m_sm_stats.m_stats_map["total_num_cycles_issue_stage_stall_no_valid_instruction_head_invalid_waiting_frontend_in_l0i_response_queue_stream_buffer_wait_prefetch_ready_not_promoted"]->increment_with_integer(is_any_invalid_head_waiting_frontend_in_l0i_response_queue_stream_buffer_wait_prefetch_ready_not_promoted);
+    shared_sm->m_sm_stats.m_stats_map["total_num_cycles_issue_stage_stall_no_valid_instruction_head_invalid_waiting_frontend_in_l0i_response_queue_other"]->increment_with_integer(is_any_invalid_head_waiting_frontend_in_l0i_response_queue_other);
+    shared_sm->m_sm_stats.m_stats_map["total_num_cycles_issue_stage_stall_no_valid_instruction_head_invalid_waiting_frontend_hit_status"]->increment_with_integer(is_any_invalid_head_waiting_frontend_hit_status);
+    shared_sm->m_sm_stats.m_stats_map["total_num_cycles_issue_stage_stall_no_valid_instruction_ibuffer_empty"]->increment_with_integer(is_any_invalid_head_ibuffer_empty);
+    shared_sm->m_sm_stats.m_stats_map["total_num_cycles_issue_stage_stall_no_valid_instruction_unknown"]->increment_with_integer(is_any_invalid_head_unknown);
   }else { // It has been possible to switch to another warp, but none where ready to issue
     shared_sm->m_sm_stats.m_stats_map["total_num_cycles_issue_stage_stall_no_warps_ready"]->increment_with_integer(1);
     // m_stats->total_num_cycles_issue_stage_stall_at_least_one_warp_with_fu_occupied += is_any_waiting_in_fu_occupied;
@@ -891,6 +983,7 @@ void Subcore::single_decode(SM *shared_sm, warp_inst_t *pI,
 void Subcore::decode(SM *shared_sm) {
   if (m_inst_fetch_decode_latch.m_valid) {
     address_type pc = m_inst_fetch_decode_latch.m_pc;
+    unsigned long long current_cycle = shared_sm->get_current_gpu_cycle();
     m_stats->m_num_decoded_insn[shared_sm->get_sid()]++;
     if(m_config->ibuffer_coalescing) {
       for (auto warp : m_warps_of_subcore) {
@@ -901,6 +994,7 @@ void Subcore::decode(SM *shared_sm) {
           for (auto &ibuffer_entry :
               warp->get_IBuffer_remodeled()->get_remodeled_ibuffer()) {
             if (!ibuffer_entry.m_valid && (ibuffer_entry.m_pc == pc)) {
+              shared_sm->m_sm_stats.m_stats_map["total_num_ibuffer_entries_decoded"]->increment_with_integer(1);
               warp_inst_t *pI = get_next_inst(shared_sm, subcore_warp_id, pc);
               single_decode(shared_sm, pI, ibuffer_entry, sm_warp_id,
                             subcore_warp_id, warp);
@@ -916,6 +1010,7 @@ void Subcore::decode(SM *shared_sm) {
       for (auto &ibuffer_entry :
            warp->get_IBuffer_remodeled()->get_remodeled_ibuffer()) {
         if (!ibuffer_entry.m_valid && (ibuffer_entry.m_pc == pc)) {
+          shared_sm->m_sm_stats.m_stats_map["total_num_ibuffer_entries_decoded"]->increment_with_integer(1);
           warp_inst_t *pI = get_next_inst(shared_sm, subcore_warp_id, pc);
           single_decode(shared_sm, pI, ibuffer_entry, sm_warp_id,
                         subcore_warp_id, warp);
@@ -940,6 +1035,31 @@ warp_inst_t *Subcore::get_next_inst(SM *shared_sm, unsigned int warp_id, address
 
 void Subcore::fetch(SM *shared_sm) {
   if (!m_inst_fetch_decode_latch.m_valid) {
+    unsigned long long current_cycle = shared_sm->get_current_gpu_cycle();
+    auto mark_response_ready = [&](unsigned int target_subcore_warp_id,
+                                   address_type pc) {
+      if (m_config->ibuffer_coalescing) {
+        for (auto warp : m_warps_of_subcore) {
+          if (warp == NULL || warp->functional_done()) {
+            continue;
+          }
+          for (auto &ibuffer_entry :
+               warp->get_IBuffer_remodeled()->get_remodeled_ibuffer()) {
+            if (!ibuffer_entry.m_valid && (ibuffer_entry.m_pc == pc)) {
+              shared_sm->m_sm_stats.m_stats_map["total_num_ibuffer_entries_response_ready"]->increment_with_integer(1);
+            }
+          }
+        }
+      } else {
+        shd_warp_t *warp = m_warps_of_subcore[target_subcore_warp_id];
+        for (auto &ibuffer_entry :
+             warp->get_IBuffer_remodeled()->get_remodeled_ibuffer()) {
+          if (!ibuffer_entry.m_valid && (ibuffer_entry.m_pc == pc)) {
+            shared_sm->m_sm_stats.m_stats_map["total_num_ibuffer_entries_response_ready"]->increment_with_integer(1);
+          }
+        }
+      }
+    };
     if (m_L0I->is_first_access_ready()) {
       mem_fetch *mf = m_L0I->next_first_access();
       unsigned int unique_function_id = mf->get_unique_function_id();
@@ -947,6 +1067,7 @@ void Subcore::fetch(SM *shared_sm) {
           mf->get_wid(), shared_sm->get_num_subcores());
       address_type local_pc_response =
           shared_sm->from_global_pc_address_to_local_pc(mf->get_addr(), unique_function_id);
+      mark_response_ready(subcore_warp_id, local_pc_response);
       m_inst_fetch_decode_latch = ifetch_buffer_t(
           local_pc_response, mf->get_access_size(), subcore_warp_id);
       // if(shared_sm->get_sid() == 1 && m_subcore_id == 0) {
@@ -1007,6 +1128,26 @@ void Subcore::fetch(SM *shared_sm) {
           status = m_L0I->access((new_addr_type)global_pc_addr, mf,
                                  shared_sm->get_current_gpu_cycle(),
                                  events);
+          if ((status == HIT) && !m_inst_fetch_decode_latch.m_valid &&
+              m_L0I->is_first_access_ready()) {
+            mem_fetch *hit_mf = m_L0I->next_first_access();
+            unsigned int hit_unique_function_id =
+                hit_mf->get_unique_function_id();
+            unsigned int hit_subcore_warp_id =
+                translate_warp_id_of_sm_to_subcore(
+                    hit_mf->get_wid(), shared_sm->get_num_subcores());
+            address_type local_pc_response =
+                shared_sm->from_global_pc_address_to_local_pc(
+                    hit_mf->get_addr(), hit_unique_function_id);
+            mark_response_ready(hit_subcore_warp_id, local_pc_response);
+            m_inst_fetch_decode_latch = ifetch_buffer_t(
+                local_pc_response, hit_mf->get_access_size(),
+                hit_subcore_warp_id);
+            m_inst_fetch_decode_latch.m_valid = true;
+            m_warps_of_subcore[hit_subcore_warp_id]->set_last_fetch(
+                shared_sm->get_gpu()->gpu_sim_cycle);
+            delete hit_mf;
+          }
         }
         
         // if(shared_sm->get_sid() == 1 && m_subcore_id == 0) {

@@ -81,7 +81,10 @@
 #include "../constants.h"
 
 #include "remodeling/sm.h"
+#include "remodeling/l0_icnt.h"
 #include "remodeling/new_stats.h"
+
+std::string get_instruction_region_prewarm_debug_stats();
 
 
 #define PRIORITIZE_MSHR_OVER_WB 1
@@ -1184,12 +1187,26 @@ void shader_core_stats::print_coalescing_stats(FILE *out) {
   unsigned long long total_accesses_coalesced = m_gpu-> m_gpu_per_sm_stats.m_stats_map["total_accesses_coalesced"]->get_value();
   unsigned long long total_accesses_not_coalesced = m_gpu-> m_gpu_per_sm_stats.m_stats_map["total_accesses_not_coalesced"]->get_value();
   unsigned long long total_accesses = m_gpu-> m_gpu_per_sm_stats.m_stats_map["total_accesses"]->get_value();
+  unsigned long long total_l1d_precache_merges = m_gpu->m_gpu_per_sm_stats.m_stats_map["total_l1d_precache_merges"]->get_value();
+  unsigned long long total_l1d_precache_merged_requesters =
+      m_gpu->m_gpu_per_sm_stats.m_stats_map["total_l1d_precache_merged_requesters"]->get_value();
   unsigned long long total_accesses_candidate_to_coalesce = total_accesses_coalesced + total_accesses_not_coalesced;
   long double total_percentage_accesses_candidate_to_coalesce = total_accesses ? ( ( ((double) total_accesses_candidate_to_coalesce)/ total_accesses) * 100 ) : 0; // Avoid NaN
   long double total_percentage_accesses_coalesced = total_accesses_candidate_to_coalesce ? ( ( ((double) total_accesses_coalesced)/ total_accesses_candidate_to_coalesce) * 100 ) : 0; // Avoid NaN
+  long double average_l1d_precache_merged_requesters =
+      total_l1d_precache_merges
+          ? (((long double)total_l1d_precache_merged_requesters) /
+             total_l1d_precache_merges)
+          : 0;
 
   fprintf(out, "total_percentage_accesses_candidate_to_coalesce = %.4Lf\n", total_percentage_accesses_candidate_to_coalesce);
   fprintf(out, "total_percentage_accesses_coalesced = %.4Lf\n", total_percentage_accesses_coalesced);
+  fprintf(out, "total_l1d_precache_merges = %llu\n",
+          total_l1d_precache_merges);
+  fprintf(out, "total_l1d_precache_merged_requesters = %llu\n",
+          total_l1d_precache_merged_requesters);
+  fprintf(out, "average_l1d_precache_merged_requesters = %.4Lf\n",
+          average_l1d_precache_merged_requesters);
 }
 
 // MOD. Begin. Remodeling
@@ -1202,10 +1219,245 @@ void shader_core_stats::print_remodeling_stats(FILE *fout) {
   long double total_percentage_dp_instructions = total_num_dp_instructions ? ( ( ((double) total_num_dp_instructions)/ total_num_warp_instructions) * 100 ) : 0; // Avoid NaN
   fprintf(fout, "total_percentage_dp_instructions = %.4Lf\n", total_percentage_dp_instructions);
   total_num_cycles_issue_stage_issuing = m_gpu-> m_gpu_per_sm_stats.m_stats_map["total_num_cycles_issue_stage_issuing"]->get_value();
+  unsigned long long total_num_cycles_issue_stage_stall_issue_port_busy = m_gpu-> m_gpu_per_sm_stats.m_stats_map["total_num_cycles_issue_stage_stall_issue_port_busy"]->get_value();
+  unsigned long long total_num_cycles_issue_stage_stall_no_valid_instruction = m_gpu-> m_gpu_per_sm_stats.m_stats_map["total_num_cycles_issue_stage_stall_no_valid_instruction"]->get_value();
+  unsigned long long total_num_cycles_issue_stage_stall_no_valid_instruction_decode_pending = m_gpu-> m_gpu_per_sm_stats.m_stats_map["total_num_cycles_issue_stage_stall_no_valid_instruction_decode_pending"]->get_value();
+  unsigned long long total_num_cycles_issue_stage_stall_no_valid_instruction_l0i_response_ready = m_gpu-> m_gpu_per_sm_stats.m_stats_map["total_num_cycles_issue_stage_stall_no_valid_instruction_l0i_response_ready"]->get_value();
+  unsigned long long total_num_cycles_issue_stage_stall_no_valid_instruction_head_invalid_waiting_frontend = m_gpu-> m_gpu_per_sm_stats.m_stats_map["total_num_cycles_issue_stage_stall_no_valid_instruction_head_invalid_waiting_frontend"]->get_value();
+  unsigned long long total_num_cycles_issue_stage_stall_no_valid_instruction_head_invalid_waiting_frontend_miss = m_gpu-> m_gpu_per_sm_stats.m_stats_map["total_num_cycles_issue_stage_stall_no_valid_instruction_head_invalid_waiting_frontend_miss"]->get_value();
+  unsigned long long total_num_cycles_issue_stage_stall_no_valid_instruction_head_invalid_waiting_frontend_in_l0i_response_queue = m_gpu-> m_gpu_per_sm_stats.m_stats_map["total_num_cycles_issue_stage_stall_no_valid_instruction_head_invalid_waiting_frontend_in_l0i_response_queue"]->get_value();
+  unsigned long long total_num_cycles_issue_stage_stall_no_valid_instruction_head_invalid_waiting_frontend_in_l0i_response_queue_stream_buffer_wait = m_gpu-> m_gpu_per_sm_stats.m_stats_map["total_num_cycles_issue_stage_stall_no_valid_instruction_head_invalid_waiting_frontend_in_l0i_response_queue_stream_buffer_wait"]->get_value();
+  unsigned long long total_num_cycles_issue_stage_stall_no_valid_instruction_head_invalid_waiting_frontend_in_l0i_response_queue_stream_buffer_wait_prefetch_not_allocated = m_gpu-> m_gpu_per_sm_stats.m_stats_map["total_num_cycles_issue_stage_stall_no_valid_instruction_head_invalid_waiting_frontend_in_l0i_response_queue_stream_buffer_wait_prefetch_not_allocated"]->get_value();
+  unsigned long long total_num_cycles_issue_stage_stall_no_valid_instruction_head_invalid_waiting_frontend_in_l0i_response_queue_stream_buffer_wait_prefetch_issued_not_ready = m_gpu-> m_gpu_per_sm_stats.m_stats_map["total_num_cycles_issue_stage_stall_no_valid_instruction_head_invalid_waiting_frontend_in_l0i_response_queue_stream_buffer_wait_prefetch_issued_not_ready"]->get_value();
+  unsigned long long total_num_cycles_issue_stage_stall_no_valid_instruction_head_invalid_waiting_frontend_in_l0i_response_queue_stream_buffer_wait_prefetch_ready_not_promoted = m_gpu-> m_gpu_per_sm_stats.m_stats_map["total_num_cycles_issue_stage_stall_no_valid_instruction_head_invalid_waiting_frontend_in_l0i_response_queue_stream_buffer_wait_prefetch_ready_not_promoted"]->get_value();
+  unsigned long long total_num_cycles_issue_stage_stall_no_valid_instruction_head_invalid_waiting_frontend_in_l0i_response_queue_other = m_gpu-> m_gpu_per_sm_stats.m_stats_map["total_num_cycles_issue_stage_stall_no_valid_instruction_head_invalid_waiting_frontend_in_l0i_response_queue_other"]->get_value();
+  unsigned long long total_num_cycles_issue_stage_stall_no_valid_instruction_head_invalid_waiting_frontend_hit_status = m_gpu-> m_gpu_per_sm_stats.m_stats_map["total_num_cycles_issue_stage_stall_no_valid_instruction_head_invalid_waiting_frontend_hit_status"]->get_value();
+  unsigned long long total_num_cycles_issue_stage_stall_no_valid_instruction_ibuffer_empty = m_gpu-> m_gpu_per_sm_stats.m_stats_map["total_num_cycles_issue_stage_stall_no_valid_instruction_ibuffer_empty"]->get_value();
+  unsigned long long total_num_cycles_issue_stage_stall_no_valid_instruction_unknown = m_gpu-> m_gpu_per_sm_stats.m_stats_map["total_num_cycles_issue_stage_stall_no_valid_instruction_unknown"]->get_value();
+  unsigned long long total_num_l0i_access_returns_in_l0i_response_queue_stream_buffer_wait = m_gpu-> m_gpu_per_sm_stats.m_stats_map["total_num_l0i_access_returns_in_l0i_response_queue_stream_buffer_wait"]->get_value();
+  unsigned long long total_num_l0i_access_returns_in_l0i_response_queue_duplicate_request = m_gpu-> m_gpu_per_sm_stats.m_stats_map["total_num_l0i_access_returns_in_l0i_response_queue_duplicate_request"]->get_value();
+  unsigned long long total_num_l0i_stream_buffer_search_hit_requested_addr = m_gpu-> m_gpu_per_sm_stats.m_stats_map["total_num_l0i_stream_buffer_search_hit_requested_addr"]->get_value();
+  unsigned long long total_num_l0i_stream_buffer_search_found_requested_addr_deeper_than_head = m_gpu-> m_gpu_per_sm_stats.m_stats_map["total_num_l0i_stream_buffer_search_found_requested_addr_deeper_than_head"]->get_value();
+  unsigned long long total_num_l0i_stream_buffer_search_found_requested_addr_deeper_than_head_ready = m_gpu-> m_gpu_per_sm_stats.m_stats_map["total_num_l0i_stream_buffer_search_found_requested_addr_deeper_than_head_ready"]->get_value();
+  unsigned long long total_num_l0i_stream_buffer_search_found_requested_addr_deeper_than_head_not_ready = m_gpu-> m_gpu_per_sm_stats.m_stats_map["total_num_l0i_stream_buffer_search_found_requested_addr_deeper_than_head_not_ready"]->get_value();
+  unsigned long long total_num_l0i_stream_buffer_search_hit_prefetch_addr = m_gpu-> m_gpu_per_sm_stats.m_stats_map["total_num_l0i_stream_buffer_search_hit_prefetch_addr"]->get_value();
+  unsigned long long total_num_l0i_stream_buffer_early_trigger_threshold_reached = m_gpu-> m_gpu_per_sm_stats.m_stats_map["total_num_l0i_stream_buffer_early_trigger_threshold_reached"]->get_value();
+  unsigned long long total_num_l0i_stream_buffer_early_trigger_candidate = m_gpu-> m_gpu_per_sm_stats.m_stats_map["total_num_l0i_stream_buffer_early_trigger_candidate"]->get_value();
+  unsigned long long total_num_l0i_stream_buffer_early_trigger_next_line_tag_hit = m_gpu-> m_gpu_per_sm_stats.m_stats_map["total_num_l0i_stream_buffer_early_trigger_next_line_tag_hit"]->get_value();
+  unsigned long long total_num_l0i_stream_buffer_early_trigger_next_line_mshr_hit = m_gpu-> m_gpu_per_sm_stats.m_stats_map["total_num_l0i_stream_buffer_early_trigger_next_line_mshr_hit"]->get_value();
+  unsigned long long total_num_l0i_stream_buffer_early_trigger_selected_inactive_buffer = m_gpu-> m_gpu_per_sm_stats.m_stats_map["total_num_l0i_stream_buffer_early_trigger_selected_inactive_buffer"]->get_value();
+  unsigned long long total_num_l0i_stream_buffer_early_trigger_selected_active_buffer = m_gpu-> m_gpu_per_sm_stats.m_stats_map["total_num_l0i_stream_buffer_early_trigger_selected_active_buffer"]->get_value();
+  unsigned long long total_num_l0i_stream_buffer_early_trigger_set_new_stream_calls = m_gpu-> m_gpu_per_sm_stats.m_stats_map["total_num_l0i_stream_buffer_early_trigger_set_new_stream_calls"]->get_value();
+  unsigned long long total_num_l0i_stream_buffer_early_trigger_set_new_stream_accepted = m_gpu-> m_gpu_per_sm_stats.m_stats_map["total_num_l0i_stream_buffer_early_trigger_set_new_stream_accepted"]->get_value();
+  unsigned long long total_num_l0i_stream_buffer_early_trigger_set_new_stream_accepted_idle_buffer = m_gpu-> m_gpu_per_sm_stats.m_stats_map["total_num_l0i_stream_buffer_early_trigger_set_new_stream_accepted_idle_buffer"]->get_value();
+  unsigned long long total_num_l0i_stream_buffer_early_trigger_set_new_stream_accepted_replace_active = m_gpu-> m_gpu_per_sm_stats.m_stats_map["total_num_l0i_stream_buffer_early_trigger_set_new_stream_accepted_replace_active"]->get_value();
+  unsigned long long total_num_l0i_stream_buffer_early_trigger_set_new_stream_rejected_head_waiting_for_cache = m_gpu-> m_gpu_per_sm_stats.m_stats_map["total_num_l0i_stream_buffer_early_trigger_set_new_stream_rejected_head_waiting_for_cache"]->get_value();
+  unsigned long long total_num_l0i_stream_buffer_early_trigger_set_new_stream_redundant_same_stream = m_gpu-> m_gpu_per_sm_stats.m_stats_map["total_num_l0i_stream_buffer_early_trigger_set_new_stream_redundant_same_stream"]->get_value();
+  unsigned long long total_num_l0i_stream_buffer_early_trigger_redundant_same_stream_active = m_gpu-> m_gpu_per_sm_stats.m_stats_map["total_num_l0i_stream_buffer_early_trigger_redundant_same_stream_active"]->get_value();
+  unsigned long long total_num_l0i_stream_buffer_early_trigger_redundant_same_stream_inactive = m_gpu-> m_gpu_per_sm_stats.m_stats_map["total_num_l0i_stream_buffer_early_trigger_redundant_same_stream_inactive"]->get_value();
+  unsigned long long total_sum_l0i_stream_buffer_early_trigger_redundant_same_stream_queue_depth = m_gpu-> m_gpu_per_sm_stats.m_stats_map["total_sum_l0i_stream_buffer_early_trigger_redundant_same_stream_queue_depth"]->get_value();
+  unsigned long long total_num_l0i_stream_buffer_early_trigger_redundant_same_stream_target_allocated = m_gpu-> m_gpu_per_sm_stats.m_stats_map["total_num_l0i_stream_buffer_early_trigger_redundant_same_stream_target_allocated"]->get_value();
+  unsigned long long total_num_l0i_stream_buffer_early_trigger_redundant_same_stream_target_not_allocated = m_gpu-> m_gpu_per_sm_stats.m_stats_map["total_num_l0i_stream_buffer_early_trigger_redundant_same_stream_target_not_allocated"]->get_value();
+  unsigned long long total_num_l0i_stream_buffer_early_trigger_redundant_same_stream_target_ready = m_gpu-> m_gpu_per_sm_stats.m_stats_map["total_num_l0i_stream_buffer_early_trigger_redundant_same_stream_target_ready"]->get_value();
+  unsigned long long total_num_l0i_stream_buffer_early_trigger_redundant_same_stream_target_not_ready = m_gpu-> m_gpu_per_sm_stats.m_stats_map["total_num_l0i_stream_buffer_early_trigger_redundant_same_stream_target_not_ready"]->get_value();
+  unsigned long long total_num_l0i_stream_buffer_new_stream_candidate = m_gpu-> m_gpu_per_sm_stats.m_stats_map["total_num_l0i_stream_buffer_new_stream_candidate"]->get_value();
+  unsigned long long total_num_l0i_stream_buffer_new_stream_selection_saw_inactive_nonempty_buffer = m_gpu-> m_gpu_per_sm_stats.m_stats_map["total_num_l0i_stream_buffer_new_stream_selection_saw_inactive_nonempty_buffer"]->get_value();
+  unsigned long long total_num_l0i_stream_buffer_new_stream_selection_selected_idle_buffer = m_gpu-> m_gpu_per_sm_stats.m_stats_map["total_num_l0i_stream_buffer_new_stream_selection_selected_idle_buffer"]->get_value();
+  unsigned long long total_num_l0i_stream_buffer_new_stream_selection_selected_active_buffer = m_gpu-> m_gpu_per_sm_stats.m_stats_map["total_num_l0i_stream_buffer_new_stream_selection_selected_active_buffer"]->get_value();
+  unsigned long long total_num_l0i_stream_buffer_new_stream_selection_selected_active_while_inactive_nonempty_exists = m_gpu-> m_gpu_per_sm_stats.m_stats_map["total_num_l0i_stream_buffer_new_stream_selection_selected_active_while_inactive_nonempty_exists"]->get_value();
+  unsigned long long total_num_l0i_stream_buffer_new_stream_accepted = m_gpu-> m_gpu_per_sm_stats.m_stats_map["total_num_l0i_stream_buffer_new_stream_accepted"]->get_value();
+  unsigned long long total_num_l0i_stream_buffer_new_stream_rejected_head_waiting_for_cache = m_gpu-> m_gpu_per_sm_stats.m_stats_map["total_num_l0i_stream_buffer_new_stream_rejected_head_waiting_for_cache"]->get_value();
+  unsigned long long total_num_l0i_stream_buffer_new_stream_flush_replaced_active_stream = m_gpu-> m_gpu_per_sm_stats.m_stats_map["total_num_l0i_stream_buffer_new_stream_flush_replaced_active_stream"]->get_value();
+  unsigned long long total_num_l0i_stream_buffer_prefetch_issued = m_gpu-> m_gpu_per_sm_stats.m_stats_map["total_num_l0i_stream_buffer_prefetch_issued"]->get_value();
+  unsigned long long total_num_l0i_stream_buffer_prefetch_blocked_memport_full = m_gpu-> m_gpu_per_sm_stats.m_stats_map["total_num_l0i_stream_buffer_prefetch_blocked_memport_full"]->get_value();
+  unsigned long long total_num_l0i_stream_buffer_prefetch_blocked_sb_full = m_gpu-> m_gpu_per_sm_stats.m_stats_map["total_num_l0i_stream_buffer_prefetch_blocked_sb_full"]->get_value();
+  unsigned long long total_num_l0i_stream_buffer_prefetch_l1i_accesses = m_gpu-> m_gpu_per_sm_stats.m_stats_map["total_num_l0i_stream_buffer_prefetch_l1i_accesses"]->get_value();
+  unsigned long long total_num_l0i_stream_buffer_prefetch_l1i_hits = m_gpu-> m_gpu_per_sm_stats.m_stats_map["total_num_l0i_stream_buffer_prefetch_l1i_hits"]->get_value();
+  unsigned long long total_num_l0i_stream_buffer_prefetch_l1i_misses = m_gpu-> m_gpu_per_sm_stats.m_stats_map["total_num_l0i_stream_buffer_prefetch_l1i_misses"]->get_value();
+  unsigned long long total_num_l0i_stream_buffer_prefetch_l1i_reservation_fails = m_gpu-> m_gpu_per_sm_stats.m_stats_map["total_num_l0i_stream_buffer_prefetch_l1i_reservation_fails"]->get_value();
+  unsigned long long total_num_l0i_stream_buffer_prefetch_l1i_miss_allocate_on_invalid = m_gpu-> m_gpu_per_sm_stats.m_stats_map["total_num_l0i_stream_buffer_prefetch_l1i_miss_allocate_on_invalid"]->get_value();
+  unsigned long long total_num_l0i_stream_buffer_prefetch_l1i_miss_allocate_on_valid = m_gpu-> m_gpu_per_sm_stats.m_stats_map["total_num_l0i_stream_buffer_prefetch_l1i_miss_allocate_on_valid"]->get_value();
+  unsigned long long total_num_l0i_stream_buffer_prefetched_l1i_lines_evicted = m_gpu-> m_gpu_per_sm_stats.m_stats_map["total_num_l0i_stream_buffer_prefetched_l1i_lines_evicted"]->get_value();
+  unsigned long long total_num_l0i_stream_buffer_prefetched_l1i_lines_evicted_by_prefetch_miss = m_gpu-> m_gpu_per_sm_stats.m_stats_map["total_num_l0i_stream_buffer_prefetched_l1i_lines_evicted_by_prefetch_miss"]->get_value();
+  unsigned long long total_num_l0i_stream_buffer_prefetched_l1i_lines_evicted_by_nonprefetch_miss = m_gpu-> m_gpu_per_sm_stats.m_stats_map["total_num_l0i_stream_buffer_prefetched_l1i_lines_evicted_by_nonprefetch_miss"]->get_value();
+  unsigned long long total_num_l0i_stream_buffer_prefetch_l1i_miss_fill_matched = m_gpu-> m_gpu_per_sm_stats.m_stats_map["total_num_l0i_stream_buffer_prefetch_l1i_miss_fill_matched"]->get_value();
+  unsigned long long total_num_l0i_stream_buffer_prefetch_l1i_miss_fill_orphaned = m_gpu-> m_gpu_per_sm_stats.m_stats_map["total_num_l0i_stream_buffer_prefetch_l1i_miss_fill_orphaned"]->get_value();
+  unsigned long long total_num_l0i_sb_l1i_miss_head_demand_arrived_before_ready = m_gpu-> m_gpu_per_sm_stats.m_stats_map["total_num_l0i_sb_l1i_miss_head_demand_arrived_before_ready"]->get_value();
+  unsigned long long total_num_l0i_sb_l1i_miss_head_demand_arrived_after_ready = m_gpu-> m_gpu_per_sm_stats.m_stats_map["total_num_l0i_sb_l1i_miss_head_demand_arrived_after_ready"]->get_value();
+  std::string l1i_prefetch_miss_top_block_addrs = m_gpu->get_l1i_prefetch_miss_top_block_addrs(8);
+  std::string l1i_prefetch_miss_top_set_indices = m_gpu->get_l1i_prefetch_miss_top_set_indices(8);
+  std::string l1i_prefetch_evicted_prefetch_top_block_addrs = m_gpu->get_l1i_prefetch_evicted_prefetch_top_block_addrs(8);
+  std::string l1i_prefetch_miss_top_pc_opcodes = m_gpu->get_l1i_prefetch_miss_top_pc_opcodes(8);
+  std::string instruction_region_top_late_miss_regions =
+      get_instruction_region_top_late_miss_regions(8);
+  std::string instruction_region_top_miss_regions =
+      get_instruction_region_top_miss_regions(8);
+  std::string instruction_region_prewarm_debug_stats =
+      get_instruction_region_prewarm_debug_stats();
+  unsigned long long total_num_l0i_stream_buffer_prefetch_stopped_tag_hit = m_gpu-> m_gpu_per_sm_stats.m_stats_map["total_num_l0i_stream_buffer_prefetch_stopped_tag_hit"]->get_value();
+  unsigned long long total_num_l0i_stream_buffer_prefetch_stopped_reservation_fail = m_gpu-> m_gpu_per_sm_stats.m_stats_map["total_num_l0i_stream_buffer_prefetch_stopped_reservation_fail"]->get_value();
+  unsigned long long total_num_l0i_stream_buffer_prefetch_stopped_mshr_hit = m_gpu-> m_gpu_per_sm_stats.m_stats_map["total_num_l0i_stream_buffer_prefetch_stopped_mshr_hit"]->get_value();
+  unsigned long long total_num_l0i_stream_buffer_fill_matched = m_gpu-> m_gpu_per_sm_stats.m_stats_map["total_num_l0i_stream_buffer_fill_matched"]->get_value();
+  unsigned long long total_num_l0i_stream_buffer_fill_orphaned = m_gpu-> m_gpu_per_sm_stats.m_stats_map["total_num_l0i_stream_buffer_fill_orphaned"]->get_value();
+  unsigned long long total_num_l0i_stream_buffer_send_to_cache_attempts = m_gpu-> m_gpu_per_sm_stats.m_stats_map["total_num_l0i_stream_buffer_send_to_cache_attempts"]->get_value();
+  unsigned long long total_num_l0i_stream_buffer_send_to_cache_partial_service = m_gpu-> m_gpu_per_sm_stats.m_stats_map["total_num_l0i_stream_buffer_send_to_cache_partial_service"]->get_value();
+  unsigned long long total_num_l0i_stream_buffer_send_to_cache_full_service = m_gpu-> m_gpu_per_sm_stats.m_stats_map["total_num_l0i_stream_buffer_send_to_cache_full_service"]->get_value();
+  unsigned long long total_num_l0i_stream_buffer_waiters_served = m_gpu-> m_gpu_per_sm_stats.m_stats_map["total_num_l0i_stream_buffer_waiters_served"]->get_value();
+  unsigned long long total_num_cycles_l0i_stream_buffer_ready_head_blocked_by_response_slot = m_gpu-> m_gpu_per_sm_stats.m_stats_map["total_num_cycles_l0i_stream_buffer_ready_head_blocked_by_response_slot"]->get_value();
+  unsigned long long total_num_l0i_sb_head_first_demand_events = m_gpu-> m_gpu_per_sm_stats.m_stats_map["total_num_l0i_sb_head_first_demand_events"]->get_value();
+  unsigned long long total_sum_cycles_l0i_sb_prefetch_issue_to_first_demand = m_gpu-> m_gpu_per_sm_stats.m_stats_map["total_sum_cycles_l0i_sb_prefetch_issue_to_first_demand"]->get_value();
+  unsigned long long total_num_l0i_sb_head_first_demand_before_ready_issue_age_samples = m_gpu-> m_gpu_per_sm_stats.m_stats_map["total_num_l0i_sb_head_first_demand_before_ready_issue_age_samples"]->get_value();
+  unsigned long long total_sum_cycles_l0i_sb_prefetch_issue_to_first_demand_before_ready = m_gpu-> m_gpu_per_sm_stats.m_stats_map["total_sum_cycles_l0i_sb_prefetch_issue_to_first_demand_before_ready"]->get_value();
+  unsigned long long total_num_l0i_sb_head_demand_arrived_before_ready = m_gpu-> m_gpu_per_sm_stats.m_stats_map["total_num_l0i_sb_head_demand_arrived_before_ready"]->get_value();
+  unsigned long long total_sum_cycles_l0i_sb_demand_wait_for_ready = m_gpu-> m_gpu_per_sm_stats.m_stats_map["total_sum_cycles_l0i_sb_demand_wait_for_ready"]->get_value();
+  unsigned long long total_num_l0i_sb_head_demand_arrived_after_ready = m_gpu-> m_gpu_per_sm_stats.m_stats_map["total_num_l0i_sb_head_demand_arrived_after_ready"]->get_value();
+  unsigned long long total_num_ibuffer_entries_response_ready = m_gpu-> m_gpu_per_sm_stats.m_stats_map["total_num_ibuffer_entries_response_ready"]->get_value();
+  unsigned long long total_num_cycles_ibuffer_entry_reserve_to_response_ready = m_gpu-> m_gpu_per_sm_stats.m_stats_map["total_num_cycles_ibuffer_entry_reserve_to_response_ready"]->get_value();
+  unsigned long long total_num_ibuffer_entries_decoded = m_gpu-> m_gpu_per_sm_stats.m_stats_map["total_num_ibuffer_entries_decoded"]->get_value();
+  unsigned long long total_num_cycles_ibuffer_entry_reserve_to_decode = m_gpu-> m_gpu_per_sm_stats.m_stats_map["total_num_cycles_ibuffer_entry_reserve_to_decode"]->get_value();
+  unsigned long long total_num_ibuffer_entries_decoded_with_response_ready_cycle = m_gpu-> m_gpu_per_sm_stats.m_stats_map["total_num_ibuffer_entries_decoded_with_response_ready_cycle"]->get_value();
+  unsigned long long total_num_cycles_ibuffer_entry_response_ready_to_decode = m_gpu-> m_gpu_per_sm_stats.m_stats_map["total_num_cycles_ibuffer_entry_response_ready_to_decode"]->get_value();
+  unsigned long long total_num_cycles_issue_stage_stall_no_warps_ready = m_gpu-> m_gpu_per_sm_stats.m_stats_map["total_num_cycles_issue_stage_stall_no_warps_ready"]->get_value();
   unsigned long long total_num_cycles_issue_stage_stall_next_stage_not_available = m_gpu-> m_gpu_per_sm_stats.m_stats_map["total_num_cycles_issue_stage_stall_next_stage_not_available"]->get_value();
   total_num_cycles_issue_stage_evaluated = m_gpu-> m_gpu_per_sm_stats.m_stats_map["total_num_cycles_issue_stage_evaluated"]->get_value();
-  fprintf(fout, "total_percentage_cycles_issue_stage_issuing = %.4Lf\n", ((long double) total_num_cycles_issue_stage_issuing / total_num_cycles_issue_stage_evaluated) * 100);
-  fprintf(fout, "total_percentage_cycles_issue_stage_not_issuing_stall_next_stage_not_available = %.4Lf\n", ((long double) total_num_cycles_issue_stage_stall_next_stage_not_available / total_num_cycles_issue_stage_evaluated) * 100);
+  fprintf(fout, "total_num_cycles_issue_stage_evaluated = %llu\n", total_num_cycles_issue_stage_evaluated);
+  fprintf(fout, "total_num_cycles_issue_stage_issuing = %llu\n", total_num_cycles_issue_stage_issuing);
+  fprintf(fout, "total_num_cycles_issue_stage_stall_next_stage_not_available = %llu\n", total_num_cycles_issue_stage_stall_next_stage_not_available);
+  fprintf(fout, "total_num_cycles_issue_stage_stall_issue_port_busy = %llu\n", total_num_cycles_issue_stage_stall_issue_port_busy);
+  fprintf(fout, "total_num_cycles_issue_stage_stall_no_valid_instruction = %llu\n", total_num_cycles_issue_stage_stall_no_valid_instruction);
+  fprintf(fout, "total_num_cycles_issue_stage_stall_no_valid_instruction_decode_pending = %llu\n", total_num_cycles_issue_stage_stall_no_valid_instruction_decode_pending);
+  fprintf(fout, "total_num_cycles_issue_stage_stall_no_valid_instruction_l0i_response_ready = %llu\n", total_num_cycles_issue_stage_stall_no_valid_instruction_l0i_response_ready);
+  fprintf(fout, "total_num_cycles_issue_stage_stall_no_valid_instruction_head_invalid_waiting_frontend = %llu\n", total_num_cycles_issue_stage_stall_no_valid_instruction_head_invalid_waiting_frontend);
+  fprintf(fout, "total_num_cycles_issue_stage_stall_no_valid_instruction_head_invalid_waiting_frontend_miss = %llu\n", total_num_cycles_issue_stage_stall_no_valid_instruction_head_invalid_waiting_frontend_miss);
+  fprintf(fout, "total_num_cycles_issue_stage_stall_no_valid_instruction_head_invalid_waiting_frontend_in_l0i_response_queue = %llu\n", total_num_cycles_issue_stage_stall_no_valid_instruction_head_invalid_waiting_frontend_in_l0i_response_queue);
+  fprintf(fout, "total_num_cycles_issue_stage_stall_no_valid_instruction_head_invalid_waiting_frontend_in_l0i_response_queue_stream_buffer_wait = %llu\n", total_num_cycles_issue_stage_stall_no_valid_instruction_head_invalid_waiting_frontend_in_l0i_response_queue_stream_buffer_wait);
+  fprintf(fout, "total_num_cycles_issue_stage_stall_no_valid_instruction_head_invalid_waiting_frontend_in_l0i_response_queue_stream_buffer_wait_prefetch_not_allocated = %llu\n", total_num_cycles_issue_stage_stall_no_valid_instruction_head_invalid_waiting_frontend_in_l0i_response_queue_stream_buffer_wait_prefetch_not_allocated);
+  fprintf(fout, "total_num_cycles_issue_stage_stall_no_valid_instruction_head_invalid_waiting_frontend_in_l0i_response_queue_stream_buffer_wait_prefetch_issued_not_ready = %llu\n", total_num_cycles_issue_stage_stall_no_valid_instruction_head_invalid_waiting_frontend_in_l0i_response_queue_stream_buffer_wait_prefetch_issued_not_ready);
+  fprintf(fout, "total_num_cycles_issue_stage_stall_no_valid_instruction_head_invalid_waiting_frontend_in_l0i_response_queue_stream_buffer_wait_prefetch_ready_not_promoted = %llu\n", total_num_cycles_issue_stage_stall_no_valid_instruction_head_invalid_waiting_frontend_in_l0i_response_queue_stream_buffer_wait_prefetch_ready_not_promoted);
+  fprintf(fout, "total_num_cycles_issue_stage_stall_no_valid_instruction_head_invalid_waiting_frontend_in_l0i_response_queue_other = %llu\n", total_num_cycles_issue_stage_stall_no_valid_instruction_head_invalid_waiting_frontend_in_l0i_response_queue_other);
+  fprintf(fout, "total_num_cycles_issue_stage_stall_no_valid_instruction_head_invalid_waiting_frontend_hit_status = %llu\n", total_num_cycles_issue_stage_stall_no_valid_instruction_head_invalid_waiting_frontend_hit_status);
+  fprintf(fout, "total_num_cycles_issue_stage_stall_no_valid_instruction_ibuffer_empty = %llu\n", total_num_cycles_issue_stage_stall_no_valid_instruction_ibuffer_empty);
+  fprintf(fout, "total_num_cycles_issue_stage_stall_no_valid_instruction_unknown = %llu\n", total_num_cycles_issue_stage_stall_no_valid_instruction_unknown);
+  fprintf(fout, "total_num_l0i_access_returns_in_l0i_response_queue_stream_buffer_wait = %llu\n", total_num_l0i_access_returns_in_l0i_response_queue_stream_buffer_wait);
+  fprintf(fout, "total_num_l0i_access_returns_in_l0i_response_queue_duplicate_request = %llu\n", total_num_l0i_access_returns_in_l0i_response_queue_duplicate_request);
+  fprintf(fout, "total_num_l0i_stream_buffer_search_hit_requested_addr = %llu\n", total_num_l0i_stream_buffer_search_hit_requested_addr);
+  fprintf(fout, "total_num_l0i_stream_buffer_search_found_requested_addr_deeper_than_head = %llu\n", total_num_l0i_stream_buffer_search_found_requested_addr_deeper_than_head);
+  fprintf(fout, "total_num_l0i_stream_buffer_search_found_requested_addr_deeper_than_head_ready = %llu\n", total_num_l0i_stream_buffer_search_found_requested_addr_deeper_than_head_ready);
+  fprintf(fout, "total_num_l0i_stream_buffer_search_found_requested_addr_deeper_than_head_not_ready = %llu\n", total_num_l0i_stream_buffer_search_found_requested_addr_deeper_than_head_not_ready);
+  fprintf(fout, "total_num_l0i_stream_buffer_search_hit_prefetch_addr = %llu\n", total_num_l0i_stream_buffer_search_hit_prefetch_addr);
+  fprintf(fout, "total_num_l0i_stream_buffer_early_trigger_threshold_reached = %llu\n", total_num_l0i_stream_buffer_early_trigger_threshold_reached);
+  fprintf(fout, "total_num_l0i_stream_buffer_early_trigger_candidate = %llu\n", total_num_l0i_stream_buffer_early_trigger_candidate);
+  fprintf(fout, "total_num_l0i_stream_buffer_early_trigger_next_line_tag_hit = %llu\n", total_num_l0i_stream_buffer_early_trigger_next_line_tag_hit);
+  fprintf(fout, "total_num_l0i_stream_buffer_early_trigger_next_line_mshr_hit = %llu\n", total_num_l0i_stream_buffer_early_trigger_next_line_mshr_hit);
+  fprintf(fout, "total_num_l0i_stream_buffer_early_trigger_selected_inactive_buffer = %llu\n", total_num_l0i_stream_buffer_early_trigger_selected_inactive_buffer);
+  fprintf(fout, "total_num_l0i_stream_buffer_early_trigger_selected_active_buffer = %llu\n", total_num_l0i_stream_buffer_early_trigger_selected_active_buffer);
+  fprintf(fout, "total_num_l0i_stream_buffer_early_trigger_set_new_stream_calls = %llu\n", total_num_l0i_stream_buffer_early_trigger_set_new_stream_calls);
+  fprintf(fout, "total_num_l0i_stream_buffer_early_trigger_set_new_stream_accepted = %llu\n", total_num_l0i_stream_buffer_early_trigger_set_new_stream_accepted);
+  fprintf(fout, "total_num_l0i_stream_buffer_early_trigger_set_new_stream_accepted_idle_buffer = %llu\n", total_num_l0i_stream_buffer_early_trigger_set_new_stream_accepted_idle_buffer);
+  fprintf(fout, "total_num_l0i_stream_buffer_early_trigger_set_new_stream_accepted_replace_active = %llu\n", total_num_l0i_stream_buffer_early_trigger_set_new_stream_accepted_replace_active);
+  fprintf(fout, "total_num_l0i_stream_buffer_early_trigger_set_new_stream_rejected_head_waiting_for_cache = %llu\n", total_num_l0i_stream_buffer_early_trigger_set_new_stream_rejected_head_waiting_for_cache);
+  fprintf(fout, "total_num_l0i_stream_buffer_early_trigger_set_new_stream_redundant_same_stream = %llu\n", total_num_l0i_stream_buffer_early_trigger_set_new_stream_redundant_same_stream);
+  fprintf(fout, "total_num_l0i_stream_buffer_early_trigger_redundant_same_stream_active = %llu\n", total_num_l0i_stream_buffer_early_trigger_redundant_same_stream_active);
+  fprintf(fout, "total_num_l0i_stream_buffer_early_trigger_redundant_same_stream_inactive = %llu\n", total_num_l0i_stream_buffer_early_trigger_redundant_same_stream_inactive);
+  fprintf(fout, "total_sum_l0i_stream_buffer_early_trigger_redundant_same_stream_queue_depth = %llu\n", total_sum_l0i_stream_buffer_early_trigger_redundant_same_stream_queue_depth);
+  fprintf(fout, "total_num_l0i_stream_buffer_early_trigger_redundant_same_stream_target_allocated = %llu\n", total_num_l0i_stream_buffer_early_trigger_redundant_same_stream_target_allocated);
+  fprintf(fout, "total_num_l0i_stream_buffer_early_trigger_redundant_same_stream_target_not_allocated = %llu\n", total_num_l0i_stream_buffer_early_trigger_redundant_same_stream_target_not_allocated);
+  fprintf(fout, "total_num_l0i_stream_buffer_early_trigger_redundant_same_stream_target_ready = %llu\n", total_num_l0i_stream_buffer_early_trigger_redundant_same_stream_target_ready);
+  fprintf(fout, "total_num_l0i_stream_buffer_early_trigger_redundant_same_stream_target_not_ready = %llu\n", total_num_l0i_stream_buffer_early_trigger_redundant_same_stream_target_not_ready);
+  fprintf(fout, "total_num_l0i_stream_buffer_new_stream_candidate = %llu\n", total_num_l0i_stream_buffer_new_stream_candidate);
+  fprintf(fout, "total_num_l0i_stream_buffer_new_stream_selection_saw_inactive_nonempty_buffer = %llu\n", total_num_l0i_stream_buffer_new_stream_selection_saw_inactive_nonempty_buffer);
+  fprintf(fout, "total_num_l0i_stream_buffer_new_stream_selection_selected_idle_buffer = %llu\n", total_num_l0i_stream_buffer_new_stream_selection_selected_idle_buffer);
+  fprintf(fout, "total_num_l0i_stream_buffer_new_stream_selection_selected_active_buffer = %llu\n", total_num_l0i_stream_buffer_new_stream_selection_selected_active_buffer);
+  fprintf(fout, "total_num_l0i_stream_buffer_new_stream_selection_selected_active_while_inactive_nonempty_exists = %llu\n", total_num_l0i_stream_buffer_new_stream_selection_selected_active_while_inactive_nonempty_exists);
+  fprintf(fout, "total_num_l0i_stream_buffer_new_stream_accepted = %llu\n", total_num_l0i_stream_buffer_new_stream_accepted);
+  fprintf(fout, "total_num_l0i_stream_buffer_new_stream_rejected_head_waiting_for_cache = %llu\n", total_num_l0i_stream_buffer_new_stream_rejected_head_waiting_for_cache);
+  fprintf(fout, "total_num_l0i_stream_buffer_new_stream_flush_replaced_active_stream = %llu\n", total_num_l0i_stream_buffer_new_stream_flush_replaced_active_stream);
+  fprintf(fout, "total_num_l0i_stream_buffer_prefetch_issued = %llu\n", total_num_l0i_stream_buffer_prefetch_issued);
+  fprintf(fout, "total_num_l0i_stream_buffer_prefetch_blocked_memport_full = %llu\n", total_num_l0i_stream_buffer_prefetch_blocked_memport_full);
+  fprintf(fout, "total_num_l0i_stream_buffer_prefetch_blocked_sb_full = %llu\n", total_num_l0i_stream_buffer_prefetch_blocked_sb_full);
+  fprintf(fout, "total_num_l0i_stream_buffer_prefetch_l1i_accesses = %llu\n", total_num_l0i_stream_buffer_prefetch_l1i_accesses);
+  fprintf(fout, "total_num_l0i_stream_buffer_prefetch_l1i_hits = %llu\n", total_num_l0i_stream_buffer_prefetch_l1i_hits);
+  fprintf(fout, "total_num_l0i_stream_buffer_prefetch_l1i_misses = %llu\n", total_num_l0i_stream_buffer_prefetch_l1i_misses);
+  fprintf(fout, "total_num_l0i_stream_buffer_prefetch_l1i_reservation_fails = %llu\n", total_num_l0i_stream_buffer_prefetch_l1i_reservation_fails);
+  fprintf(fout, "total_num_l0i_stream_buffer_prefetch_l1i_miss_allocate_on_invalid = %llu\n", total_num_l0i_stream_buffer_prefetch_l1i_miss_allocate_on_invalid);
+  fprintf(fout, "total_num_l0i_stream_buffer_prefetch_l1i_miss_allocate_on_valid = %llu\n", total_num_l0i_stream_buffer_prefetch_l1i_miss_allocate_on_valid);
+  fprintf(fout, "total_num_l0i_stream_buffer_prefetched_l1i_lines_evicted = %llu\n", total_num_l0i_stream_buffer_prefetched_l1i_lines_evicted);
+  fprintf(fout, "total_num_l0i_stream_buffer_prefetched_l1i_lines_evicted_by_prefetch_miss = %llu\n", total_num_l0i_stream_buffer_prefetched_l1i_lines_evicted_by_prefetch_miss);
+  fprintf(fout, "total_num_l0i_stream_buffer_prefetched_l1i_lines_evicted_by_nonprefetch_miss = %llu\n", total_num_l0i_stream_buffer_prefetched_l1i_lines_evicted_by_nonprefetch_miss);
+  fprintf(fout, "total_num_l0i_stream_buffer_prefetch_l1i_miss_fill_matched = %llu\n", total_num_l0i_stream_buffer_prefetch_l1i_miss_fill_matched);
+  fprintf(fout, "total_num_l0i_stream_buffer_prefetch_l1i_miss_fill_orphaned = %llu\n", total_num_l0i_stream_buffer_prefetch_l1i_miss_fill_orphaned);
+  fprintf(fout, "total_num_l0i_sb_l1i_miss_head_demand_arrived_before_ready = %llu\n", total_num_l0i_sb_l1i_miss_head_demand_arrived_before_ready);
+  fprintf(fout, "total_num_l0i_sb_l1i_miss_head_demand_arrived_after_ready = %llu\n", total_num_l0i_sb_l1i_miss_head_demand_arrived_after_ready);
+  fprintf(fout, "l1i_prefetch_miss_top_block_addrs = %s\n", l1i_prefetch_miss_top_block_addrs.c_str());
+  fprintf(fout, "l1i_prefetch_miss_top_set_indices = %s\n", l1i_prefetch_miss_top_set_indices.c_str());
+  fprintf(fout, "l1i_prefetch_evicted_prefetch_top_block_addrs = %s\n", l1i_prefetch_evicted_prefetch_top_block_addrs.c_str());
+  fprintf(fout, "l1i_prefetch_miss_top_pc_opcodes = %s\n", l1i_prefetch_miss_top_pc_opcodes.c_str());
+  fprintf(fout, "instruction_region_top_late_miss_regions = %s\n",
+          instruction_region_top_late_miss_regions.c_str());
+  fprintf(fout, "instruction_region_top_miss_regions = %s\n",
+          instruction_region_top_miss_regions.c_str());
+  fprintf(fout, "instruction_region_prewarm_debug_stats = %s\n",
+          instruction_region_prewarm_debug_stats.c_str());
+  fprintf(fout, "total_num_l0i_stream_buffer_prefetch_stopped_tag_hit = %llu\n", total_num_l0i_stream_buffer_prefetch_stopped_tag_hit);
+  fprintf(fout, "total_num_l0i_stream_buffer_prefetch_stopped_reservation_fail = %llu\n", total_num_l0i_stream_buffer_prefetch_stopped_reservation_fail);
+  fprintf(fout, "total_num_l0i_stream_buffer_prefetch_stopped_mshr_hit = %llu\n", total_num_l0i_stream_buffer_prefetch_stopped_mshr_hit);
+  fprintf(fout, "total_num_l0i_stream_buffer_fill_matched = %llu\n", total_num_l0i_stream_buffer_fill_matched);
+  fprintf(fout, "total_num_l0i_stream_buffer_fill_orphaned = %llu\n", total_num_l0i_stream_buffer_fill_orphaned);
+  fprintf(fout, "total_num_l0i_stream_buffer_send_to_cache_attempts = %llu\n", total_num_l0i_stream_buffer_send_to_cache_attempts);
+  fprintf(fout, "total_num_l0i_stream_buffer_send_to_cache_partial_service = %llu\n", total_num_l0i_stream_buffer_send_to_cache_partial_service);
+  fprintf(fout, "total_num_l0i_stream_buffer_send_to_cache_full_service = %llu\n", total_num_l0i_stream_buffer_send_to_cache_full_service);
+  fprintf(fout, "total_num_l0i_stream_buffer_waiters_served = %llu\n", total_num_l0i_stream_buffer_waiters_served);
+  fprintf(fout, "total_num_cycles_l0i_stream_buffer_ready_head_blocked_by_response_slot = %llu\n", total_num_cycles_l0i_stream_buffer_ready_head_blocked_by_response_slot);
+  fprintf(fout, "total_num_l0i_sb_head_first_demand_events = %llu\n", total_num_l0i_sb_head_first_demand_events);
+  fprintf(fout, "total_sum_cycles_l0i_sb_prefetch_issue_to_first_demand = %llu\n", total_sum_cycles_l0i_sb_prefetch_issue_to_first_demand);
+  fprintf(fout, "total_num_l0i_sb_head_first_demand_before_ready_issue_age_samples = %llu\n", total_num_l0i_sb_head_first_demand_before_ready_issue_age_samples);
+  fprintf(fout, "total_sum_cycles_l0i_sb_prefetch_issue_to_first_demand_before_ready = %llu\n", total_sum_cycles_l0i_sb_prefetch_issue_to_first_demand_before_ready);
+  fprintf(fout, "total_num_l0i_sb_head_demand_arrived_before_ready = %llu\n", total_num_l0i_sb_head_demand_arrived_before_ready);
+  fprintf(fout, "total_sum_cycles_l0i_sb_demand_wait_for_ready = %llu\n", total_sum_cycles_l0i_sb_demand_wait_for_ready);
+  fprintf(fout, "total_num_l0i_sb_head_demand_arrived_after_ready = %llu\n", total_num_l0i_sb_head_demand_arrived_after_ready);
+  fprintf(fout, "total_num_ibuffer_entries_response_ready = %llu\n", total_num_ibuffer_entries_response_ready);
+  fprintf(fout, "total_num_cycles_ibuffer_entry_reserve_to_response_ready = %llu\n", total_num_cycles_ibuffer_entry_reserve_to_response_ready);
+  fprintf(fout, "total_num_ibuffer_entries_decoded = %llu\n", total_num_ibuffer_entries_decoded);
+  fprintf(fout, "total_num_cycles_ibuffer_entry_reserve_to_decode = %llu\n", total_num_cycles_ibuffer_entry_reserve_to_decode);
+  fprintf(fout, "total_num_ibuffer_entries_decoded_with_response_ready_cycle = %llu\n", total_num_ibuffer_entries_decoded_with_response_ready_cycle);
+  fprintf(fout, "total_num_cycles_ibuffer_entry_response_ready_to_decode = %llu\n", total_num_cycles_ibuffer_entry_response_ready_to_decode);
+  fprintf(fout, "total_num_cycles_issue_stage_stall_no_warps_ready = %llu\n", total_num_cycles_issue_stage_stall_no_warps_ready);
+  long double total_percentage_cycles_issue_stage_issuing = total_num_cycles_issue_stage_evaluated ? (((long double) total_num_cycles_issue_stage_issuing / total_num_cycles_issue_stage_evaluated) * 100) : 0;
+  long double total_percentage_cycles_issue_stage_stall_next_stage_not_available = total_num_cycles_issue_stage_evaluated ? (((long double) total_num_cycles_issue_stage_stall_next_stage_not_available / total_num_cycles_issue_stage_evaluated) * 100) : 0;
+  long double total_percentage_cycles_issue_stage_stall_issue_port_busy = total_num_cycles_issue_stage_evaluated ? (((long double) total_num_cycles_issue_stage_stall_issue_port_busy / total_num_cycles_issue_stage_evaluated) * 100) : 0;
+  long double total_percentage_cycles_issue_stage_stall_no_valid_instruction = total_num_cycles_issue_stage_evaluated ? (((long double) total_num_cycles_issue_stage_stall_no_valid_instruction / total_num_cycles_issue_stage_evaluated) * 100) : 0;
+  long double total_percentage_cycles_issue_stage_stall_no_valid_instruction_decode_pending = total_num_cycles_issue_stage_evaluated ? (((long double) total_num_cycles_issue_stage_stall_no_valid_instruction_decode_pending / total_num_cycles_issue_stage_evaluated) * 100) : 0;
+  long double total_percentage_cycles_issue_stage_stall_no_valid_instruction_l0i_response_ready = total_num_cycles_issue_stage_evaluated ? (((long double) total_num_cycles_issue_stage_stall_no_valid_instruction_l0i_response_ready / total_num_cycles_issue_stage_evaluated) * 100) : 0;
+  long double total_percentage_cycles_issue_stage_stall_no_valid_instruction_head_invalid_waiting_frontend = total_num_cycles_issue_stage_evaluated ? (((long double) total_num_cycles_issue_stage_stall_no_valid_instruction_head_invalid_waiting_frontend / total_num_cycles_issue_stage_evaluated) * 100) : 0;
+  long double total_percentage_cycles_issue_stage_stall_no_valid_instruction_head_invalid_waiting_frontend_miss = total_num_cycles_issue_stage_evaluated ? (((long double) total_num_cycles_issue_stage_stall_no_valid_instruction_head_invalid_waiting_frontend_miss / total_num_cycles_issue_stage_evaluated) * 100) : 0;
+  long double total_percentage_cycles_issue_stage_stall_no_valid_instruction_head_invalid_waiting_frontend_in_l0i_response_queue = total_num_cycles_issue_stage_evaluated ? (((long double) total_num_cycles_issue_stage_stall_no_valid_instruction_head_invalid_waiting_frontend_in_l0i_response_queue / total_num_cycles_issue_stage_evaluated) * 100) : 0;
+  long double total_percentage_cycles_issue_stage_stall_no_valid_instruction_head_invalid_waiting_frontend_in_l0i_response_queue_stream_buffer_wait = total_num_cycles_issue_stage_evaluated ? (((long double) total_num_cycles_issue_stage_stall_no_valid_instruction_head_invalid_waiting_frontend_in_l0i_response_queue_stream_buffer_wait / total_num_cycles_issue_stage_evaluated) * 100) : 0;
+  long double total_percentage_cycles_issue_stage_stall_no_valid_instruction_head_invalid_waiting_frontend_in_l0i_response_queue_other = total_num_cycles_issue_stage_evaluated ? (((long double) total_num_cycles_issue_stage_stall_no_valid_instruction_head_invalid_waiting_frontend_in_l0i_response_queue_other / total_num_cycles_issue_stage_evaluated) * 100) : 0;
+  long double total_percentage_cycles_issue_stage_stall_no_valid_instruction_head_invalid_waiting_frontend_hit_status = total_num_cycles_issue_stage_evaluated ? (((long double) total_num_cycles_issue_stage_stall_no_valid_instruction_head_invalid_waiting_frontend_hit_status / total_num_cycles_issue_stage_evaluated) * 100) : 0;
+  long double total_percentage_cycles_issue_stage_stall_no_valid_instruction_ibuffer_empty = total_num_cycles_issue_stage_evaluated ? (((long double) total_num_cycles_issue_stage_stall_no_valid_instruction_ibuffer_empty / total_num_cycles_issue_stage_evaluated) * 100) : 0;
+  long double total_percentage_cycles_issue_stage_stall_no_valid_instruction_unknown = total_num_cycles_issue_stage_evaluated ? (((long double) total_num_cycles_issue_stage_stall_no_valid_instruction_unknown / total_num_cycles_issue_stage_evaluated) * 100) : 0;
+  long double avg_cycles_ibuffer_entry_reserve_to_response_ready = total_num_ibuffer_entries_response_ready ? ((long double) total_num_cycles_ibuffer_entry_reserve_to_response_ready / total_num_ibuffer_entries_response_ready) : 0;
+  long double avg_cycles_ibuffer_entry_reserve_to_decode = total_num_ibuffer_entries_decoded ? ((long double) total_num_cycles_ibuffer_entry_reserve_to_decode / total_num_ibuffer_entries_decoded) : 0;
+  long double avg_cycles_ibuffer_entry_response_ready_to_decode = total_num_ibuffer_entries_decoded_with_response_ready_cycle ? ((long double) total_num_cycles_ibuffer_entry_response_ready_to_decode / total_num_ibuffer_entries_decoded_with_response_ready_cycle) : 0;
+  long double total_percentage_cycles_issue_stage_stall_no_warps_ready = total_num_cycles_issue_stage_evaluated ? (((long double) total_num_cycles_issue_stage_stall_no_warps_ready / total_num_cycles_issue_stage_evaluated) * 100) : 0;
+  fprintf(fout, "total_percentage_cycles_issue_stage_issuing = %.4Lf\n", total_percentage_cycles_issue_stage_issuing);
+  fprintf(fout, "total_percentage_cycles_issue_stage_not_issuing_stall_next_stage_not_available = %.4Lf\n", total_percentage_cycles_issue_stage_stall_next_stage_not_available);
+  fprintf(fout, "total_percentage_cycles_issue_stage_stall_issue_port_busy = %.4Lf\n", total_percentage_cycles_issue_stage_stall_issue_port_busy);
+  fprintf(fout, "total_percentage_cycles_issue_stage_stall_no_valid_instruction = %.4Lf\n", total_percentage_cycles_issue_stage_stall_no_valid_instruction);
+  fprintf(fout, "total_percentage_cycles_issue_stage_stall_no_valid_instruction_decode_pending = %.4Lf\n", total_percentage_cycles_issue_stage_stall_no_valid_instruction_decode_pending);
+  fprintf(fout, "total_percentage_cycles_issue_stage_stall_no_valid_instruction_l0i_response_ready = %.4Lf\n", total_percentage_cycles_issue_stage_stall_no_valid_instruction_l0i_response_ready);
+  fprintf(fout, "total_percentage_cycles_issue_stage_stall_no_valid_instruction_head_invalid_waiting_frontend = %.4Lf\n", total_percentage_cycles_issue_stage_stall_no_valid_instruction_head_invalid_waiting_frontend);
+  fprintf(fout, "total_percentage_cycles_issue_stage_stall_no_valid_instruction_head_invalid_waiting_frontend_miss = %.4Lf\n", total_percentage_cycles_issue_stage_stall_no_valid_instruction_head_invalid_waiting_frontend_miss);
+  fprintf(fout, "total_percentage_cycles_issue_stage_stall_no_valid_instruction_head_invalid_waiting_frontend_in_l0i_response_queue = %.4Lf\n", total_percentage_cycles_issue_stage_stall_no_valid_instruction_head_invalid_waiting_frontend_in_l0i_response_queue);
+  fprintf(fout, "total_percentage_cycles_issue_stage_stall_no_valid_instruction_head_invalid_waiting_frontend_in_l0i_response_queue_stream_buffer_wait = %.4Lf\n", total_percentage_cycles_issue_stage_stall_no_valid_instruction_head_invalid_waiting_frontend_in_l0i_response_queue_stream_buffer_wait);
+  fprintf(fout, "total_percentage_cycles_issue_stage_stall_no_valid_instruction_head_invalid_waiting_frontend_in_l0i_response_queue_other = %.4Lf\n", total_percentage_cycles_issue_stage_stall_no_valid_instruction_head_invalid_waiting_frontend_in_l0i_response_queue_other);
+  fprintf(fout, "total_percentage_cycles_issue_stage_stall_no_valid_instruction_head_invalid_waiting_frontend_hit_status = %.4Lf\n", total_percentage_cycles_issue_stage_stall_no_valid_instruction_head_invalid_waiting_frontend_hit_status);
+  fprintf(fout, "total_percentage_cycles_issue_stage_stall_no_valid_instruction_ibuffer_empty = %.4Lf\n", total_percentage_cycles_issue_stage_stall_no_valid_instruction_ibuffer_empty);
+  fprintf(fout, "total_percentage_cycles_issue_stage_stall_no_valid_instruction_unknown = %.4Lf\n", total_percentage_cycles_issue_stage_stall_no_valid_instruction_unknown);
+  fprintf(fout, "avg_cycles_ibuffer_entry_reserve_to_response_ready = %.4Lf\n", avg_cycles_ibuffer_entry_reserve_to_response_ready);
+  fprintf(fout, "avg_cycles_ibuffer_entry_reserve_to_decode = %.4Lf\n", avg_cycles_ibuffer_entry_reserve_to_decode);
+  fprintf(fout, "avg_cycles_ibuffer_entry_response_ready_to_decode = %.4Lf\n", avg_cycles_ibuffer_entry_response_ready_to_decode);
+  fprintf(fout, "total_percentage_cycles_issue_stage_stall_no_warps_ready = %.4Lf\n", total_percentage_cycles_issue_stage_stall_no_warps_ready);
 
   fprintf(fout, "total_num_constant_cache_different_blocks = %zu\n", all_const_cache_accessed_blocks.size());
   fprintf(fout, "total_num_global_memory_blocks = %zu\n", all_global_memory_accessed_blocks.size());
@@ -1214,7 +1466,7 @@ void shader_core_stats::print_remodeling_stats(FILE *fout) {
 
   unsigned long long total_num_evals_rf = m_gpu-> m_gpu_per_sm_stats.m_stats_map["total_num_evals_rf"]->get_value();
   unsigned long long total_num_evals_rf_with_conflict = m_gpu-> m_gpu_per_sm_stats.m_stats_map["total_num_evals_rf_with_conflict"]->get_value();
-  fprintf(fout, "total_percentage_evals_rf_with_conflict = %.4Lf\n", ((long double) total_num_evals_rf_with_conflict / total_num_evals_rf) * 100);
+  fprintf(fout, "total_percentage_evals_rf_with_conflict = %.4Lf\n", total_num_evals_rf ? (((long double) total_num_evals_rf_with_conflict / total_num_evals_rf) * 100) : 0);
   // OLD
   // fprintf(fout, "total_num_register_file_cache_hits = %lld\n", total_num_register_file_cache_hits);
   // fprintf(fout, "total_num_register_file_cache_allocations = %lld\n", total_num_register_file_cache_allocations);
@@ -3121,6 +3373,13 @@ void gpgpu_sim::shader_print_cache_stats(FILE *fout) const {
             total_css.pending_hits);
     fprintf(fout, "\tL0I_total_cache_reservation_fails = %llu\n",
             total_css.res_fails);
+    fprintf(fout, "\tL0I_cache_port_available_cycles = %llu\n",
+            total_css.port_available_cycles);
+    fprintf(fout, "\tL0I_cache_data_port_busy_cycles = %llu\n",
+            total_css.data_port_busy_cycles);
+    fprintf(fout, "\tL0I_cache_fill_port_busy_cycles = %llu\n",
+            total_css.fill_port_busy_cycles);
+    total_css.print_port_stats(fout, "\tL0I_cache");
   }
   // MOD. End. L0I
 
@@ -3142,6 +3401,13 @@ void gpgpu_sim::shader_print_cache_stats(FILE *fout) const {
             total_css.pending_hits);
     fprintf(fout, "\tL1I_total_cache_reservation_fails = %llu\n",
             total_css.res_fails);
+    fprintf(fout, "\tL1I_cache_port_available_cycles = %llu\n",
+            total_css.port_available_cycles);
+    fprintf(fout, "\tL1I_cache_data_port_busy_cycles = %llu\n",
+            total_css.data_port_busy_cycles);
+    fprintf(fout, "\tL1I_cache_fill_port_busy_cycles = %llu\n",
+            total_css.fill_port_busy_cycles);
+    total_css.print_port_stats(fout, "\tL1I_cache");
   }
 
   // L1D

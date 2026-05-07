@@ -51,11 +51,23 @@ struct status_element {
     cache_status = RESERVATION_FAIL;
     mf = nullptr;
     mf_erased = true;
+    status_origin = NONE;
   }
-  status_element(cache_request_status cache_status, mem_fetch *mf, bool mf_erased) : cache_status(cache_status), mf(mf), mf_erased(mf_erased) {}
+  enum origin {
+    NONE,
+    NORMAL_ACCESS,
+    STREAM_BUFFER_WAIT
+  };
+  status_element(cache_request_status cache_status, mem_fetch *mf, bool mf_erased,
+                 origin status_origin)
+      : cache_status(cache_status),
+        mf(mf),
+        mf_erased(mf_erased),
+        status_origin(status_origin) {}
   cache_request_status cache_status;
   mem_fetch *mf;
   bool mf_erased;
+  origin status_origin;
 };
 
 class first_level_instruction_cache : public read_only_cache {
@@ -84,7 +96,7 @@ class first_level_instruction_cache : public read_only_cache {
                                    unsigned int time,
                                    std::list<cache_event> &events) override;
   
-  new_addr_type get_base_line_of_address(new_addr_type addr);
+  new_addr_type get_base_line_of_address(new_addr_type addr) const;
 
   void cycle() override;
 
@@ -102,6 +114,18 @@ class first_level_instruction_cache : public read_only_cache {
 
   mem_fetch *next_first_access();
 
+  bool is_first_access_ready_for_warp_pc(unsigned int warp_id,
+                                         new_addr_type addr) const;
+
+  bool get_access_status_for_warp_pc(unsigned int warp_id, new_addr_type addr,
+                                     cache_request_status &status) const;
+
+  bool get_access_origin_for_warp_pc(unsigned int warp_id, new_addr_type addr,
+                                     status_element::origin &origin) const;
+
+  bool classify_stream_buffer_wait_state(new_addr_type addr,
+                                         bool &is_prefetch_ready) const;
+
   SM *get_sm();
 
   bool regular_request_search_single_warp(unsigned int warp_id, new_addr_type addr);
@@ -109,7 +133,7 @@ class first_level_instruction_cache : public read_only_cache {
 
   void print_without_IB_coalescing_access_status();
 
-  private:
+ private:
     std::map<new_addr_type, status_element> m_regular_access_status_with_IB_coalescing;
     std::map<unsigned int, std::map<new_addr_type, status_element>> m_regular_access_status_without_IB_coalescing; // The key of the first map is the warp ip
     std::unique_ptr<response_element> m_next_response;

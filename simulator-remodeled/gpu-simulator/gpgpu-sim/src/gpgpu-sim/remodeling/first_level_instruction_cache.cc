@@ -32,6 +32,17 @@
 #include "../shader.h"
 #include "../gpu-sim.h"
 
+namespace {
+bool is_instruction_stream_early_trigger_threshold_reached(new_addr_type addr,
+                                                           unsigned int line_size) {
+    unsigned int request_size = line_size / 8;
+    if(request_size == 0) {
+        request_size = 1;
+    }
+    unsigned int offset_in_block = addr & (line_size - 1);
+    return (offset_in_block + (2 * request_size)) >= line_size;
+}
+}
 
 first_level_instruction_cache::first_level_instruction_cache(const char *name, cache_config &config, int core_id,
           int type_id, mem_fetch_interface *memport,
@@ -103,7 +114,7 @@ void first_level_instruction_cache::clear_cache() {
     }
 }
 
-new_addr_type first_level_instruction_cache::get_base_line_of_address(new_addr_type addr) {
+new_addr_type first_level_instruction_cache::get_base_line_of_address(new_addr_type addr) const {
     new_addr_type base_addr = (addr / m_config.get_line_sz()) * m_config.get_line_sz();
     return base_addr;
 }
@@ -154,38 +165,85 @@ cache_request_status first_level_instruction_cache::access(new_addr_type addr, m
     cache_request_status status = IN_L0I_RESPONSE_QUEUE;
     assert(!m_next_response);
     new_addr_type base_addr = get_base_line_of_address(addr);
+    status_element::origin status_origin = status_element::NONE;
     bool is_reg_request_found = is_regular_request_found(mf, addr, false);   
     if (!is_reg_request_found) {
         if(m_is_prefetching_enabled) {
             SM * sm = get_sm();
             unsigned int useless_idx;
-            new_addr_type addr_to_prefetch = base_addr + m_config.get_line_sz();
+            unsigned int line_size = m_config.get_line_sz();
+            new_addr_type addr_to_prefetch = base_addr + line_size;
             new_addr_type mshr_addr = get_config().mshr_addr(base_addr);
             cache_request_status forecasting_addr_request = m_tag_array->probe(mshr_addr, useless_idx, mf->is_write(), mf);
+            unsigned int useless_idx_prefetch;
+            new_addr_type next_line_mshr_addr = get_config().mshr_addr(addr_to_prefetch);
+            cache_request_status forecasting_prefetch_addr_request =
+                m_tag_array->probe(next_line_mshr_addr, useless_idx_prefetch,
+                                   mf->is_write(), mf);
+            bool prefetch_addr_mshr_hit = get_mshr().probe(next_line_mshr_addr);
             stream_buffer_search_result sb_check = m_stream_buffers->search(base_addr, addr_to_prefetch, sm->get_current_gpu_cycle());
-            if(!sb_check.is_hit_requested_addr && !sb_check.is_hit_prefetch_addr && (forecasting_addr_request == MISS)) {
-                m_stream_buffers->set_new_stream(addr_to_prefetch , mf->get_unique_function_id(), sm->get_current_gpu_cycle(), mf->get_wid());
+            if(sb_check.is_hit_requested_addr) {
+                sm->m_sm_stats.m_stats_map["total_num_l0i_stream_buffer_search_hit_requested_addr"]->increment_with_integer(1);
+            }
+            if(sb_check.is_found_requested_addr_deeper_than_head) {
+                sm->m_sm_stats.m_stats_map["total_num_l0i_stream_buffer_search_found_requested_addr_deeper_than_head"]->increment_with_integer(1);
+                if(sb_check.is_found_requested_addr_deeper_than_head_ready) {
+                    sm->m_sm_stats.m_stats_map["total_num_l0i_stream_buffer_search_found_requested_addr_deeper_than_head_ready"]->increment_with_integer(1);
+                } else {
+                    sm->m_sm_stats.m_stats_map["total_num_l0i_stream_buffer_search_found_requested_addr_deeper_than_head_not_ready"]->increment_with_integer(1);
+                }
+            }
+            if(sb_check.is_hit_prefetch_addr) {
+                sm->m_sm_stats.m_stats_map["total_num_l0i_stream_buffer_search_hit_prefetch_addr"]->increment_with_integer(1);
+            }
+            bool early_trigger_threshold_reached =
+                is_instruction_stream_early_trigger_threshold_reached(addr,
+                                                                     line_size);
+            bool early_trigger_candidate = false;
+            if(early_trigger_threshold_reached) {
+                sm->m_sm_stats.m_stats_map["total_num_l0i_stream_buffer_early_trigger_threshold_reached"]->increment_with_integer(1);
+                if(!sb_check.is_hit_requested_addr && !sb_check.is_hit_prefetch_addr) {
+                    if(forecasting_prefetch_addr_request == HIT) {
+                        sm->m_sm_stats.m_stats_map["total_num_l0i_stream_buffer_early_trigger_next_line_tag_hit"]->increment_with_integer(1);
+                    } else if(prefetch_addr_mshr_hit) {
+                        sm->m_sm_stats.m_stats_map["total_num_l0i_stream_buffer_early_trigger_next_line_mshr_hit"]->increment_with_integer(1);
+                    } else if(forecasting_prefetch_addr_request == MISS) {
+                        early_trigger_candidate = true;
+                        sm->m_sm_stats.m_stats_map["total_num_l0i_stream_buffer_early_trigger_candidate"]->increment_with_integer(1);
+                    }
+                }
+            }
+            if(!sb_check.is_hit_requested_addr && !sb_check.is_hit_prefetch_addr &&
+               ((forecasting_addr_request == MISS) || early_trigger_candidate)) {
+                sm->m_sm_stats.m_stats_map["total_num_l0i_stream_buffer_new_stream_candidate"]->increment_with_integer(1);
+                m_stream_buffers->set_new_stream(addr_to_prefetch , mf->get_unique_function_id(), sm->get_current_gpu_cycle(), mf->get_wid(), early_trigger_candidate);
             }
             if(sb_check.is_hit_requested_addr) {
+                status_origin = status_element::STREAM_BUFFER_WAIT;
+                sm->m_sm_stats.m_stats_map["total_num_l0i_access_returns_in_l0i_response_queue_stream_buffer_wait"]->increment_with_integer(1);
                 m_stream_buffers->set_waiting_fill_in_cache(sb_check.stream_buffer_id, base_addr, addr, mf->get_wid());
             }else {
+                status_origin = status_element::NORMAL_ACCESS;
                 status = read_only_cache::access(addr, mf, time, events);
             }
         }else {
+            status_origin = status_element::NORMAL_ACCESS;
             status = read_only_cache::access(addr, mf, time, events); 
         }
         
         if(status != RESERVATION_FAIL) {
             bool mf_will_be_erased = (status == RESERVATION_FAIL) || (status == IN_L0I_RESPONSE_QUEUE);
             if(m_is_IB_coalescing_enabled) {
-                m_regular_access_status_with_IB_coalescing[addr] = status_element(status, mf, mf_will_be_erased);
+                m_regular_access_status_with_IB_coalescing[addr] = status_element(status, mf, mf_will_be_erased, status_origin);
             }else {
-                m_regular_access_status_without_IB_coalescing[mf->get_wid()][addr] = status_element(status, mf, mf_will_be_erased);
+                m_regular_access_status_without_IB_coalescing[mf->get_wid()][addr] = status_element(status, mf, mf_will_be_erased, status_origin);
             }            
             if(status == HIT) {
                 m_next_response = std::make_unique<response_element>(addr, mf, mf->get_wid(), mf_will_be_erased);
             }
         }        
+    } else {
+        get_sm()->m_sm_stats.m_stats_map["total_num_l0i_access_returns_in_l0i_response_queue_duplicate_request"]->increment_with_integer(1);
     }
     return status;
 }
@@ -200,10 +258,11 @@ bool first_level_instruction_cache::fill(mem_fetch *mf, unsigned time) {
 
 bool first_level_instruction_cache::fill_from_stream_buffer(new_addr_type prefetch_addr, unsigned time, prefetch_element &pending_information) {
     assert(m_next_response == nullptr && "Next response is not null");
+    new_addr_type mshr_addr = m_config.mshr_addr(prefetch_addr);
     bool is_safe_to_erase_entry_in_sb = false;
     get_bw_manager().use_fill_port(nullptr);
-    new_addr_type mshr_addr = m_config.mshr_addr(prefetch_addr);
     mem_fetch *mf_fill = nullptr;
+    get_sm()->m_sm_stats.m_stats_map["total_num_l0i_stream_buffer_waiters_served"]->increment_with_integer(1);
     if(m_is_IB_coalescing_enabled) {
         assert(!pending_information.waiting_addrs_of_the_block.empty() && "No waiting addresses found");
         auto it_first = pending_information.waiting_addrs_of_the_block.begin();
@@ -313,6 +372,79 @@ bool first_level_instruction_cache::is_first_access_ready() {
         assert(it_regular_access_addr->second.cache_status == HIT && "First access is not a hit");
     }
     return true;
+}
+
+bool first_level_instruction_cache::is_first_access_ready_for_warp_pc(
+    unsigned int warp_id, new_addr_type addr) const {
+    if (!m_next_response) {
+        return false;
+    }
+    return (m_next_response->original_warp_id == warp_id) &&
+           (m_next_response->addr == addr);
+}
+
+bool first_level_instruction_cache::get_access_status_for_warp_pc(
+    unsigned int warp_id, new_addr_type addr,
+    cache_request_status &status) const {
+    if (m_is_IB_coalescing_enabled) {
+        auto it_regular_access = m_regular_access_status_with_IB_coalescing.find(addr);
+        if (it_regular_access == m_regular_access_status_with_IB_coalescing.end()) {
+            return false;
+        }
+        status = it_regular_access->second.cache_status;
+        return true;
+    }
+
+    auto it_regular_access_by_wid =
+        m_regular_access_status_without_IB_coalescing.find(warp_id);
+    if (it_regular_access_by_wid == m_regular_access_status_without_IB_coalescing.end()) {
+        return false;
+    }
+
+    auto it_regular_access_addr = it_regular_access_by_wid->second.find(addr);
+    if (it_regular_access_addr == it_regular_access_by_wid->second.end()) {
+        return false;
+    }
+
+    status = it_regular_access_addr->second.cache_status;
+    return true;
+}
+
+bool first_level_instruction_cache::get_access_origin_for_warp_pc(
+    unsigned int warp_id, new_addr_type addr,
+    status_element::origin &origin) const {
+    if (m_is_IB_coalescing_enabled) {
+        auto it_regular_access = m_regular_access_status_with_IB_coalescing.find(addr);
+        if (it_regular_access == m_regular_access_status_with_IB_coalescing.end()) {
+            return false;
+        }
+        origin = it_regular_access->second.status_origin;
+        return true;
+    }
+
+    auto it_regular_access_by_wid =
+        m_regular_access_status_without_IB_coalescing.find(warp_id);
+    if (it_regular_access_by_wid == m_regular_access_status_without_IB_coalescing.end()) {
+        return false;
+    }
+
+    auto it_regular_access_addr = it_regular_access_by_wid->second.find(addr);
+    if (it_regular_access_addr == it_regular_access_by_wid->second.end()) {
+        return false;
+    }
+
+    origin = it_regular_access_addr->second.status_origin;
+    return true;
+}
+
+bool first_level_instruction_cache::classify_stream_buffer_wait_state(
+    new_addr_type addr, bool &is_prefetch_ready) const {
+    if(!m_is_prefetching_enabled || (m_stream_buffers == nullptr)) {
+        return false;
+    }
+    new_addr_type base_addr = get_base_line_of_address(addr);
+    return m_stream_buffers->classify_waiting_requested_head(base_addr,
+                                                             is_prefetch_ready);
 }
 
 mem_fetch *first_level_instruction_cache::next_first_access() {
