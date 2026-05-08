@@ -35,8 +35,8 @@ top of `main`.
 | Stat scaling fix | Leave cycles unscaled; only scale insn / CTA-count by sampling weight. |
 | Pressure signals | Per-kernel snapshot of `gpu_sim_insn`, `dram_bytes`, `l2_misses`, `achieved_bw_ratio`, `dram_queue_occupancy`. |
 | 3-way roofline classifier | `compute / memory / mixed` from `kernel_ai` + memory pressure. Knob-tunable thresholds. |
-| `N_sat_est` + initial target | Picks a starting `sim_ctas` count based on classification + saturation estimate. |
-| Stratified-shuffle replication | When the K-rep heuristic returns fewer reps than the target, replicate them with stratified shuffle to fill more SMs. |
+| `N_sat_est` + initial target | Estimates the concurrency (CTAs/SM) needed to saturate the GPU for each class (compute/memory/mixed). Uses this to set the initial `sim_ctas` target: `target ≈ min(total_ctas, total_sms × N_sat_est)`. Ensures the sample is large enough to exercise realistic SM occupancy. |
+| Stratified-shuffle replication | When K-rep collapses to fewer unique CTAs than the target (e.g., grid corners on a 1D grid), duplicates the representative CTAs and shuffles them across SMs to fill the target occupancy while spreading similar CTAs rather than clumping them. Trades diversity for SM occupancy. |
 | Adaptive pilot loop | Re-launches the kernel with doubled `sim_ctas` if pressure signals haven't stabilized. Snapshot/restore so rejected iters don't pollute totals. |
 | Validation harness | `validate.py` runs each workload across 4 sampling modes (`baseline`, `K-rep`, `expanded40`, `pilot`) and reports cycle/insn/IPC error vs. baseline. |
 
@@ -236,6 +236,11 @@ The honest scientific finding: the model **generalizes within the
 6-workload regime** (medium grids, well-behaved K-rep, reasonable
 log-fit extrapolation distance) and **breaks** when those assumptions
 do.
+
+## Other points to consider:
+
+* Shared memory contention
+* I-Cache misses.
 
 ---
 

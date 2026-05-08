@@ -1,14 +1,16 @@
-# CTA Sampling — Final Status Update
+# CTA Sampling — Status Update (2026-05-07)
 
-**Status: ✅ Both accuracy targets met on the wider 9-workload set.**
+**Status: ✅ Both accuracy targets met on the wider 9-workload set.
+⚠️ Wall-time regresses on workloads that don't reach the
+`pilot_overhead / per_cta_cost` crossover.**
 
-This is the final walkthrough of the cycle-accuracy + wider-validation
+This is the status update for the cycle-accuracy + wider-validation
 work on the `cta-sampling` branch. It covers what shipped, the
 measured results per change, the wall-time speedup analysis, and an
-honest verdict on where the work pays off. Pairs with
-`CTA_SAMPLING_WALKTHROUGH.md` (the previous walkthrough, covering the
-branch from `main` through the original cycle-accuracy push) and
-`CTA_SAMPLING_C1_C2_C3_LOG.md` (the live progress log of this phase).
+honest verdict on where the work pays off (and where it currently
+hurts). Pairs with `20260430_CTA_SAMPLING_WALKTHROUGH.md` (the
+previous walkthrough, covering the branch from `main` through the
+original cycle-accuracy push).
 
 ---
 
@@ -19,15 +21,23 @@ branch from `main` through the original cycle-accuracy push) and
   10-workload sweep exposed.
 - **Cycle accuracy on the wider 9-workload set: p50 = 10.1%,
   p90 = 23.4% — both targets met.**
-- **Wall-time speedup is workload-dependent.** On rodinia2 toy traces
-  the cumulative is 0.92× (slight slowdown), but per-workload ranges
-  from 0.46× (heartwall) to 2.12× (hotspot). A simple model predicts
-  the crossover at ~90 to ~3300 CTAs depending on per-CTA simulation
-  cost — every workload we measured below that threshold lost time,
-  every one above won.
-- **Production-scale traces (10K+ CTAs/kernel) are projected to see
-  100×+ speedups; we have not yet measured on such a trace.** The
-  cycle-accuracy contribution is independent of trace scale.
+- **Wall-time speedup is workload-dependent and on rodinia2 traces
+  is mostly negative.** Per-workload ranges from 0.46× (heartwall)
+  to 2.12× (hotspot); cumulative 0.92×. **Any workload where the
+  pilot finishes after the baseline would have is a strict
+  regression** — the user could have just run baseline and gotten
+  0% error in less time. nn, heartwall, backprop, and srad_v2 all
+  hit this.
+- **A simple model predicts the crossover at
+  `pilot_overhead / per_cta_cost`** ≈ 90 to 3300 CTAs depending on
+  workload class — every workload we measured below that threshold
+  lost time, every one above won. Production-scale traces (10K+
+  CTAs/kernel) are projected to see 100×+ speedups; we have not yet
+  measured on such a trace.
+- **Top open follow-up: pilot wall-time budget with abort-to-baseline
+  fallback** (§9 #1). Without this, the optimization is unsafe to
+  ship to a workload mix that includes any kernel below the
+  crossover threshold.
 
 ![speedup](speedup_chart.png)
 
@@ -37,7 +47,7 @@ branch from `main` through the original cycle-accuracy push) and
 
 ## Starting state (after the previous walkthrough)
 
-Previous walkthrough closed at p50 = 12.3%, p90 = 17.3% on the
+The 2026-04-30 walkthrough closed at p50 = 12.3%, p90 = 17.3% on the
 **original 6-workload set**. A wider sweep with 4 more rodinia2
 kernels (heartwall, nn, nw, streamcluster) revealed three failure
 modes:
@@ -237,11 +247,18 @@ Commit: `471ccd5`.
 
 **Tuning note**: first try shipped with `PILOT_MAX_DOUBLINGS_CEILING = 4`,
 which gave nn +37% (deepest density 8). Bumping to 5 (deepest density
-16) closed the remaining gap to +10%. Sim-time impact on nn: pilot
-wall time went from 4.9s baseline → 7.0s (ceiling=4) → 11.6s
-(ceiling=5). The pilot is now slightly slower than baseline for nn
-specifically — acceptable since the goal is cycle-estimate accuracy,
-not raw simulator throughput on this single workload.
+16) closed the cycle-error gap to +10%.
+
+**Sim-time honesty.** Bumping the ceiling is what made nn's pilot
+slower than baseline. nn pilot wall: 4.9s baseline → 7.0s
+(ceiling=4) → 11.6s (ceiling=5). At ceiling=5, **the pilot is a
+strict regression for nn — the user is worse off on every dimension
+(more wall time AND non-zero cycle error) than just running baseline.**
+This is the *right* setting for accuracy on a kernel where baseline
+would be too slow to run at all (production scale, where 938 CTAs is
+938K) — but for the rodinia2 nn trace, it's the wrong call. The fix
+for this workload-class mismatch is the abort-on-slow follow-up
+(§9 #1), not a tuning of this knob.
 
 ---
 
@@ -277,8 +294,6 @@ a known limit rather than chased further.
 Turing traces, 9 workloads (streamcluster excluded — its 130s pilot
 mode dwarfs the others and skews the chart).
 
-![speedup](speedup_chart.png)
-
 ```
 Per-workload speedup (baseline_wall / pilot_wall, mean of 3 trials):
 
@@ -287,10 +302,10 @@ Per-workload speedup (baseline_wall / pilot_wall, mean of 3 trials):
   bfs          1.04x  ( 5.91s -> 5.69s)
   lud          1.01x  ( 8.26s -> 8.18s)
   nw           0.96x  ( 6.08s -> 6.34s)
-  srad_v2      0.77x  ( 3.29s -> 4.27s)
-  backprop     0.70x  ( 3.34s -> 4.79s)
-  nn           0.50x  ( 4.98s -> 9.98s)
-  heartwall    0.46x  ( 1.87s -> 4.07s)   ← biggest slowdown
+  srad_v2      0.77x  ( 3.29s -> 4.27s)   ← regression
+  backprop     0.70x  ( 3.34s -> 4.79s)   ← regression
+  nn           0.50x  ( 4.98s -> 9.98s)   ← regression
+  heartwall    0.46x  ( 1.87s -> 4.07s)   ← regression
 
 Cumulative: 45.96s -> 49.88s   (overall 0.92x)
 ```
@@ -300,35 +315,26 @@ Cumulative: 45.96s -> 49.88s   (overall 0.92x)
 These rodinia2 Turing traces are **toy-scale** — the largest kernel
 is nn at 938 CTAs, and most are well under 256. In that regime, the
 pilot's overhead (multiple iterations to find the right sampling
-density) exceeds the savings from skipping CTAs:
+density, each paying kernel-launch latency and re-warming caches)
+exceeds the savings from skipping CTAs. **For 4 of the 9 workloads
+the pilot is a strict regression: the user would have been better
+off running baseline.**
 
 - **hotspot wins big (2.12×)** because pilot accepts iter 0 with K-rep
   = 9 CTAs out of 64; no expansion needed, classifier says compute, fast
   path. This is the motivating case for sampling.
-- **nn / heartwall / backprop slow down** because the force-expand
-  logic correctly insists on more iterations to get an accurate cycle
-  projection — 5 pilot iterations on nn means 6× more sim work per
-  kernel before the accepted iteration, even though each iteration
-  itself only sees a small fraction of the grid.
+- **nn / heartwall / backprop / srad_v2 slow down** because the
+  force-expand logic correctly insists on more iterations to get an
+  accurate cycle projection — 5 pilot iterations on nn means 6× more
+  sim work per kernel before the accepted iteration. The cycle
+  estimate is good; the wall time is a loss.
 - **pathfinder / bfs / lud / nw stay roughly flat** — C1 already
   prevents the pilot from running on those tiny grids, so they pay
   almost nothing for sampling and gain almost nothing.
 
 The cumulative number is **0.92× overall** — slightly slower across
-this set. **This is workload-mix-dependent**:
-
-- A workload mix dominated by a few very-large kernels (production
-  traces with 10K+ CTAs/kernel, e.g. real DL training/inference,
-  large-grid HPC) sees the hotspot pattern repeat — pilot accepts
-  iter 0 with O(40) CTAs out of 10000, easy 100× speedup.
-- The toy traces here have 50–940 CTAs/kernel total, so the absolute
-  time the simulator would spend on a "non-sampled CTA" is small to
-  begin with. There's just no headroom for sampling to save time.
-
-The accuracy work (cycle estimate within ±10%/±25% on a wider 9-workload
-set) is independent of trace scale — it's a property of the
-mathematical projection, validated on small traces but applies the
-same way to large ones.
+this set. Without an abort-to-baseline fallback (§9 #1), running
+sampling on this workload mix is strictly worse than running baseline.
 
 ---
 
@@ -377,8 +383,6 @@ Crossover for our workload classes:
 | 33 ms/CTA (hotspot-like)     | ~210 CTAs  |
 | 344 ms/CTA (lud-like)        | ~90 CTAs   |
 
-![projection](speedup_projection.png)
-
 This matches the data we measured:
 
 - hotspot at 320 CTAs > 210 crossover → 2.12× speedup ✓
@@ -400,20 +404,22 @@ This matches the data we measured:
 
 **Honest verdict:** the wall-time win is real but trace-scale
 dependent. We have not yet measured it on a production-scale trace —
-those aren't in the example archives. The infrastructure, however, is
-correctness-debugged and accuracy-validated for the moment those
-traces show up. The cycle-accuracy work is independent of this and
-delivered the targets it set.
+those aren't in the example archives. The cycle-accuracy work is
+independent of this and delivered the targets it set. **For workload
+mixes that include any kernel below the crossover, sampling is
+currently unsafe to default-on without the abort-to-baseline guard
+described in §9 #1** — the user could be served better by simply
+not enabling sampling.
 
 The next test that would close the question definitively: NVBit-trace
 a single transformer-layer kernel (~100K–1M CTAs) and re-run this
-exact comparison. Logged as the top open follow-up.
+exact comparison. Logged as §9 #2.
 
 ---
 
-## 8. What shipped (since the last walkthrough)
+## 8. What shipped (since the previous walkthrough)
 
-7 new commits beyond `239db61` (where the previous walkthrough
+7 new commits beyond `239db61` (where the 2026-04-30 walkthrough
 landed):
 
 | Hash | Theme | What |
@@ -428,28 +434,109 @@ landed):
 
 3 code commits, 4 doc commits. Total **~145 LOC** of code change.
 
-Total branch state: 32 commits ahead of `main` (the original 25 from
-`CTA_SAMPLING_WALKTHROUGH.md` + this session's 7).
+Total branch state: 32 commits ahead of `main`.
 
 ---
 
 ## 9. Outstanding follow-ups
 
-Listed in priority order in `CTA_SAMPLING_PHASE_AB_DONE.md` and
-`CTA_SAMPLING_C1_C2_C3_LOG.md`:
+### 1. Pilot wall-time budget + abort-to-baseline fallback (now top priority)
 
-1. **Speedup measurement on production-scale traces.** The toy-trace
-   speedup is 0.92×; a fair test is large-grid kernels (10K+ CTAs/kernel)
-   where the pilot's iter-time amortizes properly.
-2. **heartwall's cache-state pollution.** Currently sits at −23.4% (under
-   target but not closed). Would need a hardware-state reset between
-   rejected and accepted pilot iterations.
-3. **AI weight calibration** (open D2 decision). Tangential to cycle
-   accuracy.
-4. **K-rep clustering replacement.** C2's evenly-spaced supplement is the
-   cheap version; full k-means over per-CTA features would be more robust.
-5. **Pilot-rejected per-SM aggregate cleanup.** Affects IPC numerator
-   only, not cycle estimate.
+**Problem.** The current pilot has no upper bound on wall time. For
+high-projection-ratio kernels (nn) the C3a adaptive cap pushes through
+6 iterations, each paying full kernel-launch latency, classifier
+overhead, and snapshot/restore cost. At the rodinia2 scale the pilot
+wall time exceeds baseline wall time by 2.4× (heartwall) to 2.0×
+(nn), turning the optimization into a strict regression for those
+workloads. There's no graceful exit: the pilot commits to its plan at
+iter 0 and walks through all the doublings even when the simulator
+could have just run baseline already.
+
+**Proposed fix.** Track host wall time across pilot iterations; abort
+the pilot loop and fall back to baseline (`-cta_sampling_mode 0` for
+this kernel only) when the accumulated pilot wall is on track to
+exceed the projected baseline cost. Concretely:
+
+- **Where the abort decision lives.** `pilot_decide_accept` in
+  `main.cc:241-322` (or the rejection-path block in
+  `main.cc:805-828`, which is where `pst->iter` increments and the
+  next target is chosen). Add a budget check before bumping iter.
+- **Wall-time measurement.** No host wall clock is currently tracked
+  in the pilot loop. Add a `chrono::steady_clock::time_point pilot_t0`
+  field to `pilot_state_t`, capture it at iter-0 enter, and on each
+  rejection compute `auto pilot_elapsed = now - pilot_t0`.
+- **Baseline cost estimate.** Two options, in increasing complexity:
+  - **(a) CTA-count budget.** Track cumulative `sampled_ctas` across
+    history. If cumulative ≥ `pst.total_ctas`, the pilot has already
+    simulated more CTAs than baseline would have — abort. No timing
+    needed; pure integer arithmetic on `pst.history`. This is a
+    conservative upper bound (per-iter overhead beyond CTA simulation
+    is ignored), but it never under-spends.
+  - **(b) Wall-time budget.** Estimate baseline_wall from iter 0's
+    per-CTA cost: `T_per_cta_estimate = iter0.sampled_cycles /
+    (iter0.sampled_ctas * sm_clock_hz_proxy)`, scale to total CTAs.
+    Or simpler: extrapolate `iter0.host_wall_seconds` to total via
+    `total_ctas / sampled_ctas` ratio. Abort when
+    `pilot_elapsed > k * baseline_wall_estimate` for some k ∈ [1.0,
+    1.5]. More accurate but needs per-iter wall-clock capture.
+- **Fallback path.** On abort: set `kernel_trace_info`'s sampling
+  weight back to 1.0, restore via `pilot_restore`, set
+  `cta_sampling_mode = 0` for the remaining trace processing of this
+  kernel, relaunch, and finalize via the normal accept path. The
+  sampling pipeline already has `update_sampling_on_trace_info`
+  which can take target=total_ctas to disable sampling for the
+  current kernel.
+- **Reporting.** Emit a new line `pilot_aborted_reason=budget_exceeded`
+  alongside `pilot_iter=N pilot_accepted=1` in the
+  `CTA_PRESSURE_SIGNALS:` log so the validation harness can count
+  aborts and report a "would-have-regressed" rate per sweep.
+- **Default policy.** Keep the budget enabled by default; expose it
+  as `-cta_sampling_pilot_max_wall_ratio` (default 1.5 = abort at
+  1.5× projected baseline), so users running production-scale traces
+  where baseline is genuinely unaffordable can disable the abort
+  with `-cta_sampling_pilot_max_wall_ratio 0`.
+
+**Recommended choice:** ship option (a) first (pure CTA-count
+arithmetic, no wall-clock infrastructure to introduce, no new noise
+sources), measure the impact on the wider 9-workload set, then add
+option (b) only if (a) doesn't catch the regressions early enough.
+
+**Expected outcome.** Workloads where pilot is a strict regression
+(nn, heartwall, backprop, srad_v2 in our measurement) get aborted to
+baseline, getting back to 0.0% cycle error and 1.0× wall time. The
+sampling speedup story becomes "either at-target accuracy with a
+speedup, or a clean fallback to baseline" — never a strict regression.
+Cumulative wall-time on the rodinia2 set should improve from 0.92×
+toward 1.0×–1.1×; production-scale wall-time gains are unaffected
+since at scale the pilot is a clear win and won't trigger the abort.
+
+### 2. Speedup measurement on production-scale traces
+
+Top blocker for closing the "is this useful?" question
+quantitatively. The toy-trace speedup is 0.92×; a fair test is
+large-grid kernels (10K+ CTAs/kernel) where the pilot's iter-time
+amortizes properly. NVBit-tracing a transformer-layer-scale kernel
+on a real GPU is the cleanest path.
+
+### 3. heartwall's cache-state pollution
+
+Currently sits at −23.4% (under target but not closed). Would need a
+hardware-state reset between rejected and accepted pilot iterations
+(L2 contents, branch predictor, scoreboards). Out of scope for the
+sampling-pipeline work.
+
+### 4. AI weight calibration
+
+(Open D2 decision.) Tangential to cycle accuracy.
+
+### 5. K-rep clustering replacement
+
+C2's evenly-spaced supplement is the cheap version; full k-means
+over per-CTA features would be more robust on irregular workloads.
+
+### 6. Pilot-rejected per-SM aggregate cleanup
+
+Affects IPC numerator only, not cycle estimate.
 
 ---
 
@@ -458,11 +545,14 @@ Listed in priority order in `CTA_SAMPLING_PHASE_AB_DONE.md` and
 > **Wider validation gap closed in 3 layered changes (C1: nw fix; C2:
 > K-rep replication fix; C3a: adaptive deeper pilot expansion). Cycle-
 > estimate accuracy on the 9-workload set: p50 = 10.1%, p90 = 23.4%
-> — both targets met. Wall-time on the toy-trace set is mixed (0.92×
-> cumulative, hotspot 2.1× best, heartwall 0.46× worst). The
-> theoretical model says crossover is at `pilot_overhead / per_cta_cost`
-> CTAs ≈ 90 (heavy compute) to 3.3K (light compute) — every workload
-> we measured below that line lost time, every one above won. The
-> infrastructure and accuracy are validated; demonstrating the
-> wall-time win on production-scale traces (where simulators
-> actually take hours) is the next step.**
+> — both targets met. Wall-time on the rodinia2 toy-trace set is
+> mostly negative: 4 of 9 workloads regress (pilot wall > baseline
+> wall), driven by per-iter overhead in the pilot loop that doesn't
+> amortize on small kernels. The crossover model says
+> `N > pilot_overhead / per_cta_cost` ≈ 90 (heavy compute) to 3.3K
+> (light compute) — every measured data point matches. Top open
+> follow-up is a pilot wall-time budget that aborts to baseline
+> when the pilot is on track to be slower than just running every
+> CTA; without it, the optimization is unsafe to default-on.
+> Production-scale traces (10K+ CTAs/kernel) project to 100×+
+> speedups but haven't been measured.**
