@@ -278,6 +278,37 @@ The presence of TMA in the FlashAttention trace has direct implications for the 
 
 4. **Add a TMA-aware classifier flag** — if a kernel uses TMA, bypass the log-fit model and use a separate TMA-specific cycle model (e.g., warp-occupancy-based rather than CTA-concurrency-based).
 
+### Execution Plan for Option 1
+
+The implementation should proceed in two passes so we can first preserve the right artifacts, then attach decoded descriptor metadata to static instructions.
+
+#### Pass 1 — Preserve and inspect descriptor-definition artifacts
+
+1. Add a TMA-specific tracer mode in `util/tracer_nvbit/tracer_tool/tracer_tool.cu` that preserves `extra_info/cubin/` and `extra_info/sass/` instead of deleting them at the end of `enhanced_tracer()`.
+2. In that same mode, emit an additional cubin disassembly dump per extracted cubin, preferably with `nvdisasm`, into a new sibling folder such as `extra_info/nvdisasm/`.
+3. Re-run the trace and inspect the preserved disassembly for the descriptor-definition instruction sequence that materializes the 256-bit TMA descriptor used by `UTMALDG.*` / `UTMASTG.*`.
+4. Validate the flow specifically on FlashAttention function 5 and function 10, where the current trace already proves the `desc[URx]` consumer side exists.
+
+#### Pass 2 — Attach descriptor metadata to static instructions
+
+1. Extend `util/traces_enhanced/src/traced_instruction.h` and `traced_instruction.cc` with a `tma_descriptor_info` payload that stores:
+   - whether the instruction uses a TMA descriptor
+   - the descriptor operand string such as `desc[UR20]`
+   - raw descriptor words
+   - decoded fields such as address, dimensions, strides, and misc metadata
+2. Extend the SASS/disassembly parsing path in `util/tracer_nvbit/tracer_tool/tracer_tool.cu` to:
+   - detect TMA consumer instructions
+   - extract descriptor-definition candidates from preserved cubin disassembly
+   - match each definition to the corresponding TMA consumer instruction in the same kernel
+3. Serialize the new metadata into `traces/extra_info/enhanced_execution_info.json`.
+4. Reuse the existing simulator attachment path in `gpu-simulator/trace-driven/trace_driven.cc`, where each dynamic instruction already receives its static `traced_instruction` pointer.
+
+#### Initial scope limits
+
+- Do not extend the runtime protobuf or `inst_trace_t` in the first patch.
+- Do not add NVBit runtime register capture for TMA descriptors in the first patch.
+- Treat Option 1 as a static metadata project first; only move to runtime capture if preserved cubin/disassembly still cannot expose the descriptor-definition payload.
+
 ---
 
 ## Files Referenced
