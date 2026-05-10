@@ -82,11 +82,17 @@ def parse_app_definition_yaml( def_yml, apps ):
     for suite in benchmark_yaml:
         apps[suite] = []
         for exe in benchmark_yaml[suite]['execs']:
-            exe_name = list(exe.keys())[0]
-            args_list = list(exe.values())[0]
+            benchmark_name = list(exe.keys())[0]
+            exe_def = list(exe.values())[0]
+            actual_exe_name = benchmark_name
+            args_list = exe_def
+            if isinstance(exe_def, dict):
+                actual_exe_name = exe_def.get("exe", benchmark_name)
+                args_list = exe_def.get("runs", [])
             count = 0
             for runparms in args_list:
                 args = runparms["args"]
+                runparms["benchmark_name"] = benchmark_name
                 if "accel-sim-mem" not in runparms:
                     runparms["accel-sim-mem"] = "4G"
                 if "qos" not in runparms: # MOD. Change qos type
@@ -95,18 +101,18 @@ def parse_app_definition_yaml( def_yml, apps ):
                     runparms["partition"] = "production"
                 if "openmp-cpus" not in runparms:
                     runparms["openmp-cpus"] = "1"
-                apps[suite + ":" + exe_name + ":" + str(count) ] = []
-                apps[suite + ":" + exe_name + ":" + str(count) ].append( ( benchmark_yaml[suite]['exec_dir'],
+                apps[suite + ":" + benchmark_name + ":" + str(count) ] = []
+                apps[suite + ":" + benchmark_name + ":" + str(count) ].append( ( benchmark_yaml[suite]['exec_dir'],
                                     benchmark_yaml[suite]['data_dirs'],
-                                    exe_name, [args]) )
+                                    actual_exe_name, [runparms]) )
                 count += 1
             apps[suite].append(( benchmark_yaml[suite]['exec_dir'],
                                  benchmark_yaml[suite]['data_dirs'],
-                                 exe_name, args_list ))
-            apps[suite + ":" + exe_name] = []
-            apps[suite + ":" + exe_name].append( ( benchmark_yaml[suite]['exec_dir'],
+                                 actual_exe_name, args_list ))
+            apps[suite + ":" + benchmark_name] = []
+            apps[suite + ":" + benchmark_name].append( ( benchmark_yaml[suite]['exec_dir'],
                                  benchmark_yaml[suite]['data_dirs'],
-                                 exe_name, args_list ) )
+                                 actual_exe_name, args_list ) )
     return
 
 def parse_config_definition_yaml( def_yml, defined_baseconfigs, defined_xtracfgs ):

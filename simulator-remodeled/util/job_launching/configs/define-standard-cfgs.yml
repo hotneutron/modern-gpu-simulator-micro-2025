@@ -313,3 +313,11 @@ Accelwattch_PTX_SIM:
     extra_params: "-power_simulation_enabled 1
     \n-power_simulation_mode 0
     \n-accelwattch_xml_file accelwattch_ptx_sim.xml"
+
+OnlyKernel5:
+    extra_params: "-filter_first_kernel_id 5
+    \n-filter_last_kernel_id 5"
+
+OnlyKernel10:
+    extra_params: "-filter_first_kernel_id 10
+    \n-filter_last_kernel_id 10"

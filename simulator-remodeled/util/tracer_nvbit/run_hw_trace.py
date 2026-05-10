@@ -4,6 +4,7 @@ from optparse import OptionParser
 import os
 import subprocess
 import os
+import shlex
 this_directory = os.path.dirname(os.path.realpath(__file__)) + "/"
 import sys
 sys.path.insert(0,os.path.join(this_directory,"..","job_launching"))
@@ -64,7 +65,9 @@ for bench in benchmarks:
     edir, ddir, exe, argslist = bench
     for argpair in argslist:
         args = argpair["args"]
-        run_name = os.path.join( exe, common.get_argfoldername( args ) )
+        extra_env = argpair.get("env", {})
+        benchmark_name = argpair.get("benchmark_name", exe)
+        run_name = os.path.join( benchmark_name, common.get_argfoldername( args ) )
 
         # MOD. Begin. Improved tracer
         if(options.compressed == "0"):
@@ -101,6 +104,10 @@ for bench in benchmarks:
         exec_path = common.file_option_test(os.path.join(edir, exe),"",this_directory)
         sh_contents = "set -e\n"
 
+        env_exports = ""
+        for key, value in extra_env.items():
+            env_exports += "export {0}={1}; ".format(key, shlex.quote(str(value)))
+
         if options.terminate_upon_limit:
             sh_contents += "export TERMINATE_UPON_LIMIT=1; "
 
@@ -126,13 +133,13 @@ for bench in benchmarks:
         
         # MOD. Begin. Improved tracer
         if(options.compressed == "0"):
-            sh_contents += "\nexport CUDA_VERSION=\"" + cuda_version + "\"; export CUDA_VISIBLE_DEVICES=\"" + options.device_num + "\" ; " +\
-                "export TRACES_FOLDER="+ this_trace_folder + "; CUDA_INJECTION64_PATH=" + os.path.join(nvbit_tracer_path, "tracer_tool.so") +\
+            sh_contents += "\nexport CUDA_VERSION=\"" + cuda_version + "\"; export CUDA_VISIBLE_DEVICES=\"" + options.device_num + "\" ; export USER_DEFINED_FOLDERS=1; " +\
+                "export TRACES_FOLDER="+ this_trace_folder + "; " + env_exports + "export CUDA_INJECTION64_PATH=" + os.path.join(nvbit_tracer_path, "tracer_tool.so") +\
                 " " + "; LD_PRELOAD=" + os.path.join(nvbit_tracer_path, "tracer_tool.so") + " " +\
                 exec_path + " " + str(args) + " ;"
         else:
-            sh_contents += "\nexport CUDA_VERSION=\"" + cuda_version + "\"; export CUDA_VISIBLE_DEVICES=\"" + options.device_num + "\" ; " +\
-                "export TRACES_FOLDER="+ this_trace_folder + "; CUDA_INJECTION64_PATH=" + os.path.join(nvbit_tracer_path, "tracer_tool.so") +\
+            sh_contents += "\nexport CUDA_VERSION=\"" + cuda_version + "\"; export CUDA_VISIBLE_DEVICES=\"" + options.device_num + "\" ; export USER_DEFINED_FOLDERS=1; " +\
+                "export TRACES_FOLDER="+ this_trace_folder + "; " + env_exports + "export CUDA_INJECTION64_PATH=" + os.path.join(nvbit_tracer_path, "tracer_tool.so") +\
                 " " + "; LD_PRELOAD=" + os.path.join(nvbit_tracer_path, "tracer_tool.so") + " " +\
                 exec_path + " " + str(args) + " ; " + os.path.join(nvbit_tracer_path,"traces-processing", "post-traces-processing-compressed") + " " +\
                 os.path.join(this_trace_folder, "kernelslist") + " " + str(psutil.virtual_memory()[1]*.8) + " ; rm -f " + this_trace_folder + "/*.trace ; rm -f " + this_trace_folder + "/kernelslist "
