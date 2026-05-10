@@ -28,6 +28,11 @@
 BIN_DIR=./bin/$(ACCELSIM_CONFIG)
 BUILD_DIR=./build/$(ACCELSIM_CONFIG)
 
+# Pass to sub-Makes
+# GPGPUSIM_ROOT must point to the gpgpu-sim/ subdirectory (set by gpgpu-sim/setup_environment)
+# ACCELSIM uses GPGPUSIM_SETUP_ENVIRONMENT_WAS_RUN to mean "env was sourced"
+export GPGPUSIM_SETUP_ENVIRONMENT_WAS_RUN=1
+
 # MOD. Begin. ENHANCED TRACES
 TRACES_ENHANCED_DIR=../util/traces_enhanced
 TRACES_ENHANCED_OBJ=$(wildcard $(TRACES_ENHANCED_DIR)/obj/*.o)
@@ -82,7 +87,7 @@ checkenv: makedirs
 	fi
 
 $(BIN_DIR)/accel-sim.out: traces_enhanced trace-driven trace-parser gpgpu-sim makedirs $(BUILD_DIR)/main.o version
-	$(CXX) -std=c++17 -L$(GPGPUSIM_ROOT)/lib/$(GPGPUSIM_CONFIG)/ -lm -lGL -pthread -lz -lcudart -lz $(BUILD_DIR)/*.o $(TRACES_ENHANCED_OBJ) $(TRACES_ENHANCED_PROTOCOL_BUFFER_OBJ) -lgomp -lprotobuf -o $(BIN_DIR)/accel-sim.out $(SANITIZER_FLAG_FULL)
+	$(CXX) -std=c++17 -L$(GPGPUSIM_ROOT)/build/$(GPGPUSIM_CONFIG)/ -lm -lGL -pthread -lz -lcudart -lz $(BUILD_DIR)/*.o $(TRACES_ENHANCED_OBJ) $(TRACES_ENHANCED_PROTOCOL_BUFFER_OBJ) -Wl,--start-group $(GPGPUSIM_ROOT)/build/$(GPGPUSIM_CONFIG)/libcuda/libcuda.a $(GPGPUSIM_ROOT)/build/$(GPGPUSIM_CONFIG)/libgpgpusim.a $(GPGPUSIM_ROOT)/build/$(GPGPUSIM_CONFIG)/gpgpu-sim/libgpu_uarch_sim.a $(GPGPUSIM_ROOT)/build/$(GPGPUSIM_CONFIG)/cuda-sim/libgpgpu_ptx_sim.a $(GPGPUSIM_ROOT)/build/$(GPGPUSIM_CONFIG)/remodeling/libgpu_remodeling_uarch_sim.a $(GPGPUSIM_ROOT)/build/$(GPGPUSIM_CONFIG)/fusedMemory/libgpu_fusedMemory_sim.a -Wl,--end-group -lgomp -lprotobuf -o $(BIN_DIR)/accel-sim.out $(SANITIZER_FLAG_FULL)
 
 $(BUILD_DIR)/main.o: main.cc version
 	$(CXX) $(CXXFLAGS) $(SANITZER_FLAG) -I$(BUILD_DIR) -I./trace-driven -I./trace-parser -I$(GPGPUSIM_ROOT)/libcuda -I$(GPGPUSIM_ROOT)/src -I$(CUDA_INSTALL_PATH)/include -c main.cc -o $(BUILD_DIR)/main.o
