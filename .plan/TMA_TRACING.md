@@ -140,16 +140,16 @@ The TMA descriptor is a 256-bit value stored in the GPU's **hardware descriptor 
 
 ## Three Options to Capture TMA Descriptors
 
-### Option 1 — Decode TMA Descriptors from CUBIN Binary (Recommended)
+### Option 1 — Decode TMA Descriptors from CUBIN Binary (Not Viable)
 
-**How it works:** The TMA descriptor is a 256-bit immediate value encoded directly in `DMNP` (define null pointer + descriptor) instructions in the CUBIN. The SASS disassembly (`cuobjdump -sass`) contains this value as an operand.
+**How it works:** Attempt to recover the TMA descriptor by decoding preserved CUBIN / SASS artifacts and matching descriptor-definition instructions to later `UTMALDG.*` / `UTMASTG.*` consumers.
 
 **Steps:**
 1. Disassemble each kernel's CUBIN:
    ```bash
    cuobjdump -sass kernel.sm_90.cubin > kernel.sm_90.sass
    ```
-2. Find all `DMNP` instructions — they encode the full 256-bit TMA descriptor as immediate operands
+2. Find the descriptor-definition instruction sequence in the preserved disassembly
 3. Parse the descriptor fields (see below)
 4. Add a `tma_descriptors` section to `enhanced_execution_info.json`, keyed by kernel `unique_function_id`
 5. Extend the protobuf schema to carry TMA descriptor metadata
@@ -169,7 +169,12 @@ The TMA descriptor is a 256-bit value stored in the GPU's **hardware descriptor 
 | 87:80 | `BOX_DIM` | 4D/3D box dimensions |
 | 79:0 | `RESERVED` | |
 
-**Limitation:** Only captures statically initialized descriptors. Any descriptor constructed dynamically at runtime would be missed.
+**Why Option 1 is not viable as the main path:**
+
+1. It only has access to preserved static artifacts, so it cannot recover descriptor state that is assembled, patched, or specialized dynamically at runtime.
+2. The simulator needs the descriptor semantics that are actually visible at the `UTMALDG.*` / `UTMASTG.*` issue point, including per-CTA or per-launch variation; static binary inspection cannot prove those final runtime values.
+3. The descriptor construction flow may involve multiple producer instructions and runtime inputs, so a pure CUBIN/SASS decode is not a reliable source of truth for the resolved 256-bit descriptor used by the consumer.
+4. Because of those gaps, Option 1 is still useful as a cross-check or static reference, but it is not sufficient to drive simulator-visible TMA behavior.
 
 ### Option 2 — Reconstruct Runtime TMA Descriptors from Producer Instructions
 
@@ -251,7 +256,7 @@ message TmaDescriptorSnapshot {
 - Keep producer capture and consumer capture separate from the existing generic memory-reference injection path to reduce callback argument fragility.
 - Prefer writing reconstructed descriptor snapshots to a sideband debug artifact first, and only move them into the main trace schema after validation.
 
-**Limitation:** Requires rebuilding `tracer_tool.so`, identifying the actual descriptor producer sequence, and implementing a host-side descriptor state tracker. This is more work than Option 1, but it is the only path that can recover true runtime descriptor semantics when the descriptor is assembled dynamically.
+**Limitation:** Requires rebuilding `tracer_tool.so`, identifying the actual descriptor producer sequence, and implementing a host-side descriptor state tracker. This is more work than Option 1, but it is the only viable path for recovering true runtime descriptor semantics when the descriptor is assembled dynamically.
 
 ### Option 3 — Use NVIDIA Nsight Compute for TMA Metrics
 
@@ -310,9 +315,9 @@ The presence of TMA in the FlashAttention trace has direct implications for the 
 
 ## Recommended Next Steps
 
-1. **Use Option 1 only as a static reference path.** Preserve and parse cubin/SASS artifacts so static descriptors can still be decoded when available, but do not rely on this path for simulator-visible runtime semantics.
+1. **Do not pursue Option 1 as the implementation path.** Keep preserved cubin/SASS artifacts only as a static reference or cross-check mechanism because static decoding is not viable for recovering simulator-visible runtime descriptor semantics.
 
-2. **Implement revised Option 2 as the main runtime path.** Instrument descriptor producer instructions, reconstruct descriptor state on the host, and attach the resolved descriptor snapshot to each `UTMALDG.*` / `UTMASTG.*` consumer.
+2. **Move to revised Option 2 as the main runtime path.** Instrument descriptor producer instructions, reconstruct descriptor state on the host, and attach the resolved descriptor snapshot to each `UTMALDG.*` / `UTMASTG.*` consumer.
 
 3. **Persist decoded descriptor semantics** needed by the future simulator: base address, dimensions, strides, element size, swizzle, box dimensions, and any other cache/layout controls that affect TMA behavior.
 
@@ -452,37 +457,6 @@ Success criteria:
 - a `UTMALDG.*` or `UTMASTG.*` instruction can access decoded descriptor metadata through its associated traced instruction object
 - no simulator timing-model changes are required in the first integration patch
 
-### Execution Plan for Option 1
-
-The implementation should proceed in two passes so we can first preserve the right artifacts, then attach decoded descriptor metadata to static instructions.
-
-#### Pass 1 — Preserve and inspect descriptor-definition artifacts
-
-1. Reuse the existing TMA-specific tracer output that already preserves `extra_info/cubin/`, `extra_info/sass/`, and `extra_info/nvdisasm/` for the examined FlashAttention trace.
-2. Inspect the preserved disassembly for the descriptor-definition instruction sequence that materializes the 256-bit TMA descriptor used by `UTMALDG.*` / `UTMASTG.*`.
-3. Validate the flow specifically on FlashAttention function 5 and function 10, where the current trace already proves the `desc[URx]` consumer side exists.
-4. Only add more preservation logic if a later workload is missing one of these artifact classes.
-
-#### Pass 2 — Attach descriptor metadata to static instructions
-
-1. Extend `util/traces_enhanced/src/traced_instruction.h` and `traced_instruction.cc` with a `tma_descriptor_info` payload that stores:
-   - whether the instruction uses a TMA descriptor
-   - the descriptor operand string such as `desc[UR20]`
-   - raw descriptor words
-   - decoded fields such as address, dimensions, strides, and misc metadata
-2. Extend the SASS/disassembly parsing path in `util/tracer_nvbit/tracer_tool/tracer_tool.cu` to:
-   - detect TMA consumer instructions
-   - extract descriptor-definition candidates from preserved cubin disassembly
-   - match each definition to the corresponding TMA consumer instruction in the same kernel
-3. Serialize the new metadata into `traces/extra_info/enhanced_execution_info.json`.
-4. Reuse the existing simulator attachment path in `gpu-simulator/trace-driven/trace_driven.cc`, where each dynamic instruction already receives its static `traced_instruction` pointer.
-
-#### Initial scope limits
-
-- Do not extend the runtime protobuf or `inst_trace_t` in the first patch.
-- Do not add NVBit runtime register capture for TMA descriptors in the first patch.
-- Treat Option 1 as a static metadata project first; only move to runtime capture if preserved cubin/disassembly still cannot expose the descriptor-definition payload.
-
 ### Execution Plan for Revised Option 2
 
 The runtime path should be implemented in stages so we can first identify the true producer sequence, then validate descriptor reconstruction before changing simulator semantics.
@@ -549,7 +523,7 @@ The runtime path should be implemented in stages so we can first identify the tr
 - Do not modify the TMA simulator model yet.
 - Do not rely on consumer-PC `desc[URx]` reads as the authoritative descriptor value.
 - Do not require the first patch to support every possible descriptor-producing opcode family; proving correct reconstruction on FlashAttention is enough.
-- Do not remove Option 1; keep it as a fallback and cross-check path for static descriptors.
+- Keep Option 1 only as a non-authoritative static reference and cross-check path.
 
 ---
 
