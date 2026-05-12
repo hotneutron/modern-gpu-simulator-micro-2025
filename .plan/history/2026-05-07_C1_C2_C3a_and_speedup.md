@@ -1,56 +1,26 @@
-# CTA Sampling — Status Update (2026-05-07)
+# CTA Sampling — History 2: Closing the wider-validation gap (C1/C2/C3a) + speedup measurement
 
-**Status: ✅ Both accuracy targets met on the wider 9-workload set.
-⚠️ Wall-time regresses on workloads that don't reach the
-`pilot_overhead / per_cta_cost` crossover.**
+**Date snapshot:** 2026-05-07
+**Branch state at end of stage:** 32 commits ahead of `main` (7 new
+since History 1: 3 code + 4 doc).
+**Outcome:** Both cycle-accuracy targets met on the wider 9-workload
+set (p50 = 10.1%, p90 = 23.4%). Wall-time speedup is workload-scale
+dependent — cumulative 0.92× on rodinia2 toy traces, projected 100×+
+on production-scale traces. Pilot wall-time budget + abort-to-baseline
+identified as the top blocker for shipping the optimization safely.
 
-This is the status update for the cycle-accuracy + wider-validation
-work on the `cta-sampling` branch. It covers what shipped, the
-measured results per change, the wall-time speedup analysis, and an
-honest verdict on where the work pays off (and where it currently
-hurts). Pairs with `20260430_CTA_SAMPLING_WALKTHROUGH.md` (the
-previous walkthrough, covering the branch from `main` through the
-original cycle-accuracy push).
-
----
-
-## TL;DR for the meeting
-
-- **3 layered changes shipped in ~145 LOC + 1 dropped before
-  implementation.** All targeted at the failure modes a wider
-  10-workload sweep exposed.
-- **Cycle accuracy on the wider 9-workload set: p50 = 10.1%,
-  p90 = 23.4% — both targets met.**
-- **Wall-time speedup is workload-dependent and on rodinia2 traces
-  is mostly negative.** Per-workload ranges from 0.46× (heartwall)
-  to 2.12× (hotspot); cumulative 0.92×. **Any workload where the
-  pilot finishes after the baseline would have is a strict
-  regression** — the user could have just run baseline and gotten
-  0% error in less time. nn, heartwall, backprop, and srad_v2 all
-  hit this.
-- **A simple model predicts the crossover at
-  `pilot_overhead / per_cta_cost`** ≈ 90 to 3300 CTAs depending on
-  workload class — every workload we measured below that threshold
-  lost time, every one above won. Production-scale traces (10K+
-  CTAs/kernel) are projected to see 100×+ speedups; we have not yet
-  measured on such a trace.
-- **Top open follow-up: pilot wall-time budget with abort-to-baseline
-  fallback** (§9 #1). Without this, the optimization is unsafe to
-  ship to a workload mix that includes any kernel below the
-  crossover threshold.
-
-![speedup](speedup_chart.png)
-
-![projection](speedup_projection.png)
+This file is the historical record of the second half of the
+`cta-sampling` branch through 2026-05-07. It is derived from the
+2026-05-07 walkthrough (`20260507_CTA_SAMPLING_WALKTHROUGH.md`) with
+the C1/C2/C3 plan context (`CTA_SAMPLING_NEXT_PLAN.md`) folded in so
+it reads on its own.
 
 ---
 
-## Starting state (after the previous walkthrough)
+## 0. Where we picked up (recap from History 1)
 
-The 2026-04-30 walkthrough closed at p50 = 12.3%, p90 = 17.3% on the
-**original 6-workload set**. A wider sweep with 4 more rodinia2
-kernels (heartwall, nn, nw, streamcluster) revealed three failure
-modes:
+After History 1, the wider 10-workload sweep had exposed three
+failure modes:
 
 ```
 heartwall  −28.7%   K-rep replication (corner-only sampling)
@@ -58,15 +28,18 @@ nn        +103.5%   log-fit under-extrapolates large CTAs/SM gaps
 nw         +56.8%   pilot overhead + state pollution on tiny grids
 ```
 
-Goal: hit p50 < 15%, p90 < 25% on the wider 9-workload set without
-regressing the workloads already at target.
+Goal of this stage: hit p50 < 15%, p90 < 25% on the wider 9-workload
+set (streamcluster excluded from the wall-time chart because its
+130 s pilot mode dwarfs the others) without regressing the workloads
+already at target.
 
 ---
 
-## 1. The plan
+## 1. The plan: C1/C2/C3
 
-`.plan/CTA_SAMPLING_NEXT_PLAN.md` laid out 3 changes, ordered cheap →
-expensive so each is independently shippable and bisectable:
+Three layered changes were specified in `CTA_SAMPLING_NEXT_PLAN.md`,
+ordered cheap → expensive so each is independently shippable and
+bisectable:
 
 | # | Targets | What |
 |---|---|---|
@@ -74,10 +47,10 @@ expensive so each is independently shippable and bisectable:
 | **C2** | heartwall | Fix K-rep replication: never duplicate before exhausting unique CTAs |
 | **C3** | nn | Bound log-fit extrapolation + adaptive deeper expansion |
 
-C3 had two sub-parts in the plan: **C3a** = adaptive `pilot_max_doublings`,
-**C3b** = clamp log-fit extrapolation distance. As detailed below, **C3b
-was dropped before implementation** once the actual data showed it
-would be wrong-signed.
+C3 had two sub-parts in the plan: **C3a** = adaptive
+`pilot_max_doublings`, **C3b** = clamp log-fit extrapolation distance.
+As detailed in §4, **C3b was dropped before implementation** once the
+actual data showed it would be wrong-signed.
 
 ---
 
@@ -250,13 +223,13 @@ which gave nn +37% (deepest density 8). Bumping to 5 (deepest density
 16) closed the cycle-error gap to +10%.
 
 **Sim-time honesty.** Bumping the ceiling is what made nn's pilot
-slower than baseline. nn pilot wall: 4.9s baseline → 7.0s
-(ceiling=4) → 11.6s (ceiling=5). At ceiling=5, **the pilot is a
+slower than baseline. nn pilot wall: 4.9 s baseline → 7.0 s
+(ceiling=4) → 11.6 s (ceiling=5). At ceiling=5, **the pilot is a
 strict regression for nn — the user is worse off on every dimension
 (more wall time AND non-zero cycle error) than just running baseline.**
 This is the *right* setting for accuracy on a kernel where baseline
 would be too slow to run at all (production scale, where 938 CTAs is
-938K) — but for the rodinia2 nn trace, it's the wrong call. The fix
+938 K) — but for the rodinia2 nn trace, it's the wrong call. The fix
 for this workload-class mismatch is the abort-on-slow follow-up
 (§9 #1), not a tuning of this knob.
 
@@ -291,7 +264,7 @@ a known limit rather than chased further.
 ## 6. Wall-time speedup measurement
 
 3 trials per workload × mode. Conditions: SM75 RTX2070_S, rodinia2
-Turing traces, 9 workloads (streamcluster excluded — its 130s pilot
+Turing traces, 9 workloads (streamcluster excluded — its 130 s pilot
 mode dwarfs the others and skews the chart).
 
 ```
@@ -309,6 +282,9 @@ Per-workload speedup (baseline_wall / pilot_wall, mean of 3 trials):
 
 Cumulative: 45.96s -> 49.88s   (overall 0.92x)
 ```
+
+See `speedup_chart.png`, `speedup_projection.png`, and
+`speedup_results.csv` (same directory).
 
 ### Reading the chart honestly
 
@@ -417,7 +393,7 @@ exact comparison. Logged as §9 #2.
 
 ---
 
-## 8. What shipped (since the previous walkthrough)
+## 8. What shipped (since History 1)
 
 7 new commits beyond `239db61` (where the 2026-04-30 walkthrough
 landed):
@@ -438,9 +414,9 @@ Total branch state: 32 commits ahead of `main`.
 
 ---
 
-## 9. Outstanding follow-ups
+## 9. Outstanding follow-ups at end of this stage
 
-### 1. Pilot wall-time budget + abort-to-baseline fallback (now top priority)
+### 1. Pilot wall-time budget + abort-to-baseline fallback (top priority)
 
 **Problem.** The current pilot has no upper bound on wall time. For
 high-projection-ratio kernels (nn) the C3a adaptive cap pushes through
@@ -537,6 +513,17 @@ over per-CTA features would be more robust on irregular workloads.
 ### 6. Pilot-rejected per-SM aggregate cleanup
 
 Affects IPC numerator only, not cycle estimate.
+
+### 7. Log-fit replacement (NEW — branches into a dedicated debate)
+
+The C3a fix mitigates nn by bringing the pilot's deepest density much
+closer to the full-grid density, so the log-fit doesn't have to
+extrapolate as far. It does **not** address the more fundamental
+critique: `T(N) = a + b·log(N+1)` has no physical basis, no
+hardware-limit asymptote, and no connection to microarchitectural
+constants. The debate over what should replace it lives in
+`CTA_SAMPLING_Debate_Log_Fit.md` and is the active task in
+`HANDOFF.md`.
 
 ---
 
