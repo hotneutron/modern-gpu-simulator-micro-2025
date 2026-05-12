@@ -28,8 +28,10 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <map>
 #include <math.h>
 #include <random>
@@ -146,11 +148,23 @@ static unsigned compute_initial_sim_ctas(kernel_class kc, unsigned k_reps,
 // fit. Per-SM throughput grows nonlinearly with concurrent CTAs/SM (memory
 // latency hiding), and the constant-throughput cycle estimator under-counts
 // that growth. After 2+ iterations at distinct CTAs/SM densities we fit a
-// log model to extrapolate to the full-grid density.
+// concurrency-throughput model to extrapolate to the full-grid density.
 struct pilot_iter_obs_t {
   unsigned long long sampled_cycles;  // gpu_sim_cycle for this iter
   unsigned           sampled_ctas;    // ps.ctas_launched
   unsigned           active_sms;      // min(sampled_ctas, total_sms)
+  // Roofline inputs measured from this iter, used by the roofline_* models
+  // at accept time. compute_ops are total weighted FP/INT/DP/TC/SFU ops the
+  // sample executed; flops_per_cta = compute_ops / sampled_ctas approximates
+  // per-CTA work used to convert a roofline FLOPS/cycle to CTAs/cycle/SM.
+  // peak_* and kernel_ai are duplicated across iters since they only depend
+  // on the hardware config / aggregate AI, but we still carry them per-iter
+  // so the fit logic can use the most recent / deepest sample's measurement
+  // (cold-cache bias decreases with deeper sample density).
+  double             kernel_ai;
+  double             compute_ops;
+  double             peak_flops_per_cycle;
+  double             peak_dram_bw_bytes_per_cycle;
 };
 
 // Per-kernel state carried across iterations of the adaptive pilot loop.
@@ -160,14 +174,6 @@ struct pilot_state_t {
   unsigned k_reps;          // K (constant per-kernel)
   unsigned total_ctas;      // grid total (constant per-kernel)
   unsigned total_sms;       // hardware SM count (constant per kernel)
-  // Per-kernel override of the global pilot_max_doublings cap. 0 = use
-  // global config. Bumped by C3a when iter 0 force-expand fires and the
-  // projection ratio (full_per_sm / sampled_per_sm) is large -- without a
-  // deeper sample, the log-fit's per-SM-throughput extrapolation goes too
-  // far past its calibration range and either under- or over-shoots the
-  // real full-grid behavior. Capped at PILOT_MAX_DOUBLINGS_CEILING so a
-  // pathologically large grid can't drive sim time through the floor.
-  unsigned effective_max_doublings;
   pilot_stats_snapshot_t snapshot;  // gpu_tot_* before this iter's contribution
   pressure_signals_t prev_signals;  // for stability check
   bool prev_signals_valid;
@@ -176,37 +182,17 @@ struct pilot_state_t {
   std::vector<pilot_iter_obs_t> history;
 };
 
-// Hard ceiling on the per-kernel doublings cap that C3a can adaptively bump
-// to. Keeps sim-time bounded: at this ceiling the pilot can run up to
-// (CEILING + 1) expansion iterations on top of K-rep. Picked at 5 so that
-// nn-class kernels (projection ratio ~23x, log2 ~4.5) reach a sample at
-// density 16 -- four log-fit data points at densities {1,2,4,8,16} bring
-// the extrapolation distance to full-grid density (~23) within 2x.
-static constexpr unsigned PILOT_MAX_DOUBLINGS_CEILING = 5u;
-
 // Mutate kernel_trace_info's sampling fields for the next pilot iteration.
 // target == 0 leaves sampling off (mode 0); target == K uses the K-rep list;
 // target > K stratified-shuffle replicates.
 static void update_sampling_on_trace_info(kernel_trace_t* ti, unsigned target, unsigned seed);
 
-// Fit T(N) = a + b*log(N+1) to per-SM throughput vs CTAs-per-SM, where
-// throughput is sampled_ctas/(active_sms * sampled_cycles) and N is
-// sampled_ctas/active_sms (CTAs per SM in that iteration). Per-SM
-// throughput grows nonlinearly with concurrent CTAs/SM (memory-latency
-// hiding), and a constant-throughput extrapolation under-counts that
-// growth on memory-stall-bound kernels (notably backprop's 1D-grid
-// kernels where K-rep collapses to 1-CTA-per-SM samples).
-//
-// Requires at least 2 distinct CTAs-per-SM densities in the history to
-// fit a slope. Returns false (no fit) when fewer densities are present
-// or the fit yields a non-monotone slope. When multiple iterations share
-// a density the per-SM throughputs are averaged before fitting.
-static bool pilot_fit_log_throughput(const std::vector<pilot_iter_obs_t>& history,
-                                     double& fit_a, double& fit_b) {
-  fit_a = 0.0; fit_b = 0.0;
-  if (history.size() < 2) return false;
-  // Aggregate by CTAs-per-SM (rounded to nearest integer). Average the
-  // throughputs at each density.
+// Aggregate the pilot history into per-density (N, T_avg) points, where N is
+// CTAs-per-SM (rounded to nearest int) and T is per-SM throughput
+// (CTAs/cycle/SM). When multiple iterations share a density the per-SM
+// throughputs are averaged. Returns the points sorted by N.
+static std::vector<std::pair<double,double>>
+pilot_history_points(const std::vector<pilot_iter_obs_t>& history) {
   std::map<unsigned, std::pair<double, unsigned>> agg;  // N -> (sum_T, count)
   for (const auto& obs : history) {
     if (obs.active_sms == 0 || obs.sampled_cycles == 0) continue;
@@ -218,27 +204,177 @@ static bool pilot_fit_log_throughput(const std::vector<pilot_iter_obs_t>& histor
     entry.first += t;
     entry.second += 1;
   }
-  if (agg.size() < 2) return false;
-  // Least-squares fit on (log(N+1), T_avg) pairs.
   std::vector<std::pair<double,double>> pts;
   pts.reserve(agg.size());
   for (auto& kv : agg) {
-    double x = std::log((double)kv.first + 1.0);
-    double y = kv.second.first / (double)kv.second.second;
-    pts.push_back({x, y});
+    pts.push_back({(double)kv.first, kv.second.first / (double)kv.second.second});
   }
+  return pts;
+}
+
+// Roofline per-SM throughput ceiling, in CTAs/cycle/SM, derived from the
+// kernel's measured AI and hardware peak rates. The asymptote a real SM can
+// hit when CTA density is saturating.
+//
+//   T_roofline_total_flops_per_cycle = min(peak_flops, peak_bw * kernel_ai)
+//   flops_per_cta                    = compute_ops / sampled_ctas
+//   T_roofline_total_ctas_per_cycle  = T_roofline_total_flops / flops_per_cta
+//   T_roofline_per_sm                = T_roofline_total_ctas_per_cycle / active_sms_full
+//
+// We use the *deepest* pilot iter (largest sampled_ctas) for AI/compute_ops
+// because cold-cache bias decreases with concurrency. Returns 0 if any input
+// is non-positive (caller falls back to the non-roofline path).
+static double pilot_roofline_T(const std::vector<pilot_iter_obs_t>& history,
+                               unsigned total_ctas, unsigned total_sms) {
+  if (history.empty() || total_ctas == 0 || total_sms == 0) return 0.0;
+  // Pick the iter with the largest sampled_ctas as the AI / compute_ops source.
+  const pilot_iter_obs_t* deepest = &history.front();
+  for (const auto& o : history) {
+    if (o.sampled_ctas > deepest->sampled_ctas) deepest = &o;
+  }
+  if (deepest->sampled_ctas == 0) return 0.0;
+  double peak_flops = deepest->peak_flops_per_cycle;
+  double peak_bw    = deepest->peak_dram_bw_bytes_per_cycle;
+  double ai         = deepest->kernel_ai;
+  double compute_ops = deepest->compute_ops;
+  if (!(peak_flops > 0.0) || !(peak_bw > 0.0) || !(ai > 0.0)
+      || !(compute_ops > 0.0))
+    return 0.0;
+  double flops_per_cycle_total = std::min(peak_flops, peak_bw * ai);
+  double flops_per_cta = compute_ops / (double)deepest->sampled_ctas;
+  if (!(flops_per_cta > 0.0) || !(flops_per_cycle_total > 0.0)) return 0.0;
+  double total_ctas_per_cycle = flops_per_cycle_total / flops_per_cta;
+  unsigned active_full = std::min(total_ctas, total_sms);
+  if (active_full == 0) active_full = 1;
+  double per_sm = total_ctas_per_cycle / (double)active_full;
+  if (!std::isfinite(per_sm) || per_sm <= 0.0) return 0.0;
+  return per_sm;
+}
+
+// Fit T(N) = a + b*log(N+1) to per-SM throughput vs CTAs-per-SM. Per-SM
+// throughput grows nonlinearly with concurrent CTAs/SM (memory-latency
+// hiding), and a constant-throughput extrapolation under-counts that growth
+// on memory-stall-bound kernels (notably backprop's 1D-grid kernels where
+// K-rep collapses to 1-CTA-per-SM samples).
+//
+// Returns false when fewer than 2 distinct CTAs-per-SM densities are in the
+// history or the slope is non-positive (a noisy signal we shouldn't
+// extrapolate from).
+static bool pilot_fit_log_throughput(const std::vector<pilot_iter_obs_t>& history,
+                                     double& fit_a, double& fit_b) {
+  fit_a = 0.0; fit_b = 0.0;
+  auto pts = pilot_history_points(history);
+  if (pts.size() < 2) return false;
   double n = (double)pts.size();
   double sx = 0.0, sy = 0.0, sxx = 0.0, sxy = 0.0;
-  for (auto& p : pts) { sx += p.first; sy += p.second;
-                        sxx += p.first*p.first; sxy += p.first*p.second; }
+  for (auto& p : pts) {
+    double x = std::log(p.first + 1.0);
+    double y = p.second;
+    sx += x; sy += y; sxx += x*x; sxy += x*y;
+  }
   double denom = n*sxx - sx*sx;
   if (std::fabs(denom) < 1e-30) return false;
   fit_b = (n*sxy - sx*sy) / denom;
   fit_a = (sy - fit_b*sx) / n;
-  // Reject non-monotone (decreasing) fits -- those mean per-SM throughput
-  // dropped as we added concurrency, which is a noisy signal we shouldn't
-  // extrapolate from.
   if (fit_b <= 0.0) return false;
+  return true;
+}
+
+// Fit T(N) = T_max * (1 - exp(-k*N)) to per-SM throughput vs CTAs-per-SM.
+// Two free parameters (T_max, k) solved by a 1D grid search over k: for
+// each candidate k the analytical least-squares T_max minimizes the
+// residual on (1-exp(-k*N), T) pairs. Reject if best_k <= 0, T_max
+// <= max(T_observed), or fewer than 2 distinct densities.
+//
+// On exit, fit_a = T_max, fit_b = k.
+static bool pilot_fit_sat_exp(const std::vector<pilot_iter_obs_t>& history,
+                              double& fit_a, double& fit_b) {
+  fit_a = 0.0; fit_b = 0.0;
+  auto pts = pilot_history_points(history);
+  if (pts.size() < 2) return false;
+
+  // Heuristic for the k search range: a fast-saturating compute kernel has
+  // k ~ 1-3 (mostly saturated at N=1-2), a slowly-saturating memory-bound
+  // kernel has k ~ 0.05-0.2. Sweep a log-spaced grid covering both regimes.
+  const double k_min = 0.01;
+  const double k_max = 5.0;
+  const int    n_steps = 128;
+  double best_k = 0.0;
+  double best_T_max = 0.0;
+  double best_resid = std::numeric_limits<double>::infinity();
+  for (int i = 0; i < n_steps; ++i) {
+    double t = (double)i / (double)(n_steps - 1);
+    double k = k_min * std::pow(k_max / k_min, t);  // log-spaced
+    // Analytical T_max for this k: minimize Σ (T_i - T_max * f_i)² over T_max.
+    //   T_max = Σ T_i f_i / Σ f_i², where f_i = 1 - exp(-k*N_i).
+    double num = 0.0, den = 0.0;
+    for (auto& p : pts) {
+      double f = 1.0 - std::exp(-k * p.first);
+      num += p.second * f;
+      den += f * f;
+    }
+    if (den <= 0.0) continue;
+    double T_max = num / den;
+    if (!(T_max > 0.0)) continue;
+    double resid = 0.0;
+    for (auto& p : pts) {
+      double f = 1.0 - std::exp(-k * p.first);
+      double r = p.second - T_max * f;
+      resid += r * r;
+    }
+    if (resid < best_resid) {
+      best_resid = resid;
+      best_k = k;
+      best_T_max = T_max;
+    }
+  }
+  if (!(best_k > 0.0) || !(best_T_max > 0.0)) return false;
+  // T_max must lie at or above the deepest observed throughput. The
+  // exponential is monotone non-decreasing in N, so a T_max below
+  // max(T_observed) means the fit collapsed to a near-constant flat line.
+  double max_T_obs = 0.0;
+  for (auto& p : pts) if (p.second > max_T_obs) max_T_obs = p.second;
+  if (best_T_max < max_T_obs * 0.999) return false;
+  fit_a = best_T_max;
+  fit_b = best_k;
+  return true;
+}
+
+// Fit T(N) = T_roofline * (1 - exp(-k*N)) for a known T_roofline. Only k is
+// free, solved by minimizing Σ (T_i - T_roofline * (1 - exp(-k*N_i)))² over
+// a log-spaced k grid. Reject if T_roofline <= 0 or best_k <= 0 or fewer
+// than 2 points.
+//
+// On exit, fit_a = T_roofline (echoed in), fit_b = best_k.
+static bool pilot_fit_roofline_exp(const std::vector<pilot_iter_obs_t>& history,
+                                   double T_roofline,
+                                   double& fit_a, double& fit_b) {
+  fit_a = 0.0; fit_b = 0.0;
+  if (!(T_roofline > 0.0)) return false;
+  auto pts = pilot_history_points(history);
+  if (pts.size() < 2) return false;
+  // Same k search range as sat_exp.
+  const double k_min = 0.01;
+  const double k_max = 5.0;
+  const int    n_steps = 128;
+  double best_k = 0.0;
+  double best_resid = std::numeric_limits<double>::infinity();
+  for (int i = 0; i < n_steps; ++i) {
+    double t = (double)i / (double)(n_steps - 1);
+    double k = k_min * std::pow(k_max / k_min, t);
+    double resid = 0.0;
+    for (auto& p : pts) {
+      double r = p.second - T_roofline * (1.0 - std::exp(-k * p.first));
+      resid += r * r;
+    }
+    if (resid < best_resid) {
+      best_resid = resid;
+      best_k = k;
+    }
+  }
+  if (!(best_k > 0.0)) return false;
+  fit_a = T_roofline;
+  fit_b = best_k;
   return true;
 }
 
@@ -254,7 +390,7 @@ static bool pilot_fit_log_throughput(const std::vector<pilot_iter_obs_t>& histor
 //     concurrency.
 //   iter > 0: accept on stop_bw_target reached, or stable deltas, or hit the
 //     doublings cap, or sim_ctas == total_ctas.
-static bool pilot_decide_accept(pilot_state_t& pst, const pressure_signals_t& ps,
+static bool pilot_decide_accept(const pilot_state_t& pst, const pressure_signals_t& ps,
                                 kernel_class kc, const trace_config& tc) {
   if (pst.iter == 0) {
     // If K-rep happens to cover all CTAs, expansion is a no-op -- accept,
@@ -285,33 +421,14 @@ static bool pilot_decide_accept(pilot_state_t& pst, const pressure_signals_t& ps
     if (full_active == 0) full_active = 1;
     double sampled_per_sm = (double)ps.ctas_launched / (double)sampled_active;
     double full_per_sm    = (double)pst.total_ctas / (double)full_active;
-    if (full_per_sm > 4.0 * sampled_per_sm) {
-      // C3a: high projection ratio. The default doublings cap (typically 2)
-      // leaves the deepest pilot sample at densities far short of the full
-      // grid -- the log-fit's per-SM-throughput extrapolation then has to
-      // span an out-of-distribution range and predicts T_full poorly. Bump
-      // the per-kernel cap so subsequent doublings push the sample closer
-      // to the full-grid CTAs/SM density. Cap is ceil(log2(ratio)) so the
-      // deepest sample N is within ~2x of full_per_sm; held at
-      // PILOT_MAX_DOUBLINGS_CEILING (4) to keep sim-time bounded for very
-      // large grids (e.g. nn at ratio 23 would otherwise want 5 doublings).
-      double ratio = full_per_sm / sampled_per_sm;
-      unsigned needed = (unsigned)std::ceil(std::log2(ratio));
-      if (needed > PILOT_MAX_DOUBLINGS_CEILING) needed = PILOT_MAX_DOUBLINGS_CEILING;
-      unsigned global_cap = tc.get_cta_sampling_pilot_max_doublings();
-      pst.effective_max_doublings = std::max(global_cap, needed);
-      return false;
-    }
+    if (full_per_sm > 4.0 * sampled_per_sm) return false;
     bool undersized = (ps.ctas_launched * 2u < pst.total_ctas)
                    && (ps.ctas_launched < 8u);
     if (undersized && ps.mem_stall_frac > 0.10) return false;
     return true;
   }
   if (pst.target_sim_ctas >= pst.total_ctas) return true;
-  unsigned cap = pst.effective_max_doublings
-               ? pst.effective_max_doublings
-               : tc.get_cta_sampling_pilot_max_doublings();
-  if (pst.iter > cap) return true;
+  if (pst.iter > tc.get_cta_sampling_pilot_max_doublings()) return true;
   if (ps.achieved_bw_ratio >= tc.get_cta_sampling_pilot_stop_bw_target()) return true;
   if (pst.prev_signals_valid) {
     double tol = tc.get_cta_sampling_pilot_stop_delta();
@@ -600,7 +717,6 @@ int main(int argc, const char **argv) {
             pst.total_ctas = this_total;
             pst.target_sim_ctas = pst.k_reps;
             pst.total_sms = this_sms;
-            pst.effective_max_doublings = 0;  // 0 = use global config; C3a may bump
             pst.prev_signals_valid = false;
           }
         }
@@ -719,6 +835,10 @@ int main(int argc, const char **argv) {
           obs.sampled_ctas   = (unsigned)ps.ctas_launched;
           obs.active_sms     = std::min((unsigned)ps.ctas_launched, total_sms);
           if (obs.active_sms == 0) obs.active_sms = 1;
+          obs.kernel_ai                    = ps.kernel_ai;
+          obs.compute_ops                  = ps.compute_ops;
+          obs.peak_flops_per_cycle         = ps.peak_flops_per_cycle;
+          obs.peak_dram_bw_bytes_per_cycle = ps.peak_dram_bw_bytes_per_cycle;
           pst->history.push_back(obs);
           accept = pilot_decide_accept(*pst, ps, kc, tconfig);
         }
@@ -780,15 +900,52 @@ int main(int argc, const char **argv) {
         wave_info.max_cta_per_core = (unsigned)m_gpgpu_sim->max_cta_per_core();
         wave_info.total_sms        = total_sms;
         // Concurrency-throughput fit: if the pilot ran multiple iterations at
-        // distinct CTAs-per-SM densities, fit a log model so the estimator
-        // can extrapolate per-SM throughput to the full-grid density rather
-        // than assuming it stays constant.
+        // distinct CTAs-per-SM densities, fit the configured model so the
+        // estimator can extrapolate per-SM throughput to the full-grid
+        // density rather than assuming it stays constant.
         if (pst) {
-          double a = 0.0, b = 0.0;
-          if (pilot_fit_log_throughput(pst->history, a, b)) {
-            wave_info.has_log_fit = true;
-            wave_info.log_fit_a   = a;
-            wave_info.log_fit_b   = b;
+          const char* model_name = tconfig.get_cta_sampling_concurrency_model();
+          if (!model_name) model_name = "logfit";
+          int model_idx = 0;  // default: logfit
+          if (std::strcmp(model_name, "logfit") == 0)              model_idx = 0;
+          else if (std::strcmp(model_name, "sat_exp") == 0)        model_idx = 1;
+          else if (std::strcmp(model_name, "roofline_clamp") == 0) model_idx = 2;
+          else if (std::strcmp(model_name, "roofline_exp") == 0)   model_idx = 3;
+          wave_info.concurrency_model = model_idx;
+          double a = 0.0, b = 0.0, t_cap = 0.0;
+          bool ok = false;
+          switch (model_idx) {
+            case 0:
+              ok = pilot_fit_log_throughput(pst->history, a, b);
+              break;
+            case 1:
+              ok = pilot_fit_sat_exp(pst->history, a, b);
+              break;
+            case 2: {
+              // log-fit, then clamp to roofline per-SM ceiling at evaluation
+              // time. Clamp value carried in fit_t_cap.
+              ok = pilot_fit_log_throughput(pst->history, a, b);
+              double T_roof = pilot_roofline_T(pst->history,
+                                               finished_kernel_total_ctas,
+                                               total_sms);
+              if (ok && T_roof > 0.0) t_cap = T_roof;
+              else if (T_roof <= 0.0) ok = false;  // need a clamp to be roofline_clamp
+              break;
+            }
+            case 3: {
+              double T_roof = pilot_roofline_T(pst->history,
+                                               finished_kernel_total_ctas,
+                                               total_sms);
+              if (T_roof > 0.0)
+                ok = pilot_fit_roofline_exp(pst->history, T_roof, a, b);
+              break;
+            }
+          }
+          if (ok) {
+            wave_info.has_fit   = true;
+            wave_info.fit_a     = a;
+            wave_info.fit_b     = b;
+            wave_info.fit_t_cap = t_cap;
           }
         }
         m_gpgpu_sim->set_last_kernel_wave_info(wave_info);

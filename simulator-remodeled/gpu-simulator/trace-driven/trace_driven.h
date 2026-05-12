@@ -178,6 +178,10 @@ class trace_config {
   double get_cta_sampling_ai_w_sfu() const { return cta_sampling_ai_w_sfu; }
   // Memory-stall fraction threshold (issue-stage l1c-wait cycles / issue_eval cycles)
   double get_cta_sampling_pressure_mstall() const { return cta_sampling_pressure_mstall; }
+  // Whole-kernel cycle estimator's concurrency-throughput model. See the
+  // values in trace_driven.cc reg_options(). Default "logfit" preserves
+  // historical behavior.
+  const char* get_cta_sampling_concurrency_model() const { return cta_sampling_concurrency_model; }
 
   unsigned int get_int_latency() const { return int_latency; }
   unsigned int get_fp_latency() const { return fp_latency; }
@@ -253,6 +257,12 @@ class trace_config {
   double   cta_sampling_ai_w_tc;              // weight on m_num_tensor_core_acesses
   double   cta_sampling_ai_w_sfu;             // weight on m_num_sfu_acesses
   double   cta_sampling_pressure_mstall;      // mem_stall_frac above this => high mem pressure
+  // Concurrency-throughput model for the whole-kernel cycle estimator.
+  // Accepted values: "logfit"         T(N) = a + b*log(N+1)
+  //                  "sat_exp"        T(N) = T_max*(1 - exp(-k*N)), T_max + k fitted
+  //                  "roofline_clamp" log-fit, then clamped by min(T_fit, T_roofline)
+  //                  "roofline_exp"   T(N) = T_roofline*(1 - exp(-k*N)), only k fitted
+  char*    cta_sampling_concurrency_model;
 
 };
 

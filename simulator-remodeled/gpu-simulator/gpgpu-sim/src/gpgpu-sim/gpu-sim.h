@@ -833,15 +833,21 @@ struct last_kernel_wave_info_t {
   unsigned total_ctas           = 0;
   unsigned max_cta_per_core     = 0;
   unsigned total_sms            = 0;
-  // Concurrency-throughput log fit, populated when the pilot ran 2+
-  // iterations at distinct CTAs-per-SM densities. Per-SM throughput
-  // (CTAs/cycle/SM) is modeled as T(N) = log_fit_a + log_fit_b * log(N+1)
-  // where N = CTAs-per-SM; the cycle estimator extrapolates T to the
-  // full-grid density. has_log_fit=false falls back to constant-per-SM
-  // throughput (the prior formula).
-  bool   has_log_fit            = false;
-  double log_fit_a              = 0.0;
-  double log_fit_b              = 0.0;
+  // Concurrency-throughput fit, populated when the pilot ran 2+ iterations
+  // at distinct CTAs-per-SM densities and the configured model yielded a
+  // usable fit. Per-SM throughput (CTAs/cycle/SM) at the full-grid
+  // CTAs-per-SM density N is computed per concurrency_model:
+  //   0  (logfit)         T(N) = fit_a + fit_b * log(N + 1)
+  //   1  (sat_exp)        T(N) = fit_a * (1 - exp(-fit_b * N))      // a=T_max, b=k
+  //   2  (roofline_clamp) T(N) = min(fit_a + fit_b*log(N+1), fit_t_cap)
+  //   3  (roofline_exp)   T(N) = fit_a * (1 - exp(-fit_b * N))      // a=T_roofline, b=k
+  // has_fit=false falls back to constant-per-SM throughput (the prior
+  // throughput-conservation formula).
+  int    concurrency_model      = 0;
+  bool   has_fit                = false;
+  double fit_a                  = 0.0;
+  double fit_b                  = 0.0;
+  double fit_t_cap              = 0.0;
 };
 
 // gpu_tot_* snapshot used to roll back a pilot iteration so its contribution

@@ -2531,41 +2531,62 @@ void gpgpu_sim::gpu_print_stat() {
       // SM concurrently but they share that SM's issue bandwidth, so adding
       // more resident CTAs/SM doesn't add parallelism for this projection.
       // The per-SM throughput term, however, *does* grow with CTAs/SM (memory
-      // latency hiding); when a log-fit is available from the pilot history
-      // we use it, otherwise we fall back to constant per-SM throughput.
+      // latency hiding); when a fit from the pilot history is available, we
+      // dispatch on the concurrency-throughput model the user selected,
+      // otherwise we fall back to constant per-SM throughput.
       unsigned total_sms = w.total_sms ? w.total_sms : 1;
       unsigned sampled_active = std::min(w.sampled_ctas, total_sms);
       if (sampled_active == 0) sampled_active = 1;
       unsigned full_active = std::min(w.total_ctas, total_sms);
       if (full_active == 0) full_active = 1;
 
-      double cls_label_compute = (w.kernel_class_int == 0);
-      double cls_label_memory  = (w.kernel_class_int == 1);
-      (void)cls_label_compute; (void)cls_label_memory;
-
-      if (w.has_log_fit) {
+      if (w.has_fit) {
         // Predicted per-SM throughput at the full-grid CTAs-per-SM density.
-        // The fit was T(N) = a + b*log(N+1) where N is CTAs/SM; clamp to a
-        // floor of the sampled-iteration throughput to avoid the fit
-        // extrapolating below the measured point (defensive: fit_b is
-        // already required > 0 in main.cc).
+        // Clamp to a floor of the sampled-iteration throughput to avoid the
+        // fit extrapolating below the measured point.
         double full_n = (double)w.total_ctas / (double)full_active;
-        double sample_n = (double)w.sampled_ctas / (double)sampled_active;
-        double T_full = w.log_fit_a + w.log_fit_b * std::log(full_n + 1.0);
         double T_sample = (double)w.sampled_ctas
                         / ((double)sampled_active * (double)sampled_cycles);
+        double T_full = 0.0;
+        const char* model_tag = "";
+        switch (w.concurrency_model) {
+          case 0:  // logfit
+            T_full = w.fit_a + w.fit_b * std::log(full_n + 1.0);
+            model_tag = "log_fit";
+            break;
+          case 1:  // sat_exp
+            T_full = w.fit_a * (1.0 - std::exp(-w.fit_b * full_n));
+            model_tag = "sat_exp";
+            break;
+          case 2: {  // roofline_clamp
+            double T_logfit = w.fit_a + w.fit_b * std::log(full_n + 1.0);
+            T_full = (w.fit_t_cap > 0.0 && T_logfit > w.fit_t_cap)
+                       ? w.fit_t_cap : T_logfit;
+            model_tag = "roofline_clamp";
+            break;
+          }
+          case 3:  // roofline_exp
+            T_full = w.fit_a * (1.0 - std::exp(-w.fit_b * full_n));
+            model_tag = "roofline_exp";
+            break;
+          default:
+            T_full = T_sample;
+            model_tag = "unknown";
+            break;
+        }
         if (!(T_full > T_sample)) T_full = T_sample;  // never extrapolate downward
-        // est_cycles = total_ctas / (full_active * T_full).
         if (T_full > 0.0) {
           est_cycles = (unsigned long long)
               ((double)w.total_ctas / ((double)full_active * T_full));
         } else {
           est_cycles = sampled_cycles;
         }
-        (void)sample_n;
-        est_mode = (w.kernel_class_int == 0) ? "log_fit_compute"
-                 : (w.kernel_class_int == 1) ? "log_fit_memory"
-                 : "log_fit_mixed";
+        const char* cls_tag = (w.kernel_class_int == 0) ? "compute"
+                            : (w.kernel_class_int == 1) ? "memory"
+                            : "mixed";
+        static thread_local char est_mode_buf[64];
+        std::snprintf(est_mode_buf, sizeof(est_mode_buf), "%s_%s", model_tag, cls_tag);
+        est_mode = est_mode_buf;
       } else {
         // Constant per-SM throughput fallback:
         //   scale      = (total_ctas / full_active) / (sampled_ctas / sampled_active)

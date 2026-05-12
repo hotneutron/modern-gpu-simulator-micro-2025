@@ -586,6 +586,7 @@ trace_config::trace_config() {
   cta_sampling_ai_w_tc  = 8.0;
   cta_sampling_ai_w_sfu = 4.0;
   cta_sampling_pressure_mstall = 0.4;
+  cta_sampling_concurrency_model = nullptr;  // populated by option parser
 }
 
 void trace_config::reg_options(option_parser_t opp) {
@@ -741,6 +742,13 @@ void trace_config::reg_options(option_parser_t opp) {
                          "Roofline classifier: mem_stall_frac (issue-stage l1c-wait "
                          "/ issue_eval) above this is treated as high memory pressure",
                          "0.4");
+  option_parser_register(opp, "-cta_sampling_concurrency_model", OPT_CSTR,
+                         &cta_sampling_concurrency_model,
+                         "Whole-kernel cycle estimator: concurrency-throughput "
+                         "model used to extrapolate per-SM throughput from the "
+                         "pilot's sampled densities to the full-grid density. "
+                         "Values: logfit | sat_exp | roofline_clamp | roofline_exp.",
+                         "sat_exp");
 }
 
 void trace_config::parse_config() {
