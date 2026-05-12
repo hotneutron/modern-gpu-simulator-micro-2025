@@ -258,6 +258,344 @@ message TmaDescriptorSnapshot {
 
 **Limitation:** Requires rebuilding `tracer_tool.so`, identifying the actual descriptor producer sequence, and implementing a host-side descriptor state tracker. This is more work than Option 1, but it is the only viable path for recovering true runtime descriptor semantics when the descriptor is assembled dynamically.
 
+---
+
+## Finalized Option 2 implementation design
+
+The final implementation path does **not** try to reconstruct the descriptor by decoding arbitrary producer instructions in SASS. Instead, it uses the CUDA driver API call that already assembles the tensor map descriptor on the host:
+
+- `cuTensorMapEncodeTiled`
+
+That API is the most reliable source of truth because it exposes:
+- the semantic tensor-map inputs:
+  - rank — how many logical tensor dimensions the descriptor uses
+  - data type — the element type encoded into the tensor map
+  - global dimensions — the full logical shape of the tensor being described
+  - global strides — the outer-dimension address jumps used to walk that tensor in memory
+  - box dimensions — the tile shape that each TMA transaction reads or writes
+  - element strides — per-dimension stepping in element units inside the tensor map
+  - interleave — whether adjacent tensor data is interleaved in a special hardware-friendly layout
+  - swizzle — which address swizzle pattern the tensor map applies to improve memory behavior
+  - cache policy — how the TMA request should interact with cache promotion / residency controls
+  - OOB mode — what the hardware should do when the tensor access goes out of bounds
+- the encoded output object:
+  - `CUtensorMap`
+
+The tracer now dumps both:
+- a human-readable CSV row in `tensor_map_encode_dump.csv`
+- the raw encoded `CUtensorMap` bytes in `tensor_map_encode_blobs/<dump_id>.bin`
+
+This makes the host-side encoded tensor map the descriptor source of truth for simulator modeling.
+
+### Terminology used in this section
+
+The word **family** in the remaining discussion is a tracing term, not an official NVIDIA architectural field.
+
+- **Tensor-map dump**
+  - one observed `cuTensorMapEncodeTiled` output row plus its raw `CUtensorMap` blob
+- **Tensor-map family**
+  - a normalized group of tensor-map dumps that share the same simulator-relevant semantic fields:
+    - `tensor_rank`
+    - `tensor_data_type`
+    - `global_dim`
+    - `global_strides`
+    - `box_dim`
+    - `element_strides`
+    - `interleave`
+    - `swizzle`
+    - `l2_promotion`
+    - `oob_fill`
+- **Runtime handle family**
+  - a group of dynamic `UTMALDG.*` observations that share the same stable `desc_value_hi` for the same `(unique_function_id, pc_hex)` site
+- **Resolved descriptor config**
+  - the normalized tensor-map family that the simulator should use for a given runtime TMA consumer site
+
+The important point is that the current workflow does **not** claim that `desc_value_hi` is itself a decoded box dimension or a complete descriptor. It is only a stable runtime tag that can be correlated with the host-side tensor-map encode outputs.
+
+### Final data flow
+
+The finalized path has three primary data sources and two downstream processing steps:
+
+1. **Static TMA discovery**
+   - scan enhanced trace / disassembly and identify TMA consumer PCs like `UTMALDG.4D ... desc[URx]`
+   - also backtrack the likely producer chain that writes the uniform register pair consumed by `desc[URx]`
+   - produce `tma_discovery.json`
+   - main value:
+     - identifies the static TMA site by `(unique_function_id, pc_hex)`
+     - supplies the opcode needed to infer tensor rank from the static instruction form
+     - provides producer-side evidence for debugging, but is not the primary resolver key
+
+2. **Runtime consumer capture**
+   - at each `UTMALDG.*` issue, capture:
+     - `unique_function_id` — identifies which static kernel/function variant this dynamic consumer belongs to
+     - `pc_hex` — identifies the exact TMA consumer instruction site inside that function
+     - `desc_reg_id` — records which uniform descriptor register pair the consumer reads from
+     - `desc_value_lo` — captures the low 32-bit runtime descriptor handle value seen by the consumer
+     - `desc_value_hi` — captures the high 32-bit runtime descriptor handle value used as the stable runtime tag
+     - `first_lane_addr` — records one sampled effective memory address from the first active thread slot in the warp, used only as a lightweight correlation hint
+   - write `utmaldg_runtime_debug.csv`
+
+3. **Producer-side handle capture**
+   - find the producer instruction chain that sets the uniform register pair used by `desc[URx]`
+   - write `utmaldg_producer_debug.csv`
+   - main value:
+     - verify that the consumer-side `desc_reg_id` is fed by the expected producer chain
+     - verify that the observed runtime handle family is not an artifact of one instruction site
+     - provide debugging evidence when multiple candidate tensor-map families exist
+
+4. **Tensor-map encode capture**
+   - hook `cuTensorMapEncodeTiled`
+   - on callback exit, dump:
+     - semantic descriptor fields to `tensor_map_encode_dump.csv`
+     - raw `CUtensorMap` bytes to `tensor_map_encode_blobs/*.bin`
+   - this is the source of truth for simulator-visible tensor-map semantics
+
+5. **Normalization for simulation**
+   - parse `tensor_map_encode_dump.csv`
+   - deduplicate semantically equivalent tensor maps into normalized config families
+   - build:
+     - `tma_descriptor_configs.json`
+     - `tma_descriptor_resolver.json`
+
+The simulator should use the normalized config/resolver JSON files, not the raw blob files.
+
+### Why this final design is preferred
+
+This design was chosen after several failed and successful iterations:
+
+- **Normal HtoD copy capture was too weak**
+  - hooking `cuMemcpyHtoD*` could not reliably observe descriptor creation
+- **Generic callback logging was only a discovery tool**
+  - useful to identify the real API path
+  - not needed in steady-state tracing
+- **`cuTensorMapEncodeTiled` is the right source**
+  - it already produces the encoded descriptor object
+  - it exposes the semantic fields the simulator actually needs
+
+### Algorithm 1 — Capture descriptor candidates
+
+For each CUDA callback:
+
+1. If callback name is `cuTensorMapEncodeTiled`
+2. Wait until callback exit
+3. Read the `cuTensorMapEncodeTiled_params`
+4. Write one row:
+   - `dump_id`
+   - tensor-map semantic fields
+   - blob path
+5. Write the raw `CUtensorMap` bytes to `tensor_map_encode_blobs/<dump_id>.bin`
+
+This produces the full set of candidate descriptor tables created during the traced run.
+
+### Algorithm 2 — Map a static TMA site to a normalized tensor-map config
+
+This is the main resolver algorithm. Its job is to connect:
+
+- the **static site identity** discovered from the TMA consumer or its producer chain
+- the **runtime handle family** observed when that consumer executes
+- the **host-side tensor-map encode output** captured from `cuTensorMapEncodeTiled`
+
+#### Inputs
+
+1. **Static discovery input**
+   - `tma_discovery.json`
+   - provides:
+     - `unique_function_id`
+     - `pc_hex`
+     - `opcode`
+     - descriptor register references and producer-search evidence
+
+2. **Runtime consumer input**
+   - `utmaldg_runtime_debug.csv`
+   - provides:
+     - `unique_function_id`
+     - `pc_hex`
+     - `desc_reg_id`
+     - `desc_value_lo`
+     - `desc_value_hi`
+
+3. **Tensor-map encode input**
+   - `tensor_map_encode_dump.csv`
+   - provides:
+     - semantic tensor-map fields
+     - one row per `cuTensorMapEncodeTiled` call
+
+#### Output
+
+- one resolver entry that maps:
+  - `(unique_function_id, pc_hex, handle_hi_hex)`
+  - to a normalized `config_id`
+
+#### Procedure
+
+1. **Normalize tensor-map dumps into config families**
+   - read all rows from `tensor_map_encode_dump.csv`
+   - group rows by semantic fields only:
+     - `tensor_rank`
+     - `tensor_data_type`
+     - `global_dim`
+     - `global_strides`
+     - `box_dim`
+     - `element_strides`
+     - `interleave`
+     - `swizzle`
+     - `l2_promotion`
+     - `oob_fill`
+   - assign one normalized `config_id` to each unique semantic group
+   - ignore differences that are not needed for this simulation phase, such as backing buffer address
+
+2. **Identify the static TMA consumer site**
+   - from `tma_discovery.json`, select the site by:
+     - `unique_function_id`
+     - `pc_hex`
+   - read the site opcode such as `UTMALDG.4D`
+   - infer tensor rank from the static opcode suffix
+
+3. **Collect runtime observations for that exact static site**
+   - filter `utmaldg_runtime_debug.csv` by the same:
+     - `unique_function_id`
+     - `pc_hex`
+   - group the remaining rows by `desc_value_hi`
+   - each unique `desc_value_hi` becomes one runtime handle family for that static site
+
+4. **Use producer information only as supporting evidence**
+   - if producer-side discovery exists, verify that:
+     - the producer chain writes the uniform register pair consumed by the static site
+     - the same producer/consumer path consistently leads to the same runtime handle family
+   - producer information is useful for confidence and debugging, but it is not the main resolver key in the current implementation
+
+5. **Restrict candidate tensor-map families**
+   - consider only tensor-map config families produced in the same launch window
+   - prefer config families whose `tensor_rank` matches the consumer opcode rank
+
+6. **Correlate runtime handle families with normalized tensor-map families**
+   - for each static site, compare the set of observed runtime handle families against the set of normalized tensor-map families in the same launch window
+   - in the current FlashAttention-3 trace, the two normalized 4D config families are distinguished primarily by `box_dim`
+   - because the runtime samples also split into two stable `desc_value_hi` values, the mapping is:
+     - one stable handle family ↔ one normalized tensor-map family
+
+7. **Emit the resolver entry**
+   - write the final mapping as:
+     - `(unique_function_id, pc_hex, handle_hi_hex)` → `config_id`
+   - if the correlation is not unique, emit candidate configs instead of a single resolved config
+
+#### Important clarification
+
+The current observed mapping:
+
+- `0x14f00000` → `box_dim = 64 192 1 1`
+- `0x12f00000` → `box_dim = 64 128 1 1`
+
+does **not** mean that `desc_value_hi` is a decoded `box_dim` field.
+
+It means only that, in the currently observed FlashAttention-3 run:
+
+- `desc_value_hi` is a stable runtime tag
+- the normalized tensor-map families in the same launch window are mainly distinguished by `box_dim`
+- therefore the current correlation between runtime handle family and tensor-map family is effectively resolved by that distinction
+
+If later traces contain multiple normalized tensor-map families with the same rank and the same `box_dim`, then this heuristic will no longer be sufficient by itself and more evidence will be required.
+
+### Algorithm 3 — Worked example: why `0x94e0` maps to `dump_id 0`
+
+For the first important consumer:
+
+- PC `0x94e0`
+- runtime handle high word `0x14f00000`
+
+The mapping process is:
+
+1. Query `utmaldg_runtime_debug.csv` for `pc_hex = 0x94e0`
+2. Observe stable runtime tuple:
+   - `desc_value_lo = 0`
+   - `desc_value_hi = 0x14f00000`
+3. Query tensor-map dumps from the same launch window
+4. Compare descriptor families:
+   - `dump_id 0` has:
+     - `tensor_rank = 4`
+     - `box_dim = 64 192 1 1`
+   - `dump_id 1/2/...` have:
+     - `tensor_rank = 4`
+     - `box_dim = 64 128 1 1`
+5. Match the unique `0x14f00000` runtime handle family to the unique normalized tensor-map family with `box_dim = 64 192 1 1`
+
+So the current best mapping is:
+
+- `pc 0x94e0` → runtime handle family `0x14f00000` → `dump_id 0` family → config family `tm_4d_dt9_box_64x192x1x1`
+
+### Algorithm 4 — Worked example: why `0x96b0` maps to the `dump_id 1/2` family
+
+For the second consumer:
+
+- PC `0x96b0`
+- runtime handle high word `0x12f00000`
+
+The mapping process is:
+
+1. Query `utmaldg_runtime_debug.csv` for `pc_hex = 0x96b0`
+2. Observe stable runtime tuple:
+   - `desc_value_lo = 0`
+   - `desc_value_hi = 0x12f00000`
+3. Query tensor-map dumps from the same launch window
+4. Compare descriptor families:
+   - `dump_id 1` and `dump_id 2` share identical semantic tensor-map fields
+   - they differ only in `global_address_hex`
+5. Since the simulator does not require the exact backing buffer base address for this phase, merge those rows into one normalized tensor-map family
+
+So the current best mapping is:
+
+- `pc 0x96b0` → runtime handle family `0x12f00000` → `dump_id 1 or 2` family → config family `tm_4d_dt9_box_64x128x1x1`
+
+### Algorithm 5 — Build simulator-facing configs
+
+Input:
+- `tensor_map_encode_dump.csv`
+- `utmaldg_runtime_debug.csv`
+- `tma_discovery.json`
+
+Steps:
+
+1. Read all tensor-map rows
+2. Deduplicate rows by semantic fields:
+   - rank, type, dims, strides, box dims, element strides, interleave, swizzle, l2 promotion, oob fill
+3. Assign a normalized `config_id` to each unique family
+4. Read all runtime consumer rows
+5. Group runtime rows by:
+   - `unique_function_id`
+   - `pc_hex`
+   - `handle_hi_hex`
+6. Read `tma_discovery.json` and build the `(unique_function_id, pc_hex) -> opcode` map
+7. Use the static opcode rank plus the observed runtime `handle_hi_hex` family to resolve each grouped runtime consumer to a normalized `config_id`
+8. Write:
+   - `tma_descriptor_configs.json`
+   - `tma_descriptor_resolver.json`
+
+### Final resolver key
+
+The simulator should **not** resolve by `desc_reg_id` alone.
+
+The current best lookup key is:
+
+- `(unique_function_id, pc_hex, handle_hi_hex)`
+
+because:
+- the same `desc[URx]` register pair can carry different descriptor families at different PCs
+- `handle_hi_hex` is the stable runtime family signal observed so far
+- the static site identity from `(unique_function_id, pc_hex)` is required to connect the runtime observation back to the correct consumer instruction
+
+### Current scope
+
+The current implementation is validated for the first analyzed `UTMALDG` family in the FlashAttention-3 trace:
+
+- `0x94e0`
+- `0x96b0`
+- `0x9a80`
+
+The same config/resolver framework is intended to be extended later to:
+- additional `UTMALDG.*` sites
+- `UTMASTG.*`
+- other TMA ops that also use `desc[URx]`
+
 ### Option 3 — Use NVIDIA Nsight Compute for TMA Metrics
 
 **How it works:** Run the kernel under `ncu` to get aggregate TMA statistics.

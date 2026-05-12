@@ -53,7 +53,9 @@ typedef struct {
   uint32_t unique_function_id;
   MEM_TYPE mem_type;
   int32_t width;
+  uint32_t ureg_desc_id;
   uint32_t ureg_desc_value;
+  uint32_t ureg_desc_value_hi;
   uint32_t active_mask;
   uint32_t predicate_mask;
   uint32_t num_of_injects;

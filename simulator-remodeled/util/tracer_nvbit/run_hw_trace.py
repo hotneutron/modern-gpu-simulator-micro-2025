@@ -61,6 +61,18 @@ logfile = day_string + "--" + time_string + ".csv"
 
 nvbit_tracer_path = os.path.join(this_directory, "tracer_tool")
 
+
+def build_tma_descriptor_mapping_if_available(trace_folder):
+    extra_info_dir = os.path.join(trace_folder, "extra_info")
+    required_inputs = [
+        os.path.join(extra_info_dir, "tensor_map_encode_dump.csv"),
+        os.path.join(extra_info_dir, "utmaldg_runtime_debug.csv"),
+    ]
+    if not all(os.path.exists(path) for path in required_inputs):
+        return
+    mapping_script = os.path.join(this_directory, "build_tma_descriptor_mapping.py")
+    subprocess.run([sys.executable, mapping_script, extra_info_dir], check=True)
+
 for bench in benchmarks:
     edir, ddir, exe, argslist = bench
     for argpair in argslist:
@@ -157,3 +169,4 @@ for bench in benchmarks:
             if subprocess.call(["bash","run.sh"]) != 0:
                 sys.exit("Error invoking nvbit on {0}".format(this_run_dir))
             os.chdir(saved_dir)
+            build_tma_descriptor_mapping_if_available(this_trace_folder)
