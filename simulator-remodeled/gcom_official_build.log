@@ -1,0 +1,1010 @@
+make: Entering directory '/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator'
+if [ ! -d ./bin/release ]; then mkdir -p ./bin/release; fi;
+if [ ! -d ./build/release ]; then mkdir -p ./build/release; fi;
+touch ./build/release/main.makedepend
+makedepend -f./build/release/main.makedepend -p./build/release/ main.cc 2> /dev/null
+make -C ../util/traces_enhanced
+make -C gpgpu-sim
+echo "const char *g_accelsim_version=\"accelsim-commit-71ae7c5889e2603ef108c5ef8c83dbfbc9cd22df_modified_0.0\";" > ./build/release/accelsim_version.h
+make[1]: Entering directory '/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/util/traces_enhanced'
+g++ -fopenmp -Wall -O3 -g3 -fPIC -std=c++17   -I./build/release -I./trace-driven -I./trace-parser -I/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/libcuda -I/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src -I/usr/local/cuda-12.4/include -c main.cc -o ./build/release/main.o
+make[1]: Entering directory '/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim'
+g++ -c -o obj/traced_operand.o src/traced_operand.cc -Wall -O3 -g3 -fPIC -std=c++17 -I/usr/local/cuda-12.4/include -fPIC
+g++ -c -o obj/traced_instruction.o src/traced_instruction.cc -Wall -O3 -g3 -fPIC -std=c++17 -I/usr/local/cuda-12.4/include -fPIC
+Protocol buffer files generated
+
+	Building GPGPU-Sim version 4.2.0 (build gpgpu-sim_git-commit-71ae7c5889e2603ef108c5ef8c83dbfbc9cd22df_modified_0.0) with CUDA version 12.4
+
+if [ ! -d lib/gcc-/cuda-12040/release ]; then mkdir -p lib/gcc-/cuda-12040/release; fi;
+if [ ! -d /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/libcuda ]; then mkdir -p /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/libcuda; fi;
+if [ ! -d /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/cuda-sim ]; then mkdir -p /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/cuda-sim; fi;
+Warning: gpgpu-sim is building without opencl support. Make sure NVOPENCL_LIBDIR and NVOPENCL_INCDIR are set
+if [ ! -d /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/cuda-sim/decuda_pred_table ]; then mkdir -p /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/cuda-sim/decuda_pred_table; fi;
+if [ ! -d /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/gpgpu-sim ]; then mkdir -p /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/gpgpu-sim; fi;
+if [ ! -d /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/remodeling ]; then mkdir -p /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/remodeling; fi;
+if [ ! -d /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/fusedMemory ]; then mkdir -p /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/fusedMemory; fi;
+if [ ! -d /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/libopencl ]; then mkdir -p /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/libopencl; fi;
+if [ ! -d /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/libopencl/bin ]; then mkdir -p /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/libopencl/bin; fi;
+if [ ! -d /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/intersim2 ]; then mkdir -p /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/intersim2; fi;
+if [ ! -d /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/cuobjdump_to_ptxplus ]; then mkdir -p /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/cuobjdump_to_ptxplus; fi;
+if [ ! -d /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/accelwattch ]; then mkdir -p /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/accelwattch; fi;
+if [ ! -d /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/accelwattch/cacti ]; then mkdir -p /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/accelwattch/cacti; fi;
+make -C ./src/cuda-sim/ depend
+make -C /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/accelwattch/ depend
+make[2]: Entering directory '/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/cuda-sim'
+make[2]: Entering directory '/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/accelwattch'
+make[3]: Entering directory '/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/accelwattch'
+touch /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/accelwattch/Makefile.makedepend
+makedepend -f/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/accelwattch/Makefile.makedepend -p/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/accelwattch/ Ucache.cc XML_Parse.cc arbiter.cc area.cc array.cc bank.cc basic_circuit.cc basic_components.cc cacti_interface.cc component.cc core.cc crossbar.cc decoder.cc htree2.cc interconnect.cc io.cc iocontrollers.cc logic.cc main.cc mat.cc memoryctrl.cc noc.cc nuca.cc parameter.cc processor.cc router.cc sharedcache.cc subarray.cc technology.cc uca.cc wire.cc xmlParser.cc gpgpu_sim_wrapper.cc  2> /dev/null
+make -C ./cacti/ depend
+make[4]: Entering directory '/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/accelwattch/cacti'
+make[5]: Entering directory '/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/accelwattch/cacti'
+touch /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/cuda-sim/Makefile.makedepend
+makedepend -f/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/cuda-sim/Makefile.makedepend -p/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/cuda-sim/ cuda_device_printf.cc cuda_device_runtime.cc cuda-sim.cc instructions.cc memory.cc ptx_ir.cc ptx_loader.cc ptx_parser.cc ptx_sim.cc ptx-stats.cc 2> /dev/null
+touch /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/accelwattch/cacti/Makefile.makedepend
+makedepend -f/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/accelwattch/cacti/Makefile.makedepend -p/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/accelwattch/cacti/ area.cc bank.cc mat.cc main.cc Ucache.cc io.cc technology.cc basic_circuit.cc parameter.cc decoder.cc component.cc uca.cc subarray.cc wire.cc htree2.cc cacti_interface.cc router.cc nuca.cc crossbar.cc arbiter.cc  2> /dev/null
+make[5]: Nothing to be done for 'depend'.
+make[5]: Leaving directory '/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/accelwattch/cacti'
+make[4]: Leaving directory '/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/accelwattch/cacti'
+make[3]: Nothing to be done for 'depend'.
+make[3]: Leaving directory '/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/accelwattch'
+make[2]: Leaving directory '/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/accelwattch'
+make -C /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/accelwattch/ 
+make[2]: Entering directory '/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/accelwattch'
+make[3]: Entering directory '/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/accelwattch'
+make[2]: 'depend' is up to date.
+make[2]: Leaving directory '/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/cuda-sim'
+make -C ./src/cuda-sim/
+make[2]: Entering directory '/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/cuda-sim'
+touch /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/accelwattch/Makefile.makedepend
+makedepend -f/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/accelwattch/Makefile.makedepend -p/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/accelwattch/ Ucache.cc XML_Parse.cc arbiter.cc area.cc array.cc bank.cc basic_circuit.cc basic_components.cc cacti_interface.cc component.cc core.cc crossbar.cc decoder.cc htree2.cc interconnect.cc io.cc iocontrollers.cc logic.cc main.cc mat.cc memoryctrl.cc noc.cc nuca.cc parameter.cc processor.cc router.cc sharedcache.cc subarray.cc technology.cc uca.cc wire.cc xmlParser.cc gpgpu_sim_wrapper.cc  2> /dev/null
+make -C ./cacti/ depend
+make[4]: Entering directory '/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/accelwattch/cacti'
+make[5]: Entering directory '/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/accelwattch/cacti'
+touch /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/accelwattch/cacti/Makefile.makedepend
+makedepend -f/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/accelwattch/cacti/Makefile.makedepend -p/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/accelwattch/cacti/ area.cc bank.cc mat.cc main.cc Ucache.cc io.cc technology.cc basic_circuit.cc parameter.cc decoder.cc component.cc uca.cc subarray.cc wire.cc htree2.cc cacti_interface.cc router.cc nuca.cc crossbar.cc arbiter.cc  2> /dev/null
+touch /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/cuda-sim/Makefile.makedepend
+makedepend -f/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/cuda-sim/Makefile.makedepend -p/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/cuda-sim/ cuda_device_printf.cc cuda_device_runtime.cc cuda-sim.cc instructions.cc memory.cc ptx_ir.cc ptx_loader.cc ptx_parser.cc ptx_sim.cc ptx-stats.cc 2> /dev/null
+make[5]: Nothing to be done for 'depend'.
+make[5]: Leaving directory '/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/accelwattch/cacti'
+make[4]: Leaving directory '/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/accelwattch/cacti'
+make[3]: Nothing to be done for 'all'.
+make[3]: Leaving directory '/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/accelwattch'
+make[2]: Leaving directory '/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/accelwattch'
+g++  -c -O3 -g3 -Wall -Wno-unused-function -Wno-sign-compare -I/usr/local/cuda-12.4/include  -I/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/cuda-sim/ -I. -I/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release -fPIC  -DTRACING_ON=1 -DCUDART_VERSION=12040 -std=c++17 cuda-sim.cc -o /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/cuda-sim/cuda-sim.o
+In file included from src/../../../gpu-simulator/trace-parser/trace_parser.h:37,
+                 from src/traced_instruction.cc:32:
+src/../../../gpu-simulator/trace-parser/../gpgpu-sim/src/abstract_hardware_model.h: In function ‘void move_warp_uniptr_impl(std::unique_ptr<warp_inst_t>&, std::unique_ptr<warp_inst_t>&, const char*, int)’:
+src/../../../gpu-simulator/trace-parser/../gpgpu-sim/src/abstract_hardware_model.h:2006:32: warning: format ‘%x’ expects argument of type ‘unsigned int’, but argument 2 has type ‘address_type’ {aka ‘long long unsigned int’} [-Wformat=]
+ 2006 |             printf("dst->pc = %x, src->pc = %x\n", dst->pc, src->pc);
+      |                               ~^                   ~~~~~~~
+      |                                |                        |
+      |                                unsigned int             address_type {aka long long unsigned int}
+      |                               %llx
+src/../../../gpu-simulator/trace-parser/../gpgpu-sim/src/abstract_hardware_model.h:2006:46: warning: format ‘%x’ expects argument of type ‘unsigned int’, but argument 3 has type ‘address_type’ {aka ‘long long unsigned int’} [-Wformat=]
+ 2006 |             printf("dst->pc = %x, src->pc = %x\n", dst->pc, src->pc);
+      |                                             ~^              ~~~~~~~
+      |                                              |                   |
+      |                                              unsigned int        address_type {aka long long unsigned int}
+      |                                             %llx
+In file included from /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/libcuda/../src/cuda-sim/cuda-sim.h:36,
+                 from /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/libcuda/gpgpu_context.h:3,
+                 from main.cc:38:
+/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/libcuda/../src/cuda-sim/../abstract_hardware_model.h: In function ‘void move_warp_uniptr_impl(std::unique_ptr<warp_inst_t>&, std::unique_ptr<warp_inst_t>&, const char*, int)’:
+/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/libcuda/../src/cuda-sim/../abstract_hardware_model.h:2006:32: warning: format ‘%x’ expects argument of type ‘unsigned int’, but argument 2 has type ‘address_type’ {aka ‘long long unsigned int’} [-Wformat=]
+ 2006 |             printf("dst->pc = %x, src->pc = %x\n", dst->pc, src->pc);
+      |                               ~^                   ~~~~~~~
+      |                                |                        |
+      |                                unsigned int             address_type {aka long long unsigned int}
+      |                               %llx
+/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/libcuda/../src/cuda-sim/../abstract_hardware_model.h:2006:46: warning: format ‘%x’ expects argument of type ‘unsigned int’, but argument 3 has type ‘address_type’ {aka ‘long long unsigned int’} [-Wformat=]
+ 2006 |             printf("dst->pc = %x, src->pc = %x\n", dst->pc, src->pc);
+      |                                             ~^              ~~~~~~~
+      |                                              |                   |
+      |                                              unsigned int        address_type {aka long long unsigned int}
+      |                                             %llx
+In file included from cuda-sim.h:36,
+                 from cuda-sim.cc:32:
+../abstract_hardware_model.h: In function ‘void move_warp_uniptr_impl(std::unique_ptr<warp_inst_t>&, std::unique_ptr<warp_inst_t>&, const char*, int)’:
+../abstract_hardware_model.h:2006:20: warning: format ‘%x’ expects argument of type ‘unsigned int’, but argument 2 has type ‘address_type’ {aka ‘long long unsigned int’} [-Wformat=]
+ 2006 |             printf("dst->pc = %x, src->pc = %x\n", dst->pc, src->pc);
+      |                    ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~  ~~~~~~~
+      |                                                         |
+      |                                                         address_type {aka long long unsigned int}
+../abstract_hardware_model.h:2006:20: warning: format ‘%x’ expects argument of type ‘unsigned int’, but argument 3 has type ‘address_type’ {aka ‘long long unsigned int’} [-Wformat=]
+ 2006 |             printf("dst->pc = %x, src->pc = %x\n", dst->pc, src->pc);
+      |                    ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~           ~~~~~~~
+      |                                                                  |
+      |                                                                  address_type {aka long long unsigned int}
+ar rcs /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/cuda-sim/libgpgpu_ptx_sim.a /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/cuda-sim/ptx.tab.o /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/cuda-sim/lex.ptx_.o /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/cuda-sim/ptxinfo.tab.o /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/cuda-sim/lex.ptxinfo_.o /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/cuda-sim/ptx_parser.o /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/cuda-sim/ptx_loader.o /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/cuda-sim/cuda_device_printf.o /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/cuda-sim/instructions.o /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/cuda-sim/cuda-sim.o /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/cuda-sim/ptx_ir.o /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/cuda-sim/ptx_sim.o  /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/cuda-sim/memory.o /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/cuda-sim/ptx-stats.o /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/cuda-sim/decuda_pred_table/decuda_pred_table.o /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/cuda-sim/ptx.tab.o /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/cuda-sim/lex.ptx_.o /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/cuda-sim/ptxinfo.tab.o /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/cuda-sim/lex.ptxinfo_.o /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/cuda-sim/cuda_device_runtime.o
+make[2]: Leaving directory '/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/cuda-sim'
+make -C ./src/gpgpu-sim/remodeling/fusedMemory/ depend
+make -C ./libcuda/ depend
+make[2]: Entering directory '/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/fusedMemory'
+make -C ./cuobjdump_to_ptxplus/ depend
+make[2]: Entering directory '/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/libcuda'
+make[2]: Entering directory '/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/cuobjdump_to_ptxplus'
+touch /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/cuobjdump_to_ptxplus/Makefile.makedepend
+makedepend -f/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/cuobjdump_to_ptxplus/Makefile.makedepend cuobjdumpInst.cc cuobjdumpInstList.cc cuobjdump_to_ptxplus.cc 2> /dev/null
+make[2]: Leaving directory '/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/cuobjdump_to_ptxplus'
+make -C ./cuobjdump_to_ptxplus/
+make[2]: Entering directory '/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/cuobjdump_to_ptxplus'
+:
+:
+:
+make[2]: Leaving directory '/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/cuobjdump_to_ptxplus'
+touch /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/libcuda/Makefile.makedepend
+makedepend -f/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/libcuda/Makefile.makedepend -p/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/libcuda/ cuda_runtime_api.cc 2> /dev/null
+touch /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/fusedMemory/Makefile.makedepend
+makedepend -f/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/fusedMemory/Makefile.makedepend -p/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/fusedMemory/ coalescingStats.cc 2> /dev/null
+make[2]: 'depend' is up to date.
+make[2]: Leaving directory '/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/fusedMemory'
+make -C ./src/gpgpu-sim/remodeling/fusedMemory/ 
+make[2]: Entering directory '/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/fusedMemory'
+make[2]: 'depend' is up to date.
+make[2]: Leaving directory '/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/libcuda'
+make -C ./libcuda/
+make[2]: Entering directory '/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/libcuda'
+touch /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/libcuda/Makefile.makedepend
+touch /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/fusedMemory/Makefile.makedepend
+makedepend -f/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/libcuda/Makefile.makedepend -p/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/libcuda/ cuda_runtime_api.cc 2> /dev/null
+makedepend -f/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/fusedMemory/Makefile.makedepend -p/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/fusedMemory/ coalescingStats.cc 2> /dev/null
+ar rcs  /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/fusedMemory/libgpu_fusedMemory_sim.a /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/fusedMemory/coalescingStats.o
+:
+echo /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/libcuda/cuda_runtime_api.o /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/libcuda/cuobjdump_lexer.o /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/libcuda/cuobjdump_parser.o
+/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/libcuda/cuda_runtime_api.o /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/libcuda/cuobjdump_lexer.o /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/libcuda/cuobjdump_parser.o
+ar rcs /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/libcuda/libcuda.a /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/libcuda/cuda_runtime_api.o /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/libcuda/cuobjdump_lexer.o /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/libcuda/cuobjdump_parser.o
+make[2]: Leaving directory '/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/fusedMemory'
+make -C ./src/gpgpu-sim/remodeling/ depend
+make[2]: Entering directory '/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling'
+make[2]: Leaving directory '/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/libcuda'
+touch /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/remodeling/Makefile.makedepend
+makedepend -f/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/remodeling/Makefile.makedepend -p/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/remodeling/ first_level_instruction_cache.cc functional_unit.cc gmmu.cc ibuffer_remodeled.cc l0_icnt.cc ldst_unit_sm.cc page_table_walker.cc register_file.cc sm.cc stream_buffer.cc subcore.cc warp_dependency_state.cc 2> /dev/null
+make[2]: 'depend' is up to date.
+make[2]: Leaving directory '/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling'
+make -C ./src/gpgpu-sim/remodeling/
+make[2]: Entering directory '/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling'
+touch /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/remodeling/Makefile.makedepend
+makedepend -f/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/remodeling/Makefile.makedepend -p/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/remodeling/ first_level_instruction_cache.cc functional_unit.cc gmmu.cc ibuffer_remodeled.cc l0_icnt.cc ldst_unit_sm.cc page_table_walker.cc register_file.cc sm.cc stream_buffer.cc subcore.cc warp_dependency_state.cc 2> /dev/null
+ar rcs  /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/remodeling/libgpu_remodeling_uarch_sim.a /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/remodeling/first_level_instruction_cache.o /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/remodeling/functional_unit.o /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/remodeling/gmmu.o /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/remodeling/ibuffer_remodeled.o /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/remodeling/l0_icnt.o /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/remodeling/ldst_unit_sm.o /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/remodeling/page_table_walker.o /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/remodeling/register_file.o /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/remodeling/sm.o /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/remodeling/stream_buffer.o /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/remodeling/subcore.o /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/remodeling/warp_dependency_state.o
+make[2]: Leaving directory '/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling'
+make -C ./src/gpgpu-sim/ depend
+make[2]: Entering directory '/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim'
+touch /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/gpgpu-sim/Makefile.makedepend
+makedepend -f/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/gpgpu-sim/Makefile.makedepend -p/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/gpgpu-sim/ addrdec.cc dram.cc dram_sched.cc gpu-cache.cc gpu-misc.cc gpu-sim.cc hashing.cc histogram.cc icnt_wrapper.cc l2cache.cc local_interconnect.cc mem_fetch.cc mem_latency_stat.cc power_interface.cc power_stat.cc result_bus.cc scoreboard.cc scoreboard_reads.cc shader.cc stack.cc stat-tool.cc traffic_breakdown.cc visualizer.cc 2> /dev/null
+make[2]: 'depend' is up to date.
+make[2]: Leaving directory '/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim'
+make -C ./src/gpgpu-sim/
+make[2]: Entering directory '/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim'
+touch /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/gpgpu-sim/Makefile.makedepend
+makedepend -f/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/gpgpu-sim/Makefile.makedepend -p/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/gpgpu-sim/ addrdec.cc dram.cc dram_sched.cc gpu-cache.cc gpu-misc.cc gpu-sim.cc hashing.cc histogram.cc icnt_wrapper.cc l2cache.cc local_interconnect.cc mem_fetch.cc mem_latency_stat.cc power_interface.cc power_stat.cc result_bus.cc scoreboard.cc scoreboard_reads.cc shader.cc stack.cc stat-tool.cc traffic_breakdown.cc visualizer.cc 2> /dev/null
+make -C ./remodeling/fusedMemory
+make[3]: Entering directory '/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim'
+make[3]: warning: jobserver unavailable: using -j1.  Add '+' to parent make rule.
+touch /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/fusedMemory/Makefile.makedepend
+makedepend -f/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/fusedMemory/Makefile.makedepend -p/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/fusedMemory/ coalescingStats.cc 2> /dev/null
+ar rcs  /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/fusedMemory/libgpu_fusedMemory_sim.a /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/fusedMemory/coalescingStats.o
+make[3]: Leaving directory '/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/fusedMemory'
+g++  -O3 -g3 -fPIC -DCUDART_VERSION=12040 -fopenmp -Wall -DTRACING_ON=1 -std=c++17 -I/usr/local/cuda-12.4/include -I/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/accelwattch/ -DGPGPUSIM_POWER_MODEL -o /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/gpgpu-sim/addrdec.o -c addrdec.cc
+g++  -O3 -g3 -fPIC -DCUDART_VERSION=12040 -fopenmp -Wall -DTRACING_ON=1 -std=c++17 -I/usr/local/cuda-12.4/include -I/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/accelwattch/ -DGPGPUSIM_POWER_MODEL -o /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/gpgpu-sim/dram.o -c dram.cc
+g++  -O3 -g3 -fPIC -DCUDART_VERSION=12040 -fopenmp -Wall -DTRACING_ON=1 -std=c++17 -I/usr/local/cuda-12.4/include -I/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/accelwattch/ -DGPGPUSIM_POWER_MODEL -o /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/gpgpu-sim/dram_sched.o -c dram_sched.cc
+g++  -O3 -g3 -fPIC -DCUDART_VERSION=12040 -fopenmp -Wall -DTRACING_ON=1 -std=c++17 -I/usr/local/cuda-12.4/include -I/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/accelwattch/ -DGPGPUSIM_POWER_MODEL -o /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/gpgpu-sim/gpu-cache.o -c gpu-cache.cc
+g++  -O3 -g3 -fPIC -DCUDART_VERSION=12040 -fopenmp -Wall -DTRACING_ON=1 -std=c++17 -I/usr/local/cuda-12.4/include -I/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/accelwattch/ -DGPGPUSIM_POWER_MODEL -o /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/gpgpu-sim/gpu-misc.o -c gpu-misc.cc
+g++  -O3 -g3 -fPIC -DCUDART_VERSION=12040 -fopenmp -Wall -DTRACING_ON=1 -std=c++17 -I/usr/local/cuda-12.4/include -I/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/accelwattch/ -DGPGPUSIM_POWER_MODEL -o /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/gpgpu-sim/gpu-sim.o -c gpu-sim.cc
+g++  -O3 -g3 -fPIC -DCUDART_VERSION=12040 -fopenmp -Wall -DTRACING_ON=1 -std=c++17 -I/usr/local/cuda-12.4/include -I/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/accelwattch/ -DGPGPUSIM_POWER_MODEL -o /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/gpgpu-sim/hashing.o -c hashing.cc
+g++  -O3 -g3 -fPIC -DCUDART_VERSION=12040 -fopenmp -Wall -DTRACING_ON=1 -std=c++17 -I/usr/local/cuda-12.4/include -I/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/accelwattch/ -DGPGPUSIM_POWER_MODEL -o /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/gpgpu-sim/histogram.o -c histogram.cc
+g++  -O3 -g3 -fPIC -DCUDART_VERSION=12040 -fopenmp -Wall -DTRACING_ON=1 -std=c++17 -I/usr/local/cuda-12.4/include -I/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/accelwattch/ -DGPGPUSIM_POWER_MODEL -o /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/gpgpu-sim/icnt_wrapper.o -c icnt_wrapper.cc
+g++  -O3 -g3 -fPIC -DCUDART_VERSION=12040 -fopenmp -Wall -DTRACING_ON=1 -std=c++17 -I/usr/local/cuda-12.4/include -I/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/accelwattch/ -DGPGPUSIM_POWER_MODEL -o /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/gpgpu-sim/l2cache.o -c l2cache.cc
+g++  -O3 -g3 -fPIC -DCUDART_VERSION=12040 -fopenmp -Wall -DTRACING_ON=1 -std=c++17 -I/usr/local/cuda-12.4/include -I/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/accelwattch/ -DGPGPUSIM_POWER_MODEL -o /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/gpgpu-sim/local_interconnect.o -c local_interconnect.cc
+g++  -O3 -g3 -fPIC -DCUDART_VERSION=12040 -fopenmp -Wall -DTRACING_ON=1 -std=c++17 -I/usr/local/cuda-12.4/include -I/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/accelwattch/ -DGPGPUSIM_POWER_MODEL -o /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/gpgpu-sim/mem_fetch.o -c mem_fetch.cc
+g++  -O3 -g3 -fPIC -DCUDART_VERSION=12040 -fopenmp -Wall -DTRACING_ON=1 -std=c++17 -I/usr/local/cuda-12.4/include -I/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/accelwattch/ -DGPGPUSIM_POWER_MODEL -o /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/gpgpu-sim/mem_latency_stat.o -c mem_latency_stat.cc
+g++  -O3 -g3 -fPIC -DCUDART_VERSION=12040 -fopenmp -Wall -DTRACING_ON=1 -std=c++17 -I/usr/local/cuda-12.4/include -I/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/accelwattch/ -DGPGPUSIM_POWER_MODEL -o /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/gpgpu-sim/power_interface.o -c power_interface.cc
+g++  -O3 -g3 -fPIC -DCUDART_VERSION=12040 -fopenmp -Wall -DTRACING_ON=1 -std=c++17 -I/usr/local/cuda-12.4/include -I/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/accelwattch/ -DGPGPUSIM_POWER_MODEL -o /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/gpgpu-sim/power_stat.o -c power_stat.cc
+g++  -O3 -g3 -fPIC -DCUDART_VERSION=12040 -fopenmp -Wall -DTRACING_ON=1 -std=c++17 -I/usr/local/cuda-12.4/include -I/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/accelwattch/ -DGPGPUSIM_POWER_MODEL -o /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/gpgpu-sim/result_bus.o -c result_bus.cc
+g++  -O3 -g3 -fPIC -DCUDART_VERSION=12040 -fopenmp -Wall -DTRACING_ON=1 -std=c++17 -I/usr/local/cuda-12.4/include -I/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/accelwattch/ -DGPGPUSIM_POWER_MODEL -o /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/gpgpu-sim/scoreboard.o -c scoreboard.cc
+g++  -O3 -g3 -fPIC -DCUDART_VERSION=12040 -fopenmp -Wall -DTRACING_ON=1 -std=c++17 -I/usr/local/cuda-12.4/include -I/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/accelwattch/ -DGPGPUSIM_POWER_MODEL -o /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/gpgpu-sim/scoreboard_reads.o -c scoreboard_reads.cc
+g++  -O3 -g3 -fPIC -DCUDART_VERSION=12040 -fopenmp -Wall -DTRACING_ON=1 -std=c++17 -I/usr/local/cuda-12.4/include -I/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/accelwattch/ -DGPGPUSIM_POWER_MODEL -o /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/gpgpu-sim/shader.o -c shader.cc
+g++  -O3 -g3 -fPIC -DCUDART_VERSION=12040 -fopenmp -Wall -DTRACING_ON=1 -std=c++17 -I/usr/local/cuda-12.4/include -I/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/accelwattch/ -DGPGPUSIM_POWER_MODEL -o /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/gpgpu-sim/stack.o -c stack.cc
+g++  -O3 -g3 -fPIC -DCUDART_VERSION=12040 -fopenmp -Wall -DTRACING_ON=1 -std=c++17 -I/usr/local/cuda-12.4/include -I/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/accelwattch/ -DGPGPUSIM_POWER_MODEL -o /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/gpgpu-sim/stat-tool.o -c stat-tool.cc
+g++  -O3 -g3 -fPIC -DCUDART_VERSION=12040 -fopenmp -Wall -DTRACING_ON=1 -std=c++17 -I/usr/local/cuda-12.4/include -I/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/accelwattch/ -DGPGPUSIM_POWER_MODEL -o /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/gpgpu-sim/traffic_breakdown.o -c traffic_breakdown.cc
+g++  -O3 -g3 -fPIC -DCUDART_VERSION=12040 -fopenmp -Wall -DTRACING_ON=1 -std=c++17 -I/usr/local/cuda-12.4/include -I/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/accelwattch/ -DGPGPUSIM_POWER_MODEL -o /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/gpgpu-sim/visualizer.o -c visualizer.cc
+In file included from stack.h:32,
+                 from stack.cc:29:
+../abstract_hardware_model.h: In function ‘void move_warp_uniptr_impl(std::unique_ptr<warp_inst_t>&, std::unique_ptr<warp_inst_t>&, const char*, int)’:
+../abstract_hardware_model.h:2006:32: warning: format ‘%x’ expects argument of type ‘unsigned int’, but argument 2 has type ‘address_type’ {aka ‘long long unsigned int’} [-Wformat=]
+ 2006 |             printf("dst->pc = %x, src->pc = %x\n", dst->pc, src->pc);
+      |                               ~^                   ~~~~~~~
+      |                                |                        |
+      |                                unsigned int             address_type {aka long long unsigned int}
+      |                               %llx
+../abstract_hardware_model.h:2006:46: warning: format ‘%x’ expects argument of type ‘unsigned int’, but argument 3 has type ‘address_type’ {aka ‘long long unsigned int’} [-Wformat=]
+ 2006 |             printf("dst->pc = %x, src->pc = %x\n", dst->pc, src->pc);
+      |                                             ~^              ~~~~~~~
+      |                                              |                   |
+      |                                              unsigned int        address_type {aka long long unsigned int}
+      |                                             %llx
+In file included from mem_fetch.h:33,
+                 from traffic_breakdown.cc:2:
+../abstract_hardware_model.h: In function ‘void move_warp_uniptr_impl(std::unique_ptr<warp_inst_t>&, std::unique_ptr<warp_inst_t>&, const char*, int)’:
+../abstract_hardware_model.h:2006:32: warning: format ‘%x’ expects argument of type ‘unsigned int’, but argument 2 has type ‘address_type’ {aka ‘long long unsigned int’} [-Wformat=]
+ 2006 |             printf("dst->pc = %x, src->pc = %x\n", dst->pc, src->pc);
+      |                               ~^                   ~~~~~~~
+      |                                |                        |
+      |                                unsigned int             address_type {aka long long unsigned int}
+      |                               %llx
+../abstract_hardware_model.h:2006:46: warning: format ‘%x’ expects argument of type ‘unsigned int’, but argument 3 has type ‘address_type’ {aka ‘long long unsigned int’} [-Wformat=]
+ 2006 |             printf("dst->pc = %x, src->pc = %x\n", dst->pc, src->pc);
+      |                                             ~^              ~~~~~~~
+      |                                              |                   |
+      |                                              unsigned int        address_type {aka long long unsigned int}
+      |                                             %llx
+In file included from gpu-cache.h:36,
+                 from gpu-cache.cc:32:
+../abstract_hardware_model.h: In function ‘void move_warp_uniptr_impl(std::unique_ptr<warp_inst_t>&, std::unique_ptr<warp_inst_t>&, const char*, int)’:
+../abstract_hardware_model.h:2006:32: warning: format ‘%x’ expects argument of type ‘unsigned int’, but argument 2 has type ‘address_type’ {aka ‘long long unsigned int’} [-Wformat=]
+ 2006 |             printf("dst->pc = %x, src->pc = %x\n", dst->pc, src->pc);
+      |                               ~^                   ~~~~~~~
+      |                                |                        |
+      |                                unsigned int             address_type {aka long long unsigned int}
+      |                               %llx
+../abstract_hardware_model.h:2006:46: warning: format ‘%x’ expects argument of type ‘unsigned int’, but argument 3 has type ‘address_type’ {aka ‘long long unsigned int’} [-Wformat=]
+ 2006 |             printf("dst->pc = %x, src->pc = %x\n", dst->pc, src->pc);
+      |                                             ~^              ~~~~~~~
+      |                                              |                   |
+      |                                              unsigned int        address_type {aka long long unsigned int}
+      |                                             %llx
+In file included from l2cache.cc:38:
+../abstract_hardware_model.h: In function ‘void move_warp_uniptr_impl(std::unique_ptr<warp_inst_t>&, std::unique_ptr<warp_inst_t>&, const char*, int)’:
+../abstract_hardware_model.h:2006:32: warning: format ‘%x’ expects argument of type ‘unsigned int’, but argument 2 has type ‘address_type’ {aka ‘long long unsigned int’} [-Wformat=]
+ 2006 |             printf("dst->pc = %x, src->pc = %x\n", dst->pc, src->pc);
+      |                               ~^                   ~~~~~~~
+      |                                |                        |
+      |                                unsigned int             address_type {aka long long unsigned int}
+      |                               %llx
+../abstract_hardware_model.h:2006:46: warning: format ‘%x’ expects argument of type ‘unsigned int’, but argument 3 has type ‘address_type’ {aka ‘long long unsigned int’} [-Wformat=]
+ 2006 |             printf("dst->pc = %x, src->pc = %x\n", dst->pc, src->pc);
+      |                                             ~^              ~~~~~~~
+      |                                              |                   |
+      |                                              unsigned int        address_type {aka long long unsigned int}
+      |                                             %llx
+In file included from mem_fetch.h:33,
+                 from mem_fetch.cc:29:
+../abstract_hardware_model.h: In function ‘void move_warp_uniptr_impl(std::unique_ptr<warp_inst_t>&, std::unique_ptr<warp_inst_t>&, const char*, int)’:
+../abstract_hardware_model.h:2006:32: warning: format ‘%x’ expects argument of type ‘unsigned int’, but argument 2 has type ‘address_type’ {aka ‘long long unsigned int’} [-Wformat=]
+ 2006 |             printf("dst->pc = %x, src->pc = %x\n", dst->pc, src->pc);
+      |                               ~^                   ~~~~~~~
+      |                                |                        |
+      |                                unsigned int             address_type {aka long long unsigned int}
+      |                               %llx
+../abstract_hardware_model.h:2006:46: warning: format ‘%x’ expects argument of type ‘unsigned int’, but argument 3 has type ‘address_type’ {aka ‘long long unsigned int’} [-Wformat=]
+ 2006 |             printf("dst->pc = %x, src->pc = %x\n", dst->pc, src->pc);
+      |                                             ~^              ~~~~~~~
+      |                                              |                   |
+      |                                              unsigned int        address_type {aka long long unsigned int}
+      |                                             %llx
+In file included from hashing.cc:6:
+../abstract_hardware_model.h: In function ‘void move_warp_uniptr_impl(std::unique_ptr<warp_inst_t>&, std::unique_ptr<warp_inst_t>&, const char*, int)’:
+../abstract_hardware_model.h:2006:32: warning: format ‘%x’ expects argument of type ‘unsigned int’, but argument 2 has type ‘address_type’ {aka ‘long long unsigned int’} [-Wformat=]
+ 2006 |             printf("dst->pc = %x, src->pc = %x\n", dst->pc, src->pc);
+      |                               ~^                   ~~~~~~~
+      |                                |                        |
+      |                                unsigned int             address_type {aka long long unsigned int}
+      |                               %llx
+../abstract_hardware_model.h:2006:46: warning: format ‘%x’ expects argument of type ‘unsigned int’, but argument 3 has type ‘address_type’ {aka ‘long long unsigned int’} [-Wformat=]
+ 2006 |             printf("dst->pc = %x, src->pc = %x\n", dst->pc, src->pc);
+      |                                             ~^              ~~~~~~~
+      |                                              |                   |
+      |                                              unsigned int        address_type {aka long long unsigned int}
+      |                                             %llx
+In file included from scoreboard_reads.h:40,
+                 from scoreboard_reads.cc:30:
+../abstract_hardware_model.h: In function ‘void move_warp_uniptr_impl(std::unique_ptr<warp_inst_t>&, std::unique_ptr<warp_inst_t>&, const char*, int)’:
+../abstract_hardware_model.h:2006:32: warning: format ‘%x’ expects argument of type ‘unsigned int’, but argument 2 has type ‘address_type’ {aka ‘long long unsigned int’} [-Wformat=]
+ 2006 |             printf("dst->pc = %x, src->pc = %x\n", dst->pc, src->pc);
+      |                               ~^                   ~~~~~~~
+      |                                |                        |
+      |                                unsigned int             address_type {aka long long unsigned int}
+      |                               %llx
+../abstract_hardware_model.h:2006:46: warning: format ‘%x’ expects argument of type ‘unsigned int’, but argument 3 has type ‘address_type’ {aka ‘long long unsigned int’} [-Wformat=]
+ 2006 |             printf("dst->pc = %x, src->pc = %x\n", dst->pc, src->pc);
+      |                                             ~^              ~~~~~~~
+      |                                              |                   |
+      |                                              unsigned int        address_type {aka long long unsigned int}
+      |                                             %llx
+In file included from scoreboard.h:66,
+                 from scoreboard.cc:57:
+../abstract_hardware_model.h: In function ‘void move_warp_uniptr_impl(std::unique_ptr<warp_inst_t>&, std::unique_ptr<warp_inst_t>&, const char*, int)’:
+../abstract_hardware_model.h:2006:32: warning: format ‘%x’ expects argument of type ‘unsigned int’, but argument 2 has type ‘address_type’ {aka ‘long long unsigned int’} [-Wformat=]
+ 2006 |             printf("dst->pc = %x, src->pc = %x\n", dst->pc, src->pc);
+      |                               ~^                   ~~~~~~~
+      |                                |                        |
+      |                                unsigned int             address_type {aka long long unsigned int}
+      |                               %llx
+../abstract_hardware_model.h:2006:46: warning: format ‘%x’ expects argument of type ‘unsigned int’, but argument 3 has type ‘address_type’ {aka ‘long long unsigned int’} [-Wformat=]
+ 2006 |             printf("dst->pc = %x, src->pc = %x\n", dst->pc, src->pc);
+      |                                             ~^              ~~~~~~~
+      |                                              |                   |
+      |                                              unsigned int        address_type {aka long long unsigned int}
+      |                                             %llx
+In file included from stat-tool.h:32,
+                 from stat-tool.cc:29:
+../abstract_hardware_model.h: In function ‘void move_warp_uniptr_impl(std::unique_ptr<warp_inst_t>&, std::unique_ptr<warp_inst_t>&, const char*, int)’:
+../abstract_hardware_model.h:2006:32: warning: format ‘%x’ expects argument of type ‘unsigned int’, but argument 2 has type ‘address_type’ {aka ‘long long unsigned int’} [-Wformat=]
+ 2006 |             printf("dst->pc = %x, src->pc = %x\n", dst->pc, src->pc);
+      |                               ~^                   ~~~~~~~
+      |                                |                        |
+      |                                unsigned int             address_type {aka long long unsigned int}
+      |                               %llx
+../abstract_hardware_model.h:2006:46: warning: format ‘%x’ expects argument of type ‘unsigned int’, but argument 3 has type ‘address_type’ {aka ‘long long unsigned int’} [-Wformat=]
+ 2006 |             printf("dst->pc = %x, src->pc = %x\n", dst->pc, src->pc);
+      |                                             ~^              ~~~~~~~
+      |                                              |                   |
+      |                                              unsigned int        address_type {aka long long unsigned int}
+      |                                             %llx
+In file included from mem_latency_stat.cc:31:
+../abstract_hardware_model.h: In function ‘void move_warp_uniptr_impl(std::unique_ptr<warp_inst_t>&, std::unique_ptr<warp_inst_t>&, const char*, int)’:
+../abstract_hardware_model.h:2006:32: warning: format ‘%x’ expects argument of type ‘unsigned int’, but argument 2 has type ‘address_type’ {aka ‘long long unsigned int’} [-Wformat=]
+ 2006 |             printf("dst->pc = %x, src->pc = %x\n", dst->pc, src->pc);
+      |                               ~^                   ~~~~~~~
+      |                                |                        |
+      |                                unsigned int             address_type {aka long long unsigned int}
+      |                               %llx
+../abstract_hardware_model.h:2006:46: warning: format ‘%x’ expects argument of type ‘unsigned int’, but argument 3 has type ‘address_type’ {aka ‘long long unsigned int’} [-Wformat=]
+ 2006 |             printf("dst->pc = %x, src->pc = %x\n", dst->pc, src->pc);
+      |                                             ~^              ~~~~~~~
+      |                                              |                   |
+      |                                              unsigned int        address_type {aka long long unsigned int}
+      |                                             %llx
+In file included from addrdec.h:37,
+                 from addrdec.cc:29:
+../abstract_hardware_model.h: In function ‘void move_warp_uniptr_impl(std::unique_ptr<warp_inst_t>&, std::unique_ptr<warp_inst_t>&, const char*, int)’:
+../abstract_hardware_model.h:2006:32: warning: format ‘%x’ expects argument of type ‘unsigned int’, but argument 2 has type ‘address_type’ {aka ‘long long unsigned int’} [-Wformat=]
+ 2006 |             printf("dst->pc = %x, src->pc = %x\n", dst->pc, src->pc);
+      |                               ~^                   ~~~~~~~
+      |                                |                        |
+      |                                unsigned int             address_type {aka long long unsigned int}
+      |                               %llx
+../abstract_hardware_model.h:2006:46: warning: format ‘%x’ expects argument of type ‘unsigned int’, but argument 3 has type ‘address_type’ {aka ‘long long unsigned int’} [-Wformat=]
+ 2006 |             printf("dst->pc = %x, src->pc = %x\n", dst->pc, src->pc);
+      |                                             ~^              ~~~~~~~
+      |                                              |                   |
+      |                                              unsigned int        address_type {aka long long unsigned int}
+      |                                             %llx
+In file included from result_bus.h:34,
+                 from result_bus.cc:4:
+../abstract_hardware_model.h: In function ‘void move_warp_uniptr_impl(std::unique_ptr<warp_inst_t>&, std::unique_ptr<warp_inst_t>&, const char*, int)’:
+../abstract_hardware_model.h:2006:32: warning: format ‘%x’ expects argument of type ‘unsigned int’, but argument 2 has type ‘address_type’ {aka ‘long long unsigned int’} [-Wformat=]
+ 2006 |             printf("dst->pc = %x, src->pc = %x\n", dst->pc, src->pc);
+      |                               ~^                   ~~~~~~~
+      |                                |                        |
+      |                                unsigned int             address_type {aka long long unsigned int}
+      |                               %llx
+../abstract_hardware_model.h:2006:46: warning: format ‘%x’ expects argument of type ‘unsigned int’, but argument 3 has type ‘address_type’ {aka ‘long long unsigned int’} [-Wformat=]
+ 2006 |             printf("dst->pc = %x, src->pc = %x\n", dst->pc, src->pc);
+      |                                             ~^              ~~~~~~~
+      |                                              |                   |
+      |                                              unsigned int        address_type {aka long long unsigned int}
+      |                                             %llx
+In file included from shader.h:79,
+                 from shader.cc:60:
+../abstract_hardware_model.h: In function ‘void move_warp_uniptr_impl(std::unique_ptr<warp_inst_t>&, std::unique_ptr<warp_inst_t>&, const char*, int)’:
+../abstract_hardware_model.h:2006:32: warning: format ‘%x’ expects argument of type ‘unsigned int’, but argument 2 has type ‘address_type’ {aka ‘long long unsigned int’} [-Wformat=]
+ 2006 |             printf("dst->pc = %x, src->pc = %x\n", dst->pc, src->pc);
+      |                               ~^                   ~~~~~~~
+      |                                |                        |
+      |                                unsigned int             address_type {aka long long unsigned int}
+      |                               %llx
+../abstract_hardware_model.h:2006:46: warning: format ‘%x’ expects argument of type ‘unsigned int’, but argument 3 has type ‘address_type’ {aka ‘long long unsigned int’} [-Wformat=]
+ 2006 |             printf("dst->pc = %x, src->pc = %x\n", dst->pc, src->pc);
+      |                                             ~^              ~~~~~~~
+      |                                              |                   |
+      |                                              unsigned int        address_type {aka long long unsigned int}
+      |                                             %llx
+In file included from gpu-sim.h:70,
+                 from power_stat.h:36,
+                 from power_stat.cc:31:
+../abstract_hardware_model.h: In function ‘void move_warp_uniptr_impl(std::unique_ptr<warp_inst_t>&, std::unique_ptr<warp_inst_t>&, const char*, int)’:
+../abstract_hardware_model.h:2006:32: warning: format ‘%x’ expects argument of type ‘unsigned int’, but argument 2 has type ‘address_type’ {aka ‘long long unsigned int’} [-Wformat=]
+ 2006 |             printf("dst->pc = %x, src->pc = %x\n", dst->pc, src->pc);
+      |                               ~^                   ~~~~~~~
+      |                                |                        |
+      |                                unsigned int             address_type {aka long long unsigned int}
+      |                               %llx
+../abstract_hardware_model.h:2006:46: warning: format ‘%x’ expects argument of type ‘unsigned int’, but argument 3 has type ‘address_type’ {aka ‘long long unsigned int’} [-Wformat=]
+ 2006 |             printf("dst->pc = %x, src->pc = %x\n", dst->pc, src->pc);
+      |                                             ~^              ~~~~~~~
+      |                                              |                   |
+      |                                              unsigned int        address_type {aka long long unsigned int}
+      |                                             %llx
+In file included from gpu-sim.h:70,
+                 from power_interface.h:34,
+                 from power_interface.cc:32:
+../abstract_hardware_model.h: In function ‘void move_warp_uniptr_impl(std::unique_ptr<warp_inst_t>&, std::unique_ptr<warp_inst_t>&, const char*, int)’:
+../abstract_hardware_model.h:2006:32: warning: format ‘%x’ expects argument of type ‘unsigned int’, but argument 2 has type ‘address_type’ {aka ‘long long unsigned int’} [-Wformat=]
+ 2006 |             printf("dst->pc = %x, src->pc = %x\n", dst->pc, src->pc);
+      |                               ~^                   ~~~~~~~
+      |                                |                        |
+      |                                unsigned int             address_type {aka long long unsigned int}
+      |                               %llx
+../abstract_hardware_model.h:2006:46: warning: format ‘%x’ expects argument of type ‘unsigned int’, but argument 3 has type ‘address_type’ {aka ‘long long unsigned int’} [-Wformat=]
+ 2006 |             printf("dst->pc = %x, src->pc = %x\n", dst->pc, src->pc);
+      |                                             ~^              ~~~~~~~
+      |                                              |                   |
+      |                                              unsigned int        address_type {aka long long unsigned int}
+      |                                             %llx
+In file included from gpu-sim.h:70,
+                 from visualizer.cc:32:
+../abstract_hardware_model.h: In function ‘void move_warp_uniptr_impl(std::unique_ptr<warp_inst_t>&, std::unique_ptr<warp_inst_t>&, const char*, int)’:
+../abstract_hardware_model.h:2006:32: warning: format ‘%x’ expects argument of type ‘unsigned int’, but argument 2 has type ‘address_type’ {aka ‘long long unsigned int’} [-Wformat=]
+ 2006 |             printf("dst->pc = %x, src->pc = %x\n", dst->pc, src->pc);
+      |                               ~^                   ~~~~~~~
+      |                                |                        |
+      |                                unsigned int             address_type {aka long long unsigned int}
+      |                               %llx
+../abstract_hardware_model.h:2006:46: warning: format ‘%x’ expects argument of type ‘unsigned int’, but argument 3 has type ‘address_type’ {aka ‘long long unsigned int’} [-Wformat=]
+ 2006 |             printf("dst->pc = %x, src->pc = %x\n", dst->pc, src->pc);
+      |                                             ~^              ~~~~~~~
+      |                                              |                   |
+      |                                              unsigned int        address_type {aka long long unsigned int}
+      |                                             %llx
+In file included from mem_fetch.h:33,
+                 from local_interconnect.cc:38:
+../abstract_hardware_model.h: In function ‘void move_warp_uniptr_impl(std::unique_ptr<warp_inst_t>&, std::unique_ptr<warp_inst_t>&, const char*, int)’:
+../abstract_hardware_model.h:2006:32: warning: format ‘%x’ expects argument of type ‘unsigned int’, but argument 2 has type ‘address_type’ {aka ‘long long unsigned int’} [-Wformat=]
+ 2006 |             printf("dst->pc = %x, src->pc = %x\n", dst->pc, src->pc);
+      |                               ~^                   ~~~~~~~
+      |                                |                        |
+      |                                unsigned int             address_type {aka long long unsigned int}
+      |                               %llx
+../abstract_hardware_model.h:2006:46: warning: format ‘%x’ expects argument of type ‘unsigned int’, but argument 3 has type ‘address_type’ {aka ‘long long unsigned int’} [-Wformat=]
+ 2006 |             printf("dst->pc = %x, src->pc = %x\n", dst->pc, src->pc);
+      |                                             ~^              ~~~~~~~
+      |                                              |                   |
+      |                                              unsigned int        address_type {aka long long unsigned int}
+      |                                             %llx
+In file included from gpu-sim.h:70,
+                 from gpu-sim.cc:60:
+../abstract_hardware_model.h: In function ‘void move_warp_uniptr_impl(std::unique_ptr<warp_inst_t>&, std::unique_ptr<warp_inst_t>&, const char*, int)’:
+../abstract_hardware_model.h:2006:32: warning: format ‘%x’ expects argument of type ‘unsigned int’, but argument 2 has type ‘address_type’ {aka ‘long long unsigned int’} [-Wformat=]
+ 2006 |             printf("dst->pc = %x, src->pc = %x\n", dst->pc, src->pc);
+      |                               ~^                   ~~~~~~~
+      |                                |                        |
+      |                                unsigned int             address_type {aka long long unsigned int}
+      |                               %llx
+../abstract_hardware_model.h:2006:46: warning: format ‘%x’ expects argument of type ‘unsigned int’, but argument 3 has type ‘address_type’ {aka ‘long long unsigned int’} [-Wformat=]
+ 2006 |             printf("dst->pc = %x, src->pc = %x\n", dst->pc, src->pc);
+      |                                             ~^              ~~~~~~~
+      |                                              |                   |
+      |                                              unsigned int        address_type {aka long long unsigned int}
+      |                                             %llx
+In file included from gpu-sim.h:70,
+                 from dram_sched.h:36,
+                 from dram.cc:33:
+../abstract_hardware_model.h: In function ‘void move_warp_uniptr_impl(std::unique_ptr<warp_inst_t>&, std::unique_ptr<warp_inst_t>&, const char*, int)’:
+../abstract_hardware_model.h:2006:32: warning: format ‘%x’ expects argument of type ‘unsigned int’, but argument 2 has type ‘address_type’ {aka ‘long long unsigned int’} [-Wformat=]
+ 2006 |             printf("dst->pc = %x, src->pc = %x\n", dst->pc, src->pc);
+      |                               ~^                   ~~~~~~~
+      |                                |                        |
+      |                                unsigned int             address_type {aka long long unsigned int}
+      |                               %llx
+../abstract_hardware_model.h:2006:46: warning: format ‘%x’ expects argument of type ‘unsigned int’, but argument 3 has type ‘address_type’ {aka ‘long long unsigned int’} [-Wformat=]
+ 2006 |             printf("dst->pc = %x, src->pc = %x\n", dst->pc, src->pc);
+      |                                             ~^              ~~~~~~~
+      |                                              |                   |
+      |                                              unsigned int        address_type {aka long long unsigned int}
+      |                                             %llx
+In file included from gpu-sim.h:70,
+                 from dram_sched.h:36,
+                 from dram_sched.cc:29:
+../abstract_hardware_model.h: In function ‘void move_warp_uniptr_impl(std::unique_ptr<warp_inst_t>&, std::unique_ptr<warp_inst_t>&, const char*, int)’:
+../abstract_hardware_model.h:2006:32: warning: format ‘%x’ expects argument of type ‘unsigned int’, but argument 2 has type ‘address_type’ {aka ‘long long unsigned int’} [-Wformat=]
+ 2006 |             printf("dst->pc = %x, src->pc = %x\n", dst->pc, src->pc);
+      |                               ~^                   ~~~~~~~
+      |                                |                        |
+      |                                unsigned int             address_type {aka long long unsigned int}
+      |                               %llx
+../abstract_hardware_model.h:2006:46: warning: format ‘%x’ expects argument of type ‘unsigned int’, but argument 3 has type ‘address_type’ {aka ‘long long unsigned int’} [-Wformat=]
+ 2006 |             printf("dst->pc = %x, src->pc = %x\n", dst->pc, src->pc);
+      |                                             ~^              ~~~~~~~
+      |                                              |                   |
+      |                                              unsigned int        address_type {aka long long unsigned int}
+      |                                             %llx
+make[1]: Leaving directory '/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/util/traces_enhanced'
+make -C trace-driven depend
+make -C trace-parser depend
+make[1]: Entering directory '/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/trace-driven'
+make[1]: Entering directory '/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/trace-parser'
+touch ../build/release/trace-driven.Makefile.makedepend
+touch ../build/release/trace-parser.Makefile.makedepend
+makedepend -f../build/release/trace-driven.Makefile.makedepend -p../build/release/ trace_driven.cc 2> /dev/null
+makedepend -f../build/release/trace-parser.Makefile.makedepend -p../build/release/ trace_parser.cc 2> /dev/null
+make[1]: 'depend' is up to date.
+make[1]: Leaving directory '/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/trace-parser'
+make -C trace-parser
+make[1]: 'depend' is up to date.
+make[1]: Leaving directory '/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/trace-driven'
+make -C trace-driven
+make[1]: Entering directory '/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/trace-parser'
+make[1]: Entering directory '/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/trace-driven'
+touch ../build/release/trace-parser.Makefile.makedepend
+touch ../build/release/trace-driven.Makefile.makedepend
+makedepend -f../build/release/trace-parser.Makefile.makedepend -p../build/release/ trace_parser.cc 2> /dev/null
+makedepend -f../build/release/trace-driven.Makefile.makedepend -p../build/release/ trace_driven.cc 2> /dev/null
+make[1]: Nothing to be done for 'trace-driven'.
+make[1]: Leaving directory '/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/trace-driven'
+make[1]: Nothing to be done for 'trace-parser'.
+make[1]: Leaving directory '/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/trace-parser'
+shader.cc: In member function ‘void opndcoll_rfu_t::allocate_cu(unsigned int)’:
+shader.cc:4605:18: warning: ‘schd_id’ may be used uninitialized in this function [-Wmaybe-uninitialized]
+ 4605 |         unsigned schd_id;
+      |                  ^~~~~~~
+ar rcs  /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/gpgpu-sim/libgpu_uarch_sim.a /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/gpgpu-sim/addrdec.o /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/gpgpu-sim/dram.o /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/gpgpu-sim/dram_sched.o /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/gpgpu-sim/gpu-cache.o /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/gpgpu-sim/gpu-misc.o /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/gpgpu-sim/gpu-sim.o /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/gpgpu-sim/hashing.o /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/gpgpu-sim/histogram.o /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/gpgpu-sim/icnt_wrapper.o /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/gpgpu-sim/l2cache.o /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/gpgpu-sim/local_interconnect.o /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/gpgpu-sim/mem_fetch.o /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/gpgpu-sim/mem_latency_stat.o /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/gpgpu-sim/power_interface.o /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/gpgpu-sim/power_stat.o /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/gpgpu-sim/result_bus.o /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/gpgpu-sim/scoreboard.o /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/gpgpu-sim/scoreboard_reads.o /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/gpgpu-sim/shader.o /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/gpgpu-sim/stack.o /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/gpgpu-sim/stat-tool.o /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/gpgpu-sim/traffic_breakdown.o /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/gpgpu-sim/visualizer.o /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/remodeling/*.o /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/fusedMemory/*.o
+make[2]: Leaving directory '/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim'
+make "CREATE_LIBRARY=1" "DEBUG=0" -C ./src/intersim2
+make[2]: Entering directory '/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/intersim2'
+touch /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/intersim2/Makefile.makedepend
+makedepend -f/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/intersim2/Makefile.makedepend -I-I. -Iarbiters -Iallocators -Irouters -Inetworks -Ipower -I/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src -I/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/ -p/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/intersim2/ config_utils.cpp booksim_config.cpp module.cpp buffer.cpp vc.cpp routefunc.cpp traffic.cpp flitchannel.cpp trafficmanager.cpp batchtrafficmanager.cpp packet_reply_info.cpp buffer_state.cpp stats.cpp credit.cpp outputset.cpp flit.cpp injection.cpp misc_utils.cpp rng_wrapper.cpp rng_double_wrapper.cpp power_module.cpp switch_monitor.cpp buffer_monitor.cpp main.cpp gputrafficmanager.cpp intersim_config.cpp interconnect_interface.cpp allocators/allocator.cpp allocators/islip.cpp allocators/loa.cpp allocators/maxsize.cpp allocators/pim.cpp allocators/selalloc.cpp allocators/separable.cpp allocators/separable_input_first.cpp allocators/separable_output_first.cpp allocators/wavefront.cpp arbiters/arbiter.cpp arbiters/matrix_arb.cpp arbiters/prio_arb.cpp arbiters/roundrobin_arb.cpp arbiters/tree_arb.cpp networks/anynet.cpp networks/cmesh.cpp networks/dragonfly.cpp networks/fattree.cpp networks/flatfly_onchip.cpp networks/fly.cpp networks/kncube.cpp networks/network.cpp networks/qtree.cpp networks/tree4.cpp power/buffer_monitor.cpp power/power_module.cpp power/switch_monitor.cpp routers/chaos_router.cpp routers/event_router.cpp routers/iq_router.cpp routers/router.cpp 2> /dev/null
+g++ -Wall -I. -Iarbiters -Iallocators -Irouters -Inetworks -Ipower -I/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src -I/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/ -DCREATE_LIBRARY -O3 -g -fPIC -I/usr/local/cuda-12.4/include -c interconnect_interface.cpp -o /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/intersim2/interconnect_interface.o
+In file included from /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/mem_fetch.h:33,
+                 from interconnect_interface.cpp:41:
+/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/../abstract_hardware_model.h: In function ‘void move_warp_uniptr_impl(std::unique_ptr<warp_inst_t>&, std::unique_ptr<warp_inst_t>&, const char*, int)’:
+/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/../abstract_hardware_model.h:2006:32: warning: format ‘%x’ expects argument of type ‘unsigned int’, but argument 2 has type ‘address_type’ {aka ‘long long unsigned int’} [-Wformat=]
+ 2006 |             printf("dst->pc = %x, src->pc = %x\n", dst->pc, src->pc);
+      |                               ~^                   ~~~~~~~
+      |                                |                        |
+      |                                unsigned int             address_type {aka long long unsigned int}
+      |                               %llx
+/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/../abstract_hardware_model.h:2006:46: warning: format ‘%x’ expects argument of type ‘unsigned int’, but argument 3 has type ‘address_type’ {aka ‘long long unsigned int’} [-Wformat=]
+ 2006 |             printf("dst->pc = %x, src->pc = %x\n", dst->pc, src->pc);
+      |                                             ~^              ~~~~~~~
+      |                                              |                   |
+      |                                              unsigned int        address_type {aka long long unsigned int}
+      |                                             %llx
+make[2]: Leaving directory '/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/intersim2'
+make -C ./src/ depend
+make[2]: Entering directory '/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src'
+touch /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/Makefile.makedepend
+makedepend -f/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/Makefile.makedepend -p/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/ abstract_hardware_model.cc debug.cc gpgpusim_entrypoint.cc option_parser.cc statwrapper.cc stream_manager.cc trace.cc 2> /dev/null
+make[2]: 'depend' is up to date.
+make[2]: Leaving directory '/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src'
+make -C ./src/
+make[2]: Entering directory '/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src'
+touch /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/Makefile.makedepend
+makedepend -f/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/Makefile.makedepend -p/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/ abstract_hardware_model.cc debug.cc gpgpusim_entrypoint.cc option_parser.cc statwrapper.cc stream_manager.cc trace.cc 2> /dev/null
+g++  -O3 -g3 -fPIC -Wall -DDEBUG -fopenmp -DCUDART_VERSION=12040 -std=c++17 -DTRACING_ON=1 -I/usr/local/cuda-12.4/include -o /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/abstract_hardware_model.o -c abstract_hardware_model.cc
+g++  -O3 -g3 -fPIC -Wall -DDEBUG -fopenmp -DCUDART_VERSION=12040 -std=c++17 -DTRACING_ON=1 -I/usr/local/cuda-12.4/include -o /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/debug.o -c debug.cc
+g++  -O3 -g3 -fPIC -Wall -DDEBUG -fopenmp -DCUDART_VERSION=12040 -std=c++17 -DTRACING_ON=1 -I/usr/local/cuda-12.4/include -o /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/gpgpusim_entrypoint.o -c gpgpusim_entrypoint.cc
+g++  -O3 -g3 -fPIC -Wall -DDEBUG -fopenmp -DCUDART_VERSION=12040 -std=c++17 -DTRACING_ON=1 -I/usr/local/cuda-12.4/include -o /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/stream_manager.o -c stream_manager.cc
+make   -C ./gpgpu-sim
+make[3]: Entering directory '/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src'
+make[3]: warning: jobserver unavailable: using -j1.  Add '+' to parent make rule.
+touch /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/gpgpu-sim/Makefile.makedepend
+makedepend -f/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/gpgpu-sim/Makefile.makedepend -p/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/gpgpu-sim/ addrdec.cc dram.cc dram_sched.cc gpu-cache.cc gpu-misc.cc gpu-sim.cc hashing.cc histogram.cc icnt_wrapper.cc l2cache.cc local_interconnect.cc mem_fetch.cc mem_latency_stat.cc power_interface.cc power_stat.cc result_bus.cc scoreboard.cc scoreboard_reads.cc shader.cc stack.cc stat-tool.cc traffic_breakdown.cc visualizer.cc 2> /dev/null
+make -C ./remodeling/fusedMemory
+make[4]: Entering directory '/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/fusedMemory'
+touch /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/fusedMemory/Makefile.makedepend
+makedepend -f/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/fusedMemory/Makefile.makedepend -p/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/fusedMemory/ coalescingStats.cc 2> /dev/null
+ar rcs  /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/fusedMemory/libgpu_fusedMemory_sim.a /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/fusedMemory/coalescingStats.o
+make[4]: Leaving directory '/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/fusedMemory'
+g++  -O3 -g3 -fPIC -DCUDART_VERSION=12040 -fopenmp -Wall -DTRACING_ON=1 -std=c++17 -I/usr/local/cuda-12.4/include -I/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/accelwattch/ -DGPGPUSIM_POWER_MODEL -o /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/gpgpu-sim/addrdec.o -c addrdec.cc
+In file included from stream_manager.h:35,
+                 from stream_manager.cc:29:
+abstract_hardware_model.h: In function ‘void move_warp_uniptr_impl(std::unique_ptr<warp_inst_t>&, std::unique_ptr<warp_inst_t>&, const char*, int)’:
+abstract_hardware_model.h:2006:32: warning: format ‘%x’ expects argument of type ‘unsigned int’, but argument 2 has type ‘address_type’ {aka ‘long long unsigned int’} [-Wformat=]
+ 2006 |             printf("dst->pc = %x, src->pc = %x\n", dst->pc, src->pc);
+      |                               ~^                   ~~~~~~~
+      |                                |                        |
+      |                                unsigned int             address_type {aka long long unsigned int}
+      |                               %llx
+abstract_hardware_model.h:2006:46: warning: format ‘%x’ expects argument of type ‘unsigned int’, but argument 3 has type ‘address_type’ {aka ‘long long unsigned int’} [-Wformat=]
+ 2006 |             printf("dst->pc = %x, src->pc = %x\n", dst->pc, src->pc);
+      |                                             ~^              ~~~~~~~
+      |                                              |                   |
+      |                                              unsigned int        address_type {aka long long unsigned int}
+      |                                             %llx
+In file included from gpgpusim_entrypoint.h:35,
+                 from gpgpusim_entrypoint.cc:29:
+abstract_hardware_model.h: In function ‘void move_warp_uniptr_impl(std::unique_ptr<warp_inst_t>&, std::unique_ptr<warp_inst_t>&, const char*, int)’:
+abstract_hardware_model.h:2006:32: warning: format ‘%x’ expects argument of type ‘unsigned int’, but argument 2 has type ‘address_type’ {aka ‘long long unsigned int’} [-Wformat=]
+ 2006 |             printf("dst->pc = %x, src->pc = %x\n", dst->pc, src->pc);
+      |                               ~^                   ~~~~~~~
+      |                                |                        |
+      |                                unsigned int             address_type {aka long long unsigned int}
+      |                               %llx
+In file included from debug.h:32,
+                 from debug.cc:29:
+abstract_hardware_model.h: In function ‘void move_warp_uniptr_impl(std::unique_ptr<warp_inst_t>&, std::unique_ptr<warp_inst_t>&, const char*, int)’:
+abstract_hardware_model.h:2006:32: warning: format ‘%x’ expects argument of type ‘unsigned int’, but argument 2 has type ‘address_type’ {aka ‘long long unsigned int’} [-Wformat=]
+ 2006 |             printf("dst->pc = %x, src->pc = %x\n", dst->pc, src->pc);
+      |                               ~^                   ~~~~~~~
+      |                                |                        |
+      |                                unsigned int             address_type {aka long long unsigned int}
+      |                               %llx
+abstract_hardware_model.h:2006:46: warning: format ‘%x’ expects argument of type ‘unsigned int’, but argument 3 has type ‘address_type’ {aka ‘long long unsigned int’} [-Wformat=]
+ 2006 |             printf("dst->pc = %x, src->pc = %x\n", dst->pc, src->pc);
+      |                                             ~^              ~~~~~~~
+      |                                              |                   |
+      |                                              unsigned int        address_type {aka long long unsigned int}
+      |                                             %llx
+abstract_hardware_model.h:2006:46: warning: format ‘%x’ expects argument of type ‘unsigned int’, but argument 3 has type ‘address_type’ {aka ‘long long unsigned int’} [-Wformat=]
+ 2006 |             printf("dst->pc = %x, src->pc = %x\n", dst->pc, src->pc);
+      |                                             ~^              ~~~~~~~
+      |                                              |                   |
+      |                                              unsigned int        address_type {aka long long unsigned int}
+      |                                             %llx
+In file included from abstract_hardware_model.cc:60:
+abstract_hardware_model.h: In function ‘void move_warp_uniptr_impl(std::unique_ptr<warp_inst_t>&, std::unique_ptr<warp_inst_t>&, const char*, int)’:
+abstract_hardware_model.h:2006:32: warning: format ‘%x’ expects argument of type ‘unsigned int’, but argument 2 has type ‘address_type’ {aka ‘long long unsigned int’} [-Wformat=]
+ 2006 |             printf("dst->pc = %x, src->pc = %x\n", dst->pc, src->pc);
+      |                               ~^                   ~~~~~~~
+      |                                |                        |
+      |                                unsigned int             address_type {aka long long unsigned int}
+      |                               %llx
+abstract_hardware_model.h:2006:46: warning: format ‘%x’ expects argument of type ‘unsigned int’, but argument 3 has type ‘address_type’ {aka ‘long long unsigned int’} [-Wformat=]
+ 2006 |             printf("dst->pc = %x, src->pc = %x\n", dst->pc, src->pc);
+      |                                             ~^              ~~~~~~~
+      |                                              |                   |
+      |                                              unsigned int        address_type {aka long long unsigned int}
+      |                                             %llx
+In file included from addrdec.h:37,
+                 from addrdec.cc:29:
+../abstract_hardware_model.h: In function ‘void move_warp_uniptr_impl(std::unique_ptr<warp_inst_t>&, std::unique_ptr<warp_inst_t>&, const char*, int)’:
+../abstract_hardware_model.h:2006:32: warning: format ‘%x’ expects argument of type ‘unsigned int’, but argument 2 has type ‘address_type’ {aka ‘long long unsigned int’} [-Wformat=]
+ 2006 |             printf("dst->pc = %x, src->pc = %x\n", dst->pc, src->pc);
+      |                               ~^                   ~~~~~~~
+      |                                |                        |
+      |                                unsigned int             address_type {aka long long unsigned int}
+      |                               %llx
+../abstract_hardware_model.h:2006:46: warning: format ‘%x’ expects argument of type ‘unsigned int’, but argument 3 has type ‘address_type’ {aka ‘long long unsigned int’} [-Wformat=]
+ 2006 |             printf("dst->pc = %x, src->pc = %x\n", dst->pc, src->pc);
+      |                                             ~^              ~~~~~~~
+      |                                              |                   |
+      |                                              unsigned int        address_type {aka long long unsigned int}
+      |                                             %llx
+g++  -O3 -g3 -fPIC -DCUDART_VERSION=12040 -fopenmp -Wall -DTRACING_ON=1 -std=c++17 -I/usr/local/cuda-12.4/include -I/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/accelwattch/ -DGPGPUSIM_POWER_MODEL -o /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/gpgpu-sim/dram.o -c dram.cc
+In file included from gpu-sim.h:70,
+                 from dram_sched.h:36,
+                 from dram.cc:33:
+../abstract_hardware_model.h: In function ‘void move_warp_uniptr_impl(std::unique_ptr<warp_inst_t>&, std::unique_ptr<warp_inst_t>&, const char*, int)’:
+../abstract_hardware_model.h:2006:32: warning: format ‘%x’ expects argument of type ‘unsigned int’, but argument 2 has type ‘address_type’ {aka ‘long long unsigned int’} [-Wformat=]
+ 2006 |             printf("dst->pc = %x, src->pc = %x\n", dst->pc, src->pc);
+      |                               ~^                   ~~~~~~~
+      |                                |                        |
+      |                                unsigned int             address_type {aka long long unsigned int}
+      |                               %llx
+../abstract_hardware_model.h:2006:46: warning: format ‘%x’ expects argument of type ‘unsigned int’, but argument 3 has type ‘address_type’ {aka ‘long long unsigned int’} [-Wformat=]
+ 2006 |             printf("dst->pc = %x, src->pc = %x\n", dst->pc, src->pc);
+      |                                             ~^              ~~~~~~~
+      |                                              |                   |
+      |                                              unsigned int        address_type {aka long long unsigned int}
+      |                                             %llx
+g++  -O3 -g3 -fPIC -DCUDART_VERSION=12040 -fopenmp -Wall -DTRACING_ON=1 -std=c++17 -I/usr/local/cuda-12.4/include -I/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/accelwattch/ -DGPGPUSIM_POWER_MODEL -o /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/gpgpu-sim/dram_sched.o -c dram_sched.cc
+In file included from gpu-sim.h:70,
+                 from dram_sched.h:36,
+                 from dram_sched.cc:29:
+../abstract_hardware_model.h: In function ‘void move_warp_uniptr_impl(std::unique_ptr<warp_inst_t>&, std::unique_ptr<warp_inst_t>&, const char*, int)’:
+../abstract_hardware_model.h:2006:32: warning: format ‘%x’ expects argument of type ‘unsigned int’, but argument 2 has type ‘address_type’ {aka ‘long long unsigned int’} [-Wformat=]
+ 2006 |             printf("dst->pc = %x, src->pc = %x\n", dst->pc, src->pc);
+      |                               ~^                   ~~~~~~~
+      |                                |                        |
+      |                                unsigned int             address_type {aka long long unsigned int}
+      |                               %llx
+../abstract_hardware_model.h:2006:46: warning: format ‘%x’ expects argument of type ‘unsigned int’, but argument 3 has type ‘address_type’ {aka ‘long long unsigned int’} [-Wformat=]
+ 2006 |             printf("dst->pc = %x, src->pc = %x\n", dst->pc, src->pc);
+      |                                             ~^              ~~~~~~~
+      |                                              |                   |
+      |                                              unsigned int        address_type {aka long long unsigned int}
+      |                                             %llx
+g++  -O3 -g3 -fPIC -DCUDART_VERSION=12040 -fopenmp -Wall -DTRACING_ON=1 -std=c++17 -I/usr/local/cuda-12.4/include -I/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/accelwattch/ -DGPGPUSIM_POWER_MODEL -o /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/gpgpu-sim/gpu-cache.o -c gpu-cache.cc
+In file included from gpu-cache.h:36,
+                 from gpu-cache.cc:32:
+../abstract_hardware_model.h: In function ‘void move_warp_uniptr_impl(std::unique_ptr<warp_inst_t>&, std::unique_ptr<warp_inst_t>&, const char*, int)’:
+../abstract_hardware_model.h:2006:32: warning: format ‘%x’ expects argument of type ‘unsigned int’, but argument 2 has type ‘address_type’ {aka ‘long long unsigned int’} [-Wformat=]
+ 2006 |             printf("dst->pc = %x, src->pc = %x\n", dst->pc, src->pc);
+      |                               ~^                   ~~~~~~~
+      |                                |                        |
+      |                                unsigned int             address_type {aka long long unsigned int}
+      |                               %llx
+../abstract_hardware_model.h:2006:46: warning: format ‘%x’ expects argument of type ‘unsigned int’, but argument 3 has type ‘address_type’ {aka ‘long long unsigned int’} [-Wformat=]
+ 2006 |             printf("dst->pc = %x, src->pc = %x\n", dst->pc, src->pc);
+      |                                             ~^              ~~~~~~~
+      |                                              |                   |
+      |                                              unsigned int        address_type {aka long long unsigned int}
+      |                                             %llx
+g++  -O3 -g3 -fPIC -DCUDART_VERSION=12040 -fopenmp -Wall -DTRACING_ON=1 -std=c++17 -I/usr/local/cuda-12.4/include -I/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/accelwattch/ -DGPGPUSIM_POWER_MODEL -o /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/gpgpu-sim/gpu-misc.o -c gpu-misc.cc
+g++  -O3 -g3 -fPIC -DCUDART_VERSION=12040 -fopenmp -Wall -DTRACING_ON=1 -std=c++17 -I/usr/local/cuda-12.4/include -I/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/accelwattch/ -DGPGPUSIM_POWER_MODEL -o /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/gpgpu-sim/gpu-sim.o -c gpu-sim.cc
+In file included from gpu-sim.h:70,
+                 from gpu-sim.cc:60:
+../abstract_hardware_model.h: In function ‘void move_warp_uniptr_impl(std::unique_ptr<warp_inst_t>&, std::unique_ptr<warp_inst_t>&, const char*, int)’:
+../abstract_hardware_model.h:2006:32: warning: format ‘%x’ expects argument of type ‘unsigned int’, but argument 2 has type ‘address_type’ {aka ‘long long unsigned int’} [-Wformat=]
+ 2006 |             printf("dst->pc = %x, src->pc = %x\n", dst->pc, src->pc);
+      |                               ~^                   ~~~~~~~
+      |                                |                        |
+      |                                unsigned int             address_type {aka long long unsigned int}
+      |                               %llx
+../abstract_hardware_model.h:2006:46: warning: format ‘%x’ expects argument of type ‘unsigned int’, but argument 3 has type ‘address_type’ {aka ‘long long unsigned int’} [-Wformat=]
+ 2006 |             printf("dst->pc = %x, src->pc = %x\n", dst->pc, src->pc);
+      |                                             ~^              ~~~~~~~
+      |                                              |                   |
+      |                                              unsigned int        address_type {aka long long unsigned int}
+      |                                             %llx
+g++  -O3 -g3 -fPIC -DCUDART_VERSION=12040 -fopenmp -Wall -DTRACING_ON=1 -std=c++17 -I/usr/local/cuda-12.4/include -I/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/accelwattch/ -DGPGPUSIM_POWER_MODEL -o /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/gpgpu-sim/hashing.o -c hashing.cc
+In file included from hashing.cc:6:
+../abstract_hardware_model.h: In function ‘void move_warp_uniptr_impl(std::unique_ptr<warp_inst_t>&, std::unique_ptr<warp_inst_t>&, const char*, int)’:
+../abstract_hardware_model.h:2006:32: warning: format ‘%x’ expects argument of type ‘unsigned int’, but argument 2 has type ‘address_type’ {aka ‘long long unsigned int’} [-Wformat=]
+ 2006 |             printf("dst->pc = %x, src->pc = %x\n", dst->pc, src->pc);
+      |                               ~^                   ~~~~~~~
+      |                                |                        |
+      |                                unsigned int             address_type {aka long long unsigned int}
+      |                               %llx
+../abstract_hardware_model.h:2006:46: warning: format ‘%x’ expects argument of type ‘unsigned int’, but argument 3 has type ‘address_type’ {aka ‘long long unsigned int’} [-Wformat=]
+ 2006 |             printf("dst->pc = %x, src->pc = %x\n", dst->pc, src->pc);
+      |                                             ~^              ~~~~~~~
+      |                                              |                   |
+      |                                              unsigned int        address_type {aka long long unsigned int}
+      |                                             %llx
+g++  -O3 -g3 -fPIC -DCUDART_VERSION=12040 -fopenmp -Wall -DTRACING_ON=1 -std=c++17 -I/usr/local/cuda-12.4/include -I/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/accelwattch/ -DGPGPUSIM_POWER_MODEL -o /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/gpgpu-sim/histogram.o -c histogram.cc
+g++  -O3 -g3 -fPIC -DCUDART_VERSION=12040 -fopenmp -Wall -DTRACING_ON=1 -std=c++17 -I/usr/local/cuda-12.4/include -I/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/accelwattch/ -DGPGPUSIM_POWER_MODEL -o /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/gpgpu-sim/icnt_wrapper.o -c icnt_wrapper.cc
+g++  -O3 -g3 -fPIC -DCUDART_VERSION=12040 -fopenmp -Wall -DTRACING_ON=1 -std=c++17 -I/usr/local/cuda-12.4/include -I/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/accelwattch/ -DGPGPUSIM_POWER_MODEL -o /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/gpgpu-sim/l2cache.o -c l2cache.cc
+In file included from l2cache.cc:38:
+../abstract_hardware_model.h: In function ‘void move_warp_uniptr_impl(std::unique_ptr<warp_inst_t>&, std::unique_ptr<warp_inst_t>&, const char*, int)’:
+../abstract_hardware_model.h:2006:32: warning: format ‘%x’ expects argument of type ‘unsigned int’, but argument 2 has type ‘address_type’ {aka ‘long long unsigned int’} [-Wformat=]
+ 2006 |             printf("dst->pc = %x, src->pc = %x\n", dst->pc, src->pc);
+      |                               ~^                   ~~~~~~~
+      |                                |                        |
+      |                                unsigned int             address_type {aka long long unsigned int}
+      |                               %llx
+../abstract_hardware_model.h:2006:46: warning: format ‘%x’ expects argument of type ‘unsigned int’, but argument 3 has type ‘address_type’ {aka ‘long long unsigned int’} [-Wformat=]
+ 2006 |             printf("dst->pc = %x, src->pc = %x\n", dst->pc, src->pc);
+      |                                             ~^              ~~~~~~~
+      |                                              |                   |
+      |                                              unsigned int        address_type {aka long long unsigned int}
+      |                                             %llx
+g++  -O3 -g3 -fPIC -DCUDART_VERSION=12040 -fopenmp -Wall -DTRACING_ON=1 -std=c++17 -I/usr/local/cuda-12.4/include -I/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/accelwattch/ -DGPGPUSIM_POWER_MODEL -o /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/gpgpu-sim/local_interconnect.o -c local_interconnect.cc
+In file included from mem_fetch.h:33,
+                 from local_interconnect.cc:38:
+../abstract_hardware_model.h: In function ‘void move_warp_uniptr_impl(std::unique_ptr<warp_inst_t>&, std::unique_ptr<warp_inst_t>&, const char*, int)’:
+../abstract_hardware_model.h:2006:32: warning: format ‘%x’ expects argument of type ‘unsigned int’, but argument 2 has type ‘address_type’ {aka ‘long long unsigned int’} [-Wformat=]
+ 2006 |             printf("dst->pc = %x, src->pc = %x\n", dst->pc, src->pc);
+      |                               ~^                   ~~~~~~~
+      |                                |                        |
+      |                                unsigned int             address_type {aka long long unsigned int}
+      |                               %llx
+../abstract_hardware_model.h:2006:46: warning: format ‘%x’ expects argument of type ‘unsigned int’, but argument 3 has type ‘address_type’ {aka ‘long long unsigned int’} [-Wformat=]
+ 2006 |             printf("dst->pc = %x, src->pc = %x\n", dst->pc, src->pc);
+      |                                             ~^              ~~~~~~~
+      |                                              |                   |
+      |                                              unsigned int        address_type {aka long long unsigned int}
+      |                                             %llx
+g++  -O3 -g3 -fPIC -DCUDART_VERSION=12040 -fopenmp -Wall -DTRACING_ON=1 -std=c++17 -I/usr/local/cuda-12.4/include -I/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/accelwattch/ -DGPGPUSIM_POWER_MODEL -o /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/gpgpu-sim/mem_fetch.o -c mem_fetch.cc
+In file included from mem_fetch.h:33,
+                 from mem_fetch.cc:29:
+../abstract_hardware_model.h: In function ‘void move_warp_uniptr_impl(std::unique_ptr<warp_inst_t>&, std::unique_ptr<warp_inst_t>&, const char*, int)’:
+../abstract_hardware_model.h:2006:32: warning: format ‘%x’ expects argument of type ‘unsigned int’, but argument 2 has type ‘address_type’ {aka ‘long long unsigned int’} [-Wformat=]
+ 2006 |             printf("dst->pc = %x, src->pc = %x\n", dst->pc, src->pc);
+      |                               ~^                   ~~~~~~~
+      |                                |                        |
+      |                                unsigned int             address_type {aka long long unsigned int}
+      |                               %llx
+../abstract_hardware_model.h:2006:46: warning: format ‘%x’ expects argument of type ‘unsigned int’, but argument 3 has type ‘address_type’ {aka ‘long long unsigned int’} [-Wformat=]
+ 2006 |             printf("dst->pc = %x, src->pc = %x\n", dst->pc, src->pc);
+      |                                             ~^              ~~~~~~~
+      |                                              |                   |
+      |                                              unsigned int        address_type {aka long long unsigned int}
+      |                                             %llx
+g++  -O3 -g3 -fPIC -DCUDART_VERSION=12040 -fopenmp -Wall -DTRACING_ON=1 -std=c++17 -I/usr/local/cuda-12.4/include -I/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/accelwattch/ -DGPGPUSIM_POWER_MODEL -o /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/gpgpu-sim/mem_latency_stat.o -c mem_latency_stat.cc
+In file included from mem_latency_stat.cc:31:
+../abstract_hardware_model.h: In function ‘void move_warp_uniptr_impl(std::unique_ptr<warp_inst_t>&, std::unique_ptr<warp_inst_t>&, const char*, int)’:
+../abstract_hardware_model.h:2006:32: warning: format ‘%x’ expects argument of type ‘unsigned int’, but argument 2 has type ‘address_type’ {aka ‘long long unsigned int’} [-Wformat=]
+ 2006 |             printf("dst->pc = %x, src->pc = %x\n", dst->pc, src->pc);
+      |                               ~^                   ~~~~~~~
+      |                                |                        |
+      |                                unsigned int             address_type {aka long long unsigned int}
+      |                               %llx
+../abstract_hardware_model.h:2006:46: warning: format ‘%x’ expects argument of type ‘unsigned int’, but argument 3 has type ‘address_type’ {aka ‘long long unsigned int’} [-Wformat=]
+ 2006 |             printf("dst->pc = %x, src->pc = %x\n", dst->pc, src->pc);
+      |                                             ~^              ~~~~~~~
+      |                                              |                   |
+      |                                              unsigned int        address_type {aka long long unsigned int}
+      |                                             %llx
+g++  -O3 -g3 -fPIC -DCUDART_VERSION=12040 -fopenmp -Wall -DTRACING_ON=1 -std=c++17 -I/usr/local/cuda-12.4/include -I/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/accelwattch/ -DGPGPUSIM_POWER_MODEL -o /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/gpgpu-sim/power_interface.o -c power_interface.cc
+In file included from gpu-sim.h:70,
+                 from power_interface.h:34,
+                 from power_interface.cc:32:
+../abstract_hardware_model.h: In function ‘void move_warp_uniptr_impl(std::unique_ptr<warp_inst_t>&, std::unique_ptr<warp_inst_t>&, const char*, int)’:
+../abstract_hardware_model.h:2006:32: warning: format ‘%x’ expects argument of type ‘unsigned int’, but argument 2 has type ‘address_type’ {aka ‘long long unsigned int’} [-Wformat=]
+ 2006 |             printf("dst->pc = %x, src->pc = %x\n", dst->pc, src->pc);
+      |                               ~^                   ~~~~~~~
+      |                                |                        |
+      |                                unsigned int             address_type {aka long long unsigned int}
+      |                               %llx
+../abstract_hardware_model.h:2006:46: warning: format ‘%x’ expects argument of type ‘unsigned int’, but argument 3 has type ‘address_type’ {aka ‘long long unsigned int’} [-Wformat=]
+ 2006 |             printf("dst->pc = %x, src->pc = %x\n", dst->pc, src->pc);
+      |                                             ~^              ~~~~~~~
+      |                                              |                   |
+      |                                              unsigned int        address_type {aka long long unsigned int}
+      |                                             %llx
+g++  -O3 -g3 -fPIC -DCUDART_VERSION=12040 -fopenmp -Wall -DTRACING_ON=1 -std=c++17 -I/usr/local/cuda-12.4/include -I/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/accelwattch/ -DGPGPUSIM_POWER_MODEL -o /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/gpgpu-sim/power_stat.o -c power_stat.cc
+In file included from gpu-sim.h:70,
+                 from power_stat.h:36,
+                 from power_stat.cc:31:
+../abstract_hardware_model.h: In function ‘void move_warp_uniptr_impl(std::unique_ptr<warp_inst_t>&, std::unique_ptr<warp_inst_t>&, const char*, int)’:
+../abstract_hardware_model.h:2006:32: warning: format ‘%x’ expects argument of type ‘unsigned int’, but argument 2 has type ‘address_type’ {aka ‘long long unsigned int’} [-Wformat=]
+ 2006 |             printf("dst->pc = %x, src->pc = %x\n", dst->pc, src->pc);
+      |                               ~^                   ~~~~~~~
+      |                                |                        |
+      |                                unsigned int             address_type {aka long long unsigned int}
+      |                               %llx
+../abstract_hardware_model.h:2006:46: warning: format ‘%x’ expects argument of type ‘unsigned int’, but argument 3 has type ‘address_type’ {aka ‘long long unsigned int’} [-Wformat=]
+ 2006 |             printf("dst->pc = %x, src->pc = %x\n", dst->pc, src->pc);
+      |                                             ~^              ~~~~~~~
+      |                                              |                   |
+      |                                              unsigned int        address_type {aka long long unsigned int}
+      |                                             %llx
+g++  -O3 -g3 -fPIC -DCUDART_VERSION=12040 -fopenmp -Wall -DTRACING_ON=1 -std=c++17 -I/usr/local/cuda-12.4/include -I/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/accelwattch/ -DGPGPUSIM_POWER_MODEL -o /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/gpgpu-sim/result_bus.o -c result_bus.cc
+In file included from result_bus.h:34,
+                 from result_bus.cc:4:
+../abstract_hardware_model.h: In function ‘void move_warp_uniptr_impl(std::unique_ptr<warp_inst_t>&, std::unique_ptr<warp_inst_t>&, const char*, int)’:
+../abstract_hardware_model.h:2006:32: warning: format ‘%x’ expects argument of type ‘unsigned int’, but argument 2 has type ‘address_type’ {aka ‘long long unsigned int’} [-Wformat=]
+ 2006 |             printf("dst->pc = %x, src->pc = %x\n", dst->pc, src->pc);
+      |                               ~^                   ~~~~~~~
+      |                                |                        |
+      |                                unsigned int             address_type {aka long long unsigned int}
+      |                               %llx
+../abstract_hardware_model.h:2006:46: warning: format ‘%x’ expects argument of type ‘unsigned int’, but argument 3 has type ‘address_type’ {aka ‘long long unsigned int’} [-Wformat=]
+ 2006 |             printf("dst->pc = %x, src->pc = %x\n", dst->pc, src->pc);
+      |                                             ~^              ~~~~~~~
+      |                                              |                   |
+      |                                              unsigned int        address_type {aka long long unsigned int}
+      |                                             %llx
+g++  -O3 -g3 -fPIC -DCUDART_VERSION=12040 -fopenmp -Wall -DTRACING_ON=1 -std=c++17 -I/usr/local/cuda-12.4/include -I/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/accelwattch/ -DGPGPUSIM_POWER_MODEL -o /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/gpgpu-sim/scoreboard.o -c scoreboard.cc
+In file included from scoreboard.h:66,
+                 from scoreboard.cc:57:
+../abstract_hardware_model.h: In function ‘void move_warp_uniptr_impl(std::unique_ptr<warp_inst_t>&, std::unique_ptr<warp_inst_t>&, const char*, int)’:
+../abstract_hardware_model.h:2006:32: warning: format ‘%x’ expects argument of type ‘unsigned int’, but argument 2 has type ‘address_type’ {aka ‘long long unsigned int’} [-Wformat=]
+ 2006 |             printf("dst->pc = %x, src->pc = %x\n", dst->pc, src->pc);
+      |                               ~^                   ~~~~~~~
+      |                                |                        |
+      |                                unsigned int             address_type {aka long long unsigned int}
+      |                               %llx
+../abstract_hardware_model.h:2006:46: warning: format ‘%x’ expects argument of type ‘unsigned int’, but argument 3 has type ‘address_type’ {aka ‘long long unsigned int’} [-Wformat=]
+ 2006 |             printf("dst->pc = %x, src->pc = %x\n", dst->pc, src->pc);
+      |                                             ~^              ~~~~~~~
+      |                                              |                   |
+      |                                              unsigned int        address_type {aka long long unsigned int}
+      |                                             %llx
+g++  -O3 -g3 -fPIC -DCUDART_VERSION=12040 -fopenmp -Wall -DTRACING_ON=1 -std=c++17 -I/usr/local/cuda-12.4/include -I/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/accelwattch/ -DGPGPUSIM_POWER_MODEL -o /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/gpgpu-sim/scoreboard_reads.o -c scoreboard_reads.cc
+In file included from scoreboard_reads.h:40,
+                 from scoreboard_reads.cc:30:
+../abstract_hardware_model.h: In function ‘void move_warp_uniptr_impl(std::unique_ptr<warp_inst_t>&, std::unique_ptr<warp_inst_t>&, const char*, int)’:
+../abstract_hardware_model.h:2006:32: warning: format ‘%x’ expects argument of type ‘unsigned int’, but argument 2 has type ‘address_type’ {aka ‘long long unsigned int’} [-Wformat=]
+ 2006 |             printf("dst->pc = %x, src->pc = %x\n", dst->pc, src->pc);
+      |                               ~^                   ~~~~~~~
+      |                                |                        |
+      |                                unsigned int             address_type {aka long long unsigned int}
+      |                               %llx
+../abstract_hardware_model.h:2006:46: warning: format ‘%x’ expects argument of type ‘unsigned int’, but argument 3 has type ‘address_type’ {aka ‘long long unsigned int’} [-Wformat=]
+ 2006 |             printf("dst->pc = %x, src->pc = %x\n", dst->pc, src->pc);
+      |                                             ~^              ~~~~~~~
+      |                                              |                   |
+      |                                              unsigned int        address_type {aka long long unsigned int}
+      |                                             %llx
+g++  -O3 -g3 -fPIC -DCUDART_VERSION=12040 -fopenmp -Wall -DTRACING_ON=1 -std=c++17 -I/usr/local/cuda-12.4/include -I/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/accelwattch/ -DGPGPUSIM_POWER_MODEL -o /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/gpgpu-sim/shader.o -c shader.cc
+In file included from shader.h:79,
+                 from shader.cc:60:
+../abstract_hardware_model.h: In function ‘void move_warp_uniptr_impl(std::unique_ptr<warp_inst_t>&, std::unique_ptr<warp_inst_t>&, const char*, int)’:
+../abstract_hardware_model.h:2006:32: warning: format ‘%x’ expects argument of type ‘unsigned int’, but argument 2 has type ‘address_type’ {aka ‘long long unsigned int’} [-Wformat=]
+ 2006 |             printf("dst->pc = %x, src->pc = %x\n", dst->pc, src->pc);
+      |                               ~^                   ~~~~~~~
+      |                                |                        |
+      |                                unsigned int             address_type {aka long long unsigned int}
+      |                               %llx
+../abstract_hardware_model.h:2006:46: warning: format ‘%x’ expects argument of type ‘unsigned int’, but argument 3 has type ‘address_type’ {aka ‘long long unsigned int’} [-Wformat=]
+ 2006 |             printf("dst->pc = %x, src->pc = %x\n", dst->pc, src->pc);
+      |                                             ~^              ~~~~~~~
+      |                                              |                   |
+      |                                              unsigned int        address_type {aka long long unsigned int}
+      |                                             %llx
+shader.cc: In member function ‘void opndcoll_rfu_t::allocate_cu(unsigned int)’:
+shader.cc:4605:18: warning: ‘schd_id’ may be used uninitialized in this function [-Wmaybe-uninitialized]
+ 4605 |         unsigned schd_id;
+      |                  ^~~~~~~
+g++  -O3 -g3 -fPIC -DCUDART_VERSION=12040 -fopenmp -Wall -DTRACING_ON=1 -std=c++17 -I/usr/local/cuda-12.4/include -I/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/accelwattch/ -DGPGPUSIM_POWER_MODEL -o /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/gpgpu-sim/stack.o -c stack.cc
+In file included from stack.h:32,
+                 from stack.cc:29:
+../abstract_hardware_model.h: In function ‘void move_warp_uniptr_impl(std::unique_ptr<warp_inst_t>&, std::unique_ptr<warp_inst_t>&, const char*, int)’:
+../abstract_hardware_model.h:2006:32: warning: format ‘%x’ expects argument of type ‘unsigned int’, but argument 2 has type ‘address_type’ {aka ‘long long unsigned int’} [-Wformat=]
+ 2006 |             printf("dst->pc = %x, src->pc = %x\n", dst->pc, src->pc);
+      |                               ~^                   ~~~~~~~
+      |                                |                        |
+      |                                unsigned int             address_type {aka long long unsigned int}
+      |                               %llx
+../abstract_hardware_model.h:2006:46: warning: format ‘%x’ expects argument of type ‘unsigned int’, but argument 3 has type ‘address_type’ {aka ‘long long unsigned int’} [-Wformat=]
+ 2006 |             printf("dst->pc = %x, src->pc = %x\n", dst->pc, src->pc);
+      |                                             ~^              ~~~~~~~
+      |                                              |                   |
+      |                                              unsigned int        address_type {aka long long unsigned int}
+      |                                             %llx
+g++  -O3 -g3 -fPIC -DCUDART_VERSION=12040 -fopenmp -Wall -DTRACING_ON=1 -std=c++17 -I/usr/local/cuda-12.4/include -I/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/accelwattch/ -DGPGPUSIM_POWER_MODEL -o /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/gpgpu-sim/stat-tool.o -c stat-tool.cc
+In file included from stat-tool.h:32,
+                 from stat-tool.cc:29:
+../abstract_hardware_model.h: In function ‘void move_warp_uniptr_impl(std::unique_ptr<warp_inst_t>&, std::unique_ptr<warp_inst_t>&, const char*, int)’:
+../abstract_hardware_model.h:2006:32: warning: format ‘%x’ expects argument of type ‘unsigned int’, but argument 2 has type ‘address_type’ {aka ‘long long unsigned int’} [-Wformat=]
+ 2006 |             printf("dst->pc = %x, src->pc = %x\n", dst->pc, src->pc);
+      |                               ~^                   ~~~~~~~
+      |                                |                        |
+      |                                unsigned int             address_type {aka long long unsigned int}
+      |                               %llx
+../abstract_hardware_model.h:2006:46: warning: format ‘%x’ expects argument of type ‘unsigned int’, but argument 3 has type ‘address_type’ {aka ‘long long unsigned int’} [-Wformat=]
+ 2006 |             printf("dst->pc = %x, src->pc = %x\n", dst->pc, src->pc);
+      |                                             ~^              ~~~~~~~
+      |                                              |                   |
+      |                                              unsigned int        address_type {aka long long unsigned int}
+      |                                             %llx
+g++  -O3 -g3 -fPIC -DCUDART_VERSION=12040 -fopenmp -Wall -DTRACING_ON=1 -std=c++17 -I/usr/local/cuda-12.4/include -I/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/accelwattch/ -DGPGPUSIM_POWER_MODEL -o /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/gpgpu-sim/traffic_breakdown.o -c traffic_breakdown.cc
+In file included from mem_fetch.h:33,
+                 from traffic_breakdown.cc:2:
+../abstract_hardware_model.h: In function ‘void move_warp_uniptr_impl(std::unique_ptr<warp_inst_t>&, std::unique_ptr<warp_inst_t>&, const char*, int)’:
+../abstract_hardware_model.h:2006:32: warning: format ‘%x’ expects argument of type ‘unsigned int’, but argument 2 has type ‘address_type’ {aka ‘long long unsigned int’} [-Wformat=]
+ 2006 |             printf("dst->pc = %x, src->pc = %x\n", dst->pc, src->pc);
+      |                               ~^                   ~~~~~~~
+      |                                |                        |
+      |                                unsigned int             address_type {aka long long unsigned int}
+      |                               %llx
+../abstract_hardware_model.h:2006:46: warning: format ‘%x’ expects argument of type ‘unsigned int’, but argument 3 has type ‘address_type’ {aka ‘long long unsigned int’} [-Wformat=]
+ 2006 |             printf("dst->pc = %x, src->pc = %x\n", dst->pc, src->pc);
+      |                                             ~^              ~~~~~~~
+      |                                              |                   |
+      |                                              unsigned int        address_type {aka long long unsigned int}
+      |                                             %llx
+g++  -O3 -g3 -fPIC -DCUDART_VERSION=12040 -fopenmp -Wall -DTRACING_ON=1 -std=c++17 -I/usr/local/cuda-12.4/include -I/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/accelwattch/ -DGPGPUSIM_POWER_MODEL -o /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/gpgpu-sim/visualizer.o -c visualizer.cc
+In file included from gpu-sim.h:70,
+                 from visualizer.cc:32:
+../abstract_hardware_model.h: In function ‘void move_warp_uniptr_impl(std::unique_ptr<warp_inst_t>&, std::unique_ptr<warp_inst_t>&, const char*, int)’:
+../abstract_hardware_model.h:2006:32: warning: format ‘%x’ expects argument of type ‘unsigned int’, but argument 2 has type ‘address_type’ {aka ‘long long unsigned int’} [-Wformat=]
+ 2006 |             printf("dst->pc = %x, src->pc = %x\n", dst->pc, src->pc);
+      |                               ~^                   ~~~~~~~
+      |                                |                        |
+      |                                unsigned int             address_type {aka long long unsigned int}
+      |                               %llx
+../abstract_hardware_model.h:2006:46: warning: format ‘%x’ expects argument of type ‘unsigned int’, but argument 3 has type ‘address_type’ {aka ‘long long unsigned int’} [-Wformat=]
+ 2006 |             printf("dst->pc = %x, src->pc = %x\n", dst->pc, src->pc);
+      |                                             ~^              ~~~~~~~
+      |                                              |                   |
+      |                                              unsigned int        address_type {aka long long unsigned int}
+      |                                             %llx
+ar rcs  /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/gpgpu-sim/libgpu_uarch_sim.a /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/gpgpu-sim/addrdec.o /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/gpgpu-sim/dram.o /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/gpgpu-sim/dram_sched.o /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/gpgpu-sim/gpu-cache.o /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/gpgpu-sim/gpu-misc.o /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/gpgpu-sim/gpu-sim.o /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/gpgpu-sim/hashing.o /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/gpgpu-sim/histogram.o /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/gpgpu-sim/icnt_wrapper.o /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/gpgpu-sim/l2cache.o /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/gpgpu-sim/local_interconnect.o /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/gpgpu-sim/mem_fetch.o /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/gpgpu-sim/mem_latency_stat.o /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/gpgpu-sim/power_interface.o /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/gpgpu-sim/power_stat.o /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/gpgpu-sim/result_bus.o /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/gpgpu-sim/scoreboard.o /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/gpgpu-sim/scoreboard_reads.o /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/gpgpu-sim/shader.o /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/gpgpu-sim/stack.o /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/gpgpu-sim/stat-tool.o /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/gpgpu-sim/traffic_breakdown.o /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/gpgpu-sim/visualizer.o /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/remodeling/*.o /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/fusedMemory/*.o
+make[3]: Leaving directory '/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim'
+ar rcs  /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/libgpgpusim.a /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/abstract_hardware_model.o /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/debug.o /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/gpgpusim_entrypoint.o /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/option_parser.o /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/statwrapper.o /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/stream_manager.o /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/trace.o /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/gpgpu-sim/*.o
+make[2]: Leaving directory '/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src'
+g++ -lm -lz -lGL -pthread -fopenmp -shared -Wl,-soname,libcudart.so -Wl,--version-script=linux-so-version.txt\
+		/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/libcuda/*.o \
+		/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/cuda-sim/*.o \
+		/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/cuda-sim/decuda_pred_table/*.o \
+		/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/gpgpu-sim/*.o \
+		/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/remodeling/*.o \
+		/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/fusedMemory/*.o \
+		/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/intersim2/*.o \
+		/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/*.o \
+		/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/build/gcc-/cuda-12040/release/accelwattch/*.o \
+		-o lib/gcc-/cuda-12040/release/libcudart.so
+if [ ! -f lib/gcc-/cuda-12040/release/libcudart.so.2 ]; then ln -s libcudart.so lib/gcc-/cuda-12040/release/libcudart.so.2; fi
+if [ ! -f lib/gcc-/cuda-12040/release/libcudart.so.3 ]; then ln -s libcudart.so lib/gcc-/cuda-12040/release/libcudart.so.3; fi
+if [ ! -f lib/gcc-/cuda-12040/release/libcudart.so.4 ]; then ln -s libcudart.so lib/gcc-/cuda-12040/release/libcudart.so.4; fi
+if [ ! -f lib/gcc-/cuda-12040/release/libcudart.so.5.0 ]; then ln -s libcudart.so lib/gcc-/cuda-12040/release/libcudart.so.5.0; fi
+if [ ! -f lib/gcc-/cuda-12040/release/libcudart.so.5.5 ]; then ln -s libcudart.so lib/gcc-/cuda-12040/release/libcudart.so.5.5; fi
+if [ ! -f lib/gcc-/cuda-12040/release/libcudart.so.6.0 ]; then ln -s libcudart.so lib/gcc-/cuda-12040/release/libcudart.so.6.0; fi
+if [ ! -f lib/gcc-/cuda-12040/release/libcudart.so.6.5 ]; then ln -s libcudart.so lib/gcc-/cuda-12040/release/libcudart.so.6.5; fi
+if [ ! -f lib/gcc-/cuda-12040/release/libcudart.so.7.0 ]; then ln -s libcudart.so lib/gcc-/cuda-12040/release/libcudart.so.7.0; fi
+if [ ! -f lib/gcc-/cuda-12040/release/libcudart.so.7.5 ]; then ln -s libcudart.so lib/gcc-/cuda-12040/release/libcudart.so.7.5; fi
+if [ ! -f lib/gcc-/cuda-12040/release/libcudart.so.8.0 ]; then ln -s libcudart.so lib/gcc-/cuda-12040/release/libcudart.so.8.0; fi
+if [ ! -f lib/gcc-/cuda-12040/release/libcudart.so.9.0 ]; then ln -s libcudart.so lib/gcc-/cuda-12040/release/libcudart.so.9.0; fi
+if [ ! -f lib/gcc-/cuda-12040/release/libcudart.so.9.1 ]; then ln -s libcudart.so lib/gcc-/cuda-12040/release/libcudart.so.9.1; fi
+if [ ! -f lib/gcc-/cuda-12040/release/libcudart.so.9.2 ]; then ln -s libcudart.so lib/gcc-/cuda-12040/release/libcudart.so.9.2; fi
+if [ ! -f lib/gcc-/cuda-12040/release/libcudart.so.10.0 ]; then ln -s libcudart.so lib/gcc-/cuda-12040/release/libcudart.so.10.0; fi
+if [ ! -f lib/gcc-/cuda-12040/release/libcudart.so.10.1 ]; then ln -s libcudart.so lib/gcc-/cuda-12040/release/libcudart.so.10.1; fi
+if [ ! -f lib/gcc-/cuda-12040/release/libcudart.so.11.0 ]; then ln -s libcudart.so lib/gcc-/cuda-12040/release/libcudart.so.11.0; fi
+if [ ! -f lib/gcc-/cuda-12040/release/libcudart.so.12.0 ]; then ln -s libcudart.so lib/gcc-/cuda-12040/release/libcudart.so.12.0; fi
+make[1]: Leaving directory '/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim'
+g++ -std=c++17 -L/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/lib/gcc-/cuda-12040/release/ -lm -lGL -pthread -lz -lcudart -lz ./build/release/*.o ../util/traces_enhanced/obj/control_bits.o ../util/traces_enhanced/obj/JSONBase.o ../util/traces_enhanced/obj/register_usage.o ../util/traces_enhanced/obj/string_utilities.o ../util/traces_enhanced/obj/traced_execution.o ../util/traces_enhanced/obj/traced_instruction.o ../util/traces_enhanced/obj/traced_kernel.o ../util/traces_enhanced/obj/traced_operand.o ../util/traces_enhanced/pb_trace/obj/address.pb.o ../util/traces_enhanced/pb_trace/obj/cuda_stream.pb.o ../util/traces_enhanced/pb_trace/obj/dim3d.pb.o ../util/traces_enhanced/pb_trace/obj/gpu_device.pb.o ../util/traces_enhanced/pb_trace/obj/instruction.pb.o ../util/traces_enhanced/pb_trace/obj/kernel.pb.o ../util/traces_enhanced/pb_trace/obj/threadblock.pb.o ../util/traces_enhanced/pb_trace/obj/trace.pb.o ../util/traces_enhanced/pb_trace/obj/warp.pb.o -lgomp -lprotobuf -o ./bin/release/accel-sim.out 
+make: Leaving directory '/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator'

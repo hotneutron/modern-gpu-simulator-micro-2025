@@ -1,0 +1,62 @@
+if [ ! -d ./bin/release ]; then mkdir -p ./bin/release; fi;
+if [ ! -d ./build/release ]; then mkdir -p ./build/release; fi;
+touch ./build/release/main.makedepend
+makedepend -f./build/release/main.makedepend -p./build/release/ main.cc 2> /dev/null
+make -C ../util/traces_enhanced
+make[1]: Entering directory '/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/util/traces_enhanced'
+g++ -c -I/usr/local/include -I. -I./pb_trace/include -I/usr/local/include -fPIC -o pb_trace/obj/address.pb.o pb_trace/src/address.pb.cc
+g++ -c -I/usr/local/include -I. -I./pb_trace/include -I/usr/local/include -fPIC -o pb_trace/obj/cuda_stream.pb.o pb_trace/src/cuda_stream.pb.cc
+g++ -c -I/usr/local/include -I. -I./pb_trace/include -I/usr/local/include -fPIC -o pb_trace/obj/dim3d.pb.o pb_trace/src/dim3d.pb.cc
+g++ -c -I/usr/local/include -I. -I./pb_trace/include -I/usr/local/include -fPIC -o pb_trace/obj/gpu_device.pb.o pb_trace/src/gpu_device.pb.cc
+g++ -c -I/usr/local/include -I. -I./pb_trace/include -I/usr/local/include -fPIC -o pb_trace/obj/instruction.pb.o pb_trace/src/instruction.pb.cc
+g++ -c -I/usr/local/include -I. -I./pb_trace/include -I/usr/local/include -fPIC -o pb_trace/obj/kernel.pb.o pb_trace/src/kernel.pb.cc
+g++ -c -I/usr/local/include -I. -I./pb_trace/include -I/usr/local/include -fPIC -o pb_trace/obj/threadblock.pb.o pb_trace/src/threadblock.pb.cc
+g++ -c -I/usr/local/include -I. -I./pb_trace/include -I/usr/local/include -fPIC -o pb_trace/obj/trace.pb.o pb_trace/src/trace.pb.cc
+g++ -c -I/usr/local/include -I. -I./pb_trace/include -I/usr/local/include -fPIC -o pb_trace/obj/warp.pb.o pb_trace/src/warp.pb.cc
+Protocol buffer files generated
+g++ -c -o obj/traced_operand.o src/traced_operand.cc -Wall -O3 -g3 -fPIC -std=c++17 -I/usr/local/cuda-12.4/include -fPIC
+Assembler messages:
+Fatal error: can't create obj/traced_operand.o: Permission denied
+make[1]: *** [Makefile:65: obj/traced_operand.o] Error 1
+make[1]: Leaving directory '/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/util/traces_enhanced'
+make: *** [Makefile:107: traces_enhanced] Error 2
+if [ ! -d ./bin/release ]; then mkdir -p ./bin/release; fi;
+if [ ! -d ./build/release ]; then mkdir -p ./build/release; fi;
+touch ./build/release/main.makedepend
+makedepend -f./build/release/main.makedepend -p./build/release/ main.cc 2> /dev/null
+make -C ../util/traces_enhanced
+make[1]: Entering directory '/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/util/traces_enhanced'
+Protocol buffer files generated
+g++ -c -o obj/traced_operand.o src/traced_operand.cc -Wall -O3 -g3 -fPIC -std=c++17 -I/usr/local/cuda-12.4/include -fPIC
+g++ -c -o obj/traced_instruction.o src/traced_instruction.cc -Wall -O3 -g3 -fPIC -std=c++17 -I/usr/local/cuda-12.4/include -fPIC
+make[1]: Leaving directory '/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/util/traces_enhanced'
+make -C trace-driven depend
+make[1]: Entering directory '/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/trace-driven'
+touch ../build/release/trace-driven.Makefile.makedepend
+makedepend -f../build/release/trace-driven.Makefile.makedepend -p../build/release/ trace_driven.cc 2> /dev/null
+make[1]: 'depend' is up to date.
+make[1]: Leaving directory '/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/trace-driven'
+make -C trace-driven
+make[1]: Entering directory '/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/trace-driven'
+touch ../build/release/trace-driven.Makefile.makedepend
+makedepend -f../build/release/trace-driven.Makefile.makedepend -p../build/release/ trace_driven.cc 2> /dev/null
+g++ -O3 -g3 -fPIC -std=c++17 -Wall -I/usr/local/cuda-12.4/include -I. -I/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/libcuda -I/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src -c trace_driven.cc -o ../build/release/trace_driven.o 
+make[1]: Leaving directory '/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/trace-driven'
+make -C trace-parser depend
+make[1]: Entering directory '/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/trace-parser'
+touch ../build/release/trace-parser.Makefile.makedepend
+makedepend -f../build/release/trace-parser.Makefile.makedepend -p../build/release/ trace_parser.cc 2> /dev/null
+make[1]: 'depend' is up to date.
+make[1]: Leaving directory '/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/trace-parser'
+make -C trace-parser
+make[1]: Entering directory '/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/trace-parser'
+touch ../build/release/trace-parser.Makefile.makedepend
+makedepend -f../build/release/trace-parser.Makefile.makedepend -p../build/release/ trace_parser.cc 2> /dev/null
+g++ -O3 -g3 -fPIC -std=c++17 -Wall -I/usr/local/cuda-12.4/include -I. -I/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/libcuda -I/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src -c trace_parser.cc -o ../build/release/trace_parser.o 
+make[1]: Leaving directory '/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/trace-parser'
+make -C gpgpu-sim
+make[1]: Entering directory '/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim'
+ERROR *** run 'source setup_environment' before 'make'; please see README.
+make[1]: *** [Makefile:101: check_setup_environment] Error 101
+make[1]: Leaving directory '/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim'
+make: *** [Makefile:76: gpgpu-sim] Error 2

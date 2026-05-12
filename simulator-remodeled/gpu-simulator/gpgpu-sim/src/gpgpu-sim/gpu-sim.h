@@ -80,6 +80,7 @@
 #include "remodeling/fusedMemory/coalescingStats.h"
 
 #include "../../../../util/traces_enhanced/src/traced_execution.h" // MOD. Improved tracer
+#include "stat_gating.h"
 
 #include <omp.h>
 
@@ -448,6 +449,7 @@ class gpgpu_sim_config : public power_config,
     m_valid = false;
     gpgpu_ctx = ctx;
     g_visualizer_filename = nullptr;
+    gpu_stat_gating_segments = nullptr;
   }
   ~gpgpu_sim_config() {
     if (g_visualizer_filename) {
@@ -670,6 +672,9 @@ class gpgpu_sim_config : public power_config,
   unsigned int gpgpu_compute_capability_minor;
   unsigned long long liveness_message_freq;
 
+  // stat-gating
+  char *gpu_stat_gating_segments;
+
   friend class gpgpu_sim;
 };
 
@@ -824,6 +829,7 @@ class gpgpu_sim : public gpgpu_t {
   const gpgpu_sim_config &get_config() const { return m_config; }
   void gpu_print_stat();
   void dump_pipeline(int mask, int s, int m) const;
+  StatGating &get_stat_gating() { return m_stat_gating; }
 
   void perf_memcpy_to_gpu(size_t dst_start_addr, size_t count);
 
@@ -968,6 +974,7 @@ class gpgpu_sim : public gpgpu_t {
   class memory_stats_t *m_memory_stats;
   class power_stat_t *m_power_stats;
   class gpgpu_sim_wrapper *m_gpgpusim_wrapper;
+  StatGating m_stat_gating;
   unsigned long long last_gpu_sim_insn;
 
   unsigned long long last_liveness_message_time;

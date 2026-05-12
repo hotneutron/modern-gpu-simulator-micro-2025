@@ -1,7 +1,8 @@
 #include "stat_gating.h"
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include <fstream>
-#include <json/json.h>
 
 StatGating::StatGating() : enabled_(false), total_cycles_(0) {}
 
@@ -14,33 +15,38 @@ void StatGating::reset() {
   stats_.clear();
 }
 
-bool StatGating::load_segments(const std::string& json_path) {
+bool StatGating::load_segments(const std::string& txt_path) {
   reset();
-  std::ifstream f(json_path);
+  std::ifstream f(txt_path);
   if (!f.is_open()) {
-    fprintf(stderr, "StatGating: cannot open %s\n", json_path.c_str());
+    fprintf(stderr, "StatGating: cannot open %s\n", txt_path.c_str());
     return false;
   }
 
-  Json::Value root;
-  f >> root;
-
-  const Json::Value& segs = root["segments"];
-  for (const auto& js : segs) {
+  // Format: "start_inst end_inst" per line
+  unsigned id = 0;
+  unsigned long long start_inst, end_inst;
+  while (f >> start_inst >> end_inst) {
     SegmentDef sd;
-    sd.segment_id = js["segment_id"].asUInt();
-    sd.start_inst = js["start_interval"].asUInt64() * 1024;
-    sd.end_inst = (js["end_interval"].asUInt64() + 1) * 1024 - 1;
+    sd.segment_id = id++;
+    sd.start_inst = start_inst;
+    sd.end_inst = end_inst;
     sd.cta_x = 0;
     sd.cta_y = 0;
     sd.cta_z = 0;
     segments_by_cta_[0].push_back(sd);
   }
 
-  enabled_ = true;
+  enabled_ = !segments_by_cta_[0].empty();
   total_cycles_ = 0;
-  fprintf(stderr, "StatGating: loaded %zu segments\n", segments_by_cta_[0].size());
-  return true;
+
+  if (enabled_) {
+    fprintf(stderr, "StatGating: loaded %zu segments from %s\n",
+            segments_by_cta_[0].size(), txt_path.c_str());
+  } else {
+    fprintf(stderr, "StatGating: no segments found in %s\n", txt_path.c_str());
+  }
+  return enabled_;
 }
 
 unsigned StatGating::current_segment_for_cta(unsigned cta_id,
@@ -68,7 +74,7 @@ void StatGating::record_event(unsigned cta_id, unsigned event_type,
 }
 
 void StatGating::print_stats(FILE* out) {
-  if (!enabled_) return;
+  if (!enabled_ || stats_.empty()) return;
   fprintf(out, "gpu_segment_count = %zu\n", stats_.size());
   for (auto& [seg_id, st] : stats_) {
     double cpi = st.instructions > 0
@@ -77,40 +83,9 @@ void StatGating::print_stats(FILE* out) {
     fprintf(out, "gpu_segment_%u_cycles = %llu\n", seg_id, st.cycles);
     fprintf(out, "gpu_segment_%u_instructions = %llu\n", seg_id, st.instructions);
     fprintf(out, "gpu_segment_%u_cpi = %.4f\n", seg_id, cpi);
-    fprintf(out, "gpu_segment_%u_l1_hit_rate = %.3f\n", seg_id,
-            (st.l1_hits + st.l1_misses) > 0
-                ? (double)st.l1_hits / (st.l1_hits + st.l1_misses)
-                : 0.0);
-    fprintf(out, "gpu_segment_%u_l2_hit_rate = %.3f\n", seg_id,
-            (st.l2_hits + st.l2_misses) > 0
-                ? (double)st.l2_hits / (st.l2_hits + st.l2_misses)
-                : 0.0);
   }
-}
-
-void StatGating::emit_json(const std::string& out_path) {
-  Json::Value root;
-  root["total_cycles"] = (Json::Value::UInt64)total_cycles_;
-
-  for (auto& [seg_id, st] : stats_) {
-    Json::Value js;
-    js["segment_id"] = seg_id;
-    js["cycles"] = (Json::Value::UInt64)st.cycles;
-    js["instructions"] = (Json::Value::UInt64)st.instructions;
-    js["cpi"] = st.instructions > 0
-                    ? (double)st.cycles / st.instructions
-                    : 0.0;
-    js["l1_hit_rate"] = (st.l1_hits + st.l1_misses) > 0
-                            ? (double)st.l1_hits / (st.l1_hits + st.l1_misses)
-                            : 0.0;
-    js["l2_hit_rate"] = (st.l2_hits + st.l2_misses) > 0
-                            ? (double)st.l2_hits / (st.l2_hits + st.l2_misses)
-                            : 0.0;
-    root["segments"].append(js);
-  }
-
-  std::ofstream f(out_path);
-  f << root;
+  bool ok = validate_sum();
+  fprintf(out, "gpu_segment_validate_sum = %s\n", ok ? "PASS" : "FAIL");
 }
 
 bool StatGating::validate_sum() const {
@@ -120,7 +95,7 @@ bool StatGating::validate_sum() const {
     seg_sum += st.cycles;
   bool ok = seg_sum == total_cycles_;
   if (!ok)
-    fprintf(stderr, "StatGating: segment sum (%llu) != total (%llu)\n",
-            seg_sum, total_cycles_);
+    fprintf(stderr, "StatGating: segment sum (%llu) != total (%llu), diff=%lld\n",
+            seg_sum, total_cycles_, (long long)(total_cycles_ - seg_sum));
   return ok;
 }

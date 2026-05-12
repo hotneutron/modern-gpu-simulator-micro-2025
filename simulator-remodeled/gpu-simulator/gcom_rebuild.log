@@ -1,0 +1,50 @@
+if [ ! -d ./bin/release ]; then mkdir -p ./bin/release; fi;
+if [ ! -d ./build/release ]; then mkdir -p ./build/release; fi;
+touch ./build/release/main.makedepend
+makedepend -f./build/release/main.makedepend -p./build/release/ main.cc 2> /dev/null
+make -C ../util/traces_enhanced
+make -C gpgpu-sim
+echo "const char *g_accelsim_version=\"accelsim-commit-71ae7c5889e2603ef108c5ef8c83dbfbc9cd22df_modified_0.0\";" > ./build/release/accelsim_version.h
+make[1]: Entering directory '/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/util/traces_enhanced'
+g++ -fopenmp -Wall -O3 -g3 -fPIC -std=c++17   -I./build/release -I./trace-driven -I./trace-parser -I/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/libcuda -I/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src -I/usr/local/cuda-12.4/include -c main.cc -o ./build/release/main.o
+make[1]: Entering directory '/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim'
+g++ -c -o obj/traced_operand.o src/traced_operand.cc -Wall -O3 -g3 -fPIC -std=c++17 -I/usr/local/cuda-12.4/include -fPIC
+g++ -c -o obj/traced_instruction.o src/traced_instruction.cc -Wall -O3 -g3 -fPIC -std=c++17 -I/usr/local/cuda-12.4/include -fPIC
+Protocol buffer files generated
+ERROR *** run 'source setup_environment' before 'make'; please see README.
+make[1]: *** [Makefile:101: check_setup_environment] Error 101
+make[1]: Leaving directory '/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim'
+make: *** [Makefile:76: gpgpu-sim] Error 2
+make: *** Waiting for unfinished jobs....
+In file included from src/../../../gpu-simulator/trace-parser/trace_parser.h:37,
+                 from src/traced_instruction.cc:32:
+src/../../../gpu-simulator/trace-parser/../gpgpu-sim/src/abstract_hardware_model.h: In function ‘void move_warp_uniptr_impl(std::unique_ptr<warp_inst_t>&, std::unique_ptr<warp_inst_t>&, const char*, int)’:
+src/../../../gpu-simulator/trace-parser/../gpgpu-sim/src/abstract_hardware_model.h:2006:32: warning: format ‘%x’ expects argument of type ‘unsigned int’, but argument 2 has type ‘address_type’ {aka ‘long long unsigned int’} [-Wformat=]
+ 2006 |             printf("dst->pc = %x, src->pc = %x\n", dst->pc, src->pc);
+      |                               ~^                   ~~~~~~~
+      |                                |                        |
+      |                                unsigned int             address_type {aka long long unsigned int}
+      |                               %llx
+src/../../../gpu-simulator/trace-parser/../gpgpu-sim/src/abstract_hardware_model.h:2006:46: warning: format ‘%x’ expects argument of type ‘unsigned int’, but argument 3 has type ‘address_type’ {aka ‘long long unsigned int’} [-Wformat=]
+ 2006 |             printf("dst->pc = %x, src->pc = %x\n", dst->pc, src->pc);
+      |                                             ~^              ~~~~~~~
+      |                                              |                   |
+      |                                              unsigned int        address_type {aka long long unsigned int}
+      |                                             %llx
+In file included from /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/libcuda/../src/cuda-sim/cuda-sim.h:36,
+                 from /home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/libcuda/gpgpu_context.h:3,
+                 from main.cc:38:
+/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/libcuda/../src/cuda-sim/../abstract_hardware_model.h: In function ‘void move_warp_uniptr_impl(std::unique_ptr<warp_inst_t>&, std::unique_ptr<warp_inst_t>&, const char*, int)’:
+/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/libcuda/../src/cuda-sim/../abstract_hardware_model.h:2006:32: warning: format ‘%x’ expects argument of type ‘unsigned int’, but argument 2 has type ‘address_type’ {aka ‘long long unsigned int’} [-Wformat=]
+ 2006 |             printf("dst->pc = %x, src->pc = %x\n", dst->pc, src->pc);
+      |                               ~^                   ~~~~~~~
+      |                                |                        |
+      |                                unsigned int             address_type {aka long long unsigned int}
+      |                               %llx
+/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/libcuda/../src/cuda-sim/../abstract_hardware_model.h:2006:46: warning: format ‘%x’ expects argument of type ‘unsigned int’, but argument 3 has type ‘address_type’ {aka ‘long long unsigned int’} [-Wformat=]
+ 2006 |             printf("dst->pc = %x, src->pc = %x\n", dst->pc, src->pc);
+      |                                             ~^              ~~~~~~~
+      |                                              |                   |
+      |                                              unsigned int        address_type {aka long long unsigned int}
+      |                                             %llx
+make[1]: Leaving directory '/home/cliu/wk/accorde/3rdparty/modern-gpu-simulator-micro-2025/simulator-remodeled/util/traces_enhanced'

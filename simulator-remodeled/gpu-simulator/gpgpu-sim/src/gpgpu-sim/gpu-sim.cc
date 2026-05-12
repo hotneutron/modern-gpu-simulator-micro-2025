@@ -1510,8 +1510,11 @@ void gpgpu_sim_config::reg_options(option_parser_t opp) {
   option_parser_register(
       opp, "-gpgpu_cflog_interval", OPT_INT32, &gpgpu_cflog_interval,
       "Interval between each snapshot in control flow logger", "0");
-  option_parser_register(opp, "-visualizer_enabled", OPT_BOOL,
-                         &g_visualizer_enabled,
+   option_parser_register(opp, "-gpu_stat_gating_segments", OPT_CSTR,
+                          &gpu_stat_gating_segments,
+                          "Path to segments.json for per-segment cycle accounting", "");
+   option_parser_register(opp, "-visualizer_enabled", OPT_BOOL,
+                          &g_visualizer_enabled,
                          "Turn on visualizer output (1=On, 0=Off)", "1");
   option_parser_register(opp, "-visualizer_outputfile", OPT_CSTR,
                          &g_visualizer_filename,
@@ -2325,6 +2328,10 @@ void gpgpu_sim::init() {
     m_cluster[i]->reinit();
   m_shader_stats->new_grid();
   // initialize the control-flow, memory access, memory latency logger
+  if (m_config.gpu_stat_gating_segments && strlen(m_config.gpu_stat_gating_segments) > 0) {
+    m_stat_gating.load_segments(m_config.gpu_stat_gating_segments);
+  }
+
   if (m_config.g_visualizer_enabled) {
     create_thread_CFlogger(gpgpu_ctx, m_config.num_shader(),
                            m_shader_config->n_thread_per_shader, 0,
@@ -2379,6 +2386,7 @@ void gpgpu_sim::print_stats() {
 
   gpgpu_ctx->stats->ptx_file_line_stats_write_file();
   gpu_print_stat();
+  m_stat_gating.print_stats(stdout);
 
   if (g_network_mode) {
     printf(
