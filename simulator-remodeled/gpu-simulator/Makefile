@@ -86,8 +86,9 @@ checkenv: makedirs
 		exit 1; \
 	fi
 
+ACCELWATTCH_OBJS = $(wildcard $(GPGPUSIM_ROOT)/build/$(GPGPUSIM_CONFIG)/accelwattch/*.o)
 $(BIN_DIR)/accel-sim.out: traces_enhanced trace-driven trace-parser gpgpu-sim makedirs $(BUILD_DIR)/main.o version
-	$(CXX) -std=c++17 -L$(GPGPUSIM_ROOT)/build/$(GPGPUSIM_CONFIG)/ -lm -lGL -pthread -lz -lcudart -lz $(BUILD_DIR)/*.o $(TRACES_ENHANCED_OBJ) $(TRACES_ENHANCED_PROTOCOL_BUFFER_OBJ) -Wl,--start-group $(GPGPUSIM_ROOT)/build/$(GPGPUSIM_CONFIG)/libcuda/libcuda.a $(GPGPUSIM_ROOT)/build/$(GPGPUSIM_CONFIG)/libgpgpusim.a $(GPGPUSIM_ROOT)/build/$(GPGPUSIM_CONFIG)/gpgpu-sim/libgpu_uarch_sim.a $(GPGPUSIM_ROOT)/build/$(GPGPUSIM_CONFIG)/cuda-sim/libgpgpu_ptx_sim.a $(GPGPUSIM_ROOT)/build/$(GPGPUSIM_CONFIG)/remodeling/libgpu_remodeling_uarch_sim.a $(GPGPUSIM_ROOT)/build/$(GPGPUSIM_CONFIG)/fusedMemory/libgpu_fusedMemory_sim.a -Wl,--end-group -lgomp -lprotobuf -o $(BIN_DIR)/accel-sim.out $(SANITIZER_FLAG_FULL)
+	$(CXX) -std=c++17 -L$(GPGPUSIM_ROOT)/build/$(GPGPUSIM_CONFIG)/ -L$(CUDA_INSTALL_PATH)/lib64 -lm -lGL -pthread -lcudart $(BUILD_DIR)/*.o $(TRACES_ENHANCED_OBJ) $(TRACES_ENHANCED_PROTOCOL_BUFFER_OBJ) -Wl,--start-group $(GPGPUSIM_ROOT)/build/$(GPGPUSIM_CONFIG)/libcuda/libcuda.a $(GPGPUSIM_ROOT)/build/$(GPGPUSIM_CONFIG)/libgpgpusim.a $(GPGPUSIM_ROOT)/build/$(GPGPUSIM_CONFIG)/gpgpu-sim/libgpu_uarch_sim.a $(GPGPUSIM_ROOT)/build/$(GPGPUSIM_CONFIG)/cuda-sim/libgpgpu_ptx_sim.a $(GPGPUSIM_ROOT)/build/$(GPGPUSIM_CONFIG)/remodeling/libgpu_remodeling_uarch_sim.a $(GPGPUSIM_ROOT)/build/$(GPGPUSIM_CONFIG)/fusedMemory/libgpu_fusedMemory_sim.a $(ACCELWATTCH_OBJS) -Wl,--end-group -Wl,--allow-multiple-definition -lgomp -lprotobuf -lz -o $(BIN_DIR)/accel-sim.out $(SANITIZER_FLAG_FULL)
 
 $(BUILD_DIR)/main.o: main.cc version
 	$(CXX) $(CXXFLAGS) $(SANITZER_FLAG) -I$(BUILD_DIR) -I./trace-driven -I./trace-parser -I$(GPGPUSIM_ROOT)/libcuda -I$(GPGPUSIM_ROOT)/src -I$(CUDA_INSTALL_PATH)/include -c main.cc -o $(BUILD_DIR)/main.o

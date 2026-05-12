@@ -17,7 +17,7 @@ TRACES_ENHANCED_DIR=.
 TRACES_ENHANCED_OBJ=$(wildcard $(TRACES_ENHANCED_DIR)/obj/*.o)
 
 # Protocol Buffer setup
-PROTOC=protoc
+PROTOC=/usr/bin/protoc
 PROTO_FILES=$(wildcard $(TRACES_ENHANCED_PROTO_DIR)/*.proto)
 
 # Define directories for generated files
@@ -27,8 +27,8 @@ PROTO_HDR_DIR=$(PROTO_GEN_DIR)/include
 PROTO_OBJ_DIR=$(PROTO_GEN_DIR)/obj
 
 # Add protobuf includes and libraries
-PROTOBUF_INCLUDES=-I/usr/local/include
-PROTOBUF_LIBS=-L/usr/local/lib -lprotobuf
+PROTOBUF_INCLUDES=-I/usr/include
+PROTOBUF_LIBS=-lprotobuf
 
 # Create directory structure if it doesn't exist
 $(shell mkdir -p $(PROTO_SRC_DIR) $(PROTO_HDR_DIR) $(PROTO_OBJ_DIR))

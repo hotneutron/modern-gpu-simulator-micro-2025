@@ -63,7 +63,7 @@ SRCS = $(shell ls *.cc)
 OBJS = $(SRCS:%.cc=$(OUTPUT_DIR)/%.$(OEXT))
 
 $(OUTPUT_DIR)/libgpgpusim.a:	$(OBJS) gpu_uarch_simlib
-	ar rcs  $(OUTPUT_DIR)/libgpgpusim.a $(OBJS) $(OUTPUT_DIR)/gpgpu-sim/*.o
+	ar rcs  $(OUTPUT_DIR)/libgpgpusim.a $(OBJS) $(OUTPUT_DIR)/gpgpu-sim/*.o $(OUTPUT_DIR)/intersim2/*.o $(wildcard $(OUTPUT_DIR)/accelwattch/*.o)
 
 gpu_uarch_simlib:
 	make   -C ./gpgpu-sim
