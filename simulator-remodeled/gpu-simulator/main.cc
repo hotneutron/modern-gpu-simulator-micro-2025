@@ -27,6 +27,7 @@
 // POSSIBILITY OF SUCH DAMAGE.
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <fstream>
@@ -180,6 +181,20 @@ struct pilot_state_t {
   // Log of every iteration's measurement (rejected and accepted alike), so
   // the concurrency-throughput fit at accept time can use all data points.
   std::vector<pilot_iter_obs_t> history;
+  // Wall-time budget tracking. iter_start is captured immediately before the
+  // launch() call for the current iteration. baseline_wall_est_sec is a
+  // projection of how long a single full-grid (no-sampling) run of this kernel
+  // would take, computed from iter 0's wall time scaled by total_ctas /
+  // ctas_launched_iter0 -- the K-rep iter pays roughly per-CTA cost on K reps,
+  // so the full-grid wall is approximately that times the grid expansion
+  // factor. pilot_elapsed_sec is the cumulative wall time of all pilot
+  // iterations on this kernel so far. aborting=true short-circuits
+  // pilot_decide_accept to true so the relaunched full-grid iter finalizes
+  // through the normal accept path.
+  std::chrono::steady_clock::time_point iter_start;
+  double baseline_wall_est_sec;
+  double pilot_elapsed_sec;
+  bool   aborting;
 };
 
 // Mutate kernel_trace_info's sampling fields for the next pilot iteration.
@@ -718,6 +733,9 @@ int main(int argc, const char **argv) {
             pst.target_sim_ctas = pst.k_reps;
             pst.total_sms = this_sms;
             pst.prev_signals_valid = false;
+            pst.baseline_wall_est_sec = 0.0;
+            pst.pilot_elapsed_sec = 0.0;
+            pst.aborting = false;
           }
         }
         std::cout << "Header info loaded for kernel command : " << commandlist[i].command_string << std::endl;
@@ -743,7 +761,10 @@ int main(int argc, const char **argv) {
         // (DRAM/L2 baseline for delta-extraction) is taken inside launch().
         if (pilot_loop_enabled) {
           auto it = pilot_states.find(k->get_trace_info());
-          if (it != pilot_states.end()) m_gpgpu_sim->pilot_snapshot(it->second.snapshot);
+          if (it != pilot_states.end()) {
+            m_gpgpu_sim->pilot_snapshot(it->second.snapshot);
+            it->second.iter_start = std::chrono::steady_clock::now();
+          }
         }
         m_gpgpu_sim->launch(k);
         k->set_launched();
@@ -823,6 +844,7 @@ int main(int argc, const char **argv) {
       // Pilot decide
       bool accept = true;
       pilot_state_t* pst = nullptr;
+      const char* pilot_aborted_reason = "none";
       if (pilot_loop_enabled) {
         auto it = pilot_states.find(finished_k->get_trace_info());
         if (it != pilot_states.end()) {
@@ -840,7 +862,46 @@ int main(int argc, const char **argv) {
           obs.peak_flops_per_cycle         = ps.peak_flops_per_cycle;
           obs.peak_dram_bw_bytes_per_cycle = ps.peak_dram_bw_bytes_per_cycle;
           pst->history.push_back(obs);
-          accept = pilot_decide_accept(*pst, ps, kc, tconfig);
+
+          // Wall-time accounting for the pilot budget check. iter_start was
+          // captured at launch() above. The K-rep iter 0 measures wall time
+          // for ctas_launched=k_reps; the full-grid baseline run would cost
+          // approximately that times total_ctas/ctas_launched (per-CTA cost
+          // is roughly flat at low concurrency, and any fixed-per-kernel
+          // overhead is paid in both modes so the scaled estimate is a
+          // conservative upper bound for fixed-overhead-dominated kernels).
+          double iter_wall_sec = std::chrono::duration<double>(
+              std::chrono::steady_clock::now() - pst->iter_start).count();
+          if (pst->iter == 0) {
+            unsigned launched = (unsigned)ps.ctas_launched;
+            if (launched == 0) launched = 1;
+            double scale = (double)pst->total_ctas / (double)launched;
+            if (scale < 1.0) scale = 1.0;
+            pst->baseline_wall_est_sec = iter_wall_sec * scale;
+          }
+          pst->pilot_elapsed_sec += iter_wall_sec;
+
+          if (pst->aborting) {
+            // This iteration is the full-grid recovery launched after a prior
+            // abort -- finalize it through the accept path regardless of the
+            // classifier / decide logic.
+            accept = true;
+            pilot_aborted_reason = "budget_exceeded";
+          } else {
+            accept = pilot_decide_accept(*pst, ps, kc, tconfig);
+            // Budget check: if we'd otherwise reject and the cumulative pilot
+            // wall time has exceeded the configured multiple of the projected
+            // baseline (full-grid no-sampling) wall, abort. Treat this iter
+            // as a reject (rolls back gpu_tot_*) but force the relaunch below
+            // to use target=total_ctas so the next iter is a single full-grid
+            // run that accepts cleanly.
+            double ratio = tconfig.get_cta_sampling_pilot_max_wall_ratio();
+            if (!accept && ratio > 0.0 && pst->baseline_wall_est_sec > 0.0
+                && pst->pilot_elapsed_sec > ratio * pst->baseline_wall_est_sec) {
+              pst->aborting = true;
+              pilot_aborted_reason = "budget_exceeded";
+            }
+          }
         }
       }
 
@@ -860,7 +921,7 @@ int main(int argc, const char **argv) {
              " kernel_ai=%.4f ridge_ratio=%.4f"
              " class=%s k_reps=%u total_ctas=%u total_sms=%u"
              " n_sat_est=%u target_sim_ctas=%u"
-             " pilot_iter=%u pilot_accepted=%d\n",
+             " pilot_iter=%u pilot_accepted=%d pilot_aborted_reason=%s\n",
              ps.sim_cycles, ps.sim_insns, ps.ctas_launched,
              ps.dram_bytes, ps.dram_reqs,
              ps.l2_accesses, ps.l2_misses, ps.l2_miss_rate,
@@ -876,7 +937,7 @@ int main(int argc, const char **argv) {
              ps.kernel_ai, ps.ridge_ratio,
              kernel_class_name(kc), k_reps, finished_kernel_total_ctas, total_sms,
              n_sat_est, target_sim_ctas,
-             pst ? pst->iter : 0u, accept ? 1 : 0);
+             pst ? pst->iter : 0u, accept ? 1 : 0, pilot_aborted_reason);
       fflush(stdout);
 
       if (accept) {
@@ -960,8 +1021,13 @@ int main(int argc, const char **argv) {
       } else {
         // Pilot reject — pick next target, rebuild kernel_info from the same
         // trace_info, replace in kernels_info, restore gpu_tot_* and reset
-        // per-kernel state so the next iteration starts clean.
-        unsigned next_target = pilot_next_target(*pst, ps, kc, total_sms);
+        // per-kernel state so the next iteration starts clean. When the
+        // wall-time budget has just been exceeded (pst->aborting set above),
+        // skip the doubling schedule and jump straight to a single full-grid
+        // run -- the next iter will accept unconditionally.
+        unsigned next_target = pst->aborting
+            ? pst->total_ctas
+            : pilot_next_target(*pst, ps, kc, total_sms);
         pst->iter += 1;
         pst->target_sim_ctas = next_target;
         pst->prev_signals = ps;

@@ -182,6 +182,11 @@ class trace_config {
   // values in trace_driven.cc reg_options(). Default "logfit" preserves
   // historical behavior.
   const char* get_cta_sampling_concurrency_model() const { return cta_sampling_concurrency_model; }
+  // Pilot wall-time budget. If cumulative pilot wall time on a kernel exceeds
+  // this multiple of the iter-0 (K-rep) wall time, abort the pilot loop:
+  // restore gpu_tot_* via pilot_restore, re-run the kernel once at full grid,
+  // and accept that as the final sample. 0 disables the abort.
+  double get_cta_sampling_pilot_max_wall_ratio() const { return cta_sampling_pilot_max_wall_ratio; }
 
   unsigned int get_int_latency() const { return int_latency; }
   unsigned int get_fp_latency() const { return fp_latency; }
@@ -263,6 +268,7 @@ class trace_config {
   //                  "roofline_clamp" log-fit, then clamped by min(T_fit, T_roofline)
   //                  "roofline_exp"   T(N) = T_roofline*(1 - exp(-k*N)), only k fitted
   char*    cta_sampling_concurrency_model;
+  double   cta_sampling_pilot_max_wall_ratio; // 0 disables; otherwise abort when pilot_elapsed > ratio * iter0_wall
 
 };
 

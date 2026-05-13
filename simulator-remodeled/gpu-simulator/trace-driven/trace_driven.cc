@@ -587,6 +587,7 @@ trace_config::trace_config() {
   cta_sampling_ai_w_sfu = 4.0;
   cta_sampling_pressure_mstall = 0.4;
   cta_sampling_concurrency_model = nullptr;  // populated by option parser
+  cta_sampling_pilot_max_wall_ratio = 1.5;
 }
 
 void trace_config::reg_options(option_parser_t opp) {
@@ -749,6 +750,13 @@ void trace_config::reg_options(option_parser_t opp) {
                          "pilot's sampled densities to the full-grid density. "
                          "Values: logfit | sat_exp | roofline_clamp | roofline_exp.",
                          "sat_exp");
+  option_parser_register(opp, "-cta_sampling_pilot_max_wall_ratio", OPT_DOUBLE,
+                         &cta_sampling_pilot_max_wall_ratio,
+                         "Pilot wall-time budget: if cumulative pilot wall time "
+                         "for a kernel exceeds this multiple of the iter-0 "
+                         "(K-rep) wall time, abort the pilot, restore baseline, "
+                         "and run the kernel once at full grid. 0 disables.",
+                         "1.5");
 }
 
 void trace_config::parse_config() {

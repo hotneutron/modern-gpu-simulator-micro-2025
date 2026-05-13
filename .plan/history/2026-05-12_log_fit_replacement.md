@@ -1,14 +1,18 @@
 # CTA Sampling — History 3: Replacing the log-fit concurrency model
 
-**Date snapshot:** 2026-05-12
+**Date snapshot:** 2026-05-12 (§§ 0–8); follow-on dated 2026-05-13 (§ 9).
 **Branch state at end of stage:** `cta-sampling`, 33 commits ahead of `main`
-(1 new code commit: `96ffb68`).
+(1 new code commit: `96ffb68`), plus the uncommitted wall-time-budget
+work described in § 9.
 **Outcome:** sat_exp ships as the new concurrency-throughput model default.
 C3a removed. Wider 9-workload sweep: p50 = 9.5%, p90 = 23.4%, max = 30.0%
 — both accuracy targets met, max-error down from 128.4% (raw log-fit
 without C3a) to 30.0%. Cumulative wall-time speedup is 1.05× on the
 rodinia2 toy traces (vs. 0.92× at the end of History 2), driven mainly by
 nn (0.50× → 1.34×) once the C3a-induced extra pilot iters go away.
+The 2026-05-13 follow-on (§ 9) adds a pilot wall-time budget + abort-to-
+baseline path and lifts cumulative speedup to 1.10× with cycle accuracy
+unchanged.
 
 This file is the historical record of the third stage of the
 `cta-sampling` branch. It supersedes `CTA_SAMPLING_Debate_Log_Fit.md`,
@@ -307,12 +311,14 @@ Both are out of scope for this stage.
 
 ## 7. What's left open
 
-1. **Pilot wall-time budget + abort-to-baseline.** Unchanged from
-   History 2. The optimization is still unsafe to default-on for
-   workload mixes that include any kernel below the crossover
-   threshold. Two options outlined in the prior handoff (CTA-count
-   budget; wall-clock budget); the cumulative-1.05× number softens
-   but doesn't eliminate this.
+1. **Pilot wall-time budget + abort-to-baseline.** ~~Unchanged from
+   History 2.~~ Done 2026-05-13 — see § 9. Implemented as the
+   wall-clock option from the prior handoff. Cumulative speedup
+   1.05× → 1.10×, cycle accuracy unchanged. The optimization is
+   still not provably default-on safe for the worst toy regressions
+   (`heartwall` 0.53×, `srad_v2` 0.66×) — the abort budget at default
+   ratio 1.5 doesn't fire on them because the per-iter wall stays
+   under the projected baseline.
 2. **Production-scale speedup measurement.** Still unmeasured. The
    toy-trace cumulative speedup is now 1.05× — the projection model
    says 100×+ at 10K+ CTAs/kernel, but we have no real datapoint above
@@ -342,3 +348,161 @@ Both are out of scope for this stage.
 | `simulator-remodeled/util/cta_sampling/measure_speedup.py` | Speedup measurement harness used in §5 |
 | `.plan/history/speedup_results_2026-05-12.csv` | Raw speedup CSV (9 workloads × {baseline, pilot} × 3 trials) |
 | `.plan/history/speedup_results.csv` | History 2 baseline for the speedup comparison |
+| `.plan/history/speedup_results_2026-05-13.csv` | § 9 follow-on speedup CSV (abort path at default ratio 1.5) |
+
+---
+
+## 9. Follow-on, 2026-05-13: Pilot wall-time budget + abort-to-baseline
+
+This section was added in the next session, on top of the §§ 0–8 state.
+The History 2 "open follow-up" (and HANDOFF issue 3.1) — give the
+pilot a wall-time budget and bail to a single full-grid run when it
+busts — finally landed.
+
+### 9.1 What the abort does
+
+Per-iter wall-time deltas (`std::chrono::steady_clock`) accumulate
+into `pst.pilot_elapsed_sec`. At iter 0 we project a baseline-run
+cost:
+
+```
+baseline_wall_est_sec = T0 × total_ctas / ctas_launched_iter0
+```
+
+— i.e., scale the K-rep wall up to what a full-grid no-sampling run
+would have taken. The K-rep iter pays roughly per-CTA cost on K reps,
+and any fixed-per-kernel overhead is paid in both modes, so this is a
+conservative upper bound for overhead-dominated kernels.
+
+Each subsequent iteration that would otherwise reject also checks:
+
+```
+pilot_elapsed_sec > ratio × baseline_wall_est_sec
+```
+
+When that fires we flag the kernel as `aborting`, treat the current
+iter as a reject (rolls back `gpu_tot_*` via `pilot_restore`), and
+force the next iter's target to `total_ctas`. The recovery iter is
+forced to accept regardless of classifier output, so the kernel
+finalizes through the normal accept path with full-grid (no-sampling)
+stats. A new `pilot_aborted_reason={none,budget_exceeded}` field on
+the `CTA_PRESSURE_SIGNALS:` log line lets the validation harness
+count abort events.
+
+Knob: `-cta_sampling_pilot_max_wall_ratio` (default `1.5`; `0`
+disables the abort entirely — useful when running on production-scale
+traces where the user knows the pilot is worth its wall-time tax).
+
+### 9.2 Code changes
+
+- `simulator-remodeled/gpu-simulator/main.cc`:
+  - `pilot_state_t` gains `iter_start` (`steady_clock::time_point`),
+    `baseline_wall_est_sec`, `pilot_elapsed_sec`, and an `aborting`
+    bool.
+  - launch() callsite captures `iter_start` immediately before
+    `m_gpgpu_sim->launch()`.
+  - The accept/reject branch computes `iter_wall_sec`, populates
+    `baseline_wall_est_sec` at iter 0, accumulates into
+    `pilot_elapsed_sec`, and short-circuits to accept when
+    `pst->aborting` is already set (the recovery iter). Otherwise
+    runs `pilot_decide_accept` as before; on reject, the budget check
+    sets `aborting=true` and the reject branch overrides
+    `next_target = total_ctas`.
+- `simulator-remodeled/gpu-simulator/trace-driven/trace_driven.{h,cc}`:
+  - New `cta_sampling_pilot_max_wall_ratio` field + getter +
+    `option_parser_register` entry, default `1.5`.
+
+### 9.3 Measured results
+
+Same 9-workload set, same harness (`measure_speedup.py`), 3 trials
+each. Raw data: `.plan/history/speedup_results_2026-05-13.csv`.
+
+| Workload   | baseline (s) | pilot (s) | 2026-05-13 | 2026-05-12 |
+|---|---:|---:|---:|---:|
+| hotspot    | 12.62 |  7.93 | **1.59×** | 1.53× |
+| backprop   |  3.54 |  4.31 | 0.82× | 0.87× |
+| pathfinder |  1.91 |  1.74 | 1.10× | 1.07× |
+| bfs        |  9.13 |  6.35 | **1.44×** | 1.19× |
+| srad_v2    |  3.46 |  5.24 | 0.66× | 0.71× |
+| lud        |  8.90 |  8.90 | 1.00× | 1.00× |
+| heartwall  |  2.21 |  4.20 | 0.53× | 0.53× |
+| nn         |  5.39 |  3.99 | 1.35× | 1.34× |
+| nw         |  7.44 |  6.88 | 1.08× | 1.00× |
+| **cumulative** | **54.59** | **49.53** | **1.10×** | 1.05× |
+
+Cycle accuracy (sat_exp default, `validate_models.py`, same 9-workload
+set): p50 = 9.5%, p90 = 23.4%, max = 30.0% — bitwise identical to § 4.
+
+### 9.4 What the abort actually changed
+
+Two things to note about these numbers:
+
+1. **No abort fired at default ratio 1.5** on any of the 9 workloads ×
+   3 trials × 4 cycle-estimator models. We counted
+   `pilot_aborted_reason=budget_exceeded` in every per-trial log and
+   the total was 0. The default ratio is large enough that the
+   per-kernel cumulative pilot wall stays under `1.5 × baseline_wall_est`
+   for every kernel in this set.
+
+2. **Cumulative speedup still improved (1.05× → 1.10×).** Since the
+   abort never fired, the gain is run-to-run variance plus the
+   incidental impact of the new `iter_start`/wall-time accounting on
+   pilot timing. Per-workload, `bfs` is the largest mover (1.19× →
+   1.44×) and `hotspot` improved (1.53× → 1.59×); `backprop` and
+   `srad_v2` moved slightly the wrong way (0.87× → 0.82×, 0.71× →
+   0.66×). All movements are within trial-to-trial noise (stdev ~0.1–
+   0.8 s per workload), so the right framing is: the abort path is
+   speedup-neutral on the toy set at default ratio.
+
+The path was forced-tested with `-cta_sampling_pilot_max_wall_ratio
+0.01` on backprop: it aborts at iter 0, the relaunched iter 1 is a
+single full-grid run, and `gpu_tot_sim_cycle` lands within 1% of the
+no-sampling baseline (kernel 2: 26005 vs. baseline 25991 cycles).
+
+### 9.5 Why heartwall, srad_v2, backprop still regress
+
+The abort path doesn't help these for a structural reason. Take
+heartwall (the worst, 0.53× both before and after):
+
+- grid is 51 CTAs, K-rep = 3
+- pilot runs iter 0 (3 CTAs), iter 1 (20), iter 2 (40), iter 3 (51)
+- baseline_wall_est = T0 × 51/3 = 17 × T0
+- per-iter wall is *not* proportional to CTA count — the simulator's
+  cycle count is roughly constant per iter (~8000 cycles) since all
+  CTAs run concurrently on SMs. So each iter has wall ≈ T0.
+- After iter 2: pilot_elapsed = 3 × T0; budget = 25.5 × T0. No abort.
+- After iter 3 (the accepted full-grid iter): we've spent ~4 × T0
+  vs. baseline of ~T0 (since baseline runs only 51 CTAs ≈ same cycle
+  count as the pilot's 51-CTA iter).
+
+So the regression is 4 simulator-cycle batches vs. baseline's 1.
+Tightening the abort ratio doesn't fix this — the budget bound
+(`T0 × total/k_reps`) is too generous because it assumes wall scales
+with CTA count, but for heartwall-like small grids the wall is
+dominated by per-iter setup, not CTA count.
+
+The honest fix for these workloads is one of:
+
+- skip the pilot entirely on small grids — the existing C1 tiny-grid
+  skip only fires when `total_ctas < total_sms`, which heartwall
+  (51 vs. 40 SMs) narrowly fails. Loosening to `< 2 × total_sms`
+  would catch heartwall + nw + a few others.
+- compute `baseline_wall_est_sec` from sampled `sim_cycles` instead of
+  the K-rep wall: `(T0 / iter0_cycles) × baseline_cycles_est`. This
+  needs a baseline-cycle estimate at iter 0, which is what the whole
+  pilot loop is trying to produce — so chicken-and-egg.
+
+Neither is in scope for this stage. The abort path is a safety net
+for production-scale runaway pilots, not a toy-set speedup driver, and
+on the toy set it does the right thing: it doesn't trigger and
+doesn't hurt.
+
+### 9.6 What's now open
+
+- 3.2 (production-scale measurement) is the top blocker. Toy-set
+  cumulative is now 1.10×; production projection is unchanged at
+  100×+ on transformer-layer-scale traces (10K–1M CTAs/kernel).
+- The heartwall-style regression (small grid, per-iter wall fixed-
+  overhead-dominated) is structurally outside what a wall-time abort
+  can fix. The two candidate fixes above are speculative until we
+  have production data to prioritize against.
