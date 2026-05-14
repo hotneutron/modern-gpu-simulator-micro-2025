@@ -183,23 +183,24 @@ uint64_t total_incremental_flushes = 0;  // stats counter
 uint64_t total_instructions_flushed = 0;  // stats counter
 int enable_tma_desc = 0;
 int aux_htod_dump_max_bytes = 4096;
-std::unordered_set<int> utmaldg_runtime_debug_header_written;
-std::unordered_set<int> utmaldg_producer_debug_header_written;
+std::unordered_set<int> tma_desc_runtime_debug_header_written;
+std::unordered_set<int> tma_desc_producer_debug_header_written;
 std::unordered_set<int> tma_memcpy_dump_header_written;
 std::unordered_set<int> tensor_map_encode_dump_header_written;
-std::map<int, std::map<int, uint32_t>> utmaldg_desc_ureg_by_pc;
+std::unordered_set<int> tma_consumer_opcode_ids;
+std::map<int, std::map<int, uint32_t>> tma_desc_ureg_by_pc;
 std::map<int, std::map<int, uint32_t>> first_dest_ureg_by_pc;
 std::map<int, std::map<int, std::string>> instruction_text_by_pc;
 uint64_t tma_memcpy_dump_id = 0;
 uint64_t tensor_map_encode_dump_id = 0;
-struct utmaldg_producer_candidate_t {
+struct tma_desc_producer_candidate_t {
   int unique_function_id;
   int pc;
   uint32_t dest_ureg_id;
   uint32_t pre_value_lo;
   uint32_t pre_value_hi;
 };
-std::unordered_map<std::string, std::deque<utmaldg_producer_candidate_t>> recent_utmaldg_producers_by_warp;
+std::unordered_map<std::string, std::deque<tma_desc_producer_candidate_t>> recent_tma_desc_producers_by_warp;
 // =============================================================================
 
 struct traced_operand_instrument {
@@ -279,11 +280,44 @@ const std::unordered_map<std::string, OpcodeChar> *OpcodeMap = nullptr;
 
 void create_folder(const char * folder_path);
 
-static bool is_utmaldg_opcode(const std::string &opcode) {
-  return opcode.rfind("UTMALDG", 0) == 0;
+static bool is_tma_desc_consumer_opcode(const std::string &opcode) {
+  return opcode.rfind("UTMALDG", 0) == 0 ||
+         opcode.rfind("UTMASTG", 0) == 0 ||
+         opcode.rfind("UBLKCP", 0) == 0 ||
+         opcode.rfind("UBLKPF", 0) == 0 ||
+         opcode.rfind("UBLKRED", 0) == 0 ||
+         opcode.rfind("UTMACCTL", 0) == 0 ||
+         opcode.rfind("UTMACMDFLUSH", 0) == 0 ||
+         opcode.rfind("UTMAPF", 0) == 0 ||
+         opcode.rfind("UTMAREDG", 0) == 0;
 }
 
-static std::string get_utmaldg_producer_debug_key(const std::string &tb_string_id, int warp_id_tb) {
+static const char *traced_reg_type_to_string(TRACED_REG_TYPE reg_type) {
+  switch (reg_type) {
+    case TRACED_REG_TYPE::NO_REGS: return "NO_REGS";
+    case TRACED_REG_TYPE::MEMORY_REF: return "MEMORY_REF";
+    case TRACED_REG_TYPE::REGULAR: return "REGULAR";
+    case TRACED_REG_TYPE::REGULAR_2_REGS: return "REGULAR_2_REGS";
+    case TRACED_REG_TYPE::REGULAR_4_REGS: return "REGULAR_4_REGS";
+    case TRACED_REG_TYPE::UNIFORM: return "UNIFORM";
+    case TRACED_REG_TYPE::UNIFORM_2_REGS: return "UNIFORM_2_REGS";
+    case TRACED_REG_TYPE::PREDICATE: return "PREDICATE";
+    case TRACED_REG_TYPE::UNIFORM_PREDICATE: return "UNIFORM_PREDICATE";
+    default: return "UNKNOWN";
+  }
+}
+
+static const char *mem_type_to_string(MEM_TYPE mem_type) {
+  switch (mem_type) {
+    case MEM_TYPE::NONE: return "NONE";
+    case MEM_TYPE::STANDARD_MEM: return "STANDARD_MEM";
+    case MEM_TYPE::CONSTANT_MEM: return "CONSTANT_MEM";
+    case MEM_TYPE::CALL_OR_RET: return "CALL_OR_RET";
+    default: return "UNKNOWN";
+  }
+}
+
+static std::string get_tma_desc_producer_debug_key(const std::string &tb_string_id, int warp_id_tb) {
   return tb_string_id + "_w_" + std::to_string(warp_id_tb);
 }
 
@@ -327,6 +361,12 @@ static std::string uint32_array_to_string(const cuuint32_t *values, uint32_t cou
     }
     oss << values[i];
   }
+  return oss.str();
+}
+
+static std::string uint64_to_hex_string(uint64_t value) {
+  std::ostringstream oss;
+  oss << "0x" << std::hex << std::setw(16) << std::setfill('0') << value;
   return oss.str();
 }
 
@@ -390,7 +430,7 @@ static void append_tensor_map_encode_dump_event(int device_id, const cuTensorMap
   }
   if (needs_header) {
     tensor_map_encode_dump_header_written.insert(device_id);
-    csv << "dump_id,device_id,tensor_map_ptr_hex,global_address_hex,tensor_data_type,tensor_rank,global_dim,global_strides,box_dim,element_strides,interleave,swizzle,l2_promotion,oob_fill,blob_path\n";
+    csv << "dump_id,device_id,tensor_map_ptr_hex,global_address_hex,tensor_data_type,tensor_rank,global_dim,global_strides,box_dim,element_strides,interleave,swizzle,l2_promotion,oob_fill,qword0_hex,qword1_hex,qword2_hex,qword3_hex,qword4_hex,qword5_hex,qword6_hex,qword7_hex,blob_path\n";
   }
   uint64_t dump_id = tensor_map_encode_dump_id++;
   std::string blob_path = tensor_map_blob_path + "/" + std::to_string(dump_id) + ".bin";
@@ -407,6 +447,7 @@ static void append_tensor_map_encode_dump_event(int device_id, const cuTensorMap
   std::string global_strides = uint64_array_to_string(p->globalStrides, global_stride_count);
   std::string box_dim = uint32_array_to_string(p->boxDim, p->tensorRank);
   std::string element_strides = uint32_array_to_string(p->elementStrides, p->tensorRank);
+  const uint64_t *qwords = reinterpret_cast<const uint64_t *>(p->tensorMap);
   csv << dump_id << ","
       << device_id << ","
       << tensor_map_ptr_stream.str() << ","
@@ -421,6 +462,14 @@ static void append_tensor_map_encode_dump_event(int device_id, const cuTensorMap
       << static_cast<int>(p->swizzle) << ","
       << static_cast<int>(p->l2Promotion) << ","
       << static_cast<int>(p->oobFill) << ","
+      << uint64_to_hex_string(qwords[0]) << ","
+      << uint64_to_hex_string(qwords[1]) << ","
+      << uint64_to_hex_string(qwords[2]) << ","
+      << uint64_to_hex_string(qwords[3]) << ","
+      << uint64_to_hex_string(qwords[4]) << ","
+      << uint64_to_hex_string(qwords[5]) << ","
+      << uint64_to_hex_string(qwords[6]) << ","
+      << uint64_to_hex_string(qwords[7]) << ","
       << blob_path << "\n";
 }
 
@@ -431,16 +480,16 @@ struct cuMemcpyHtoDAsync_v2_params_proxy {
   CUstream hStream;
 };
 
-static void append_utmaldg_runtime_debug_event(
+static void append_tma_desc_runtime_debug_event(
     int device_id, int stream_id, int kernel_trace_id, const inst_trace_t *ma) {
   if (!enable_tma_desc || ma->ureg_desc_id == SECRET_UREG_DESC_NOT_USED) {
     return;
   }
-  std::string filename = extrainfo_path + "/utmaldg_runtime_debug.csv";
+  std::string filename = extrainfo_path + "/tma_desc_runtime_debug.csv";
   create_folder(extrainfo_path.c_str());
   std::ofstream ofs;
-  bool needs_header = utmaldg_runtime_debug_header_written.find(device_id) ==
-                      utmaldg_runtime_debug_header_written.end();
+  bool needs_header = tma_desc_runtime_debug_header_written.find(device_id) ==
+                      tma_desc_runtime_debug_header_written.end();
   if (needs_header) {
     ofs.open(filename, std::ios::out);
   } else {
@@ -450,7 +499,7 @@ static void append_utmaldg_runtime_debug_event(
     return;
   }
   if (needs_header) {
-    utmaldg_runtime_debug_header_written.insert(device_id);
+    tma_desc_runtime_debug_header_written.insert(device_id);
     ofs << "device_id,stream_id,kernel_id,unique_function_id,pc_hex,cta_x,cta_y,cta_z,warp_id_tb,sm_id,active_mask,predicate_mask,desc_reg_id,desc_value_lo,desc_value_hi,first_lane_addr\n";
   }
   uint64_t first_lane_addr = 0;
@@ -481,22 +530,71 @@ static void append_utmaldg_runtime_debug_event(
       << first_lane_addr << "\n";
 }
 
-static void append_utmaldg_producer_debug_event(
+static void append_tma_runtime_operand_debug_event(
+    int device_id, int stream_id, int kernel_trace_id, const inst_trace_t *ma,
+    const std::string &opcode, unsigned int callback_index) {
+  if (!enable_tma_desc) {
+    return;
+  }
+  create_folder(extrainfo_path.c_str());
+  std::ofstream ofs(extrainfo_path + "/tma_runtime_operand_debug.jsonl", std::ios::app);
+  if (!ofs.is_open()) {
+    return;
+  }
+  uint64_t first_lane_addr = 0;
+  std::bitset<32> mask(ma->active_mask & ma->predicate_mask);
+  for (int lane = 0; lane < 32; ++lane) {
+    if (mask.test(lane)) {
+      first_lane_addr = ma->addrs_or_reg_val_0[lane];
+      break;
+    }
+  }
+  std::ostringstream pc_stream;
+  pc_stream << "0x" << std::hex << ma->vpc;
+  ofs << "{"
+      << "\"device_id\":" << device_id << ","
+      << "\"stream_id\":" << stream_id << ","
+      << "\"kernel_id\":" << kernel_trace_id << ","
+      << "\"unique_function_id\":" << ma->unique_function_id << ","
+      << "\"pc_hex\":\"" << pc_stream.str() << "\","
+      << "\"opcode\":\"" << opcode << "\","
+      << "\"callback_index\":" << callback_index << ","
+      << "\"operand_type\":\"" << traced_reg_type_to_string(static_cast<TRACED_REG_TYPE>(ma->per_operand_type)) << "\","
+      << "\"mem_type\":\"" << mem_type_to_string(ma->mem_type) << "\","
+      << "\"operand_reg_id\":" << ma->reg_id << ","
+      << "\"value_lo\":" << static_cast<uint64_t>(ma->addrs_or_reg_val_0[0]) << ","
+      << "\"value_hi\":" << ma->reg_val_1[0] << ","
+      << "\"value_2\":" << ma->reg_val_2[0] << ","
+      << "\"value_3\":" << ma->reg_val_3[0] << ","
+      << "\"first_lane_addr\":" << first_lane_addr << ","
+      << "\"width\":" << ma->width << ","
+      << "\"desc_reg_id\":" << ma->ureg_desc_id << ","
+      << "\"desc_value_lo\":" << ma->ureg_desc_value << ","
+      << "\"desc_value_hi\":" << ma->ureg_desc_value_hi << ","
+      << "\"cta_x\":" << ma->cta_id_x << ","
+      << "\"cta_y\":" << ma->cta_id_y << ","
+      << "\"cta_z\":" << ma->cta_id_z << ","
+      << "\"warp_id_tb\":" << ma->warpid_tb << ","
+      << "\"sm_id\":" << ma->sm_id
+      << "}\n";
+}
+
+static void append_tma_desc_producer_debug_event(
     int device_id, int stream_id, int kernel_trace_id, const inst_trace_t *ma,
     const std::string &tb_string_id, int warp_id_tb) {
   if (!enable_tma_desc || ma->ureg_desc_id == SECRET_UREG_DESC_NOT_USED) {
     return;
   }
-  std::string recent_key = get_utmaldg_producer_debug_key(tb_string_id, warp_id_tb);
-  auto recent_it = recent_utmaldg_producers_by_warp.find(recent_key);
-  if (recent_it == recent_utmaldg_producers_by_warp.end()) {
+  std::string recent_key = get_tma_desc_producer_debug_key(tb_string_id, warp_id_tb);
+  auto recent_it = recent_tma_desc_producers_by_warp.find(recent_key);
+  if (recent_it == recent_tma_desc_producers_by_warp.end()) {
     return;
   }
-  std::string filename = extrainfo_path + "/utmaldg_producer_debug.csv";
+  std::string filename = extrainfo_path + "/tma_desc_producer_debug.csv";
   create_folder(extrainfo_path.c_str());
   std::ofstream ofs;
-  bool needs_header = utmaldg_producer_debug_header_written.find(device_id) ==
-                      utmaldg_producer_debug_header_written.end();
+  bool needs_header = tma_desc_producer_debug_header_written.find(device_id) ==
+                      tma_desc_producer_debug_header_written.end();
   if (needs_header) {
     ofs.open(filename, std::ios::out);
   } else {
@@ -506,7 +604,7 @@ static void append_utmaldg_producer_debug_event(
     return;
   }
   if (needs_header) {
-    utmaldg_producer_debug_header_written.insert(device_id);
+    tma_desc_producer_debug_header_written.insert(device_id);
     ofs << "device_id,stream_id,kernel_id,consumer_function_id,consumer_pc_hex,consumer_desc_reg_id,consumer_desc_value_lo,consumer_desc_value_hi,producer_function_id,producer_pc_hex,producer_dest_ureg_id,producer_pre_value_lo,producer_pre_value_hi,producer_inst_text\n";
   }
   uint32_t consumer_desc_hi_reg = ma->ureg_desc_id + 1;
@@ -1270,6 +1368,9 @@ void instrument_function_if_needed(CUcontext ctx, CUfunction func, int device_id
         int opcode_id = opcode_to_id_map.size();
         opcode_to_id_map[instr->getOpcode()] = opcode_id;
         id_to_opcode_map[opcode_id] = instr->getOpcode();
+        if (is_tma_desc_consumer_opcode(instr->getOpcode())) {
+          tma_consumer_opcode_ids.insert(opcode_id);
+        }
       }
 
       int opcode_id = opcode_to_id_map[instr->getOpcode()];
@@ -1288,7 +1389,7 @@ void instrument_function_if_needed(CUcontext ctx, CUfunction func, int device_id
       bool is_call_or_ret = (std::string(instr->getOpcode()).find("CALL") != std::string::npos) || (std::string(instr->getOpcode()).find("RET") != std::string::npos);
       bool is_rel_type = (std::string(instr->getOpcode()).find("REL") != std::string::npos);
       bool is_call_or_ret_with_reg = false;
-      bool is_utmaldg_instruction = is_utmaldg_opcode(instr->getOpcode());
+      bool is_tma_desc_consumer_instruction = is_tma_desc_consumer_opcode(instr->getOpcode());
 
       if(track_this_instruction(cnt, threshold_unique_kernel_checking ,instr->getOpcode())) {
         current_kernel_key_instructions_by_pc[vpc] = inst_str;
@@ -1318,7 +1419,7 @@ void instrument_function_if_needed(CUcontext ctx, CUfunction func, int device_id
 
       bool has_ldc_with_reg = false;
       bool has_ldc_with_ureg = false;
-      uint32_t utmaldg_desc_ureg_id = SECRET_UREG_DESC_NOT_USED;
+      uint32_t tma_desc_ureg_id = SECRET_UREG_DESC_NOT_USED;
       std::map<uint32_t, uint32_t> memref_idx_with_desc;
       std::map<uint32_t, traced_operand_instrument> per_operand_type;
       int ldc_reg_id = -1;
@@ -1326,6 +1427,7 @@ void instrument_function_if_needed(CUcontext ctx, CUfunction func, int device_id
       std::vector<int> aux_reg_ids;
       uint64_t call_ret_imm = 0;
       uint32_t num_of_injects = 0;
+      std::string opcode_str = instr->getOpcode() ? std::string(instr->getOpcode()) : "";
 
       if(inst_parsed->is_tensor_core_op()) {
         inst_parsed->set_tensor_core_instruction_info();
@@ -1333,8 +1435,11 @@ void instrument_function_if_needed(CUcontext ctx, CUfunction func, int device_id
       for(int i = 0; i < instr->getNumOperands(); ++i){
         const InstrType::operand_t *op = instr->getOperand(i);
         std::string operand_str = op->str ? std::string(op->str) : "";
-        if(is_utmaldg_instruction && operand_str.find("desc[UR") != std::string::npos) {
-          utmaldg_desc_ureg_id = get_ur_register(operand_str);
+        if(is_tma_desc_consumer_instruction && operand_str.find("desc[UR") != std::string::npos) {
+          tma_desc_ureg_id = get_ur_register(operand_str);
+        } else if (opcode_str.rfind("UTMASTG", 0) == 0 && i == 0 &&
+                   operand_str.find("[UR") != std::string::npos) {
+          tma_desc_ureg_id = get_ur_register(operand_str);
         }
         if (op->type == InstrType::OperandType::MREF) {
           mem_oper_idx++;
@@ -1392,8 +1497,8 @@ void instrument_function_if_needed(CUcontext ctx, CUfunction func, int device_id
           num_of_injects++;
         }
       }
-      if (is_utmaldg_instruction && utmaldg_desc_ureg_id != SECRET_UREG_DESC_NOT_USED) {
-        utmaldg_desc_ureg_by_pc[next_candidate_unique_function_id][vpc] = utmaldg_desc_ureg_id;
+      if (is_tma_desc_consumer_instruction && tma_desc_ureg_id != SECRET_UREG_DESC_NOT_USED) {
+        tma_desc_ureg_by_pc[next_candidate_unique_function_id][vpc] = tma_desc_ureg_id;
       }
 
       if(num_of_injects == 0) {
@@ -1422,18 +1527,13 @@ void instrument_function_if_needed(CUcontext ctx, CUfunction func, int device_id
               uint32_t desc_ureg_id = SECRET_UREG_DESC_NOT_USED;
               if(memref_idx_with_desc.find(mem_oper_idx) != memref_idx_with_desc.end()) {
                 desc_ureg_id = memref_idx_with_desc[mem_oper_idx];
-              } else if(is_utmaldg_instruction && utmaldg_desc_ureg_id != SECRET_UREG_DESC_NOT_USED) {
-                desc_ureg_id = utmaldg_desc_ureg_id;
+              } else if(is_tma_desc_consumer_instruction && tma_desc_ureg_id != SECRET_UREG_DESC_NOT_USED) {
+                desc_ureg_id = tma_desc_ureg_id;
               }
               if(desc_ureg_id != SECRET_UREG_DESC_NOT_USED) {
                 nvbit_add_call_arg_ureg_val(instr, desc_ureg_id);
-                if(is_utmaldg_instruction) {
-                  nvbit_add_call_arg_const_val32(instr, desc_ureg_id);
-                  nvbit_add_call_arg_ureg_val(instr, desc_ureg_id + 1);
-                } else {
-                  nvbit_add_call_arg_const_val32(instr, SECRET_UREG_DESC_NOT_USED);
-                  nvbit_add_call_arg_const_val32(instr, SECRET_UREG_DESC_NOT_USED);
-                }
+                nvbit_add_call_arg_const_val32(instr, desc_ureg_id);
+                nvbit_add_call_arg_ureg_val(instr, desc_ureg_id + 1);
               }else {
                 nvbit_add_call_arg_const_val32(instr, SECRET_UREG_DESC_NOT_USED);
                 nvbit_add_call_arg_const_val32(instr, SECRET_UREG_DESC_NOT_USED);
@@ -1653,14 +1753,16 @@ void nvbit_at_cuda_event(CUcontext ctx, int is_exit, nvbit_api_cuda_t cbid,
       }
     }
     if (enable_tma_desc) {
-      std::ofstream ofs(extrainfo_path + "/utmaldg_runtime_debug.csv", std::ios::out);
+      std::ofstream ofs(extrainfo_path + "/tma_desc_runtime_debug.csv", std::ios::out);
       if (ofs.is_open()) {
         ofs << "device_id,stream_id,kernel_id,unique_function_id,pc_hex,cta_x,cta_y,cta_z,warp_id_tb,sm_id,active_mask,predicate_mask,desc_reg_id,desc_value_lo,desc_value_hi,first_lane_addr\n";
       }
-      std::ofstream producer_ofs(extrainfo_path + "/utmaldg_producer_debug.csv", std::ios::out);
+      std::ofstream producer_ofs(extrainfo_path + "/tma_desc_producer_debug.csv", std::ios::out);
       if (producer_ofs.is_open()) {
         producer_ofs << "device_id,stream_id,kernel_id,consumer_function_id,consumer_pc_hex,consumer_desc_reg_id,consumer_desc_value_lo,consumer_desc_value_hi,producer_function_id,producer_pc_hex,producer_dest_ureg_id,producer_pre_value_lo,producer_pre_value_hi,producer_inst_text\n";
       }
+      std::ofstream operand_jsonl_ofs(extrainfo_path + "/tma_runtime_operand_debug.jsonl", std::ios::out);
+      operand_jsonl_ofs.close();
     }
 
     statsFile = fopen(stats_location.c_str(), "w");
@@ -2074,6 +2176,13 @@ void *recv_thread_fun(void *args) {
         }
         remaining_injects--;
         unsigned int callback_index = ma->num_of_injects - remaining_injects - 1;
+        auto opcode_it = id_to_opcode_map.find(opcode_id);
+        const std::string opcode = opcode_it == id_to_opcode_map.end() ? "" : opcode_it->second;
+        if (tma_consumer_opcode_ids.count(opcode_id)) {
+          append_tma_runtime_operand_debug_event(device_id, current_stream_id[device_id],
+                                                 kernel_id[device_id] - 1, ma, opcode,
+                                                 callback_index);
+        }
         std::bitset<32> mask(ma->active_mask & ma->predicate_mask);
         if (ma->mem_type == MEM_TYPE::NONE && callback_index == 0 &&
             (ma->per_operand_type == TRACED_REG_TYPE::UNIFORM ||
@@ -2082,9 +2191,9 @@ void *recv_thread_fun(void *args) {
           if (function_it != first_dest_ureg_by_pc.end()) {
             auto pc_it = function_it->second.find(ma->vpc);
             if (pc_it != function_it->second.end()) {
-              std::string recent_key = get_utmaldg_producer_debug_key(tb_string_id, warp_id_tb);
-              auto &recent_queue = recent_utmaldg_producers_by_warp[recent_key];
-              utmaldg_producer_candidate_t candidate;
+              std::string recent_key = get_tma_desc_producer_debug_key(tb_string_id, warp_id_tb);
+              auto &recent_queue = recent_tma_desc_producers_by_warp[recent_key];
+              tma_desc_producer_candidate_t candidate;
               candidate.unique_function_id = ma->unique_function_id;
               candidate.pc = ma->vpc;
               candidate.dest_ureg_id = pc_it->second;
@@ -2152,12 +2261,12 @@ void *recv_thread_fun(void *args) {
             }
           }
           if (ma->mem_type == MEM_TYPE::STANDARD_MEM && enable_tma_desc &&
-              is_utmaldg_opcode(id_to_opcode_map[opcode_id])) {
-            append_utmaldg_runtime_debug_event(device_id, current_stream_id[device_id],
-                                               kernel_id[device_id] - 1, ma);
-            append_utmaldg_producer_debug_event(device_id, current_stream_id[device_id],
-                                                kernel_id[device_id] - 1, ma, tb_string_id,
-                                                warp_id_tb);
+              ma->ureg_desc_id != SECRET_UREG_DESC_NOT_USED) {
+            append_tma_desc_runtime_debug_event(device_id, current_stream_id[device_id],
+                                                kernel_id[device_id] - 1, ma);
+            append_tma_desc_producer_debug_event(device_id, current_stream_id[device_id],
+                                                 kernel_id[device_id] - 1, ma, tb_string_id,
+                                                 warp_id_tb);
           }
         }
 

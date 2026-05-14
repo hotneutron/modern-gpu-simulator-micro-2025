@@ -1,0 +1,59 @@
+ublkred_size_micro:
+    exec_dir: "$GPUAPPS_ROOT/bin/$CUDA_VERSION/release/"
+    data_dirs: "$GPUAPPS_ROOT/data_dirs/"
+    execs:
+        - ublkred-size-16B:
+            exe: ublkred_size_probe
+            runs:
+                - args: --total-floats 1024 --init-floats 256 --op-bytes 16 --dst-init 1000.0
+                  env:
+                    CUDA_ARCH: sm_90a
+                    ENABLE_TMA_DESC: 1
+                    INTERMEDIATE_EXTRA_FILES_PERSISTANCE: 1
+                  accel-sim-mem: 6G
+                  qos: all
+                  openmp-cpus: 2
+        - ublkred-size-32B:
+            exe: ublkred_size_probe
+            runs:
+                - args: --total-floats 1024 --init-floats 256 --op-bytes 32 --dst-init 1000.0
+                  env:
+                    CUDA_ARCH: sm_90a
+                    ENABLE_TMA_DESC: 1
+                    INTERMEDIATE_EXTRA_FILES_PERSISTANCE: 1
+                  accel-sim-mem: 6G
+                  qos: all
+                  openmp-cpus: 2
+        - ublkred-size-64B:
+            exe: ublkred_size_probe
+            runs:
+                - args: --total-floats 1024 --init-floats 256 --op-bytes 64 --dst-init 1000.0
+                  env:
+                    CUDA_ARCH: sm_90a
+                    ENABLE_TMA_DESC: 1
+                    INTERMEDIATE_EXTRA_FILES_PERSISTANCE: 1
+                  accel-sim-mem: 6G
+                  qos: all
+                  openmp-cpus: 2
+        - ublkred-size-256B:
+            exe: ublkred_size_probe
+            runs:
+                - args: --total-floats 1024 --init-floats 256 --op-bytes 256 --dst-init 1000.0
+                  env:
+                    CUDA_ARCH: sm_90a
+                    ENABLE_TMA_DESC: 1
+                    INTERMEDIATE_EXTRA_FILES_PERSISTANCE: 1
+                  accel-sim-mem: 6G
+                  qos: all
+                  openmp-cpus: 2
+        - ublkred-size-1024B:
+            exe: ublkred_size_probe
+            runs:
+                - args: --total-floats 1024 --init-floats 256 --op-bytes 1024 --dst-init 1000.0
+                  env:
+                    CUDA_ARCH: sm_90a
+                    ENABLE_TMA_DESC: 1
+                    INTERMEDIATE_EXTRA_FILES_PERSISTANCE: 1
+                  accel-sim-mem: 6G
+                  qos: all
+                  openmp-cpus: 2

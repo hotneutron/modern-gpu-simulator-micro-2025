@@ -201,9 +201,9 @@ First implementation does not need to fully match Hopper encoding, but it should
 
 ## Descriptor-Driven Execution Model
 
-TMA execution should be based on trace-side descriptor metadata rather than per-lane memory addresses.
+TMA execution should be based on trace-side metadata rather than ordinary per-lane memory addresses.
 
-The execution model should consume:
+For most Hopper-style TMA forms, the execution model should consume:
 
 - tensor descriptor config
 - tile coordinates
@@ -213,12 +213,115 @@ The execution model should consume:
 - boundary policy
 - optional swizzle mode
 
-The simulator already has useful sidecar artifacts for this, including:
+The simulator already has useful simulator-facing sidecar artifacts for this, including:
 
 - `tma_descriptor_configs.json`
 - `tma_descriptor_resolver.json`
+- `tma_operand_resolver.json`
 
 These should be loaded into the simulator’s trace metadata path and consulted during TMA decode or command creation.
+
+The simulator should treat these JSON artifacts as the primary modeling inputs.
+Raw tracer debug artifacts such as:
+
+- `tensor_map_encode_dump.csv`
+- `tensor_map_encode_blobs/*.bin`
+- `tma_desc_runtime_debug.csv`
+- `tma_desc_producer_debug.csv`
+- `tma_runtime_operand_debug.jsonl`
+
+are important generation/debug evidence, but they are not the main simulator-facing interface.
+
+### Resolver Split
+
+The updated tracing work implies that the simulator should not assume one single metadata path for all TMA-family instructions.
+
+Instead, Phase 2+ should use a split resolver model:
+
+- **Descriptor config table**
+  - `tma_descriptor_configs.json`
+  - normalized tensor-map semantics
+- **Descriptor-backed consumer resolver**
+  - `tma_descriptor_resolver.json`
+  - maps a TMA consumer site to one normalized descriptor config
+  - primary key is `(unique_function_id, pc_hex, handle_hi_hex)` when available
+  - fallback evidence can include:
+    - desc-like register-pair reuse
+    - same-function config reuse
+    - single-rank-candidate selection
+- **Operand semantics resolver**
+  - `tma_operand_resolver.json`
+  - maps operand roles, runtime-observed values, and static decode formulas for TMA-family instructions whose behavior depends on operands beyond descriptor resolution alone
+
+### Updated TMA Form Classification
+
+The traced Hopper forms now split into three practical categories:
+
+1. **Explicit descriptor-backed forms**
+   - examples:
+     - `UTMALDG.* ... desc[URx]`
+     - descriptor-backed `UBLKRED.* ... desc[URx]`
+   - these should primarily use:
+     - `tma_descriptor_resolver.json`
+     - `tma_descriptor_configs.json`
+
+2. **Desc-like operand-pair forms**
+   - current important case:
+     - `UTMASTG.* [URa], [URb]`
+  - tracing now treats the first bracketed uniform-register pair as the desc-like selector / handle source
+  - for example, `UTMASTG.4D [UR8], [UR6]` uses:
+    - desc-like pair: `UR8/UR9`
+    - support pair: `UR6/UR7`
+   - these should still resolve through the descriptor path, but with decode logic that understands the first operand pair is descriptor-like even when the opcode text does not contain `desc[URx]`
+
+3. **Operand-driven bulk forms**
+   - current important case:
+     - bulk non-descriptor `UBLKRED.G.S.ADD.F32.RN [URdst], [URsrc], URspan`
+   - this form should not require descriptor resolution as the primary semantic source
+   - instead it should use:
+     - `tma_operand_resolver.json`
+   - for the validated F32 bulk form, operand 3 currently represents covered span in units of 16 bytes
+   - this form is **not part of the first test suite** and can be deferred until after the descriptor-backed path is stable
+
+### UBLKRED-Specific Rule
+
+`UBLKRED` should no longer be treated as a single architectural form in the simulator plan.
+
+It has at least two practically different forms:
+
+- **Descriptor-backed `UBLKRED`**
+  - example:
+    - `UBLKRED.G.S.ADD.F32.RN [UR28], [UR18], UR11, desc[UR30]`
+  - should use descriptor resolution plus extra operand semantics
+  - operand 3 is a runtime size/span-style control operand
+  - however, its exact decode rule should remain conservative until directly validated for the descriptor-backed form
+- **Bulk non-descriptor `UBLKRED`**
+  - example:
+    - `UBLKRED.G.S.ADD.F32.RN [UR8], [UR4], UR6`
+  - should use operand-resolver semantics as the primary execution source
+  - this path can be deferred from the first implementation and first test suite
+
+For the currently validated non-descriptor bulk `UBLKRED` operand interpretation:
+
+- operand 1 = destination base
+- operand 2 = source base
+- operand 3 = encoded covered span / actual data size consumed by the operation
+
+Current decode rule:
+
+- `covered_bytes = operand_3 * 16`
+- `covered_elements_f32 = operand_3 * 4`
+
+The TMA engine should therefore allow `UBLKRED` to select between:
+
+- descriptor-backed reduce-store mode
+- operand-driven bulk reduce-store mode
+
+For the first implementation and first test suite, prioritize the **descriptor-backed `UBLKRED`** path.
+In that path:
+
+- operand 3 must still be preserved as the runtime size/span control operand
+- but the simulator should **not** hard-code the bulk non-descriptor `operand_3 * 16` rule unless and until that exact descriptor-backed form is directly validated
 
 ## Minimal Internal TMA Transfer Representation
 
@@ -231,12 +334,17 @@ Suggested contents:
 - direction: GMEM -> SMEM or SMEM -> GMEM
 - issuing warp ID / subcore ID / SM ID
 - descriptor config ID
+- metadata source: descriptor resolver / operand resolver / mixed
+- resolver confidence / mapping method
 - rank
 - coordinates
 - shared-memory source/destination pointer
 - total bytes
+- covered bytes for validated bulk operand-driven forms
+- raw operand-3 runtime value for descriptor-backed size/span-controlled forms
 - bytes completed
 - swizzle/layout mode
+- operand form: explicit descriptor / desc-like pair / bulk
 - completion object identifier
 - engine state
 
@@ -287,21 +395,43 @@ For `UTMALDG` / `UTMAPF` / `UBLKCP` / `UBLKPF`:
 
 ### SMEM -> GMEM
 
-For `UTMASTG` / `UTMAREDG` / `UBLKRED`:
+For descriptor-backed store forms such as `UTMASTG` / `UTMAREDG` and descriptor-backed `UBLKRED`:
 
 1. warp issues TMA store command
 2. generic-path writes to shared memory must already be visible
 3. TMA engine reads from shared memory source region
-4. TMA engine writes to global memory using descriptor-generated addresses
+4. TMA engine writes to global memory using descriptor-generated addresses and descriptor-carried tensor-layout context
 5. completion object is optionally tracked if later code depends on completion
 
 ### Reduction Stores
 
-`UTMAREDG` / `UBLKRED` should initially be modeled as:
+`UTMAREDG` and descriptor-backed `UBLKRED` should initially be modeled as:
 
 - store-like bulk traffic plus a reduction mode tag
+- with descriptor/layout semantics preserved for any model that aims to be more than throughput-only
 
 The detailed arithmetic semantics can be refined later if needed.
+
+### Bulk Non-Descriptor `UBLKRED`
+
+For the validated bulk non-descriptor form:
+
+- `UBLKRED.G.S.ADD.F32.RN [URdst], [URsrc], URspan`
+
+the dataflow should be modeled separately from descriptor-backed TMA stores:
+
+1. warp issues a TMA bulk reduce-store command
+2. operand resolver identifies:
+   - destination base
+   - source base
+   - covered span encoding
+3. TMA engine decodes covered bytes from operand 3
+4. TMA engine performs a bulk shared-to-global reduce-store over that covered region
+5. completion is tracked like other TMA stores if later code depends on it
+
+This path should remain under the TMA engine, but it should not be forced through descriptor-config lookup as its primary semantic source.
+
+This path is currently a **follow-on extension**, not a first-suite requirement.
 
 ## Proposed File-Level Direction
 
@@ -316,6 +446,7 @@ The detailed arithmetic semantics can be refined later if needed.
 - `gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/sm.h`
 - `gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/sm.cc`
 - `util/traces_enhanced/src/traced_execution.h`
+- loader/support code for descriptor and operand resolver metadata
 
 ### New files likely to be added
 
@@ -364,18 +495,30 @@ Goal:
 Tasks:
 
 - load TMA sidecar descriptor metadata
-- resolve `(unique_function_id, pc)` to descriptor config
+- resolve descriptor-backed forms primarily by `(unique_function_id, pc_hex, handle_hi_hex)`
+- load TMA operand-resolver metadata
+- classify TMA forms as descriptor-backed, desc-like-pair-backed, or operand-driven bulk
+- support `UTMASTG` first-operand-pair descriptor-like resolution
+- support descriptor-backed `UBLKRED` resolution plus conservative operand-3 size/span metadata attachment
 - attach TMA command information to decoded instructions
 
 Success criterion:
 
-- the TMA engine receives structured transfer commands rather than guessed ordinary memory accesses
+- the TMA engine receives structured transfer commands rather than guessed ordinary memory accesses, and descriptor-backed `UBLKRED` carries both descriptor semantics and conservative operand-3 size/span metadata
 
 Test plan:
 
-- add a parser test that the simulator can load `tma_descriptor_configs.json` and `tma_descriptor_resolver.json` when present
-- add a lookup test for `(unique_function_id, pc)` resolution covering exact hit, multi-candidate fallback, and missing-entry fallback cases
-- add a decode-time test that a TMA instruction produces a populated internal TMA command object with direction, config ID, rank, and coordinates metadata
+- add a parser test that the simulator can load `tma_descriptor_configs.json`, `tma_descriptor_resolver.json`, and `tma_operand_resolver.json` when present
+- add a lookup test for descriptor-backed resolution covering:
+  - exact `(unique_function_id, pc_hex, handle_hi_hex)` hit
+  - same-function desc-reg reuse fallback
+  - single-rank-candidate fallback
+- add a decode-time test that a TMA instruction produces a populated internal TMA command object with direction, metadata source, config ID when applicable, rank, mapping method, and coordinates metadata
+- add a `UTMASTG` test confirming the first bracketed operand pair is treated as desc-like for resolution and the second pair is preserved as support state
+- add a descriptor-backed `UBLKRED ... desc[URx]` test confirming:
+  - descriptor config resolution works
+  - operand 3 raw runtime value is propagated as size/span metadata
+  - no unsupported bulk-only decode rule is silently applied
 - add negative tests confirming that ordinary load/store instructions do not try to consume TMA descriptor metadata
 - run a TMA trace with debug counters/logging and verify the number of formed TMA commands matches the number of decoded TMA instructions
 
@@ -416,16 +559,18 @@ Tasks:
 
 - support `UTMASTG`, `UTMAREDG`, `UBLKRED`
 - add source-side shared-memory handling
+- support descriptor-backed `UBLKRED` execution setup with operand-3 size/span control preserved conservatively
 - track optional completion dependencies
 
 Success criterion:
 
-- TMA stores/reductions use the dedicated TMA engine rather than the normal store datapath
+- TMA stores/reductions use the dedicated TMA engine rather than the normal store datapath, including descriptor-backed `UBLKRED` with descriptor layout plus operand-3 size/span control
 
 Test plan:
 
 - create a focused micro-trace or synthetic test with `UTMASTG` and verify the source is taken from the TMA-side shared-memory model and the transfer is issued by `tma_unit_sm`
 - add a reduction-tag propagation test for `UTMAREDG` / `UBLKRED` to ensure the reduction mode is preserved in the transfer record even if arithmetic semantics remain simplified
+- add a descriptor-backed `UBLKRED` test that verifies it goes through descriptor resolution when `desc[URx]` is present and preserves operand-3 size/span runtime state without assuming the bulk-only formula
 - verify ordinary `STG` and `RED*` instructions still use the normal store datapath and counters
 - add a completion-dependency test where later code waits for store completion and confirm the TMA completion object changes state correctly
 - add a fire-and-forget store test where no later wait occurs and confirm the simulator does not introduce unnecessary stalls
@@ -517,8 +662,8 @@ Recommended benchmark categories:
   - Minimal kernels dominated by `UTMASTG` behavior
   - Useful for validating SMEM visibility, source consumption, and completion handling for SMEM -> GMEM
 - **TMA reduction-store microbenchmarks**
-  - Minimal kernels that exercise `UTMAREDG` / `UBLKRED`
-  - Useful for validating reduction-mode propagation even if arithmetic semantics are initially simplified
+  - Minimal kernels that exercise `UTMAREDG` and descriptor-backed `UBLKRED`
+  - Useful for validating reduction-mode propagation and operand-3-covered-size handling in the first test suite
 - **LDGSTS comparison microbenchmarks**
   - Kernels that use `LDGSTS` instead of TMA
   - Useful as a control group to ensure the legacy async-copy path is not accidentally disturbed by TMA changes
@@ -558,17 +703,23 @@ Recommended fixture classes:
   - a trace dominated by `UTMASTG`
   - used to validate TMA store flow and ordering
 - **Fixture 5: reduction fixture**
-  - a trace containing `UTMAREDG` or `UBLKRED`
-  - used to validate reduction-mode propagation and store-side control flow
-- **Fixture 6: LDGSTS control fixture**
+  - a trace containing `UTMAREDG` or descriptor-backed `UBLKRED`
+  - used to validate descriptor-backed reduction-mode propagation and store-side control flow
+- **Fixture 6: future bulk `UBLKRED` fixture**
+  - a trace or synthetic microbench containing non-descriptor `UBLKRED [URdst], [URsrc], URspan`
+  - reserved for later extension after the first suite is stable
+- **Fixture 7: LDGSTS control fixture**
   - a trace that uses `LDGSTS` but no TMA
   - used to confirm the legacy async-copy path remains unchanged
-- **Fixture 7: non-TMA regression fixture**
+- **Fixture 8: non-TMA regression fixture**
   - a tensor-core-heavy trace without TMA
   - used as a guardrail for unrelated regressions
-- **Fixture 8: FlashAttention integration fixture**
+- **Fixture 9: FlashAttention integration fixture**
   - the main FA3 trace used for end-to-end architectural validation
   - should become the primary acceptance fixture for milestone checks
+- **Fixture 10: mixed TMA-form fixture**
+  - a trace containing both descriptor-backed and operand-driven TMA forms when available
+  - used to validate that one kernel can exercise multiple metadata paths without ambiguity
 
 Fixture policy:
 
@@ -591,11 +742,17 @@ Recommended counter groups:
   - resolver misses
   - multi-candidate fallbacks
   - missing-config fallbacks
+- **Operand-resolution counters**
+  - operand-resolver hits
+  - operand-resolver misses
+  - static-formula decode applications
+  - `UBLKRED` covered-span decodes from operand 3
 - **Command-formation counters**
   - TMA commands formed
   - TMA commands rejected or dropped
   - commands by direction: GMEM -> SMEM, SMEM -> GMEM
   - commands by subtype: load, prefetch, store, reduction, control
+  - commands by metadata source: descriptor, operand, mixed
 - **TMA-engine admission counters**
   - commands accepted by `tma_unit_sm`
   - queue full / backpressure events
@@ -605,6 +762,7 @@ Recommended counter groups:
   - tile bytes requested
   - boundary-handling or zero-fill events
   - swizzle mode usage
+  - operand-driven covered bytes for bulk `UBLKRED`
 - **Transfer-progress counters**
   - bytes issued
   - bytes completed

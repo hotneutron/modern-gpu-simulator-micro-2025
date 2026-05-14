@@ -24,19 +24,24 @@ The trace-generation flow now produces these TMA-related outputs under `traces/e
   - raw semantic descriptor captures from `cuTensorMapEncodeTiled`
 - `tensor_map_encode_blobs/*.bin`
   - exact encoded `CUtensorMap` blobs
-- `utmaldg_runtime_debug.csv`
+- `tma_desc_runtime_debug.csv`
   - runtime consumer-side `desc[URx]` data
-- `utmaldg_producer_debug.csv`
+- `tma_desc_producer_debug.csv`
   - producer-side uniform-register setup info
 - `tma_descriptor_configs.json`
   - normalized simulator-facing descriptor configs
 - `tma_descriptor_resolver.json`
   - mapping from runtime TMA consumer to `config_id`
+- `tma_runtime_operand_debug.jsonl`
+  - raw runtime operand callback captures for TMA-family instructions
+- `tma_operand_resolver.json`
+  - simulator-facing operand roles, runtime-observed values, and static decode formulas
 
 For simulator modeling, the most important outputs are:
 
 - `tma_descriptor_configs.json`
 - `tma_descriptor_resolver.json`
+- `tma_operand_resolver.json`
 
 ---
 
@@ -83,6 +88,16 @@ This is better than using only the descriptor register number because:
 
 - the same `desc[URx]` register pair can carry different descriptor families at different PCs
 - the observed high 32-bit descriptor handle is the stable family signal in the current trace
+
+However, later trace work shows that this key is not always sufficient by itself:
+
+- `UTMALDG.*`
+  - usually has a useful nonzero `handle_hi_hex`
+- `UBLKRED.*`
+  - may need rank inference from same-function related uses because the opcode text does not always encode `4D` / `5D`
+- `UTMASTG.*`
+  - may expose `handle_hi_hex = 0x00000000`
+  - so final resolution may need same-function `desc_reg_ids` reuse or single-rank-candidate fallback
 
 ---
 
@@ -264,9 +279,11 @@ The simulator should not inspect raw dump ids. It should ask the resolver which 
 
 - `handle_hi_hex`
   - high 32-bit runtime handle observed in `desc[URx+1]`
+  - may be `0x00000000` for some desc-like ops such as `UTMASTG.*`
 
 - `desc_reg_ids`
   - uniform descriptor register ids observed for this consumer group
+  - for `UTMASTG.*`, this records the first bracketed uniform-register pair base, treated as desc-like
 
 - `sample_count`
   - number of runtime samples grouped into this entry
@@ -276,6 +293,12 @@ The simulator should not inspect raw dump ids. It should ask the resolver which 
 
 - `mapping_method`
   - resolver-level mapping method for this entry
+  - examples now include:
+    - `handle_hi_to_box_dim_family_with_opcode_rank`
+    - `handle_hi_to_box_dim_family_with_inferred_rank_from_desc_reg_reuse`
+    - `handle_hi_to_box_dim_family_with_inferred_rank_from_handle_reuse`
+    - `same_function_desc_reg_config_reuse`
+    - `single_rank_candidate_config`
 
 - `config_id`
   - normalized config selected for the consumer
@@ -323,6 +346,8 @@ The simulator should not inspect raw dump ids. It should ask the resolver which 
 At instruction issue time, when the simulator sees a TMA consumer like:
 
 - `UTMALDG.* ... desc[URx]`
+- `UBLKRED.* ... desc[URx]`
+- `UTMASTG.* [URa], [URb]`
 
 it should:
 
@@ -330,6 +355,7 @@ it should:
    - `unique_function_id`
    - `pc_hex`
    - `handle_hi`
+   - `desc_reg_id` when available
 2. build a resolver key:
    - `(unique_function_id, pc_hex, handle_hi_hex)`
 3. query `tma_descriptor_resolver.json`
@@ -368,11 +394,245 @@ This design avoids:
 - making the simulator infer descriptor identity from register numbers
 - coupling the simulator to raw tracer dump ids
 
+---
+
+## `tma_operand_resolver.json`
+
+### File role
+
+`tma_operand_resolver.json` is the simulator-facing operand metadata file for TMA-family instructions whose runtime behavior depends on operand values beyond descriptor resolution alone.
+
+This is especially important for:
+
+- bulk `UBLKRED` without `desc[URx]`
+- future mixed forms where a descriptor exists but additional control operands still affect execution semantics
+
+It is generated from:
+
+- `tma_discovery.json`
+- `tma_runtime_operand_debug.jsonl`
+- optionally `tma_descriptor_resolver.json` when a descriptor-backed association exists
+
+### Design split
+
+Keep descriptor and operand semantics separate:
+
+- `tma_descriptor_configs.json`
+  - tensor-map semantics
+- `tma_descriptor_resolver.json`
+  - descriptor-backed PC → config mapping
+- `tma_operand_resolver.json`
+  - operand roles, runtime-observed values, and static decode formulas
+
+### Schema
+
+```json
+{
+  "version": 1,
+  "source": {
+    "discovery_entries": 0,
+    "runtime_events": 0
+  },
+  "resolver": [
+    {
+      "unique_function_id": 1,
+      "pc_hex": "0x370",
+      "opcode": "UBLKRED.G.S.ADD.F32.RN",
+      "text": "/*0370*/ UBLKRED.G.S.ADD.F32.RN [UR8], [UR4], UR6 ;",
+      "role": "store_reduce",
+      "operand_form": "bulk",
+      "operands": {
+        "operand_1": {
+          "position": 1,
+          "text": "[UR8]",
+          "reg_ids": [8],
+          "kind": "dst_base"
+        },
+        "operand_2": {
+          "position": 2,
+          "text": "[UR4]",
+          "reg_ids": [4],
+          "kind": "src_base"
+        },
+        "operand_3": {
+          "position": 3,
+          "text": "UR6",
+          "reg_ids": [6],
+          "kind": "covered_bytes_or_encoded_span"
+        }
+      },
+      "runtime_observed_values": {
+        "operand_3": {
+          "callback_index": 2,
+          "operand_type": "UNIFORM",
+          "mem_type": "NONE",
+          "operand_reg_ids": [6],
+          "raw_value_lo_samples": [1],
+          "sample_count": 1,
+          "decoded_byte_samples": [16],
+          "decoded_elements_f32_samples": [4]
+        }
+      },
+      "static_decode_formula": {
+        "kind": "sass_validated_formula",
+        "applies_to": "bulk_ublkred",
+        "operands": {
+          "operand_3": {
+            "kind": "covered_bytes",
+            "encoding": "16B_units",
+            "formula": {
+              "covered_bytes": "operand_3 * 16",
+              "covered_elements_f32": "operand_3 * 4"
+            }
+          }
+        }
+      }
+    }
+  ]
+}
+```
+
+### Bulk `UBLKRED` interpretation
+
+For the validated non-descriptor bulk form:
+
+```text
+UBLKRED.G.S.ADD.F32.RN [UR8], [UR4], UR6
+```
+
+the resolver should interpret:
+
+- operand 1
+  - destination base
+- operand 2
+  - source base
+- operand 3
+  - encoded covered span in units of 16 bytes
+
+Decode rule:
+
+```text
+covered_bytes = operand_3 * 16
+covered_elements_f32 = operand_3 * 4
+```
+
+### Descriptor-backed `UBLKRED` interpretation
+
+For descriptor-backed forms such as:
+
+```text
+UBLKRED.G.S.ADD.F32.RN [UR10], [UR4], UR12, desc[UR16]
+```
+
+the current FA3 evidence supports a more conservative model:
+
+- operand 1
+  - destination-side runtime state
+  - not yet proven to be a complete final destination address by itself
+- operand 2
+  - source-side runtime state
+- operand 3
+  - size/span-style control operand
+  - observed raw runtime value is stable across multiple descriptor-backed `UBLKRED` PCs in the analyzed FA3 trace
+- `desc[URx]`
+  - tensor-map layout / address-resolution context
+
+The key observation is that descriptor-backed `UBLKRED` still needs the descriptor even when operand 3 already carries size-like meaning, because the descriptor contributes tensor-layout metadata that the other operands do not encode.
+
+For descriptor-backed entries:
+
+- keep `raw_value_lo_samples` as the authoritative runtime observation
+- do **not** automatically apply the bulk `operand_3 * 16` decode rule unless it has been validated for that descriptor-backed form
+- use `static_decode_formula.kind = "descriptor_backed_formula_pending"` until the descriptor-backed size rule is directly proven
+
+### Recommended simulator consumption path
+
+For descriptor-backed TMA forms:
+
+1. resolve descriptor semantics through:
+   - `tma_descriptor_resolver.json`
+   - `tma_descriptor_configs.json`
+2. resolve extra operand semantics through:
+   - `tma_operand_resolver.json`
+
+For bulk non-descriptor `UBLKRED`:
+
+1. look up `(unique_function_id, pc_hex)` in `tma_operand_resolver.json`
+2. read:
+   - `operand_form`
+   - `operands`
+   - `runtime_observed_values`
+   - `static_decode_formula`
+3. decode the covered span from operand 3
+4. simulate the reduce-store using operand 1 / operand 2 / operand 3 semantics
+
+For descriptor-backed `UBLKRED`:
+
+1. look up `(unique_function_id, pc_hex)` in `tma_operand_resolver.json`
+2. read:
+   - `operands`
+   - `runtime_observed_values`
+   - `descriptor_ref`
+   - `static_decode_formula`
+3. use `tma_descriptor_resolver.json` and `tma_descriptor_configs.json` to recover the referenced tensor-map layout
+4. interpret operand 1 as destination-side runtime state resolved through the descriptor
+5. treat operand 3 as the runtime size/span control operand, but keep its decode rule conservative until directly validated for that form
+
+### Notes on raw runtime fields
+
+- `raw_value_lo_samples`
+  - primary captured runtime payload for the operand callback
+- `raw_value_hi_samples`
+  - optional companion high slot when the traced operand really uses an additional value
+- `raw_value_2_samples`, `raw_value_3_samples`
+  - only kept when they contain nontrivial data
+  - absent for simple bulk `UBLKRED` operand-3 cases because those slots are not meaningful there
+
+### `UTMAREDG` simulator guidance
+
+For `UTMAREDG`, the right abstraction depends on simulator scope:
+
+- if the simulator only needs a coarse throughput-level model
+  - amount of data
+  - reduction op kind
+  - issue / completion cost
+  may be sufficient
+- if the simulator needs layout-aware placement, locality, or correctness-sensitive address behavior
+  - descriptor-derived tensor-map semantics still matter
+
+So `UTMAREDG` can be simplified to amount + op kind only for a deliberately coarse model, but not for a descriptor-faithful model.
+
+### `UTMALDG` / `UTMASTG` resolver labels
+
+`UTMALDG` and `UTMASTG` now use explicit resolver labels when a descriptor-backed tensor-map association exists.
+
+The intended interpretation is:
+
+- `operand_form = "descriptor_shape_driven"`
+  - the logical transfer shape is primarily carried by the descriptor
+- `inferred_runtime_semantics.descriptor.shape_role = "descriptor_shape_driven"`
+  - the descriptor is the main source of tensor-map shape / tile interpretation
+- `inferred_runtime_semantics.operand_model.kind = "operand_state_driven"`
+  - runtime operands behave like address/state/coordinate inputs rather than a simple direct byte-count field
+
+Typical operand labels are:
+
+- `UTMALDG`
+  - `operand_1 = load_dst_state`
+  - `operand_2 = load_coord_or_state`
+  - `operand_3 = tensor_map_descriptor`
+- `UTMASTG`
+  - `operand_1 = store_dst_state`
+  - `operand_2 = store_src_or_state`
+
+This labeling is intended to distinguish these instructions from bulk `UBLKRED`, where a dedicated runtime operand appears to directly control the covered span.
+
 And it enables:
 
 - one semantic config reused across many dump rows
 - one resolver method reused across many TMA sites
 - incremental extension to more `desc[URx]` TMA ops later
+- trace-backed mapping even when a TMA op does not expose a useful nonzero `handle_hi`
 
 ---
 
@@ -388,5 +648,20 @@ For the currently analyzed FlashAttention-3 trace:
 
 - `pc 0x9a80`, `handle_hi 0x14f00000`
   - likely maps to `tm_r4_dt9_box_64x192x1x1`
+
+- `UBLKRED` first family in `unique_function_id = 8`
+  - `pc 0x90a0`, `0x91d0`, `0x94e0`, `0x95b0`, `0x96f0`, `0x97c0`
+  - maps to `tm_r4_dt9_box_64x192x1x1`
+  - resolved generically through inferred-rank reuse, not opcode-specific hard-coding
+
+- `UTMASTG.5D` at `pc 0x8210`
+  - uses desc-like first operand pair `UR8/UR9`
+  - maps to `tm_r5_dt9_box_64x192x1x1x1`
+  - resolved by `single_rank_candidate_config`
+
+- `UTMASTG.4D` at `pc 0x7ed0` and `0x7ef0`
+  - use desc-like first operand pair `UR8/UR9`
+  - map to `tm_r4_dt9_box_64x192x1x1`
+  - resolved by `same_function_desc_reg_config_reuse` because `handle_hi_hex` is zero at runtime
 
 This is only the first TMA family. The same format should be extended to later `desc[URx]` TMA ops as more mappings are derived.

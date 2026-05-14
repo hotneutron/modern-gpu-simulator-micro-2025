@@ -77,7 +77,9 @@ def load_tensor_map_configs(extra_info_dir: Path):
 
 
 def load_runtime_groups(extra_info_dir: Path):
-    csv_path = extra_info_dir / "utmaldg_runtime_debug.csv"
+    csv_path = extra_info_dir / "tma_desc_runtime_debug.csv"
+    if not csv_path.exists():
+        csv_path = extra_info_dir / "utmaldg_runtime_debug.csv"
     grouped = {}
     with csv_path.open(newline="") as fh:
         reader = csv.DictReader(fh)
@@ -113,7 +115,15 @@ def collect_pc_opcode_map(node, current_unique_function_id=None, mapping=None):
         if "unique_function_id" in node and node["unique_function_id"] is not None:
             next_unique_function_id = node["unique_function_id"]
         if next_unique_function_id is not None and "pc_hex" in node and "opcode" in node:
-            mapping[(next_unique_function_id, node["pc_hex"])] = node["opcode"]
+            key = (next_unique_function_id, node["pc_hex"])
+            existing_opcode = mapping.get(key)
+            candidate_opcode = node["opcode"]
+            if existing_opcode is None:
+                mapping[key] = candidate_opcode
+            elif existing_opcode == candidate_opcode:
+                pass
+            elif extract_rank_from_opcode(candidate_opcode) is not None and extract_rank_from_opcode(existing_opcode) is None:
+                mapping[key] = candidate_opcode
         for value in node.values():
             collect_pc_opcode_map(value, next_unique_function_id, mapping)
     elif isinstance(node, list):
@@ -139,6 +149,32 @@ def extract_rank_from_opcode(opcode):
     return None
 
 
+def infer_rank_from_related_usage(entry, runtime_groups, pc_opcode_map):
+    preferred_ranks = set()
+    fallback_ranks = set()
+    entry_desc_regs = set(entry["desc_reg_ids"])
+    for other in runtime_groups:
+        if other is entry:
+            continue
+        if other["unique_function_id"] != entry["unique_function_id"]:
+            continue
+        if other["handle_hi_hex"] != entry["handle_hi_hex"]:
+            continue
+        other_opcode = pc_opcode_map.get((other["unique_function_id"], other["pc_hex"]))
+        other_rank = extract_rank_from_opcode(other_opcode)
+        if other_rank is None:
+            continue
+        if entry_desc_regs.intersection(other["desc_reg_ids"]):
+            preferred_ranks.add(other_rank)
+        else:
+            fallback_ranks.add(other_rank)
+    if len(preferred_ranks) == 1:
+        return preferred_ranks.pop(), "same_function_handle_and_desc_reg_rank_inference"
+    if len(fallback_ranks) == 1:
+        return fallback_ranks.pop(), "same_function_handle_rank_inference"
+    return None, None
+
+
 def derive_handle_family_map_by_rank(configs):
     grouped = {}
     for config in configs:
@@ -155,6 +191,34 @@ def derive_handle_family_map_by_rank(configs):
     return mapping
 
 
+def finalize_unresolved_entries(resolver):
+    resolved_by_function_and_desc_reg = {}
+    for entry in resolver:
+        config_id = entry.get("config_id")
+        if not config_id:
+            continue
+        key = (entry["unique_function_id"], tuple(sorted(entry["desc_reg_ids"])))
+        resolved_by_function_and_desc_reg.setdefault(key, set()).add(config_id)
+
+    for entry in resolver:
+        if entry.get("config_id"):
+            continue
+        candidate_config_ids = entry.get("candidate_config_ids", [])
+        if len(candidate_config_ids) == 1:
+            entry["config_id"] = candidate_config_ids[0]
+            entry["confidence"] = "medium"
+            entry["mapping_method"] = "single_rank_candidate_config"
+            del entry["candidate_config_ids"]
+            continue
+        key = (entry["unique_function_id"], tuple(sorted(entry["desc_reg_ids"])))
+        reused_config_ids = resolved_by_function_and_desc_reg.get(key, set())
+        if len(reused_config_ids) == 1:
+            entry["config_id"] = next(iter(reused_config_ids))
+            entry["confidence"] = "medium"
+            entry["mapping_method"] = "same_function_desc_reg_config_reuse"
+            del entry["candidate_config_ids"]
+
+
 def build_resolver_entries(runtime_groups, handle_map_by_rank, configs, pc_opcode_map):
     all_config_ids = [config["config_id"] for config in configs]
     configs_by_rank = {}
@@ -164,8 +228,17 @@ def build_resolver_entries(runtime_groups, handle_map_by_rank, configs, pc_opcod
     for entry in runtime_groups:
         opcode = pc_opcode_map.get((entry["unique_function_id"], entry["pc_hex"]))
         rank = extract_rank_from_opcode(opcode)
+        rank_source = "opcode_rank" if rank is not None else None
+        if rank is None:
+            rank, rank_source = infer_rank_from_related_usage(entry, runtime_groups, pc_opcode_map)
         rank_handle_map = handle_map_by_rank.get(rank, {})
         config_id = rank_handle_map.get(entry["handle_hi_hex"])
+        confidence = "medium" if config_id else "low"
+        mapping_method = "handle_hi_to_box_dim_family_with_opcode_rank"
+        if rank_source == "same_function_handle_and_desc_reg_rank_inference":
+            mapping_method = "handle_hi_to_box_dim_family_with_inferred_rank_from_desc_reg_reuse"
+        elif rank_source == "same_function_handle_rank_inference":
+            mapping_method = "handle_hi_to_box_dim_family_with_inferred_rank_from_handle_reuse"
         resolver_entry = {
             "unique_function_id": entry["unique_function_id"],
             "pc_hex": entry["pc_hex"],
@@ -173,14 +246,16 @@ def build_resolver_entries(runtime_groups, handle_map_by_rank, configs, pc_opcod
             "desc_reg_ids": entry["desc_reg_ids"],
             "sample_count": entry["sample_count"],
             "opcode": opcode,
-            "confidence": "medium" if config_id else "low",
-            "mapping_method": "handle_hi_to_box_dim_family_with_opcode_rank",
+            "inferred_rank": rank,
+            "confidence": confidence,
+            "mapping_method": mapping_method,
         }
         if config_id:
             resolver_entry["config_id"] = config_id
         else:
             resolver_entry["candidate_config_ids"] = configs_by_rank.get(rank, all_config_ids)
         resolver.append(resolver_entry)
+    finalize_unresolved_entries(resolver)
     return resolver
 
 

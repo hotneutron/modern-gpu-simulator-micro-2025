@@ -8,6 +8,7 @@ flashattn:
                 - args: flashattn-fa2-bf16-bwd-causal-b1-s256-hd128-nh8 --warmup 0 --iters 1
                   env:
                     CUDA_ARCH: sm_90
+                    ENABLE_TMA_DESC: 1
                     INTERMEDIATE_EXTRA_FILES_PERSISTANCE: 1
                     TRACER_CUBIN_BINARY: /home/jihyun/program/miniconda/build/envs/gcom/lib/python3.13/site-packages/flash_attn_3-3.0.0-py3.13-linux-x86_64.egg/flash_attn_3/_C.abi3.so
                     TRACER_MAX_CUBIN_SOURCES: 1
@@ -23,6 +24,7 @@ flashattn:
                 - args: flashattn-fa3-bf16-bwd-causal-b1-s2048-hd64-nh24 --warmup 0 --iters 1
                   env:
                     CUDA_ARCH: sm_90
+                    ENABLE_TMA_DESC: 1
                     INTERMEDIATE_EXTRA_FILES_PERSISTANCE: 1
                     TRACER_CUBIN_BINARY: /home/jihyun/program/miniconda/build/envs/gcom/lib/python3.13/site-packages/flash_attn_3-3.0.0-py3.13-linux-x86_64.egg/flash_attn_3/_C.abi3.so
                     TRACER_MAX_CUBIN_SOURCES: 1

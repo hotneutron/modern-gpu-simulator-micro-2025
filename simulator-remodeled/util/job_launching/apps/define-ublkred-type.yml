@@ -1,0 +1,124 @@
+ublkred_type_micro:
+    exec_dir: "$GPUAPPS_ROOT/bin/$CUDA_VERSION/release/"
+    data_dirs: "$GPUAPPS_ROOT/data_dirs/"
+    execs:
+        - ublkred-type-f32-16B:
+            exe: ublkred_type_probe
+            runs:
+                - args: --format f32 --total-elems 1024 --op-bytes 16 --repeats 1 --dst-init-float 1000.0
+                  env:
+                    ENABLE_TMA_DESC: 1
+                    INTERMEDIATE_EXTRA_FILES_PERSISTANCE: 1
+                  accel-sim-mem: 4G
+                  qos: all
+                  openmp-cpus: 1
+        - ublkred-type-f32-64B:
+            exe: ublkred_type_probe
+            runs:
+                - args: --format f32 --total-elems 1024 --op-bytes 64 --repeats 1 --dst-init-float 1000.0
+                  env:
+                    ENABLE_TMA_DESC: 1
+                    INTERMEDIATE_EXTRA_FILES_PERSISTANCE: 1
+                  accel-sim-mem: 4G
+                  qos: all
+                  openmp-cpus: 1
+        - ublkred-type-f32-256B:
+            exe: ublkred_type_probe
+            runs:
+                - args: --format f32 --total-elems 1024 --op-bytes 256 --repeats 1 --dst-init-float 1000.0
+                  env:
+                    ENABLE_TMA_DESC: 1
+                    INTERMEDIATE_EXTRA_FILES_PERSISTANCE: 1
+                  accel-sim-mem: 4G
+                  qos: all
+                  openmp-cpus: 1
+        - ublkred-type-f32-1024B:
+            exe: ublkred_type_probe
+            runs:
+                - args: --format f32 --total-elems 1024 --op-bytes 1024 --repeats 1 --dst-init-float 1000.0
+                  env:
+                    ENABLE_TMA_DESC: 1
+                    INTERMEDIATE_EXTRA_FILES_PERSISTANCE: 1
+                  accel-sim-mem: 4G
+                  qos: all
+                  openmp-cpus: 1
+        - ublkred-type-f16-16B:
+            exe: ublkred_type_probe
+            runs:
+                - args: --format f16 --total-elems 1024 --op-bytes 16 --repeats 1 --dst-init-float 1000.0
+                  env:
+                    ENABLE_TMA_DESC: 1
+                    INTERMEDIATE_EXTRA_FILES_PERSISTANCE: 1
+                  accel-sim-mem: 4G
+                  qos: all
+                  openmp-cpus: 1
+        - ublkred-type-f16-64B:
+            exe: ublkred_type_probe
+            runs:
+                - args: --format f16 --total-elems 1024 --op-bytes 64 --repeats 1 --dst-init-float 1000.0
+                  env:
+                    ENABLE_TMA_DESC: 1
+                    INTERMEDIATE_EXTRA_FILES_PERSISTANCE: 1
+                  accel-sim-mem: 4G
+                  qos: all
+                  openmp-cpus: 1
+        - ublkred-type-f16-256B:
+            exe: ublkred_type_probe
+            runs:
+                - args: --format f16 --total-elems 1024 --op-bytes 256 --repeats 1 --dst-init-float 1000.0
+                  env:
+                    ENABLE_TMA_DESC: 1
+                    INTERMEDIATE_EXTRA_FILES_PERSISTANCE: 1
+                  accel-sim-mem: 4G
+                  qos: all
+                  openmp-cpus: 1
+        - ublkred-type-f16-1024B:
+            exe: ublkred_type_probe
+            runs:
+                - args: --format f16 --total-elems 1024 --op-bytes 1024 --repeats 1 --dst-init-float 1000.0
+                  env:
+                    ENABLE_TMA_DESC: 1
+                    INTERMEDIATE_EXTRA_FILES_PERSISTANCE: 1
+                  accel-sim-mem: 4G
+                  qos: all
+                  openmp-cpus: 1
+        - ublkred-type-s32-16B:
+            exe: ublkred_type_probe
+            runs:
+                - args: --format s32 --total-elems 1024 --op-bytes 16 --repeats 1 --dst-init-int 1000
+                  env:
+                    ENABLE_TMA_DESC: 1
+                    INTERMEDIATE_EXTRA_FILES_PERSISTANCE: 1
+                  accel-sim-mem: 4G
+                  qos: all
+                  openmp-cpus: 1
+        - ublkred-type-s32-64B:
+            exe: ublkred_type_probe
+            runs:
+                - args: --format s32 --total-elems 1024 --op-bytes 64 --repeats 1 --dst-init-int 1000
+                  env:
+                    ENABLE_TMA_DESC: 1
+                    INTERMEDIATE_EXTRA_FILES_PERSISTANCE: 1
+                  accel-sim-mem: 4G
+                  qos: all
+                  openmp-cpus: 1
+        - ublkred-type-s32-256B:
+            exe: ublkred_type_probe
+            runs:
+                - args: --format s32 --total-elems 1024 --op-bytes 256 --repeats 1 --dst-init-int 1000
+                  env:
+                    ENABLE_TMA_DESC: 1
+                    INTERMEDIATE_EXTRA_FILES_PERSISTANCE: 1
+                  accel-sim-mem: 4G
+                  qos: all
+                  openmp-cpus: 1
+        - ublkred-type-s32-1024B:
+            exe: ublkred_type_probe
+            runs:
+                - args: --format s32 --total-elems 1024 --op-bytes 1024 --repeats 1 --dst-init-int 1000
+                  env:
+                    ENABLE_TMA_DESC: 1
+                    INTERMEDIATE_EXTRA_FILES_PERSISTANCE: 1
+                  accel-sim-mem: 4G
+                  qos: all
+                  openmp-cpus: 1

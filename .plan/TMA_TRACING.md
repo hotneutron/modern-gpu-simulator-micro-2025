@@ -56,6 +56,64 @@ Both FlashAttention kernels (forward and backward) contain TMA instructions:
 
 ---
 
+## New Extraction Findings
+
+### `UBLKRED` uses explicit `desc[URx]`
+
+The backward trace shows `UBLKRED.G.S.ADD.F32.RN` as a descriptor-consuming TMA op with the same explicit `desc[URx]` form used by `UTMALDG.*`.
+
+Example:
+
+```text
+UBLKRED.G.S.ADD.F32.RN [UR28], [UR18], UR11, desc[UR30]
+```
+
+Practical implication:
+
+- `UBLKRED` can use the same descriptor extraction path as `UTMALDG`
+- if the opcode text does not expose rank directly, the resolver can infer rank from same-function reuse of the same handle family or descriptor register pair
+
+### `UTMASTG` uses a desc-like first operand pair
+
+The trace shows `UTMASTG.*` in the form:
+
+```text
+UTMASTG.4D [UR8], [UR6]
+UTMASTG.5D [UR8], [UR16]
+```
+
+The first bracketed uniform-register pair behaves like the descriptor selector / handle source:
+
+- `UTMASTG.4D [UR8], [UR6]`
+  - desc-like pair: `UR8/UR9`
+  - support pair: `UR6/UR7`
+- `UTMASTG.5D [UR8], [UR16]`
+  - desc-like pair: `UR8/UR9`
+  - support pair: `UR16/UR17`
+
+This interpretation is supported by nearby producer instructions and later `UTMALDG.* ... desc[UR8]` reuse in the same function.
+
+Practical implication:
+
+- static extraction should classify the first `UTMASTG` operand pair as:
+  - `desc_refs = [8]`
+  - `desc_regs = [8, 9]`
+- runtime capture should treat that first operand pair as the desc-like source for `UTMASTG`
+
+### `support_regs` meaning
+
+In `tma_discovery.json`, `support_regs` means:
+
+- uniform-register operands used by the instruction that are **not** currently classified as the descriptor pair
+
+So after the `UTMASTG` update:
+
+- `UTMASTG.4D [UR8], [UR6]`
+  - `desc_regs = [8, 9]`
+  - `support_regs = [6, 7]`
+
+---
+
 ## UTMALDG.4D — Operand and Control Bit Details
 
 The `UTMALDG.4D` instruction is the primary async load primitive. Example from CTA (0,0,0), warp 0, PC=0x94e0:
@@ -258,6 +316,21 @@ message TmaDescriptorSnapshot {
 
 **Limitation:** Requires rebuilding `tracer_tool.so`, identifying the actual descriptor producer sequence, and implementing a host-side descriptor state tracker. This is more work than Option 1, but it is the only viable path for recovering true runtime descriptor semantics when the descriptor is assembled dynamically.
 
+### Current practical trace-backed rule
+
+For the current FlashAttention trace, exact reconstructed 256-bit descriptor payloads are still not available at all consumer sites. The current extraction pipeline therefore uses the following practical rules:
+
+- `UTMALDG.*`
+  - consume explicit `desc[URx]`
+  - usually expose a stable nonzero `handle_hi` family signal
+- `UBLKRED.*`
+  - consume explicit `desc[URx]`
+  - may require rank inference from same-function related uses when the opcode text does not include `4D` or `5D`
+- `UTMASTG.*`
+  - use the first bracketed `UR` pair as desc-like
+  - may not expose a useful nonzero `handle_hi`
+  - should therefore be resolved from rank plus same-function descriptor-register reuse
+
 ---
 
 ## Finalized Option 2 implementation design
@@ -333,11 +406,11 @@ The finalized path has three primary data sources and two downstream processing 
      - `desc_value_lo` — captures the low 32-bit runtime descriptor handle value seen by the consumer
      - `desc_value_hi` — captures the high 32-bit runtime descriptor handle value used as the stable runtime tag
      - `first_lane_addr` — records one sampled effective memory address from the first active thread slot in the warp, used only as a lightweight correlation hint
-   - write `utmaldg_runtime_debug.csv`
+   - write `tma_desc_runtime_debug.csv`
 
 3. **Producer-side handle capture**
    - find the producer instruction chain that sets the uniform register pair used by `desc[URx]`
-   - write `utmaldg_producer_debug.csv`
+   - write `tma_desc_producer_debug.csv`
    - main value:
      - verify that the consumer-side `desc_reg_id` is fed by the expected producer chain
      - verify that the observed runtime handle family is not an artifact of one instruction site
@@ -406,7 +479,7 @@ This is the main resolver algorithm. Its job is to connect:
      - descriptor register references and producer-search evidence
 
 2. **Runtime consumer input**
-   - `utmaldg_runtime_debug.csv`
+   - `tma_desc_runtime_debug.csv`
    - provides:
      - `unique_function_id`
      - `pc_hex`
@@ -452,7 +525,7 @@ This is the main resolver algorithm. Its job is to connect:
    - infer tensor rank from the static opcode suffix
 
 3. **Collect runtime observations for that exact static site**
-   - filter `utmaldg_runtime_debug.csv` by the same:
+   - filter `tma_desc_runtime_debug.csv` by the same:
      - `unique_function_id`
      - `pc_hex`
    - group the remaining rows by `desc_value_hi`
@@ -505,7 +578,7 @@ For the first important consumer:
 
 The mapping process is:
 
-1. Query `utmaldg_runtime_debug.csv` for `pc_hex = 0x94e0`
+1. Query `tma_desc_runtime_debug.csv` for `pc_hex = 0x94e0`
 2. Observe stable runtime tuple:
    - `desc_value_lo = 0`
    - `desc_value_hi = 0x14f00000`
@@ -532,7 +605,7 @@ For the second consumer:
 
 The mapping process is:
 
-1. Query `utmaldg_runtime_debug.csv` for `pc_hex = 0x96b0`
+1. Query `tma_desc_runtime_debug.csv` for `pc_hex = 0x96b0`
 2. Observe stable runtime tuple:
    - `desc_value_lo = 0`
    - `desc_value_hi = 0x12f00000`
@@ -550,7 +623,7 @@ So the current best mapping is:
 
 Input:
 - `tensor_map_encode_dump.csv`
-- `utmaldg_runtime_debug.csv`
+- `tma_desc_runtime_debug.csv`
 - `tma_discovery.json`
 
 Steps:
@@ -860,6 +933,139 @@ The runtime path should be implemented in stages so we can first identify the tr
 
 - Do not modify the TMA simulator model yet.
 - Do not rely on consumer-PC `desc[URx]` reads as the authoritative descriptor value.
+
+---
+
+## Bulk `UBLKRED` Follow-up Findings
+
+Additional Hopper microbench work established that there are at least two practically different `UBLKRED` forms:
+
+- **Descriptor-backed form**
+  - example from FlashAttention:
+    - `UBLKRED.G.S.ADD.F32.RN [UR28], [UR18], UR11, desc[UR30]`
+  - this form should continue to use the descriptor extraction / resolver path
+- **Bulk non-descriptor form**
+  - reproduced with a standalone microbench:
+    - `UBLKRED.G.S.ADD.F32.RN [UR8], [UR4], UR6`
+  - this form has no `desc[URx]` operand
+  - increasing source / destination backing buffer sizes does **not** cause a descriptor operand to appear
+
+### Bulk-form operand roles
+
+For the validated bulk microbench form:
+
+```text
+UBLKRED.G.S.ADD.F32.RN [UR8], [UR4], UR6
+```
+
+the runtime and source-level probes support the following interpretation:
+
+- operand 1
+  - destination base / destination memory reference
+- operand 2
+  - source base / source shared-memory reference
+- operand 3
+  - covered span control for the current bulk reduce-store operation
+
+The key point is that operand 3 is **not** a many-to-one reduction fan-in count.
+Instead, the bulk form behaves like an elementwise reduce-store across a covered region.
+
+### Operand 3 encoding
+
+Runtime operand capture plus size-scaling microbenches showed:
+
+- `op_bytes = 16`   → operand 3 runtime value `1`
+- `op_bytes = 32`   → operand 3 runtime value `2`
+- `op_bytes = 64`   → operand 3 runtime value `4`
+- `op_bytes = 256`  → operand 3 runtime value `16`
+- `op_bytes = 1024` → operand 3 runtime value `64`
+
+Therefore, for this bulk `UBLKRED` form:
+
+```text
+covered_bytes = operand_3 * 16
+covered_elements_f32 = operand_3 * 4
+```
+
+and the execution model for F32 is:
+
+```cpp
+for (int i = 0; i < operand_3 * 4; ++i) {
+    dst[dst_base + i] += src[src_base + i];
+}
+```
+
+### Practical tracing implication
+
+Static CUBIN / SASS inspection is useful as a decode aid for operand preparation, but it is not sufficient by itself to recover the actual runtime operand value used in one traced launch.
+
+The current practical split is:
+
+- `tma_descriptor_configs.json`
+  - descriptor semantics only
+- `tma_descriptor_resolver.json`
+  - descriptor-backed consumer → config mapping
+- `tma_operand_resolver.json`
+  - runtime operand semantics and static decode formulas for TMA-family ops, including bulk `UBLKRED`
+
+For simulator work, bulk `UBLKRED` should therefore use the operand resolver rather than the descriptor resolver as the primary source of operand-3 semantics.
+
+### Descriptor-backed `UBLKRED` findings from FlashAttention FA3
+
+The FlashAttention-3 backward trace shows multiple descriptor-backed `UBLKRED` sites, for example:
+
+- `/*90a0*/ UBLKRED.G.S.ADD.F32.RN [UR10], [UR4], UR12, desc[UR16]`
+- `/*94e0*/ UBLKRED.G.S.ADD.F32.RN [UR32], [UR21], UR22, desc[UR30]`
+
+Current evidence suggests:
+
+- operand 3 remains an independent size/span-style control operand
+  - the raw runtime value is stable at `1024` across multiple descriptor-backed `UBLKRED` PCs in the analyzed FA3 run
+- operand 1 is **not** obviously a full linear destination address by itself
+  - the textual register changes across PCs
+  - but the observed runtime payload can remain a small stable value such as `33792`
+- the descriptor carries the tensor-map layout information that operand 1 / operand 2 / operand 3 do not encode
+  - shape
+  - strides
+  - box dimensions
+  - related tensor-map interpretation state
+
+This supports the working model:
+
+```text
+operand 1 = destination-side runtime state
+operand 2 = source-side runtime state
+operand 3 = covered span / encoded size control
+desc      = tensor-layout / address-resolution context
+```
+
+This is the most likely explanation for why `desc` is still required even when operand 3 already provides size-like semantics.
+
+### `UTMAREDG` modeling note
+
+For simulator design, `UTMAREDG` should not be reduced to only:
+
+- amount of data
+- reduction op kind
+
+unless the intended model is a deliberately coarse throughput-only abstraction.
+
+At minimum, there are two simulator levels:
+
+- **coarse performance model**
+  - amount of data moved / reduced
+  - reduction op kind
+  - issue / completion cost
+  - this may be enough for first-order bandwidth or latency estimation
+- **layout-aware / address-aware model**
+  - descriptor-carried tensor-map layout
+  - destination mapping behavior
+  - possible effects on locality, addressing, or correctness-sensitive placement
+
+So the short answer is:
+
+- **for a minimal coarse model**: yes, amount + op kind may be sufficient
+- **for a faithful model**: no, descriptor/layout semantics still matter
 - Do not require the first patch to support every possible descriptor-producing opcode family; proving correct reconstruction on FlashAttention is enough.
 - Keep Option 1 only as a non-authoritative static reference and cross-check path.
 
