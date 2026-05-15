@@ -73,6 +73,50 @@ Practical implication:
 - `UBLKRED` can use the same descriptor extraction path as `UTMALDG`
 - if the opcode text does not expose rank directly, the resolver can infer rank from same-function reuse of the same handle family or descriptor register pair
 
+### `UBLKCP` uses a uniform span operand encoded in 16-byte units
+
+The FlashAttention-3 backward trace shows multiple `UBLKCP.S.G` sites with the form:
+
+```text
+UBLKCP.S.G [URdst], [URsrc], URspan
+```
+
+Example FA3 sites:
+
+```text
+/*a260*/ UBLKCP.S.G [UR28], [UR6], UR9
+/*a620*/ UBLKCP.S.G [UR6], [UR8], UR10
+/*a800*/ UBLKCP.S.G [UR14], [UR22], UR10
+```
+
+The important finding is that callback 2 is the span-like uniform operand and it decodes the same way as the validated `UBLKCP` microbench:
+
+- raw callback value
+  - `32`
+- decoded covered bytes
+  - `512`
+- decode rule
+  - `covered_bytes = operand_3 * 16`
+
+Concrete FA3 evidence:
+
+- `pc 0xa260`
+  - raw `UR9 = 32`, decoded `512` bytes
+- `pc 0xa620`
+  - raw `UR10 = 32`, decoded `512` bytes
+- `pc 0xa800`
+  - raw `UR10 = 32`, decoded `512` bytes
+- `pc 0x4f0`
+  - raw `UR10 = 2048`, decoded `32768` bytes
+
+Practical implication:
+
+- bulk `UBLKCP` should use the same resolver style as bulk `UBLKRED`
+- operand 3 should be recorded as:
+  - top-level operand label: `covered_bytes_or_encoded_span`
+  - semantic decode: `kind = covered_bytes`, `encoding = 16B_units`, `scale_bytes = 16`
+- the simulator-facing byte count should come from `decoded_byte_samples`, not from the raw callback value alone
+
 ### `UTMASTG` uses a desc-like first operand pair
 
 The trace shows `UTMASTG.*` in the form:
@@ -185,6 +229,8 @@ typedef struct {
 
 The `DESC` operand type is recognized in the enhanced tracer's JSON output (`operand_type: 'DESC'`), but the tracer only records **which register** holds the descriptor (`desc[UR18]`), not **the contents** of that register.
 
+For non-descriptor bulk `UBLKCP`, this is not a blocker because the simulator-relevant span comes from the uniform operand callback rather than from descriptor state.
+
 ### Where the Gap Is
 
 The TMA descriptor is a 256-bit value stored in the GPU's **hardware descriptor cache**. The tracer cannot read it because:
@@ -254,6 +300,13 @@ Reading a single value from `desc[URx]` at `UTMALDG.*` / `UTMASTG.*` is not prom
 3. The descriptor itself is held in special descriptor state / cache, so the operand-side `URx` is typically a selector, handle, or partial input rather than the final expanded descriptor image.
 4. Different producer instructions may contribute different fields at different points before the TMA issue, so a snapshot taken only at the consumer PC can miss earlier dynamic updates.
 5. The current TMA-specific runtime UR capture path already shows instability on FlashAttention runs, so increasing dependence on consumer-side reads is high risk.
+
+That concern applies mainly to descriptor reconstruction. For bulk `UBLKCP`, the currently needed runtime fact is much narrower:
+
+- the destination / source runtime references from the memory-ref callbacks
+- the operand-3 span value from the uniform callback
+
+The FA3 trace already provides that information sufficiently to validate `covered_bytes = operand_3 * 16` for the checked `UBLKCP` sites.
 
 **Revised changes required:**
 

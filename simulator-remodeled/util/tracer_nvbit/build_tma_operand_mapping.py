@@ -151,6 +151,12 @@ def find_matching_runtime_keys(runtime_groups, unique_function_id, pc_hex):
 def infer_operand_kinds(entry):
     opcode = entry["opcode"] or ""
     operands = entry["operands"]
+    if opcode.startswith("UBLKCP") and len(operands) == 3:
+        return {
+            "operand_1": "dst_smem_base_or_cursor",
+            "operand_2": "src_gmem_base_or_cursor",
+            "operand_3": "covered_bytes_or_encoded_span",
+        }
     if opcode.startswith("UBLKRED") and len(operands) == 3 and not entry.get("descriptor_ref"):
         return {
             "operand_1": "dst_base",
@@ -189,6 +195,8 @@ def infer_operand_kinds(entry):
 
 
 def infer_operand_form(opcode, descriptor_ref):
+    if opcode.startswith("UBLKCP"):
+        return "bulk"
     if opcode.startswith("UBLKRED") and not descriptor_ref:
         return "bulk"
     if opcode.startswith("UBLKRED") and descriptor_ref:
@@ -208,7 +216,30 @@ def infer_ublkred_element_size_bytes(opcode):
 
 def infer_runtime_semantics(opcode, operands, callback_groups, descriptor_ref):
     semantics = {}
-    if opcode.startswith("UBLKRED") and len(operands) == 3 and not descriptor_ref:
+    if opcode.startswith("UBLKCP") and len(operands) == 3:
+        for callback in callback_groups:
+            position = callback.get("operand_position")
+            if position == 1:
+                semantics["operand_1"] = {
+                    "kind": "dst_smem_base_or_cursor",
+                    "runtime_source": "memory_ref",
+                }
+            elif position == 2:
+                semantics["operand_2"] = {
+                    "kind": "src_gmem_base_or_cursor",
+                    "runtime_source": "memory_ref",
+                }
+            elif position == 3:
+                raw_samples = callback.get("value_lo_samples", [])
+                semantics["operand_3"] = {
+                    "kind": "covered_bytes",
+                    "runtime_source": "uniform_reg",
+                    "encoding": "16B_units",
+                    "scale_bytes": 16,
+                    "raw_value_samples": raw_samples,
+                    "decoded_byte_samples": [value * 16 for value in raw_samples],
+                }
+    elif opcode.startswith("UBLKRED") and len(operands) == 3 and not descriptor_ref:
         element_size_bytes = infer_ublkred_element_size_bytes(opcode)
         for callback in callback_groups:
             position = callback.get("operand_position")
@@ -311,6 +342,9 @@ def build_runtime_observed_values(opcode, callback_groups, descriptor_ref):
         if keep_nontrivial_sample_field(callback.get("value_3_samples", [])):
             entry["raw_value_3_samples"] = callback.get("value_3_samples", [])
         observed[key] = entry
+    if opcode.startswith("UBLKCP") and "operand_3" in observed:
+        raw_samples = observed["operand_3"]["raw_value_lo_samples"]
+        observed["operand_3"]["decoded_byte_samples"] = [value * 16 for value in raw_samples]
     if opcode.startswith("UBLKRED") and "operand_3" in observed and not descriptor_ref:
         raw_samples = observed["operand_3"]["raw_value_lo_samples"]
         element_size_bytes = infer_ublkred_element_size_bytes(opcode)
@@ -324,6 +358,33 @@ def build_runtime_observed_values(opcode, callback_groups, descriptor_ref):
 
 
 def build_static_decode_formula(opcode, operands, descriptor_ref):
+    if opcode.startswith("UBLKCP") and len(operands) == 3:
+        return {
+            "kind": "sass_validated_formula",
+            "applies_to": "bulk_ublkcp",
+            "operands": {
+                "operand_1": {
+                    "kind": "dst_smem_base_or_cursor",
+                },
+                "operand_2": {
+                    "kind": "src_gmem_base_or_cursor",
+                },
+                "operand_3": {
+                    "kind": "covered_bytes",
+                    "encoding": "16B_units",
+                    "formula": {
+                        "covered_bytes": "operand_3 * 16",
+                    },
+                },
+            },
+            "notes": [
+                "A dedicated UBLKCP microbench lowered cp.async.bulk.shared::cta.global to UBLKCP.S.G with the same operand ordering.",
+                "Callback 0 is the shared-memory destination reference.",
+                "Callback 1 is the global-memory source reference.",
+                "Callback 2 is the scalar uniform operand.",
+                "The microbench validates operand_3 as a 16-byte-unit span field."
+            ],
+        }
     if opcode.startswith("UBLKRED") and len(operands) == 3 and not descriptor_ref:
         element_size_bytes = infer_ublkred_element_size_bytes(opcode)
         operand_3_entry = {

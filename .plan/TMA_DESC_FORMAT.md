@@ -405,6 +405,7 @@ This design avoids:
 This is especially important for:
 
 - bulk `UBLKRED` without `desc[URx]`
+- bulk `UBLKCP` without `desc[URx]`
 - future mixed forms where a descriptor exists but additional control operands still affect execution semantics
 
 It is generated from:
@@ -437,27 +438,27 @@ Keep descriptor and operand semantics separate:
     {
       "unique_function_id": 1,
       "pc_hex": "0x370",
-      "opcode": "UBLKRED.G.S.ADD.F32.RN",
-      "text": "/*0370*/ UBLKRED.G.S.ADD.F32.RN [UR8], [UR4], UR6 ;",
-      "role": "store_reduce",
+      "opcode": "UBLKCP.S.G",
+      "text": "/*0390*/ UBLKCP.S.G [UR12], [UR6], UR10 ;",
+      "role": "copy",
       "operand_form": "bulk",
       "operands": {
         "operand_1": {
           "position": 1,
-          "text": "[UR8]",
-          "reg_ids": [8],
-          "kind": "dst_base"
+          "text": "[UR12]",
+          "reg_ids": [12],
+          "kind": "dst_smem_base_or_cursor"
         },
         "operand_2": {
           "position": 2,
-          "text": "[UR4]",
-          "reg_ids": [4],
-          "kind": "src_base"
+          "text": "[UR6]",
+          "reg_ids": [6],
+          "kind": "src_gmem_base_or_cursor"
         },
         "operand_3": {
           "position": 3,
-          "text": "UR6",
-          "reg_ids": [6],
+          "text": "UR10",
+          "reg_ids": [10],
           "kind": "covered_bytes_or_encoded_span"
         }
       },
@@ -466,23 +467,21 @@ Keep descriptor and operand semantics separate:
           "callback_index": 2,
           "operand_type": "UNIFORM",
           "mem_type": "NONE",
-          "operand_reg_ids": [6],
-          "raw_value_lo_samples": [1],
+          "operand_reg_ids": [10],
+          "raw_value_lo_samples": [16],
           "sample_count": 1,
-          "decoded_byte_samples": [16],
-          "decoded_elements_f32_samples": [4]
+          "decoded_byte_samples": [256]
         }
       },
       "static_decode_formula": {
         "kind": "sass_validated_formula",
-        "applies_to": "bulk_ublkred",
+        "applies_to": "bulk_ublkcp",
         "operands": {
           "operand_3": {
             "kind": "covered_bytes",
             "encoding": "16B_units",
             "formula": {
-              "covered_bytes": "operand_3 * 16",
-              "covered_elements_f32": "operand_3 * 4"
+              "covered_bytes": "operand_3 * 16"
             }
           }
         }
@@ -491,6 +490,38 @@ Keep descriptor and operand semantics separate:
   ]
 }
 ```
+
+### Bulk `UBLKCP` interpretation
+
+For the validated non-descriptor bulk form:
+
+```text
+UBLKCP.S.G [UR12], [UR6], UR10
+```
+
+the resolver should interpret:
+
+- operand 1
+  - shared-memory destination base / cursor
+- operand 2
+  - global-memory source base / cursor
+- operand 3
+  - encoded covered span in units of 16 bytes
+
+Decode rule:
+
+```text
+covered_bytes = operand_3 * 16
+```
+
+This matches the resolver style already used by bulk `UBLKRED`:
+
+- top-level operand entry
+  - `kind = covered_bytes_or_encoded_span`
+- semantic decode entry
+  - `kind = covered_bytes`
+  - `encoding = 16B_units`
+  - `formula.covered_bytes = operand_3 * 16`
 
 ### Bulk `UBLKRED` interpretation
 
@@ -565,6 +596,17 @@ For bulk non-descriptor `UBLKRED`:
    - `static_decode_formula`
 3. decode the covered span from operand 3
 4. simulate the reduce-store using operand 1 / operand 2 / operand 3 semantics
+
+For bulk non-descriptor `UBLKCP`:
+
+1. look up `(unique_function_id, pc_hex)` in `tma_operand_resolver.json`
+2. read:
+   - `operand_form`
+   - `operands`
+   - `runtime_observed_values`
+   - `static_decode_formula`
+3. decode the covered span from operand 3
+4. simulate the GMEM → SMEM copy using operand 1 / operand 2 / operand 3 semantics
 
 For descriptor-backed `UBLKRED`:
 
