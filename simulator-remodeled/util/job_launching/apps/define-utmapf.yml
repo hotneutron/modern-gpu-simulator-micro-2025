@@ -1,0 +1,48 @@
+utmapf_micro:
+    exec_dir: "$GPUAPPS_ROOT/bin/$CUDA_VERSION/release/"
+    data_dirs: "$GPUAPPS_ROOT/data_dirs/"
+    execs:
+        - utmapf-baseline:
+            exe: utmapf_probe
+            runs:
+                - args: --variant baseline --global-d0 1 --global-d1 1 --global-d2 64 --global-d3 64 --pitch-d3 64 --box-d0 1 --box-d1 1 --box-d2 16 --box-d3 16 --coord-d0 0 --coord-d1 0 --coord-d2 0 --coord-d3 0 --smem-offset 0 --alu-gap-iters 32
+                  env:
+                    CUDA_ARCH: sm_90a
+                    ENABLE_TMA_DESC: 1
+                    INTERMEDIATE_EXTRA_FILES_PERSISTANCE: 1
+                  accel-sim-mem: 6G
+                  qos: all
+                  openmp-cpus: 2
+        - utmapf-op1-alt:
+            exe: utmapf_probe
+            runs:
+                - args: --variant op1_alt --global-d0 1 --global-d1 1 --global-d2 64 --global-d3 64 --pitch-d3 64 --box-d0 1 --box-d1 1 --box-d2 16 --box-d3 16 --coord-d0 0 --coord-d1 0 --coord-d2 0 --coord-d3 0 --smem-offset 0 --alu-gap-iters 32
+                  env:
+                    CUDA_ARCH: sm_90a
+                    ENABLE_TMA_DESC: 1
+                    INTERMEDIATE_EXTRA_FILES_PERSISTANCE: 1
+                  accel-sim-mem: 6G
+                  qos: all
+                  openmp-cpus: 2
+        - utmapf-op2-alt:
+            exe: utmapf_probe
+            runs:
+                - args: --variant op2_alt --global-d0 1 --global-d1 1 --global-d2 64 --global-d3 64 --pitch-d3 64 --box-d0 1 --box-d1 1 --box-d2 16 --box-d3 16 --coord-d0 0 --coord-d1 0 --coord-d2 0 --coord-d3 0 --smem-offset 0 --alu-gap-iters 32
+                  env:
+                    CUDA_ARCH: sm_90a
+                    ENABLE_TMA_DESC: 1
+                    INTERMEDIATE_EXTRA_FILES_PERSISTANCE: 1
+                  accel-sim-mem: 6G
+                  qos: all
+                  openmp-cpus: 2
+        - utmapf-pred-off:
+            exe: utmapf_probe
+            runs:
+                - args: --variant pred --predicate-flag 0 --global-d0 1 --global-d1 1 --global-d2 64 --global-d3 64 --pitch-d3 64 --box-d0 1 --box-d1 1 --box-d2 16 --box-d3 16 --coord-d0 0 --coord-d1 0 --coord-d2 0 --coord-d3 0 --smem-offset 0 --alu-gap-iters 32
+                  env:
+                    CUDA_ARCH: sm_90a
+                    ENABLE_TMA_DESC: 1
+                    INTERMEDIATE_EXTRA_FILES_PERSISTANCE: 1
+                  accel-sim-mem: 6G
+                  qos: all
+                  openmp-cpus: 2

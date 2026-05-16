@@ -666,8 +666,43 @@ Typical operand labels are:
 - `UTMASTG`
   - `operand_1 = store_dst_state`
   - `operand_2 = store_src_or_state`
+- `UTMAPF`
+  - `operand_1 = prefetch_request_or_state`
+  - `operand_2 = prefetch_coord_or_state`
+  - descriptor is not explicit in the opcode text, so the resolver carries it through `descriptor_link`
 
 This labeling is intended to distinguish these instructions from bulk `UBLKRED`, where a dedicated runtime operand appears to directly control the covered span.
+
+### `UTMAPF` descriptor linkage
+
+`UTMAPF` does not expose a direct `desc[URx]` operand in the traced SASS text, so the canonical resolver stores its descriptor association as a link:
+
+- `descriptor_link.status`
+  - whether the link is usable
+- `descriptor_link.match_rule`
+  - current rule: `exact_forward_utmaldg_operand_1`
+- `descriptor_link.matched_consumer`
+  - later `UTMALDG.*` site used as the descriptor-carrying consumer
+- `descriptor_link.matched_descriptor.config_ids`
+  - canonical descriptor config ids to use with `tma_descriptor_configs.json`
+- `descriptor_link.operand_match`
+  - trace evidence that justified the link
+
+The intended simulator-side lookup order is:
+
+1. read one instruction entry from `tma_operand_resolver.json`
+2. if `descriptor_ref.config_ids` exists, use it directly
+3. otherwise, if `descriptor_link.status == "matched"`, use `descriptor_link.matched_descriptor.config_ids`
+4. resolve that `config_id` inside `tma_descriptor_configs.json`
+
+For the currently validated FA3 `UTMAPF` site:
+
+- `pc 0x91e0`
+  - links to later consumer `pc 0x96b0`
+  - maps to descriptor config `tm_r4_dt9_box_64x128x1x1`
+  - the exact link is justified by matching runtime `operand_1` samples between the prefetch and the later `UTMALDG`
+
+This keeps all authoritative prefetch information in `tma_operand_resolver.json`; there is no separate prefetch-only canonical JSON anymore.
 
 And it enables:
 
@@ -690,6 +725,12 @@ For the currently analyzed FlashAttention-3 trace:
 
 - `pc 0x9a80`, `handle_hi 0x14f00000`
   - likely maps to `tm_r4_dt9_box_64x192x1x1`
+
+- `UTMAPF.L2.4D` at `pc 0x91e0`
+  - has no explicit `descriptor_ref`
+  - uses `descriptor_link -> matched_consumer pc 0x96b0`
+  - maps to `tm_r4_dt9_box_64x128x1x1`
+  - link rule: `exact_forward_utmaldg_operand_1`
 
 - `UBLKRED` first family in `unique_function_id = 8`
   - `pc 0x90a0`, `0x91d0`, `0x94e0`, `0x95b0`, `0x96f0`, `0x97c0`

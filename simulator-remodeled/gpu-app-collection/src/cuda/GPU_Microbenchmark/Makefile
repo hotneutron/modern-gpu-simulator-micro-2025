@@ -25,6 +25,7 @@ all:
 	cd ublkred_size_probe && 		make &&	cp ublkred_size_probe $(BIN_DIR)
 	cd ublkred_type_probe && 		make &&	cp ublkred_type_probe $(BIN_DIR)
 	cd ublkred_desc_probe && 		make &&	cp ublkred_desc_probe $(BIN_DIR)
+	cd utmapf_probe && 		make &&	cp utmapf_probe $(BIN_DIR)
 	cd Atomic_ubench/Atomic_add/Atomic_add_bw &&            make && cp atomic_add_bw $(BIN_DIR)
 	cd Atomic_ubench/Atomic_add/Atomic_add_bw_conflict &&            make && cp atomic_add_bw_conflict $(BIN_DIR)
 	cd Atomic_ubench/Atomic_add/Atomic_add_lat &&            make && cp atomic_add_lat $(BIN_DIR)

@@ -73,6 +73,66 @@ Practical implication:
 - `UBLKRED` can use the same descriptor extraction path as `UTMALDG`
 - if the opcode text does not expose rank directly, the resolver can infer rank from same-function reuse of the same handle family or descriptor register pair
 
+### `UTMAPF` descriptor link on real FA3
+
+The validated FA3 runtime shows only one actually observed `UTMAPF` site:
+
+```text
+/*91e0*/ @!UP2 UTMAPF.L2.4D [UR28], [UR8] ;
+```
+
+For that site, the canonical resolver now stores:
+
+- `runtime_observed = true`
+- runtime operand samples for both operands
+- `descriptor_link`
+
+The current `descriptor_link` rule is:
+
+```text
+exact_forward_utmaldg_operand_1
+```
+
+Meaning:
+
+1. start from a runtime-observed `UTMAPF`
+2. search later `UTMALDG.*` in the same `unique_function_id`
+3. require exact equality of runtime `operand_1.raw_value_lo_samples`
+4. use that later `UTMALDG` as the descriptor-carrying consumer
+
+For FA3 this resolves:
+
+- `UTMAPF pc 0x91e0`
+  - later consumer `UTMALDG pc 0x96b0`
+  - descriptor config `tm_r4_dt9_box_64x128x1x1`
+
+The important practical point is:
+
+- `UTMAPF` itself does not carry explicit `desc[URx]`
+- the descriptor association is recovered through `descriptor_link`
+- the canonical place for this is now `tma_operand_resolver.json`
+
+### Why most FA3 `UTMAPF` sites have no runtime samples
+
+The apparent `72` `UTMAPF` sites in FA3 should not be interpreted as `72` executed prefetches.
+
+What actually happens is:
+
+- `tma_discovery.json` keeps all statically discovered TMA-family instructions from disassembly
+- only a subset match real executed runtime kernels and receive a non-null `unique_function_id`
+- `runtime_observed = false` means the site is static-only in this run
+
+For the analyzed FA3 trace:
+
+- static `UTMAPF` sites discovered
+  - `72`
+- runtime-observed `UTMAPF` sites
+  - `1`
+
+So the `71` non-observed entries are mostly static-only disassembly sites, not failed runtime captures of executed prefetches.
+
+This is why `runtime_observed` was added to the canonical resolver: simulator code should consume only runtime-observed entries unless it intentionally wants static analysis coverage.
+
 ### `UBLKCP` uses a uniform span operand encoded in 16-byte units
 
 The FlashAttention-3 backward trace shows multiple `UBLKCP.S.G` sites with the form:

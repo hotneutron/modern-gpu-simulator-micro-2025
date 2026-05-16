@@ -86,6 +86,31 @@ def load_descriptor_refs(extra_info_dir: Path):
     return normalized
 
 
+def build_function_descriptor_index(descriptor_refs):
+    grouped = {}
+    for (unique_function_id, pc_hex), descriptor_ref in descriptor_refs.items():
+        if unique_function_id is None:
+            continue
+        grouped.setdefault(unique_function_id, {
+            "config_ids": set(),
+            "desc_reg_ids": set(),
+            "source_pcs": set(),
+        })
+        for config_id in descriptor_ref.get("config_ids", []):
+            grouped[unique_function_id]["config_ids"].add(config_id)
+        for desc_reg_id in descriptor_ref.get("desc_reg_ids", []):
+            grouped[unique_function_id]["desc_reg_ids"].add(desc_reg_id)
+        grouped[unique_function_id]["source_pcs"].add(pc_hex)
+    normalized = {}
+    for unique_function_id, value in grouped.items():
+        normalized[unique_function_id] = {
+            "config_ids": sorted(value["config_ids"]),
+            "desc_reg_ids": sorted(value["desc_reg_ids"]),
+            "source_pcs": sorted(value["source_pcs"], key=parse_pc_hex),
+        }
+    return normalized
+
+
 def build_runtime_groups(runtime_rows):
     grouped = {}
     for row in runtime_rows:
@@ -441,6 +466,109 @@ def build_static_decode_formula(opcode, operands, descriptor_ref):
     return None
 
 
+def parse_pc_hex(pc_hex):
+    if pc_hex is None:
+        return None
+    return int(pc_hex, 16)
+
+
+def operand_raw_samples(entry, operand_key):
+    return entry.get("runtime_observed_values", {}).get(operand_key, {}).get("raw_value_lo_samples", [])
+
+
+def build_utmapf_descriptor_link(entry, resolver_entries, function_descriptor_index):
+    if not entry["opcode"].startswith("UTMAPF"):
+        return None
+    prefetch_operand_1 = operand_raw_samples(entry, "operand_1")
+    if not prefetch_operand_1:
+        return {
+            "status": "unresolved",
+            "match_rule": "exact_forward_utmaldg_operand_1",
+            "reason": "missing_runtime_operand_1",
+        }
+    unique_function_id = entry.get("unique_function_id")
+    current_pc = parse_pc_hex(entry.get("pc_hex"))
+    if unique_function_id is None or current_pc is None:
+        return {
+            "status": "unresolved",
+            "match_rule": "exact_forward_utmaldg_operand_1",
+            "reason": "missing_location_identity",
+        }
+    candidates = []
+    for other in resolver_entries:
+        if not other["opcode"].startswith("UTMALDG"):
+            continue
+        if other.get("unique_function_id") != unique_function_id:
+            continue
+        other_pc = parse_pc_hex(other.get("pc_hex"))
+        if other_pc is None or other_pc <= current_pc:
+            continue
+        other_operand_1 = operand_raw_samples(other, "operand_1")
+        if not other_operand_1:
+            continue
+        if other_operand_1 != prefetch_operand_1:
+            continue
+        candidates.append(other)
+    if not candidates:
+        return {
+            "status": "unresolved",
+            "match_rule": "exact_forward_utmaldg_operand_1",
+            "reason": "no_exact_later_utmaldg_match",
+        }
+    deduped_candidates = {}
+    for candidate in candidates:
+        dedup_key = (candidate.get("pc_hex"), candidate.get("opcode"))
+        if dedup_key not in deduped_candidates:
+            deduped_candidates[dedup_key] = candidate
+    candidates = sorted(deduped_candidates.values(), key=lambda item: parse_pc_hex(item["pc_hex"]))
+    if len(candidates) > 1:
+        return {
+            "status": "unresolved",
+            "match_rule": "exact_forward_utmaldg_operand_1",
+            "reason": "multiple_exact_later_utmaldg_matches",
+            "candidate_pcs": [candidate["pc_hex"] for candidate in candidates[:8]],
+        }
+    matched = candidates[0]
+    descriptor_ref = matched.get("descriptor_ref", {})
+    if descriptor_ref.get("config_ids"):
+        matched_descriptor = {
+            "config_ids": descriptor_ref.get("config_ids", []),
+            "desc_reg_ids": descriptor_ref.get("desc_reg_ids", []),
+            "source": "matched_consumer_descriptor_ref",
+        }
+    else:
+        function_descriptor_ref = function_descriptor_index.get(unique_function_id, {})
+        if len(function_descriptor_ref.get("config_ids", [])) != 1:
+            return {
+                "status": "unresolved",
+                "match_rule": "exact_forward_utmaldg_operand_1",
+                "reason": "matched_consumer_has_no_descriptor_ref_and_function_descriptor_is_ambiguous",
+                "candidate_function_config_ids": function_descriptor_ref.get("config_ids", []),
+            }
+        matched_descriptor = {
+            "config_ids": function_descriptor_ref.get("config_ids", []),
+            "desc_reg_ids": function_descriptor_ref.get("desc_reg_ids", []),
+            "source_pcs": function_descriptor_ref.get("source_pcs", []),
+            "source": "unique_function_descriptor_config",
+        }
+    return {
+        "status": "matched",
+        "match_rule": "exact_forward_utmaldg_operand_1",
+        "matched_consumer": {
+            "pc_hex": matched.get("pc_hex"),
+            "opcode": matched.get("opcode"),
+            "role": matched.get("role"),
+        },
+        "matched_descriptor": matched_descriptor,
+        "operand_match": {
+            "match_operand": "operand_1",
+            "prefetch_operand_1_raw_value_lo_samples": prefetch_operand_1,
+            "prefetch_operand_2_raw_value_lo_samples": operand_raw_samples(entry, "operand_2"),
+            "consumer_operand_1_raw_value_lo_samples": operand_raw_samples(matched, "operand_1"),
+            "consumer_operand_2_raw_value_lo_samples": operand_raw_samples(matched, "operand_2"),
+        },
+    }
+
 def build_resolver(extra_info_dir: Path):
     discovery_path = extra_info_dir / "tma_discovery.json"
     runtime_path = extra_info_dir / "tma_runtime_operand_debug.jsonl"
@@ -450,6 +578,7 @@ def build_resolver(extra_info_dir: Path):
     discovery_data = json.loads(discovery_path.read_text())
     discovery_entries = collect_tma_entries(discovery_data)
     descriptor_refs = load_descriptor_refs(extra_info_dir)
+    function_descriptor_index = build_function_descriptor_index(descriptor_refs)
     runtime_rows = parse_jsonl(runtime_path)
     runtime_groups = build_runtime_groups(runtime_rows)
 
@@ -490,6 +619,7 @@ def build_resolver(extra_info_dir: Path):
             "opcode": entry["opcode"],
             "text": entry["text"],
             "role": entry["role"],
+            "runtime_observed": bool(callback_groups),
             "operand_form": infer_operand_form(entry["opcode"], descriptor_ref),
             "operands": build_operand_entries(operands, inferred_operand_kinds),
             "support_regs": entry.get("support_regs", []),
@@ -511,6 +641,10 @@ def build_resolver(extra_info_dir: Path):
         if descriptor_ref:
             resolver_entry["descriptor_ref"] = descriptor_ref
         resolver.append(resolver_entry)
+    for resolver_entry in resolver:
+        descriptor_link = build_utmapf_descriptor_link(resolver_entry, resolver, function_descriptor_index)
+        if descriptor_link:
+            resolver_entry["descriptor_link"] = descriptor_link
     return {
         "version": 1,
         "source": {
