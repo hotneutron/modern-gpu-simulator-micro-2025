@@ -182,6 +182,40 @@ For simulator purposes this means:
 - it can be treated as a control/setup op only
 - the data-size path still comes from `UTMAPF -> descriptor_link -> UTMALDG -> descriptor config`
 
+### `UTMACMDFLUSH` acts like a control-only command flush
+
+The FA3 trace shows `UTMACMDFLUSH` with no visible operands:
+
+```text
+/*8220*/ UTMACMDFLUSH ;
+/*7f00*/ UTMACMDFLUSH ;
+/*90b0*/ UTMACMDFLUSH ;
+```
+
+Representative resolver observations:
+
+- `role = control`
+- `operands = {}`
+- `support_regs = []`
+- `runtime_observed = true` for the executed FA3 sites
+- runtime callback classification is effectively `NO_REGS` / `NONE`
+- `runtime_observed_values = {}`
+
+So the current practical interpretation is:
+
+- `UTMACMDFLUSH` is a command/control flush event
+- it does not carry a meaningful runtime operand payload
+- it does not carry descriptor-selection info
+- it does not need byte-movement accounting
+
+For simulator purposes, it is enough to treat it as:
+
+```text
+UTMACMDFLUSH = control-only flush event for TMA command/control state
+```
+
+This should be understood as a pipeline/control effect, not as flushing an operand value or moving data directly.
+
 ### `UBLKCP` uses a uniform span operand encoded in 16-byte units
 
 The FlashAttention-3 backward trace shows multiple `UBLKCP.S.G` sites with the form:

@@ -670,6 +670,10 @@ Typical operand labels are:
   - `operand_1 = prefetch_control_state`
   - control/setup operand for the prefetch pipeline
   - not treated as a data-movement byte-count field
+- `UTMACMDFLUSH`
+  - no explicit operands in the traced FA3 form
+  - treated as a control-only command flush event
+  - not treated as a data-movement byte-count field
 - `UTMAPF`
   - `operand_1 = prefetch_request_or_state`
   - `operand_2 = prefetch_coord_or_state`
@@ -744,6 +748,35 @@ UTMALDG   operand_1   = load_dst_state
 ```
 
 where all three belong to the same broad state family used by the TMA prefetch/load pipeline.
+
+### `UTMACMDFLUSH` meaning
+
+`UTMACMDFLUSH` currently appears in FA3 in the form:
+
+```text
+UTMACMDFLUSH ;
+```
+
+Observed resolver facts:
+
+- `operands = {}`
+- `support_regs = []`
+- `desc_refs = []`
+- `desc_regs = []`
+- runtime callback type is effectively `NO_REGS`
+
+Current practical interpretation:
+
+- it is a control-only flush event for the TMA command/control path
+- it does not expose a descriptor operand
+- it does not expose a byte-count operand
+- it should not be modeled as a data-moving instruction
+
+For simulator use, the current recommendation is:
+
+- keep `role = control`
+- keep `runtime_observed`
+- do not add operand labels or descriptor-link semantics unless future evidence shows otherwise
 
 And it enables:
 
