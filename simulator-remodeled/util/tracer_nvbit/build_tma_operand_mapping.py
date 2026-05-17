@@ -216,6 +216,11 @@ def infer_operand_kinds(entry):
         if len(operands) >= 2:
             inferred["operand_2"] = "store_src_or_state"
         return inferred
+    if opcode.startswith("UTMACCTL.PF"):
+        inferred = {}
+        if len(operands) >= 1:
+            inferred["operand_1"] = "prefetch_control_state"
+        return inferred
     return {}
 
 

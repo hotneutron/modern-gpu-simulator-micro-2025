@@ -666,6 +666,10 @@ Typical operand labels are:
 - `UTMASTG`
   - `operand_1 = store_dst_state`
   - `operand_2 = store_src_or_state`
+- `UTMACCTL.PF`
+  - `operand_1 = prefetch_control_state`
+  - control/setup operand for the prefetch pipeline
+  - not treated as a data-movement byte-count field
 - `UTMAPF`
   - `operand_1 = prefetch_request_or_state`
   - `operand_2 = prefetch_coord_or_state`
@@ -703,6 +707,43 @@ For the currently validated FA3 `UTMAPF` site:
   - the exact link is justified by matching runtime `operand_1` samples between the prefetch and the later `UTMALDG`
 
 This keeps all authoritative prefetch information in `tma_operand_resolver.json`; there is no separate prefetch-only canonical JSON anymore.
+
+### `UTMACCTL.PF` operand meaning
+
+`UTMACCTL.PF` currently appears in FA3 as a one-operand control opcode:
+
+```text
+UTMACCTL.PF [URx]
+```
+
+The canonical resolver label is:
+
+- `operand_1 = prefetch_control_state`
+
+Current interpretation:
+
+- it is a control/setup state for the prefetch path
+- it is not itself used as a byte-count field
+- it is not the direct descriptor carrier
+
+Trace evidence shows that this value aligns with nearby prefetch/load-side state values. For example in FA3:
+
+- `UTMACCTL.PF pc 0x110`
+  - runtime `operand_1 = 18446744072806204416`
+- `UTMAPF pc 0x91e0`
+  - runtime `operand_1 = 18446744072806204416`
+- `UTMALDG pc 0x9c00`
+  - runtime `operand_1 = 18446744072806204800`
+
+This supports the practical model:
+
+```text
+UTMACCTL.PF operand_1 = prefetch_control_state
+UTMAPF    operand_1   = prefetch_request_state
+UTMALDG   operand_1   = load_dst_state
+```
+
+where all three belong to the same broad state family used by the TMA prefetch/load pipeline.
 
 And it enables:
 

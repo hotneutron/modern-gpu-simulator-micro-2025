@@ -133,6 +133,55 @@ So the `71` non-observed entries are mostly static-only disassembly sites, not f
 
 This is why `runtime_observed` was added to the canonical resolver: simulator code should consume only runtime-observed entries unless it intentionally wants static analysis coverage.
 
+### `UTMACCTL.PF` acts like prefetch control-state setup
+
+The FA3 trace shows `UTMACCTL.PF` as a one-operand control opcode:
+
+```text
+/*0110*/ UTMACCTL.PF [UR6] ;
+/*0120*/ UTMACCTL.PF [UR8] ;
+/*0130*/ UTMACCTL.PF [UR10] ;
+```
+
+The useful runtime observation is that its single operand behaves like a state token rather than a byte-count field.
+
+Representative FA3 runtime values:
+
+- `pc 0x110`
+  - `operand_1 = 18446744072806204416`
+- `pc 0x120`
+  - `operand_1 = 18446744072806204608`
+- `pc 0x130`
+  - `operand_1 = 18446744072806204800`
+
+These values line up with nearby prefetch/load-side state values:
+
+- `UTMACCTL.PF pc 0x110`
+  - `operand_1 = 18446744072806204416`
+- runtime-observed `UTMAPF pc 0x91e0`
+  - `operand_1 = 18446744072806204416`
+- nearby `UTMALDG pc 0x9c00`
+  - `operand_1 = 18446744072806204800`
+
+So the current practical interpretation is:
+
+- `UTMACCTL.PF operand_1`
+  - `prefetch_control_state`
+
+and the relationship is:
+
+```text
+UTMACCTL.PF = control/setup for prefetch state
+UTMAPF      = actual prefetch request using that state family
+UTMALDG     = later load using the related state/descriptor path
+```
+
+For simulator purposes this means:
+
+- `UTMACCTL.PF` does not need byte-movement accounting
+- it can be treated as a control/setup op only
+- the data-size path still comes from `UTMAPF -> descriptor_link -> UTMALDG -> descriptor config`
+
 ### `UBLKCP` uses a uniform span operand encoded in 16-byte units
 
 The FlashAttention-3 backward trace shows multiple `UBLKCP.S.G` sites with the form:
