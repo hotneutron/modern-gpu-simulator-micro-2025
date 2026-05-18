@@ -4,6 +4,7 @@ from optparse import OptionParser
 import os
 import subprocess
 import os
+import shlex
 this_directory = os.path.dirname(os.path.realpath(__file__)) + "/"
 import sys
 sys.path.insert(0,os.path.join(this_directory,"..","job_launching"))
@@ -60,11 +61,45 @@ logfile = day_string + "--" + time_string + ".csv"
 
 nvbit_tracer_path = os.path.join(this_directory, "tracer_tool")
 
+
+def build_tma_descriptor_mapping_if_available(trace_folder):
+    extra_info_dir = os.path.join(trace_folder, "extra_info")
+    discovery_inputs = [
+        os.path.join(extra_info_dir, "enhanced_execution_info.json"),
+        os.path.join(extra_info_dir, "sass"),
+    ]
+    if all(os.path.exists(path) for path in discovery_inputs):
+        discovery_script = os.path.join(this_directory, "discover_tma_producers.py")
+        subprocess.run([sys.executable, discovery_script, "--traces", trace_folder], check=True)
+    mapping_inputs = [
+        os.path.join(extra_info_dir, "tensor_map_encode_dump.csv"),
+        os.path.join(extra_info_dir, "tma_desc_runtime_debug.csv"),
+        os.path.join(extra_info_dir, "tma_discovery.json"),
+    ]
+    if not all(os.path.exists(path) for path in mapping_inputs):
+        return
+    mapping_script = os.path.join(this_directory, "build_tma_descriptor_mapping.py")
+    subprocess.run([sys.executable, mapping_script, extra_info_dir], check=True)
+
+
+def build_tma_operand_mapping_if_available(trace_folder):
+    extra_info_dir = os.path.join(trace_folder, "extra_info")
+    operand_inputs = [
+        os.path.join(extra_info_dir, "tma_discovery.json"),
+        os.path.join(extra_info_dir, "tma_runtime_operand_debug.jsonl"),
+    ]
+    if not all(os.path.exists(path) for path in operand_inputs):
+        return
+    operand_script = os.path.join(this_directory, "build_tma_operand_mapping.py")
+    subprocess.run([sys.executable, operand_script, extra_info_dir], check=True)
+
 for bench in benchmarks:
     edir, ddir, exe, argslist = bench
     for argpair in argslist:
         args = argpair["args"]
-        run_name = os.path.join( exe, common.get_argfoldername( args ) )
+        extra_env = argpair.get("env", {})
+        benchmark_name = argpair.get("benchmark_name", exe)
+        run_name = os.path.join( benchmark_name, common.get_argfoldername( args ) )
 
         # MOD. Begin. Improved tracer
         if(options.compressed == "0"):
@@ -101,6 +136,10 @@ for bench in benchmarks:
         exec_path = common.file_option_test(os.path.join(edir, exe),"",this_directory)
         sh_contents = "set -e\n"
 
+        env_exports = ""
+        for key, value in extra_env.items():
+            env_exports += "export {0}={1}; ".format(key, shlex.quote(str(value)))
+
         if options.terminate_upon_limit:
             sh_contents += "export TERMINATE_UPON_LIMIT=1; "
 
@@ -126,13 +165,13 @@ for bench in benchmarks:
         
         # MOD. Begin. Improved tracer
         if(options.compressed == "0"):
-            sh_contents += "\nexport CUDA_VERSION=\"" + cuda_version + "\"; export CUDA_VISIBLE_DEVICES=\"" + options.device_num + "\" ; " +\
-                "export TRACES_FOLDER="+ this_trace_folder + "; CUDA_INJECTION64_PATH=" + os.path.join(nvbit_tracer_path, "tracer_tool.so") +\
+            sh_contents += "\nexport CUDA_VERSION=\"" + cuda_version + "\"; export CUDA_VISIBLE_DEVICES=\"" + options.device_num + "\" ; export USER_DEFINED_FOLDERS=1; " +\
+                "export TRACES_FOLDER="+ this_trace_folder + "; " + env_exports + "export CUDA_INJECTION64_PATH=" + os.path.join(nvbit_tracer_path, "tracer_tool.so") +\
                 " " + "; LD_PRELOAD=" + os.path.join(nvbit_tracer_path, "tracer_tool.so") + " " +\
                 exec_path + " " + str(args) + " ;"
         else:
-            sh_contents += "\nexport CUDA_VERSION=\"" + cuda_version + "\"; export CUDA_VISIBLE_DEVICES=\"" + options.device_num + "\" ; " +\
-                "export TRACES_FOLDER="+ this_trace_folder + "; CUDA_INJECTION64_PATH=" + os.path.join(nvbit_tracer_path, "tracer_tool.so") +\
+            sh_contents += "\nexport CUDA_VERSION=\"" + cuda_version + "\"; export CUDA_VISIBLE_DEVICES=\"" + options.device_num + "\" ; export USER_DEFINED_FOLDERS=1; " +\
+                "export TRACES_FOLDER="+ this_trace_folder + "; " + env_exports + "export CUDA_INJECTION64_PATH=" + os.path.join(nvbit_tracer_path, "tracer_tool.so") +\
                 " " + "; LD_PRELOAD=" + os.path.join(nvbit_tracer_path, "tracer_tool.so") + " " +\
                 exec_path + " " + str(args) + " ; " + os.path.join(nvbit_tracer_path,"traces-processing", "post-traces-processing-compressed") + " " +\
                 os.path.join(this_trace_folder, "kernelslist") + " " + str(psutil.virtual_memory()[1]*.8) + " ; rm -f " + this_trace_folder + "/*.trace ; rm -f " + this_trace_folder + "/kernelslist "
@@ -150,3 +189,5 @@ for bench in benchmarks:
             if subprocess.call(["bash","run.sh"]) != 0:
                 sys.exit("Error invoking nvbit on {0}".format(this_run_dir))
             os.chdir(saved_dir)
+            build_tma_descriptor_mapping_if_available(this_trace_folder)
+            build_tma_operand_mapping_if_available(this_trace_folder)

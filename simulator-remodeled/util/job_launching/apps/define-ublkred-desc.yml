@@ -1,0 +1,59 @@
+ublkred_desc_micro:
+    exec_dir: "$GPUAPPS_ROOT/bin/$CUDA_VERSION/release/"
+    data_dirs: "$GPUAPPS_ROOT/data_dirs/"
+    execs:
+        - ublkred-desc-baseline:
+            exe: ublkred_desc_probe
+            runs:
+                - args: --global-rows 64 --global-cols 64 --pitch-cols 64 --box-rows 16 --box-cols 16 --coord-row 0 --coord-col 0 --smem-offset 0 --init 1.0
+                  env:
+                    CUDA_ARCH: sm_90a
+                    ENABLE_TMA_DESC: 1
+                    INTERMEDIATE_EXTRA_FILES_PERSISTANCE: 1
+                  accel-sim-mem: 6G
+                  qos: all
+                  openmp-cpus: 2
+        - ublkred-desc-pitch-128:
+            exe: ublkred_desc_probe
+            runs:
+                - args: --global-rows 64 --global-cols 64 --pitch-cols 128 --box-rows 16 --box-cols 16 --coord-row 0 --coord-col 0 --smem-offset 0 --init 1.0
+                  env:
+                    CUDA_ARCH: sm_90a
+                    ENABLE_TMA_DESC: 1
+                    INTERMEDIATE_EXTRA_FILES_PERSISTANCE: 1
+                  accel-sim-mem: 6G
+                  qos: all
+                  openmp-cpus: 2
+        - ublkred-desc-coord-shift:
+            exe: ublkred_desc_probe
+            runs:
+                - args: --global-rows 64 --global-cols 64 --pitch-cols 64 --box-rows 16 --box-cols 16 --coord-row 16 --coord-col 8 --smem-offset 0 --init 1.0
+                  env:
+                    CUDA_ARCH: sm_90a
+                    ENABLE_TMA_DESC: 1
+                    INTERMEDIATE_EXTRA_FILES_PERSISTANCE: 1
+                  accel-sim-mem: 6G
+                  qos: all
+                  openmp-cpus: 2
+        - ublkred-desc-box-8x32:
+            exe: ublkred_desc_probe
+            runs:
+                - args: --global-rows 64 --global-cols 64 --pitch-cols 64 --box-rows 8 --box-cols 32 --coord-row 0 --coord-col 0 --smem-offset 0 --init 1.0
+                  env:
+                    CUDA_ARCH: sm_90a
+                    ENABLE_TMA_DESC: 1
+                    INTERMEDIATE_EXTRA_FILES_PERSISTANCE: 1
+                  accel-sim-mem: 6G
+                  qos: all
+                  openmp-cpus: 2
+        - ublkred-desc-smem-offset:
+            exe: ublkred_desc_probe
+            runs:
+                - args: --global-rows 64 --global-cols 64 --pitch-cols 64 --box-rows 16 --box-cols 16 --coord-row 0 --coord-col 0 --smem-offset 32 --init 1.0
+                  env:
+                    CUDA_ARCH: sm_90a
+                    ENABLE_TMA_DESC: 1
+                    INTERMEDIATE_EXTRA_FILES_PERSISTANCE: 1
+                  accel-sim-mem: 6G
+                  qos: all
+                  openmp-cpus: 2

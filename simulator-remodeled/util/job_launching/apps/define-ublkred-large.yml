@@ -1,0 +1,59 @@
+ublkred_micro_large:
+    exec_dir: "$GPUAPPS_ROOT/bin/$CUDA_VERSION/release/"
+    data_dirs: "$GPUAPPS_ROOT/data_dirs/"
+    execs:
+        - ublkred-probe-large-baseline:
+            exe: ublkred_probe
+            runs:
+                - args: --total-floats 262144 --store-floats 4096 --gmem-offset 0 --smem-offset 0 --init 1.0
+                  env:
+                    CUDA_ARCH: sm_90a
+                    ENABLE_TMA_DESC: 1
+                    INTERMEDIATE_EXTRA_FILES_PERSISTANCE: 1
+                  accel-sim-mem: 6G
+                  qos: all
+                  openmp-cpus: 2
+        - ublkred-probe-large-gmem-offset:
+            exe: ublkred_probe
+            runs:
+                - args: --total-floats 262144 --store-floats 4096 --gmem-offset 4096 --smem-offset 0 --init 1.0
+                  env:
+                    CUDA_ARCH: sm_90a
+                    ENABLE_TMA_DESC: 1
+                    INTERMEDIATE_EXTRA_FILES_PERSISTANCE: 1
+                  accel-sim-mem: 6G
+                  qos: all
+                  openmp-cpus: 2
+        - ublkred-probe-large-smem-offset:
+            exe: ublkred_probe
+            runs:
+                - args: --total-floats 262144 --store-floats 4096 --gmem-offset 0 --smem-offset 256 --init 1.0
+                  env:
+                    CUDA_ARCH: sm_90a
+                    ENABLE_TMA_DESC: 1
+                    INTERMEDIATE_EXTRA_FILES_PERSISTANCE: 1
+                  accel-sim-mem: 6G
+                  qos: all
+                  openmp-cpus: 2
+        - ublkred-probe-large-store-2048:
+            exe: ublkred_probe
+            runs:
+                - args: --total-floats 262144 --store-floats 2048 --gmem-offset 0 --smem-offset 0 --init 1.0
+                  env:
+                    CUDA_ARCH: sm_90a
+                    ENABLE_TMA_DESC: 1
+                    INTERMEDIATE_EXTRA_FILES_PERSISTANCE: 1
+                  accel-sim-mem: 6G
+                  qos: all
+                  openmp-cpus: 2
+        - ublkred-probe-large-init-2:
+            exe: ublkred_probe
+            runs:
+                - args: --total-floats 262144 --store-floats 4096 --gmem-offset 0 --smem-offset 0 --init 2.0
+                  env:
+                    CUDA_ARCH: sm_90a
+                    ENABLE_TMA_DESC: 1
+                    INTERMEDIATE_EXTRA_FILES_PERSISTANCE: 1
+                  accel-sim-mem: 6G
+                  qos: all
+                  openmp-cpus: 2

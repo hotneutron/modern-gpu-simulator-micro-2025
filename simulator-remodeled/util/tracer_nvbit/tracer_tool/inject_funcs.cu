@@ -64,7 +64,9 @@ extern "C" __device__ __noinline__ void instrument_inst(
   }
 
   inst_trace_t ma;
+  ma.ureg_desc_id = SECRET_UREG_DESC_NOT_USED;
   ma.ureg_desc_value = SECRET_UREG_DESC_NOT_USED;
+  ma.ureg_desc_value_hi = SECRET_UREG_DESC_NOT_USED;
   ma.num_of_injects = num_of_injects;
   ma.per_operand_type = per_operand_type;
   if (memory_type == MEM_TYPE::STANDARD_MEM) {
@@ -76,6 +78,12 @@ extern "C" __device__ __noinline__ void instrument_inst(
     ma.mem_type = MEM_TYPE::STANDARD_MEM;
     if(op_reg_val_1 != SECRET_UREG_DESC_NOT_USED) {
       ma.ureg_desc_value = op_reg_val_1;
+    }
+    if(op_reg_val_2 != SECRET_UREG_DESC_NOT_USED) {
+      ma.ureg_desc_id = op_reg_val_2;
+    }
+    if(op_reg_val_3 != SECRET_UREG_DESC_NOT_USED) {
+      ma.ureg_desc_value_hi = op_reg_val_3;
     }
   }else if(memory_type == MEM_TYPE::CONSTANT_MEM) {
     ma.mem_type = MEM_TYPE::CONSTANT_MEM;

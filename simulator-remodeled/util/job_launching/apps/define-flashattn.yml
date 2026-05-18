@@ -1,0 +1,36 @@
+flashattn:
+    exec_dir: "/home/jihyun/project/modern-gpu-simulator-micro-2025/simulator-remodeled/util/job_launching/apps/bin"
+    data_dirs: "/home/jihyun/project/accorde"
+    execs:
+        - flashattn-fa2-bf16-bwd-causal-b1-s256-hd128-nh8:
+            exe: flashattn_runner
+            runs:
+                - args: flashattn-fa2-bf16-bwd-causal-b1-s256-hd128-nh8 --warmup 0 --iters 1
+                  env:
+                    CUDA_ARCH: sm_90
+                    ENABLE_TMA_DESC: 1
+                    INTERMEDIATE_EXTRA_FILES_PERSISTANCE: 1
+                    TRACER_CUBIN_BINARY: /home/jihyun/program/miniconda/build/envs/gcom/lib/python3.13/site-packages/flash_attn_3-3.0.0-py3.13-linux-x86_64.egg/flash_attn_3/_C.abi3.so
+                    TRACER_MAX_CUBIN_SOURCES: 1
+                    TRACER_MAX_CUBIN_FILES: 8
+                    TRACER_FAST_XELF: 1
+                    TRACER_XELF_PREFER_SUBSTR: hdim128
+                  accel-sim-mem: 16G
+                  qos: all
+                  openmp-cpus: 4
+        - flashattn-fa3-bf16-bwd-causal-b1-s2048-hd64-nh24:
+            exe: flashattn_runner
+            runs:
+                - args: flashattn-fa3-bf16-bwd-causal-b1-s2048-hd64-nh24 --warmup 0 --iters 1
+                  env:
+                    CUDA_ARCH: sm_90
+                    ENABLE_TMA_DESC: 1
+                    INTERMEDIATE_EXTRA_FILES_PERSISTANCE: 1
+                    TRACER_CUBIN_BINARY: /home/jihyun/program/miniconda/build/envs/gcom/lib/python3.13/site-packages/flash_attn_3-3.0.0-py3.13-linux-x86_64.egg/flash_attn_3/_C.abi3.so
+                    TRACER_MAX_CUBIN_SOURCES: 1
+                    TRACER_MAX_CUBIN_FILES: 16
+                    TRACER_FAST_XELF: 1
+                    TRACER_XELF_PREFER_SUBSTR: hdim64
+                  accel-sim-mem: 24G
+                  qos: all
+                  openmp-cpus: 4

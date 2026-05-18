@@ -152,6 +152,126 @@ GPU_Microbenchmark:
               qos: all
               openmp-cpus: 3
 
+ublkred_micro:
+    exec_dir: "$GPUAPPS_ROOT/bin/$CUDA_VERSION/release/"
+    data_dirs: "$GPUAPPS_ROOT/data_dirs/"
+    execs:
+        - ublkred-probe-baseline:
+            exe: ublkred_probe
+            runs:
+                - args: --total-floats 1024 --store-floats 256 --gmem-offset 0 --smem-offset 0 --init 1.0
+                  env:
+                    CUDA_ARCH: sm_90a
+                    ENABLE_TMA_DESC: 1
+                    INTERMEDIATE_EXTRA_FILES_PERSISTANCE: 1
+                  accel-sim-mem: 6G
+                  qos: all
+                  openmp-cpus: 2
+        - ublkred-probe-gmem-offset:
+            exe: ublkred_probe
+            runs:
+                - args: --total-floats 1024 --store-floats 256 --gmem-offset 32 --smem-offset 0 --init 1.0
+                  env:
+                    CUDA_ARCH: sm_90a
+                    ENABLE_TMA_DESC: 1
+                    INTERMEDIATE_EXTRA_FILES_PERSISTANCE: 1
+                  accel-sim-mem: 6G
+                  qos: all
+                  openmp-cpus: 2
+        - ublkred-probe-smem-offset:
+            exe: ublkred_probe
+            runs:
+                - args: --total-floats 1024 --store-floats 256 --gmem-offset 0 --smem-offset 32 --init 1.0
+                  env:
+                    CUDA_ARCH: sm_90a
+                    ENABLE_TMA_DESC: 1
+                    INTERMEDIATE_EXTRA_FILES_PERSISTANCE: 1
+                  accel-sim-mem: 6G
+                  qos: all
+                  openmp-cpus: 2
+        - ublkred-probe-store-128:
+            exe: ublkred_probe
+            runs:
+                - args: --total-floats 1024 --store-floats 128 --gmem-offset 0 --smem-offset 0 --init 1.0
+                  env:
+                    CUDA_ARCH: sm_90a
+                    ENABLE_TMA_DESC: 1
+                    INTERMEDIATE_EXTRA_FILES_PERSISTANCE: 1
+                  accel-sim-mem: 6G
+                  qos: all
+                  openmp-cpus: 2
+        - ublkred-probe-init-2:
+            exe: ublkred_probe
+            runs:
+                - args: --total-floats 1024 --store-floats 256 --gmem-offset 0 --smem-offset 0 --init 2.0
+                  env:
+                    CUDA_ARCH: sm_90a
+                    ENABLE_TMA_DESC: 1
+                    INTERMEDIATE_EXTRA_FILES_PERSISTANCE: 1
+                  accel-sim-mem: 6G
+                  qos: all
+                  openmp-cpus: 2
+
+ublkred_count_micro:
+    exec_dir: "$GPUAPPS_ROOT/bin/$CUDA_VERSION/release/"
+    data_dirs: "$GPUAPPS_ROOT/data_dirs/"
+    execs:
+        - ublkred-count-store-4:
+            exe: ublkred_count_probe
+            runs:
+                - args: --total-floats 1024 --store-floats 4 --repeats 1 --dst-init 1000.0
+                  env:
+                    CUDA_ARCH: sm_90a
+                    ENABLE_TMA_DESC: 1
+                    INTERMEDIATE_EXTRA_FILES_PERSISTANCE: 1
+                  accel-sim-mem: 6G
+                  qos: all
+                  openmp-cpus: 2
+        - ublkred-count-store-16:
+            exe: ublkred_count_probe
+            runs:
+                - args: --total-floats 1024 --store-floats 16 --repeats 1 --dst-init 1000.0
+                  env:
+                    CUDA_ARCH: sm_90a
+                    ENABLE_TMA_DESC: 1
+                    INTERMEDIATE_EXTRA_FILES_PERSISTANCE: 1
+                  accel-sim-mem: 6G
+                  qos: all
+                  openmp-cpus: 2
+        - ublkred-count-store-64:
+            exe: ublkred_count_probe
+            runs:
+                - args: --total-floats 1024 --store-floats 64 --repeats 1 --dst-init 1000.0
+                  env:
+                    CUDA_ARCH: sm_90a
+                    ENABLE_TMA_DESC: 1
+                    INTERMEDIATE_EXTRA_FILES_PERSISTANCE: 1
+                  accel-sim-mem: 6G
+                  qos: all
+                  openmp-cpus: 2
+        - ublkred-count-store-256:
+            exe: ublkred_count_probe
+            runs:
+                - args: --total-floats 1024 --store-floats 256 --repeats 1 --dst-init 1000.0
+                  env:
+                    CUDA_ARCH: sm_90a
+                    ENABLE_TMA_DESC: 1
+                    INTERMEDIATE_EXTRA_FILES_PERSISTANCE: 1
+                  accel-sim-mem: 6G
+                  qos: all
+                  openmp-cpus: 2
+        - ublkred-count-repeat-2:
+            exe: ublkred_count_probe
+            runs:
+                - args: --total-floats 1024 --store-floats 64 --repeats 2 --dst-init 1000.0
+                  env:
+                    CUDA_ARCH: sm_90a
+                    ENABLE_TMA_DESC: 1
+                    INTERMEDIATE_EXTRA_FILES_PERSISTANCE: 1
+                  accel-sim-mem: 6G
+                  qos: all
+                  openmp-cpus: 2
+
 GPU_Microbenchmark_MaxFlops:
     exec_dir: "$GPUAPPS_ROOT/bin/$CUDA_VERSION/release/"
     data_dirs: "$GPUAPPS_ROOT/data_dirs/"

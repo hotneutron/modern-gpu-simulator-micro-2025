@@ -32,6 +32,7 @@
 #include <bitset>
 #include <cctype>
 #include <cstdio>
+#include <deque>
 #include <inttypes.h>
 #include <iostream>
 #include <iterator>
@@ -180,6 +181,26 @@ std::unordered_map<std::string, uint64_t> tb_instruction_count;  // per-TB instr
 std::unordered_map<std::string, int> tb_flush_part_count;  // per-TB part file counter
 uint64_t total_incremental_flushes = 0;  // stats counter
 uint64_t total_instructions_flushed = 0;  // stats counter
+int enable_tma_desc = 0;
+int aux_htod_dump_max_bytes = 4096;
+std::unordered_set<int> tma_desc_runtime_debug_header_written;
+std::unordered_set<int> tma_desc_producer_debug_header_written;
+std::unordered_set<int> tma_memcpy_dump_header_written;
+std::unordered_set<int> tensor_map_encode_dump_header_written;
+std::unordered_set<int> tma_consumer_opcode_ids;
+std::map<int, std::map<int, uint32_t>> tma_desc_ureg_by_pc;
+std::map<int, std::map<int, uint32_t>> first_dest_ureg_by_pc;
+std::map<int, std::map<int, std::string>> instruction_text_by_pc;
+uint64_t tma_memcpy_dump_id = 0;
+uint64_t tensor_map_encode_dump_id = 0;
+struct tma_desc_producer_candidate_t {
+  int unique_function_id;
+  int pc;
+  uint32_t dest_ureg_id;
+  uint32_t pre_value_lo;
+  uint32_t pre_value_hi;
+};
+std::unordered_map<std::string, std::deque<tma_desc_producer_candidate_t>> recent_tma_desc_producers_by_warp;
 // =============================================================================
 
 struct traced_operand_instrument {
@@ -230,6 +251,8 @@ std::map<std::string, uint64_t> map_kernel_name_to_func_addr;
 traced_execution *m_enhanced_traced_execution;
 std::string traces_path = "traces";
 std::string extrainfo_path = traces_path + "/extra_info";
+std::string tma_htod_blob_path = extrainfo_path + "/tma_htod_blobs";
+std::string tensor_map_blob_path = extrainfo_path + "/tensor_map_encode_blobs";
 std::string cubin_path = extrainfo_path + "/cubin";
 std::string sass_path = extrainfo_path + "/sass";
 std::string register_usage_path = extrainfo_path + "/register_usage";
@@ -254,6 +277,362 @@ std::unordered_map<std::string, dynamic_trace::threadblock> threadblocks;
 //TB key, warp id, int remaining injects
 std::unordered_map<std::string, std::map<unsigned int, unsigned int>> remaining_injects_to_current_instruction;
 const std::unordered_map<std::string, OpcodeChar> *OpcodeMap = nullptr;
+
+void create_folder(const char * folder_path);
+
+static bool is_tma_desc_consumer_opcode(const std::string &opcode) {
+  return opcode.rfind("UTMALDG", 0) == 0 ||
+         opcode.rfind("UTMASTG", 0) == 0 ||
+         opcode.rfind("UBLKCP", 0) == 0 ||
+         opcode.rfind("UBLKPF", 0) == 0 ||
+         opcode.rfind("UBLKRED", 0) == 0 ||
+         opcode.rfind("UTMACCTL", 0) == 0 ||
+         opcode.rfind("UTMACMDFLUSH", 0) == 0 ||
+         opcode.rfind("UTMAPF", 0) == 0 ||
+         opcode.rfind("UTMAREDG", 0) == 0;
+}
+
+static const char *traced_reg_type_to_string(TRACED_REG_TYPE reg_type) {
+  switch (reg_type) {
+    case TRACED_REG_TYPE::NO_REGS: return "NO_REGS";
+    case TRACED_REG_TYPE::MEMORY_REF: return "MEMORY_REF";
+    case TRACED_REG_TYPE::REGULAR: return "REGULAR";
+    case TRACED_REG_TYPE::REGULAR_2_REGS: return "REGULAR_2_REGS";
+    case TRACED_REG_TYPE::REGULAR_4_REGS: return "REGULAR_4_REGS";
+    case TRACED_REG_TYPE::UNIFORM: return "UNIFORM";
+    case TRACED_REG_TYPE::UNIFORM_2_REGS: return "UNIFORM_2_REGS";
+    case TRACED_REG_TYPE::PREDICATE: return "PREDICATE";
+    case TRACED_REG_TYPE::UNIFORM_PREDICATE: return "UNIFORM_PREDICATE";
+    default: return "UNKNOWN";
+  }
+}
+
+static const char *mem_type_to_string(MEM_TYPE mem_type) {
+  switch (mem_type) {
+    case MEM_TYPE::NONE: return "NONE";
+    case MEM_TYPE::STANDARD_MEM: return "STANDARD_MEM";
+    case MEM_TYPE::CONSTANT_MEM: return "CONSTANT_MEM";
+    case MEM_TYPE::CALL_OR_RET: return "CALL_OR_RET";
+    default: return "UNKNOWN";
+  }
+}
+
+static std::string get_tma_desc_producer_debug_key(const std::string &tb_string_id, int warp_id_tb) {
+  return tb_string_id + "_w_" + std::to_string(warp_id_tb);
+}
+
+static std::string bytes_to_hex_preview(const uint8_t *data, size_t size, size_t max_preview_bytes) {
+  size_t preview_size = std::min(size, max_preview_bytes);
+  std::ostringstream oss;
+  oss << std::hex;
+  for (size_t i = 0; i < preview_size; ++i) {
+    if (i != 0) {
+      oss << " ";
+    }
+    oss.width(2);
+    oss.fill('0');
+    oss << static_cast<unsigned int>(data[i]);
+  }
+  return oss.str();
+}
+
+static std::string uint64_array_to_string(const cuuint64_t *values, uint32_t count) {
+  if (values == nullptr || count == 0) {
+    return "";
+  }
+  std::ostringstream oss;
+  for (uint32_t i = 0; i < count; ++i) {
+    if (i != 0) {
+      oss << " ";
+    }
+    oss << values[i];
+  }
+  return oss.str();
+}
+
+static std::string uint32_array_to_string(const cuuint32_t *values, uint32_t count) {
+  if (values == nullptr || count == 0) {
+    return "";
+  }
+  std::ostringstream oss;
+  for (uint32_t i = 0; i < count; ++i) {
+    if (i != 0) {
+      oss << " ";
+    }
+    oss << values[i];
+  }
+  return oss.str();
+}
+
+static std::string uint64_to_hex_string(uint64_t value) {
+  std::ostringstream oss;
+  oss << "0x" << std::hex << std::setw(16) << std::setfill('0') << value;
+  return oss.str();
+}
+
+static void append_tma_memcpy_dump_event(int device_id, uint64_t stream_key, CUdeviceptr dst_device,
+                                         const void *src_host, size_t byte_count) {
+  if (!enable_tma_desc || src_host == nullptr || byte_count == 0 ||
+      byte_count > aux_htod_dump_max_bytes) {
+    return;
+  }
+  create_folder(extrainfo_path.c_str());
+  create_folder(tma_htod_blob_path.c_str());
+  std::string csv_path = extrainfo_path + "/tma_htod_dump.csv";
+  std::ofstream csv;
+  bool needs_header = tma_memcpy_dump_header_written.empty();
+  if (needs_header) {
+    csv.open(csv_path, std::ios::out);
+  } else {
+    csv.open(csv_path, std::ios::app);
+  }
+  if (!csv.is_open()) {
+    return;
+  }
+  if (needs_header) {
+    tma_memcpy_dump_header_written.insert(device_id);
+    csv << "dump_id,device_id,stream_key,dst_device_hex,byte_count,preview_hex,blob_path\n";
+  }
+  uint64_t dump_id = tma_memcpy_dump_id++;
+  std::string blob_path = tma_htod_blob_path + "/" + std::to_string(dump_id) + ".bin";
+  std::ofstream blob(blob_path, std::ios::binary | std::ios::out);
+  if (blob.is_open()) {
+    blob.write(reinterpret_cast<const char *>(src_host), byte_count);
+  }
+  std::ostringstream dst_stream;
+  dst_stream << "0x" << std::hex << static_cast<uint64_t>(dst_device);
+  std::string preview_hex = bytes_to_hex_preview(reinterpret_cast<const uint8_t *>(src_host), byte_count, 64);
+  csv << dump_id << ","
+      << device_id << ","
+      << stream_key << ","
+      << dst_stream.str() << ","
+      << byte_count << ","
+      << "\"" << preview_hex << "\"" << ","
+      << blob_path << "\n";
+}
+
+static void append_tensor_map_encode_dump_event(int device_id, const cuTensorMapEncodeTiled_params *p) {
+  if (!enable_tma_desc || p == nullptr || p->tensorMap == nullptr) {
+    return;
+  }
+  create_folder(extrainfo_path.c_str());
+  create_folder(tensor_map_blob_path.c_str());
+  std::string csv_path = extrainfo_path + "/tensor_map_encode_dump.csv";
+  std::ofstream csv;
+  bool needs_header = tensor_map_encode_dump_header_written.empty();
+  if (needs_header) {
+    csv.open(csv_path, std::ios::out);
+  } else {
+    csv.open(csv_path, std::ios::app);
+  }
+  if (!csv.is_open()) {
+    return;
+  }
+  if (needs_header) {
+    tensor_map_encode_dump_header_written.insert(device_id);
+    csv << "dump_id,device_id,tensor_map_ptr_hex,global_address_hex,tensor_data_type,tensor_rank,global_dim,global_strides,box_dim,element_strides,interleave,swizzle,l2_promotion,oob_fill,qword0_hex,qword1_hex,qword2_hex,qword3_hex,qword4_hex,qword5_hex,qword6_hex,qword7_hex,blob_path\n";
+  }
+  uint64_t dump_id = tensor_map_encode_dump_id++;
+  std::string blob_path = tensor_map_blob_path + "/" + std::to_string(dump_id) + ".bin";
+  std::ofstream blob(blob_path, std::ios::binary | std::ios::out);
+  if (blob.is_open()) {
+    blob.write(reinterpret_cast<const char *>(p->tensorMap), sizeof(CUtensorMap));
+  }
+  std::ostringstream tensor_map_ptr_stream;
+  tensor_map_ptr_stream << "0x" << std::hex << reinterpret_cast<uintptr_t>(p->tensorMap);
+  std::ostringstream global_addr_stream;
+  global_addr_stream << "0x" << std::hex << reinterpret_cast<uintptr_t>(p->globalAddress);
+  uint32_t global_stride_count = (p->tensorRank > 0) ? p->tensorRank - 1 : 0;
+  std::string global_dim = uint64_array_to_string(p->globalDim, p->tensorRank);
+  std::string global_strides = uint64_array_to_string(p->globalStrides, global_stride_count);
+  std::string box_dim = uint32_array_to_string(p->boxDim, p->tensorRank);
+  std::string element_strides = uint32_array_to_string(p->elementStrides, p->tensorRank);
+  const uint64_t *qwords = reinterpret_cast<const uint64_t *>(p->tensorMap);
+  csv << dump_id << ","
+      << device_id << ","
+      << tensor_map_ptr_stream.str() << ","
+      << global_addr_stream.str() << ","
+      << static_cast<int>(p->tensorDataType) << ","
+      << p->tensorRank << ","
+      << "\"" << global_dim << "\"" << ","
+      << "\"" << global_strides << "\"" << ","
+      << "\"" << box_dim << "\"" << ","
+      << "\"" << element_strides << "\"" << ","
+      << static_cast<int>(p->interleave) << ","
+      << static_cast<int>(p->swizzle) << ","
+      << static_cast<int>(p->l2Promotion) << ","
+      << static_cast<int>(p->oobFill) << ","
+      << uint64_to_hex_string(qwords[0]) << ","
+      << uint64_to_hex_string(qwords[1]) << ","
+      << uint64_to_hex_string(qwords[2]) << ","
+      << uint64_to_hex_string(qwords[3]) << ","
+      << uint64_to_hex_string(qwords[4]) << ","
+      << uint64_to_hex_string(qwords[5]) << ","
+      << uint64_to_hex_string(qwords[6]) << ","
+      << uint64_to_hex_string(qwords[7]) << ","
+      << blob_path << "\n";
+}
+
+struct cuMemcpyHtoDAsync_v2_params_proxy {
+  CUdeviceptr dstDevice;
+  const void *srcHost;
+  size_t ByteCount;
+  CUstream hStream;
+};
+
+static void append_tma_desc_runtime_debug_event(
+    int device_id, int stream_id, int kernel_trace_id, const inst_trace_t *ma) {
+  if (!enable_tma_desc || ma->ureg_desc_id == SECRET_UREG_DESC_NOT_USED) {
+    return;
+  }
+  std::string filename = extrainfo_path + "/tma_desc_runtime_debug.csv";
+  create_folder(extrainfo_path.c_str());
+  std::ofstream ofs;
+  bool needs_header = tma_desc_runtime_debug_header_written.find(device_id) ==
+                      tma_desc_runtime_debug_header_written.end();
+  if (needs_header) {
+    ofs.open(filename, std::ios::out);
+  } else {
+    ofs.open(filename, std::ios::app);
+  }
+  if (!ofs.is_open()) {
+    return;
+  }
+  if (needs_header) {
+    tma_desc_runtime_debug_header_written.insert(device_id);
+    ofs << "device_id,stream_id,kernel_id,unique_function_id,pc_hex,cta_x,cta_y,cta_z,warp_id_tb,sm_id,active_mask,predicate_mask,desc_reg_id,desc_value_lo,desc_value_hi,first_lane_addr\n";
+  }
+  uint64_t first_lane_addr = 0;
+  std::bitset<32> mask(ma->active_mask & ma->predicate_mask);
+  for (int lane = 0; lane < 32; ++lane) {
+    if (mask.test(lane)) {
+      first_lane_addr = ma->addrs_or_reg_val_0[lane];
+      break;
+    }
+  }
+  std::ostringstream pc_stream;
+  pc_stream << "0x" << std::hex << ma->vpc;
+  ofs << device_id << ","
+      << stream_id << ","
+      << kernel_trace_id << ","
+      << ma->unique_function_id << ","
+      << pc_stream.str() << ","
+      << ma->cta_id_x << ","
+      << ma->cta_id_y << ","
+      << ma->cta_id_z << ","
+      << ma->warpid_tb << ","
+      << ma->sm_id << ","
+      << ma->active_mask << ","
+      << ma->predicate_mask << ","
+      << ma->ureg_desc_id << ","
+      << ma->ureg_desc_value << ","
+      << ma->ureg_desc_value_hi << ","
+      << first_lane_addr << "\n";
+}
+
+static void append_tma_runtime_operand_debug_event(
+    int device_id, int stream_id, int kernel_trace_id, const inst_trace_t *ma,
+    const std::string &opcode, unsigned int callback_index) {
+  if (!enable_tma_desc) {
+    return;
+  }
+  create_folder(extrainfo_path.c_str());
+  std::ofstream ofs(extrainfo_path + "/tma_runtime_operand_debug.jsonl", std::ios::app);
+  if (!ofs.is_open()) {
+    return;
+  }
+  uint64_t first_lane_addr = 0;
+  std::bitset<32> mask(ma->active_mask & ma->predicate_mask);
+  for (int lane = 0; lane < 32; ++lane) {
+    if (mask.test(lane)) {
+      first_lane_addr = ma->addrs_or_reg_val_0[lane];
+      break;
+    }
+  }
+  std::ostringstream pc_stream;
+  pc_stream << "0x" << std::hex << ma->vpc;
+  ofs << "{"
+      << "\"device_id\":" << device_id << ","
+      << "\"stream_id\":" << stream_id << ","
+      << "\"kernel_id\":" << kernel_trace_id << ","
+      << "\"unique_function_id\":" << ma->unique_function_id << ","
+      << "\"pc_hex\":\"" << pc_stream.str() << "\","
+      << "\"opcode\":\"" << opcode << "\","
+      << "\"callback_index\":" << callback_index << ","
+      << "\"operand_type\":\"" << traced_reg_type_to_string(static_cast<TRACED_REG_TYPE>(ma->per_operand_type)) << "\","
+      << "\"mem_type\":\"" << mem_type_to_string(ma->mem_type) << "\","
+      << "\"operand_reg_id\":" << ma->reg_id << ","
+      << "\"value_lo\":" << static_cast<uint64_t>(ma->addrs_or_reg_val_0[0]) << ","
+      << "\"value_hi\":" << ma->reg_val_1[0] << ","
+      << "\"value_2\":" << ma->reg_val_2[0] << ","
+      << "\"value_3\":" << ma->reg_val_3[0] << ","
+      << "\"first_lane_addr\":" << first_lane_addr << ","
+      << "\"width\":" << ma->width << ","
+      << "\"desc_reg_id\":" << ma->ureg_desc_id << ","
+      << "\"desc_value_lo\":" << ma->ureg_desc_value << ","
+      << "\"desc_value_hi\":" << ma->ureg_desc_value_hi << ","
+      << "\"cta_x\":" << ma->cta_id_x << ","
+      << "\"cta_y\":" << ma->cta_id_y << ","
+      << "\"cta_z\":" << ma->cta_id_z << ","
+      << "\"warp_id_tb\":" << ma->warpid_tb << ","
+      << "\"sm_id\":" << ma->sm_id
+      << "}\n";
+}
+
+static void append_tma_desc_producer_debug_event(
+    int device_id, int stream_id, int kernel_trace_id, const inst_trace_t *ma,
+    const std::string &tb_string_id, int warp_id_tb) {
+  if (!enable_tma_desc || ma->ureg_desc_id == SECRET_UREG_DESC_NOT_USED) {
+    return;
+  }
+  std::string recent_key = get_tma_desc_producer_debug_key(tb_string_id, warp_id_tb);
+  auto recent_it = recent_tma_desc_producers_by_warp.find(recent_key);
+  if (recent_it == recent_tma_desc_producers_by_warp.end()) {
+    return;
+  }
+  std::string filename = extrainfo_path + "/tma_desc_producer_debug.csv";
+  create_folder(extrainfo_path.c_str());
+  std::ofstream ofs;
+  bool needs_header = tma_desc_producer_debug_header_written.find(device_id) ==
+                      tma_desc_producer_debug_header_written.end();
+  if (needs_header) {
+    ofs.open(filename, std::ios::out);
+  } else {
+    ofs.open(filename, std::ios::app);
+  }
+  if (!ofs.is_open()) {
+    return;
+  }
+  if (needs_header) {
+    tma_desc_producer_debug_header_written.insert(device_id);
+    ofs << "device_id,stream_id,kernel_id,consumer_function_id,consumer_pc_hex,consumer_desc_reg_id,consumer_desc_value_lo,consumer_desc_value_hi,producer_function_id,producer_pc_hex,producer_dest_ureg_id,producer_pre_value_lo,producer_pre_value_hi,producer_inst_text\n";
+  }
+  uint32_t consumer_desc_hi_reg = ma->ureg_desc_id + 1;
+  for (auto it = recent_it->second.rbegin(); it != recent_it->second.rend(); ++it) {
+    if (it->dest_ureg_id != ma->ureg_desc_id && it->dest_ureg_id != consumer_desc_hi_reg) {
+      continue;
+    }
+    std::ostringstream consumer_pc_stream;
+    consumer_pc_stream << "0x" << std::hex << ma->vpc;
+    std::ostringstream producer_pc_stream;
+    producer_pc_stream << "0x" << std::hex << it->pc;
+    std::string producer_inst_text = instruction_text_by_pc[it->unique_function_id][it->pc];
+    ofs << device_id << ","
+        << stream_id << ","
+        << kernel_trace_id << ","
+        << ma->unique_function_id << ","
+        << consumer_pc_stream.str() << ","
+        << ma->ureg_desc_id << ","
+        << ma->ureg_desc_value << ","
+        << ma->ureg_desc_value_hi << ","
+        << it->unique_function_id << ","
+        << producer_pc_stream.str() << ","
+        << it->dest_ureg_id << ","
+        << it->pre_value_lo << ","
+        << it->pre_value_hi << ","
+        << producer_inst_text << "\n";
+  }
+}
 
 dynamic_trace::threadblock& get_threadblock(std::string tb_key) {
   if(threadblocks.find(tb_key) == threadblocks.end()) {
@@ -911,6 +1290,10 @@ void nvbit_at_init() {
   GET_VAR_INT(incremental_flush_threshold, "INCREMENTAL_FLUSH_THRESHOLD", 0,
               "Flush threadblocks to disk when instruction count exceeds this threshold. "
               "0 = disabled (default). Recommended: 50000-100000 for large kernels.");
+  GET_VAR_INT(enable_tma_desc, "ENABLE_TMA_DESC", 0,
+              "Enable TMA descriptor capture, including runtime desc handle debug and tensor-map descriptor dumps.");
+  GET_VAR_INT(aux_htod_dump_max_bytes, "AUX_HTOD_DUMP_MAX_BYTES", 4096,
+              "Maximum auxiliary HtoD memcpy payload size to dump when ENABLE_TMA_DESC is enabled.");
   std::string pad(100, '-');
   printf("%s\n", pad.c_str());
 
@@ -985,6 +1368,9 @@ void instrument_function_if_needed(CUcontext ctx, CUfunction func, int device_id
         int opcode_id = opcode_to_id_map.size();
         opcode_to_id_map[instr->getOpcode()] = opcode_id;
         id_to_opcode_map[opcode_id] = instr->getOpcode();
+        if (is_tma_desc_consumer_opcode(instr->getOpcode())) {
+          tma_consumer_opcode_ids.insert(opcode_id);
+        }
       }
 
       int opcode_id = opcode_to_id_map[instr->getOpcode()];
@@ -1003,6 +1389,7 @@ void instrument_function_if_needed(CUcontext ctx, CUfunction func, int device_id
       bool is_call_or_ret = (std::string(instr->getOpcode()).find("CALL") != std::string::npos) || (std::string(instr->getOpcode()).find("RET") != std::string::npos);
       bool is_rel_type = (std::string(instr->getOpcode()).find("REL") != std::string::npos);
       bool is_call_or_ret_with_reg = false;
+      bool is_tma_desc_consumer_instruction = is_tma_desc_consumer_opcode(instr->getOpcode());
 
       if(track_this_instruction(cnt, threshold_unique_kernel_checking ,instr->getOpcode())) {
         current_kernel_key_instructions_by_pc[vpc] = inst_str;
@@ -1010,6 +1397,15 @@ void instrument_function_if_needed(CUcontext ctx, CUfunction func, int device_id
 
       std::shared_ptr<traced_instruction> inst_parsed = create_no_binay_instruction(vpc, inst_str);
       inst_parsed->set_simulation_opcode(OpcodeMap, inst_parsed->get_op_code());
+      instruction_text_by_pc[next_candidate_unique_function_id][vpc] = inst_str;
+      if (inst_parsed->get_num_operands() > 0) {
+        traced_operand &first_operand = inst_parsed->get_operand(0);
+        if (first_operand.get_operand_type() == TraceEnhancedOperandType::UREG &&
+            first_operand.get_has_reg()) {
+          first_dest_ureg_by_pc[next_candidate_unique_function_id][vpc] =
+              first_operand.get_operand_reg_number();
+        }
+      }
 
       if(is_call_or_ret && !is_rel_type) {
         current_kernel_call_or_ret_by_pc[vpc] = inst_str;
@@ -1023,7 +1419,7 @@ void instrument_function_if_needed(CUcontext ctx, CUfunction func, int device_id
 
       bool has_ldc_with_reg = false;
       bool has_ldc_with_ureg = false;
-      std::vector<uint32_t> desc_ureg_ids;
+      uint32_t tma_desc_ureg_id = SECRET_UREG_DESC_NOT_USED;
       std::map<uint32_t, uint32_t> memref_idx_with_desc;
       std::map<uint32_t, traced_operand_instrument> per_operand_type;
       int ldc_reg_id = -1;
@@ -1031,12 +1427,20 @@ void instrument_function_if_needed(CUcontext ctx, CUfunction func, int device_id
       std::vector<int> aux_reg_ids;
       uint64_t call_ret_imm = 0;
       uint32_t num_of_injects = 0;
+      std::string opcode_str = instr->getOpcode() ? std::string(instr->getOpcode()) : "";
 
       if(inst_parsed->is_tensor_core_op()) {
         inst_parsed->set_tensor_core_instruction_info();
       }
       for(int i = 0; i < instr->getNumOperands(); ++i){
         const InstrType::operand_t *op = instr->getOperand(i);
+        std::string operand_str = op->str ? std::string(op->str) : "";
+        if(is_tma_desc_consumer_instruction && operand_str.find("desc[UR") != std::string::npos) {
+          tma_desc_ureg_id = get_ur_register(operand_str);
+        } else if (opcode_str.rfind("UTMASTG", 0) == 0 && i == 0 &&
+                   operand_str.find("[UR") != std::string::npos) {
+          tma_desc_ureg_id = get_ur_register(operand_str);
+        }
         if (op->type == InstrType::OperandType::MREF) {
           mem_oper_idx++;
           num_mref++;
@@ -1093,6 +1497,9 @@ void instrument_function_if_needed(CUcontext ctx, CUfunction func, int device_id
           num_of_injects++;
         }
       }
+      if (is_tma_desc_consumer_instruction && tma_desc_ureg_id != SECRET_UREG_DESC_NOT_USED) {
+        tma_desc_ureg_by_pc[next_candidate_unique_function_id][vpc] = tma_desc_ureg_id;
+      }
 
       if(num_of_injects == 0) {
         per_operand_type[0] = traced_operand_instrument(TRACED_REG_TYPE::NO_REGS, 0, 0);
@@ -1117,13 +1524,21 @@ void instrument_function_if_needed(CUcontext ctx, CUfunction func, int device_id
               assert(num_mref <= 2);
               nvbit_add_call_arg_mref_addr64(instr, mem_oper_idx);
               nvbit_add_call_arg_const_val32(instr, (int)instr->getSize());
+              uint32_t desc_ureg_id = SECRET_UREG_DESC_NOT_USED;
               if(memref_idx_with_desc.find(mem_oper_idx) != memref_idx_with_desc.end()) {
-                nvbit_add_call_arg_ureg_val(instr, memref_idx_with_desc[mem_oper_idx]);
+                desc_ureg_id = memref_idx_with_desc[mem_oper_idx];
+              } else if(is_tma_desc_consumer_instruction && tma_desc_ureg_id != SECRET_UREG_DESC_NOT_USED) {
+                desc_ureg_id = tma_desc_ureg_id;
+              }
+              if(desc_ureg_id != SECRET_UREG_DESC_NOT_USED) {
+                nvbit_add_call_arg_ureg_val(instr, desc_ureg_id);
+                nvbit_add_call_arg_const_val32(instr, desc_ureg_id);
+                nvbit_add_call_arg_ureg_val(instr, desc_ureg_id + 1);
               }else {
                 nvbit_add_call_arg_const_val32(instr, SECRET_UREG_DESC_NOT_USED);
+                nvbit_add_call_arg_const_val32(instr, SECRET_UREG_DESC_NOT_USED);
+                nvbit_add_call_arg_const_val32(instr, SECRET_UREG_DESC_NOT_USED);
               }
-              nvbit_add_call_arg_const_val32(instr, SECRET_UREG_DESC_NOT_USED);
-              nvbit_add_call_arg_const_val32(instr, SECRET_UREG_DESC_NOT_USED);
               mem_oper_idx--;
             }else if(has_ldc_with_reg || has_ldc_with_ureg) {
               nvbit_add_call_arg_const_val32(instr, MEM_TYPE::CONSTANT_MEM);
@@ -1309,6 +1724,7 @@ void nvbit_at_cuda_event(CUcontext ctx, int is_exit, nvbit_api_cuda_t cbid,
         std::string usr_folder = usr_folder_env;
         traces_path = usr_folder;
         extrainfo_path = traces_path + "/extra_info";
+        tma_htod_blob_path = extrainfo_path + "/tma_htod_blobs";
         cubin_path = extrainfo_path + "/cubin";
         sass_path = extrainfo_path + "/sass";
         register_usage_path = extrainfo_path + "/register_usage";
@@ -1323,6 +1739,31 @@ void nvbit_at_cuda_event(CUcontext ctx, int is_exit, nvbit_api_cuda_t cbid,
     }
 
     create_folder(traces_path.c_str());
+    create_folder(extrainfo_path.c_str());
+    if (enable_tma_desc) {
+      create_folder(tma_htod_blob_path.c_str());
+      create_folder(tensor_map_blob_path.c_str());
+      std::ofstream tma_dump_ofs(extrainfo_path + "/tma_htod_dump.csv", std::ios::out);
+      if (tma_dump_ofs.is_open()) {
+        tma_dump_ofs << "dump_id,device_id,stream_key,dst_device_hex,byte_count,preview_hex,blob_path\n";
+      }
+      std::ofstream tensor_map_dump_ofs(extrainfo_path + "/tensor_map_encode_dump.csv", std::ios::out);
+      if (tensor_map_dump_ofs.is_open()) {
+        tensor_map_dump_ofs << "dump_id,device_id,tensor_map_ptr_hex,global_address_hex,tensor_data_type,tensor_rank,global_dim,global_strides,box_dim,element_strides,interleave,swizzle,l2_promotion,oob_fill,qword0_hex,qword1_hex,qword2_hex,qword3_hex,qword4_hex,qword5_hex,qword6_hex,qword7_hex,blob_path\n";
+      }
+    }
+    if (enable_tma_desc) {
+      std::ofstream ofs(extrainfo_path + "/tma_desc_runtime_debug.csv", std::ios::out);
+      if (ofs.is_open()) {
+        ofs << "device_id,stream_id,kernel_id,unique_function_id,pc_hex,cta_x,cta_y,cta_z,warp_id_tb,sm_id,active_mask,predicate_mask,desc_reg_id,desc_value_lo,desc_value_hi,first_lane_addr\n";
+      }
+      std::ofstream producer_ofs(extrainfo_path + "/tma_desc_producer_debug.csv", std::ios::out);
+      if (producer_ofs.is_open()) {
+        producer_ofs << "device_id,stream_id,kernel_id,consumer_function_id,consumer_pc_hex,consumer_desc_reg_id,consumer_desc_value_lo,consumer_desc_value_hi,producer_function_id,producer_pc_hex,producer_dest_ureg_id,producer_pre_value_lo,producer_pre_value_hi,producer_inst_text\n";
+      }
+      std::ofstream operand_jsonl_ofs(extrainfo_path + "/tma_runtime_operand_debug.jsonl", std::ios::out);
+      operand_jsonl_ofs.close();
+    }
 
     statsFile = fopen(stats_location.c_str(), "w");
     fprintf(statsFile,
@@ -1339,10 +1780,44 @@ void nvbit_at_cuda_event(CUcontext ctx, int is_exit, nvbit_api_cuda_t cbid,
       char buffer[1024];
       int device_id;
       cuCtxGetDevice(&device_id);
+      append_tma_memcpy_dump_event(device_id, stream_key, p->dstDevice, p->srcHost, p->ByteCount);
       sprintf(buffer, "MemcpyHtoD,0x%016llx,%lu", p->dstDevice, p->ByteCount);
       dynamic_trace::gpu_device &gpu_dev = (*dyn_trace.mutable_gpu_device())[device_id];
       dynamic_trace::cuda_stream &stream = (*gpu_dev.mutable_streams())[stream_key];
       stream.add_ordered_cuda_events(buffer);
+    }
+
+#if defined(API_CUDA_cuMemcpyHtoDAsync_v2)
+  } else if (cbid == API_CUDA_cuMemcpyHtoDAsync_v2
+#if defined(API_CUDA_cuMemcpyHtoDAsync_v2_ptsz)
+             || cbid == API_CUDA_cuMemcpyHtoDAsync_v2_ptsz
+#endif
+  ) {
+    if (!is_exit) {
+      cuMemcpyHtoDAsync_v2_params_proxy *p =
+          (cuMemcpyHtoDAsync_v2_params_proxy *)params;
+      uint64_t stream_key = (uint64_t)p->hStream;
+      char buffer[1024];
+      int device_id;
+      cuCtxGetDevice(&device_id);
+      append_tma_memcpy_dump_event(device_id, stream_key, p->dstDevice, p->srcHost, p->ByteCount);
+      sprintf(buffer, "MemcpyHtoDAsync,0x%016llx,%lu", p->dstDevice, p->ByteCount);
+      dynamic_trace::gpu_device &gpu_dev = (*dyn_trace.mutable_gpu_device())[device_id];
+      dynamic_trace::cuda_stream &stream = (*gpu_dev.mutable_streams())[stream_key];
+      stream.add_ordered_cuda_events(buffer);
+    }
+#endif
+
+  } else if (
+#if defined(API_CUDA_cuTensorMapEncodeTiled)
+             cbid == API_CUDA_cuTensorMapEncodeTiled ||
+#endif
+             (name != nullptr && std::string(name) == "cuTensorMapEncodeTiled")) {
+    if (is_exit) {
+      cuTensorMapEncodeTiled_params *p = (cuTensorMapEncodeTiled_params *)params;
+      int device_id;
+      cuCtxGetDevice(&device_id);
+      append_tensor_map_encode_dump_event(device_id, p);
     }
 
   } else if (cbid == API_CUDA_cuLaunchKernel_ptsz ||
@@ -1700,7 +2175,39 @@ void *recv_thread_fun(void *args) {
           inst = wp.mutable_instructions(wp.instructions_size()-1);
         }
         remaining_injects--;
+        unsigned int callback_index = ma->num_of_injects - remaining_injects - 1;
+        auto opcode_it = id_to_opcode_map.find(opcode_id);
+        const std::string opcode = opcode_it == id_to_opcode_map.end() ? "" : opcode_it->second;
+        if (tma_consumer_opcode_ids.count(opcode_id)) {
+          append_tma_runtime_operand_debug_event(device_id, current_stream_id[device_id],
+                                                 kernel_id[device_id] - 1, ma, opcode,
+                                                 callback_index);
+        }
         std::bitset<32> mask(ma->active_mask & ma->predicate_mask);
+        if (ma->mem_type == MEM_TYPE::NONE && callback_index == 0 &&
+            (ma->per_operand_type == TRACED_REG_TYPE::UNIFORM ||
+             ma->per_operand_type == TRACED_REG_TYPE::UNIFORM_2_REGS)) {
+          auto function_it = first_dest_ureg_by_pc.find(ma->unique_function_id);
+          if (function_it != first_dest_ureg_by_pc.end()) {
+            auto pc_it = function_it->second.find(ma->vpc);
+            if (pc_it != function_it->second.end()) {
+              std::string recent_key = get_tma_desc_producer_debug_key(tb_string_id, warp_id_tb);
+              auto &recent_queue = recent_tma_desc_producers_by_warp[recent_key];
+              tma_desc_producer_candidate_t candidate;
+              candidate.unique_function_id = ma->unique_function_id;
+              candidate.pc = ma->vpc;
+              candidate.dest_ureg_id = pc_it->second;
+              candidate.pre_value_lo = static_cast<uint32_t>(ma->addrs_or_reg_val_0[0]);
+              candidate.pre_value_hi =
+                  (ma->per_operand_type == TRACED_REG_TYPE::UNIFORM_2_REGS) ? ma->reg_val_1[0]
+                                                                            : SECRET_UREG_DESC_NOT_USED;
+              recent_queue.push_back(candidate);
+              if (recent_queue.size() > 16) {
+                recent_queue.pop_front();
+              }
+            }
+          }
+        }
         if (ma->mem_type != MEM_TYPE::NONE) {
           dynamic_trace::address *addr = inst->add_addresses();
           std::istringstream iss(id_to_opcode_map[opcode_id]);
@@ -1752,6 +2259,14 @@ void *recv_thread_fun(void *args) {
               if (mask.test(s))
                 addr->add_addrs(ma->addrs_or_reg_val_0[s]);
             }
+          }
+          if (ma->mem_type == MEM_TYPE::STANDARD_MEM && enable_tma_desc &&
+              ma->ureg_desc_id != SECRET_UREG_DESC_NOT_USED) {
+            append_tma_desc_runtime_debug_event(device_id, current_stream_id[device_id],
+                                                kernel_id[device_id] - 1, ma);
+            append_tma_desc_producer_debug_event(device_id, current_stream_id[device_id],
+                                                 kernel_id[device_id] - 1, ma, tb_string_id,
+                                                 warp_id_tb);
           }
         }
 
@@ -2285,8 +2800,9 @@ void nvbit_at_ctx_init(CUcontext ctx) {
 void init_context_state(CUcontext ctx) {
   if(is_first_init_context_call) {
     is_first_init_context_call = false;
-    cudaGetDeviceCount(&num_devices);
-    cudaMallocManaged(&stop_report, num_devices * sizeof(bool));
+    CUDA_SAFECALL(cuDeviceGetCount(&num_devices));
+    CUDA_SAFECALL(cuMemAllocManaged(reinterpret_cast<CUdeviceptr *>(&stop_report),
+                                   num_devices * sizeof(bool), CU_MEM_ATTACH_GLOBAL));
     for(int i = 0; i < num_devices; ++i) {
       stop_report[i] = false;
       kernel_id.push_back(1);
@@ -2295,7 +2811,8 @@ void init_context_state(CUcontext ctx) {
   }
   CTXstate* ctx_state = ctx_state_map[ctx];
   ctx_state->recv_thread_done = RecvThreadState::WORKING;
-  cudaMallocManaged(&ctx_state->channel_dev, sizeof(ChannelDev));
+  CUDA_SAFECALL(cuMemAllocManaged(reinterpret_cast<CUdeviceptr *>(&ctx_state->channel_dev),
+                                  sizeof(ChannelDev), CU_MEM_ATTACH_GLOBAL));
   ctx_state->channel_host.init((int)ctx_state_map.size() - 1, CHANNEL_SIZE,
                                ctx_state->channel_dev, recv_thread_fun, ctx);
   nvbit_set_tool_pthread(ctx_state->channel_host.get_thread());
@@ -2348,7 +2865,7 @@ void nvbit_at_ctx_term(CUcontext ctx) {
   ctx_state->recv_thread_done = RecvThreadState::STOP;
   while (ctx_state->recv_thread_done != RecvThreadState::FINISHED);
   ctx_state->channel_host.destroy(false);
-  cudaFree(ctx_state->channel_dev);
+  CUDA_SAFECALL(cuMemFree(reinterpret_cast<CUdeviceptr>(ctx_state->channel_dev)));
   skip_callback_flag = false;
   delete ctx_state;
   pthread_mutex_unlock(&mutex);

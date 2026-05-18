@@ -103,23 +103,24 @@ class ConfigurationSpec:
 
             for argmap in self.command_line_args_list:
                 args = argmap["args"]
+                benchmark_name = argmap.get("benchmark_name", benchmark)
                 mem_usage = argmap["accel-sim-mem"]
                 qos = argmap["qos"] # MOD. Change qos type
                 partition = argmap["partition"]
                 openmp_cpus = argmap["openmp-cpus"] # MOD. Change qos type
-                appargs_run_subdir = os.path.join( benchmark.replace('/','_'),
+                appargs_run_subdir = os.path.join( benchmark_name.replace('/','_'),
                                 self.benchmark_args_subdirs[args] )
                 this_run_dir = os.path.join( run_directory, appargs_run_subdir, self.run_subdir )
                 self.setup_run_directory(full_data_dir, this_run_dir, data_dir, appargs_run_subdir)
 
                 self.text_replace_torque_sim(full_data_dir,
                     this_run_dir,
-                    benchmark,cuda_version,
+                    benchmark_name,cuda_version,
                     args,
                     simdir,
                     full_exec_dir,build_handle,
                     mem_usage, qos, openmp_cpus, partition) # MOD. Change qos type
-                self.append_gpgpusim_config(benchmark, this_run_dir, appargs_run_subdir, self.config_file)
+                self.append_gpgpusim_config(benchmark_name, this_run_dir, appargs_run_subdir, self.config_file)
                 
                 # Submit the job to torque and dump the output to a file
                 if not options.no_launch:
