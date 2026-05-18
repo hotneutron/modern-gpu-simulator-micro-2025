@@ -50,6 +50,24 @@ The remodeled simulator should represent TMA as a separate execution domain with
    - Eventually models Hopper-style `mbarrier` semantics
    - Supports consumer/producer overlap with compute
 
+### Independence From Compute Pipelines
+
+The TMA model should explicitly preserve the architectural fact that TMA progress is independent from ordinary compute execution.
+
+- TMA command issue may originate from a warp running on the normal subcore frontend
+- but transfer progress must not be tied to tensor-core occupancy
+- and it must not be tied to CUDA-core/SP/INT/DP pipeline occupancy
+- after a TMA command is accepted, the SM-shared TMA engine should continue advancing it even while unrelated compute instructions execute
+
+This means the simulator should model:
+
+- **issue-side ownership**
+  - the subcore only spends issue bandwidth to submit the command
+- **execution-side ownership**
+  - `tma_unit_sm` owns AGU work, request issuance, transfer progress, and completion updates
+- **overlap**
+  - tensor-core work, CUDA-core work, and TMA transfer progress can coexist in the same SM cycle model
+
 ## What Stays Unchanged
 
 The following should continue to use the current remodeled path:
@@ -143,6 +161,12 @@ Responsibilities:
 
 This should be queue-based, similar in spirit to the memory subcore unit.
 
+The important modeling rule is that `m_tma_pipeline` should represent only **command issue**, not the full transfer lifetime.
+
+- once a command is accepted into the TMA path, the issuing warp should not remain busy just because the transfer is still in flight
+- the subcore-side pipeline should therefore retire ownership quickly after enqueue, subject only to issue-side structural constraints
+- long-lived transfer state belongs in the SM-shared TMA engine, not in the subcore execution latch
+
 ### 3. New SM-Shared TMA Engine
 
 Add a new SM-shared unit, e.g.:
@@ -163,6 +187,16 @@ Architecturally it should sit alongside:
 - the shared DP structure
 
 not inside them.
+
+It should also advance independently each SM cycle, regardless of whether tensor-core or CUDA-core pipelines are busy in that same cycle.
+
+Suggested per-cycle responsibilities:
+
+- accept newly issued TMA commands from subcores
+- advance descriptor/AGU work for pending entries
+- issue bulk request work subject to TMA-engine bandwidth/admission limits
+- consume returning progress or completion events
+- update completion objects and release finished entries
 
 ### 4. TMA In-Flight Table
 
@@ -198,6 +232,19 @@ Suggested state:
 - associated warp / CTA / stage
 
 First implementation does not need to fully match Hopper encoding, but it should preserve the architectural idea that TMA completion is tied to async transaction progress rather than only to the issuing instruction’s ordinary retirement.
+
+### 6. Wait-Side Stall Rule
+
+The simulator should preserve TMA's async nature by placing the main stall point on the **consumer wait side**, not on the producer issue side.
+
+That means:
+
+- issuing a TMA command should usually be a short issue-side event
+- the issuing warp may continue executing later independent instructions
+- a consumer should stall only when it reaches a wait/test/readiness point that depends on incomplete TMA progress
+- readiness must therefore be derived from the TMA completion object rather than from simple instruction retirement
+
+This is the key rule that allows TMA transfer overlap with compute to emerge in the timing model.
 
 ## Descriptor-Driven Execution Model
 
@@ -350,6 +397,37 @@ Suggested contents:
 
 This becomes the primary abstraction for TMA execution.
 
+### Minimal Async State Machine
+
+As a first implementation, each TMA transfer entry should follow a short explicit state machine so issue, transfer progress, and wait satisfaction remain clearly separated.
+
+- **`ISSUED`**
+  - the warp has issued a TMA instruction into the subcore-side TMA path
+  - issue-side timing is consumed here
+- **`ENQUEUED`**
+  - the command has been accepted by `tma_unit_sm`
+  - subcore ownership ends here, even though transfer work is not yet complete
+- **`AGU_READY`**
+  - descriptor/operand metadata has been resolved enough to form transfer geometry
+  - the entry is ready to begin bulk request issuance
+- **`IN_FLIGHT`**
+  - the TMA engine is actively issuing or completing bulk transfer work
+  - bytes issued and bytes completed may continue changing over multiple cycles
+- **`COMPLETED`**
+  - transfer-side work is done and the completion object has reached its ready condition
+  - the issuing command is no longer waiting on transfer progress
+- **`WAIT_SATISFIED`**
+  - any dependent consumer wait/test/use point has observed the ready completion state
+  - the dependent warp or stage may now proceed without further TMA-specific blocking
+
+The key modeling distinction is:
+
+- `ISSUED` and `ENQUEUED` are command-submission states
+- `AGU_READY` and `IN_FLIGHT` are engine-progress states
+- `COMPLETED` and `WAIT_SATISFIED` are readiness / consumer-observation states
+
+This keeps the simulator from collapsing producer issue, engine progress, and consumer release into one event.
+
 ## Synchronization Plan
 
 ### Current Reusable Pieces
@@ -379,6 +457,17 @@ The right plan is:
 3. later refine it into a more Hopper-like `mbarrier` model
 4. finally add simplified proxy-fence visibility rules for TMA stores
 
+### First Async Execution Rule
+
+Before full Hopper `mbarrier` fidelity exists, the simulator should still model a minimal async rule:
+
+- TMA issue and TMA completion are separate events
+- warp issue/retirement and transfer completion are separate events
+- transfer progress is updated by `tma_unit_sm` over time
+- waits are released only when the completion object reaches the required ready state
+
+This minimal rule is sufficient to preserve the intended architectural distinction from `LDGSTS` and from ordinary load/store scoreboarding.
+
 ## Dataflow Model
 
 ### GMEM -> SMEM
@@ -387,21 +476,23 @@ For `UTMALDG` / `UTMAPF` / `UBLKCP` / `UBLKPF`:
 
 1. warp issues TMA command
 2. subcore forwards command to `tma_unit_sm`
-3. TMA AGU resolves addresses using descriptor + coordinates
-4. TMA engine emits bulk requests toward memory hierarchy
-5. returning data is placed into shared memory through TMA landing path
-6. completion object is updated as bytes arrive
-7. consumers proceed once completion state is satisfied
+3. issuing ownership ends after command enqueue, so the warp can continue with later independent work
+4. TMA AGU resolves addresses using descriptor + coordinates
+5. TMA engine emits bulk requests toward memory hierarchy
+6. returning data is placed into shared memory through TMA landing path
+7. completion object is updated as bytes arrive
+8. consumers proceed once completion state is satisfied
 
 ### SMEM -> GMEM
 
 For descriptor-backed store forms such as `UTMASTG` / `UTMAREDG` and descriptor-backed `UBLKRED`:
 
 1. warp issues TMA store command
-2. generic-path writes to shared memory must already be visible
-3. TMA engine reads from shared memory source region
-4. TMA engine writes to global memory using descriptor-generated addresses and descriptor-carried tensor-layout context
-5. completion object is optionally tracked if later code depends on completion
+2. issuing ownership ends after enqueue, while the store transfer continues under `tma_unit_sm`
+3. generic-path writes to shared memory must already be visible
+4. TMA engine reads from shared memory source region
+5. TMA engine writes to global memory using descriptor-generated addresses and descriptor-carried tensor-layout context
+6. completion object is optionally tracked if later code depends on completion
 
 ### Reduction Stores
 
@@ -477,12 +568,14 @@ Tasks:
 Success criterion:
 
 - TMA instructions are no longer routed through ordinary LD/ST execution ownership
+- TMA architectural ownership is separated from tensor-core, CUDA-core, and ordinary LD/ST execution paths even before full transfer semantics are implemented
 
 Test plan:
 
 - add a trace-decode unit check that Hopper TMA mnemonics map to `TMA_OP` while `LDGSTS`, `LDG`, `STG`, `LDS`, and `STS` keep their previous routing
 - add a routing-level check that `Subcore::get_fu()` sends only `TMA_OP` to `m_tma_pipeline` and leaves non-TMA memory ops on `m_memory_unit_subcore`
 - add a construction/initialization check that `SM` instantiates the new TMA reception latch and `tma_unit_sm` without changing LD/ST initialization
+- add a structural check that the new TMA path is modeled as a separate engine path rather than as a tensor-core or CUDA-core sub-variant
 - run a non-TMA regression workload and verify there is no behavioral change in issue counts, memory-unit traffic, or cycle count beyond harmless noise
 - run a TMA-containing trace and verify it no longer falls into the old LD/ST ownership path or crashes due to missing TMA execution routing
 
@@ -501,10 +594,12 @@ Tasks:
 - support `UTMASTG` first-operand-pair descriptor-like resolution
 - support descriptor-backed `UBLKRED` resolution plus conservative operand-3 size/span metadata attachment
 - attach TMA command information to decoded instructions
+- ensure the internal TMA command object represents a submitted async transfer request rather than a long-lived subcore execution record
 
 Success criterion:
 
 - the TMA engine receives structured transfer commands rather than guessed ordinary memory accesses, and descriptor-backed `UBLKRED` carries both descriptor semantics and conservative operand-3 size/span metadata
+- command formation is cleanly separated from later transfer progress and completion accounting
 
 Test plan:
 
@@ -514,6 +609,7 @@ Test plan:
   - same-function desc-reg reuse fallback
   - single-rank-candidate fallback
 - add a decode-time test that a TMA instruction produces a populated internal TMA command object with direction, metadata source, config ID when applicable, rank, mapping method, and coordinates metadata
+- add a decode/issue ownership test confirming that TMA command formation finishes at enqueue time and does not keep the issuing warp bound to full transfer lifetime
 - add a `UTMASTG` test confirming the first bracketed operand pair is treated as desc-like for resolution and the second pair is preserved as support state
 - add a descriptor-backed `UBLKRED ... desc[URx]` test confirming:
   - descriptor config resolution works
@@ -535,10 +631,12 @@ Tasks:
 - emit bulk transfer work
 - land into shared memory model
 - update completion state
+- advance transfer progress inside `tma_unit_sm` independently of tensor-core and CUDA-core occupancy
 
 Success criterion:
 
 - TMA loads/prefetches execute through the new engine and become asynchronously ready
+- after enqueue, the issuing warp is free to execute later independent work while the TMA engine keeps making progress
 
 Test plan:
 
@@ -546,6 +644,7 @@ Test plan:
 - add AGU tests for 1D/2D/4D or 5D descriptor cases to verify base+stride address generation is stable and deterministic
 - add boundary-handling tests where tile coordinates exceed tensor bounds and confirm the selected fallback behavior is applied consistently
 - verify GMEM -> SMEM TMA traffic increments new TMA counters rather than LDGSTS counters or ordinary LD/ST counters
+- add an overlap test where unrelated compute continues while a TMA transfer remains in flight, and verify the transfer still progresses each SM cycle
 - run a regression where `LDGSTS` is still present and confirm its old two-phase path remains unchanged while TMA uses the new engine
 - compare a known FA3 or TMA-bearing trace before and after the phase and verify TMA loads reach a ready/completed state without using ordinary per-lane memory-access generation
 
@@ -561,10 +660,12 @@ Tasks:
 - add source-side shared-memory handling
 - support descriptor-backed `UBLKRED` execution setup with operand-3 size/span control preserved conservatively
 - track optional completion dependencies
+- preserve the same async ownership split used by load-side TMA so store transfer lifetime remains inside `tma_unit_sm`
 
 Success criterion:
 
 - TMA stores/reductions use the dedicated TMA engine rather than the normal store datapath, including descriptor-backed `UBLKRED` with descriptor layout plus operand-3 size/span control
+- issuing a TMA store does not serialize the warp for the full transfer lifetime unless a later wait/completion dependency requires it
 
 Test plan:
 
@@ -574,6 +675,7 @@ Test plan:
 - verify ordinary `STG` and `RED*` instructions still use the normal store datapath and counters
 - add a completion-dependency test where later code waits for store completion and confirm the TMA completion object changes state correctly
 - add a fire-and-forget store test where no later wait occurs and confirm the simulator does not introduce unnecessary stalls
+- add an overlap test where unrelated compute or memory-independent work continues while the store-side TMA transfer is still in flight
 
 ### Phase 5: TMA Completion / Barrier Model
 
@@ -587,16 +689,19 @@ Tasks:
 - support expected bytes and completed bytes
 - support phase/parity readiness
 - connect consumer waits to the completion object
+- make the main blocking point appear at consumer wait/test time rather than at producer issue time
 
 Success criterion:
 
 - readiness depends on transaction completion rather than simple instruction lifetime
+- producer issue and transfer completion remain distinct events in the timing model
 
 Test plan:
 
 - add unit tests for the new TMA completion object covering initialize, expect-bytes, partial progress, complete, phase/parity flip, and reset/reuse
 - add producer-consumer tests where compute is allowed to overlap with an in-flight TMA transfer and consumers only proceed after the completion state becomes ready
 - verify that readiness is driven by completed bytes rather than by command issue or ordinary instruction retirement
+- add a wait-side stall test confirming that a warp is blocked only when it reaches a readiness-dependent wait/use point, not simply because it previously issued a TMA command
 - add regression tests confirming existing `BAR`, `MEMBAR`, `DEPBAR`, and `LDGDEPBAR` behavior is unchanged
 - add a mixed-workload test containing both LDGSTS and TMA to confirm the two completion mechanisms stay independent
 
