@@ -341,10 +341,94 @@ incorrect transfer accounting.
 
 ---
 
+---
+
+## Descriptor-to-Handle Mapping: The Resolver JSON Is Built on a Fragile Heuristic
+
+### The problem in `build_tma_descriptor_mapping.py`
+
+The reflection above states that the simulator-facing resolver interface is stable and
+can be treated as a black box. That interface is correct. The bug is one level below
+it: the Python script that populates the resolver JSON from trace artifacts contains a
+hardcoded FA3-specific heuristic that will silently fail on any other workload.
+
+The function `derive_handle_family_map_by_rank` builds the handle → config lookup
+table like this:
+
+```python
+rank_map["0x14f00000"] = sorted_configs[0]["config_id"]   # hardcoded
+rank_map["0x12f00000"] = sorted_configs[-1]["config_id"]  # hardcoded
+```
+
+It hardcodes exactly the two runtime `handle_hi` values observed in the FA3 trace and
+assigns them to configs sorted by box volume descending. This produces the right
+answer for FA3 because:
+
+- FA3 happens to produce exactly two distinct handle values
+- Those two handle values happen to be `0x14f00000` and `0x12f00000`
+- The larger box config happens to correspond to the larger handle
+
+None of these coincidences hold in general. For any trace with different handle values,
+more than two configs per rank, or a different box-to-handle relationship, the primary
+lookup produces zero matches and everything degrades to the weaker fallback chain
+(`same_function_desc_reg_config_reuse`, `single_rank_candidate_config`).
+
+### The discarded data that would fix it
+
+`tensor_map_encode_dump.csv` contains `qword0_hex` through `qword7_hex` — the raw
+8 × 64-bit words of the encoded `CUtensorMap` blob, captured at the exit of
+`cuTensorMapEncodeTiled`. The runtime `tma_desc_runtime_debug.csv` captures
+`desc_value_hi` and `desc_value_lo` — the 64-bit value loaded into the `URx` pair
+at each `UTMALDG` site.
+
+`load_tensor_map_configs` reads the CSV rows but **drops all qword fields silently**.
+Only the semantic fields (rank, dims, box, swizzle, etc.) survive into the normalized
+config table.
+
+If `qword0` of the encoded `CUtensorMap` blob equals the runtime handle
+`(desc_value_hi << 32) | desc_value_lo`, then the correct general mapping is a direct
+hash lookup:
+
+```python
+handle_64 = (desc_value_hi << 32) | desc_value_lo
+config_id = qword0_to_config[handle_64]
+```
+
+This would be exact, general, and trace-independent — no heuristics.
+
+### Note on `tensor_map_ptr_hex`
+
+`tensor_map_ptr_hex` in the CSV is `reinterpret_cast<uintptr_t>(p->tensorMap)` — the
+host CPU address of the `CUtensorMap` output struct. It is not the GPU handle.
+Dropping it from the normalized config is correct. It is irrelevant to this problem.
+
+### What needs to happen before Phase 2
+
+Before Phase 2 (descriptor and command formation) can be trusted on non-FA3 workloads,
+the qword0 hypothesis must be verified:
+
+1. Take any row from `tma_desc_runtime_debug.csv` with a known `(unique_function_id,
+   pc_hex)` pair.
+2. Compute `handle_64 = (desc_value_hi << 32) | desc_value_lo`.
+3. Find the corresponding `tensor_map_encode_dump.csv` row (via `source_dump_ids` in
+   the config or via `tma_discovery.json` PC correlation).
+4. Compare `handle_64` against `qword0_hex` through `qword7_hex`.
+
+If one qword matches, fix `load_tensor_map_configs` to retain that qword and replace
+`derive_handle_family_map_by_rank` with a direct lookup. If no qword matches, the
+handle encoding needs to be identified from the blob layout or from hardware
+documentation before Phase 2 can be considered general.
+
+Until this is resolved, the resolver JSON is only valid for the specific FA3 trace
+used to generate it. The simulator itself can consume the JSON correctly regardless;
+the fragility is in the generation pipeline, not in the simulator's lookup.
+
+---
+
 ## Phasing Summary
 
 The original seven-phase roadmap in `TMA_ARCH.md` remains correct in structure.
-The reflections above sharpen two things about how early phases should be executed:
+The reflections above sharpen three things about how early phases should be executed:
 
 1. **Use `requests_total` from day one**, not `total_bytes`. The formula is cheap.
    The cost of correcting a `total_bytes`-based model after calibration breaks it on
@@ -355,9 +439,15 @@ The reflections above sharpen two things about how early phases should be execut
    from structural rewrites into behavioral extensions, which is the definition of an
    evolvable implementation.
 
-Everything else in the phasing plan stands:
+3. **Verify the qword0 → handle mapping before Phase 2 is considered correct.** The
+   resolver interface is stable. The resolver-building script is not. Shipping Phase 2
+   without fixing `derive_handle_family_map_by_rank` means the descriptor metadata
+   silently degrades to heuristic fallbacks on any workload that is not FA3.
+
+The phase sequence otherwise stands:
 
 - Phase 1: routing skeleton (`TMA_OP`, `m_tma_pipeline`, `tma_unit_sm` shell)
+- **Phase 2 gate**: verify qword0 == runtime handle; fix resolver-building script
 - Phase 2: descriptor and command formation (JSON loader, resolver interface)
 - Phase 3: GMEM → SMEM transfers (real `requests_total`-based progress)
 - Phase 4: SMEM → GMEM transfers
