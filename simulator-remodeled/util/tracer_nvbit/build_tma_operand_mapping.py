@@ -196,6 +196,19 @@ def infer_operand_kinds(entry):
             "descriptor": "tensor_map",
         }
     descriptor_ref = entry.get("descriptor_ref")
+    if opcode.startswith("UTMALDG") and ".MULTICAST" in opcode and descriptor_ref:
+        inferred = {
+            "descriptor": "tensor_map_shape",
+        }
+        if len(operands) >= 1:
+            inferred["operand_1"] = "load_dst_state"
+        if len(operands) >= 2:
+            inferred["operand_2"] = "load_coord_or_state"
+        if len(operands) >= 3:
+            inferred["operand_3"] = "multicast_mask_or_cluster_mask"
+        if len(operands) >= 4:
+            inferred["operand_4"] = "tensor_map_descriptor"
+        return inferred
     if opcode.startswith("UTMALDG") and descriptor_ref:
         inferred = {
             "descriptor": "tensor_map_shape",

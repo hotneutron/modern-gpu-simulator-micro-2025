@@ -385,6 +385,29 @@ The TMA descriptor is a 256-bit value stored in the GPU's **hardware descriptor 
 
 ---
 
+### `UTMALDG.4D.MULTICAST` in FA2
+
+The regenerated FA2 trace shows a multicast variant:
+
+```text
+UTMALDG.4D.MULTICAST [UR8], [UR22], UR28, desc[UR24]
+```
+
+Current practical interpretation relative to normal `UTMALDG.4D`:
+
+- `operand_1`
+  - `load_dst_state`
+- `operand_2`
+  - `load_coord_or_state`
+- `operand_3`
+  - `multicast_mask_or_cluster_mask`
+- `operand_4`
+  - `tensor_map_descriptor`
+
+So the main difference is one extra multicast-control operand. The load is still descriptor-driven, but it carries an additional cluster/multicast selector beyond the normal 3-operand `UTMALDG.4D` form.
+
+For tracer handling, this variant is already covered because the opcode family is matched by the `UTMALDG` prefix. The new resolver labeling only makes the multicast-specific operand roles explicit.
+
 ## Three Options to Capture TMA Descriptors
 
 ### Option 1 — Decode TMA Descriptors from CUBIN Binary (Not Viable)
