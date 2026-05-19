@@ -175,18 +175,33 @@ def infer_rank_from_related_usage(entry, runtime_groups, pc_opcode_map):
     return None, None
 
 
-def derive_handle_family_map_by_rank(configs):
+def derive_handle_family_map_by_rank(configs, runtime_groups, pc_opcode_map):
     grouped = {}
     for config in configs:
         grouped.setdefault(config["tensor_rank"], []).append(config)
+    observed_handles_by_rank = {}
+    for entry in runtime_groups:
+        handle_hi_hex = entry["handle_hi_hex"]
+        if handle_hi_hex == "0x00000000":
+            continue
+        opcode = pc_opcode_map.get((entry["unique_function_id"], entry["pc_hex"]))
+        rank = extract_rank_from_opcode(opcode)
+        if rank is None:
+            rank, _ = infer_rank_from_related_usage(entry, runtime_groups, pc_opcode_map)
+        if rank is None:
+            continue
+        observed_handles_by_rank.setdefault(rank, set()).add(handle_hi_hex)
     mapping = {}
     for rank, rank_configs in grouped.items():
         sorted_configs = sorted(rank_configs, key=box_volume, reverse=True)
+        observed_handles = sorted(
+            observed_handles_by_rank.get(rank, []),
+            key=lambda value: parse_int(value),
+            reverse=True,
+        )
         rank_map = {}
-        if len(sorted_configs) >= 1:
-            rank_map["0x14f00000"] = sorted_configs[0]["config_id"]
-        if len(sorted_configs) >= 2:
-            rank_map["0x12f00000"] = sorted_configs[-1]["config_id"]
+        for handle_hi_hex, config in zip(observed_handles, sorted_configs):
+            rank_map[handle_hi_hex] = config["config_id"]
         mapping[rank] = rank_map
     return mapping
 
@@ -274,7 +289,7 @@ def main():
     tensor_rows, configs = load_tensor_map_configs(extra_info_dir)
     runtime_groups = load_runtime_groups(extra_info_dir)
     pc_opcode_map = load_pc_opcode_map(extra_info_dir)
-    handle_map_by_rank = derive_handle_family_map_by_rank(configs)
+    handle_map_by_rank = derive_handle_family_map_by_rank(configs, runtime_groups, pc_opcode_map)
     resolver = build_resolver_entries(runtime_groups, handle_map_by_rank, configs, pc_opcode_map)
 
     configs_out = args.configs_out or (extra_info_dir / "tma_descriptor_configs.json")
@@ -292,7 +307,7 @@ def main():
         "version": 1,
         "source": {
             "runtime_group_count": len(runtime_groups),
-            "mapping_method": "handle_hi_to_box_dim_family_with_opcode_rank",
+            "mapping_method": "runtime_observed_handle_hi_to_box_dim_family_with_opcode_rank",
         },
         "resolver": resolver,
     })

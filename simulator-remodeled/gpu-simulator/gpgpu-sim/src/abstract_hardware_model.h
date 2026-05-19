@@ -1150,6 +1150,12 @@ class inst_t {
     return (op == STORE_OP || op == TENSOR_CORE_STORE_OP ||
             memory_op == memory_store);
   }
+  bool is_tma_load() const { return (op == TMA_LOAD_OP); }
+  bool is_tma_store() const { return (op == TMA_STORE_OP); }
+  bool is_tma_misc() const { return (op == TMA_MISCELLANEOUS_OP); }
+  bool is_tma_op() const {
+    return is_tma_load() || is_tma_store() || is_tma_misc();
+  }
 
   bool is_memory_barrier() const {
     return (op == MEMORY_BARRIER_OP);

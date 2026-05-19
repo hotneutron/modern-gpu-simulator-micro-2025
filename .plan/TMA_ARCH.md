@@ -13,9 +13,10 @@ TMA should **not** be modeled as an extension of `LDGSTS` or as a specialized ca
 Instead:
 
 - **`LDGSTS` remains on the current LD/ST path**
-- **TMA gets a new opcode class and a new SM-shared engine**
+- **TMA gets its own opcode families and a new SM-shared engine**
 - **TMA performs descriptor-driven address generation internally**
 - **TMA completion is tracked through a TMA-specific completion model**
+- **TMA never reuses `ldst_unit_sm` ownership or `DEPBAR`/`LDGDEPBAR` completion tracking**
 
 This follows the architectural distinction:
 
@@ -130,22 +131,30 @@ Therefore, TMA should submit a **command**, not mutate into a normal load/store 
 
 ### 1. New Opcode Class
 
-Add a new architectural operation type, e.g.:
+Add dedicated TMA architectural operation types:
 
-- `TMA_OP`
+- `TMA_LOAD_OP`
+- `TMA_STORE_OP`
+- `TMA_MISCELLANEOUS_OP`
 
 This should be added in the op-type definitions and assigned to Hopper TMA opcode families.
 
 Candidate families:
 
-- `UTMALDG`
-- `UTMAPF`
-- `UTMASTG`
-- `UTMAREDG`
-- `UBLKCP`
-- `UBLKPF`
-- `UBLKRED`
-- likely also TMA-control families such as `UTMACCTL`, `UTMACMDFLUSH`
+- **`TMA_LOAD_OP`**
+  - `UTMALDG`
+  - `UTMAPF`
+  - `UBLKCP`
+  - `UBLKPF`
+- **`TMA_STORE_OP`**
+  - `UTMASTG`
+  - `UTMAREDG`
+  - `UBLKRED`
+- **`TMA_MISCELLANEOUS_OP`**
+  - `UTMACCTL`
+  - `UTMACMDFLUSH`
+
+Do not add `TMA_RED_OP` or `TMA_CTRL_OP` at this stage. Reduction vs. non-reduction and control vs. prefetch distinctions should remain command-level fields, not top-level execution-domain splits.
 
 ### 2. New Subcore-Side Pipeline
 
@@ -155,7 +164,7 @@ Add a new subcore-side pipeline, e.g.:
 
 Responsibilities:
 
-- accept `TMA_OP`
+- accept `TMA_LOAD_OP`, `TMA_STORE_OP`, and `TMA_MISCELLANEOUS_OP`
 - perform lightweight issue-side timing
 - forward commands to the SM-shared TMA engine
 
@@ -386,6 +395,7 @@ Suggested contents:
 - rank
 - coordinates
 - shared-memory source/destination pointer
+- requests total
 - total bytes
 - covered bytes for validated bulk operand-driven forms
 - raw operand-3 runtime value for descriptor-backed size/span-controlled forms
@@ -396,6 +406,152 @@ Suggested contents:
 - engine state
 
 This becomes the primary abstraction for TMA execution.
+
+### Canonical Struct Layouts
+
+The plan should target compact canonical layouts from the beginning so later phases extend behavior without forcing structural rewrites.
+
+```cpp
+enum class TMAOpcodeFamily {
+    UTMALDG,
+    UTMAPF,
+    UTMASTG,
+    UTMAREDG,
+    UBLKCP,
+    UBLKPF,
+    UBLKRED,
+    UTMACCTL,
+    UTMACMDFLUSH
+};
+
+enum class TMADirection {
+    GMEM_TO_SMEM,
+    SMEM_TO_GMEM,
+    NONE
+};
+
+enum class TMATransferType {
+    LOAD,
+    STORE,
+    PREFETCH,
+    REDUCTION,
+    CONTROL
+};
+
+enum class TMAMetadataSource {
+    DESCRIPTOR,
+    OPERAND,
+    MIXED,
+    NONE
+};
+
+enum class TMAOperandForm {
+    EXPLICIT_DESC,
+    DESC_LIKE_PAIR,
+    BULK_OPERAND,
+    GENERIC
+};
+
+struct TMACommand {
+    uint32_t warp_id;
+    uint32_t cta_id;
+    uint32_t sm_id;
+    uint32_t subcore_id;
+    TMAOpcodeFamily opcode_family;
+    TMADirection direction;
+    TMATransferType transfer_type;
+    std::string config_id;
+    TMAMetadataSource meta_source;
+    std::string mapping_method;
+    float resolver_confidence;
+    uint32_t rank;
+    std::array<uint32_t, 5> box_dim;
+    std::array<uint32_t, 5> coords;
+    uint32_t element_size;
+    uint64_t smem_ptr;
+    uint32_t requests_total;
+    uint32_t total_bytes;
+    uint32_t covered_bytes;
+    uint32_t operand3_raw;
+    uint32_t swizzle;
+    uint32_t interleave;
+    uint32_t oob_fill;
+    uint32_t l2_promotion;
+    TMAOperandForm operand_form;
+    uint32_t completion_id;
+};
+
+struct TMATransferEntry {
+    enum class State {
+        ISSUED,
+        ENQUEUED,
+        AGU_READY,
+        IN_FLIGHT,
+        COMPLETED,
+        WAIT_SATISFIED
+    };
+
+    TMACommand cmd;
+    State state;
+    uint32_t requests_issued;
+    uint32_t requests_completed;
+    int cycle_enqueued;
+    int cycle_agu_ready;
+    int cycle_first_request;
+    int cycle_last_completion;
+    uint32_t completion_id;
+};
+
+struct TMACompletionObject {
+    uint32_t expected_tx_bytes;
+    uint32_t completed_tx_bytes;
+    uint32_t phase;
+    bool ready;
+    uint32_t warp_id;
+    uint32_t cta_id;
+    int cycle_ready;
+};
+```
+
+Field usage by phase:
+
+- **Phase 1**
+  - identity, opcode family, direction, transfer type, operand form
+- **Phase 2**
+  - config ID, metadata source, mapping method, rank, descriptor-derived geometry
+- **Phase 3**
+  - `requests_total`, `requests_issued`, `requests_completed`, `completion_id`
+- **Phase 4**
+  - store-side `smem_ptr`, reduction/control transfer type usage
+- **Phase 5**
+  - `expected_tx_bytes`, `completed_tx_bytes`, `phase`, `ready`
+
+Even if some fields are initially populated with conservative defaults, the structure shape should match this target early so later phases remain additive.
+
+### AGU Timing Basis
+
+The TMA AGU timing model should be based on the number of aligned transfer requests, not on `total_bytes`.
+
+Required quantity:
+
+- `row_bytes = box_dim[0] * element_size`
+- `requests_per_row = ceil(row_bytes / 128)`
+- `outer_iters = box_dim[1] * box_dim[2] * ... * box_dim[rank - 1]`
+- `requests_total = requests_per_row * outer_iters`
+
+`total_bytes / 128` is only correct when `row_bytes` is already an exact multiple of 128. That happens to hold for some FA3 geometries, but it is not a general rule. Therefore:
+
+- `total_bytes` should remain in the command for reference and completion-byte accounting
+- but AGU / transfer progress must be driven by `requests_total`
+- early phases may simplify request issue rate or per-request latency
+- early phases must not simplify `requests_total` into `total_bytes / 128`
+
+The minimum acceptable Phase 3 transfer entry should therefore carry both:
+
+- `requests_total`
+- `total_bytes`
+
+and treat them as different quantities with different uses.
 
 ### Minimal Async State Machine
 
@@ -440,6 +596,12 @@ The simulator already has:
 - `LDGDEPBAR`
 
 These are useful as scaffolding, but they are **not equivalent** to Hopper TMA synchronization.
+
+TMA completion must remain a separate tracking domain from:
+
+- `DEPBAR`
+- `LDGDEPBAR`
+- ordinary wait-barrier / scoreboard retirement tracking
 
 ### Required New Semantics
 
@@ -524,6 +686,26 @@ This path should remain under the TMA engine, but it should not be forced throug
 
 This path is currently a **follow-on extension**, not a first-suite requirement.
 
+## Descriptor-Resolver Validity Gate
+
+The simulator-facing descriptor interface is still correct:
+
+- `tma_descriptor_configs.json`
+- `tma_descriptor_resolver.json`
+- `tma_operand_resolver.json`
+
+However, the current resolver-generation path may still depend on a workload-specific handle-family heuristic. Before descriptor-backed Phase 2 behavior is considered generally correct, the tracing/generation path must validate whether runtime descriptor handles map directly to one of the raw encoded tensor-map qwords.
+
+Phase-2 gate:
+
+1. take a known runtime descriptor site from `tma_desc_runtime_debug.csv`
+2. build the 64-bit runtime handle from `(desc_value_hi, desc_value_lo)`
+3. compare it against the encoded qwords retained from `tensor_map_encode_dump.csv`
+4. if a stable qword match exists, replace handle-family heuristics with a direct lookup in the generator path
+5. if no qword match exists, treat descriptor-backed Phase 2 behavior as trace-specific until the encoding is identified
+
+This gate does not change the simulator lookup API, but it does determine whether the descriptor JSONs are trustworthy beyond the current FA3-oriented trace set.
+
 ## Proposed File-Level Direction
 
 ### Existing files likely to change
@@ -558,8 +740,8 @@ Goal:
 
 Tasks:
 
-- add `TMA_OP`
-- map Hopper TMA families to `TMA_OP`
+- add `TMA_LOAD_OP`, `TMA_STORE_OP`, and `TMA_MISCELLANEOUS_OP`
+- map Hopper TMA families to those TMA-specific op classes
 - add `m_tma_pipeline`
 - add `tma_unit_sm`
 - route only TMA ops to the new path
@@ -572,12 +754,34 @@ Success criterion:
 
 Test plan:
 
-- add a trace-decode unit check that Hopper TMA mnemonics map to `TMA_OP` while `LDGSTS`, `LDG`, `STG`, `LDS`, and `STS` keep their previous routing
-- add a routing-level check that `Subcore::get_fu()` sends only `TMA_OP` to `m_tma_pipeline` and leaves non-TMA memory ops on `m_memory_unit_subcore`
+- add a trace-decode unit check that Hopper TMA mnemonics map to `TMA_LOAD_OP`, `TMA_STORE_OP`, or `TMA_MISCELLANEOUS_OP` while `LDGSTS`, `LDG`, `STG`, `LDS`, and `STS` keep their previous routing
+- add a routing-level check that `Subcore::get_fu()` sends only the three TMA op families to `m_tma_pipeline` and leaves non-TMA memory ops on `m_memory_unit_subcore`
 - add a construction/initialization check that `SM` instantiates the new TMA reception latch and `tma_unit_sm` without changing LD/ST initialization
 - add a structural check that the new TMA path is modeled as a separate engine path rather than as a tensor-core or CUDA-core sub-variant
 - run a non-TMA regression workload and verify there is no behavioral change in issue counts, memory-unit traffic, or cycle count beyond harmless noise
 - run a TMA-containing trace and verify it no longer falls into the old LD/ST ownership path or crashes due to missing TMA execution routing
+
+### Phase 2 Gate: Descriptor Mapping Validation
+
+Goal:
+
+- ensure descriptor-backed TMA metadata is not silently tied to one FA3-specific handle heuristic
+
+Tasks:
+
+- verify whether runtime `(desc_value_hi, desc_value_lo)` matches a retained encoded tensor-map qword
+- if matched, replace handle-family heuristics in the generator path with direct qword-based lookup
+- if unmatched, mark descriptor-backed Phase 2 behavior as trace-specific and do not claim general resolver correctness
+
+Success criterion:
+
+- descriptor-backed `config_id` resolution is justified by a verified handle mapping path rather than only by workload-specific fallback heuristics
+
+Test plan:
+
+- add a generator-side validation script or check that compares runtime handles against retained encoded qwords on at least one descriptor-backed trace
+- confirm the resulting resolver JSON remains stable when the same descriptor is encountered across multiple dynamic sites in the same trace
+- document whether the mapping is exact or still heuristic before enabling broader non-FA3 confidence claims
 
 ### Phase 2: Descriptor and Command Formation
 
@@ -600,6 +804,7 @@ Success criterion:
 
 - the TMA engine receives structured transfer commands rather than guessed ordinary memory accesses, and descriptor-backed `UBLKRED` carries both descriptor semantics and conservative operand-3 size/span metadata
 - command formation is cleanly separated from later transfer progress and completion accounting
+- descriptor-backed lookup relies on the validated mapping path established by the Phase 2 gate rather than an undocumented FA3-only assumption
 
 Test plan:
 
@@ -632,6 +837,7 @@ Tasks:
 - land into shared memory model
 - update completion state
 - advance transfer progress inside `tma_unit_sm` independently of tensor-core and CUDA-core occupancy
+- drive AGU-side progress using `requests_total`, not `total_bytes / 128`
 
 Success criterion:
 
@@ -642,6 +848,7 @@ Test plan:
 
 - create a focused micro-trace or synthetic test with `UTMALDG`/`UTMAPF`/`UBLKCP` and verify the command enters `tma_unit_sm`, allocates an in-flight entry, and emits bulk transfer work
 - add AGU tests for 1D/2D/4D or 5D descriptor cases to verify base+stride address generation is stable and deterministic
+- add an AGU-timing contrast test with equal `total_bytes` but different `box_dim[0]` aspect ratios and verify the modeled request count differs
 - add boundary-handling tests where tile coordinates exceed tensor bounds and confirm the selected fallback behavior is applied consistently
 - verify GMEM -> SMEM TMA traffic increments new TMA counters rather than LDGSTS counters or ordinary LD/ST counters
 - add an overlap test where unrelated compute continues while a TMA transfer remains in flight, and verify the transfer still progresses each SM cycle
@@ -904,7 +1111,7 @@ Each phase should have explicit acceptance conditions beyond “it runs.”
 
 Pass if:
 
-- all targeted TMA opcodes decode as `TMA_OP`
+- all targeted TMA opcodes decode as `TMA_LOAD_OP`, `TMA_STORE_OP`, or `TMA_MISCELLANEOUS_OP`
 - only TMA ops route to the new TMA path
 - non-TMA memory ops still route exactly as before
 - no existing non-TMA regression trace shows unintended routing changes

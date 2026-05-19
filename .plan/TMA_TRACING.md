@@ -763,8 +763,8 @@ This is the main resolver algorithm. Its job is to connect:
 6. **Correlate runtime handle families with normalized tensor-map families**
    - for each static site, compare the set of observed runtime handle families against the set of normalized tensor-map families in the same launch window
    - in the current FlashAttention-3 trace, the two normalized 4D config families are distinguished primarily by `box_dim`
-   - because the runtime samples also split into two stable `desc_value_hi` values, the mapping is:
-     - one stable handle family ↔ one normalized tensor-map family
+   - the current implementation no longer hard-codes specific `desc_value_hi` literals
+   - instead, it collects the nonzero runtime-observed handle families for each inferred rank and maps them to normalized config families in sorted order
 
 7. **Emit the resolver entry**
    - write the final mapping as:
@@ -773,7 +773,7 @@ This is the main resolver algorithm. Its job is to connect:
 
 #### Important clarification
 
-The current observed mapping:
+The current observed FlashAttention-3 example mapping:
 
 - `0x14f00000` → `box_dim = 64 192 1 1`
 - `0x12f00000` → `box_dim = 64 128 1 1`
@@ -785,6 +785,7 @@ It means only that, in the currently observed FlashAttention-3 run:
 - `desc_value_hi` is a stable runtime tag
 - the normalized tensor-map families in the same launch window are mainly distinguished by `box_dim`
 - therefore the current correlation between runtime handle family and tensor-map family is effectively resolved by that distinction
+- and the current script derives that mapping from runtime-observed nonzero handle families, not from fixed literal constants
 
 If later traces contain multiple normalized tensor-map families with the same rank and the same `box_dim`, then this heuristic will no longer be sufficient by itself and more evidence will be required.
 
@@ -858,6 +859,8 @@ Steps:
    - `handle_hi_hex`
 6. Read `tma_discovery.json` and build the `(unique_function_id, pc_hex) -> opcode` map
 7. Use the static opcode rank plus the observed runtime `handle_hi_hex` family to resolve each grouped runtime consumer to a normalized `config_id`
+   - derive the candidate handle families from the runtime trace itself
+   - do not hard-code particular values such as `0x14f00000` or `0x12f00000` into the resolver implementation
 8. Write:
    - `tma_descriptor_configs.json`
    - `tma_descriptor_resolver.json`
@@ -874,6 +877,7 @@ because:
 - the same `desc[URx]` register pair can carry different descriptor families at different PCs
 - `handle_hi_hex` is the stable runtime family signal observed so far
 - the static site identity from `(unique_function_id, pc_hex)` is required to connect the runtime observation back to the correct consumer instruction
+- the current implementation derives valid handle families from the trace instead of assuming fixed literal family tags
 
 ### Current scope
 

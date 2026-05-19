@@ -214,6 +214,9 @@ types_of_operands get_oprnd_type(op_type op, special_ops sp_op){
     case DP_OP:
     case LOAD_OP:
     case STORE_OP:
+    case TMA_LOAD_OP:
+    case TMA_STORE_OP:
+    case TMA_MISCELLANEOUS_OP:
       return FP_OP;
     case BRANCH_OP:
     case UNIFORM_OP:

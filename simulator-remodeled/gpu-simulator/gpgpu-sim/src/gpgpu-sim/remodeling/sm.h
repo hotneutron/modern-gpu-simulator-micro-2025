@@ -66,6 +66,7 @@ class Scoreboard_reads;
 class functional_unit;
 class coalescingStatsPerSm;
 class coalescingStatsAcrossSms;
+class tma_unit_sm;
 
 enum subcore_dispatch_latch_name_t {
   DISPATCH_SP = 0, // FP32
@@ -353,6 +354,7 @@ class SM : public core_t, public shader_core_ctx_wrapper {
 
   std::vector<register_set_uniptr*> m_EX_WB_sm_shared_units_subcore_latches; 
   std::vector<register_set_uniptr*> m_EX_MEM_reception_latches_per_subcore;
+  std::vector<register_set_uniptr*> m_EX_TMA_reception_latches_per_subcore;
   register_set_uniptr m_EX_DP_shared_sm_reception_latch = register_set_uniptr(1,"EX_DP_shared_sm_reception_latch");
   functional_unit *m_shared_dp_unit;
 
@@ -363,6 +365,7 @@ class SM : public core_t, public shader_core_ctx_wrapper {
   // In order to be perfect, another icnt from memory_unit_subcore to shared
   // structures of memory of the subcore needs to be places here.
   ldst_unit_sm *m_ldst_unit_shared_of_sm;
+  tma_unit_sm *m_tma_unit_shared_of_sm = nullptr;
   std::shared_ptr<shader_core_mem_fetch_allocator> m_mem_fetch_allocator;
 
   std::vector<shd_warp_t *> m_physical_warp;  // per warp information array

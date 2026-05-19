@@ -38,6 +38,7 @@
 #include "l0_icnt.h"
 #include "../shader.h"
 #include "../shader_trace.h"
+#include "tma_unit_sm.h"
 #include "../stat-tool.h"
 
 #include "first_level_instruction_cache.h"
@@ -141,8 +142,12 @@ SM::~SM() {
   for(unsigned int i = 0; i < m_EX_MEM_reception_latches_per_subcore.size(); i++) {
     delete m_EX_MEM_reception_latches_per_subcore[i];
   }
+  for (unsigned int i = 0; i < m_EX_TMA_reception_latches_per_subcore.size(); i++) {
+    delete m_EX_TMA_reception_latches_per_subcore[i];
+  }
   m_EX_WB_sm_shared_units_subcore_latches.clear();
   delete m_ldst_unit_shared_of_sm;
+  delete m_tma_unit_shared_of_sm;
   if(m_config->is_dp_pipeline_shared_for_subcores) {
     delete m_shared_dp_unit;
   }
@@ -317,6 +322,7 @@ void SM::cycle() {
   }
 
   m_ldst_unit_shared_of_sm->cycle();
+  m_tma_unit_shared_of_sm->cycle();
 
   if(m_config->is_interwarp_coalescing_enabled && 
         ((m_config->interwarp_coalescing_selection_policy == DEP_COUNT_WAIT_OLDEST_INST_IBUFFER_GENERIC) ||
@@ -819,10 +825,17 @@ void SM::create_logical_structures() {
         "EX_MEM_shared_reception_latch_for_subcore_" + std::to_string(i);
     register_set_uniptr *mem_sm_reception_latch_for_subcore = new register_set_uniptr(1, latch_name.c_str());
     m_EX_MEM_reception_latches_per_subcore.push_back(mem_sm_reception_latch_for_subcore);
+    latch_name =
+        "EX_TMA_shared_reception_latch_for_subcore_" + std::to_string(i);
+    register_set_uniptr *tma_sm_reception_latch_for_subcore =
+        new register_set_uniptr(1, latch_name.c_str());
+    m_EX_TMA_reception_latches_per_subcore.push_back(
+        tma_sm_reception_latch_for_subcore);
     
     Subcore *subcore = new Subcore(i, m_config, m_stats, this,
                                    &m_EX_DP_shared_sm_reception_latch,
-                                   mem_sm_reception_latch_for_subcore);
+                                   mem_sm_reception_latch_for_subcore,
+                                   tma_sm_reception_latch_for_subcore);
     subcore->create_pipeline();
     m_subcores.push_back(subcore);
     m_EX_WB_sm_shared_units_subcore_latches.push_back(
@@ -892,6 +905,9 @@ void SM::create_memory_interfaces() {
       m_EX_MEM_reception_latches_per_subcore, m_icnt, m_icnt_L0s, m_mem_fetch_allocator,
       this, m_scoreboard, m_scoreboard_WAR, m_config, m_memory_config, m_stats,
       m_sm_id, m_tpc_id, m_config->memory_sm_prt_size);
+  m_tma_unit_shared_of_sm =
+      new tma_unit_sm(m_EX_WB_sm_shared_units_subcore_latches,
+                      m_EX_TMA_reception_latches_per_subcore, m_config, this);
   static_cast<L0_icnt *>(m_icnt_L0s)
         ->add_L0(static_cast<read_only_cache *>(m_ldst_unit_shared_of_sm->get_L1C()));
 }
