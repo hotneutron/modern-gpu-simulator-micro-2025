@@ -71,6 +71,13 @@ Allow FA3-style Hopper kernels to achieve forward progress without relying on a 
 - TMA completion wired into barrier-object readiness
 - Consumer wait instructions observing barrier-object state rather than legacy CTA arrival counts
 - Enough TMA/sidecar metadata resolution to support the executed FA3 command stream
+- An explicit binding rule for `expected_tx_bytes`:
+  - at TMA command build time, bind the issuing warp's active mbarrier address
+  - write `cmd.total_bytes` into the bound barrier object's `expected_tx_bytes`
+  - store the bound barrier address on the TMA command so completion updates the same object
+- A defined non-TMA arrival fallback:
+  - if a barrier has no bound TMA transfer for the current round, pure warp-arrive progress must still be able to satisfy the waiter
+  - minimum may simplify the exact rule, but it must not leave non-TMA `ARRIVE` / `TRYWAIT` pairs permanently unready
 
 ### What minimum may still simplify
 
@@ -93,6 +100,10 @@ at minimum, but they should be documented explicitly rather than silently ignore
 These can remain branch/misc approximations at minimum as long as the plan states that
 they are deferred rather than covered.
 
+The current FA3 backward target trace does not show `UCGABAR_*`, so cluster-barrier
+routing is not a minimum blocker for the present FA3-first bring-up target. It still
+remains a Hopper-general safety hazard once the goal expands beyond this trace.
+
 ### What minimum does not require yet
 
 - Full phase/parity protocol
@@ -100,6 +111,22 @@ they are deferred rather than covered.
 - Full proxy-fence model
 - Full Blackwell sync coverage
 - Full Gen5 tensor-core sync coverage
+
+### Minimum validation gates
+
+Minimum should be checked in two stages rather than one vague "forward progress" label:
+
+- **Bring-up gate**
+  - the first target FA3 backward kernel executes past its first blocking `SYNCS.TRYWAIT`
+  - debug visibility shows at least one end-to-end path:
+    - mbarrier object created
+    - TMA bound to that barrier
+    - TMA completion updates that barrier
+    - `TRYWAIT` is released
+- **Minimum achieved**
+  - the target FA3 backward kernel completes end-to-end with the temporary `SYNCS` bypass removed
+  - Hopper `SYNCS` no longer enter legacy `barrier_set_t`
+  - non-Hopper regressions remain unchanged
 
 ## Tier 2: Good
 
@@ -128,6 +155,11 @@ The reflection note makes several important points that belong here:
 - `UCGABAR_ARV` and `UCGABAR_WAIT` must not continue entering `barrier_set_t` through `BARRIER_OP`
 - they need their own stub or dedicated routing before the Hopper sync plan can be considered architecturally safe
 - `ACQBULK` must be verified against FA3 SASS so we know whether a no-op stub is harmless or whether it silently breaks consumer ordering
+
+For clarity:
+
+- `UCGABAR_*` remains a **Good-tier Hopper-general safety fix**, not a blocker for the current FA3 backward minimum target, because the present FA3 target trace does not execute those opcodes
+- if the scope changes from "FA3-first runnable" to "safe Hopper sync support beyond FA3", this item should be pulled earlier
 
 ### Good means stable beyond one kernel
 
@@ -203,6 +235,17 @@ sync/TMA-related areas identified by the reflection note:
 - `ELECT`
 - `ENDCOLLECTIVE`
 
+### Infrastructure that may land before Tier 4
+
+Some Blackwell work is cheaper than full semantic support and may be pulled earlier if
+it reduces obvious crashes:
+
+- adding missing sync-related opcode names to `blackwell_opcode.h`
+- mapping them to Hopper-equivalent safe baseline routing
+
+This does not mean Blackwell synchronization itself is solved. It only means opcode
+recognition and safe initial routing can be decoupled from full Blackwell semantic work.
+
 ### Why this is its own tier
 
 The reflection note makes the key point clearly:
@@ -212,9 +255,9 @@ The reflection note makes the key point clearly:
 - missing cluster and warpgroup-related opcodes leave large correctness holes
 
 So “Blackwell-support” is not just “full Hopper plus a little extra.”
-It is a distinct coverage milestone:
+It remains a distinct semantic coverage milestone:
 
-- opcode map parity
+- Blackwell-specific semantic validation
 - correct routing categories
 - prevention of silent fallback into wrong legacy paths
 
@@ -261,11 +304,29 @@ These should remain on the known-unknowns list until real Blackwell traces are a
 
 ## What To Fix Next Relative To These Tiers
 
+### Dependency ordering note
+
+The implementation dependency chain should be treated as:
+
+- opcode/types infrastructure
+- `warp_inst_t` fields and `SYNCS` decode
+- SM-side mbarrier storage and helpers
+- subcore-side wait gating
+- TMA-to-mbarrier binding and completion updates
+- bypass removal
+- validation
+
+Trace operand helpers are useful cleanup, but they are not a hard prerequisite if the
+minimum decode path is implemented directly in `trace_driven.cc`.
+
 ### To reach minimum
 
 - fix the current operand sidecar lookup mismatch / runtime key mismatch
 - get the intended kernel-10 TMA path to resolve metadata reliably
 - make the Hopper `SYNCS` / TMA handshake reach a stable executed path
+- specify and implement the `expected_tx_bytes` binding path from TMA issue to mbarrier state
+- specify and implement the non-TMA arrival fallback so non-transfer waits cannot deadlock by construction
+- remove the temporary `SYNCS` bypass only after the new path passes the bring-up gate
 
 ### To move from minimum to good
 
@@ -273,6 +334,7 @@ These should remain on the known-unknowns list until real Blackwell traces are a
 - refine `EXCH`, `ARRIVE`, and wait semantics
 - address `UCGABAR_*` routing hazard
 - verify the role of `ACQBULK`
+- decide whether early Blackwell opcode-map parity should be landed as low-risk infrastructure before full Tier 4 work
 
 ### To move from good to full
 
