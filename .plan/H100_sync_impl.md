@@ -12,6 +12,110 @@ The implementation should:
 - wire TMA completion bytes into barrier readiness
 - remove the temporary `SYNCS` bypass after the new model is active
 
+### Why This Goal Exists
+
+#### 1) Difference Between Legacy Barriers and Hopper `mbarrier` / `SYNCS`
+
+- Legacy `BAR.SYNC`-style barriers are **barrier-id-based collective synchronization**.
+- Their core meaning is: “all participating warps in the CTA must arrive at the same barrier point before anyone is released.”
+- Hopper `mbarrier` / `SYNCS`, in contrast, behaves as an **address-based barrier-object state machine**.
+- Its core meaning is: “producer warps, consumer warps, and TMA all update and observe the state of a barrier object stored at a specific memory address.”
+
+In short:
+
+- `BAR.SYNC` is a **rendezvous where threads/warps meet**
+- `mbarrier` / `SYNCS` is **asynchronous completion synchronization mediated through a shared memory-resident state object**
+
+#### 2) Legacy Barrier Picture
+
+```text
+Warp 0  ----\
+Warp 1  -----+----> [ BAR.SYNC id=0 ] ----> all released together
+Warp 2  -----+
+Warp 3  ----/
+```
+
+- All participating warps must arrive at the same barrier id.
+- The barrier releases only when the final required participant arrives.
+- The important state is:
+  - barrier id
+  - arriving warp set
+  - arrival count
+
+#### 3) Hopper `mbarrier` / `SYNCS` Picture
+
+```text
+                +----------------------+
+                | mbarrier object @ A  |
+                |----------------------|
+Producer warp ->| arrive / exch        |
+TMA engine ---->| complete bytes       |
+Consumer warp ->| trywait / phasechk   |
+                +----------------------+
+```
+
+- Producer-side warps prepare or signal the barrier object using `SYNCS.EXCH` / `SYNCS.ARRIVE`.
+- TMA updates the same barrier object when asynchronous data movement completes.
+- Consumer-side warps use `TRYWAIT` / `PHASECHK` to observe whether the object is ready.
+
+So in Hopper, it is much more important to know:
+
+- which **barrier address** is being referenced
+- what the object’s **phase / ready / expected / completed** state is
+
+than simply how many warps have “met” at a barrier.
+
+#### 4) Why TMA Must Be Modeled Together With `SYNCS`
+
+In Hopper kernels such as FA3, the following appear together:
+
+- `SYNCS.EXCH`
+- `SYNCS.ARRIVE.TRANS64`
+- `SYNCS.PHASECHK.TRANS64.TRYWAIT`
+- TMA-family instructions such as `UTMALDG`, `UTMASTG`, and `UBLKRED`
+
+Conceptually, the intended flow is:
+
+```text
+(1) EXCH / ARRIVE prepares the barrier object
+(2) TMA performs asynchronous transfer
+(3) TMA completion updates the barrier object's ready state
+(4) TRYWAIT / PHASECHK observes ready and proceeds
+```
+
+Therefore, if `SYNCS` is treated as a legacy CTA barrier, or if TMA completion is not connected to the barrier object:
+
+- the waiter may be waiting on barrier A
+- while TMA completion updates barrier B
+- or the expected / completed comparison may never match
+- and the kernel can deadlock
+
+#### 5) What This Goal Really Means
+
+The purpose of this document is not “fully implement every Hopper synchronization feature.”
+
+Instead, the goal is to:
+
+- capture the key semantics of Hopper `SYNCS` / `mbarrier` that FA3 actually depends on
+- connect TMA completion to wait semantics
+- make the kernel achieve at least **forward progress**
+
+So the near-term goal is:
+
+- leave legacy `BAR.SYNC` behavior untouched
+- route Hopper `SYNCS` through a separate `MBARRIER_OP` path
+- create address-based barrier objects
+- make `TRYWAIT` / `PHASECHK` observe those objects
+- make TMA completion transition those objects to ready
+
+#### 6) Important Findings From Debugging So Far
+
+- FA3 SASS uses **multiple distinct barrier addresses** within the same CTA.
+- Therefore, the assumption “one active barrier per CTA” is too weak.
+- The current implementation should prefer active barrier association by `(cta, warp)`, with CTA-wide fallback only when the active barrier address is unambiguous.
+- Also, the observed `SYNCS.ARRIVE*` operand values such as `RZ`, `R3`, `R5`, and `R9` do not look trustworthy as transfer-byte counts.
+- For the FA3-first model, expected bytes should therefore come from **TMA issue-time `cmd.total_bytes`**, not from decoded `ARRIVE` operand values.
+
 ## Design Summary
 
 - Do not route Hopper `SYNCS` through legacy CTA `bar_id` barrier logic.
@@ -149,11 +253,14 @@ The implementation should:
 **Add to `SM`**
 
 - `std::map<HopperMBarrierKey, HopperMBarrierObject> m_mbarriers`
+- `std::map<std::pair<unsigned, unsigned>, uint64_t> m_active_mbarrier_addr_by_warp`
 
 **Add helpers**
 
 - `HopperMBarrierObject &get_or_create_mbarrier(unsigned cta_id, new_addr_type addr)`
 - `const HopperMBarrierObject *find_mbarrier(unsigned cta_id, new_addr_type addr) const`
+- `void set_active_mbarrier_addr(unsigned cta_id, unsigned warp_id, new_addr_type addr)`
+- `bool get_active_mbarrier_addr(unsigned cta_id, unsigned warp_id, new_addr_type &addr) const`
 - `void reset_mbarriers_for_cta(unsigned cta_id)`
 
 **Why SM**
@@ -180,9 +287,11 @@ The implementation should:
   - create or find barrier object
   - mark initialized
   - update phase or base state
+  - record the active barrier address for the issuing warp
 - `SYNCS_ARRIVE`
   - increment `arrive_count`
-  - optionally update `expected_tx_bytes`
+  - record the active barrier address for the issuing warp
+  - do not derive `expected_tx_bytes` from the operand value in the FA3-first model
 - `SYNCS_ARRIVE_RED`
   - treat as `ARRIVE` for FA3-first implementation
 - `SYNCS_PHASECHK`
@@ -216,7 +325,8 @@ The implementation should:
 
 **At command build time**
 
-- inspect traced operands or metadata to identify the barrier address associated with TMA completion
+- bind TMA completion to the active mbarrier address for the same `(cta, warp)` when available
+- only use CTA-wide fallback if the CTA has a single unambiguous active barrier address
 - populate:
   - `cmd.completion_barrier_addr`
   - `cmd.has_completion_barrier_addr`
@@ -234,7 +344,8 @@ The implementation should:
 
 **FA3-first rule**
 
-- `expected_tx_bytes` comes from `SYNCS.ARRIVE*` operand value when encoded there
+- do not use `SYNCS.ARRIVE*` operand values as expected transfer bytes
+- `expected_tx_bytes` comes from TMA issue-time `cmd.total_bytes`
 - `completed_tx_bytes` comes from TMA completion progress
 - `TRYWAIT` and `PHASECHK` become satisfied when completed bytes meet expectation
 
@@ -270,6 +381,15 @@ The implementation should:
 - first few `TRYWAIT blocked`
 - first few `TRYWAIT released`
 - first few `TMA completion -> mbarrier ready`
+- first few raw decoded `SYNCS` opcode and operand strings
+- first few active-barrier overwrites
+- first few `TMA bind-missing` events
+
+**Add deadlock summaries**
+
+- wait hotspot summary keyed by `(cta, pc, barrier_addr, sync_kind)`
+- TMA↔mbarrier correlation summary keyed by `(cta, barrier_addr)`
+- per-SM deadlock-time mbarrier object dump
 
 **Purpose**
 
@@ -292,6 +412,7 @@ The implementation should:
 ### Step 3
 
 - add mbarrier storage and helpers in `sm.h` and `sm.cc`
+- use warp-aware active barrier tracking instead of a single active barrier per CTA
 
 ### Step 4
 
@@ -300,6 +421,7 @@ The implementation should:
 ### Step 5
 
 - wire TMA completion to barrier readiness in `tma_unit_sm.cc`
+- set expected bytes from TMA issue-time transfer size rather than `SYNCS.ARRIVE` operand values
 
 ### Step 6
 
@@ -309,6 +431,14 @@ The implementation should:
 
 - rerun FA3 kernel 10
 - then rerun the wider H100 config
+
+## Current FA3-First Notes
+
+- The single active-CTA mbarrier heuristic was too weak for FA3 because the kernel uses multiple live barrier addresses in the same CTA.
+- The current implementation should prefer active barrier association by `(cta, warp)` and only use CTA-wide fallback when the active address is unambiguous.
+- Static inspection of the FA3 SASS suggests `SYNCS.ARRIVE*` operands such as `RZ`, `R3`, `R5`, and `R9` are unlikely to represent transfer-byte counts.
+- For the FA3-first model, expected bytes should therefore be driven by TMA command size, not by decoded `ARRIVE` operand values.
+- The next likely semantic bug, if deadlock persists after these fixes, is that `SYNCS.EXCH` may still be resetting barrier state too aggressively.
 
 ## Explicit Non-Goals For First Pass
 
