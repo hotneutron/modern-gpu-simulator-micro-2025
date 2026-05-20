@@ -139,6 +139,7 @@ enum AdaptiveCache { FIXED = 0, ADAPTIVE_CACHE = 1 };
 #include <cassert>
 
 #include "operation_type.h"
+#include "gpgpu-sim/remodeling/tma_types.h"
 #include "../../../util/traces_enhanced/src/traced_instruction.h" // MOD. Improved tracer
 
 typedef unsigned long long new_addr_type;
@@ -1209,6 +1210,8 @@ class inst_t {
   address_type next_traced_pc;  // program counter address of the next traced instruction
   unsigned isize;   // size of instruction in bytes
   op_type op;       // opcode (uarch visible)
+  TMAOpcodeFamily tma_opcode_family = TMAOpcodeFamily::UNKNOWN;
+  uint32_t tma_handle_hi = 0;
   bool skip_wb;
 
   barrier_type bar_type;

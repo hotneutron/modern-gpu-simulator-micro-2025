@@ -72,6 +72,7 @@ struct inst_memadd_info_t {
   uint64_t addrs[WARP_SIZE];
   int16_t width;
   uint32_t u_desc_value;
+  uint32_t u_desc_value_hi;
 
   void base_stride_decompress(unsigned long long base_address, int stride,
                               const std::bitset<WARP_SIZE> &mask);

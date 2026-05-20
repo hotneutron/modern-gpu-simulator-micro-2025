@@ -312,9 +312,35 @@ def infer_runtime_semantics(opcode, operands, callback_groups, descriptor_ref):
                         (value * 16) // element_size_bytes for value in raw_samples
                     ]
     elif opcode.startswith("UBLKRED") and len(operands) >= 3 and descriptor_ref:
+        element_size_bytes = infer_ublkred_element_size_bytes(opcode)
         semantics["descriptor"] = {
             "kind": "tensor_map",
         }
+        for callback in callback_groups:
+            position = callback.get("operand_position")
+            if position == 1:
+                semantics["operand_1"] = {
+                    "kind": "dst_or_coord_state",
+                    "runtime_source": "memory_ref",
+                }
+            elif position == 2:
+                semantics["operand_2"] = {
+                    "kind": "src_state",
+                    "runtime_source": "memory_ref",
+                }
+            elif position == 3:
+                raw_samples = callback.get("value_lo_samples", [])
+                semantics["operand_3"] = {
+                    "kind": "covered_bytes",
+                    "runtime_source": "uniform_reg",
+                    "raw_value_samples": raw_samples,
+                    "decoded_byte_samples": raw_samples,
+                }
+                if element_size_bytes:
+                    semantics["operand_3"]["element_size_bytes"] = element_size_bytes
+                    semantics["operand_3"]["decoded_element_samples"] = [
+                        value // element_size_bytes for value in raw_samples
+                    ]
     elif opcode.startswith("UTMALDG") and descriptor_ref:
         semantics["descriptor"] = {
             "kind": "tensor_map",
@@ -388,14 +414,17 @@ def build_runtime_observed_values(opcode, callback_groups, descriptor_ref):
     if opcode.startswith("UBLKCP") and "operand_3" in observed:
         raw_samples = observed["operand_3"]["raw_value_lo_samples"]
         observed["operand_3"]["decoded_byte_samples"] = [value * 16 for value in raw_samples]
-    if opcode.startswith("UBLKRED") and "operand_3" in observed and not descriptor_ref:
+    if opcode.startswith("UBLKRED") and "operand_3" in observed:
         raw_samples = observed["operand_3"]["raw_value_lo_samples"]
         element_size_bytes = infer_ublkred_element_size_bytes(opcode)
-        observed["operand_3"]["decoded_byte_samples"] = [value * 16 for value in raw_samples]
+        if descriptor_ref:
+            observed["operand_3"]["decoded_byte_samples"] = raw_samples
+        else:
+            observed["operand_3"]["decoded_byte_samples"] = [value * 16 for value in raw_samples]
         if element_size_bytes:
             observed["operand_3"]["element_size_bytes"] = element_size_bytes
             observed["operand_3"]["decoded_element_samples"] = [
-                (value * 16) // element_size_bytes for value in raw_samples
+                value // element_size_bytes for value in observed["operand_3"]["decoded_byte_samples"]
             ]
     return observed
 

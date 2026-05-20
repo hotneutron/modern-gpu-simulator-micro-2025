@@ -68,6 +68,7 @@
 
 #include "../ISA_Def/blackwell_opcode.h"
 #include "../ISA_Def/hopper_opcode.h"
+#include "../gpgpu-sim/src/gpgpu-sim/remodeling/tma_types.h"
 #include "../ISA_Def/ampere_opcode.h"
 #include "../ISA_Def/kepler_opcode.h"
 #include "../ISA_Def/pascal_opcode.h"
@@ -299,6 +300,20 @@ bool trace_warp_inst_t::parse_from_trace_struct(
   if (it != OpcodeMap->end()) {
     m_opcode = it->second.opcode;
     op = (op_type)(it->second.opcode_category);
+    if (op == TMA_LOAD_OP || op == TMA_STORE_OP || op == TMA_MISCELLANEOUS_OP) {
+      switch (m_opcode) {
+        case OP_UTMALDG:      tma_opcode_family = TMAOpcodeFamily::UTMALDG;      break;
+        case OP_UTMAPF:       tma_opcode_family = TMAOpcodeFamily::UTMAPF;       break;
+        case OP_UTMASTG:      tma_opcode_family = TMAOpcodeFamily::UTMASTG;      break;
+        case OP_UTMAREDG:     tma_opcode_family = TMAOpcodeFamily::UTMAREDG;     break;
+        case OP_UBLKCP:       tma_opcode_family = TMAOpcodeFamily::UBLKCP;       break;
+        case OP_UBLKPF:       tma_opcode_family = TMAOpcodeFamily::UBLKPF;       break;
+        case OP_UBLKRED:      tma_opcode_family = TMAOpcodeFamily::UBLKRED;      break;
+        case OP_UTMACCTL:     tma_opcode_family = TMAOpcodeFamily::UTMACCTL;     break;
+        case OP_UTMACMDFLUSH: tma_opcode_family = TMAOpcodeFamily::UTMACMDFLUSH; break;
+        default:              tma_opcode_family = TMAOpcodeFamily::UNKNOWN;      break;
+      }
+    }
     const std::unordered_map<unsigned, unsigned> *OpcPowerMap = &OpcodePowerMap;
     std::unordered_map<unsigned, unsigned>::const_iterator it2 =
       OpcPowerMap->find(m_opcode);
@@ -366,12 +381,15 @@ bool trace_warp_inst_t::parse_from_trace_struct(
   // fill addresses
   if(!trace.memadd_info.empty()) {
     data_size = trace.memadd_info[0]->width;
+    tma_handle_hi = trace.memadd_info[0]->u_desc_value_hi;
     for (unsigned i = 0; i < config_warp_size; ++i) {
       set_addr(i, trace.memadd_info[0]->addrs[i]);
       if(trace.memadd_info.size() == 2){
         set_addr_memref2(i, trace.memadd_info[1]->addrs[i]);
       }
     }
+  } else {
+    tma_handle_hi = 0;
   }
 
 

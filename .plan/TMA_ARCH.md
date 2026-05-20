@@ -242,6 +242,8 @@ Suggested state:
 
 First implementation does not need to fully match Hopper encoding, but it should preserve the architectural idea that TMA completion is tied to async transaction progress rather than only to the issuing instruction’s ordinary retirement.
 
+**Implementation note (Phase 1.5 → Phase 5):** The current skeleton uses a `std::vector<TMACompletionObject>` that grows unbounded — each new TMA command appends an entry and none are ever freed. This is acceptable for Phase 1.5 validation but must be replaced with a fixed-size pool or ring before Phase 5. The `completion_id` is currently the raw vector index; a pool design would allocate from a free-list and return the slot on WAIT_SATISFIED.
+
 ### 6. Wait-Side Stall Rule
 
 The simulator should preserve TMA's async nature by placing the main stall point on the **consumer wait side**, not on the producer issue side.
@@ -510,6 +512,9 @@ struct TMACompletionObject {
     uint32_t warp_id;
     uint32_t cta_id;
     int cycle_ready;
+    // Phase 5: add expected_arrival_count and completed_arrival_count.
+    // Hopper mbarrier has two independent counters (arrival count + tx-count);
+    // a phase completes only when BOTH reach zero.
 };
 ```
 
@@ -619,6 +624,31 @@ The right plan is:
 3. later refine it into a more Hopper-like `mbarrier` model
 4. finally add simplified proxy-fence visibility rules for TMA stores
 
+#### Hardware gap: mbarrier has two independent completion counters
+
+Hopper `mbarrier` tracks two independent counters, not one:
+
+- **arrival count**: decremented by each thread arriving at the barrier (`MBAR.ARV`)
+- **tx-count**: decremented by each byte arriving from async transfers (`MBAR.ARRIVE_DROP_EXPECT_TX` / `complete_tx`)
+
+A barrier phase completes only when **both** counts reach zero. Current `TMACompletionObject` only tracks tx-count (bytes). Phase 5 must add `expected_arrival_count` and `completed_arrival_count` to model the full readiness condition.
+
+#### Hardware gap: TMA load vs store use different completion mechanisms
+
+These are two distinct hardware mechanisms, not variants of the same path:
+
+- **TMA loads** (`UTMALDG`, `UTMAPF`, `UBLKCP`, `UBLKPF`): completion is signaled via mbarrier `complete_tx`. The mbarrier is the synchronization object; `MBAR.TEST_WAIT.PARITY` is the consumer wait point.
+- **TMA stores** (`UTMASTG`, `UTMAREDG`, `UBLKRED`): completion is signaled via commit-group / wait-group, not via mbarrier. In SASS this corresponds to `UTMACMDFLUSH`. The consumer wait pattern is `cp.async.bulk.wait_group 0`, not mbarrier phase wait.
+
+Phase 4 and Phase 5 must model these as separate synchronization domains, not as one unified completion model.
+
+#### Hardware gap: fence.proxy.async is required in two contexts
+
+`FENCE.PROXY.ASYNC` is not only required before TMA stores. It is also required **after `mbarrier.init`** to ensure the mbarrier object is visible across the async proxy before any thread attempts to use it. Phase 6 must account for both:
+
+1. after `mbarrier.init` — ensures async proxy sees the initialized mbarrier object
+2. before TMA stores — ensures prior generic-path writes to shared memory are visible to the TMA store engine
+
 ### First Async Execution Rule
 
 Before full Hopper `mbarrier` fidelity exists, the simulator should still model a minimal async rule:
@@ -641,9 +671,10 @@ For `UTMALDG` / `UTMAPF` / `UBLKCP` / `UBLKPF`:
 3. issuing ownership ends after command enqueue, so the warp can continue with later independent work
 4. TMA AGU resolves addresses using descriptor + coordinates
 5. TMA engine emits bulk requests toward memory hierarchy
+   - **Hardware note: TMA loads bypass L1 data cache.** Requests go directly to L2/DRAM, not through the per-SM L1 cache. Phase 3 memory hierarchy routing must not send TMA traffic through the L1 data cache path. TMA traffic should be counted separately from L1-cached loads.
 6. returning data is placed into shared memory through TMA landing path
-7. completion object is updated as bytes arrive
-8. consumers proceed once completion state is satisfied
+7. completion object is updated as bytes arrive (via mbarrier `complete_tx`)
+8. consumers proceed once mbarrier tx-count AND arrival count both reach zero
 
 ### SMEM -> GMEM
 
@@ -651,10 +682,10 @@ For descriptor-backed store forms such as `UTMASTG` / `UTMAREDG` and descriptor-
 
 1. warp issues TMA store command
 2. issuing ownership ends after enqueue, while the store transfer continues under `tma_unit_sm`
-3. generic-path writes to shared memory must already be visible
+3. generic-path writes to shared memory must already be visible; `FENCE.PROXY.ASYNC` is required to ensure proxy-domain visibility
 4. TMA engine reads from shared memory source region
 5. TMA engine writes to global memory using descriptor-generated addresses and descriptor-carried tensor-layout context
-6. completion object is optionally tracked if later code depends on completion
+6. completion is signaled via **commit-group / wait-group** (`UTMACMDFLUSH` in SASS), **not via mbarrier**. This is a separate completion mechanism from TMA load completion.
 
 ### Reduction Stores
 
@@ -694,17 +725,17 @@ The simulator-facing descriptor interface is still correct:
 - `tma_descriptor_resolver.json`
 - `tma_operand_resolver.json`
 
-However, the current resolver-generation path may still depend on a workload-specific handle-family heuristic. Before descriptor-backed Phase 2 behavior is considered generally correct, the tracing/generation path must validate whether runtime descriptor handles map directly to one of the raw encoded tensor-map qwords.
+However, the current resolver-generation path still depends on a workload-specific handle-family heuristic. Previous qword-comparison attempts did not yield a useful or stable direct descriptor lookup path, so Phase 2 should treat the validated handle-family heuristic as the intended generator-side binding method for the current target traces.
 
 Phase-2 gate:
 
-1. take a known runtime descriptor site from `tma_desc_runtime_debug.csv`
-2. build the 64-bit runtime handle from `(desc_value_hi, desc_value_lo)`
-3. compare it against the encoded qwords retained from `tensor_map_encode_dump.csv`
-4. if a stable qword match exists, replace handle-family heuristics with a direct lookup in the generator path
-5. if no qword match exists, treat descriptor-backed Phase 2 behavior as trace-specific until the encoding is identified
+1. verify that the handle-family heuristic remains stable on the first target traces
+2. confirm FA3 / FA2 keep the expected `config_id` assignments after hard-coded literal removal
+3. keep `UTMAPF` descriptor linkage one-to-one on the targeted traces
+4. keep `UTMASTG` desc-like first-operand-pair handling valid on the targeted traces
+5. keep descriptor-backed `UBLKRED` conservative unless its operand-3 rule is directly validated
 
-This gate does not change the simulator lookup API, but it does determine whether the descriptor JSONs are trustworthy beyond the current FA3-oriented trace set.
+This gate does not change the simulator lookup API, but it does determine whether the current heuristic-backed descriptor JSONs are trustworthy enough to begin Phase 2 metadata binding for the first target traces.
 
 ## Proposed File-Level Direction
 
@@ -769,19 +800,19 @@ Goal:
 
 Tasks:
 
-- verify whether runtime `(desc_value_hi, desc_value_lo)` matches a retained encoded tensor-map qword
-- if matched, replace handle-family heuristics in the generator path with direct qword-based lookup
-- if unmatched, mark descriptor-backed Phase 2 behavior as trace-specific and do not claim general resolver correctness
+- validate the runtime-observed `handle_hi_hex` family mapping path after hard-coded literal removal
+- confirm the resulting `config_id` assignments remain stable on the targeted FA3 / FA2 traces
+- keep unresolved or weakly resolved descriptor-backed sites out of Phase 2 binding
 
 Success criterion:
 
-- descriptor-backed `config_id` resolution is justified by a verified handle mapping path rather than only by workload-specific fallback heuristics
+- descriptor-backed `config_id` resolution is justified by a validated heuristic handle-mapping path on the first target traces, with known limits documented explicitly
 
 Test plan:
 
-- add a generator-side validation script or check that compares runtime handles against retained encoded qwords on at least one descriptor-backed trace
-- confirm the resulting resolver JSON remains stable when the same descriptor is encountered across multiple dynamic sites in the same trace
-- document whether the mapping is exact or still heuristic before enabling broader non-FA3 confidence claims
+- confirm the resulting resolver JSON remains stable when the same descriptor-backed site is encountered across repeated targeted traces
+- confirm FA3 / FA2 preserve the expected `config_id` assignments after heuristic cleanup
+- document the supported heuristic cases and unresolved cases before enabling Phase 2 metadata binding
 
 ### Phase 2: Descriptor and Command Formation
 
@@ -799,6 +830,15 @@ Tasks:
 - support descriptor-backed `UBLKRED` resolution plus conservative operand-3 size/span metadata attachment
 - attach TMA command information to decoded instructions
 - ensure the internal TMA command object represents a submitted async transfer request rather than a long-lived subcore execution record
+
+**UTMAPF descriptor_link handling:** `UTMAPF` has no explicit `desc[URx]` operand.
+Its descriptor association is stored in `tma_operand_resolver.json` under `descriptor_link.matched_descriptor.config_ids`, pointing to a later `UTMALDG` at the same `unique_function_id`.
+The Phase 2 JSON loader should **pre-resolve** this link at load time and store the resolved `config_id` directly in the `TMACommand`.
+There is no `descriptor_link` field in `TMACommand` and none is needed — the resolver is resolved to a `config_id` string before the command is formed.
+
+**UBLKRED operand_form at Phase 2:** `classify_tma_operand_form` currently returns `BULK_OPERAND` for all UBLKRED sites as a static default.
+The Phase 2 metadata loader must override this per-site: if `tma_descriptor_resolver.json` has an entry for the site, set `operand_form = EXPLICIT_DESC`; if only `tma_operand_resolver.json` covers the site with `operand_form = "bulk"`, keep `BULK_OPERAND`.
+No change to `TMACommand` struct is needed; `operand_form` is already present.
 
 Success criterion:
 
@@ -838,6 +878,13 @@ Tasks:
 - update completion state
 - advance transfer progress inside `tma_unit_sm` independently of tensor-core and CUDA-core occupancy
 - drive AGU-side progress using `requests_total`, not `total_bytes / 128`
+- **route TMA load traffic to bypass L1 data cache** — TMA loads go directly to L2; they must not increment L1 hit/miss counters or pass through the L1 hit/miss path
+
+**UTMALDG.MULTICAST decision point:** `UTMALDG` has a `.MULTICAST` variant that takes an extra 16-bit `ctaMask` operand and delivers one global fetch to multiple CTAs' SMEM simultaneously. This variant is already observed in FA2 traces, but FA2 is not the first implementation target. Phase 3 may defer MULTICAST fidelity until after the first FA3-oriented path is stable. When it is addressed, the model must decide whether to represent MULTICAST as:
+  - a no-op (treat as single-CTA load, suppress extra copies) — acceptable as a conservative first model
+  - a bandwidth optimization (reduce redundant GMEM fetches for overlapping CTA tiles) — higher fidelity but requires cross-CTA SMEM write visibility
+
+The choice must be documented and made explicit; silently routing MULTICAST as a plain UTMALDG without noting the suppressed ctaMask is an untracked accuracy gap.
 
 Success criterion:
 
@@ -922,6 +969,7 @@ Tasks:
 
 - add a simplified `FENCE.PROXY.ASYNC` visibility model
 - model the ordering needed before TMA stores source from shared memory
+- model the ordering needed **after `mbarrier.init`** — a `FENCE.PROXY.ASYNC` is required after initializing an mbarrier object to ensure the async proxy can observe the initialized state before any thread arrives or waits on it
 
 Success criterion:
 
@@ -1007,7 +1055,7 @@ Recommended fixture classes:
   - used to validate opcode classification and command formation
 - **Fixture 2: descriptor-resolution fixture**
   - a trace with known `tma_descriptor_configs.json` and `tma_descriptor_resolver.json` entries
-  - used to validate `(unique_function_id, pc)` lookup and fallback cases
+  - used to validate `(unique_function_id, pc, handle_hi)` lookup and explicit zero-handle cases
 - **Fixture 3: GMEM -> SMEM fixture**
   - a trace dominated by `UTMALDG` / `UTMAPF`
   - used to validate TMA load flow and completion
@@ -1127,7 +1175,7 @@ Fail if:
 Pass if:
 
 - descriptor configs and resolver metadata load successfully
-- known `(unique_function_id, pc)` pairs resolve to expected configs
+- known `(unique_function_id, pc, handle_hi)` tuples resolve to expected configs
 - TMA commands contain the expected structured metadata
 - fallback cases are explicit and counted
 

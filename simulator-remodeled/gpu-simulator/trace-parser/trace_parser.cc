@@ -109,6 +109,7 @@ inst_trace_t::inst_trace_t(const inst_trace_t &b) {
     memadd_info[i] = std::make_unique<inst_memadd_info_t>();
     memadd_info[i]->width = b.memadd_info[i]->width;
     memadd_info[i]->u_desc_value = b.memadd_info[i]->u_desc_value;
+    memadd_info[i]->u_desc_value_hi = b.memadd_info[i]->u_desc_value_hi;
     std::copy(b.memadd_info[i]->addrs, b.memadd_info[i]->addrs + WARP_SIZE,
               memadd_info[i]->addrs);
   }
@@ -282,6 +283,7 @@ bool inst_trace_t::parse_from_pb(dynamic_trace::instruction pb_inst,
     mem_width = pb_inst.addresses(i).data_width();
     parse_memref(i, mem_width, mask_bits, pb_inst.addresses(i));
     memadd_info[i]->u_desc_value = pb_inst.addresses(i).udesc_value();
+    memadd_info[i]->u_desc_value_hi = pb_inst.addresses(i).udesc_value_hi();
   }
 
   return true;

@@ -107,10 +107,13 @@ class gpgpu_sim_wrapper {};
 #include <stdio.h>
 #include <string.h>
 #include <algorithm>
+#include <filesystem>
 #include <iostream>
 #include <mutex>
 #include <sstream>
 #include <string>
+
+#include "../../../../util/traces_enhanced/src/JSONIncludes.h"
 
 bool g_interactive_debugger_enabled = false;
 
@@ -162,13 +165,452 @@ static std::string format_top_histogram_entries(
 
 #include "remodeling/gmmu.h"
 
+namespace {
+
+uint64_t parse_tma_json_uint(const rapidjson::Value &value) {
+  if (value.IsUint64()) {
+    return value.GetUint64();
+  }
+  if (value.IsInt64()) {
+    return static_cast<uint64_t>(value.GetInt64());
+  }
+  if (value.IsUint()) {
+    return value.GetUint();
+  }
+  if (value.IsInt()) {
+    return static_cast<uint64_t>(value.GetInt());
+  }
+  if (value.IsString()) {
+    return std::strtoull(value.GetString(), nullptr, 0);
+  }
+  return 0;
+}
+
+uint32_t parse_tma_tensor_data_type_size(uint32_t tensor_data_type) {
+  switch (tensor_data_type) {
+    case 0:
+      return 1;
+    case 1:
+      return 2;
+    case 2:
+    case 3:
+    case 7:
+      return 4;
+    case 4:
+    case 5:
+    case 8:
+      return 8;
+    case 6:
+    case 9:
+      return 2;
+    default:
+      return 0;
+  }
+}
+
+float parse_tma_confidence_score(const rapidjson::Value &value) {
+  if (!value.IsString()) {
+    return 0.0f;
+  }
+  std::string confidence = value.GetString();
+  if (confidence == "high") {
+    return 1.0f;
+  }
+  if (confidence == "medium") {
+    return 0.5f;
+  }
+  if (confidence == "low") {
+    return 0.25f;
+  }
+  return 0.0f;
+}
+
+TMAOperandForm parse_tma_operand_form_string(const std::string &operand_form,
+                                             TMAOpcodeFamily opcode_family) {
+  if (operand_form == "bulk") {
+    return TMAOperandForm::BULK_OPERAND;
+  }
+  if (operand_form == "descriptor_backed") {
+    return TMAOperandForm::EXPLICIT_DESC;
+  }
+  if (operand_form == "descriptor_shape_driven") {
+    if (opcode_family == TMAOpcodeFamily::UTMASTG) {
+      return TMAOperandForm::DESC_LIKE_PAIR;
+    }
+    return TMAOperandForm::EXPLICIT_DESC;
+  }
+  return TMAOperandForm::GENERIC;
+}
+
+TMAOpcodeFamily parse_tma_opcode_family_string(const std::string &opcode) {
+  if (opcode.rfind("UTMALDG", 0) == 0) {
+    return TMAOpcodeFamily::UTMALDG;
+  }
+  if (opcode.rfind("UTMAPF", 0) == 0) {
+    return TMAOpcodeFamily::UTMAPF;
+  }
+  if (opcode.rfind("UTMASTG", 0) == 0) {
+    return TMAOpcodeFamily::UTMASTG;
+  }
+  if (opcode.rfind("UTMAREDG", 0) == 0) {
+    return TMAOpcodeFamily::UTMAREDG;
+  }
+  if (opcode.rfind("UBLKCP", 0) == 0) {
+    return TMAOpcodeFamily::UBLKCP;
+  }
+  if (opcode.rfind("UBLKPF", 0) == 0) {
+    return TMAOpcodeFamily::UBLKPF;
+  }
+  if (opcode.rfind("UBLKRED", 0) == 0) {
+    return TMAOpcodeFamily::UBLKRED;
+  }
+  if (opcode.rfind("UTMACCTL", 0) == 0) {
+    return TMAOpcodeFamily::UTMACCTL;
+  }
+  if (opcode.rfind("UTMACMDFLUSH", 0) == 0) {
+    return TMAOpcodeFamily::UTMACMDFLUSH;
+  }
+  return TMAOpcodeFamily::UNKNOWN;
+}
+
+void fill_tma_u32_array(const rapidjson::Value &value,
+                        std::array<uint32_t, 5> &dst) {
+  dst = {0, 0, 0, 0, 0};
+  if (!value.IsArray()) {
+    return;
+  }
+  unsigned int limit = std::min<unsigned int>(5, value.Size());
+  for (unsigned int i = 0; i < limit; ++i) {
+    dst[i] = static_cast<uint32_t>(parse_tma_json_uint(value[i]));
+  }
+}
+
+void fill_tma_u64_array(const rapidjson::Value &value,
+                        std::array<uint64_t, 5> &dst) {
+  dst = {0, 0, 0, 0, 0};
+  if (!value.IsArray()) {
+    return;
+  }
+  unsigned int limit = std::min<unsigned int>(5, value.Size());
+  for (unsigned int i = 0; i < limit; ++i) {
+    dst[i] = parse_tma_json_uint(value[i]);
+  }
+}
+
+bool load_tma_json_document(const std::filesystem::path &path,
+                            rapidjson::Document &doc) {
+  if (!std::filesystem::exists(path)) {
+    return false;
+  }
+  std::ifstream input(path);
+  if (!input.is_open()) {
+    return false;
+  }
+  std::stringstream buffer;
+  buffer << input.rdbuf();
+  doc.Parse(buffer.str().c_str());
+  return !doc.HasParseError() && doc.IsObject();
+}
+
+void merge_tma_site_config_id(TMADescriptorSiteRecord &record,
+                              const std::string &config_id) {
+  if (config_id.empty()) {
+    return;
+  }
+  if (record.config_id.empty()) {
+    record.config_id = config_id;
+    return;
+  }
+  if (record.config_id != config_id) {
+    record.config_is_ambiguous = true;
+    record.config_id.clear();
+  }
+}
+
+void load_tma_descriptor_configs(const std::filesystem::path &extra_info_dir,
+                                 TMASidecarMetadataDB &db) {
+  rapidjson::Document doc;
+  if (!load_tma_json_document(extra_info_dir / "tma_descriptor_configs.json",
+                              doc)) {
+    return;
+  }
+  if (!doc.HasMember("configs")) {
+    return;
+  }
+  const rapidjson::Value &configs = doc["configs"];
+  if (!configs.IsArray()) {
+    return;
+  }
+  for (const auto &cfg_value : configs.GetArray()) {
+    if (!cfg_value.IsObject() || !cfg_value.HasMember("config_id") ||
+        !cfg_value["config_id"].IsString()) {
+      continue;
+    }
+    TMADescriptorConfigMetadata cfg;
+    cfg.config_id = cfg_value["config_id"].GetString();
+    if (cfg_value.HasMember("tensor_rank")) {
+      cfg.tensor_rank = static_cast<uint32_t>(parse_tma_json_uint(
+          cfg_value["tensor_rank"]));
+    }
+    if (cfg_value.HasMember("tensor_data_type")) {
+      cfg.tensor_data_type = static_cast<uint32_t>(parse_tma_json_uint(
+          cfg_value["tensor_data_type"]));
+    }
+    if (cfg_value.HasMember("global_dim")) {
+      fill_tma_u32_array(cfg_value["global_dim"], cfg.global_dim);
+    }
+    if (cfg_value.HasMember("global_strides")) {
+      fill_tma_u64_array(cfg_value["global_strides"], cfg.global_strides);
+    }
+    if (cfg_value.HasMember("box_dim")) {
+      fill_tma_u32_array(cfg_value["box_dim"], cfg.box_dim);
+    }
+    if (cfg_value.HasMember("element_strides")) {
+      fill_tma_u32_array(cfg_value["element_strides"], cfg.element_strides);
+    }
+    if (cfg_value.HasMember("interleave")) {
+      cfg.interleave = static_cast<uint32_t>(parse_tma_json_uint(
+          cfg_value["interleave"]));
+    }
+    if (cfg_value.HasMember("swizzle")) {
+      cfg.swizzle = static_cast<uint32_t>(parse_tma_json_uint(
+          cfg_value["swizzle"]));
+    }
+    if (cfg_value.HasMember("l2_promotion")) {
+      cfg.l2_promotion = static_cast<uint32_t>(parse_tma_json_uint(
+          cfg_value["l2_promotion"]));
+    }
+    if (cfg_value.HasMember("oob_fill")) {
+      cfg.oob_fill = static_cast<uint32_t>(parse_tma_json_uint(
+          cfg_value["oob_fill"]));
+    }
+    cfg.element_size = parse_tma_tensor_data_type_size(cfg.tensor_data_type);
+    db.descriptor_configs[cfg.config_id] = cfg;
+  }
+}
+
+void load_tma_descriptor_resolver(const std::filesystem::path &extra_info_dir,
+                                  TMASidecarMetadataDB &db) {
+  rapidjson::Document doc;
+  if (!load_tma_json_document(extra_info_dir / "tma_descriptor_resolver.json",
+                              doc)) {
+    return;
+  }
+  if (!doc.HasMember("resolver")) {
+    return;
+  }
+  const rapidjson::Value &resolver = doc["resolver"];
+  if (!resolver.IsArray()) {
+    return;
+  }
+  for (const auto &entry : resolver.GetArray()) {
+    if (!entry.IsObject() || !entry.HasMember("unique_function_id") ||
+        entry["unique_function_id"].IsNull() ||
+        !entry.HasMember("pc_hex") || !entry["pc_hex"].IsString()) {
+      continue;
+    }
+    unsigned int unique_function_id =
+        static_cast<unsigned int>(parse_tma_json_uint(
+            entry["unique_function_id"]));
+    uint64_t pc = std::strtoull(entry["pc_hex"].GetString(), nullptr, 0);
+    uint32_t handle_hi = 0;
+    if (entry.HasMember("handle_hi_hex") && entry["handle_hi_hex"].IsString()) {
+      handle_hi = static_cast<uint32_t>(
+          std::strtoul(entry["handle_hi_hex"].GetString(), nullptr, 0));
+    }
+    TMADescriptorSiteRecord &record =
+        db.descriptor_site_records[TMADescriptorLookupKey{
+            unique_function_id, pc, handle_hi}];
+    record.has_descriptor_metadata = true;
+    if (entry.HasMember("mapping_method") && entry["mapping_method"].IsString() &&
+        record.mapping_method.empty()) {
+      record.mapping_method = entry["mapping_method"].GetString();
+    }
+    if (entry.HasMember("confidence")) {
+      record.resolver_confidence =
+          std::max(record.resolver_confidence,
+                   parse_tma_confidence_score(entry["confidence"]));
+    }
+    if (entry.HasMember("config_id") && entry["config_id"].IsString()) {
+      merge_tma_site_config_id(record, entry["config_id"].GetString());
+    }
+  }
+}
+
+void load_tma_operand_resolver(const std::filesystem::path &extra_info_dir,
+                               TMASidecarMetadataDB &db) {
+  rapidjson::Document doc;
+  if (!load_tma_json_document(extra_info_dir / "tma_operand_resolver.json",
+                              doc)) {
+    return;
+  }
+  if (!doc.HasMember("resolver")) {
+    return;
+  }
+  const rapidjson::Value &resolver = doc["resolver"];
+  if (!resolver.IsArray()) {
+    return;
+  }
+  for (const auto &entry : resolver.GetArray()) {
+    if (!entry.IsObject() || !entry.HasMember("unique_function_id") ||
+        entry["unique_function_id"].IsNull() ||
+        !entry.HasMember("pc_hex") || !entry["pc_hex"].IsString()) {
+      continue;
+    }
+    unsigned int unique_function_id =
+        static_cast<unsigned int>(parse_tma_json_uint(
+            entry["unique_function_id"]));
+    uint64_t pc = std::strtoull(entry["pc_hex"].GetString(), nullptr, 0);
+    TMAOperandSiteRecord &record =
+        db.operand_site_records[TMAOperandLookupKey{unique_function_id, pc}];
+    std::string opcode = entry.HasMember("opcode") && entry["opcode"].IsString()
+                             ? entry["opcode"].GetString()
+                             : "";
+    TMAOpcodeFamily opcode_family = parse_tma_opcode_family_string(opcode);
+    if (entry.HasMember("runtime_observed")) {
+      record.runtime_observed = entry["runtime_observed"].IsBool() &&
+                                entry["runtime_observed"].GetBool();
+    }
+    if (entry.HasMember("operand_form") && entry["operand_form"].IsString()) {
+      record.operand_form = parse_tma_operand_form_string(
+          entry["operand_form"].GetString(), opcode_family);
+      if (record.operand_form != TMAOperandForm::GENERIC) {
+        record.has_operand_metadata = true;
+      }
+    }
+    if (entry.HasMember("runtime_observed_values") &&
+        entry["runtime_observed_values"].IsObject()) {
+      const rapidjson::Value &observed = entry["runtime_observed_values"];
+      if (observed.HasMember("operand_3") && observed["operand_3"].IsObject()) {
+        const rapidjson::Value &operand3 = observed["operand_3"];
+        if (operand3.HasMember("raw_value_lo_samples") &&
+            operand3["raw_value_lo_samples"].IsArray() &&
+            operand3["raw_value_lo_samples"].Size() > 0) {
+          record.operand3_raw = static_cast<uint32_t>(parse_tma_json_uint(
+              operand3["raw_value_lo_samples"][0]));
+          record.has_operand3_raw = true;
+          record.has_operand_metadata = true;
+        }
+        if (operand3.HasMember("decoded_byte_samples") &&
+            operand3["decoded_byte_samples"].IsArray() &&
+            operand3["decoded_byte_samples"].Size() > 0) {
+          record.covered_bytes = static_cast<uint32_t>(parse_tma_json_uint(
+              operand3["decoded_byte_samples"][0]));
+          record.has_covered_bytes = true;
+          record.has_operand_metadata = true;
+        }
+      }
+    }
+    if (entry.HasMember("descriptor_ref") && entry["descriptor_ref"].IsObject()) {
+      const rapidjson::Value &descriptor_ref = entry["descriptor_ref"];
+      if (descriptor_ref.HasMember("config_ids") &&
+          descriptor_ref["config_ids"].IsArray() &&
+          descriptor_ref["config_ids"].Size() == 1 &&
+          descriptor_ref["config_ids"][0].IsString()) {
+        record.has_linked_descriptor_metadata = true;
+        record.linked_config_id = descriptor_ref["config_ids"][0].GetString();
+      }
+    }
+    if (entry.HasMember("descriptor_link") && entry["descriptor_link"].IsObject()) {
+      const rapidjson::Value &descriptor_link = entry["descriptor_link"];
+      if (descriptor_link.HasMember("matched_descriptor") &&
+          descriptor_link["matched_descriptor"].IsObject()) {
+        const rapidjson::Value &matched_descriptor =
+            descriptor_link["matched_descriptor"];
+        if (matched_descriptor.HasMember("config_ids") &&
+            matched_descriptor["config_ids"].IsArray() &&
+            matched_descriptor["config_ids"].Size() == 1 &&
+            matched_descriptor["config_ids"][0].IsString()) {
+          record.has_linked_descriptor_metadata = true;
+          record.linked_config_id = matched_descriptor["config_ids"][0].GetString();
+          if (record.mapping_method.empty()) {
+            record.mapping_method = "operand_descriptor_link";
+          }
+          record.resolver_confidence =
+              std::max(record.resolver_confidence, 0.5f);
+        }
+      }
+    }
+  }
+}
+
+}
+
 // MOD. Begin. Improved tracer
 void gpgpu_sim::parse_extra_trace_info(std::string filepath, bool is_extra_trace_enabled) {
+  m_tma_sidecar_db.clear();
   if(is_extra_trace_enabled) {
     m_extra_trace_info.DeserializeFromFile(filepath.c_str());
+    std::filesystem::path metadata_path(filepath);
+    std::filesystem::path extra_info_dir = metadata_path.parent_path();
+    load_tma_descriptor_configs(extra_info_dir, m_tma_sidecar_db);
+    load_tma_descriptor_resolver(extra_info_dir, m_tma_sidecar_db);
+    load_tma_operand_resolver(extra_info_dir, m_tma_sidecar_db);
+    std::cerr << "[TMA][Phase2] loaded descriptor_configs="
+              << m_tma_sidecar_db.descriptor_configs.size()
+              << " descriptor_sites="
+              << m_tma_sidecar_db.descriptor_site_records.size()
+              << " operand_sites="
+              << m_tma_sidecar_db.operand_site_records.size() << std::endl;
   }
 }
 // MOD. End. Improved tracer
+
+bool gpgpu_sim::lookup_tma_site_metadata(unsigned int unique_function_id,
+                                         address_type pc,
+                                         uint32_t handle_hi,
+                                         TMAResolvedSiteMetadata &metadata) const {
+  metadata = TMAResolvedSiteMetadata();
+  metadata.handle_hi = handle_hi;
+  auto it_operand = m_tma_sidecar_db.operand_site_records.find(
+      TMAOperandLookupKey{unique_function_id, pc});
+  if (it_operand != m_tma_sidecar_db.operand_site_records.end()) {
+    const TMAOperandSiteRecord &operand_record = it_operand->second;
+    metadata.valid = true;
+    metadata.operand_lookup_hit = true;
+    metadata.runtime_observed = operand_record.runtime_observed;
+    metadata.has_operand_metadata = operand_record.has_operand_metadata;
+    metadata.operand_form = operand_record.operand_form;
+    metadata.mapping_method = operand_record.mapping_method;
+    metadata.resolver_confidence = operand_record.resolver_confidence;
+    metadata.has_covered_bytes = operand_record.has_covered_bytes;
+    metadata.covered_bytes = operand_record.covered_bytes;
+    metadata.has_operand3_raw = operand_record.has_operand3_raw;
+    metadata.operand3_raw = operand_record.operand3_raw;
+    if (operand_record.has_linked_descriptor_metadata &&
+        !operand_record.linked_config_id.empty()) {
+      auto it_cfg =
+          m_tma_sidecar_db.descriptor_configs.find(operand_record.linked_config_id);
+      if (it_cfg != m_tma_sidecar_db.descriptor_configs.end()) {
+        metadata.has_descriptor_metadata = true;
+        metadata.config_id = operand_record.linked_config_id;
+        metadata.descriptor_config = it_cfg->second;
+      }
+    }
+  }
+  auto it_descriptor = m_tma_sidecar_db.descriptor_site_records.find(
+      TMADescriptorLookupKey{unique_function_id, pc, handle_hi});
+  if (it_descriptor != m_tma_sidecar_db.descriptor_site_records.end()) {
+    const TMADescriptorSiteRecord &record = it_descriptor->second;
+    metadata.valid = true;
+    metadata.descriptor_lookup_hit = true;
+    if (!record.mapping_method.empty()) {
+      metadata.mapping_method = record.mapping_method;
+    }
+    metadata.resolver_confidence =
+        std::max(metadata.resolver_confidence, record.resolver_confidence);
+    if (record.has_descriptor_metadata && !record.config_is_ambiguous &&
+        !record.config_id.empty()) {
+      auto it_cfg = m_tma_sidecar_db.descriptor_configs.find(record.config_id);
+      if (it_cfg != m_tma_sidecar_db.descriptor_configs.end()) {
+        metadata.has_descriptor_metadata = true;
+        metadata.config_id = record.config_id;
+        metadata.descriptor_config = it_cfg->second;
+      }
+    }
+  }
+  return metadata.valid;
+}
 
 void power_config::reg_options(class OptionParser *opp) {
   option_parser_register(opp, "-accelwattch_xml_file", OPT_CSTR,

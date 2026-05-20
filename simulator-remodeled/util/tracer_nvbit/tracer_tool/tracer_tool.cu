@@ -2214,6 +2214,7 @@ void *recv_thread_fun(void *args) {
           std::vector<std::string> tokens;
           std::string token;
           addr->set_udesc_value(ma->ureg_desc_value);
+          addr->set_udesc_value_hi(ma->ureg_desc_value_hi);
           if(ma->mem_type == MEM_TYPE::CALL_OR_RET) {
             addr->set_data_width(1);
           }else {
