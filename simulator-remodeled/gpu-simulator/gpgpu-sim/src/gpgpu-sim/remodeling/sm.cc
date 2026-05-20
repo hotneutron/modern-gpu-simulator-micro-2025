@@ -450,7 +450,11 @@ void SM::issue_warp(register_set_uniptr &pipe_reg_set, warp_inst_t *next_inst,
                                              [warp_id]++;  // MOD. Custom
                                                            // powermodel stats
 
-  if ((pipe_reg->op == BARRIER_OP) || (pipe_reg->op == MEMORY_BARRIER_OP)) {
+  bool bypass_syncs_barrier =
+      pipe_reg->has_extra_trace_instruction_info() &&
+      pipe_reg->get_extra_trace_instruction_info().get_op_code().rfind("SYNCS", 0) == 0;
+  if (((pipe_reg->op == BARRIER_OP) || (pipe_reg->op == MEMORY_BARRIER_OP)) &&
+      !bypass_syncs_barrier) {
     if(pipe_reg->op == MEMORY_BARRIER_OP) {
       pipe_reg->m_num_cycles_to_stall_SM = m_config->num_cycles_to_stall_SM_at_gpu_memory_barrier;
       if(m_config->is_trace_mode && pipe_reg->get_extra_trace_instruction_info().get_is_system_memory_barrier()) {

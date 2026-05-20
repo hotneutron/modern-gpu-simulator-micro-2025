@@ -2113,7 +2113,10 @@ void shader_core_ctx::issue_warp(register_set &pipe_reg_set,
 
   m_stats->warp_issues_from_last_power_sample[m_sid][warp_id]++; // MOD. Custom powermodel stats
 
-  if (next_inst->op == BARRIER_OP) {
+  bool bypass_syncs_barrier =
+      next_inst->has_extra_trace_instruction_info() &&
+      next_inst->get_extra_trace_instruction_info().get_op_code().rfind("SYNCS", 0) == 0;
+  if (next_inst->op == BARRIER_OP && !bypass_syncs_barrier) {
     m_warp[warp_id]->store_info_of_last_inst_at_barrier(*pipe_reg);
     warp_inst_t *inst_bar;
     inst_bar = const_cast<warp_inst_t *>(next_inst);
