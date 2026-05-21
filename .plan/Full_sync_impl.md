@@ -78,6 +78,7 @@ Allow FA3-style Hopper kernels to achieve forward progress without relying on a 
 - A defined non-TMA arrival fallback:
   - if a barrier has no bound TMA transfer for the current round, pure warp-arrive progress must still be able to satisfy the waiter
   - minimum may simplify the exact rule, but it must not leave non-TMA `ARRIVE` / `TRYWAIT` pairs permanently unready
+  - that fallback must also avoid a bind-after-arrive race: if a later TMA bind attaches real transfer bytes to a barrier that was provisionally marked ready, readiness must be recomputed so consumers cannot pass before the transfer completes
 
 ### What minimum may still simplify
 
@@ -128,6 +129,10 @@ Minimum should be checked in two stages rather than one vague "forward progress"
   - Hopper `SYNCS` no longer enter legacy `barrier_set_t`
   - non-Hopper regressions remain unchanged
 
+These gates should be written so they can be checked automatically where practical,
+not only by manual log reading. Debug prints are useful during bring-up, but the
+intended end state is a scriptable pass/fail check for the FA3 target kernel.
+
 ## Tier 2: Good
 
 ### Goal
@@ -155,6 +160,7 @@ The reflection note makes several important points that belong here:
 - `UCGABAR_ARV` and `UCGABAR_WAIT` must not continue entering `barrier_set_t` through `BARRIER_OP`
 - they need their own stub or dedicated routing before the Hopper sync plan can be considered architecturally safe
 - `ACQBULK` must be verified against FA3 SASS so we know whether a no-op stub is harmless or whether it silently breaks consumer ordering
+- `PHASECHK` must be verified as more than a harmless no-op if the traced SASS relies on predicate-producing behavior before `TRYWAIT`
 
 For clarity:
 
@@ -245,6 +251,8 @@ it reduces obvious crashes:
 
 This does not mean Blackwell synchronization itself is solved. It only means opcode
 recognition and safe initial routing can be decoupled from full Blackwell semantic work.
+When the correct Blackwell category is uncertain, conservative stub routing is safer
+than making a stronger semantic commitment too early.
 
 ### Why this is its own tier
 
@@ -318,6 +326,10 @@ The implementation dependency chain should be treated as:
 
 Trace operand helpers are useful cleanup, but they are not a hard prerequisite if the
 minimum decode path is implemented directly in `trace_driven.cc`.
+Also, "bypass removal" should be read in two parts:
+
+- first, the real `MBARRIER_OP` path replaces the old bypass in live execution
+- later, the dead legacy bypass code is deleted once the new path has passed validation
 
 ### To reach minimum
 
@@ -326,6 +338,7 @@ minimum decode path is implemented directly in `trace_driven.cc`.
 - make the Hopper `SYNCS` / TMA handshake reach a stable executed path
 - specify and implement the `expected_tx_bytes` binding path from TMA issue to mbarrier state
 - specify and implement the non-TMA arrival fallback so non-transfer waits cannot deadlock by construction
+- guard the non-TMA fallback against late TMA binding so provisional readiness cannot survive once real transfer bytes are attached
 - remove the temporary `SYNCS` bypass only after the new path passes the bring-up gate
 
 ### To move from minimum to good
@@ -334,6 +347,7 @@ minimum decode path is implemented directly in `trace_driven.cc`.
 - refine `EXCH`, `ARRIVE`, and wait semantics
 - address `UCGABAR_*` routing hazard
 - verify the role of `ACQBULK`
+- verify whether `PHASECHK` needs explicit predicate-visible behavior beyond shared wait-state observation
 - decide whether early Blackwell opcode-map parity should be landed as low-risk infrastructure before full Tier 4 work
 
 ### To move from good to full
