@@ -24,8 +24,18 @@ struct Options {
   int coord_d2 = 0;
   int coord_d3 = 0;
   int smem_offset = 0;
+  int barrier_slot = 0;
+  int dummy_loads = 0;
   int alu_gap_iters = 64;
   int predicate_flag = 1;
+  int init_arrivals = 1;
+  int arrive_count = 1;
+  int arrive_repeats = 1;
+  int use_expect_tx = 1;
+  int use_load = 1;
+  int issue_prefetch = 1;
+  int phase_cycles = 1;
+  int reuse_barrier = 0;
   int fill_a = 100;
   int fill_b = 10000;
   std::string variant = "baseline";
@@ -77,8 +87,18 @@ static void print_usage(const char *argv0) {
   std::printf("  --coord-d2 N\n");
   std::printf("  --coord-d3 N\n");
   std::printf("  --smem-offset N\n");
+  std::printf("  --barrier-slot 0..3\n");
+  std::printf("  --dummy-loads 0..3\n");
   std::printf("  --alu-gap-iters N\n");
   std::printf("  --predicate-flag 0|1\n");
+  std::printf("  --init-arrivals N\n");
+  std::printf("  --arrive-count N\n");
+  std::printf("  --arrive-repeats N\n");
+  std::printf("  --use-expect-tx 0|1\n");
+  std::printf("  --use-load 0|1\n");
+  std::printf("  --issue-prefetch 0|1\n");
+  std::printf("  --phase-cycles N\n");
+  std::printf("  --reuse-barrier 0|1\n");
   std::printf("  --fill-a N\n");
   std::printf("  --fill-b N\n");
 }
@@ -129,10 +149,30 @@ static Options parse_options(int argc, char **argv) {
       options.coord_d3 = parse_int_arg(argv[i], argv[++i]);
     } else if (std::strcmp(argv[i], "--smem-offset") == 0) {
       options.smem_offset = parse_int_arg(argv[i], argv[++i]);
+    } else if (std::strcmp(argv[i], "--barrier-slot") == 0) {
+      options.barrier_slot = parse_int_arg(argv[i], argv[++i]);
+    } else if (std::strcmp(argv[i], "--dummy-loads") == 0) {
+      options.dummy_loads = parse_int_arg(argv[i], argv[++i]);
     } else if (std::strcmp(argv[i], "--alu-gap-iters") == 0) {
       options.alu_gap_iters = parse_int_arg(argv[i], argv[++i]);
     } else if (std::strcmp(argv[i], "--predicate-flag") == 0) {
       options.predicate_flag = parse_int_arg(argv[i], argv[++i]);
+    } else if (std::strcmp(argv[i], "--init-arrivals") == 0) {
+      options.init_arrivals = parse_int_arg(argv[i], argv[++i]);
+    } else if (std::strcmp(argv[i], "--arrive-count") == 0) {
+      options.arrive_count = parse_int_arg(argv[i], argv[++i]);
+    } else if (std::strcmp(argv[i], "--arrive-repeats") == 0) {
+      options.arrive_repeats = parse_int_arg(argv[i], argv[++i]);
+    } else if (std::strcmp(argv[i], "--use-expect-tx") == 0) {
+      options.use_expect_tx = parse_int_arg(argv[i], argv[++i]);
+    } else if (std::strcmp(argv[i], "--use-load") == 0) {
+      options.use_load = parse_int_arg(argv[i], argv[++i]);
+    } else if (std::strcmp(argv[i], "--issue-prefetch") == 0) {
+      options.issue_prefetch = parse_int_arg(argv[i], argv[++i]);
+    } else if (std::strcmp(argv[i], "--phase-cycles") == 0) {
+      options.phase_cycles = parse_int_arg(argv[i], argv[++i]);
+    } else if (std::strcmp(argv[i], "--reuse-barrier") == 0) {
+      options.reuse_barrier = parse_int_arg(argv[i], argv[++i]);
     } else if (std::strcmp(argv[i], "--fill-a") == 0) {
       options.fill_a = parse_int_arg(argv[i], argv[++i]);
     } else if (std::strcmp(argv[i], "--fill-b") == 0) {
@@ -185,6 +225,46 @@ static void validate_options(const Options &options) {
     std::fprintf(stderr, "predicate-flag must be 0 or 1.\n");
     std::exit(EXIT_FAILURE);
   }
+  if (!(options.use_expect_tx == 0 || options.use_expect_tx == 1) ||
+      !(options.use_load == 0 || options.use_load == 1) ||
+      !(options.issue_prefetch == 0 || options.issue_prefetch == 1) ||
+      !(options.reuse_barrier == 0 || options.reuse_barrier == 1)) {
+    std::fprintf(stderr, "use-expect-tx, use-load, issue-prefetch, and reuse-barrier must be 0 or 1.\n");
+    std::exit(EXIT_FAILURE);
+  }
+  if (options.barrier_slot < 0 || options.barrier_slot > 3) {
+    std::fprintf(stderr, "barrier-slot must be in [0, 3].\n");
+    std::exit(EXIT_FAILURE);
+  }
+  if (options.dummy_loads < 0 || options.dummy_loads > 3) {
+    std::fprintf(stderr, "dummy-loads must be in [0, 3].\n");
+    std::exit(EXIT_FAILURE);
+  }
+  if (options.init_arrivals <= 0 || options.arrive_count <= 0 ||
+      options.arrive_repeats <= 0 || options.phase_cycles <= 0) {
+    std::fprintf(stderr, "init-arrivals, arrive-count, arrive-repeats, and phase-cycles must be positive.\n");
+    std::exit(EXIT_FAILURE);
+  }
+  if (static_cast<long long>(options.arrive_count) *
+          static_cast<long long>(options.arrive_repeats) !=
+      static_cast<long long>(options.init_arrivals)) {
+    std::fprintf(stderr,
+                 "init-arrivals must equal arrive-count * arrive-repeats for a valid barrier phase.\n");
+    std::exit(EXIT_FAILURE);
+  }
+  if (options.use_expect_tx != 0 && options.use_load == 0) {
+    std::fprintf(stderr, "use-expect-tx=1 requires use-load=1 to avoid a permanently pending tx phase.\n");
+    std::exit(EXIT_FAILURE);
+  }
+  if (options.use_load == 0 && options.dummy_loads != 0) {
+    std::fprintf(stderr, "dummy-loads requires use-load=1.\n");
+    std::exit(EXIT_FAILURE);
+  }
+  if (options.reuse_barrier != 0 &&
+      (options.use_load != 0 || options.use_expect_tx != 0 || options.issue_prefetch != 0)) {
+    std::fprintf(stderr, "reuse-barrier=1 currently supports pure-arrive mode only.\n");
+    std::exit(EXIT_FAILURE);
+  }
 }
 
 static size_t linear_index(const Options &options, int d0, int d1, int d2, int d3) {
@@ -226,6 +306,15 @@ static __device__ __forceinline__ uint64_t mbarrier_arrive(uint64_t *bar) {
   asm volatile("mbarrier.arrive.shared::cta.b64 %0, [%1];"
                : "=l"(state)
                : "r"(cast_smem_ptr_to_uint(bar))
+               : "memory");
+  return state;
+}
+
+static __device__ __forceinline__ uint64_t mbarrier_arrive_count(uint64_t *bar, unsigned count) {
+  uint64_t state;
+  asm volatile("mbarrier.arrive.shared::cta.b64 %0, [%1], %2;"
+               : "=l"(state)
+               : "r"(cast_smem_ptr_to_uint(bar)), "r"(count)
                : "memory");
   return state;
 }
@@ -302,6 +391,21 @@ static __device__ __forceinline__ void do_alu_gap(int iters) {
   asm volatile("" : : "r"(x));
 }
 
+static __device__ __forceinline__ int nth_aux_barrier_slot(int main_slot,
+                                                            int aux_index) {
+  int seen = 0;
+  for (int slot = 0; slot < 4; ++slot) {
+    if (slot == main_slot) {
+      continue;
+    }
+    if (seen == aux_index) {
+      return slot;
+    }
+    ++seen;
+  }
+  return 0;
+}
+
 template <Variant V>
 __device__ void run_probe(const CUtensorMap &tensor_map_a,
                           const CUtensorMap &tensor_map_b,
@@ -315,17 +419,29 @@ __device__ void run_probe(const CUtensorMap &tensor_map_a,
                           int alt_coord3,
                           int predicate_flag,
                           int smem_offset,
+                          int barrier_slot,
+                          int dummy_loads,
+                          int init_arrivals,
+                          int arrive_count,
+                          int arrive_repeats,
+                          int use_expect_tx,
+                          int use_load,
+                          int issue_prefetch,
+                          int phase_cycles,
+                          int reuse_barrier,
                           int tile_elems,
                           int transaction_bytes,
                           int alu_gap_iters,
                           float *output) {
   extern __shared__ __align__(128) float smem[];
-  __shared__ alignas(16) uint64_t bar[1];
-  for (int idx = threadIdx.x; idx < tile_elems + smem_offset; idx += blockDim.x) {
+  __shared__ alignas(16) uint64_t barriers[8];
+  const int total_smem_elems = smem_offset + tile_elems * (dummy_loads + 1);
+  for (int idx = threadIdx.x; idx < total_smem_elems; idx += blockDim.x) {
     smem[idx] = -1.0f;
   }
   __syncthreads();
   if (threadIdx.x == 0) {
+    uint64_t *bar = &barriers[barrier_slot * 2];
     const CUtensorMap *prefetch_map = &tensor_map_a;
     int pf_coord0 = coord0;
     int pf_coord1 = coord1;
@@ -340,22 +456,60 @@ __device__ void run_probe(const CUtensorMap &tensor_map_a,
       pf_coord2 = alt_coord2;
       pf_coord3 = alt_coord3;
     }
-    mbarrier_init(bar, 1);
-    mbarrier_expect_tx(bar, static_cast<unsigned>(transaction_bytes));
-    if constexpr (V == Variant::Predicate) {
-      if (predicate_flag != 0) {
-        issue_utmapf_predicated(prefetch_map, pf_coord0, pf_coord1, pf_coord2, pf_coord3, 1);
+    if (reuse_barrier != 0) {
+      mbarrier_init(bar, static_cast<unsigned>(init_arrivals));
+    }
+    for (int cycle = 0; cycle < phase_cycles; ++cycle) {
+      uint64_t dummy_states[3] = {0, 0, 0};
+      uint64_t *dummy_bars[3] = {nullptr, nullptr, nullptr};
+      if (reuse_barrier == 0) {
+        mbarrier_init(bar, static_cast<unsigned>(init_arrivals));
+      }
+      if (use_expect_tx != 0) {
+        mbarrier_expect_tx(bar, static_cast<unsigned>(transaction_bytes));
+      }
+      if (issue_prefetch != 0) {
+        if constexpr (V == Variant::Predicate) {
+          if (predicate_flag != 0) {
+            issue_utmapf_predicated(prefetch_map, pf_coord0, pf_coord1, pf_coord2, pf_coord3, 1);
+          }
+        } else {
+          issue_utmapf(prefetch_map, pf_coord0, pf_coord1, pf_coord2, pf_coord3);
+        }
+      }
+      do_alu_gap(alu_gap_iters);
+      if (use_load != 0) {
+        for (int i = 0; i < dummy_loads; ++i) {
+          const int aux_slot = nth_aux_barrier_slot(barrier_slot, i);
+          uint64_t *dummy_bar = &barriers[aux_slot * 2];
+          float *dummy_dst = smem + smem_offset + (i + 1) * tile_elems;
+          mbarrier_init(dummy_bar, 1);
+          mbarrier_expect_tx(dummy_bar, static_cast<unsigned>(transaction_bytes));
+          issue_utmaldg(&tensor_map_a, dummy_dst, coord0, coord1, coord2, coord3, dummy_bar);
+          dummy_bars[i] = dummy_bar;
+          dummy_states[i] = mbarrier_arrive(dummy_bar);
+        }
+        issue_utmaldg(&tensor_map_a, smem + smem_offset, coord0, coord1, coord2, coord3, bar);
+      }
+      uint64_t state = 0;
+      for (int arrive_idx = 0; arrive_idx < arrive_repeats; ++arrive_idx) {
+        state = arrive_count == 1 ? mbarrier_arrive(bar)
+                                  : mbarrier_arrive_count(bar, static_cast<unsigned>(arrive_count));
+      }
+      for (int i = 0; i < dummy_loads; ++i) {
+        mbarrier_wait(dummy_bars[i], dummy_states[i]);
+      }
+      mbarrier_wait(bar, state);
+    }
+    if (use_load != 0) {
+      fence_proxy_async_shared_cta();
+      for (int idx = 0; idx < tile_elems; ++idx) {
+        output[idx] = smem[smem_offset + idx];
       }
     } else {
-      issue_utmapf(prefetch_map, pf_coord0, pf_coord1, pf_coord2, pf_coord3);
-    }
-    do_alu_gap(alu_gap_iters);
-    issue_utmaldg(&tensor_map_a, smem + smem_offset, coord0, coord1, coord2, coord3, bar);
-    uint64_t state = mbarrier_arrive(bar);
-    mbarrier_wait(bar, state);
-    fence_proxy_async_shared_cta();
-    for (int idx = 0; idx < tile_elems; ++idx) {
-      output[idx] = smem[smem_offset + idx];
+      for (int idx = 0; idx < tile_elems; ++idx) {
+        output[idx] = idx < phase_cycles ? static_cast<float>(idx + 1) : 0.0f;
+      }
     }
   }
 }
@@ -371,6 +525,16 @@ __global__ void utmapf_probe_kernel_baseline(const __grid_constant__ CUtensorMap
                                              int alt_coord2,
                                              int alt_coord3,
                                              int smem_offset,
+                                             int barrier_slot,
+                                             int dummy_loads,
+                                             int init_arrivals,
+                                             int arrive_count,
+                                             int arrive_repeats,
+                                             int use_expect_tx,
+                                             int use_load,
+                                             int issue_prefetch,
+                                             int phase_cycles,
+                                             int reuse_barrier,
                                              int tile_elems,
                                              int transaction_bytes,
                                              int alu_gap_iters,
@@ -387,6 +551,16 @@ __global__ void utmapf_probe_kernel_baseline(const __grid_constant__ CUtensorMap
                                alt_coord3,
                                1,
                                smem_offset,
+                               barrier_slot,
+                               dummy_loads,
+                               init_arrivals,
+                               arrive_count,
+                               arrive_repeats,
+                               use_expect_tx,
+                               use_load,
+                               issue_prefetch,
+                               phase_cycles,
+                               reuse_barrier,
                                tile_elems,
                                transaction_bytes,
                                alu_gap_iters,
@@ -404,6 +578,16 @@ __global__ void utmapf_probe_kernel_op1_alt(const __grid_constant__ CUtensorMap 
                                             int alt_coord2,
                                             int alt_coord3,
                                             int smem_offset,
+                                            int barrier_slot,
+                                            int dummy_loads,
+                                            int init_arrivals,
+                                            int arrive_count,
+                                            int arrive_repeats,
+                                            int use_expect_tx,
+                                            int use_load,
+                                            int issue_prefetch,
+                                            int phase_cycles,
+                                            int reuse_barrier,
                                             int tile_elems,
                                             int transaction_bytes,
                                             int alu_gap_iters,
@@ -420,6 +604,16 @@ __global__ void utmapf_probe_kernel_op1_alt(const __grid_constant__ CUtensorMap 
                                   alt_coord3,
                                   1,
                                   smem_offset,
+                                  barrier_slot,
+                                  dummy_loads,
+                                  init_arrivals,
+                                  arrive_count,
+                                  arrive_repeats,
+                                  use_expect_tx,
+                                  use_load,
+                                  issue_prefetch,
+                                  phase_cycles,
+                                  reuse_barrier,
                                   tile_elems,
                                   transaction_bytes,
                                   alu_gap_iters,
@@ -437,6 +631,16 @@ __global__ void utmapf_probe_kernel_op2_alt(const __grid_constant__ CUtensorMap 
                                             int alt_coord2,
                                             int alt_coord3,
                                             int smem_offset,
+                                            int barrier_slot,
+                                            int dummy_loads,
+                                            int init_arrivals,
+                                            int arrive_count,
+                                            int arrive_repeats,
+                                            int use_expect_tx,
+                                            int use_load,
+                                            int issue_prefetch,
+                                            int phase_cycles,
+                                            int reuse_barrier,
                                             int tile_elems,
                                             int transaction_bytes,
                                             int alu_gap_iters,
@@ -453,6 +657,16 @@ __global__ void utmapf_probe_kernel_op2_alt(const __grid_constant__ CUtensorMap 
                                   alt_coord3,
                                   1,
                                   smem_offset,
+                                  barrier_slot,
+                                  dummy_loads,
+                                  init_arrivals,
+                                  arrive_count,
+                                  arrive_repeats,
+                                  use_expect_tx,
+                                  use_load,
+                                  issue_prefetch,
+                                  phase_cycles,
+                                  reuse_barrier,
                                   tile_elems,
                                   transaction_bytes,
                                   alu_gap_iters,
@@ -471,6 +685,16 @@ __global__ void utmapf_probe_kernel_predicated(const __grid_constant__ CUtensorM
                                                int alt_coord3,
                                                int predicate_flag,
                                                int smem_offset,
+                                               int barrier_slot,
+                                               int dummy_loads,
+                                               int init_arrivals,
+                                               int arrive_count,
+                                               int arrive_repeats,
+                                               int use_expect_tx,
+                                               int use_load,
+                                               int issue_prefetch,
+                                               int phase_cycles,
+                                               int reuse_barrier,
                                                int tile_elems,
                                                int transaction_bytes,
                                                int alu_gap_iters,
@@ -487,6 +711,16 @@ __global__ void utmapf_probe_kernel_predicated(const __grid_constant__ CUtensorM
                                 alt_coord3,
                                 predicate_flag,
                                 smem_offset,
+                                barrier_slot,
+                                dummy_loads,
+                                init_arrivals,
+                                arrive_count,
+                                arrive_repeats,
+                                use_expect_tx,
+                                use_load,
+                                issue_prefetch,
+                                phase_cycles,
+                                reuse_barrier,
                                 tile_elems,
                                 transaction_bytes,
                                 alu_gap_iters,
@@ -598,7 +832,9 @@ int main(int argc, char **argv) {
   int alt_coord2 = std::min(options.coord_d2 + options.box_d2, options.global_d2 - options.box_d2);
   int alt_coord3 = std::min(options.coord_d3 + options.box_d3, options.global_d3 - options.box_d3);
   int transaction_bytes = tile_elems * static_cast<int>(sizeof(float));
-  size_t shared_bytes = static_cast<size_t>(tile_elems + options.smem_offset) * sizeof(float);
+  size_t shared_bytes =
+      static_cast<size_t>(options.smem_offset + tile_elems * (options.dummy_loads + 1)) *
+      sizeof(float);
   int threads = 128;
 
   switch (variant) {
@@ -614,6 +850,16 @@ int main(int argc, char **argv) {
                                                                  options.coord_d1,
                                                                  options.coord_d0,
                                                                  options.smem_offset,
+                                                                 options.barrier_slot,
+                                                                 options.dummy_loads,
+                                                                 options.init_arrivals,
+                                                                 options.arrive_count,
+                                                                 options.arrive_repeats,
+                                                                 options.use_expect_tx,
+                                                                 options.use_load,
+                                                                 options.issue_prefetch,
+                                                                 options.phase_cycles,
+                                                                 options.reuse_barrier,
                                                                  tile_elems,
                                                                  transaction_bytes,
                                                                  options.alu_gap_iters,
@@ -631,6 +877,16 @@ int main(int argc, char **argv) {
                                                                 options.coord_d1,
                                                                 options.coord_d0,
                                                                 options.smem_offset,
+                                                                options.barrier_slot,
+                                                                options.dummy_loads,
+                                                                options.init_arrivals,
+                                                                options.arrive_count,
+                                                                options.arrive_repeats,
+                                                                options.use_expect_tx,
+                                                                options.use_load,
+                                                                options.issue_prefetch,
+                                                                options.phase_cycles,
+                                                                options.reuse_barrier,
                                                                 tile_elems,
                                                                 transaction_bytes,
                                                                 options.alu_gap_iters,
@@ -648,6 +904,16 @@ int main(int argc, char **argv) {
                                                                 options.coord_d1,
                                                                 options.coord_d0,
                                                                 options.smem_offset,
+                                                                options.barrier_slot,
+                                                                options.dummy_loads,
+                                                                options.init_arrivals,
+                                                                options.arrive_count,
+                                                                options.arrive_repeats,
+                                                                options.use_expect_tx,
+                                                                options.use_load,
+                                                                options.issue_prefetch,
+                                                                options.phase_cycles,
+                                                                options.reuse_barrier,
                                                                 tile_elems,
                                                                 transaction_bytes,
                                                                 options.alu_gap_iters,
@@ -666,6 +932,16 @@ int main(int argc, char **argv) {
                                                                    options.coord_d0,
                                                                    options.predicate_flag,
                                                                    options.smem_offset,
+                                                                   options.barrier_slot,
+                                                                   options.dummy_loads,
+                                                                   options.init_arrivals,
+                                                                   options.arrive_count,
+                                                                   options.arrive_repeats,
+                                                                   options.use_expect_tx,
+                                                                   options.use_load,
+                                                                   options.issue_prefetch,
+                                                                   options.phase_cycles,
+                                                                   options.reuse_barrier,
                                                                    tile_elems,
                                                                    transaction_bytes,
                                                                    options.alu_gap_iters,
@@ -687,7 +963,20 @@ int main(int argc, char **argv) {
   }
 
   std::printf("device=%s\n", prop.name);
-  std::printf("variant=%s predicate_flag=%d\n", options.variant.c_str(), options.predicate_flag);
+  std::printf("variant=%s predicate_flag=%d barrier_slot=%d dummy_loads=%d\n",
+              options.variant.c_str(),
+              options.predicate_flag,
+              options.barrier_slot,
+              options.dummy_loads);
+  std::printf("init_arrivals=%d arrive_count=%d arrive_repeats=%d use_expect_tx=%d use_load=%d issue_prefetch=%d phase_cycles=%d reuse_barrier=%d\n",
+              options.init_arrivals,
+              options.arrive_count,
+              options.arrive_repeats,
+              options.use_expect_tx,
+              options.use_load,
+              options.issue_prefetch,
+              options.phase_cycles,
+              options.reuse_barrier);
   std::printf("global=%dx%dx%dx%d pitch_d3=%d box=%dx%dx%dx%d coord=(%d,%d,%d,%d) alt_coord=(%d,%d,%d,%d)\n",
               options.global_d0,
               options.global_d1,
