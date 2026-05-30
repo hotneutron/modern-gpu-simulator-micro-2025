@@ -622,19 +622,16 @@ static void append_tma_runtime_operand_debug_event(
   if (!enable_tma_desc) {
     return;
   }
+  int first_lane = get_first_predicated_lane(ma->active_mask, ma->predicate_mask);
+  if (first_lane < 0) {
+    return;
+  }
   create_folder(extrainfo_path.c_str());
   std::ofstream ofs(extrainfo_path + "/tma_runtime_operand_debug.jsonl", std::ios::app);
   if (!ofs.is_open()) {
     return;
   }
-  uint64_t first_lane_addr = 0;
-  std::bitset<32> mask(ma->active_mask & ma->predicate_mask);
-  for (int lane = 0; lane < 32; ++lane) {
-    if (mask.test(lane)) {
-      first_lane_addr = ma->addrs_or_reg_val_0[lane];
-      break;
-    }
-  }
+  uint64_t first_lane_addr = ma->addrs_or_reg_val_0[first_lane];
   std::ostringstream pc_stream;
   pc_stream << "0x" << std::hex << ma->vpc;
   ofs << "{"
@@ -648,10 +645,10 @@ static void append_tma_runtime_operand_debug_event(
       << "\"operand_type\":\"" << traced_reg_type_to_string(static_cast<TRACED_REG_TYPE>(ma->per_operand_type)) << "\","
       << "\"mem_type\":\"" << mem_type_to_string(ma->mem_type) << "\","
       << "\"operand_reg_id\":" << ma->reg_id << ","
-      << "\"value_lo\":" << static_cast<uint64_t>(ma->addrs_or_reg_val_0[0]) << ","
-      << "\"value_hi\":" << ma->reg_val_1[0] << ","
-      << "\"value_2\":" << ma->reg_val_2[0] << ","
-      << "\"value_3\":" << ma->reg_val_3[0] << ","
+      << "\"value_lo\":" << static_cast<uint64_t>(ma->addrs_or_reg_val_0[first_lane]) << ","
+      << "\"value_hi\":" << ma->reg_val_1[first_lane] << ","
+      << "\"value_2\":" << ma->reg_val_2[first_lane] << ","
+      << "\"value_3\":" << ma->reg_val_3[first_lane] << ","
       << "\"first_lane_addr\":" << first_lane_addr << ","
       << "\"width\":" << ma->width << ","
       << "\"desc_reg_id\":" << ma->ureg_desc_id << ","

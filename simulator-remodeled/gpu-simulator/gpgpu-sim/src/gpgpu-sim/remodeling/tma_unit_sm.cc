@@ -309,9 +309,11 @@ tma_unit_sm::tma_unit_sm(std::vector<register_set_uniptr *> result_ports,
 void tma_unit_sm::issue(register_set_uniptr &source_reg) {
   warp_inst_t *ready_inst = source_reg.get_ready();
   if (ready_inst != nullptr) {
-    TMACommand cmd = build_tma_command(*ready_inst);
-    cmd.completion_id = allocate_completion_object(cmd);
-    m_command_queue.push(cmd);
+    if (ready_inst->active_count() > 0) {
+      TMACommand cmd = build_tma_command(*ready_inst);
+      cmd.completion_id = allocate_completion_object(cmd);
+      m_command_queue.push(cmd);
+    }
   }
   functional_unit_shared_sm_part::issue(source_reg);
 }

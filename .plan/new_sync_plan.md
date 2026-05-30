@@ -419,6 +419,78 @@ Then enable expect-tx path:
 
 Then move to FA3.
 
+## Current Status
+
+The sync-first bring-up has now reached a stable checkpoint.
+
+Validated status:
+
+- Hopper `SYNCS` is classified as dedicated `MBARRIER_OP`, not legacy `BARRIER_OP`
+- legacy CTA barrier behavior remains on `BARRIER_OP`
+- `FENCE` remains `MEMORY_BARRIER_OP`
+- simulator-side Hopper sync state in `SM` is active and exercised
+- pure sync-only microbench runs complete successfully:
+  - `sync_arrive_micro:sync-arrive-1`
+  - `sync_arrive_micro:sync-arrive-phase-4`
+- existing `utmapf` sync-only-by-runtime configs now also complete successfully:
+  - `utmapf_exch_arrive_micro:utmapf-exch-arrive-1`
+  - `utmapf_exch_multiphase_micro:utmapf-exch-multiphase-1x1x4`
+
+This means:
+
+- the current Hopper sync logic works on both:
+  - a truly TMA-free benchmark
+  - the original `utmapf_probe` path when dead TMA execution is filtered correctly
+
+## Fixes Applied So Far
+
+### Simulator-side sync classification and execution
+
+- added dedicated `MBARRIER_OP`
+- mapped Hopper `SYNCS*` to `MBARRIER_OP`
+- routed `MBARRIER_OP` through Hopper sync execution in remodeled `SM`
+- kept legacy CTA barrier path unchanged for `BARRIER_OP`
+- kept `FENCE` / `MEMBAR` on `MEMORY_BARRIER_OP`
+- restored `SM::issue_warp()` split so `FENCE` does not incorrectly enter legacy CTA barrier handling
+
+### Hopper sync state model
+
+- barrier identity uses `(trace_kernel_id, cta_id, barrier_addr)`
+- Hopper barrier state now lives in `SM`
+- wait handling uses pending wait state keyed by barrier object, not by semantic token alone
+- TMA completion hook back into sync state exists, but full TMA execution modeling is still not the current checkpoint goal
+
+### Trace / build fixes needed during bring-up
+
+- `util/traces_enhanced/Makefile` now tracks header dependencies, so opcode-map header changes rebuild correctly
+- this fixed the stale-object case where source mapped `SYNCS -> MBARRIER_OP` but the runtime binary still used the old classification
+
+### Filtering fixes for sync-only `utmapf` runs
+
+Two separate filtering fixes were required:
+
+1. tracer-side TMA runtime callback filtering
+
+- predicated-off TMA callbacks are no longer written into `tma_runtime_operand_debug.jsonl`
+- TMA runtime operand values are now sampled from the first predicated lane, not blindly from lane 0
+- this keeps dead TMA sites from becoming `runtime_observed=true`
+
+2. simulator-side zero-mask TMA skip
+
+- zero-active traced TMA instructions are now treated as TMA-engine no-ops in `tma_unit_sm::issue()`
+- this avoids Phase 2 operand-metadata asserts for instructions that remain in the main trace stream but have no active lanes
+
+### Practical interpretation
+
+The remaining work is no longer "basic sync bring-up".
+
+The current checkpoint is:
+
+- sync logic itself is working
+- the original predicated-off filtering bug has been fixed
+- the `utmapf` runtime path no longer fails on fake TMA execution for sync-only configurations
+- next work can move forward from this stable baseline toward the next real TMA target
+
 ## First Implementation Slice
 
 The first implementation target should be **tracer-side only**:
