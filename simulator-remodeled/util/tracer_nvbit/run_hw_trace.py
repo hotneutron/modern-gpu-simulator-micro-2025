@@ -93,6 +93,15 @@ def build_tma_operand_mapping_if_available(trace_folder):
     operand_script = os.path.join(this_directory, "build_tma_operand_mapping.py")
     subprocess.run([sys.executable, operand_script, extra_info_dir], check=True)
 
+
+def build_sync_operand_mapping_if_available(trace_folder):
+    extra_info_dir = os.path.join(trace_folder, "extra_info")
+    info_path = os.path.join(extra_info_dir, "enhanced_execution_info.json")
+    if not os.path.exists(info_path):
+        return
+    sync_script = os.path.join(this_directory, "build_sync_operand_mapping.py")
+    subprocess.run([sys.executable, sync_script, extra_info_dir], check=True)
+
 for bench in benchmarks:
     edir, ddir, exe, argslist = bench
     for argpair in argslist:
@@ -191,3 +200,4 @@ for bench in benchmarks:
             os.chdir(saved_dir)
             build_tma_descriptor_mapping_if_available(this_trace_folder)
             build_tma_operand_mapping_if_available(this_trace_folder)
+            build_sync_operand_mapping_if_available(this_trace_folder)

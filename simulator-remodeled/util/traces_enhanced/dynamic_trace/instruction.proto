@@ -10,4 +10,11 @@ message instruction {
   uint32 predicate_mask = 3;
   int32 function_unique_id = 4;
   repeated address addresses = 5;
+  message sync_runtime_info {
+    bool valid = 1;
+    uint64 barrier_addr = 2;
+    bool has_semantic_raw = 3;
+    uint64 semantic_raw = 4;
+  }
+  sync_runtime_info sync = 6;
 }

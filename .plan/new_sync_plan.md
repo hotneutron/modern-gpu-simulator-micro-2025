@@ -129,6 +129,25 @@ message instruction {
 
 Keep `trace_kernel_id` outside per-instruction protobuf if it is already available from the enclosing kernel context. If the existing simulator loader cannot inherit it cleanly, duplicating it later is acceptable, but not required for the first tracer capture patch.
 
+### Runtime Capture Rules
+
+The runtime capture implementation must follow these rules:
+
+- do not hardcode callback positions like "barrier is callback 1" and "semantic is callback 2"
+- build a tracer-side per-`(unique_function_id, pc)` sync capture lookup during instrumentation
+- map actual callback indices for:
+  - barrier operand callback
+  - semantic operand callback
+- at runtime, use that lookup instead of assuming fixed callback order
+
+Predicate handling is also strict:
+
+- if `predicate_mask == 0`, leave `instruction.sync` unset
+- do not fabricate `barrier_addr` or `semantic_raw` from `active_mask`
+- simulator ingestion must also ignore sync runtime payload if `predicate_mask == 0` or `sync.valid == false`
+
+This is required because predicated-off `SYNCS` instructions may still appear as dynamic instruction records in the trace stream, but they must not contribute sync state.
+
 ## Confirmed Operand Mapping
 
 From confirmed SASS for current microbench traces, the useful pattern is stable:
@@ -184,7 +203,7 @@ Two-phase parity model is enough for sync MVP:
 - decode:
 
 ```cpp
-expected_arrive_count = 0x2000000 - exch_arrive_count_encoded_raw;
+expected_arrive_count = 0x200000 - exch_arrive_count_encoded_raw;
 ```
 
 - clear phase-local counters
@@ -241,6 +260,26 @@ So:
 
 - `barrier_addr` selects the barrier object
 - `wait_state_raw` is compared against that barrier's current phase/state
+
+## Validated Findings
+
+The following findings are now validated by generated microbench traces:
+
+- `SYNCS.EXCH` raw values scale consistently with `init-arrivals = 1/2/4/8`
+- observed raw values:
+  - `1 -> 0x1ffffe`
+  - `2 -> 0x1ffffc`
+  - `4 -> 0x1ffff8`
+  - `8 -> 0x1ffff0`
+- these values match:
+
+```cpp
+expected_arrive_count = 0x200000 - raw;
+```
+
+- therefore, the current validated decode base is `0x200000`, not `0x2000000`
+- relevant producer/consumer pairing must be checked by barrier address, not by assuming the first `EXCH` site in the kernel is the producer for a later `PHASECHK`
+- a later `PHASECHK` may legitimately pair with a different `EXCH` site on the same barrier address, for example `EXCH [UR17]` with later `PHASECHK [UR17]`
 
 ## Where Fields Live
 

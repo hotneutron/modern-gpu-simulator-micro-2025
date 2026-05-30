@@ -191,6 +191,19 @@ std::unordered_set<int> tma_consumer_opcode_ids;
 std::map<int, std::map<int, uint32_t>> tma_desc_ureg_by_pc;
 std::map<int, std::map<int, uint32_t>> first_dest_ureg_by_pc;
 std::map<int, std::map<int, std::string>> instruction_text_by_pc;
+struct sync_runtime_capture_site_info {
+  sync_runtime_capture_site_info()
+      : enabled(false),
+        barrier_callback_index(-1),
+        semantic_callback_index(-1),
+        semantic_is_zero_literal(false) {}
+  bool enabled;
+  int barrier_callback_index;
+  int semantic_callback_index;
+  bool semantic_is_zero_literal;
+};
+std::map<int, std::map<int, sync_runtime_capture_site_info>>
+    sync_runtime_capture_sites_by_pc;
 uint64_t tma_memcpy_dump_id = 0;
 uint64_t tensor_map_encode_dump_id = 0;
 struct tma_desc_producer_candidate_t {
@@ -290,6 +303,79 @@ static bool is_tma_desc_consumer_opcode(const std::string &opcode) {
          opcode.rfind("UTMACMDFLUSH", 0) == 0 ||
          opcode.rfind("UTMAPF", 0) == 0 ||
          opcode.rfind("UTMAREDG", 0) == 0;
+}
+
+enum class sync_runtime_capture_kind {
+  NONE,
+  EXCH,
+  ARRIVE_EXPECT_TX,
+  PHASECHK,
+};
+
+static sync_runtime_capture_kind get_sync_runtime_capture_kind(
+    const std::string &opcode) {
+  if (opcode.rfind("SYNCS.EXCH", 0) == 0) {
+    return sync_runtime_capture_kind::EXCH;
+  }
+  if (opcode.rfind("SYNCS.ARRIVE.TRANS64.RED.A0TR", 0) == 0) {
+    return sync_runtime_capture_kind::ARRIVE_EXPECT_TX;
+  }
+  if (opcode.rfind("SYNCS.PHASECHK", 0) == 0) {
+    return sync_runtime_capture_kind::PHASECHK;
+  }
+  return sync_runtime_capture_kind::NONE;
+}
+
+static bool sync_runtime_capture_enabled(sync_runtime_capture_kind kind) {
+  return kind != sync_runtime_capture_kind::NONE;
+}
+
+static bool is_sync_semantic_operand_type(InstrType::OperandType type) {
+  return type == InstrType::OperandType::REG ||
+         type == InstrType::OperandType::UREG ||
+         type == InstrType::OperandType::PRED ||
+         type == InstrType::OperandType::UPRED;
+}
+
+static bool is_zero_sync_semantic_operand(const std::string &operand_str) {
+  return operand_str == "RZ" || operand_str == "URZ";
+}
+
+static sync_runtime_capture_site_info build_sync_runtime_capture_site_info(
+    const std::string &opcode, int operand_position, int callback_index,
+    InstrType::OperandType operand_type, const std::string &operand_str) {
+  sync_runtime_capture_site_info info;
+  sync_runtime_capture_kind kind = get_sync_runtime_capture_kind(opcode);
+  if (!sync_runtime_capture_enabled(kind)) {
+    return info;
+  }
+
+  if (operand_position == 1 && operand_type == InstrType::OperandType::MREF) {
+    info.enabled = true;
+    info.barrier_callback_index = callback_index;
+  } else if (operand_position == 2 &&
+             is_sync_semantic_operand_type(operand_type)) {
+    info.enabled = true;
+    if (is_zero_sync_semantic_operand(operand_str)) {
+      info.semantic_is_zero_literal = true;
+    } else {
+      info.semantic_callback_index = callback_index;
+    }
+  }
+  return info;
+}
+
+static int get_first_predicated_lane(uint32_t active_mask, uint32_t predicate_mask) {
+  uint32_t relevant = active_mask & predicate_mask;
+  if (relevant == 0) {
+    return -1;
+  }
+  for (int lane = 0; lane < 32; ++lane) {
+    if (relevant & (1u << lane)) {
+      return lane;
+    }
+  }
+  return -1;
 }
 
 static const char *traced_reg_type_to_string(TRACED_REG_TYPE reg_type) {
@@ -1428,6 +1514,7 @@ void instrument_function_if_needed(CUcontext ctx, CUfunction func, int device_id
       uint64_t call_ret_imm = 0;
       uint32_t num_of_injects = 0;
       std::string opcode_str = instr->getOpcode() ? std::string(instr->getOpcode()) : "";
+      sync_runtime_capture_site_info sync_site_info;
 
       if(inst_parsed->is_tensor_core_op()) {
         inst_parsed->set_tensor_core_instruction_info();
@@ -1435,6 +1522,23 @@ void instrument_function_if_needed(CUcontext ctx, CUfunction func, int device_id
       for(int i = 0; i < instr->getNumOperands(); ++i){
         const InstrType::operand_t *op = instr->getOperand(i);
         std::string operand_str = op->str ? std::string(op->str) : "";
+        sync_runtime_capture_site_info sync_operand_info =
+            build_sync_runtime_capture_site_info(opcode_str, i, num_of_injects,
+                                                 op->type, operand_str);
+        if (sync_operand_info.enabled) {
+          sync_site_info.enabled = true;
+          if (sync_operand_info.barrier_callback_index >= 0) {
+            sync_site_info.barrier_callback_index =
+                sync_operand_info.barrier_callback_index;
+          }
+          if (sync_operand_info.semantic_callback_index >= 0) {
+            sync_site_info.semantic_callback_index =
+                sync_operand_info.semantic_callback_index;
+          }
+          if (sync_operand_info.semantic_is_zero_literal) {
+            sync_site_info.semantic_is_zero_literal = true;
+          }
+        }
         if(is_tma_desc_consumer_instruction && operand_str.find("desc[UR") != std::string::npos) {
           tma_desc_ureg_id = get_ur_register(operand_str);
         } else if (opcode_str.rfind("UTMASTG", 0) == 0 && i == 0 &&
@@ -1499,6 +1603,10 @@ void instrument_function_if_needed(CUcontext ctx, CUfunction func, int device_id
       }
       if (is_tma_desc_consumer_instruction && tma_desc_ureg_id != SECRET_UREG_DESC_NOT_USED) {
         tma_desc_ureg_by_pc[next_candidate_unique_function_id][vpc] = tma_desc_ureg_id;
+      }
+      if (sync_site_info.enabled) {
+        sync_runtime_capture_sites_by_pc[next_candidate_unique_function_id][vpc] =
+            sync_site_info;
       }
 
       if(num_of_injects == 0) {
@@ -2178,6 +2286,39 @@ void *recv_thread_fun(void *args) {
         unsigned int callback_index = ma->num_of_injects - remaining_injects - 1;
         auto opcode_it = id_to_opcode_map.find(opcode_id);
         const std::string opcode = opcode_it == id_to_opcode_map.end() ? "" : opcode_it->second;
+        auto sync_function_it =
+            sync_runtime_capture_sites_by_pc.find(ma->unique_function_id);
+        if (sync_function_it != sync_runtime_capture_sites_by_pc.end()) {
+          auto sync_pc_it = sync_function_it->second.find(ma->vpc);
+          if (sync_pc_it != sync_function_it->second.end()) {
+            const sync_runtime_capture_site_info &sync_site = sync_pc_it->second;
+            int first_lane =
+                get_first_predicated_lane(ma->active_mask, ma->predicate_mask);
+            if (first_lane >= 0) {
+              if (callback_index ==
+                      static_cast<unsigned int>(sync_site.barrier_callback_index) &&
+                  ma->mem_type != MEM_TYPE::NONE) {
+                dynamic_trace::instruction::sync_runtime_info *sync =
+                    inst->mutable_sync();
+                sync->set_valid(true);
+                sync->set_barrier_addr(ma->addrs_or_reg_val_0[first_lane]);
+                if (sync_site.semantic_is_zero_literal) {
+                  sync->set_has_semantic_raw(true);
+                  sync->set_semantic_raw(0);
+                }
+              } else if (callback_index ==
+                             static_cast<unsigned int>(
+                                 sync_site.semantic_callback_index) &&
+                         ma->mem_type == MEM_TYPE::NONE) {
+                dynamic_trace::instruction::sync_runtime_info *sync =
+                    inst->mutable_sync();
+                sync->set_valid(true);
+                sync->set_has_semantic_raw(true);
+                sync->set_semantic_raw(ma->addrs_or_reg_val_0[first_lane]);
+              }
+            }
+          }
+        }
         if (tma_consumer_opcode_ids.count(opcode_id)) {
           append_tma_runtime_operand_debug_event(device_id, current_stream_id[device_id],
                                                  kernel_id[device_id] - 1, ma, opcode,
