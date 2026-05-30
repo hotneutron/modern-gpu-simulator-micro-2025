@@ -142,6 +142,98 @@ struct TMASidecarMetadataDB {
   }
 };
 
+enum class SyncInstructionKind {
+  NONE,
+  EXCH,
+  ARRIVE,
+  ARRIVE_EXPECT_TX,
+  ARRIVE_COUNTED,
+  PHASECHK,
+  TRYWAIT,
+};
+
+enum class SyncSemanticOperandRole {
+  NONE,
+  EXCH_ARRIVE_COUNT_ENCODED,
+  EXPECT_TX_BYTES,
+  WAIT_STATE,
+  ARRIVE_COUNT,
+};
+
+struct SyncOperandLookupKey {
+  unsigned int unique_function_id = 0;
+  uint64_t pc = 0;
+
+  bool operator<(const SyncOperandLookupKey &other) const {
+    return std::tie(unique_function_id, pc) <
+           std::tie(other.unique_function_id, other.pc);
+  }
+};
+
+struct SyncSiteRecord {
+  std::string opcode;
+  SyncInstructionKind sync_kind = SyncInstructionKind::NONE;
+  int barrier_operand_index = -1;
+  int semantic_operand_index = -1;
+  SyncSemanticOperandRole semantic_operand_role =
+      SyncSemanticOperandRole::NONE;
+  std::string barrier_operand_text;
+  std::string semantic_operand_text;
+};
+
+struct SyncResolvedSiteMetadata {
+  bool valid = false;
+  std::string opcode;
+  SyncInstructionKind sync_kind = SyncInstructionKind::NONE;
+  int barrier_operand_index = -1;
+  int semantic_operand_index = -1;
+  SyncSemanticOperandRole semantic_operand_role =
+      SyncSemanticOperandRole::NONE;
+  std::string barrier_operand_text;
+  std::string semantic_operand_text;
+};
+
+struct SyncSidecarMetadataDB {
+  std::map<SyncOperandLookupKey, SyncSiteRecord> site_records;
+
+  void clear() { site_records.clear(); }
+
+  bool empty() const { return site_records.empty(); }
+};
+
+struct HopperMBarrierKey {
+  uint32_t trace_kernel_id = 0;
+  uint32_t cta_id = 0;
+  uint64_t barrier_addr = 0;
+
+  bool operator<(const HopperMBarrierKey &other) const {
+    return std::tie(trace_kernel_id, cta_id, barrier_addr) <
+           std::tie(other.trace_kernel_id, other.cta_id, other.barrier_addr);
+  }
+};
+
+struct HopperMBarrierObject {
+  uint32_t expected_arrive_count = 0;
+  uint32_t arrive_count = 0;
+  uint32_t expected_tx_bytes = 0;
+  uint32_t completed_tx_bytes = 0;
+  uint32_t bound_pending_tx_bytes = 0;
+  uint32_t phase = 0;
+  bool ready = false;
+};
+
+struct HopperMBarrierPendingWait {
+  bool valid = false;
+  bool is_trywait = false;
+  HopperMBarrierKey key;
+  uint64_t wait_state_raw = 0;
+};
+
+struct HopperMBarrierPendingTxBinding {
+  HopperMBarrierKey key;
+  uint32_t pending_tx_bytes = 0;
+};
+
 struct TMACommand {
   uint32_t warp_id = 0;
   uint32_t cta_id = 0;

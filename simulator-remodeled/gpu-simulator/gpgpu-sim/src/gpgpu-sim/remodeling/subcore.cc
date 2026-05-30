@@ -913,6 +913,7 @@ functional_unit* Subcore::get_fu(const warp_inst_t *pI) {
       break;
     case LDGDEPBAR_OP:
     case BARRIER_OP:
+    case MBARRIER_OP:
     case DEPBAR_OP:
     case MISCELLANEOUS_NO_QUEUE_OP:
       fu = m_miscellaneous_no_queue_pipeline;

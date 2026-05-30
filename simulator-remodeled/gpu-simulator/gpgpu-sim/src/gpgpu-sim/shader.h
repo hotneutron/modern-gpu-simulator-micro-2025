@@ -225,6 +225,16 @@ class shd_warp_t {
     }
   }
 
+  bool has_function_call_context() const {
+    return !m_function_call_stack.empty();
+  }
+
+  size_t get_function_call_depth() const { return m_function_call_stack.size(); }
+
+  bool can_pop_non_root_function_call() const {
+    return m_function_call_stack.size() > 1;
+  }
+
   unsigned int get_current_unique_function_id_call() {
     assert(!m_function_call_stack.empty());
     return m_function_call_stack.top().unique_function_id;

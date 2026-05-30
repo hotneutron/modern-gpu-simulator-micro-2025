@@ -2,6 +2,7 @@ CC=g++
 MKDIR_P = mkdir -p
 
 ODIR=obj
+DEPDIR=$(ODIR)
 SRCDIR=src
 
 ifeq ($(DEBUG),1)
@@ -44,11 +45,13 @@ LIBS+=$(PROTOBUF_LIBS)
 
 
 CFLAGS=$(CXXFLAGS) -I$(CUDA_INSTALL_PATH)/include -fPIC
+DEPFLAGS=-MMD -MP
 
 LIBS=-lz -pthread
 
 SOURCES := $(shell find $(SRCDIR) -name '*.cc')
 OBJ := $(patsubst $(SRCDIR)/%,$(ODIR)/%,$(SOURCES:.cc=.o))
+DEP := $(OBJ:.o=.d)
 
 .PHONY: clean depend
 
@@ -62,7 +65,8 @@ ${ODIR}:
 depend: $(OBJ)
 
 $(ODIR)/%.o: $(SRCDIR)/%.cc
-	$(CC) -c -o $@ $< $(CFLAGS)
+	@mkdir -p $(dir $@)
+	$(CC) -c -o $@ $< $(CFLAGS) $(DEPFLAGS)
 
 # Protocol buffer compilation rules
 $(PROTO_SRC_DIR)/%.pb.cc $(PROTO_HDR_DIR)/%.pb.h: $(TRACES_ENHANCED_PROTO_DIR)/%.proto
@@ -81,3 +85,5 @@ protobuf: $(PROTO_SRCS) $(PROTO_HDRS) $(PROTO_OBJS)
 clean:
 	rm -rf $(ODIR)
 	rm -rf $(PROTO_GEN_DIR)
+
+-include $(DEP)

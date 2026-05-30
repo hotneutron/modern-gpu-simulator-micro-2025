@@ -868,6 +868,9 @@ class gpgpu_sim : public gpgpu_t {
   bool lookup_tma_site_metadata(unsigned int unique_function_id, address_type pc,
                                 uint32_t handle_hi,
                                 TMAResolvedSiteMetadata &metadata) const;
+  bool lookup_sync_site_metadata(unsigned int unique_function_id,
+                                 address_type pc,
+                                 SyncResolvedSiteMetadata &metadata) const;
 
   void record_l1i_prefetch_miss_observation(new_addr_type block_addr,
                                             unsigned int unique_function_id,
@@ -926,6 +929,7 @@ class gpgpu_sim : public gpgpu_t {
   std::map<std::string, address_type> m_first_pc_of_each_defined_kernel; // MOD. Fix requesting same address for different kernels
   traced_execution m_extra_trace_info;  // MOD. Improved tracer
   TMASidecarMetadataDB m_tma_sidecar_db;
+  SyncSidecarMetadataDB m_sync_sidecar_db;
   std::map<new_addr_type, unsigned long long> m_l1i_prefetch_miss_block_histogram;
   std::map<new_addr_type, unsigned int> m_l1i_prefetch_miss_block_unique_function_id;
   std::map<unsigned int, unsigned long long> m_l1i_prefetch_miss_set_histogram;

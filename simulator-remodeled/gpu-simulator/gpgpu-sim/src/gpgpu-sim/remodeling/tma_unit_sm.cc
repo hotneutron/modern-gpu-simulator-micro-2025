@@ -491,6 +491,7 @@ void tma_unit_sm::advance_in_flight_transfers() {
             completion.ready = true;
             completion.cycle_ready = current_cycle;
           }
+          m_sm->notify_tma_completion(entry.cmd.warp_id, entry.cmd.total_bytes);
         }
         break;
       }

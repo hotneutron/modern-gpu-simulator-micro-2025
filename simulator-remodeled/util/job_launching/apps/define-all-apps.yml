@@ -375,6 +375,31 @@ utmapf_exch_arrive_micro:
                   qos: all
                   openmp-cpus: 2
 
+sync_arrive_micro:
+    exec_dir: "$GPUAPPS_ROOT/bin/$CUDA_VERSION/release/"
+    data_dirs: "$GPUAPPS_ROOT/data_dirs/"
+    execs:
+        - sync-arrive-1:
+            exe: sync_arrive_probe
+            runs:
+                - args: --barrier-slot 0 --init-arrivals 1 --arrive-count 1 --arrive-repeats 1 --phase-cycles 1 --reuse-barrier 0 --alu-gap-iters 32
+                  env:
+                    CUDA_ARCH: sm_90a
+                    INTERMEDIATE_EXTRA_FILES_PERSISTANCE: 1
+                  accel-sim-mem: 6G
+                  qos: all
+                  openmp-cpus: 2
+        - sync-arrive-phase-4:
+            exe: sync_arrive_probe
+            runs:
+                - args: --barrier-slot 0 --init-arrivals 1 --arrive-count 1 --arrive-repeats 1 --phase-cycles 4 --reuse-barrier 1 --alu-gap-iters 32
+                  env:
+                    CUDA_ARCH: sm_90a
+                    INTERMEDIATE_EXTRA_FILES_PERSISTANCE: 1
+                  accel-sim-mem: 6G
+                  qos: all
+                  openmp-cpus: 2
+
 utmapf_exch_phase_micro:
     exec_dir: "$GPUAPPS_ROOT/bin/$CUDA_VERSION/release/"
     data_dirs: "$GPUAPPS_ROOT/data_dirs/"

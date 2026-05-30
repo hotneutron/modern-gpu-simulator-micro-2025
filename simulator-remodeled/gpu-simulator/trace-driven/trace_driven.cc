@@ -257,6 +257,16 @@ bool trace_warp_inst_t::parse_from_trace_struct(
   pc = (address_type)trace.m_pc;
   next_traced_pc = (address_type)trace.m_next_traced_pc;
   unique_function_id = trace.m_unique_function_id;
+  sync_site_valid = trace.sync_site_valid;
+  sync_kind = trace.sync_kind;
+  sync_semantic_operand_role = trace.sync_semantic_operand_role;
+  sync_barrier_operand_index = trace.sync_barrier_operand_index;
+  sync_semantic_operand_index = trace.sync_semantic_operand_index;
+  sync_runtime_valid = trace.sync_runtime_valid;
+  sync_barrier_addr = trace.sync_barrier_addr;
+  sync_has_semantic_raw = trace.sync_has_semantic_raw;
+  sync_semantic_raw = trace.sync_semantic_raw;
+  trace_kernel_id = kernel_trace_info->kernel_id;
 
   isize =
       16;  // starting from MAXWELL isize=16 bytes (including the control bytes)

@@ -534,11 +534,94 @@ void load_tma_operand_resolver(const std::filesystem::path &extra_info_dir,
   }
 }
 
+SyncInstructionKind parse_sync_instruction_kind_string(const std::string &kind) {
+  if (kind == "EXCH") return SyncInstructionKind::EXCH;
+  if (kind == "ARRIVE") return SyncInstructionKind::ARRIVE;
+  if (kind == "ARRIVE_EXPECT_TX") return SyncInstructionKind::ARRIVE_EXPECT_TX;
+  if (kind == "ARRIVE_COUNTED") return SyncInstructionKind::ARRIVE_COUNTED;
+  if (kind == "PHASECHK") return SyncInstructionKind::PHASECHK;
+  if (kind == "TRYWAIT") return SyncInstructionKind::TRYWAIT;
+  return SyncInstructionKind::NONE;
+}
+
+SyncSemanticOperandRole parse_sync_semantic_operand_role_string(
+    const std::string &role) {
+  if (role == "EXCH_ARRIVE_COUNT_ENCODED") {
+    return SyncSemanticOperandRole::EXCH_ARRIVE_COUNT_ENCODED;
+  }
+  if (role == "EXPECT_TX_BYTES") {
+    return SyncSemanticOperandRole::EXPECT_TX_BYTES;
+  }
+  if (role == "WAIT_STATE") {
+    return SyncSemanticOperandRole::WAIT_STATE;
+  }
+  if (role == "ARRIVE_COUNT") {
+    return SyncSemanticOperandRole::ARRIVE_COUNT;
+  }
+  return SyncSemanticOperandRole::NONE;
+}
+
+void load_sync_operand_resolver(const std::filesystem::path &extra_info_dir,
+                                SyncSidecarMetadataDB &db) {
+  rapidjson::Document doc;
+  if (!load_tma_json_document(extra_info_dir / "sync_operand_resolver.json",
+                              doc)) {
+    return;
+  }
+  if (!doc.HasMember("resolver") || !doc["resolver"].IsArray()) {
+    return;
+  }
+  for (const auto &entry : doc["resolver"].GetArray()) {
+    if (!entry.IsObject() || !entry.HasMember("unique_function_id") ||
+        entry["unique_function_id"].IsNull() || !entry.HasMember("pc_hex") ||
+        !entry["pc_hex"].IsString()) {
+      continue;
+    }
+    unsigned int unique_function_id = static_cast<unsigned int>(
+        parse_tma_json_uint(entry["unique_function_id"]));
+    uint64_t pc = std::strtoull(entry["pc_hex"].GetString(), nullptr, 0);
+    SyncSiteRecord &record =
+        db.site_records[SyncOperandLookupKey{unique_function_id, pc}];
+    if (entry.HasMember("opcode") && entry["opcode"].IsString()) {
+      record.opcode = entry["opcode"].GetString();
+    }
+    if (entry.HasMember("sync_kind") && entry["sync_kind"].IsString()) {
+      record.sync_kind =
+          parse_sync_instruction_kind_string(entry["sync_kind"].GetString());
+    }
+    if (entry.HasMember("barrier_operand_index")) {
+      record.barrier_operand_index =
+          static_cast<int>(parse_tma_json_uint(entry["barrier_operand_index"]));
+    }
+    if (entry.HasMember("semantic_operand_index") &&
+        !entry["semantic_operand_index"].IsNull()) {
+      record.semantic_operand_index = static_cast<int>(
+          parse_tma_json_uint(entry["semantic_operand_index"]));
+    } else {
+      record.semantic_operand_index = -1;
+    }
+    if (entry.HasMember("semantic_operand_role") &&
+        entry["semantic_operand_role"].IsString()) {
+      record.semantic_operand_role = parse_sync_semantic_operand_role_string(
+          entry["semantic_operand_role"].GetString());
+    }
+    if (entry.HasMember("barrier_operand_text") &&
+        entry["barrier_operand_text"].IsString()) {
+      record.barrier_operand_text = entry["barrier_operand_text"].GetString();
+    }
+    if (entry.HasMember("semantic_operand_text") &&
+        entry["semantic_operand_text"].IsString()) {
+      record.semantic_operand_text = entry["semantic_operand_text"].GetString();
+    }
+  }
+}
+
 }
 
 // MOD. Begin. Improved tracer
 void gpgpu_sim::parse_extra_trace_info(std::string filepath, bool is_extra_trace_enabled) {
   m_tma_sidecar_db.clear();
+  m_sync_sidecar_db.clear();
   if(is_extra_trace_enabled) {
     m_extra_trace_info.DeserializeFromFile(filepath.c_str());
     std::filesystem::path metadata_path(filepath);
@@ -546,12 +629,15 @@ void gpgpu_sim::parse_extra_trace_info(std::string filepath, bool is_extra_trace
     load_tma_descriptor_configs(extra_info_dir, m_tma_sidecar_db);
     load_tma_descriptor_resolver(extra_info_dir, m_tma_sidecar_db);
     load_tma_operand_resolver(extra_info_dir, m_tma_sidecar_db);
+    load_sync_operand_resolver(extra_info_dir, m_sync_sidecar_db);
     std::cerr << "[TMA][Phase2] loaded descriptor_configs="
               << m_tma_sidecar_db.descriptor_configs.size()
               << " descriptor_sites="
               << m_tma_sidecar_db.descriptor_site_records.size()
               << " operand_sites="
               << m_tma_sidecar_db.operand_site_records.size() << std::endl;
+    std::cerr << "[SYNC] loaded operand_sites="
+              << m_sync_sidecar_db.site_records.size() << std::endl;
   }
 }
 // MOD. End. Improved tracer
@@ -610,6 +696,28 @@ bool gpgpu_sim::lookup_tma_site_metadata(unsigned int unique_function_id,
     }
   }
   return metadata.valid;
+}
+
+bool gpgpu_sim::lookup_sync_site_metadata(unsigned int unique_function_id,
+                                          address_type pc,
+                                          SyncResolvedSiteMetadata &metadata)
+    const {
+  metadata = SyncResolvedSiteMetadata();
+  auto it = m_sync_sidecar_db.site_records.find(
+      SyncOperandLookupKey{unique_function_id, static_cast<uint64_t>(pc)});
+  if (it == m_sync_sidecar_db.site_records.end()) {
+    return false;
+  }
+  const SyncSiteRecord &record = it->second;
+  metadata.valid = true;
+  metadata.opcode = record.opcode;
+  metadata.sync_kind = record.sync_kind;
+  metadata.barrier_operand_index = record.barrier_operand_index;
+  metadata.semantic_operand_index = record.semantic_operand_index;
+  metadata.semantic_operand_role = record.semantic_operand_role;
+  metadata.barrier_operand_text = record.barrier_operand_text;
+  metadata.semantic_operand_text = record.semantic_operand_text;
+  return true;
 }
 
 void power_config::reg_options(class OptionParser *opp) {

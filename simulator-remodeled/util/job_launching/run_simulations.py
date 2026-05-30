@@ -34,6 +34,7 @@ from optparse import OptionParser
 import os
 import subprocess
 from subprocess import Popen, PIPE
+import hashlib
 
 import sys
 import re
@@ -58,6 +59,19 @@ def extract_version( exec_path ):
     out, err = grep_process.communicate()
     version = re.sub(regex_str, r"\1", str(out.rstrip()))
     return version
+
+
+def build_short_log_basename(full_name, max_len=120):
+    sanitized = re.sub(r"[^A-Za-z0-9._-]+", "_", full_name).strip("._-")
+    if sanitized == "":
+        sanitized = "sim"
+    if len(sanitized) <= max_len:
+        return sanitized
+    digest = hashlib.sha1(sanitized.encode("utf-8")).hexdigest()[:12]
+    prefix_len = max_len - len(digest) - 1
+    if prefix_len < 1:
+        return digest[:max_len]
+    return "{0}-{1}".format(sanitized[:prefix_len], digest)
 
 #######################################################################################
 # Class the represents each configuration you are going to run
@@ -277,9 +291,13 @@ class ConfigurationSpec:
         else:
             queue_name = os.getenv("TORQUE_QUEUE_NAME")
 
+        full_job_name = benchmark + "-" + self.benchmark_args_subdirs[
+            command_line_args] + "." + gpgpusim_build_handle
+        log_basename = build_short_log_basename(full_job_name)
+
         # do the text replacement for the .sim file
-        replacement_dict = {"NAME":benchmark + "-" + self.benchmark_args_subdirs[command_line_args] + "." +\
-                                gpgpusim_build_handle,
+        replacement_dict = {"NAME":full_job_name,
+                            "LOG_BASENAME":log_basename,
                             "NODES":"1", 
                             "GPGPUSIM_ROOT":os.getenv("GPGPUSIM_ROOT"),
                             "LIBPATH": libpath,

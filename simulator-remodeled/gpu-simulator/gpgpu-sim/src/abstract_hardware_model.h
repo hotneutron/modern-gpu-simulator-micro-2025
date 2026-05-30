@@ -1166,8 +1166,12 @@ class inst_t {
     return (op == GRID_BARRIER_OP);
   }
 
+  bool is_mbarrier() const { return (op == MBARRIER_OP); }
+
   bool is_any_kind_of_barrier() const {
-    return (op == MEMORY_BARRIER_OP) || (op == LDGDEPBAR_OP) || (op == BARRIER_OP) || (op == GRID_BARRIER_OP);
+    return (op == MEMORY_BARRIER_OP) || (op == LDGDEPBAR_OP) ||
+           (op == BARRIER_OP) || (op == MBARRIER_OP) ||
+           (op == GRID_BARRIER_OP);
   }
 
   bool is_memory_miscelanous() const {
@@ -1212,6 +1216,17 @@ class inst_t {
   op_type op;       // opcode (uarch visible)
   TMAOpcodeFamily tma_opcode_family = TMAOpcodeFamily::UNKNOWN;
   uint32_t tma_handle_hi = 0;
+  bool sync_site_valid = false;
+  SyncInstructionKind sync_kind = SyncInstructionKind::NONE;
+  SyncSemanticOperandRole sync_semantic_operand_role =
+      SyncSemanticOperandRole::NONE;
+  int sync_barrier_operand_index = -1;
+  int sync_semantic_operand_index = -1;
+  bool sync_runtime_valid = false;
+  uint64_t sync_barrier_addr = 0;
+  bool sync_has_semantic_raw = false;
+  uint64_t sync_semantic_raw = 0;
+  uint32_t trace_kernel_id = 0;
   bool skip_wb;
 
   barrier_type bar_type;

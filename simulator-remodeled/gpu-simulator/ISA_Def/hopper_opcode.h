@@ -130,7 +130,7 @@ static const std::unordered_map<std::string, OpcodeChar> Hopper_OpcodeMap = {
     {"STL", OpcodeChar(OP_STL, STORE_OP)},
     {"STS", OpcodeChar(OP_STS, STORE_OP)},
     {"STAS", OpcodeChar(OP_STAS, STORE_OP)},
-    {"SYNCS", OpcodeChar(OP_SYNCS, BARRIER_OP)},
+    {"SYNCS", OpcodeChar(OP_SYNCS, MBARRIER_OP)},
     {"MATCH", OpcodeChar(OP_MATCH, MEMORY_MISCELLANEOUS_OP)},
     {"QSPC", OpcodeChar(OP_QSPC, MEMORY_MISCELLANEOUS_OP)},
     {"ATOM", OpcodeChar(OP_ATOM, STORE_OP)},
