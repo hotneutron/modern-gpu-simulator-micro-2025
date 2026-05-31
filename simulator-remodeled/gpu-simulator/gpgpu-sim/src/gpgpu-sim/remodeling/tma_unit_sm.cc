@@ -151,15 +151,14 @@ bool tma_family_requires_operand_metadata(TMAOpcodeFamily family) {
 
 void log_tma_phase2_binding_once(const warp_inst_t &inst,
                                  const TMACommand &cmd) {
-  static std::set<std::tuple<unsigned int, uint64_t, uint64_t>> logged_sites;
+  static std::set<std::tuple<unsigned int, uint64_t, uint32_t>> logged_sites;
   auto key = std::make_tuple(inst.unique_function_id, static_cast<uint64_t>(inst.pc),
-                             inst.tma_descriptor_ptr);
+                             inst.tma_handle_hi);
   if (!logged_sites.insert(key).second) {
     return;
   }
   std::cerr << "[TMA][Phase2] ufid=" << inst.unique_function_id
             << " pc=0x" << std::hex << static_cast<uint64_t>(inst.pc)
-            << " descriptor_ptr=0x" << inst.tma_descriptor_ptr
             << " handle_hi=0x" << inst.tma_handle_hi << std::dec
             << " family=" << static_cast<int>(cmd.opcode_family)
             << " meta_source=" << static_cast<int>(cmd.meta_source)
@@ -168,42 +167,6 @@ void log_tma_phase2_binding_once(const warp_inst_t &inst,
             << " requests_total=" << cmd.requests_total
             << " covered_bytes=" << cmd.covered_bytes
             << " operand3_raw=" << cmd.operand3_raw
-            << " operand_form=" << static_cast<int>(cmd.operand_form)
-            << std::endl;
-}
-
-void log_tma_phase2_missing_descriptor_once(
-    const warp_inst_t &inst, const TMACommand &cmd,
-    const TMAResolvedSiteMetadata &metadata) {
-  static std::set<std::tuple<unsigned int, uint64_t, uint64_t>> logged_sites;
-  auto key = std::make_tuple(inst.unique_function_id,
-                             static_cast<uint64_t>(inst.pc),
-                             inst.tma_descriptor_ptr);
-  if (!logged_sites.insert(key).second) {
-    return;
-  }
-  const std::string trace_opcode =
-      inst.has_extra_trace_instruction_info()
-          ? inst.get_extra_trace_instruction_info().get_op_code()
-          : "<no-trace-opcode>";
-  std::cerr << "[TMA][Phase2][MissingDescriptor] ufid="
-            << inst.unique_function_id << " pc=0x" << std::hex
-            << static_cast<uint64_t>(inst.pc) << " handle_hi=0x"
-            << inst.tma_handle_hi << " descriptor_ptr=0x"
-            << inst.tma_descriptor_ptr << std::dec
-            << " trace_opcode=" << trace_opcode
-            << " family=" << static_cast<int>(cmd.opcode_family)
-            << " meta_source=" << static_cast<int>(cmd.meta_source)
-            << " metadata.valid=" << metadata.valid
-            << " metadata.runtime_observed=" << metadata.runtime_observed
-            << " metadata.operand_lookup_hit=" << metadata.operand_lookup_hit
-            << " metadata.has_descriptor_metadata="
-            << metadata.has_descriptor_metadata
-            << " metadata.has_operand_metadata="
-            << metadata.has_operand_metadata
-            << " config_id=" << cmd.config_id
-            << " total_bytes=" << cmd.total_bytes
-            << " covered_bytes=" << cmd.covered_bytes
             << " operand_form=" << static_cast<int>(cmd.operand_form)
             << std::endl;
 }
@@ -224,16 +187,16 @@ const char *tma_phase2_family_label(TMAOpcodeFamily family) {
 }
 
 struct TMAPhase2FamilyStats {
-  std::set<std::tuple<unsigned int, uint64_t, uint64_t>> descriptor_key_sites;
-  std::set<std::tuple<unsigned int, uint64_t, uint64_t>> operand_only_sites;
-  std::set<std::tuple<unsigned int, uint64_t, uint64_t>> mixed_sites;
-  std::set<std::tuple<unsigned int, uint64_t, uint64_t>> unresolved_sites;
+  std::set<std::tuple<unsigned int, uint64_t, uint32_t>> descriptor_key_sites;
+  std::set<std::tuple<unsigned int, uint64_t, uint32_t>> operand_only_sites;
+  std::set<std::tuple<unsigned int, uint64_t, uint32_t>> mixed_sites;
+  std::set<std::tuple<unsigned int, uint64_t, uint32_t>> unresolved_sites;
   uint64_t descriptor_key_commands = 0;
   uint64_t operand_only_commands = 0;
   uint64_t mixed_commands = 0;
   uint64_t unresolved_commands = 0;
 
-  void record(const std::tuple<unsigned int, uint64_t, uint64_t> &key,
+  void record(const std::tuple<unsigned int, uint64_t, uint32_t> &key,
               const TMAResolvedSiteMetadata &metadata) {
     if (metadata.descriptor_lookup_hit && metadata.operand_lookup_hit) {
       mixed_sites.insert(key);
@@ -290,7 +253,7 @@ struct TMAPhase2BindingStats {
   void record(const warp_inst_t &inst, const TMAResolvedSiteMetadata &metadata) {
     auto key = std::make_tuple(inst.unique_function_id,
                                static_cast<uint64_t>(inst.pc),
-                               inst.tma_descriptor_ptr);
+                               inst.tma_handle_hi);
     overall.record(key, metadata);
     TMAPhase2FamilyStats *family_stats = select_family_stats(inst.tma_opcode_family);
     if (family_stats != nullptr) {
@@ -376,7 +339,7 @@ TMACommand tma_unit_sm::build_tma_command(const warp_inst_t &inst) const {
   cmd.operand_form = classify_tma_operand_form(cmd.opcode_family);
   cmd.meta_source = TMAMetadataSource::NONE;
   if (m_sm->get_gpu()->lookup_tma_site_metadata(inst.unique_function_id, inst.pc,
-                                                inst.tma_descriptor_ptr,
+                                                inst.tma_handle_hi,
                                                 metadata)) {
     if (metadata.has_descriptor_metadata) {
       cmd.config_id = metadata.config_id;
@@ -426,9 +389,6 @@ TMACommand tma_unit_sm::build_tma_command(const warp_inst_t &inst) const {
          "Phase 2 expected runtime_observed=true for executed TMA op");
   if (tma_family_requires_descriptor(cmd.opcode_family)) {
     assert(metadata.valid && "Phase 2 expected TMA metadata for descriptor-backed family");
-    if (!metadata.has_descriptor_metadata) {
-      log_tma_phase2_missing_descriptor_once(inst, cmd, metadata);
-    }
     assert(metadata.has_descriptor_metadata &&
            "Phase 2 missing descriptor metadata for descriptor-backed TMA family");
   }

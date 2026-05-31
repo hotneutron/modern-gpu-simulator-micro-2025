@@ -413,19 +413,14 @@ void load_tma_descriptor_resolver(const std::filesystem::path &extra_info_dir,
         static_cast<unsigned int>(parse_tma_json_uint(
             entry["unique_function_id"]));
     uint64_t pc = std::strtoull(entry["pc_hex"].GetString(), nullptr, 0);
-    if (!entry.HasMember("descriptor_ptr_hex") ||
-        !entry["descriptor_ptr_hex"].IsString()) {
-      std::cerr << "[TMA][Phase2][Error] descriptor resolver entry missing "
-                   "descriptor_ptr_hex for ufid="
-                << unique_function_id << " pc=0x" << std::hex << pc
-                << std::dec << std::endl;
-      std::abort();
+    uint32_t handle_hi = 0;
+    if (entry.HasMember("handle_hi_hex") && entry["handle_hi_hex"].IsString()) {
+      handle_hi = static_cast<uint32_t>(
+          std::strtoul(entry["handle_hi_hex"].GetString(), nullptr, 0));
     }
-    uint64_t descriptor_ptr = std::strtoull(
-        entry["descriptor_ptr_hex"].GetString(), nullptr, 0);
     TMADescriptorSiteRecord &record =
         db.descriptor_site_records[TMADescriptorLookupKey{
-            unique_function_id, pc, descriptor_ptr}];
+            unique_function_id, pc, handle_hi}];
     record.has_descriptor_metadata = true;
     if (entry.HasMember("mapping_method") && entry["mapping_method"].IsString() &&
         record.mapping_method.empty()) {
@@ -649,11 +644,10 @@ void gpgpu_sim::parse_extra_trace_info(std::string filepath, bool is_extra_trace
 
 bool gpgpu_sim::lookup_tma_site_metadata(unsigned int unique_function_id,
                                          address_type pc,
-                                         uint64_t descriptor_ptr,
+                                         uint32_t handle_hi,
                                          TMAResolvedSiteMetadata &metadata) const {
   metadata = TMAResolvedSiteMetadata();
-  metadata.handle_hi = static_cast<uint32_t>(descriptor_ptr >> 32);
-  metadata.descriptor_ptr = descriptor_ptr;
+  metadata.handle_hi = handle_hi;
   auto it_operand = m_tma_sidecar_db.operand_site_records.find(
       TMAOperandLookupKey{unique_function_id, pc});
   if (it_operand != m_tma_sidecar_db.operand_site_records.end()) {
@@ -681,7 +675,7 @@ bool gpgpu_sim::lookup_tma_site_metadata(unsigned int unique_function_id,
     }
   }
   auto it_descriptor = m_tma_sidecar_db.descriptor_site_records.find(
-      TMADescriptorLookupKey{unique_function_id, pc, descriptor_ptr});
+      TMADescriptorLookupKey{unique_function_id, pc, handle_hi});
   if (it_descriptor != m_tma_sidecar_db.descriptor_site_records.end()) {
     const TMADescriptorSiteRecord &record = it_descriptor->second;
     metadata.valid = true;

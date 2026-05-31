@@ -66,11 +66,11 @@ struct TMADescriptorConfigMetadata {
 struct TMADescriptorLookupKey {
   unsigned int unique_function_id = 0;
   uint64_t pc = 0;
-  uint64_t descriptor_ptr = 0;
+  uint32_t handle_hi = 0;
 
   bool operator<(const TMADescriptorLookupKey &other) const {
-    return std::tie(unique_function_id, pc, descriptor_ptr) <
-           std::tie(other.unique_function_id, other.pc, other.descriptor_ptr);
+    return std::tie(unique_function_id, pc, handle_hi) <
+           std::tie(other.unique_function_id, other.pc, other.handle_hi);
   }
 };
 
@@ -114,7 +114,6 @@ struct TMAResolvedSiteMetadata {
   bool operand_lookup_hit = false;
   bool runtime_observed = false;
   uint32_t handle_hi = 0;
-  uint64_t descriptor_ptr = 0;
   std::string config_id;
   std::string mapping_method;
   float resolver_confidence = 0.0f;
