@@ -187,6 +187,7 @@ std::unordered_set<int> tma_desc_runtime_debug_header_written;
 std::unordered_set<int> tma_desc_producer_debug_header_written;
 std::unordered_set<int> tma_memcpy_dump_header_written;
 std::unordered_set<int> tensor_map_encode_dump_header_written;
+std::unordered_set<int> kernel_launch_arg_dump_header_written;
 std::unordered_set<int> tma_consumer_opcode_ids;
 std::map<int, std::map<int, uint32_t>> tma_desc_ureg_by_pc;
 std::map<int, std::map<int, uint32_t>> first_dest_ureg_by_pc;
@@ -266,6 +267,7 @@ std::string traces_path = "traces";
 std::string extrainfo_path = traces_path + "/extra_info";
 std::string tma_htod_blob_path = extrainfo_path + "/tma_htod_blobs";
 std::string tensor_map_blob_path = extrainfo_path + "/tensor_map_encode_blobs";
+std::string kernel_launch_arg_blob_path = extrainfo_path + "/kernel_launch_arg_blobs";
 std::string cubin_path = extrainfo_path + "/cubin";
 std::string sass_path = extrainfo_path + "/sass";
 std::string register_usage_path = extrainfo_path + "/register_usage";
@@ -303,6 +305,33 @@ static bool is_tma_desc_consumer_opcode(const std::string &opcode) {
          opcode.rfind("UTMACMDFLUSH", 0) == 0 ||
          opcode.rfind("UTMAPF", 0) == 0 ||
          opcode.rfind("UTMAREDG", 0) == 0;
+}
+
+static bool is_descriptor_backed_tma_consumer_opcode(
+    const std::string &opcode) {
+  return opcode.rfind("UTMALDG", 0) == 0 ||
+         opcode.rfind("UTMASTG", 0) == 0 ||
+         opcode.rfind("UTMAPF", 0) == 0 ||
+         opcode.rfind("UTMAREDG", 0) == 0;
+}
+
+static uint32_t extract_plain_ureg_id(const std::string &operand_str) {
+  const size_t ur_pos = operand_str.find("[UR");
+  if (ur_pos == std::string::npos) {
+    return SECRET_UREG_DESC_NOT_USED;
+  }
+  size_t digit_start = ur_pos + 3;
+  size_t digit_end = digit_start;
+  while (digit_end < operand_str.size() &&
+         operand_str[digit_end] >= '0' && operand_str[digit_end] <= '9') {
+    ++digit_end;
+  }
+  if (digit_end == digit_start) {
+    return SECRET_UREG_DESC_NOT_USED;
+  }
+  return static_cast<uint32_t>(
+      std::strtoul(operand_str.substr(digit_start, digit_end - digit_start).c_str(),
+                   nullptr, 10));
 }
 
 enum class sync_runtime_capture_kind {
@@ -557,6 +586,69 @@ static void append_tensor_map_encode_dump_event(int device_id, const cuTensorMap
       << uint64_to_hex_string(qwords[6]) << ","
       << uint64_to_hex_string(qwords[7]) << ","
       << blob_path << "\n";
+}
+
+static void append_kernel_launch_tensor_map_args_dump_event(
+    CUcontext ctx, int device_id, int stream_id, int kernel_trace_id,
+    unsigned int unique_function_id, const std::string &kernel_name,
+    CUfunction func, void **kernel_params) {
+  if (!enable_tma_desc || kernel_params == nullptr) {
+    return;
+  }
+  std::vector<int> kernel_argument_sizes =
+      nvbit_get_kernel_argument_sizes(ctx, func);
+  if (kernel_argument_sizes.empty()) {
+    return;
+  }
+  create_folder(extrainfo_path.c_str());
+  create_folder(kernel_launch_arg_blob_path.c_str());
+  std::string csv_path = extrainfo_path + "/kernel_launch_arg_dump.csv";
+  std::ofstream csv;
+  bool needs_header = kernel_launch_arg_dump_header_written.find(device_id) ==
+                      kernel_launch_arg_dump_header_written.end();
+  if (needs_header) {
+    csv.open(csv_path, std::ios::out);
+  } else {
+    csv.open(csv_path, std::ios::app);
+  }
+  if (!csv.is_open()) {
+    return;
+  }
+  if (needs_header) {
+    kernel_launch_arg_dump_header_written.insert(device_id);
+    csv << "device_id,stream_id,kernel_id,unique_function_id,kernel_name,"
+           "arg_index,arg_size,arg_storage,arg_host_ptr_hex,blob_path\n";
+  }
+  for (size_t arg_index = 0; arg_index < kernel_argument_sizes.size(); ++arg_index) {
+    int arg_size = kernel_argument_sizes[arg_index];
+    if (arg_size != static_cast<int>(sizeof(CUtensorMap))) {
+      continue;
+    }
+    void *arg_ptr = kernel_params[arg_index];
+    if (arg_ptr == nullptr) {
+      continue;
+    }
+    std::ostringstream host_ptr_stream;
+    host_ptr_stream << "0x" << std::hex
+                    << reinterpret_cast<uintptr_t>(arg_ptr);
+    std::string blob_path = kernel_launch_arg_blob_path + "/kernel_" +
+                            std::to_string(kernel_trace_id) + "_arg_" +
+                            std::to_string(arg_index) + ".bin";
+    std::ofstream blob(blob_path, std::ios::binary | std::ios::out);
+    if (blob.is_open()) {
+      blob.write(reinterpret_cast<const char *>(arg_ptr), sizeof(CUtensorMap));
+    }
+    csv << device_id << ","
+        << stream_id << ","
+        << kernel_trace_id << ","
+        << unique_function_id << ","
+        << "\"" << kernel_name << "\"" << ","
+        << arg_index << ","
+        << arg_size << ","
+        << "kernelParams,"
+        << host_ptr_stream.str() << ","
+        << blob_path << "\n";
+  }
 }
 
 struct cuMemcpyHtoDAsync_v2_params_proxy {
@@ -1541,6 +1633,13 @@ void instrument_function_if_needed(CUcontext ctx, CUfunction func, int device_id
         } else if (opcode_str.rfind("UTMASTG", 0) == 0 && i == 0 &&
                    operand_str.find("[UR") != std::string::npos) {
           tma_desc_ureg_id = get_ur_register(operand_str);
+        } else if (is_descriptor_backed_tma_consumer_opcode(opcode_str) &&
+                   i + 1 == instr->getNumOperands() &&
+                   operand_str.find("[UR") != std::string::npos) {
+          uint32_t parsed_desc_ureg_id = extract_plain_ureg_id(operand_str);
+          if (parsed_desc_ureg_id != SECRET_UREG_DESC_NOT_USED) {
+            tma_desc_ureg_id = parsed_desc_ureg_id;
+          }
         }
         if (op->type == InstrType::OperandType::MREF) {
           mem_oper_idx++;
@@ -1597,6 +1696,14 @@ void instrument_function_if_needed(CUcontext ctx, CUfunction func, int device_id
           per_operand_type[num_of_injects] = traced_operand_instrument(TRACED_REG_TYPE::UNIFORM_PREDICATE, num_uses, op->u.reg.num);
           num_of_injects++;
         }
+      }
+      if (is_descriptor_backed_tma_consumer_opcode(opcode_str) &&
+          tma_desc_ureg_id == SECRET_UREG_DESC_NOT_USED) {
+        std::fprintf(stderr,
+                     "[TMA][Trace][Error] missing consumer descriptor UREG for opcode=%s pc=0x%llx\n",
+                     opcode_str.c_str(),
+                     static_cast<unsigned long long>(instr->getOffset()));
+        std::abort();
       }
       if (is_tma_desc_consumer_instruction && tma_desc_ureg_id != SECRET_UREG_DESC_NOT_USED) {
         tma_desc_ureg_by_pc[next_candidate_unique_function_id][vpc] = tma_desc_ureg_id;
@@ -1833,6 +1940,7 @@ void nvbit_at_cuda_event(CUcontext ctx, int is_exit, nvbit_api_cuda_t cbid,
         cubin_path = extrainfo_path + "/cubin";
         sass_path = extrainfo_path + "/sass";
         register_usage_path = extrainfo_path + "/register_usage";
+        kernel_launch_arg_blob_path = extrainfo_path + "/kernel_launch_arg_blobs";
         threadblock_trace_path = traces_path + "/threadblocks";
         threadblock_register_values_path = traces_path + "/threadblocks/register_values";
 
@@ -1848,6 +1956,7 @@ void nvbit_at_cuda_event(CUcontext ctx, int is_exit, nvbit_api_cuda_t cbid,
     if (enable_tma_desc) {
       create_folder(tma_htod_blob_path.c_str());
       create_folder(tensor_map_blob_path.c_str());
+      create_folder(kernel_launch_arg_blob_path.c_str());
       std::ofstream tma_dump_ofs(extrainfo_path + "/tma_htod_dump.csv", std::ios::out);
       if (tma_dump_ofs.is_open()) {
         tma_dump_ofs << "dump_id,device_id,stream_key,dst_device_hex,byte_count,preview_hex,blob_path\n";
@@ -1855,6 +1964,13 @@ void nvbit_at_cuda_event(CUcontext ctx, int is_exit, nvbit_api_cuda_t cbid,
       std::ofstream tensor_map_dump_ofs(extrainfo_path + "/tensor_map_encode_dump.csv", std::ios::out);
       if (tensor_map_dump_ofs.is_open()) {
         tensor_map_dump_ofs << "dump_id,device_id,tensor_map_ptr_hex,global_address_hex,tensor_data_type,tensor_rank,global_dim,global_strides,box_dim,element_strides,interleave,swizzle,l2_promotion,oob_fill,qword0_hex,qword1_hex,qword2_hex,qword3_hex,qword4_hex,qword5_hex,qword6_hex,qword7_hex,blob_path\n";
+      }
+      std::ofstream kernel_launch_arg_dump_ofs(
+          extrainfo_path + "/kernel_launch_arg_dump.csv", std::ios::out);
+      if (kernel_launch_arg_dump_ofs.is_open()) {
+        kernel_launch_arg_dump_ofs
+            << "device_id,stream_id,kernel_id,unique_function_id,kernel_name,"
+               "arg_index,arg_size,arg_storage,arg_host_ptr_hex,blob_path\n";
       }
     }
     if (enable_tma_desc) {
@@ -1980,10 +2096,14 @@ void nvbit_at_cuda_event(CUcontext ctx, int is_exit, nvbit_api_cuda_t cbid,
         
         auto it_map_unique_function_id = map_function_name_to_unique_function_id_with_variant.find(final_kernel_name);
         assert(it_map_unique_function_id != map_function_name_to_unique_function_id_with_variant.end());
-        dyn_trace.set_binary_version(binary_version);
-        auto stream_map = gpu_dev.streams();
         uint64_t stream_key = (uint64_t)p->hStream;
         stream_key = 0; // We use 0 as stream key for now, as we do not support multiple streams yet. WIPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP
+        append_kernel_launch_tensor_map_args_dump_event(
+            ctx, device_id, stream_key, kernel_id[device_id],
+            it_map_unique_function_id->second, final_kernel_name, p->f,
+            p->kernelParams);
+        dyn_trace.set_binary_version(binary_version);
+        auto stream_map = gpu_dev.streams();
         current_stream_id[device_id] = stream_key;
         dynamic_trace::cuda_stream &stream = (*gpu_dev.mutable_streams())[stream_key];
         stream.set_id(stream_key);

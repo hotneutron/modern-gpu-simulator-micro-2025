@@ -392,6 +392,9 @@ bool trace_warp_inst_t::parse_from_trace_struct(
   if(!trace.memadd_info.empty()) {
     data_size = trace.memadd_info[0]->width;
     tma_handle_hi = trace.memadd_info[0]->u_desc_value_hi;
+    tma_descriptor_ptr =
+        (static_cast<uint64_t>(trace.memadd_info[0]->u_desc_value_hi) << 32) |
+        static_cast<uint64_t>(trace.memadd_info[0]->u_desc_value);
     for (unsigned i = 0; i < config_warp_size; ++i) {
       set_addr(i, trace.memadd_info[0]->addrs[i]);
       if(trace.memadd_info.size() == 2){
@@ -400,6 +403,7 @@ bool trace_warp_inst_t::parse_from_trace_struct(
     }
   } else {
     tma_handle_hi = 0;
+    tma_descriptor_ptr = 0;
   }
 
 

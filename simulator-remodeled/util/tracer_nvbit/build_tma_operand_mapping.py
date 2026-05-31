@@ -86,31 +86,6 @@ def load_descriptor_refs(extra_info_dir: Path):
     return normalized
 
 
-def build_function_descriptor_index(descriptor_refs):
-    grouped = {}
-    for (unique_function_id, pc_hex), descriptor_ref in descriptor_refs.items():
-        if unique_function_id is None:
-            continue
-        grouped.setdefault(unique_function_id, {
-            "config_ids": set(),
-            "desc_reg_ids": set(),
-            "source_pcs": set(),
-        })
-        for config_id in descriptor_ref.get("config_ids", []):
-            grouped[unique_function_id]["config_ids"].add(config_id)
-        for desc_reg_id in descriptor_ref.get("desc_reg_ids", []):
-            grouped[unique_function_id]["desc_reg_ids"].add(desc_reg_id)
-        grouped[unique_function_id]["source_pcs"].add(pc_hex)
-    normalized = {}
-    for unique_function_id, value in grouped.items():
-        normalized[unique_function_id] = {
-            "config_ids": sorted(value["config_ids"]),
-            "desc_reg_ids": sorted(value["desc_reg_ids"]),
-            "source_pcs": sorted(value["source_pcs"], key=parse_pc_hex),
-        }
-    return normalized
-
-
 def build_runtime_groups(runtime_rows):
     grouped = {}
     for row in runtime_rows:
@@ -523,7 +498,7 @@ def operand_raw_samples(entry, operand_key):
     return entry.get("runtime_observed_values", {}).get(operand_key, {}).get("raw_value_lo_samples", [])
 
 
-def build_utmapf_descriptor_link(entry, resolver_entries, function_descriptor_index):
+def build_utmapf_descriptor_link(entry, resolver_entries):
     if not entry["opcode"].startswith("UTMAPF"):
         return None
     prefetch_operand_1 = operand_raw_samples(entry, "operand_1")
@@ -584,19 +559,12 @@ def build_utmapf_descriptor_link(entry, resolver_entries, function_descriptor_in
             "source": "matched_consumer_descriptor_ref",
         }
     else:
-        function_descriptor_ref = function_descriptor_index.get(unique_function_id, {})
-        if len(function_descriptor_ref.get("config_ids", [])) != 1:
-            return {
-                "status": "unresolved",
-                "match_rule": "exact_forward_utmaldg_operand_1",
-                "reason": "matched_consumer_has_no_descriptor_ref_and_function_descriptor_is_ambiguous",
-                "candidate_function_config_ids": function_descriptor_ref.get("config_ids", []),
-            }
-        matched_descriptor = {
-            "config_ids": function_descriptor_ref.get("config_ids", []),
-            "desc_reg_ids": function_descriptor_ref.get("desc_reg_ids", []),
-            "source_pcs": function_descriptor_ref.get("source_pcs", []),
-            "source": "unique_function_descriptor_config",
+        return {
+            "status": "unresolved",
+            "match_rule": "exact_forward_utmaldg_operand_1",
+            "reason": "matched_consumer_missing_exact_descriptor_ref",
+            "matched_consumer_pc_hex": matched.get("pc_hex"),
+            "matched_consumer_opcode": matched.get("opcode"),
         }
     return {
         "status": "matched",
@@ -625,7 +593,6 @@ def build_resolver(extra_info_dir: Path):
     discovery_data = json.loads(discovery_path.read_text())
     discovery_entries = collect_tma_entries(discovery_data)
     descriptor_refs = load_descriptor_refs(extra_info_dir)
-    function_descriptor_index = build_function_descriptor_index(descriptor_refs)
     runtime_rows = parse_jsonl(runtime_path)
     runtime_groups = build_runtime_groups(runtime_rows)
 
@@ -652,7 +619,8 @@ def build_resolver(extra_info_dir: Path):
         descriptor_ref = descriptor_refs.get(key)
         if descriptor_ref is None and entry["unique_function_id"] is None:
             descriptor_ref = next(
-                (value for (ufid, pc), value in descriptor_refs.items() if pc == entry["pc_hex"]),
+                (value for (_, pc), value in descriptor_refs.items()
+                 if pc == entry["pc_hex"]),
                 None,
             )
         inferred_operand_kinds = infer_operand_kinds({
@@ -689,7 +657,7 @@ def build_resolver(extra_info_dir: Path):
             resolver_entry["descriptor_ref"] = descriptor_ref
         resolver.append(resolver_entry)
     for resolver_entry in resolver:
-        descriptor_link = build_utmapf_descriptor_link(resolver_entry, resolver, function_descriptor_index)
+        descriptor_link = build_utmapf_descriptor_link(resolver_entry, resolver)
         if descriptor_link:
             resolver_entry["descriptor_link"] = descriptor_link
     return {
