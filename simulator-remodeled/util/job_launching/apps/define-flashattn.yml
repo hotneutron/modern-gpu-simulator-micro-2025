@@ -17,7 +17,7 @@ flashattn:
                     TRACER_XELF_PREFER_SUBSTR: hdim128
                   accel-sim-mem: 16G
                   qos: all
-                  openmp-cpus: 4
+                  openmp-cpus: 64
         - flashattn-fa3-bf16-bwd-causal-b1-s2048-hd64-nh24:
             exe: flashattn_runner
             runs:
@@ -33,4 +33,4 @@ flashattn:
                     TRACER_XELF_PREFER_SUBSTR: hdim64
                   accel-sim-mem: 24G
                   qos: all
-                  openmp-cpus: 4
+                  openmp-cpus: 64
