@@ -167,7 +167,8 @@ bool inst_trace_t::check_opcode_contain(const std::vector<std::string> &opcode,
 
 unsigned inst_trace_t::get_datawidth_from_opcode(
     const std::vector<std::string> &opcode) const {
-  if(opcode[0].find("LDSM") != std::string::npos) {
+  if(opcode[0].find("LDSM") != std::string::npos ||
+     opcode[0].find("STSM") != std::string::npos) {
     if (is_number(opcode[opcode.size() - 1])) {
         int num_matrix = std::stoi(opcode[opcode.size() - 1], NULL);
         unsigned int total_size = num_matrix * 32;

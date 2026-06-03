@@ -490,6 +490,11 @@ bool trace_warp_inst_t::parse_from_trace_struct(
       assert(data_size > 0);
       space.set_type(shared_space);
       break;
+    case OP_STSM:
+      assert(data_size > 0);
+      memory_op = memory_store;
+      space.set_type(shared_space);
+      break;
     case OP_ST:
     case OP_LD:
       assert(data_size > 0);

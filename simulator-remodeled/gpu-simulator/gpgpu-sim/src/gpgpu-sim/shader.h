@@ -2099,6 +2099,7 @@ class shader_core_config : public core_config {
   unsigned int num_cycles_to_wait_to_dispatch_another_inst_from_subcore_to_sm_shared_pipeline_when_is_dp_inst;
   unsigned int memory_shared_memory_minimum_latency;
   unsigned int memory_shared_memory_extra_latency_ldsm_multiple_matrix;
+  unsigned int memory_shared_memory_extra_latency_stsm_multiple_matrix;
   unsigned int memmory_max_concurrent_requests_shmem_per_sm;
   unsigned int memmory_max_concurrent_requests_standard_per_sm;
   unsigned int sm_memory_unit_l1c_access_queue_size;

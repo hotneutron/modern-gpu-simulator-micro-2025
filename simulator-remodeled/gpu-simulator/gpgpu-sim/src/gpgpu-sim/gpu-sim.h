@@ -63,6 +63,7 @@
 #define GPU_SIM_H
 
 #include <stdio.h>
+#include <algorithm>
 #include <fstream>
 #include <iostream>
 #include <list>
@@ -588,7 +589,14 @@ class gpgpu_sim_config : public power_config,
 
     m_shader_config.cycles_needed_for_address_calculation = ceil(m_shader_config.warp_size / m_shader_config.memory_num_scalar_units_per_subcore);
     m_shader_config.maximum_l1d_latency_at_sm_structure = m_shader_config.memory_l1d_minimum_latency + m_shader_config.memory_maximum_coalescing_cycles;
-    m_shader_config.maximum_shared_memory_latency_at_sm_structure = m_shader_config.memory_shared_memory_minimum_latency + m_shader_config.memory_maximum_coalescing_cycles + m_shader_config.memory_shared_memory_extra_latency_ldsm_multiple_matrix;
+    // This is the depth of the shared-memory pipeline structure, so it must be
+    // provisioned for the slowest shared-memory matrix op that can occupy it.
+    m_shader_config.maximum_shared_memory_latency_at_sm_structure =
+        m_shader_config.memory_shared_memory_minimum_latency +
+        m_shader_config.memory_maximum_coalescing_cycles +
+        std::max(
+            m_shader_config.memory_shared_memory_extra_latency_ldsm_multiple_matrix,
+            m_shader_config.memory_shared_memory_extra_latency_stsm_multiple_matrix);
   
     // Parse inter-warp coalescing selection policy
     std::string iwc_policy_str = m_shader_config.interwarp_coalescing_selection_policy_string;
