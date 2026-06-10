@@ -162,6 +162,39 @@ Confirmed examples:
 - `SYNCS.PHASECHK.TRANS64 P0, [R6+URZ], R11`
 - `SYNCS.PHASECHK.TRANS64 P0, [UR17], R5`
 
+### IMPORTANT: classify arrive by operand, not by suffix
+
+The `SYNCS.ARRIVE.TRANS64` suffix spelling is **not** a reliable kind signal. It
+differs between toolchains:
+
+- nvcc microbenches emit `.A1T0`, `.ART0`, `.RED.A0TR`
+- the CUTLASS FA3 build emits `.A1T0`, `.RED.A0T1`, `.RED.A1T0`, and suffix-less
+
+These two sets do not overlap, so the same logical operation has different suffixes
+in different builds. The `AxTy` digits are a 3-state field per slot (`0` = value 0,
+`1` = immediate 1, `R` = value comes from the register operand), not a pair of
+booleans. This is why earlier `A1=arriveON / T0=txOFF` boolean reading was wrong.
+
+The reliable discriminator is the **semantic operand (operand 3)**:
+
+- operand 3 = `RZ` (or runtime `semantic_raw == 0`) → **plain arrive** (no tx bytes)
+- operand 3 = register (runtime `semantic_raw != 0`) → **arrive expect-tx** (tx bytes)
+
+Validated against the new FA3 trace: the `.RED.A1T0` variant (operand 3 = `RZ`)
+only targets the count-closed barriers and never carries tx bytes, i.e. it is a
+plain/counted arrive, **not** expect-tx. Only the register-operand variant is
+expect-tx.
+
+> **Note (runtime-validated vs static-only).** In the FA3-bwd trace
+> (`b1-s2048-hd64`, causal) only two arrive variants actually execute:
+> suffix-less `SYNCS.ARRIVE.TRANS64` (expect-tx) and `.RED.A1T0` (plain). The
+> `.A1T0` and `.RED.A0T1` variants exist in the SASS binary but never run for this
+> input, so their semantics are unverified. The toolchain now guards against this:
+> `build_sync_operand_mapping.py` (`VALIDATED_ARRIVE_OPCODES`) and
+> `remodeling/sm.cc` (`is_validated_arrive_opcode`) reject any unvalidated arrive
+> variant that executes (`SystemExit` / `abort()`). The simulator branches on the
+> runtime `semantic_raw`, not the suffix. See `.plan/SYNC_ISA.md`.
+
 ### Sync Kind Table
 
 | `sync_kind` | barrier operand | semantic operand | simulator normalized field | simulator meaning |
@@ -203,25 +236,39 @@ Two-phase parity model is enough for sync MVP:
 - decode:
 
 ```cpp
-expected_arrive_count = 0x200000 - exch_arrive_count_encoded_raw;
+// raw is encoded at 2x the logical init count (validated, see Validated Findings)
+expected_arrive_count = (0x200000 - exch_arrive_count_encoded_raw) / 2;
 ```
 
 - clear phase-local counters
 
 #### `ARRIVE_COUNTED` or implicit arrive
 
-- increment `arrive_count`
+- increment `arrive_count` by the **active thread count** (`inst.active_count()`).
+  mbarrier counts arrivals in thread units; one `SYNCS.ARRIVE` instruction adds one
+  arrival per active thread (not 1 per warp). Validated against FA3: count barrier
+  arrive has `active_mask=0xffffffff` (+32/warp), tx barrier arrive has
+  `active_mask=0x1` (+1).
 - optionally preserve returned wait token for debug
 
 #### `ARRIVE_EXPECT_TX`
 
-- `expected_tx_bytes += expect_tx_bytes_raw`
+- `arrive_count += active_threads` **and** `expected_tx_bytes += expect_tx_bytes_raw`
+  (the expect-tx arrive also counts as an arrival in hardware). No extra arrive is
+  needed on TMA completion: the logical `expected_arrive_count` for a tx barrier is 1,
+  which the single expect-tx arrive already satisfies.
 
 #### `PHASECHK` / `TRYWAIT`
 
 - use `barrier_addr` to find the barrier object
 - use `wait_state_raw` only to test state against that barrier
 - do **not** use `wait_state_raw` to find the barrier
+- the input phase parity is encoded in **bit 31** of `wait_state_raw`
+  (`(wait_state_raw >> 31) & 1`), not bit 0
+- completion polarity is **`!=`**: the wait proceeds when the barrier's current
+  phase parity DIFFERS from the input parity (the waited-on phase has flipped
+  away); equality means keep waiting. See `.plan/SYNC_ISA.md` and the NVIDIA CUDA
+  Programming Guide §4.9.
 
 #### Ready Condition
 
@@ -235,7 +282,14 @@ completed_tx_bytes >= expected_tx_bytes
 On ready:
 
 - flip phase parity
-- clear or re-arm the phase according to chosen lifecycle rules
+- reset only the per-phase accumulators (`arrive_count`, `completed_tx_bytes`,
+  `expected_tx_bytes`) to 0
+- **preserve `expected_arrive_count`**: `EXCH` (= `mbarrier.init`) runs exactly once
+  per barrier (validated in FA3 traces: 1 EXCH vs many phases) and the hardware
+  reuses the same expected arrive count on every phase. Clearing it on flip would
+  let the next phase become ready after a single arrive (`arrive_count > 0 >= 0`),
+  causing premature flips. (`expected_tx_bytes` is reset because the expect-tx
+  arrive re-sets it each phase.)
 
 ## PHASECHK / TRYWAIT Meaning
 
@@ -259,7 +313,10 @@ mbarrier_wait(bar, state);
 So:
 
 - `barrier_addr` selects the barrier object
-- `wait_state_raw` is compared against that barrier's current phase/state
+- `wait_state_raw` carries the input phase parity in **bit 31**; the wait proceeds
+  when `barrier.phase != ((wait_state_raw >> 31) & 1)` (DIFFERS = the waited-on
+  phase has flipped). See `.plan/SYNC_ISA.md` for the validated truth table and the
+  FA3-bwd deadlock this polarity fixed.
 
 ## Validated Findings
 
@@ -271,15 +328,30 @@ The following findings are now validated by generated microbench traces:
   - `2 -> 0x1ffffc`
   - `4 -> 0x1ffff8`
   - `8 -> 0x1ffff0`
-- these values match:
+- so `0x200000 - raw == 2 * init_arrivals`, i.e. the raw encodes **2x** the logical
+  init count. The decode is therefore:
 
 ```cpp
-expected_arrive_count = 0x200000 - raw;
+expected_arrive_count = (0x200000 - raw) / 2;
 ```
 
-- therefore, the current validated decode base is `0x200000`, not `0x2000000`
+- therefore, the current validated decode base is `0x200000`, not `0x2000000`, and the
+  raw is scaled by 2
 - relevant producer/consumer pairing must be checked by barrier address, not by assuming the first `EXCH` site in the kernel is the producer for a later `PHASECHK`
 - a later `PHASECHK` may legitimately pair with a different `EXCH` site on the same barrier address, for example `EXCH [UR17]` with later `PHASECHK [UR17]`
+
+### Validated on FA3 (new trace)
+
+Decoding the new FA3 per-CTA `.pb` joined with `sync_operand_resolver.json` across many
+`kernel_10` CTAs shows FA3-bwd uses exactly two barrier roles:
+
+- tx barriers `0x31000/10/18/30/38`: `0x200000 - raw = 2`, closed by **tx bytes**
+  (arrive operand 3 = register, e.g. `0x4200` / `0x8000`); arrive count is not the gate.
+- count barriers `0x31020/28/40/48`: `0x200000 - raw = 512` (logical `256`), closed by
+  **arrive count**; arrives here are `.RED.A1T0` with operand 3 = `RZ` (plain arrive).
+
+This validates the operand-based arrive classification above on real FA3, not just
+microbenches.
 
 ## Where Fields Live
 

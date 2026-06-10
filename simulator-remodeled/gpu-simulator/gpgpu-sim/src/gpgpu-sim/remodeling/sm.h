@@ -339,7 +339,7 @@ class SM : public core_t, public shader_core_ctx_wrapper {
   HopperMBarrierObject &get_or_create_sync_barrier(
       const HopperMBarrierKey &key);
   void recompute_sync_barrier_ready_and_maybe_flip_phase(
-      HopperMBarrierObject &barrier);
+      HopperMBarrierObject &barrier, uint64_t barrier_addr);
   bool is_sync_wait_satisfied(
       const HopperMBarrierPendingWait &pending_wait) const;
   void clear_sync_barrier_state_for_cta(unsigned int cta_id);
@@ -398,7 +398,8 @@ class SM : public core_t, public shader_core_ctx_wrapper {
   mutable std::vector<HopperMBarrierPendingWait> m_pending_sync_waits;
   std::vector<std::deque<HopperMBarrierPendingTxBinding>>
       m_pending_tma_barrier_binds_per_warp;
-  uint64_t m_sync_debug_print_budget = 200;
+  uint64_t m_sync_debug_print_budget = 20000000;
+  uint64_t m_sync_debug_skip_runtime_budget = 1024;
   uint64_t m_sync_debug_sync_insts = 0;
   uint64_t m_sync_debug_exch = 0;
   uint64_t m_sync_debug_arrive = 0;
