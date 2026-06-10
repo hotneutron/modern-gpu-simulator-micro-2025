@@ -3053,8 +3053,10 @@ class shader_core_ctx : public core_t, public shader_core_ctx_wrapper {
     assert(k);
     m_kernel = k;
     //        k->inc_running();
-    printf("GPGPU-Sim uArch: Shader %d bind to kernel %u \'%s\'\n", m_sid,
-           m_kernel->get_uid(), m_kernel->name().c_str());
+    printf(
+        "GPGPU-Sim uArch: Shader %d bind to kernel launch_uid=%u trace_kernel_id=%u \'%s\'\n",
+        m_sid, m_kernel->get_uid(), m_kernel->get_trace_kernel_id(),
+        m_kernel->name().c_str());
   }
   PowerscalingCoefficients *scaling_coeffs;
   // accessors

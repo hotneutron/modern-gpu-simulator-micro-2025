@@ -130,6 +130,10 @@ class trace_kernel_info_t : public kernel_info_t {
     return m_kernel_trace_info->cuda_stream_id;
   }
 
+  unsigned get_trace_kernel_id() const override {
+    return m_kernel_trace_info ? m_kernel_trace_info->kernel_id : 0;
+  }
+
   kernel_trace_t *get_trace_info() { return m_kernel_trace_info; }
 
   bool was_launched() { return m_was_launched; }

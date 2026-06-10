@@ -91,7 +91,6 @@
 #include "../../util/traces_enhanced/src/traced_instruction.h"
 #include "../../util/traces_enhanced/src/string_utilities.h"
 
-
 void advance_trace_cta_id(kernel_trace_t *kernel_trace_info) {
   if(kernel_trace_info->next_tb_to_parse_x < (kernel_trace_info->grid_dim_x - 1)){
     kernel_trace_info->next_tb_to_parse_x++; 

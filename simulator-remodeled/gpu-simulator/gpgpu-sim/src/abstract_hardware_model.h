@@ -307,6 +307,7 @@ class kernel_info_t {
            m_next_tid.x < m_block_dim.x;
   }
   unsigned get_uid() const { return m_uid; }
+  virtual unsigned get_trace_kernel_id() const { return 0; }
   std::string get_name() const { return name(); }
   std::string name() const;
 
