@@ -24,7 +24,20 @@ def collect_tma_entries(node, current_unique_function_id=None, entries=None):
         next_unique_function_id = current_unique_function_id
         if "unique_function_id" in node and node["unique_function_id"] is not None:
             next_unique_function_id = node["unique_function_id"]
-        if "pc_hex" in node and "opcode" in node and "text" in node:
+        # Only collect real instruction-site records from tma_discovery.json.
+        # Nested producer-search/debug candidate objects also carry pc/opcode/text,
+        # but they are not executable TMA sites and must not participate in
+        # runtime operand merging.
+        if (
+            "pc" in node
+            and "pc_hex" in node
+            and "opcode" in node
+            and "text" in node
+            and "role" in node
+            and "desc_refs" in node
+            and "desc_regs" in node
+            and "support_regs" in node
+        ):
             entries.append({
                 "unique_function_id": next_unique_function_id,
                 "pc_hex": node["pc_hex"],
@@ -67,7 +80,7 @@ def load_descriptor_refs(extra_info_dir: Path):
     data = json.loads(path.read_text())
     mapping = {}
     for entry in data.get("resolver", []):
-        key = (entry.get("unique_function_id"), entry.get("pc_hex"))
+        key = (entry.get("unique_function_id"), entry.get("pc_hex"), entry.get("opcode"))
         mapping.setdefault(key, {
             "config_ids": set(),
             "desc_reg_ids": set(),
@@ -88,7 +101,7 @@ def load_descriptor_refs(extra_info_dir: Path):
 
 def build_function_descriptor_index(descriptor_refs):
     grouped = {}
-    for (unique_function_id, pc_hex), descriptor_ref in descriptor_refs.items():
+    for (unique_function_id, pc_hex, opcode), descriptor_ref in descriptor_refs.items():
         if unique_function_id is None:
             continue
         grouped.setdefault(unique_function_id, {
@@ -114,7 +127,12 @@ def build_function_descriptor_index(descriptor_refs):
 def build_runtime_groups(runtime_rows):
     grouped = {}
     for row in runtime_rows:
-        key = (row.get("unique_function_id"), row.get("pc_hex"), row.get("callback_index"))
+        key = (
+            row.get("unique_function_id"),
+            row.get("pc_hex"),
+            row.get("opcode"),
+            row.get("callback_index"),
+        )
         if key not in grouped:
             grouped[key] = {
                 "callback_index": row.get("callback_index"),
@@ -157,17 +175,17 @@ def keep_nontrivial_sample_field(samples):
     return any(sample not in (0, None) for sample in samples)
 
 
-def find_matching_runtime_keys(runtime_groups, unique_function_id, pc_hex):
+def find_matching_runtime_keys(runtime_groups, unique_function_id, pc_hex, opcode):
     direct = sorted(
         key for key in runtime_groups
-        if key[0] == unique_function_id and key[1] == pc_hex
+        if key[0] == unique_function_id and key[1] == pc_hex and key[2] == opcode
     )
     if direct:
         return direct
     if unique_function_id is None:
         by_pc = sorted(
             key for key in runtime_groups
-            if key[1] == pc_hex
+            if key[1] == pc_hex and key[2] == opcode
         )
         return by_pc
     return []
@@ -631,15 +649,16 @@ def build_resolver(extra_info_dir: Path):
 
     resolver = []
     for entry in discovery_entries:
-        key = (entry["unique_function_id"], entry["pc_hex"])
+        key = (entry["unique_function_id"], entry["pc_hex"], entry["opcode"])
         operands = parse_operands_from_text(entry["opcode"], entry["text"])
         callback_groups = []
         matched_runtime_keys = find_matching_runtime_keys(
-            runtime_groups, entry["unique_function_id"], entry["pc_hex"]
+            runtime_groups, entry["unique_function_id"], entry["pc_hex"],
+            entry["opcode"]
         )
         for matched_key in matched_runtime_keys:
             callback_group = dict(runtime_groups[matched_key])
-            callback_index = matched_key[2]
+            callback_index = matched_key[3]
             if callback_index < len(operands):
                 callback_group["operand_position"] = callback_index + 1
                 callback_group["operand_text"] = operands[callback_index]["text"]
@@ -652,7 +671,11 @@ def build_resolver(extra_info_dir: Path):
         descriptor_ref = descriptor_refs.get(key)
         if descriptor_ref is None and entry["unique_function_id"] is None:
             descriptor_ref = next(
-                (value for (ufid, pc), value in descriptor_refs.items() if pc == entry["pc_hex"]),
+                (
+                    value
+                    for (ufid, pc, op), value in descriptor_refs.items()
+                    if pc == entry["pc_hex"] and op == entry["opcode"]
+                ),
                 None,
             )
         inferred_operand_kinds = infer_operand_kinds({
@@ -702,6 +725,59 @@ def build_resolver(extra_info_dir: Path):
     }
 
 
+def site_requires_descriptor_binding(entry):
+    opcode = entry.get("opcode") or ""
+    operand_form = entry.get("operand_form")
+    if opcode.startswith(("UTMALDG", "UTMASTG", "UTMAREDG", "UTMAPF")):
+        return True
+    if opcode.startswith("UBLKRED") and operand_form == "descriptor_backed":
+        return True
+    return False
+
+
+def site_has_descriptor_binding(entry):
+    opcode = entry.get("opcode") or ""
+    if opcode.startswith("UTMAPF"):
+        descriptor_link = entry.get("descriptor_link", {})
+        if descriptor_link.get("status") != "matched":
+            return False
+        matched_descriptor = descriptor_link.get("matched_descriptor", {})
+        config_ids = matched_descriptor.get("config_ids", [])
+        return len(config_ids) == 1
+    descriptor_ref = entry.get("descriptor_ref", {})
+    config_ids = descriptor_ref.get("config_ids", [])
+    return len(config_ids) > 0
+
+
+def format_missing_descriptor_binding(entry):
+    descriptor_ref = entry.get("descriptor_ref", {})
+    descriptor_link = entry.get("descriptor_link", {})
+    return (
+        "[TMA][OperandMapping][Error] descriptor-required runtime-observed site has no "
+        "validated descriptor binding: "
+        f"ufid={entry.get('unique_function_id')} "
+        f"pc={entry.get('pc_hex')} "
+        f"opcode={entry.get('opcode')} "
+        f"operand_form={entry.get('operand_form')} "
+        f"descriptor_ref_config_ids={descriptor_ref.get('config_ids', [])} "
+        f"descriptor_link_status={descriptor_link.get('status')} "
+        f"descriptor_link_reason={descriptor_link.get('reason')}"
+    )
+
+
+def verify_descriptor_required_sites_or_fail(payload):
+    failures = [
+        entry
+        for entry in payload.get("resolver", [])
+        if entry.get("runtime_observed")
+        and site_requires_descriptor_binding(entry)
+        and not site_has_descriptor_binding(entry)
+    ]
+    if not failures:
+        return
+    raise SystemExit("\n".join(format_missing_descriptor_binding(entry) for entry in failures))
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("extra_info_dir", type=Path)
@@ -712,6 +788,7 @@ def main():
     payload = build_resolver(extra_info_dir)
     if payload is None:
         return
+    verify_descriptor_required_sites_or_fail(payload)
     resolver_out = args.resolver_out or (extra_info_dir / "tma_operand_resolver.json")
     resolver_out.write_text(json.dumps(payload, indent=2) + "\n")
 

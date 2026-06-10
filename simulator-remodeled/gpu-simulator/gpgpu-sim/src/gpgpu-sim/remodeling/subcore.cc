@@ -27,6 +27,7 @@
 // POSSIBILITY OF SUCH DAMAGE.
 
 #include <cassert>
+#include <cstdio>
 #include <memory>
 
 #include "subcore.h"
@@ -297,6 +298,24 @@ void Subcore::allocate(SM *shared_sm) {
       rf_requests.m_uniform = m_uniform_rf->is_possible_to_read_cacheable(current_ins, sm_warp_id, m_config->warp_size);
       bool is_read_available = rf_requests.is_possible_to_read();
       unsigned int target_latency_execution = latency_read_fixed_latency_inst + current_ins->latency  + current_ins->initiation_interval;
+      // #region debug-point bitset-latency-overflow
+      if (target_latency_execution >= 512) {
+        std::fprintf(stderr,
+                     "[BITSETDBG][Subcore] overflow sid=%u subcore=%u warp=%u "
+                     "ufid=%u pc=0x%llx op=%u op_pipe=%u tma_family=%u "
+                     "lat_read=%u latency=%u initiation=%u target=%u\n",
+                     shared_sm->get_sid(), m_subcore_id, current_ins->warp_id(),
+                     current_ins->unique_function_id,
+                     static_cast<unsigned long long>(current_ins->pc),
+                     static_cast<unsigned>(current_ins->op),
+                     static_cast<unsigned>(current_ins->op_pipe),
+                     static_cast<unsigned>(current_ins->tma_opcode_family),
+                     latency_read_fixed_latency_inst, current_ins->latency,
+                     current_ins->initiation_interval, target_latency_execution);
+        assert(target_latency_execution < 512 &&
+               "bitset latency overflow before functional_unit::is_latency_available");
+      }
+      // #endregion debug-point bitset-latency-overflow
       bool is_fu_latency_available = fu->is_latency_available(target_latency_execution);
       bool is_rf_ready = is_read_available;
       shared_sm->m_sm_stats.m_stats_map["total_num_evals_rf"]->increment_with_integer(1);

@@ -317,7 +317,14 @@ static sync_runtime_capture_kind get_sync_runtime_capture_kind(
   if (opcode.rfind("SYNCS.EXCH", 0) == 0) {
     return sync_runtime_capture_kind::EXCH;
   }
-  if (opcode.rfind("SYNCS.ARRIVE.TRANS64.RED.A0TR", 0) == 0) {
+  // Both SYNCS.ARRIVE.TRANS64 variants (the bare form and the ".RED.*"
+  // reduction form) are captured identically: operand 2 is recorded as the
+  // candidate expect-tx semantic. Statically the ".RED" form shows RZ in
+  // operand 2 (captured as a zero literal -> semantic_raw == 0) while the bare
+  // form shows a real register. Capturing both lets the runtime semantic_raw
+  // value decide ARRIVE vs ARRIVE_EXPECT_TX instead of baking in an unverified
+  // assumption about what ".RED" means.
+  if (opcode.rfind("SYNCS.ARRIVE.TRANS64", 0) == 0) {
     return sync_runtime_capture_kind::ARRIVE_EXPECT_TX;
   }
   if (opcode.rfind("SYNCS.PHASECHK", 0) == 0) {
@@ -632,6 +639,9 @@ static void append_tma_runtime_operand_debug_event(
     return;
   }
   uint64_t first_lane_addr = ma->addrs_or_reg_val_0[first_lane];
+  // #region debug-point tracer-desc-validity
+  const bool desc_valid = ma->ureg_desc_id != SECRET_UREG_DESC_NOT_USED;
+  // #endregion debug-point tracer-desc-validity
   std::ostringstream pc_stream;
   pc_stream << "0x" << std::hex << ma->vpc;
   ofs << "{"
@@ -651,6 +661,9 @@ static void append_tma_runtime_operand_debug_event(
       << "\"value_3\":" << ma->reg_val_3[first_lane] << ","
       << "\"first_lane_addr\":" << first_lane_addr << ","
       << "\"width\":" << ma->width << ","
+      // #region debug-point tracer-desc-validity
+      << "\"desc_valid\":" << (desc_valid ? "true" : "false") << ","
+      // #endregion debug-point tracer-desc-validity
       << "\"desc_reg_id\":" << ma->ureg_desc_id << ","
       << "\"desc_value_lo\":" << ma->ureg_desc_value << ","
       << "\"desc_value_hi\":" << ma->ureg_desc_value_hi << ","

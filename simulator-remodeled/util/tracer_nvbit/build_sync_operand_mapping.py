@@ -5,6 +5,26 @@ import json
 from pathlib import Path
 
 
+# SYNCS.ARRIVE.TRANS64 variants whose operand/semantics have been validated
+# against real runtime traces (see .plan/SYNC_ISA.md). Any other arrive variant
+# that actually executes is rejected by classify_sync_opcode().
+#
+# Classification is driven at runtime by the captured semantic_raw, so each
+# validated variant only needs a confirmed operand layout (operand2 = barrier's
+# semantic input), not a fixed static kind:
+#   - semantic_raw == 0  -> simple ARRIVE
+#   - semantic_raw != 0  -> ARRIVE_EXPECT_TX
+VALIDATED_ARRIVE_OPCODES = {
+    # CUTLASS / FA3 (observed executing)
+    "SYNCS.ARRIVE.TRANS64",            # suffix-less, operand2 = register (tx bytes)
+    "SYNCS.ARRIVE.TRANS64.RED.A1T0",  # operand2 = RZ (plain arrive)
+    # nvcc microbenches (observed executing)
+    "SYNCS.ARRIVE.TRANS64.RED.A0TR",  # operand2 = register (tx bytes)
+    "SYNCS.ARRIVE.TRANS64.ART0",      # operand2 = register, runtime value 0 (plain arrive)
+    "SYNCS.ARRIVE.TRANS64.A1T0",      # operand2 = RZ (plain arrive)
+}
+
+
 def classify_sync_opcode(opcode: str):
     if opcode.startswith("SYNCS.EXCH"):
         return {
@@ -13,26 +33,35 @@ def classify_sync_opcode(opcode: str):
             "semantic_operand_index": 2,
             "semantic_operand_role": "EXCH_ARRIVE_COUNT_ENCODED",
         }
-    if opcode.startswith("SYNCS.ARRIVE.TRANS64.RED.A0TR"):
+    # All SYNCS.ARRIVE.TRANS64 variants are recorded with operand 2 as the
+    # semantic input and labelled ARRIVE_EXPECT_TX. The actual ARRIVE vs
+    # ARRIVE_EXPECT_TX decision is made at runtime in the simulator from the
+    # captured semantic_raw (see remodeling/sm.cc):
+    #   - semantic_raw == 0  -> simple ARRIVE (no tx bytes)
+    #   - semantic_raw != 0  -> ARRIVE_EXPECT_TX
+    #
+    # Only two arrive variants have been validated end-to-end against real
+    # runtime traces (see .plan/SYNC_ISA.md):
+    #   - "SYNCS.ARRIVE.TRANS64"          (suffix-less, operand2 = register, tx bytes)
+    #   - "SYNCS.ARRIVE.TRANS64.RED.A1T0" (operand2 = RZ, plain arrive)
+    # Other statically-present variants (e.g. ".RED.A0T1", ".A1T0", nvcc ".ART0")
+    # were never observed executing, so their semantics are unverified. If any
+    # such variant actually executes it must be validated before trusting it;
+    # we flag it here so the resolver build fails loudly instead of silently
+    # mislabelling it.
+    if opcode.startswith("SYNCS.ARRIVE.TRANS64"):
+        if opcode not in VALIDATED_ARRIVE_OPCODES:
+            raise SystemExit(
+                "unvalidated SYNCS.ARRIVE.TRANS64 variant executed: "
+                f"'{opcode}'. Only {sorted(VALIDATED_ARRIVE_OPCODES)} are "
+                "validated. Validate its operand/semantics (see "
+                ".plan/SYNC_ISA.md) before adding it here."
+            )
         return {
             "sync_kind": "ARRIVE_EXPECT_TX",
             "barrier_operand_index": 1,
             "semantic_operand_index": 2,
             "semantic_operand_role": "EXPECT_TX_BYTES",
-        }
-    if opcode.startswith("SYNCS.ARRIVE.TRANS64.ART0"):
-        return {
-            "sync_kind": "ARRIVE_COUNTED",
-            "barrier_operand_index": 1,
-            "semantic_operand_index": 2,
-            "semantic_operand_role": "ARRIVE_COUNT",
-        }
-    if opcode.startswith("SYNCS.ARRIVE.TRANS64.A1T0"):
-        return {
-            "sync_kind": "ARRIVE",
-            "barrier_operand_index": 1,
-            "semantic_operand_index": None,
-            "semantic_operand_role": "NONE",
         }
     if opcode.startswith("SYNCS.PHASECHK"):
         return {

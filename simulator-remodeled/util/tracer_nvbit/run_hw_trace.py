@@ -40,7 +40,6 @@ parser.add_option("-l", "--limit_kernel_number", dest='kernel_number', default=-
                         "number of traced limits")
 parser.add_option("-t", "--terminate_upon_limit", dest='terminate_upon_limit', action="store_true", help="Once the kernel limit is " +\
                         "reached, terminate the tracing process")
-
 # MOD. Begin. Improved tracer
 parser.add_option("-C", "--compressed", dest="compressed", action="store_true", 
                  help="It runs the tracer in compressed mode", default="0")
@@ -79,7 +78,10 @@ def build_tma_descriptor_mapping_if_available(trace_folder):
     if not all(os.path.exists(path) for path in mapping_inputs):
         return
     mapping_script = os.path.join(this_directory, "build_tma_descriptor_mapping.py")
-    subprocess.run([sys.executable, mapping_script, extra_info_dir], check=True)
+    subprocess.run(
+        [sys.executable, mapping_script, extra_info_dir, "--fail-on-missing-binding"],
+        check=True,
+    )
 
 
 def build_tma_operand_mapping_if_available(trace_folder):

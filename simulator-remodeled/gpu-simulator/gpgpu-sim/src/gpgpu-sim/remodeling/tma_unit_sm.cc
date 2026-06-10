@@ -136,6 +136,18 @@ bool tma_family_requires_descriptor(TMAOpcodeFamily family) {
   }
 }
 
+bool tma_site_requires_descriptor(TMAOpcodeFamily family,
+                                  TMAOperandForm operand_form) {
+  if (tma_family_requires_descriptor(family)) {
+    return true;
+  }
+  if (family == TMAOpcodeFamily::UBLKRED &&
+      operand_form == TMAOperandForm::EXPLICIT_DESC) {
+    return true;
+  }
+  return false;
+}
+
 bool tma_family_requires_operand_metadata(TMAOpcodeFamily family) {
   switch (family) {
     case TMAOpcodeFamily::UBLKCP:
@@ -387,10 +399,13 @@ TMACommand tma_unit_sm::build_tma_command(const warp_inst_t &inst) const {
          "Phase 2 expected runtime-observed operand resolver entry for executed TMA op");
   assert(metadata.runtime_observed &&
          "Phase 2 expected runtime_observed=true for executed TMA op");
-  if (tma_family_requires_descriptor(cmd.opcode_family)) {
-    assert(metadata.valid && "Phase 2 expected TMA metadata for descriptor-backed family");
+  if (tma_site_requires_descriptor(cmd.opcode_family, cmd.operand_form)) {
+    assert(metadata.valid &&
+           "Phase 2 expected TMA metadata for descriptor-required TMA site");
     assert(metadata.has_descriptor_metadata &&
-           "Phase 2 missing descriptor metadata for descriptor-backed TMA family");
+           "Phase 2 missing descriptor metadata for descriptor-required TMA site");
+    assert(!cmd.config_id.empty() &&
+           "Phase 2 missing config_id for descriptor-required TMA site");
   }
   if (tma_family_requires_operand_metadata(cmd.opcode_family)) {
     assert(metadata.valid && "Phase 2 expected TMA metadata for operand-sensitive family");

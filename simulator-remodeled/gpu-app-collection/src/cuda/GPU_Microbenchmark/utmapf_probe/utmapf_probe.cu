@@ -407,8 +407,8 @@ static __device__ __forceinline__ int nth_aux_barrier_slot(int main_slot,
 }
 
 template <Variant V>
-__device__ void run_probe(const CUtensorMap &tensor_map_a,
-                          const CUtensorMap &tensor_map_b,
+__device__ void run_probe(const CUtensorMap *tensor_map_a,
+                          const CUtensorMap *tensor_map_b,
                           int coord0,
                           int coord1,
                           int coord2,
@@ -442,13 +442,13 @@ __device__ void run_probe(const CUtensorMap &tensor_map_a,
   __syncthreads();
   if (threadIdx.x == 0) {
     uint64_t *bar = &barriers[barrier_slot * 2];
-    const CUtensorMap *prefetch_map = &tensor_map_a;
+    const CUtensorMap *prefetch_map = tensor_map_a;
     int pf_coord0 = coord0;
     int pf_coord1 = coord1;
     int pf_coord2 = coord2;
     int pf_coord3 = coord3;
     if constexpr (V == Variant::Operand1Alt) {
-      prefetch_map = &tensor_map_b;
+      prefetch_map = tensor_map_b;
     }
     if constexpr (V == Variant::Operand2Alt) {
       pf_coord0 = alt_coord0;
@@ -485,11 +485,13 @@ __device__ void run_probe(const CUtensorMap &tensor_map_a,
           float *dummy_dst = smem + smem_offset + (i + 1) * tile_elems;
           mbarrier_init(dummy_bar, 1);
           mbarrier_expect_tx(dummy_bar, static_cast<unsigned>(transaction_bytes));
-          issue_utmaldg(&tensor_map_a, dummy_dst, coord0, coord1, coord2, coord3, dummy_bar);
+          issue_utmaldg(tensor_map_a, dummy_dst, coord0, coord1, coord2, coord3,
+                        dummy_bar);
           dummy_bars[i] = dummy_bar;
           dummy_states[i] = mbarrier_arrive(dummy_bar);
         }
-        issue_utmaldg(&tensor_map_a, smem + smem_offset, coord0, coord1, coord2, coord3, bar);
+        issue_utmaldg(tensor_map_a, smem + smem_offset, coord0, coord1, coord2,
+                      coord3, bar);
       }
       uint64_t state = 0;
       for (int arrive_idx = 0; arrive_idx < arrive_repeats; ++arrive_idx) {
@@ -514,8 +516,8 @@ __device__ void run_probe(const CUtensorMap &tensor_map_a,
   }
 }
 
-__global__ void utmapf_probe_kernel_baseline(const __grid_constant__ CUtensorMap tensor_map_a,
-                                             const __grid_constant__ CUtensorMap tensor_map_b,
+__global__ void utmapf_probe_kernel_baseline(const CUtensorMap *tensor_map_a,
+                                             const CUtensorMap *tensor_map_b,
                                              int coord0,
                                              int coord1,
                                              int coord2,
@@ -567,8 +569,8 @@ __global__ void utmapf_probe_kernel_baseline(const __grid_constant__ CUtensorMap
                                output);
 }
 
-__global__ void utmapf_probe_kernel_op1_alt(const __grid_constant__ CUtensorMap tensor_map_a,
-                                            const __grid_constant__ CUtensorMap tensor_map_b,
+__global__ void utmapf_probe_kernel_op1_alt(const CUtensorMap *tensor_map_a,
+                                            const CUtensorMap *tensor_map_b,
                                             int coord0,
                                             int coord1,
                                             int coord2,
@@ -620,8 +622,8 @@ __global__ void utmapf_probe_kernel_op1_alt(const __grid_constant__ CUtensorMap 
                                   output);
 }
 
-__global__ void utmapf_probe_kernel_op2_alt(const __grid_constant__ CUtensorMap tensor_map_a,
-                                            const __grid_constant__ CUtensorMap tensor_map_b,
+__global__ void utmapf_probe_kernel_op2_alt(const CUtensorMap *tensor_map_a,
+                                            const CUtensorMap *tensor_map_b,
                                             int coord0,
                                             int coord1,
                                             int coord2,
@@ -673,8 +675,8 @@ __global__ void utmapf_probe_kernel_op2_alt(const __grid_constant__ CUtensorMap 
                                   output);
 }
 
-__global__ void utmapf_probe_kernel_predicated(const __grid_constant__ CUtensorMap tensor_map_a,
-                                               const __grid_constant__ CUtensorMap tensor_map_b,
+__global__ void utmapf_probe_kernel_predicated(const CUtensorMap *tensor_map_a,
+                                               const CUtensorMap *tensor_map_b,
                                                int coord0,
                                                int coord1,
                                                int coord2,
@@ -771,12 +773,18 @@ int main(int argc, char **argv) {
 
   float *device_input_a = nullptr;
   float *device_input_b = nullptr;
+  CUtensorMap *device_tensor_map_a = nullptr;
+  CUtensorMap *device_tensor_map_b = nullptr;
   int tile_elems = options.box_d0 * options.box_d1 * options.box_d2 * options.box_d3;
   float *device_output = nullptr;
   std::vector<float> host_output(tile_elems, 0.0f);
 
   check_cuda(cudaMalloc(&device_input_a, alloc_elems * sizeof(float)), "cudaMalloc input_a");
   check_cuda(cudaMalloc(&device_input_b, alloc_elems * sizeof(float)), "cudaMalloc input_b");
+  check_cuda(cudaMalloc(&device_tensor_map_a, sizeof(CUtensorMap)),
+             "cudaMalloc tensor_map_a");
+  check_cuda(cudaMalloc(&device_tensor_map_b, sizeof(CUtensorMap)),
+             "cudaMalloc tensor_map_b");
   check_cuda(cudaMalloc(&device_output, static_cast<size_t>(tile_elems) * sizeof(float)), "cudaMalloc output");
   check_cuda(cudaMemcpy(device_input_a, host_a.data(), alloc_elems * sizeof(float), cudaMemcpyHostToDevice),
              "cudaMemcpy input_a");
@@ -828,6 +836,12 @@ int main(int argc, char **argv) {
                                       CU_TENSOR_MAP_L2_PROMOTION_L2_128B,
                                       CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE),
                "cuTensorMapEncodeTiled tensor_map_b");
+  check_cuda(cudaMemcpy(device_tensor_map_a, &tensor_map_a, sizeof(CUtensorMap),
+                        cudaMemcpyHostToDevice),
+             "cudaMemcpy tensor_map_a");
+  check_cuda(cudaMemcpy(device_tensor_map_b, &tensor_map_b, sizeof(CUtensorMap),
+                        cudaMemcpyHostToDevice),
+             "cudaMemcpy tensor_map_b");
 
   int alt_coord2 = std::min(options.coord_d2 + options.box_d2, options.global_d2 - options.box_d2);
   int alt_coord3 = std::min(options.coord_d3 + options.box_d3, options.global_d3 - options.box_d3);
@@ -839,8 +853,8 @@ int main(int argc, char **argv) {
 
   switch (variant) {
     case Variant::Baseline:
-      utmapf_probe_kernel_baseline<<<1, threads, shared_bytes>>>(tensor_map_a,
-                                                                 tensor_map_b,
+      utmapf_probe_kernel_baseline<<<1, threads, shared_bytes>>>(device_tensor_map_a,
+                                                                 device_tensor_map_b,
                                                                  options.coord_d3,
                                                                  options.coord_d2,
                                                                  options.coord_d1,
@@ -866,8 +880,8 @@ int main(int argc, char **argv) {
                                                                  device_output);
       break;
     case Variant::Operand1Alt:
-      utmapf_probe_kernel_op1_alt<<<1, threads, shared_bytes>>>(tensor_map_a,
-                                                                tensor_map_b,
+      utmapf_probe_kernel_op1_alt<<<1, threads, shared_bytes>>>(device_tensor_map_a,
+                                                                device_tensor_map_b,
                                                                 options.coord_d3,
                                                                 options.coord_d2,
                                                                 options.coord_d1,
@@ -893,8 +907,8 @@ int main(int argc, char **argv) {
                                                                 device_output);
       break;
     case Variant::Operand2Alt:
-      utmapf_probe_kernel_op2_alt<<<1, threads, shared_bytes>>>(tensor_map_a,
-                                                                tensor_map_b,
+      utmapf_probe_kernel_op2_alt<<<1, threads, shared_bytes>>>(device_tensor_map_a,
+                                                                device_tensor_map_b,
                                                                 options.coord_d3,
                                                                 options.coord_d2,
                                                                 options.coord_d1,
@@ -920,8 +934,8 @@ int main(int argc, char **argv) {
                                                                 device_output);
       break;
     case Variant::Predicate:
-      utmapf_probe_kernel_predicated<<<1, threads, shared_bytes>>>(tensor_map_a,
-                                                                   tensor_map_b,
+      utmapf_probe_kernel_predicated<<<1, threads, shared_bytes>>>(device_tensor_map_a,
+                                                                   device_tensor_map_b,
                                                                    options.coord_d3,
                                                                    options.coord_d2,
                                                                    options.coord_d1,
@@ -1003,6 +1017,8 @@ int main(int argc, char **argv) {
   std::printf("checksum=%0.1f\n", checksum);
   print_window(host_output, 16);
 
+  check_cuda(cudaFree(device_tensor_map_b), "cudaFree tensor_map_b");
+  check_cuda(cudaFree(device_tensor_map_a), "cudaFree tensor_map_a");
   check_cuda(cudaFree(device_output), "cudaFree output");
   check_cuda(cudaFree(device_input_b), "cudaFree input_b");
   check_cuda(cudaFree(device_input_a), "cudaFree input_a");

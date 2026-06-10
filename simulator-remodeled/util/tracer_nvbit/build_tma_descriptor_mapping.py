@@ -232,6 +232,8 @@ def finalize_unresolved_entries(resolver):
             entry["confidence"] = "medium"
             entry["mapping_method"] = "same_function_desc_reg_config_reuse"
             del entry["candidate_config_ids"]
+    for entry in resolver:
+        entry["binding_status"] = "resolved" if entry.get("config_id") else "unresolved"
 
 
 def build_resolver_entries(runtime_groups, handle_map_by_rank, configs, pc_opcode_map):
@@ -274,6 +276,52 @@ def build_resolver_entries(runtime_groups, handle_map_by_rank, configs, pc_opcod
     return resolver
 
 
+def is_descriptor_involved_opcode(opcode):
+    if not opcode:
+        return False
+    opcode_family = opcode.split()[0]
+    descriptor_prefixes = (
+        "UTMALDG",
+        "UTMAREDG",
+        "UTMASTG",
+        "UBLKRED",
+    )
+    return opcode_family.startswith(descriptor_prefixes)
+
+
+def should_verify_binding(entry):
+    opcode = entry.get("opcode")
+    return is_descriptor_involved_opcode(opcode)
+
+
+def format_binding_failure(entry):
+    candidate_config_ids = entry.get("candidate_config_ids", [])
+    candidate_text = ",".join(candidate_config_ids) if candidate_config_ids else "<none>"
+    return (
+        "[TMA][DescriptorMapping][Error] executed descriptor-involved site has no "
+        "unique final binding: "
+        f"ufid={entry['unique_function_id']} "
+        f"pc={entry['pc_hex']} "
+        f"opcode={entry.get('opcode')} "
+        f"handle_hi={entry['handle_hi_hex']} "
+        f"desc_regs={entry['desc_reg_ids']} "
+        f"mapping_method={entry.get('mapping_method')} "
+        f"candidate_configs={candidate_text}"
+    )
+
+
+def verify_executed_bindings_or_fail(resolver):
+    failures = [
+        entry
+        for entry in resolver
+        if should_verify_binding(entry) and not entry.get("config_id")
+    ]
+    if not failures:
+        return
+    failure_lines = [format_binding_failure(entry) for entry in failures]
+    raise SystemExit("\n".join(failure_lines))
+
+
 def write_json(path: Path, payload):
     path.write_text(json.dumps(payload, indent=2) + "\n")
 
@@ -283,6 +331,11 @@ def main():
     parser.add_argument("extra_info_dir", type=Path)
     parser.add_argument("--configs-out", type=Path)
     parser.add_argument("--resolver-out", type=Path)
+    parser.add_argument(
+        "--fail-on-missing-binding",
+        action="store_true",
+        help="Fail if any executed descriptor runtime site lacks a unique config_id",
+    )
     args = parser.parse_args()
 
     extra_info_dir = args.extra_info_dir
@@ -291,6 +344,8 @@ def main():
     pc_opcode_map = load_pc_opcode_map(extra_info_dir)
     handle_map_by_rank = derive_handle_family_map_by_rank(configs, runtime_groups, pc_opcode_map)
     resolver = build_resolver_entries(runtime_groups, handle_map_by_rank, configs, pc_opcode_map)
+    if args.fail_on_missing_binding:
+        verify_executed_bindings_or_fail(resolver)
 
     configs_out = args.configs_out or (extra_info_dir / "tma_descriptor_configs.json")
     resolver_out = args.resolver_out or (extra_info_dir / "tma_descriptor_resolver.json")

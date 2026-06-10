@@ -217,7 +217,6 @@ struct HopperMBarrierObject {
   uint32_t arrive_count = 0;
   uint32_t expected_tx_bytes = 0;
   uint32_t completed_tx_bytes = 0;
-  uint32_t bound_pending_tx_bytes = 0;
   uint32_t phase = 0;
   bool ready = false;
 };
