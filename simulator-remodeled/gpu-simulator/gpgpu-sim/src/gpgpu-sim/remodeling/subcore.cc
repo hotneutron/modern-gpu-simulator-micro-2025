@@ -27,6 +27,7 @@
 // POSSIBILITY OF SUCH DAMAGE.
 
 #include <cassert>
+#include <cstdio>
 #include <memory>
 
 #include "subcore.h"
@@ -50,7 +51,8 @@
 Subcore::Subcore(unsigned subcore_id, const shader_core_config *config,
                  shader_core_stats *stats, SM *sm,
                  register_set_uniptr *EX_DP_shared_sm_reception_latch,
-                 register_set_uniptr *EX_MEM_shared_sm_reception_latch) :
+                 register_set_uniptr *EX_MEM_shared_sm_reception_latch,
+                 register_set_uniptr *EX_TMA_shared_sm_reception_latch) :
                         m_regular_fixed_latency_rf_write_queue(config->max_size_register_file_write_queue_for_fixed_latency_instructions, "regular_fixed_latency_rf_write_queue"),
                         m_uniform_fixed_latency_rf_write_queue(config->max_size_register_file_write_queue_for_fixed_latency_instructions, "uniform_fixed_latency_rf_write_queue") {
   m_subcore_id = subcore_id;
@@ -61,6 +63,7 @@ Subcore::Subcore(unsigned subcore_id, const shader_core_config *config,
       m_config->max_warps_per_shader / sm->get_num_subcores();
   m_EX_DP_shared_sm_reception_latch = EX_DP_shared_sm_reception_latch;
   m_EX_MEM_shared_sm_reception_latch = EX_MEM_shared_sm_reception_latch;
+  m_EX_TMA_shared_sm_reception_latch = EX_TMA_shared_sm_reception_latch;
   m_num_pending_cycles_constant_cache_misses_before_switch_to_other_warp = 0;
   m_num_pending_cycles_with_issue_port_busy = 0;
   m_pipeline_read_stage_latency_reg.resize(MAXIMUM_LATENCY_READ_FIXED_LATENCY_INST);
@@ -85,6 +88,7 @@ Subcore::~Subcore() {
   delete m_miscellaneous_with_queue_pipeline;
   delete m_miscellaneous_no_queue_pipeline;
   delete m_memory_unit_subcore;
+  delete m_tma_pipeline;
   delete m_dp_pipeline;
   delete m_uniform_rf;
   delete m_regular_rf;
@@ -294,6 +298,24 @@ void Subcore::allocate(SM *shared_sm) {
       rf_requests.m_uniform = m_uniform_rf->is_possible_to_read_cacheable(current_ins, sm_warp_id, m_config->warp_size);
       bool is_read_available = rf_requests.is_possible_to_read();
       unsigned int target_latency_execution = latency_read_fixed_latency_inst + current_ins->latency  + current_ins->initiation_interval;
+      // #region debug-point bitset-latency-overflow
+      if (target_latency_execution >= 512) {
+        std::fprintf(stderr,
+                     "[BITSETDBG][Subcore] overflow sid=%u subcore=%u warp=%u "
+                     "ufid=%u pc=0x%llx op=%u op_pipe=%u tma_family=%u "
+                     "lat_read=%u latency=%u initiation=%u target=%u\n",
+                     shared_sm->get_sid(), m_subcore_id, current_ins->warp_id(),
+                     current_ins->unique_function_id,
+                     static_cast<unsigned long long>(current_ins->pc),
+                     static_cast<unsigned>(current_ins->op),
+                     static_cast<unsigned>(current_ins->op_pipe),
+                     static_cast<unsigned>(current_ins->tma_opcode_family),
+                     latency_read_fixed_latency_inst, current_ins->latency,
+                     current_ins->initiation_interval, target_latency_execution);
+        assert(target_latency_execution < 512 &&
+               "bitset latency overflow before functional_unit::is_latency_available");
+      }
+      // #endregion debug-point bitset-latency-overflow
       bool is_fu_latency_available = fu->is_latency_available(target_latency_execution);
       bool is_rf_ready = is_read_available;
       shared_sm->m_sm_stats.m_stats_map["total_num_evals_rf"]->increment_with_integer(1);
@@ -910,6 +932,7 @@ functional_unit* Subcore::get_fu(const warp_inst_t *pI) {
       break;
     case LDGDEPBAR_OP:
     case BARRIER_OP:
+    case MBARRIER_OP:
     case DEPBAR_OP:
     case MISCELLANEOUS_NO_QUEUE_OP:
       fu = m_miscellaneous_no_queue_pipeline;
@@ -919,6 +942,13 @@ functional_unit* Subcore::get_fu(const warp_inst_t *pI) {
     case MEMORY_BARRIER_OP:
     case GRID_BARRIER_OP:
     case MEMORY_MISCELLANEOUS_OP:
+      fu = m_memory_unit_subcore;
+      break;
+    case TMA_LOAD_OP:
+    case TMA_STORE_OP:
+    case TMA_MISCELLANEOUS_OP:
+      fu = m_tma_pipeline;
+      break;
     case LOAD_OP:
     case STORE_OP:
       fu = m_memory_unit_subcore;
@@ -947,7 +977,9 @@ void Subcore::single_decode(SM *shared_sm, warp_inst_t *pI,
       pI->get_tensor_core_instruction_info();
     }
     warp->m_last_unique_inst_id++;
-    if (pI->is_load() || pI->is_store()) {
+    if (pI->is_tma_op()) {
+      pI->generate_other_mem_ops_latencies(m_sm->get_gpu());
+    } else if (pI->is_load() || pI->is_store()) {
       pI->generate_mem_latencies(m_sm->get_gpu());
     }else if(pI->is_memory_barrier() || pI->is_grid_barrier() || pI->is_memory_miscelanous()) {
       pI->generate_other_mem_ops_latencies(m_sm->get_gpu());
@@ -1213,6 +1245,10 @@ void Subcore::create_pipeline() {
       num_intermediate_cycles_until_fu_execution, nullptr, 0, true, m_config->memory_intermidiate_stages_subcore_unit, 
       m_config->num_cycles_to_wait_to_dispatch_another_inst_from_subcore_to_sm_shared_pipeline_when_is_mem_inst, TraceEnhancedOperandType::NONE);
 
+  m_tma_pipeline = new functional_unit_with_queue(m_EX_TMA_shared_sm_reception_latch, m_regular_rf, m_config, 1, "TMA_SUBCORE_UNIT", shared_sm, MEM__OP, true, true, m_config->memory_subcore_queue_size,
+      num_intermediate_cycles_until_fu_execution, nullptr, 0, true, m_config->memory_intermidiate_stages_subcore_unit,
+      m_config->num_cycles_to_wait_to_dispatch_another_inst_from_subcore_to_sm_shared_pipeline_when_is_mem_inst, TraceEnhancedOperandType::NONE);
+
   if (m_config->is_dp_pipeline_shared_for_subcores) {
     m_dp_pipeline = new functional_unit_with_queue(m_EX_DP_shared_sm_reception_latch, m_regular_rf, m_config, m_config->dp_subcore_max_latency, "DP_SUBCORE_UNIT", shared_sm, DP__OP, true, true, 
         m_config->dp_subcore_queue_size, num_intermediate_cycles_until_fu_execution, nullptr, 0, true, m_config->dp_shared_intermidiate_stages, 
@@ -1228,6 +1264,7 @@ void Subcore::create_pipeline() {
   m_all_subcore_ex_pipelines.push_back(m_branch_pipeline);
   m_all_subcore_ex_pipelines.push_back(m_miscellaneous_no_queue_pipeline);
   m_all_subcore_ex_pipelines.push_back(m_memory_unit_subcore);
+  m_all_subcore_ex_pipelines.push_back(m_tma_pipeline);
   m_all_subcore_ex_pipelines.push_back(m_dp_pipeline);
   m_all_subcore_ex_pipelines.push_back(m_sfu_pipeline);
   m_all_subcore_ex_pipelines.push_back(m_miscellaneous_with_queue_pipeline);

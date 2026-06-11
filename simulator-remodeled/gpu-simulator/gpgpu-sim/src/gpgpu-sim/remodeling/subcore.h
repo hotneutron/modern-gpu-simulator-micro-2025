@@ -49,7 +49,8 @@ class Subcore {
   Subcore(unsigned subcore_id, const shader_core_config *config,
           shader_core_stats *stats, SM * sm,
           register_set_uniptr *EX_DP_shared_sm_reception_latch,
-          register_set_uniptr *EX_MEM_shared_sm_reception_latch);
+          register_set_uniptr *EX_MEM_shared_sm_reception_latch,
+          register_set_uniptr *EX_TMA_shared_sm_reception_latch);
 
   ~Subcore();
   void create_pipeline();
@@ -122,6 +123,7 @@ class Subcore {
   register_set_uniptr m_read_stage_aux_latch = register_set_uniptr(1, "READ_stage_aux_latch");
   register_set_uniptr *m_EX_DP_shared_sm_reception_latch;
   register_set_uniptr *m_EX_MEM_shared_sm_reception_latch;
+  register_set_uniptr *m_EX_TMA_shared_sm_reception_latch;
   std::vector<std::unique_ptr<warp_inst_t>> m_pipeline_read_stage_latency_reg;
 
   // Result queues
@@ -143,6 +145,7 @@ class Subcore {
   functional_unit* m_miscellaneous_with_queue_pipeline;
   functional_unit* m_miscellaneous_no_queue_pipeline;
   functional_unit* m_memory_unit_subcore;
+  functional_unit* m_tma_pipeline = nullptr;
   functional_unit* m_dp_pipeline;
 
   Register_file *m_regular_rf;

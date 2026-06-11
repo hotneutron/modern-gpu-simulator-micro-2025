@@ -2113,7 +2113,9 @@ void shader_core_ctx::issue_warp(register_set &pipe_reg_set,
 
   m_stats->warp_issues_from_last_power_sample[m_sid][warp_id]++; // MOD. Custom powermodel stats
 
-  if (next_inst->op == BARRIER_OP) {
+  if (next_inst->op == MBARRIER_OP) {
+    // Hopper mbarrier instructions must not enter the legacy CTA barrier path.
+  } else if (next_inst->op == BARRIER_OP) {
     m_warp[warp_id]->store_info_of_last_inst_at_barrier(*pipe_reg);
     warp_inst_t *inst_bar;
     inst_bar = const_cast<warp_inst_t *>(next_inst);

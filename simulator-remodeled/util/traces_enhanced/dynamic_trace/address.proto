@@ -9,4 +9,5 @@ message address {
   uint64 base_address = 4;
   int32 stride = 5;
   repeated int64 addrs = 6;
+  uint32 udesc_value_hi = 7;
 }

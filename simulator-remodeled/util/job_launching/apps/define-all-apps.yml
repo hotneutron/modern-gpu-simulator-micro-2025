@@ -272,6 +272,357 @@ ublkred_count_micro:
                   qos: all
                   openmp-cpus: 2
 
+utmapf_barrier_micro:
+    exec_dir: "$GPUAPPS_ROOT/bin/$CUDA_VERSION/release/"
+    data_dirs: "$GPUAPPS_ROOT/data_dirs/"
+    execs:
+        - utmapf-barrier-slot-0:
+            exe: utmapf_probe
+            runs:
+                - args: --variant baseline --barrier-slot 0 --alu-gap-iters 32
+                  env:
+                    CUDA_ARCH: sm_90a
+                    ENABLE_TMA_DESC: 1
+                    INTERMEDIATE_EXTRA_FILES_PERSISTANCE: 1
+                  accel-sim-mem: 6G
+                  qos: all
+                  openmp-cpus: 2
+        - utmapf-barrier-slot-1:
+            exe: utmapf_probe
+            runs:
+                - args: --variant baseline --barrier-slot 1 --alu-gap-iters 32
+                  env:
+                    CUDA_ARCH: sm_90a
+                    ENABLE_TMA_DESC: 1
+                    INTERMEDIATE_EXTRA_FILES_PERSISTANCE: 1
+                  accel-sim-mem: 6G
+                  qos: all
+                  openmp-cpus: 2
+        - utmapf-barrier-slot-2:
+            exe: utmapf_probe
+            runs:
+                - args: --variant baseline --barrier-slot 2 --alu-gap-iters 32
+                  env:
+                    CUDA_ARCH: sm_90a
+                    ENABLE_TMA_DESC: 1
+                    INTERMEDIATE_EXTRA_FILES_PERSISTANCE: 1
+                  accel-sim-mem: 6G
+                  qos: all
+                  openmp-cpus: 2
+
+utmapf_barrier_id_micro:
+    exec_dir: "$GPUAPPS_ROOT/bin/$CUDA_VERSION/release/"
+    data_dirs: "$GPUAPPS_ROOT/data_dirs/"
+    execs:
+        - utmapf-barrier-id-0:
+            exe: utmapf_probe
+            runs:
+                - args: --variant baseline --barrier-slot 0 --dummy-loads 0 --alu-gap-iters 32
+                  env:
+                    CUDA_ARCH: sm_90a
+                    ENABLE_TMA_DESC: 1
+                    INTERMEDIATE_EXTRA_FILES_PERSISTANCE: 1
+                  accel-sim-mem: 6G
+                  qos: all
+                  openmp-cpus: 2
+
+utmapf_exch_arrive_micro:
+    exec_dir: "$GPUAPPS_ROOT/bin/$CUDA_VERSION/release/"
+    data_dirs: "$GPUAPPS_ROOT/data_dirs/"
+    execs:
+        - utmapf-exch-arrive-1:
+            exe: utmapf_probe
+            runs:
+                - args: --variant baseline --barrier-slot 0 --use-load 0 --use-expect-tx 0 --issue-prefetch 0 --init-arrivals 1 --arrive-count 1 --phase-cycles 1 --alu-gap-iters 32
+                  env:
+                    CUDA_ARCH: sm_90a
+                    ENABLE_TMA_DESC: 1
+                    INTERMEDIATE_EXTRA_FILES_PERSISTANCE: 1
+                  accel-sim-mem: 6G
+                  qos: all
+                  openmp-cpus: 2
+        - utmapf-exch-arrive-2:
+            exe: utmapf_probe
+            runs:
+                - args: --variant baseline --barrier-slot 0 --use-load 0 --use-expect-tx 0 --issue-prefetch 0 --init-arrivals 2 --arrive-count 2 --phase-cycles 1 --alu-gap-iters 32
+                  env:
+                    CUDA_ARCH: sm_90a
+                    ENABLE_TMA_DESC: 1
+                    INTERMEDIATE_EXTRA_FILES_PERSISTANCE: 1
+                  accel-sim-mem: 6G
+                  qos: all
+                  openmp-cpus: 2
+        - utmapf-exch-arrive-4:
+            exe: utmapf_probe
+            runs:
+                - args: --variant baseline --barrier-slot 0 --use-load 0 --use-expect-tx 0 --issue-prefetch 0 --init-arrivals 4 --arrive-count 4 --phase-cycles 1 --alu-gap-iters 32
+                  env:
+                    CUDA_ARCH: sm_90a
+                    ENABLE_TMA_DESC: 1
+                    INTERMEDIATE_EXTRA_FILES_PERSISTANCE: 1
+                  accel-sim-mem: 6G
+                  qos: all
+                  openmp-cpus: 2
+        - utmapf-exch-arrive-8:
+            exe: utmapf_probe
+            runs:
+                - args: --variant baseline --barrier-slot 0 --use-load 0 --use-expect-tx 0 --issue-prefetch 0 --init-arrivals 8 --arrive-count 8 --phase-cycles 1 --alu-gap-iters 32
+                  env:
+                    CUDA_ARCH: sm_90a
+                    ENABLE_TMA_DESC: 1
+                    INTERMEDIATE_EXTRA_FILES_PERSISTANCE: 1
+                  accel-sim-mem: 6G
+                  qos: all
+                  openmp-cpus: 2
+
+sync_arrive_micro:
+    exec_dir: "$GPUAPPS_ROOT/bin/$CUDA_VERSION/release/"
+    data_dirs: "$GPUAPPS_ROOT/data_dirs/"
+    execs:
+        - sync-arrive-1:
+            exe: sync_arrive_probe
+            runs:
+                - args: --barrier-slot 0 --init-arrivals 1 --arrive-count 1 --arrive-repeats 1 --phase-cycles 1 --reuse-barrier 0 --alu-gap-iters 32
+                  env:
+                    CUDA_ARCH: sm_90a
+                    INTERMEDIATE_EXTRA_FILES_PERSISTANCE: 1
+                  accel-sim-mem: 6G
+                  qos: all
+                  openmp-cpus: 2
+        - sync-arrive-phase-4:
+            exe: sync_arrive_probe
+            runs:
+                - args: --barrier-slot 0 --init-arrivals 1 --arrive-count 1 --arrive-repeats 1 --phase-cycles 4 --reuse-barrier 1 --alu-gap-iters 32
+                  env:
+                    CUDA_ARCH: sm_90a
+                    INTERMEDIATE_EXTRA_FILES_PERSISTANCE: 1
+                  accel-sim-mem: 6G
+                  qos: all
+                  openmp-cpus: 2
+
+utmapf_exch_phase_micro:
+    exec_dir: "$GPUAPPS_ROOT/bin/$CUDA_VERSION/release/"
+    data_dirs: "$GPUAPPS_ROOT/data_dirs/"
+    execs:
+        - utmapf-exch-phase-2:
+            exe: utmapf_probe
+            runs:
+                - args: --variant baseline --barrier-slot 0 --use-load 0 --use-expect-tx 0 --issue-prefetch 0 --init-arrivals 1 --arrive-count 1 --phase-cycles 2 --alu-gap-iters 32
+                  env:
+                    CUDA_ARCH: sm_90a
+                    ENABLE_TMA_DESC: 1
+                    INTERMEDIATE_EXTRA_FILES_PERSISTANCE: 1
+                  accel-sim-mem: 6G
+                  qos: all
+                  openmp-cpus: 2
+        - utmapf-exch-phase-4:
+            exe: utmapf_probe
+            runs:
+                - args: --variant baseline --barrier-slot 0 --use-load 0 --use-expect-tx 0 --issue-prefetch 0 --init-arrivals 1 --arrive-count 1 --phase-cycles 4 --alu-gap-iters 32
+                  env:
+                    CUDA_ARCH: sm_90a
+                    ENABLE_TMA_DESC: 1
+                    INTERMEDIATE_EXTRA_FILES_PERSISTANCE: 1
+                  accel-sim-mem: 6G
+                  qos: all
+                  openmp-cpus: 2
+
+utmapf_exch_tx_micro:
+    exec_dir: "$GPUAPPS_ROOT/bin/$CUDA_VERSION/release/"
+    data_dirs: "$GPUAPPS_ROOT/data_dirs/"
+    execs:
+        - utmapf-exch-tx-256b:
+            exe: utmapf_probe
+            runs:
+                - args: --variant baseline --barrier-slot 0 --use-load 1 --use-expect-tx 1 --issue-prefetch 1 --init-arrivals 1 --arrive-count 1 --global-d2 64 --global-d3 64 --pitch-d3 64 --box-d2 8 --box-d3 8 --phase-cycles 1 --alu-gap-iters 32
+                  env:
+                    CUDA_ARCH: sm_90a
+                    ENABLE_TMA_DESC: 1
+                    INTERMEDIATE_EXTRA_FILES_PERSISTANCE: 1
+                  accel-sim-mem: 6G
+                  qos: all
+                  openmp-cpus: 2
+        - utmapf-exch-tx-1024b:
+            exe: utmapf_probe
+            runs:
+                - args: --variant baseline --barrier-slot 0 --use-load 1 --use-expect-tx 1 --issue-prefetch 1 --init-arrivals 1 --arrive-count 1 --global-d2 64 --global-d3 64 --pitch-d3 64 --box-d2 16 --box-d3 16 --phase-cycles 1 --alu-gap-iters 32
+                  env:
+                    CUDA_ARCH: sm_90a
+                    ENABLE_TMA_DESC: 1
+                    INTERMEDIATE_EXTRA_FILES_PERSISTANCE: 1
+                  accel-sim-mem: 6G
+                  qos: all
+                  openmp-cpus: 2
+        - utmapf-exch-tx-2048b:
+            exe: utmapf_probe
+            runs:
+                - args: --variant baseline --barrier-slot 0 --use-load 1 --use-expect-tx 1 --issue-prefetch 1 --init-arrivals 1 --arrive-count 1 --global-d2 64 --global-d3 64 --pitch-d3 64 --box-d2 32 --box-d3 16 --phase-cycles 1 --alu-gap-iters 32
+                  env:
+                    CUDA_ARCH: sm_90a
+                    ENABLE_TMA_DESC: 1
+                    INTERMEDIATE_EXTRA_FILES_PERSISTANCE: 1
+                  accel-sim-mem: 6G
+                  qos: all
+                  openmp-cpus: 2
+
+utmapf_exch_arrive_fine_micro:
+    exec_dir: "$GPUAPPS_ROOT/bin/$CUDA_VERSION/release/"
+    data_dirs: "$GPUAPPS_ROOT/data_dirs/"
+    execs:
+        - utmapf-exch-arrive-3:
+            exe: utmapf_probe
+            runs:
+                - args: --variant baseline --barrier-slot 0 --use-load 0 --use-expect-tx 0 --issue-prefetch 0 --init-arrivals 3 --arrive-count 3 --phase-cycles 1 --alu-gap-iters 32
+                  env:
+                    CUDA_ARCH: sm_90a
+                    ENABLE_TMA_DESC: 1
+                    INTERMEDIATE_EXTRA_FILES_PERSISTANCE: 1
+                  accel-sim-mem: 6G
+                  qos: all
+                  openmp-cpus: 2
+        - utmapf-exch-arrive-5:
+            exe: utmapf_probe
+            runs:
+                - args: --variant baseline --barrier-slot 0 --use-load 0 --use-expect-tx 0 --issue-prefetch 0 --init-arrivals 5 --arrive-count 5 --phase-cycles 1 --alu-gap-iters 32
+                  env:
+                    CUDA_ARCH: sm_90a
+                    ENABLE_TMA_DESC: 1
+                    INTERMEDIATE_EXTRA_FILES_PERSISTANCE: 1
+                  accel-sim-mem: 6G
+                  qos: all
+                  openmp-cpus: 2
+        - utmapf-exch-arrive-6:
+            exe: utmapf_probe
+            runs:
+                - args: --variant baseline --barrier-slot 0 --use-load 0 --use-expect-tx 0 --issue-prefetch 0 --init-arrivals 6 --arrive-count 6 --phase-cycles 1 --alu-gap-iters 32
+                  env:
+                    CUDA_ARCH: sm_90a
+                    ENABLE_TMA_DESC: 1
+                    INTERMEDIATE_EXTRA_FILES_PERSISTANCE: 1
+                  accel-sim-mem: 6G
+                  qos: all
+                  openmp-cpus: 2
+        - utmapf-exch-arrive-7:
+            exe: utmapf_probe
+            runs:
+                - args: --variant baseline --barrier-slot 0 --use-load 0 --use-expect-tx 0 --issue-prefetch 0 --init-arrivals 7 --arrive-count 7 --phase-cycles 1 --alu-gap-iters 32
+                  env:
+                    CUDA_ARCH: sm_90a
+                    ENABLE_TMA_DESC: 1
+                    INTERMEDIATE_EXTRA_FILES_PERSISTANCE: 1
+                  accel-sim-mem: 6G
+                  qos: all
+                  openmp-cpus: 2
+
+utmapf_exch_arrive_split_micro:
+    exec_dir: "$GPUAPPS_ROOT/bin/$CUDA_VERSION/release/"
+    data_dirs: "$GPUAPPS_ROOT/data_dirs/"
+    execs:
+        - utmapf-exch-init-4-arrive-1x4:
+            exe: utmapf_probe
+            runs:
+                - args: --variant baseline --barrier-slot 0 --use-load 0 --use-expect-tx 0 --issue-prefetch 0 --init-arrivals 4 --arrive-count 1 --arrive-repeats 4 --phase-cycles 1 --alu-gap-iters 32
+                  env:
+                    CUDA_ARCH: sm_90a
+                    ENABLE_TMA_DESC: 1
+                    INTERMEDIATE_EXTRA_FILES_PERSISTANCE: 1
+                  accel-sim-mem: 6G
+                  qos: all
+                  openmp-cpus: 2
+
+utmapf_exch_multiphase_micro:
+    exec_dir: "$GPUAPPS_ROOT/bin/$CUDA_VERSION/release/"
+    data_dirs: "$GPUAPPS_ROOT/data_dirs/"
+    execs:
+        - utmapf-exch-multiphase-1x1x4:
+            exe: utmapf_probe
+            runs:
+                - args: --variant baseline --barrier-slot 0 --use-load 0 --use-expect-tx 0 --issue-prefetch 0 --init-arrivals 1 --arrive-count 1 --arrive-repeats 1 --phase-cycles 4 --reuse-barrier 1 --alu-gap-iters 32
+                  env:
+                    CUDA_ARCH: sm_90a
+                    ENABLE_TMA_DESC: 1
+                    INTERMEDIATE_EXTRA_FILES_PERSISTANCE: 1
+                  accel-sim-mem: 6G
+                  qos: all
+                  openmp-cpus: 2
+        - utmapf-exch-multiphase-2x1x4:
+            exe: utmapf_probe
+            runs:
+                - args: --variant baseline --barrier-slot 0 --use-load 0 --use-expect-tx 0 --issue-prefetch 0 --init-arrivals 2 --arrive-count 1 --arrive-repeats 2 --phase-cycles 4 --reuse-barrier 1 --alu-gap-iters 32
+                  env:
+                    CUDA_ARCH: sm_90a
+                    ENABLE_TMA_DESC: 1
+                    INTERMEDIATE_EXTRA_FILES_PERSISTANCE: 1
+                  accel-sim-mem: 6G
+                  qos: all
+                  openmp-cpus: 2
+        - utmapf-exch-multiphase-4x1x3:
+            exe: utmapf_probe
+            runs:
+                - args: --variant baseline --barrier-slot 0 --use-load 0 --use-expect-tx 0 --issue-prefetch 0 --init-arrivals 4 --arrive-count 1 --arrive-repeats 4 --phase-cycles 3 --reuse-barrier 1 --alu-gap-iters 32
+                  env:
+                    CUDA_ARCH: sm_90a
+                    ENABLE_TMA_DESC: 1
+                    INTERMEDIATE_EXTRA_FILES_PERSISTANCE: 1
+                  accel-sim-mem: 6G
+                  qos: all
+                  openmp-cpus: 2
+        - utmapf-exch-init-4-arrive-2x2:
+            exe: utmapf_probe
+            runs:
+                - args: --variant baseline --barrier-slot 0 --use-load 0 --use-expect-tx 0 --issue-prefetch 0 --init-arrivals 4 --arrive-count 2 --arrive-repeats 2 --phase-cycles 1 --alu-gap-iters 32
+                  env:
+                    CUDA_ARCH: sm_90a
+                    ENABLE_TMA_DESC: 1
+                    INTERMEDIATE_EXTRA_FILES_PERSISTANCE: 1
+                  accel-sim-mem: 6G
+                  qos: all
+                  openmp-cpus: 2
+        - utmapf-exch-init-8-arrive-1x8:
+            exe: utmapf_probe
+            runs:
+                - args: --variant baseline --barrier-slot 0 --use-load 0 --use-expect-tx 0 --issue-prefetch 0 --init-arrivals 8 --arrive-count 1 --arrive-repeats 8 --phase-cycles 1 --alu-gap-iters 32
+                  env:
+                    CUDA_ARCH: sm_90a
+                    ENABLE_TMA_DESC: 1
+                    INTERMEDIATE_EXTRA_FILES_PERSISTANCE: 1
+                  accel-sim-mem: 6G
+                  qos: all
+                  openmp-cpus: 2
+        - utmapf-exch-init-8-arrive-2x4:
+            exe: utmapf_probe
+            runs:
+                - args: --variant baseline --barrier-slot 0 --use-load 0 --use-expect-tx 0 --issue-prefetch 0 --init-arrivals 8 --arrive-count 2 --arrive-repeats 4 --phase-cycles 1 --alu-gap-iters 32
+                  env:
+                    CUDA_ARCH: sm_90a
+                    ENABLE_TMA_DESC: 1
+                    INTERMEDIATE_EXTRA_FILES_PERSISTANCE: 1
+                  accel-sim-mem: 6G
+                  qos: all
+                  openmp-cpus: 2
+        - utmapf-barrier-id-1:
+            exe: utmapf_probe
+            runs:
+                - args: --variant baseline --barrier-slot 0 --dummy-loads 1 --alu-gap-iters 32
+                  env:
+                    CUDA_ARCH: sm_90a
+                    ENABLE_TMA_DESC: 1
+                    INTERMEDIATE_EXTRA_FILES_PERSISTANCE: 1
+                  accel-sim-mem: 6G
+                  qos: all
+                  openmp-cpus: 2
+        - utmapf-barrier-id-2:
+            exe: utmapf_probe
+            runs:
+                - args: --variant baseline --barrier-slot 0 --dummy-loads 2 --alu-gap-iters 32
+                  env:
+                    CUDA_ARCH: sm_90a
+                    ENABLE_TMA_DESC: 1
+                    INTERMEDIATE_EXTRA_FILES_PERSISTANCE: 1
+                  accel-sim-mem: 6G
+                  qos: all
+                  openmp-cpus: 2
+
 GPU_Microbenchmark_MaxFlops:
     exec_dir: "$GPUAPPS_ROOT/bin/$CUDA_VERSION/release/"
     data_dirs: "$GPUAPPS_ROOT/data_dirs/"

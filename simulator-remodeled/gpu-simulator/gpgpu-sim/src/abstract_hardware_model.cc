@@ -604,9 +604,15 @@ void warp_inst_t::generate_mem_latencies(gpgpu_sim *gpu) {
   if(is_shared) {
     m_latency_of_mem_operation_at_sm_structure = shader_config.memory_shared_memory_minimum_latency + is_regular_reg_in_mref;
     std::string opcode = m_extra_trace_instruction_info->get_op_code();
-    if(opcode.find("LDSM") != std::string::npos) {
-      if(endsWith(opcode, ".4") || endsWith(opcode, ".2")) {
+    const bool is_ldsm_opcode = opcode.find("LDSM") != std::string::npos;
+    const bool is_stsm_opcode = opcode.find("STSM") != std::string::npos;
+    if (is_ldsm_opcode || is_stsm_opcode) {
+      const bool is_multi_matrix_opcode =
+          endsWith(opcode, ".4") || endsWith(opcode, ".2");
+      if (is_ldsm_opcode && is_multi_matrix_opcode) {
         m_latency_of_mem_operation_at_sm_structure += shader_config.memory_shared_memory_extra_latency_ldsm_multiple_matrix;
+      } else if (is_stsm_opcode && is_multi_matrix_opcode) {
+        m_latency_of_mem_operation_at_sm_structure += shader_config.memory_shared_memory_extra_latency_stsm_multiple_matrix;
       }
     }
   }else if(is_consider_global) {

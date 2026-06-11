@@ -94,6 +94,15 @@ void split(const std::string &str, std::vector<std::string> &cont,
 inst_trace_t::inst_trace_t() { 
   is_instruction_traced = true;
   is_constant_addr_already_calculated = false;
+  sync_site_valid = false;
+  sync_kind = SyncInstructionKind::NONE;
+  sync_semantic_operand_role = SyncSemanticOperandRole::NONE;
+  sync_barrier_operand_index = -1;
+  sync_semantic_operand_index = -1;
+  sync_runtime_valid = false;
+  sync_barrier_addr = 0;
+  sync_has_semantic_raw = false;
+  sync_semantic_raw = 0;
 }
 
 inst_trace_t::~inst_trace_t() {}
@@ -109,11 +118,21 @@ inst_trace_t::inst_trace_t(const inst_trace_t &b) {
     memadd_info[i] = std::make_unique<inst_memadd_info_t>();
     memadd_info[i]->width = b.memadd_info[i]->width;
     memadd_info[i]->u_desc_value = b.memadd_info[i]->u_desc_value;
+    memadd_info[i]->u_desc_value_hi = b.memadd_info[i]->u_desc_value_hi;
     std::copy(b.memadd_info[i]->addrs, b.memadd_info[i]->addrs + WARP_SIZE,
               memadd_info[i]->addrs);
   }
   is_constant_addr_already_calculated = b.is_constant_addr_already_calculated;
   is_instruction_traced = b.is_instruction_traced;
+  sync_site_valid = b.sync_site_valid;
+  sync_kind = b.sync_kind;
+  sync_semantic_operand_role = b.sync_semantic_operand_role;
+  sync_barrier_operand_index = b.sync_barrier_operand_index;
+  sync_semantic_operand_index = b.sync_semantic_operand_index;
+  sync_runtime_valid = b.sync_runtime_valid;
+  sync_barrier_addr = b.sync_barrier_addr;
+  sync_has_semantic_raw = b.sync_has_semantic_raw;
+  sync_semantic_raw = b.sync_semantic_raw;
   block_idx_x = b.block_idx_x;
   block_idx_y = b.block_idx_y;
   block_idx_z = b.block_idx_z;
@@ -127,6 +146,15 @@ inst_trace_t::inst_trace_t(address_type pc, unsigned int unique_function_id, boo
   mask = 0;
   opcode = "NOP";
   is_constant_addr_already_calculated = false;
+  sync_site_valid = false;
+  sync_kind = SyncInstructionKind::NONE;
+  sync_semantic_operand_role = SyncSemanticOperandRole::NONE;
+  sync_barrier_operand_index = -1;
+  sync_semantic_operand_index = -1;
+  sync_runtime_valid = false;
+  sync_barrier_addr = 0;
+  sync_has_semantic_raw = false;
+  sync_semantic_raw = 0;
 }
 
 bool inst_trace_t::check_opcode_contain(const std::vector<std::string> &opcode,
@@ -139,7 +167,8 @@ bool inst_trace_t::check_opcode_contain(const std::vector<std::string> &opcode,
 
 unsigned inst_trace_t::get_datawidth_from_opcode(
     const std::vector<std::string> &opcode) const {
-  if(opcode[0].find("LDSM") != std::string::npos) {
+  if(opcode[0].find("LDSM") != std::string::npos ||
+     opcode[0].find("STSM") != std::string::npos) {
     if (is_number(opcode[opcode.size() - 1])) {
         int num_matrix = std::stoi(opcode[opcode.size() - 1], NULL);
         unsigned int total_size = num_matrix * 32;
@@ -269,9 +298,30 @@ bool inst_trace_t::parse_from_pb(dynamic_trace::instruction pb_inst,
   m_pc = pb_inst.pc();
   mask = pb_inst.active_mask() & pb_inst.predicate_mask();
   m_unique_function_id = pb_inst.function_unique_id();
+  sync_runtime_valid = pb_inst.has_sync() && pb_inst.sync().valid();
+  sync_barrier_addr = sync_runtime_valid ? pb_inst.sync().barrier_addr() : 0;
+  sync_has_semantic_raw =
+      sync_runtime_valid && pb_inst.sync().has_semantic_raw();
+  sync_semantic_raw =
+      sync_has_semantic_raw ? pb_inst.sync().semantic_raw() : 0;
   unsigned int num_memrefs = pb_inst.addresses_size();
   std::bitset<WARP_SIZE> mask_bits(mask);
   opcode = static_trace_info.get_kernel_by_unique_function_id(m_unique_function_id).get_instruction(m_pc).get_op_code();
+  SyncResolvedSiteMetadata sync_metadata;
+  sync_site_valid =
+      gpu != nullptr &&
+      gpu->lookup_sync_site_metadata(m_unique_function_id, m_pc, sync_metadata);
+  if (sync_site_valid) {
+    sync_kind = sync_metadata.sync_kind;
+    sync_semantic_operand_role = sync_metadata.semantic_operand_role;
+    sync_barrier_operand_index = sync_metadata.barrier_operand_index;
+    sync_semantic_operand_index = sync_metadata.semantic_operand_index;
+  } else {
+    sync_kind = SyncInstructionKind::NONE;
+    sync_semantic_operand_role = SyncSemanticOperandRole::NONE;
+    sync_barrier_operand_index = -1;
+    sync_semantic_operand_index = -1;
+  }
   m_next_traced_pc = 0;
 
   // parse mem info
@@ -282,6 +332,7 @@ bool inst_trace_t::parse_from_pb(dynamic_trace::instruction pb_inst,
     mem_width = pb_inst.addresses(i).data_width();
     parse_memref(i, mem_width, mask_bits, pb_inst.addresses(i));
     memadd_info[i]->u_desc_value = pb_inst.addresses(i).udesc_value();
+    memadd_info[i]->u_desc_value_hi = pb_inst.addresses(i).udesc_value_hi();
   }
 
   return true;

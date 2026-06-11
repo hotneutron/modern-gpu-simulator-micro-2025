@@ -139,6 +139,7 @@ enum AdaptiveCache { FIXED = 0, ADAPTIVE_CACHE = 1 };
 #include <cassert>
 
 #include "operation_type.h"
+#include "gpgpu-sim/remodeling/tma_types.h"
 #include "../../../util/traces_enhanced/src/traced_instruction.h" // MOD. Improved tracer
 
 typedef unsigned long long new_addr_type;
@@ -306,6 +307,7 @@ class kernel_info_t {
            m_next_tid.x < m_block_dim.x;
   }
   unsigned get_uid() const { return m_uid; }
+  virtual unsigned get_trace_kernel_id() const { return 0; }
   std::string get_name() const { return name(); }
   std::string name() const;
 
@@ -1150,6 +1152,12 @@ class inst_t {
     return (op == STORE_OP || op == TENSOR_CORE_STORE_OP ||
             memory_op == memory_store);
   }
+  bool is_tma_load() const { return (op == TMA_LOAD_OP); }
+  bool is_tma_store() const { return (op == TMA_STORE_OP); }
+  bool is_tma_misc() const { return (op == TMA_MISCELLANEOUS_OP); }
+  bool is_tma_op() const {
+    return is_tma_load() || is_tma_store() || is_tma_misc();
+  }
 
   bool is_memory_barrier() const {
     return (op == MEMORY_BARRIER_OP);
@@ -1159,8 +1167,12 @@ class inst_t {
     return (op == GRID_BARRIER_OP);
   }
 
+  bool is_mbarrier() const { return (op == MBARRIER_OP); }
+
   bool is_any_kind_of_barrier() const {
-    return (op == MEMORY_BARRIER_OP) || (op == LDGDEPBAR_OP) || (op == BARRIER_OP) || (op == GRID_BARRIER_OP);
+    return (op == MEMORY_BARRIER_OP) || (op == LDGDEPBAR_OP) ||
+           (op == BARRIER_OP) || (op == MBARRIER_OP) ||
+           (op == GRID_BARRIER_OP);
   }
 
   bool is_memory_miscelanous() const {
@@ -1203,6 +1215,19 @@ class inst_t {
   address_type next_traced_pc;  // program counter address of the next traced instruction
   unsigned isize;   // size of instruction in bytes
   op_type op;       // opcode (uarch visible)
+  TMAOpcodeFamily tma_opcode_family = TMAOpcodeFamily::UNKNOWN;
+  uint32_t tma_handle_hi = 0;
+  bool sync_site_valid = false;
+  SyncInstructionKind sync_kind = SyncInstructionKind::NONE;
+  SyncSemanticOperandRole sync_semantic_operand_role =
+      SyncSemanticOperandRole::NONE;
+  int sync_barrier_operand_index = -1;
+  int sync_semantic_operand_index = -1;
+  bool sync_runtime_valid = false;
+  uint64_t sync_barrier_addr = 0;
+  bool sync_has_semantic_raw = false;
+  uint64_t sync_semantic_raw = 0;
+  uint32_t trace_kernel_id = 0;
   bool skip_wb;
 
   barrier_type bar_type;

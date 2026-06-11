@@ -68,6 +68,7 @@
 
 #include "../ISA_Def/blackwell_opcode.h"
 #include "../ISA_Def/hopper_opcode.h"
+#include "../gpgpu-sim/src/gpgpu-sim/remodeling/tma_types.h"
 #include "../ISA_Def/ampere_opcode.h"
 #include "../ISA_Def/kepler_opcode.h"
 #include "../ISA_Def/pascal_opcode.h"
@@ -89,7 +90,6 @@
 
 #include "../../util/traces_enhanced/src/traced_instruction.h"
 #include "../../util/traces_enhanced/src/string_utilities.h"
-
 
 void advance_trace_cta_id(kernel_trace_t *kernel_trace_info) {
   if(kernel_trace_info->next_tb_to_parse_x < (kernel_trace_info->grid_dim_x - 1)){
@@ -214,6 +214,9 @@ types_of_operands get_oprnd_type(op_type op, special_ops sp_op){
     case DP_OP:
     case LOAD_OP:
     case STORE_OP:
+    case TMA_LOAD_OP:
+    case TMA_STORE_OP:
+    case TMA_MISCELLANEOUS_OP:
       return FP_OP;
     case BRANCH_OP:
     case UNIFORM_OP:
@@ -253,6 +256,16 @@ bool trace_warp_inst_t::parse_from_trace_struct(
   pc = (address_type)trace.m_pc;
   next_traced_pc = (address_type)trace.m_next_traced_pc;
   unique_function_id = trace.m_unique_function_id;
+  sync_site_valid = trace.sync_site_valid;
+  sync_kind = trace.sync_kind;
+  sync_semantic_operand_role = trace.sync_semantic_operand_role;
+  sync_barrier_operand_index = trace.sync_barrier_operand_index;
+  sync_semantic_operand_index = trace.sync_semantic_operand_index;
+  sync_runtime_valid = trace.sync_runtime_valid;
+  sync_barrier_addr = trace.sync_barrier_addr;
+  sync_has_semantic_raw = trace.sync_has_semantic_raw;
+  sync_semantic_raw = trace.sync_semantic_raw;
+  trace_kernel_id = kernel_trace_info->kernel_id;
 
   isize =
       16;  // starting from MAXWELL isize=16 bytes (including the control bytes)
@@ -296,6 +309,20 @@ bool trace_warp_inst_t::parse_from_trace_struct(
   if (it != OpcodeMap->end()) {
     m_opcode = it->second.opcode;
     op = (op_type)(it->second.opcode_category);
+    if (op == TMA_LOAD_OP || op == TMA_STORE_OP || op == TMA_MISCELLANEOUS_OP) {
+      switch (m_opcode) {
+        case OP_UTMALDG:      tma_opcode_family = TMAOpcodeFamily::UTMALDG;      break;
+        case OP_UTMAPF:       tma_opcode_family = TMAOpcodeFamily::UTMAPF;       break;
+        case OP_UTMASTG:      tma_opcode_family = TMAOpcodeFamily::UTMASTG;      break;
+        case OP_UTMAREDG:     tma_opcode_family = TMAOpcodeFamily::UTMAREDG;     break;
+        case OP_UBLKCP:       tma_opcode_family = TMAOpcodeFamily::UBLKCP;       break;
+        case OP_UBLKPF:       tma_opcode_family = TMAOpcodeFamily::UBLKPF;       break;
+        case OP_UBLKRED:      tma_opcode_family = TMAOpcodeFamily::UBLKRED;      break;
+        case OP_UTMACCTL:     tma_opcode_family = TMAOpcodeFamily::UTMACCTL;     break;
+        case OP_UTMACMDFLUSH: tma_opcode_family = TMAOpcodeFamily::UTMACMDFLUSH; break;
+        default:              tma_opcode_family = TMAOpcodeFamily::UNKNOWN;      break;
+      }
+    }
     const std::unordered_map<unsigned, unsigned> *OpcPowerMap = &OpcodePowerMap;
     std::unordered_map<unsigned, unsigned>::const_iterator it2 =
       OpcPowerMap->find(m_opcode);
@@ -363,12 +390,15 @@ bool trace_warp_inst_t::parse_from_trace_struct(
   // fill addresses
   if(!trace.memadd_info.empty()) {
     data_size = trace.memadd_info[0]->width;
+    tma_handle_hi = trace.memadd_info[0]->u_desc_value_hi;
     for (unsigned i = 0; i < config_warp_size; ++i) {
       set_addr(i, trace.memadd_info[0]->addrs[i]);
       if(trace.memadd_info.size() == 2){
         set_addr_memref2(i, trace.memadd_info[1]->addrs[i]);
       }
     }
+  } else {
+    tma_handle_hi = 0;
   }
 
 
@@ -457,6 +487,11 @@ bool trace_warp_inst_t::parse_from_trace_struct(
       break;
     case OP_LDSM:
       assert(data_size > 0);
+      space.set_type(shared_space);
+      break;
+    case OP_STSM:
+      assert(data_size > 0);
+      memory_op = memory_store;
       space.set_type(shared_space);
       break;
     case OP_ST:

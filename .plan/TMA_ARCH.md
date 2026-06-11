@@ -13,9 +13,10 @@ TMA should **not** be modeled as an extension of `LDGSTS` or as a specialized ca
 Instead:
 
 - **`LDGSTS` remains on the current LD/ST path**
-- **TMA gets a new opcode class and a new SM-shared engine**
+- **TMA gets its own opcode families and a new SM-shared engine**
 - **TMA performs descriptor-driven address generation internally**
 - **TMA completion is tracked through a TMA-specific completion model**
+- **TMA never reuses `ldst_unit_sm` ownership or `DEPBAR`/`LDGDEPBAR` completion tracking**
 
 This follows the architectural distinction:
 
@@ -130,22 +131,30 @@ Therefore, TMA should submit a **command**, not mutate into a normal load/store 
 
 ### 1. New Opcode Class
 
-Add a new architectural operation type, e.g.:
+Add dedicated TMA architectural operation types:
 
-- `TMA_OP`
+- `TMA_LOAD_OP`
+- `TMA_STORE_OP`
+- `TMA_MISCELLANEOUS_OP`
 
 This should be added in the op-type definitions and assigned to Hopper TMA opcode families.
 
 Candidate families:
 
-- `UTMALDG`
-- `UTMAPF`
-- `UTMASTG`
-- `UTMAREDG`
-- `UBLKCP`
-- `UBLKPF`
-- `UBLKRED`
-- likely also TMA-control families such as `UTMACCTL`, `UTMACMDFLUSH`
+- **`TMA_LOAD_OP`**
+  - `UTMALDG`
+  - `UTMAPF`
+  - `UBLKCP`
+  - `UBLKPF`
+- **`TMA_STORE_OP`**
+  - `UTMASTG`
+  - `UTMAREDG`
+  - `UBLKRED`
+- **`TMA_MISCELLANEOUS_OP`**
+  - `UTMACCTL`
+  - `UTMACMDFLUSH`
+
+Do not add `TMA_RED_OP` or `TMA_CTRL_OP` at this stage. Reduction vs. non-reduction and control vs. prefetch distinctions should remain command-level fields, not top-level execution-domain splits.
 
 ### 2. New Subcore-Side Pipeline
 
@@ -155,7 +164,7 @@ Add a new subcore-side pipeline, e.g.:
 
 Responsibilities:
 
-- accept `TMA_OP`
+- accept `TMA_LOAD_OP`, `TMA_STORE_OP`, and `TMA_MISCELLANEOUS_OP`
 - perform lightweight issue-side timing
 - forward commands to the SM-shared TMA engine
 
@@ -232,6 +241,8 @@ Suggested state:
 - associated warp / CTA / stage
 
 First implementation does not need to fully match Hopper encoding, but it should preserve the architectural idea that TMA completion is tied to async transaction progress rather than only to the issuing instruction’s ordinary retirement.
+
+**Implementation note (Phase 1.5 → Phase 5):** The current skeleton uses a `std::vector<TMACompletionObject>` that grows unbounded — each new TMA command appends an entry and none are ever freed. This is acceptable for Phase 1.5 validation but must be replaced with a fixed-size pool or ring before Phase 5. The `completion_id` is currently the raw vector index; a pool design would allocate from a free-list and return the slot on WAIT_SATISFIED.
 
 ### 6. Wait-Side Stall Rule
 
@@ -386,6 +397,7 @@ Suggested contents:
 - rank
 - coordinates
 - shared-memory source/destination pointer
+- requests total
 - total bytes
 - covered bytes for validated bulk operand-driven forms
 - raw operand-3 runtime value for descriptor-backed size/span-controlled forms
@@ -396,6 +408,155 @@ Suggested contents:
 - engine state
 
 This becomes the primary abstraction for TMA execution.
+
+### Canonical Struct Layouts
+
+The plan should target compact canonical layouts from the beginning so later phases extend behavior without forcing structural rewrites.
+
+```cpp
+enum class TMAOpcodeFamily {
+    UTMALDG,
+    UTMAPF,
+    UTMASTG,
+    UTMAREDG,
+    UBLKCP,
+    UBLKPF,
+    UBLKRED,
+    UTMACCTL,
+    UTMACMDFLUSH
+};
+
+enum class TMADirection {
+    GMEM_TO_SMEM,
+    SMEM_TO_GMEM,
+    NONE
+};
+
+enum class TMATransferType {
+    LOAD,
+    STORE,
+    PREFETCH,
+    REDUCTION,
+    CONTROL
+};
+
+enum class TMAMetadataSource {
+    DESCRIPTOR,
+    OPERAND,
+    MIXED,
+    NONE
+};
+
+enum class TMAOperandForm {
+    EXPLICIT_DESC,
+    DESC_LIKE_PAIR,
+    BULK_OPERAND,
+    GENERIC
+};
+
+struct TMACommand {
+    uint32_t warp_id;
+    uint32_t cta_id;
+    uint32_t sm_id;
+    uint32_t subcore_id;
+    TMAOpcodeFamily opcode_family;
+    TMADirection direction;
+    TMATransferType transfer_type;
+    std::string config_id;
+    TMAMetadataSource meta_source;
+    std::string mapping_method;
+    float resolver_confidence;
+    uint32_t rank;
+    std::array<uint32_t, 5> box_dim;
+    std::array<uint32_t, 5> coords;
+    uint32_t element_size;
+    uint64_t smem_ptr;
+    uint32_t requests_total;
+    uint32_t total_bytes;
+    uint32_t covered_bytes;
+    uint32_t operand3_raw;
+    uint32_t swizzle;
+    uint32_t interleave;
+    uint32_t oob_fill;
+    uint32_t l2_promotion;
+    TMAOperandForm operand_form;
+    uint32_t completion_id;
+};
+
+struct TMATransferEntry {
+    enum class State {
+        ISSUED,
+        ENQUEUED,
+        AGU_READY,
+        IN_FLIGHT,
+        COMPLETED,
+        WAIT_SATISFIED
+    };
+
+    TMACommand cmd;
+    State state;
+    uint32_t requests_issued;
+    uint32_t requests_completed;
+    int cycle_enqueued;
+    int cycle_agu_ready;
+    int cycle_first_request;
+    int cycle_last_completion;
+    uint32_t completion_id;
+};
+
+struct TMACompletionObject {
+    uint32_t expected_tx_bytes;
+    uint32_t completed_tx_bytes;
+    uint32_t phase;
+    bool ready;
+    uint32_t warp_id;
+    uint32_t cta_id;
+    int cycle_ready;
+    // Phase 5: add expected_arrival_count and completed_arrival_count.
+    // Hopper mbarrier has two independent counters (arrival count + tx-count);
+    // a phase completes only when BOTH reach zero.
+};
+```
+
+Field usage by phase:
+
+- **Phase 1**
+  - identity, opcode family, direction, transfer type, operand form
+- **Phase 2**
+  - config ID, metadata source, mapping method, rank, descriptor-derived geometry
+- **Phase 3**
+  - `requests_total`, `requests_issued`, `requests_completed`, `completion_id`
+- **Phase 4**
+  - store-side `smem_ptr`, reduction/control transfer type usage
+- **Phase 5**
+  - `expected_tx_bytes`, `completed_tx_bytes`, `phase`, `ready`
+
+Even if some fields are initially populated with conservative defaults, the structure shape should match this target early so later phases remain additive.
+
+### AGU Timing Basis
+
+The TMA AGU timing model should be based on the number of aligned transfer requests, not on `total_bytes`.
+
+Required quantity:
+
+- `row_bytes = box_dim[0] * element_size`
+- `requests_per_row = ceil(row_bytes / 128)`
+- `outer_iters = box_dim[1] * box_dim[2] * ... * box_dim[rank - 1]`
+- `requests_total = requests_per_row * outer_iters`
+
+`total_bytes / 128` is only correct when `row_bytes` is already an exact multiple of 128. That happens to hold for some FA3 geometries, but it is not a general rule. Therefore:
+
+- `total_bytes` should remain in the command for reference and completion-byte accounting
+- but AGU / transfer progress must be driven by `requests_total`
+- early phases may simplify request issue rate or per-request latency
+- early phases must not simplify `requests_total` into `total_bytes / 128`
+
+The minimum acceptable Phase 3 transfer entry should therefore carry both:
+
+- `requests_total`
+- `total_bytes`
+
+and treat them as different quantities with different uses.
 
 ### Minimal Async State Machine
 
@@ -441,6 +602,12 @@ The simulator already has:
 
 These are useful as scaffolding, but they are **not equivalent** to Hopper TMA synchronization.
 
+TMA completion must remain a separate tracking domain from:
+
+- `DEPBAR`
+- `LDGDEPBAR`
+- ordinary wait-barrier / scoreboard retirement tracking
+
 ### Required New Semantics
 
 Longer term, the simulator needs explicit support for:
@@ -456,6 +623,31 @@ The right plan is:
 2. connect consumer readiness to that object
 3. later refine it into a more Hopper-like `mbarrier` model
 4. finally add simplified proxy-fence visibility rules for TMA stores
+
+#### Hardware gap: mbarrier has two independent completion counters
+
+Hopper `mbarrier` tracks two independent counters, not one:
+
+- **arrival count**: decremented by each thread arriving at the barrier (`MBAR.ARV`)
+- **tx-count**: decremented by each byte arriving from async transfers (`MBAR.ARRIVE_DROP_EXPECT_TX` / `complete_tx`)
+
+A barrier phase completes only when **both** counts reach zero. Current `TMACompletionObject` only tracks tx-count (bytes). Phase 5 must add `expected_arrival_count` and `completed_arrival_count` to model the full readiness condition.
+
+#### Hardware gap: TMA load vs store use different completion mechanisms
+
+These are two distinct hardware mechanisms, not variants of the same path:
+
+- **TMA loads** (`UTMALDG`, `UTMAPF`, `UBLKCP`, `UBLKPF`): completion is signaled via mbarrier `complete_tx`. The mbarrier is the synchronization object; `MBAR.TEST_WAIT.PARITY` is the consumer wait point.
+- **TMA stores** (`UTMASTG`, `UTMAREDG`, `UBLKRED`): completion is signaled via commit-group / wait-group, not via mbarrier. In SASS this corresponds to `UTMACMDFLUSH`. The consumer wait pattern is `cp.async.bulk.wait_group 0`, not mbarrier phase wait.
+
+Phase 4 and Phase 5 must model these as separate synchronization domains, not as one unified completion model.
+
+#### Hardware gap: fence.proxy.async is required in two contexts
+
+`FENCE.PROXY.ASYNC` is not only required before TMA stores. It is also required **after `mbarrier.init`** to ensure the mbarrier object is visible across the async proxy before any thread attempts to use it. Phase 6 must account for both:
+
+1. after `mbarrier.init` — ensures async proxy sees the initialized mbarrier object
+2. before TMA stores — ensures prior generic-path writes to shared memory are visible to the TMA store engine
 
 ### First Async Execution Rule
 
@@ -479,9 +671,10 @@ For `UTMALDG` / `UTMAPF` / `UBLKCP` / `UBLKPF`:
 3. issuing ownership ends after command enqueue, so the warp can continue with later independent work
 4. TMA AGU resolves addresses using descriptor + coordinates
 5. TMA engine emits bulk requests toward memory hierarchy
+   - **Hardware note: TMA loads bypass L1 data cache.** Requests go directly to L2/DRAM, not through the per-SM L1 cache. Phase 3 memory hierarchy routing must not send TMA traffic through the L1 data cache path. TMA traffic should be counted separately from L1-cached loads.
 6. returning data is placed into shared memory through TMA landing path
-7. completion object is updated as bytes arrive
-8. consumers proceed once completion state is satisfied
+7. completion object is updated as bytes arrive (via mbarrier `complete_tx`)
+8. consumers proceed once mbarrier tx-count AND arrival count both reach zero
 
 ### SMEM -> GMEM
 
@@ -489,10 +682,10 @@ For descriptor-backed store forms such as `UTMASTG` / `UTMAREDG` and descriptor-
 
 1. warp issues TMA store command
 2. issuing ownership ends after enqueue, while the store transfer continues under `tma_unit_sm`
-3. generic-path writes to shared memory must already be visible
+3. generic-path writes to shared memory must already be visible; `FENCE.PROXY.ASYNC` is required to ensure proxy-domain visibility
 4. TMA engine reads from shared memory source region
 5. TMA engine writes to global memory using descriptor-generated addresses and descriptor-carried tensor-layout context
-6. completion object is optionally tracked if later code depends on completion
+6. completion is signaled via **commit-group / wait-group** (`UTMACMDFLUSH` in SASS), **not via mbarrier**. This is a separate completion mechanism from TMA load completion.
 
 ### Reduction Stores
 
@@ -523,6 +716,26 @@ the dataflow should be modeled separately from descriptor-backed TMA stores:
 This path should remain under the TMA engine, but it should not be forced through descriptor-config lookup as its primary semantic source.
 
 This path is currently a **follow-on extension**, not a first-suite requirement.
+
+## Descriptor-Resolver Validity Gate
+
+The simulator-facing descriptor interface is still correct:
+
+- `tma_descriptor_configs.json`
+- `tma_descriptor_resolver.json`
+- `tma_operand_resolver.json`
+
+However, the current resolver-generation path still depends on a workload-specific handle-family heuristic. Previous qword-comparison attempts did not yield a useful or stable direct descriptor lookup path, so Phase 2 should treat the validated handle-family heuristic as the intended generator-side binding method for the current target traces.
+
+Phase-2 gate:
+
+1. verify that the handle-family heuristic remains stable on the first target traces
+2. confirm FA3 / FA2 keep the expected `config_id` assignments after hard-coded literal removal
+3. keep `UTMAPF` descriptor linkage one-to-one on the targeted traces
+4. keep `UTMASTG` desc-like first-operand-pair handling valid on the targeted traces
+5. keep descriptor-backed `UBLKRED` conservative unless its operand-3 rule is directly validated
+
+This gate does not change the simulator lookup API, but it does determine whether the current heuristic-backed descriptor JSONs are trustworthy enough to begin Phase 2 metadata binding for the first target traces.
 
 ## Proposed File-Level Direction
 
@@ -558,8 +771,8 @@ Goal:
 
 Tasks:
 
-- add `TMA_OP`
-- map Hopper TMA families to `TMA_OP`
+- add `TMA_LOAD_OP`, `TMA_STORE_OP`, and `TMA_MISCELLANEOUS_OP`
+- map Hopper TMA families to those TMA-specific op classes
 - add `m_tma_pipeline`
 - add `tma_unit_sm`
 - route only TMA ops to the new path
@@ -572,12 +785,34 @@ Success criterion:
 
 Test plan:
 
-- add a trace-decode unit check that Hopper TMA mnemonics map to `TMA_OP` while `LDGSTS`, `LDG`, `STG`, `LDS`, and `STS` keep their previous routing
-- add a routing-level check that `Subcore::get_fu()` sends only `TMA_OP` to `m_tma_pipeline` and leaves non-TMA memory ops on `m_memory_unit_subcore`
+- add a trace-decode unit check that Hopper TMA mnemonics map to `TMA_LOAD_OP`, `TMA_STORE_OP`, or `TMA_MISCELLANEOUS_OP` while `LDGSTS`, `LDG`, `STG`, `LDS`, and `STS` keep their previous routing
+- add a routing-level check that `Subcore::get_fu()` sends only the three TMA op families to `m_tma_pipeline` and leaves non-TMA memory ops on `m_memory_unit_subcore`
 - add a construction/initialization check that `SM` instantiates the new TMA reception latch and `tma_unit_sm` without changing LD/ST initialization
 - add a structural check that the new TMA path is modeled as a separate engine path rather than as a tensor-core or CUDA-core sub-variant
 - run a non-TMA regression workload and verify there is no behavioral change in issue counts, memory-unit traffic, or cycle count beyond harmless noise
 - run a TMA-containing trace and verify it no longer falls into the old LD/ST ownership path or crashes due to missing TMA execution routing
+
+### Phase 2 Gate: Descriptor Mapping Validation
+
+Goal:
+
+- ensure descriptor-backed TMA metadata is not silently tied to one FA3-specific handle heuristic
+
+Tasks:
+
+- validate the runtime-observed `handle_hi_hex` family mapping path after hard-coded literal removal
+- confirm the resulting `config_id` assignments remain stable on the targeted FA3 / FA2 traces
+- keep unresolved or weakly resolved descriptor-backed sites out of Phase 2 binding
+
+Success criterion:
+
+- descriptor-backed `config_id` resolution is justified by a validated heuristic handle-mapping path on the first target traces, with known limits documented explicitly
+
+Test plan:
+
+- confirm the resulting resolver JSON remains stable when the same descriptor-backed site is encountered across repeated targeted traces
+- confirm FA3 / FA2 preserve the expected `config_id` assignments after heuristic cleanup
+- document the supported heuristic cases and unresolved cases before enabling Phase 2 metadata binding
 
 ### Phase 2: Descriptor and Command Formation
 
@@ -596,10 +831,20 @@ Tasks:
 - attach TMA command information to decoded instructions
 - ensure the internal TMA command object represents a submitted async transfer request rather than a long-lived subcore execution record
 
+**UTMAPF descriptor_link handling:** `UTMAPF` has no explicit `desc[URx]` operand.
+Its descriptor association is stored in `tma_operand_resolver.json` under `descriptor_link.matched_descriptor.config_ids`, pointing to a later `UTMALDG` at the same `unique_function_id`.
+The Phase 2 JSON loader should **pre-resolve** this link at load time and store the resolved `config_id` directly in the `TMACommand`.
+There is no `descriptor_link` field in `TMACommand` and none is needed — the resolver is resolved to a `config_id` string before the command is formed.
+
+**UBLKRED operand_form at Phase 2:** `classify_tma_operand_form` currently returns `BULK_OPERAND` for all UBLKRED sites as a static default.
+The Phase 2 metadata loader must override this per-site: if `tma_descriptor_resolver.json` has an entry for the site, set `operand_form = EXPLICIT_DESC`; if only `tma_operand_resolver.json` covers the site with `operand_form = "bulk"`, keep `BULK_OPERAND`.
+No change to `TMACommand` struct is needed; `operand_form` is already present.
+
 Success criterion:
 
 - the TMA engine receives structured transfer commands rather than guessed ordinary memory accesses, and descriptor-backed `UBLKRED` carries both descriptor semantics and conservative operand-3 size/span metadata
 - command formation is cleanly separated from later transfer progress and completion accounting
+- descriptor-backed lookup relies on the validated mapping path established by the Phase 2 gate rather than an undocumented FA3-only assumption
 
 Test plan:
 
@@ -632,6 +877,14 @@ Tasks:
 - land into shared memory model
 - update completion state
 - advance transfer progress inside `tma_unit_sm` independently of tensor-core and CUDA-core occupancy
+- drive AGU-side progress using `requests_total`, not `total_bytes / 128`
+- **route TMA load traffic to bypass L1 data cache** — TMA loads go directly to L2; they must not increment L1 hit/miss counters or pass through the L1 hit/miss path
+
+**UTMALDG.MULTICAST decision point:** `UTMALDG` has a `.MULTICAST` variant that takes an extra 16-bit `ctaMask` operand and delivers one global fetch to multiple CTAs' SMEM simultaneously. This variant is already observed in FA2 traces, but FA2 is not the first implementation target. Phase 3 may defer MULTICAST fidelity until after the first FA3-oriented path is stable. When it is addressed, the model must decide whether to represent MULTICAST as:
+  - a no-op (treat as single-CTA load, suppress extra copies) — acceptable as a conservative first model
+  - a bandwidth optimization (reduce redundant GMEM fetches for overlapping CTA tiles) — higher fidelity but requires cross-CTA SMEM write visibility
+
+The choice must be documented and made explicit; silently routing MULTICAST as a plain UTMALDG without noting the suppressed ctaMask is an untracked accuracy gap.
 
 Success criterion:
 
@@ -642,6 +895,7 @@ Test plan:
 
 - create a focused micro-trace or synthetic test with `UTMALDG`/`UTMAPF`/`UBLKCP` and verify the command enters `tma_unit_sm`, allocates an in-flight entry, and emits bulk transfer work
 - add AGU tests for 1D/2D/4D or 5D descriptor cases to verify base+stride address generation is stable and deterministic
+- add an AGU-timing contrast test with equal `total_bytes` but different `box_dim[0]` aspect ratios and verify the modeled request count differs
 - add boundary-handling tests where tile coordinates exceed tensor bounds and confirm the selected fallback behavior is applied consistently
 - verify GMEM -> SMEM TMA traffic increments new TMA counters rather than LDGSTS counters or ordinary LD/ST counters
 - add an overlap test where unrelated compute continues while a TMA transfer remains in flight, and verify the transfer still progresses each SM cycle
@@ -715,6 +969,7 @@ Tasks:
 
 - add a simplified `FENCE.PROXY.ASYNC` visibility model
 - model the ordering needed before TMA stores source from shared memory
+- model the ordering needed **after `mbarrier.init`** — a `FENCE.PROXY.ASYNC` is required after initializing an mbarrier object to ensure the async proxy can observe the initialized state before any thread arrives or waits on it
 
 Success criterion:
 
@@ -800,7 +1055,7 @@ Recommended fixture classes:
   - used to validate opcode classification and command formation
 - **Fixture 2: descriptor-resolution fixture**
   - a trace with known `tma_descriptor_configs.json` and `tma_descriptor_resolver.json` entries
-  - used to validate `(unique_function_id, pc)` lookup and fallback cases
+  - used to validate `(unique_function_id, pc, handle_hi)` lookup and explicit zero-handle cases
 - **Fixture 3: GMEM -> SMEM fixture**
   - a trace dominated by `UTMALDG` / `UTMAPF`
   - used to validate TMA load flow and completion
@@ -904,7 +1159,7 @@ Each phase should have explicit acceptance conditions beyond “it runs.”
 
 Pass if:
 
-- all targeted TMA opcodes decode as `TMA_OP`
+- all targeted TMA opcodes decode as `TMA_LOAD_OP`, `TMA_STORE_OP`, or `TMA_MISCELLANEOUS_OP`
 - only TMA ops route to the new TMA path
 - non-TMA memory ops still route exactly as before
 - no existing non-TMA regression trace shows unintended routing changes
@@ -920,7 +1175,7 @@ Fail if:
 Pass if:
 
 - descriptor configs and resolver metadata load successfully
-- known `(unique_function_id, pc)` pairs resolve to expected configs
+- known `(unique_function_id, pc, handle_hi)` tuples resolve to expected configs
 - TMA commands contain the expected structured metadata
 - fallback cases are explicit and counted
 

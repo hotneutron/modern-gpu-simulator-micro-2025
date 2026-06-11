@@ -38,6 +38,7 @@
 #include "l0_icnt.h"
 #include "../shader.h"
 #include "../shader_trace.h"
+#include "tma_unit_sm.h"
 #include "../stat-tool.h"
 
 #include "first_level_instruction_cache.h"
@@ -46,6 +47,7 @@
 
 #include "../../../../../util/traces_enhanced/src/traced_operand.h"
 
+#include <sstream>
 
 #define STRSIZE 1024
 
@@ -102,6 +104,99 @@ unsigned int translate_reg_to_global_id(int reg, TraceEnhancedOperandType reg_ty
   return global_id;
 }
 
+namespace {
+
+static constexpr uint32_t kSyncExchDecodeBase = 0x200000;
+
+uint32_t decode_sync_exch_expected_arrive_count(uint64_t raw) {
+  if (raw >= kSyncExchDecodeBase) {
+    return 0;
+  }
+  // EXCH encodes 2x the logical expected-arrival count (validated against
+  // microbenchmarks: knob 3 -> raw giving 6, 4 -> 8, 8 -> 16). The logical
+  // arrival count is in thread units, so divide the encoded delta by 2.
+  return static_cast<uint32_t>((kSyncExchDecodeBase - raw) / 2);
+}
+
+uint32_t decode_sync_wait_phase(uint64_t wait_state_raw) {
+  // The PHASECHK / TRYWAIT phaseParity operand is encoded in bit 31 of the
+  // captured wait_state (validated against FA3 traces: the operand only ever
+  // takes the values 0x0 and 0x80000000, differing solely in bit 31). Reading
+  // bit 0 collapsed both values to 0 and discarded the parity entirely.
+  return static_cast<uint32_t>((wait_state_raw >> 31) & 0x1ULL);
+}
+
+std::string format_hex_u64(uint64_t value) {
+  std::ostringstream oss;
+  oss << std::hex << value;
+  return oss.str();
+}
+
+const char *sync_kind_to_string(SyncInstructionKind kind) {
+  switch (kind) {
+    case SyncInstructionKind::EXCH:
+      return "EXCH";
+    case SyncInstructionKind::ARRIVE:
+      return "ARRIVE";
+    case SyncInstructionKind::ARRIVE_EXPECT_TX:
+      return "ARRIVE_EXPECT_TX";
+    case SyncInstructionKind::ARRIVE_COUNTED:
+      return "ARRIVE_COUNTED";
+    case SyncInstructionKind::PHASECHK:
+      return "PHASECHK";
+    case SyncInstructionKind::TRYWAIT:
+      return "TRYWAIT";
+    case SyncInstructionKind::NONE:
+    default:
+      return "NONE";
+  }
+}
+
+bool is_lightweight_fence_memory_barrier(const warp_inst_t &inst) {
+  if (inst.op != MEMORY_BARRIER_OP || !inst.has_extra_trace_instruction_info()) {
+    return false;
+  }
+  const std::string opcode =
+      inst.get_extra_trace_instruction_info().get_op_code();
+  return opcode.rfind("FENCE", 0) == 0;
+}
+
+// SYNCS.ARRIVE.TRANS64 variants whose runtime semantics have been validated end
+// to end (see .plan/SYNC_ISA.md). The simulator classifies arrive vs
+// arrive-expect-tx purely from the captured semantic_raw, so these only need a
+// confirmed operand layout. Any other arrive variant that actually executes is
+// unverified and must trip the guard in handle_sync_instruction().
+bool is_validated_arrive_opcode(const std::string &opcode) {
+  return opcode == "SYNCS.ARRIVE.TRANS64" ||             // suffix-less, tx bytes
+         opcode == "SYNCS.ARRIVE.TRANS64.RED.A1T0" ||    // operand2 RZ, plain
+         opcode == "SYNCS.ARRIVE.TRANS64.RED.A0TR" ||    // nvcc, tx bytes
+         opcode == "SYNCS.ARRIVE.TRANS64.ART0" ||        // nvcc, plain
+         opcode == "SYNCS.ARRIVE.TRANS64.A1T0";          // nvcc, plain
+}
+
+void debug_print_sm_barrier_issue(const warp_inst_t &inst,
+                                  unsigned int warp_id,
+                                  unsigned int sm_id) {
+  static int budget = 64;
+  if (budget <= 0) {
+    return;
+  }
+  const std::string trace_opcode =
+      inst.has_extra_trace_instruction_info()
+          ? inst.get_extra_trace_instruction_info().get_op_code()
+          : "<no-trace-opcode>";
+  std::cerr << "[SMDBG][barrier-issue] sm=" << sm_id
+            << " warp=" << warp_id
+            << " pc=0x" << format_hex_u64(inst.pc)
+            << " op=" << static_cast<int>(inst.op)
+            << " trace_opcode=" << trace_opcode
+            << " bar_id=" << inst.bar_id
+            << " bar_count=" << inst.bar_count << std::endl;
+  --budget;
+}
+
+}  // namespace
+
 SM::SM(unsigned int num_subcores, gpgpu_sim *gpu, simt_core_cluster *cluster,
        unsigned shader_id, unsigned tpc_id, const shader_core_config *config,
        const memory_config *mem_config, shader_core_stats *stats)
@@ -129,20 +224,31 @@ SM::SM(unsigned int num_subcores, gpgpu_sim *gpu, simt_core_cluster *cluster,
   m_memory_config = mem_config;
   m_config = config;
   m_num_cycles_to_wait_to_dispatch_another_inst_from_subcore_to_sm_shared_pipeline = 0;
+  m_pending_sync_waits.resize(config->max_warps_per_shader);
+  m_pending_tma_barrier_binds_per_warp.resize(config->max_warps_per_shader);
+  if (config->sync_debug_enable) {
+    m_sync_debug_print_budget = config->sync_debug_print_budget;
+    m_sync_debug_skip_runtime_budget = config->sync_debug_skip_runtime_budget;
+  }
   if(config->is_interwarp_coalescing_enabled && is_using_interwarp_coal_warps_waiting_dep_counter()) {
     m_interwarp_coal_warps_waiting_dep_counter = new InterWarp_Coalescing_Waiting_Dep_Counters(config->max_warps_per_shader);
   }
 }
 
 SM::~SM() {
+  debug_dump_sync_counters();
   for (auto warp : m_physical_warp) {
     delete warp;
   }
   for(unsigned int i = 0; i < m_EX_MEM_reception_latches_per_subcore.size(); i++) {
     delete m_EX_MEM_reception_latches_per_subcore[i];
   }
+  for (unsigned int i = 0; i < m_EX_TMA_reception_latches_per_subcore.size(); i++) {
+    delete m_EX_TMA_reception_latches_per_subcore[i];
+  }
   m_EX_WB_sm_shared_units_subcore_latches.clear();
   delete m_ldst_unit_shared_of_sm;
+  delete m_tma_unit_shared_of_sm;
   if(m_config->is_dp_pipeline_shared_for_subcores) {
     delete m_shared_dp_unit;
   }
@@ -241,6 +347,32 @@ void SM::num_cycles_to_stall_SM(unsigned int num_cycles) {
   }
 }
 
+void SM::debug_log_sync_event(const std::string &message) {
+  if (m_sync_debug_print_budget == 0) {
+    return;
+  }
+  std::cerr << "[SYNCDBG][SM" << m_sm_id << "] " << message << std::endl;
+  --m_sync_debug_print_budget;
+}
+
+void SM::debug_dump_sync_counters() const {
+  if (m_sync_debug_sync_insts == 0 && m_sync_debug_tma_completions == 0 &&
+      m_sync_debug_missing_runtime == 0) {
+    return;
+  }
+  std::cerr << "[SYNCDBG][SM" << m_sm_id << "] summary"
+            << " sync_insts=" << m_sync_debug_sync_insts
+            << " exch=" << m_sync_debug_exch
+            << " arrive=" << m_sync_debug_arrive
+            << " arrive_expect_tx=" << m_sync_debug_arrive_expect_tx
+            << " wait_pending=" << m_sync_debug_wait_pending
+            << " wait_released=" << m_sync_debug_wait_released
+            << " phase_flip=" << m_sync_debug_phase_flip
+            << " tma_completions=" << m_sync_debug_tma_completions
+            << " missing_runtime=" << m_sync_debug_missing_runtime
+            << std::endl;
+}
+
 void SM::create_gpu_per_sm_stats(Element_stats &all_stats) {
   for(auto stat_name : all_stats.m_stats_name) {
     auto stat = all_stats.m_stats_map[stat_name];
@@ -317,6 +449,7 @@ void SM::cycle() {
   }
 
   m_ldst_unit_shared_of_sm->cycle();
+  m_tma_unit_shared_of_sm->cycle();
 
   if(m_config->is_interwarp_coalescing_enabled && 
         ((m_config->interwarp_coalescing_selection_policy == DEP_COUNT_WAIT_OLDEST_INST_IBUFFER_GENERIC) ||
@@ -444,8 +577,14 @@ void SM::issue_warp(register_set_uniptr &pipe_reg_set, warp_inst_t *next_inst,
                                              [warp_id]++;  // MOD. Custom
                                                            // powermodel stats
 
-  if ((pipe_reg->op == BARRIER_OP) || (pipe_reg->op == MEMORY_BARRIER_OP)) {
-    if(pipe_reg->op == MEMORY_BARRIER_OP) {
+  if (pipe_reg->op == MBARRIER_OP) {
+    handle_sync_instruction(*pipe_reg, warp_id);
+  } else if (pipe_reg->op == BARRIER_OP) {
+    debug_print_sm_barrier_issue(*pipe_reg, warp_id, m_sm_id);
+    m_physical_warp[warp_id]->store_info_of_last_inst_at_barrier(pipe_reg.get());
+    m_barriers.warp_reaches_barrier(m_physical_warp[warp_id]->get_cta_id(),
+                                    warp_id, pipe_reg.get());
+  } else if (pipe_reg->op == MEMORY_BARRIER_OP) {
       pipe_reg->m_num_cycles_to_stall_SM = m_config->num_cycles_to_stall_SM_at_gpu_memory_barrier;
       if(m_config->is_trace_mode && pipe_reg->get_extra_trace_instruction_info().get_is_system_memory_barrier()) {
         pipe_reg->m_num_cycles_to_stall_SM = m_config->num_cycles_to_stall_SM_at_system_memory_barrier;
@@ -453,10 +592,13 @@ void SM::issue_warp(register_set_uniptr &pipe_reg_set, warp_inst_t *next_inst,
         pipe_reg->m_num_cycles_to_stall_SM = m_config->num_cycles_to_stall_SM_at_cta_memory_barrier;
       }
       m_physical_warp[warp_id]->set_membar();
-    }
-    m_physical_warp[warp_id]->store_info_of_last_inst_at_barrier(pipe_reg.get());
-    m_barriers.warp_reaches_barrier(m_physical_warp[warp_id]->get_cta_id(),
-                                    warp_id, pipe_reg.get());    
+      if (!is_lightweight_fence_memory_barrier(*pipe_reg)) {
+        debug_print_sm_barrier_issue(*pipe_reg, warp_id, m_sm_id);
+        m_physical_warp[warp_id]->store_info_of_last_inst_at_barrier(
+            pipe_reg.get());
+        m_barriers.warp_reaches_barrier(m_physical_warp[warp_id]->get_cta_id(),
+                                        warp_id, pipe_reg.get());
+      }
   }else if(pipe_reg->op == GRID_BARRIER_OP) {
     m_physical_warp[warp_id]->set_gridbar();
     m_physical_warp[warp_id]->store_info_of_last_inst_at_barrier(pipe_reg.get());
@@ -506,6 +648,7 @@ void SM::issue_warp(register_set_uniptr &pipe_reg_set, warp_inst_t *next_inst,
   m_physical_warp[warp_id]->set_next_pc(pipe_reg->pc + pipe_reg->isize);
 
   if(m_config->is_trace_mode) {
+    assert(m_physical_warp[warp_id]->has_function_call_context());
     assert(pipe_reg->unique_function_id == m_physical_warp[warp_id]->get_current_unique_function_id_call());
     bool is_any_thread_active = pipe_reg->get_active_mask().any();
     if(pipe_reg->op == CALL_OPS && is_any_thread_active) {
@@ -519,7 +662,10 @@ void SM::issue_warp(register_set_uniptr &pipe_reg_set, warp_inst_t *next_inst,
         assert(pipe_reg->next_traced_pc == (pipe_reg->pc + pipe_reg->isize) );
       }
     } else if(pipe_reg->op == RET_OPS && is_any_thread_active) {
-      m_physical_warp[warp_id]->pop_function_call(pipe_reg->get_active_mask());
+      if (m_physical_warp[warp_id]->can_pop_non_root_function_call()) {
+        m_physical_warp[warp_id]->pop_function_call(
+            pipe_reg->get_active_mask());
+      }
     }
   }
 }
@@ -819,10 +965,17 @@ void SM::create_logical_structures() {
         "EX_MEM_shared_reception_latch_for_subcore_" + std::to_string(i);
     register_set_uniptr *mem_sm_reception_latch_for_subcore = new register_set_uniptr(1, latch_name.c_str());
     m_EX_MEM_reception_latches_per_subcore.push_back(mem_sm_reception_latch_for_subcore);
+    latch_name =
+        "EX_TMA_shared_reception_latch_for_subcore_" + std::to_string(i);
+    register_set_uniptr *tma_sm_reception_latch_for_subcore =
+        new register_set_uniptr(1, latch_name.c_str());
+    m_EX_TMA_reception_latches_per_subcore.push_back(
+        tma_sm_reception_latch_for_subcore);
     
     Subcore *subcore = new Subcore(i, m_config, m_stats, this,
                                    &m_EX_DP_shared_sm_reception_latch,
-                                   mem_sm_reception_latch_for_subcore);
+                                   mem_sm_reception_latch_for_subcore,
+                                   tma_sm_reception_latch_for_subcore);
     subcore->create_pipeline();
     m_subcores.push_back(subcore);
     m_EX_WB_sm_shared_units_subcore_latches.push_back(
@@ -892,6 +1045,9 @@ void SM::create_memory_interfaces() {
       m_EX_MEM_reception_latches_per_subcore, m_icnt, m_icnt_L0s, m_mem_fetch_allocator,
       this, m_scoreboard, m_scoreboard_WAR, m_config, m_memory_config, m_stats,
       m_sm_id, m_tpc_id, m_config->memory_sm_prt_size);
+  m_tma_unit_shared_of_sm =
+      new tma_unit_sm(m_EX_WB_sm_shared_units_subcore_latches,
+                      m_EX_TMA_reception_latches_per_subcore, m_config, this);
   static_cast<L0_icnt *>(m_icnt_L0s)
         ->add_L0(static_cast<read_only_cache *>(m_ldst_unit_shared_of_sm->get_L1C()));
 }
@@ -950,6 +1106,10 @@ void SM::reinit(unsigned start_thread, unsigned end_thread,
     m_occupied_hwtid.reset();
     m_occupied_cta_to_hwtid.clear();
     m_active_warps = 0;
+    m_hopper_mbarriers.clear();
+    for (auto &bindings : m_pending_tma_barrier_binds_per_warp) {
+      bindings.clear();
+    }
   }
   for (unsigned i = start_thread; i < end_thread; i++) {
     m_threadState[i].n_insn = 0;
@@ -959,6 +1119,12 @@ void SM::reinit(unsigned start_thread, unsigned end_thread,
        i < end_thread / m_config->warp_size; ++i) {
     m_physical_warp[i]->reset();
     m_simt_stack[i]->reset();
+    if (i < m_pending_sync_waits.size()) {
+      m_pending_sync_waits[i] = HopperMBarrierPendingWait();
+    }
+    if (i < m_pending_tma_barrier_binds_per_warp.size()) {
+      m_pending_tma_barrier_binds_per_warp[i].clear();
+    }
   }
 }
 
@@ -974,6 +1140,7 @@ void SM::register_cta_thread_exit(unsigned cta_num, kernel_info_t *kernel) {
     m_sm_stats.m_stats_map["ctas_completed"]->increment_with_integer(1);
     m_n_active_cta--;
     m_barriers.deallocate_barrier(cta_num);
+    clear_sync_barrier_state_for_cta(cta_num);
     shader_CTA_count_unlog(m_sm_id, 1);
 
     SHADER_DPRINTF(
@@ -1031,8 +1198,10 @@ void SM::set_kernel(kernel_info_t *k) {
   assert(k);
   m_kernel = k;
   //        k->inc_running();
-  printf("GPGPU-Sim uArch: Shader %d bind to kernel %u \'%s\'\n", m_sm_id,
-         m_kernel->get_uid(), m_kernel->name().c_str());
+  printf(
+      "GPGPU-Sim uArch: Shader %d bind to kernel launch_uid=%u trace_kernel_id=%u \'%s\'\n",
+      m_sm_id, m_kernel->get_uid(), m_kernel->get_trace_kernel_id(),
+      m_kernel->name().c_str());
 }
 kernel_info_t *SM::get_kernel() { return this->core_t::get_kernel_info(); }
 kernel_info_t *SM::get_kernel_info() { return this->core_t::get_kernel_info(); }
@@ -1190,7 +1359,374 @@ bool SM::check_if_non_released_reduction_barrier(warp_inst_t &inst) {
 }
 
 bool SM::warp_waiting_at_barrier(unsigned warp_id) const {
-  return m_barriers.warp_waiting_at_barrier(warp_id);
+  if (m_barriers.warp_waiting_at_barrier(warp_id)) {
+    return true;
+  }
+  if (warp_id >= m_pending_sync_waits.size()) {
+    return false;
+  }
+  HopperMBarrierPendingWait &pending_wait = m_pending_sync_waits[warp_id];
+  if (!pending_wait.valid) {
+    return false;
+  }
+  if (is_sync_wait_satisfied(pending_wait)) {
+    const_cast<SM *>(this)->m_sync_debug_wait_released++;
+    const_cast<SM *>(this)->debug_log_sync_event(
+        "wait released warp=" + std::to_string(warp_id) + " cta=" +
+        std::to_string(pending_wait.key.cta_id) + " barrier=0x" +
+        format_hex_u64(pending_wait.key.barrier_addr) + " wait_state=" +
+        std::to_string(pending_wait.wait_state_raw));
+    pending_wait = HopperMBarrierPendingWait();
+    return false;
+  }
+  return true;
+}
+
+HopperMBarrierKey SM::build_sync_barrier_key(const warp_inst_t &inst,
+                                             unsigned int warp_id) const {
+  HopperMBarrierKey key;
+  key.trace_kernel_id = inst.trace_kernel_id;
+  key.cta_id = m_physical_warp[warp_id]->get_cta_id();
+  key.barrier_addr = inst.sync_barrier_addr;
+  return key;
+}
+
+HopperMBarrierObject &SM::get_or_create_sync_barrier(
+    const HopperMBarrierKey &key) {
+  return m_hopper_mbarriers[key];
+}
+
+void SM::recompute_sync_barrier_ready_and_maybe_flip_phase(
+    HopperMBarrierObject &barrier, uint64_t barrier_addr) {
+  const bool arrive_ready =
+      barrier.arrive_count >= barrier.expected_arrive_count;
+  const bool tx_ready =
+      barrier.completed_tx_bytes >= barrier.expected_tx_bytes;
+  barrier.ready = arrive_ready && tx_ready;
+  if (!barrier.ready) {
+    return;
+  }
+  m_sync_debug_phase_flip++;
+  debug_log_sync_event(
+      "phase flip barrier=0x" + format_hex_u64(barrier_addr) + " phase=" +
+      std::to_string(barrier.phase) + "->" +
+      std::to_string(barrier.phase ^ 1) + " arrive=" +
+      std::to_string(barrier.arrive_count) + "/" +
+      std::to_string(barrier.expected_arrive_count) + " tx=" +
+      std::to_string(barrier.completed_tx_bytes) + "/" +
+      std::to_string(barrier.expected_tx_bytes));
+  barrier.phase ^= 1;
+  // Reset only the per-phase accumulators. expected_arrive_count is set once by
+  // EXCH (mbarrier.init) and reused on every phase: EXCH runs exactly once per
+  // barrier (validated in FA3 traces: 1 EXCH vs many PHASECHK/arrive phases),
+  // so clearing it here would let the next phase flip after a single arrive.
+  // expected_tx_bytes IS reset because the expect-tx arrive re-sets it each
+  // phase.
+  barrier.arrive_count = 0;
+  barrier.expected_tx_bytes = 0;
+  barrier.completed_tx_bytes = 0;
+  barrier.ready = false;
+}
+
+bool SM::is_sync_wait_satisfied(
+    const HopperMBarrierPendingWait &pending_wait) const {
+  auto it = m_hopper_mbarriers.find(pending_wait.key);
+  if (it == m_hopper_mbarriers.end()) {
+    return false;
+  }
+  // Hopper mbarrier try_wait/test_wait completes when the consumer's input
+  // phaseParity DIFFERS from the barrier's current phase parity (the phase the
+  // consumer was waiting on has flipped away). Equality means the barrier is
+  // still in that phase -> keep waiting. See NVIDIA CUDA Programming Guide
+  // (4.9 Asynchronous Barriers) and .plan/SYNC_ISA.md.
+  return it->second.phase != decode_sync_wait_phase(pending_wait.wait_state_raw);
+}
+
+void SM::handle_sync_instruction(warp_inst_t &inst, unsigned int warp_id) {
+  if (!inst.sync_site_valid || !inst.sync_runtime_valid) {
+    m_sync_debug_missing_runtime++;
+    if (m_sync_debug_skip_runtime_budget > 0) {
+      const std::string opcode =
+          inst.has_extra_trace_instruction_info()
+              ? inst.get_extra_trace_instruction_info().get_op_code()
+              : "<no-trace-opcode>";
+      debug_log_sync_event(
+          "skip sync warp=" + std::to_string(warp_id) +
+          " trace_kernel_id=" + std::to_string(inst.trace_kernel_id) +
+          " site_valid=" + std::to_string(inst.sync_site_valid) +
+          " runtime_valid=" + std::to_string(inst.sync_runtime_valid) +
+          " kind=" + sync_kind_to_string(inst.sync_kind) + " pc=0x" +
+          format_hex_u64(inst.pc) + " opcode=" + opcode +
+          " barrier_idx=" + std::to_string(inst.sync_barrier_operand_index) +
+          " semantic_idx=" + std::to_string(inst.sync_semantic_operand_index));
+      --m_sync_debug_skip_runtime_budget;
+    }
+    return;
+  }
+
+  m_sync_debug_sync_insts++;
+  HopperMBarrierKey key = build_sync_barrier_key(inst, warp_id);
+  if (inst.sync_kind == SyncInstructionKind::PHASECHK ||
+      inst.sync_kind == SyncInstructionKind::TRYWAIT) {
+    if (warp_id < m_pending_sync_waits.size()) {
+      const bool is_trywait =
+          inst.sync_kind == SyncInstructionKind::TRYWAIT;
+      if (is_sync_wait_satisfied(
+              HopperMBarrierPendingWait{true, is_trywait, key,
+                                        inst.sync_semantic_raw})) {
+        m_sync_debug_wait_released++;
+        // Include decoded parity + barrier phase so a post-fix run can confirm
+        // that waits now hit at BOTH phases (the old bit-0 decode only ever hit
+        // at phase=0). parity = (wait_state >> 31) & 1; satisfied when
+        // phase != parity.
+        std::string hit_phase_state = " phase=<unseen> parity=" +
+            std::to_string(decode_sync_wait_phase(inst.sync_semantic_raw));
+        auto hit = m_hopper_mbarriers.find(key);
+        if (hit != m_hopper_mbarriers.end()) {
+          hit_phase_state =
+              " phase=" + std::to_string(hit->second.phase) + " parity=" +
+              std::to_string(decode_sync_wait_phase(inst.sync_semantic_raw));
+        }
+        debug_log_sync_event(
+            "wait immediate-hit warp=" + std::to_string(warp_id) + " cta=" +
+            std::to_string(key.cta_id) + " barrier=0x" +
+            format_hex_u64(key.barrier_addr) + " wait_state=" +
+            std::to_string(inst.sync_semantic_raw) + hit_phase_state);
+        m_pending_sync_waits[warp_id] = HopperMBarrierPendingWait();
+      } else {
+        // PHASECHK / TRYWAIT are modeled as nonblocking predicate tests.
+        // The traced control flow performs any retry or fallback sequencing.
+        m_sync_debug_wait_pending++;
+        m_pending_sync_waits[warp_id] = HopperMBarrierPendingWait();
+        // Deadlock diagnosis: dump the current barrier counters so a barrier
+        // that never becomes ready (arrive_count < expected, or tx bytes short)
+        // is visible even late in a long run.
+        std::string barrier_state = " barrier-state=<unseen>";
+        auto bit = m_hopper_mbarriers.find(key);
+        if (bit != m_hopper_mbarriers.end()) {
+          const HopperMBarrierObject &b = bit->second;
+          barrier_state =
+              " arrive=" + std::to_string(b.arrive_count) + "/" +
+              std::to_string(b.expected_arrive_count) + " tx=" +
+              std::to_string(b.completed_tx_bytes) + "/" +
+              std::to_string(b.expected_tx_bytes) + " phase=" +
+              std::to_string(b.phase) + " ready=" +
+              std::to_string(b.ready ? 1 : 0);
+        }
+        debug_log_sync_event(
+            "wait miss nonblocking warp=" + std::to_string(warp_id) +
+            " cta=" +
+            std::to_string(key.cta_id) + " barrier=0x" +
+            format_hex_u64(key.barrier_addr) + " wait_state=" +
+            std::to_string(inst.sync_semantic_raw) + " parity=" +
+            std::to_string(decode_sync_wait_phase(inst.sync_semantic_raw)) +
+            " trywait=" +
+            std::to_string(is_trywait) + barrier_state);
+      }
+    }
+    return;
+  }
+
+  HopperMBarrierObject &barrier = get_or_create_sync_barrier(key);
+  // Guard: any arrive that actually executes must be a validated variant. The
+  // resolver labels all arrives ARRIVE_EXPECT_TX and the real arrive vs
+  // expect-tx behavior is decided below from sync_semantic_raw. Unverified
+  // arrive opcodes must not be silently trusted (see .plan/SYNC_ISA.md).
+  if (inst.sync_kind == SyncInstructionKind::ARRIVE ||
+      inst.sync_kind == SyncInstructionKind::ARRIVE_COUNTED ||
+      inst.sync_kind == SyncInstructionKind::ARRIVE_EXPECT_TX) {
+    const std::string arrive_opcode =
+        inst.has_extra_trace_instruction_info()
+            ? inst.get_extra_trace_instruction_info().get_op_code()
+            : std::string("<no-trace-opcode>");
+    if (!is_validated_arrive_opcode(arrive_opcode)) {
+      fprintf(stderr,
+              "[sync] FATAL: unvalidated SYNCS.ARRIVE variant executed: '%s' "
+              "(pc=0x%s cta=%u barrier=0x%s). Validate its operand/semantics "
+              "(see .plan/SYNC_ISA.md) before trusting it.\n",
+              arrive_opcode.c_str(), format_hex_u64(inst.pc).c_str(),
+              key.cta_id, format_hex_u64(key.barrier_addr).c_str());
+      abort();
+    }
+  }
+  // mbarrier tracks arrivals in thread units: a SYNCS.ARRIVE instruction adds
+  // one arrival per active thread (validated against FA3 traces, where the
+  // count barrier has active_mask=0xffffffff -> +32 and the tx barrier has
+  // active_mask=0x1 -> +1, matching the logical expected-arrival count).
+  const uint32_t active_threads =
+      static_cast<uint32_t>(inst.active_count());
+  const std::string active_mask_hex =
+      format_hex_u64(inst.get_active_mask().to_ullong());
+  switch (inst.sync_kind) {
+    case SyncInstructionKind::EXCH:
+      m_sync_debug_exch++;
+      barrier.expected_arrive_count = inst.sync_has_semantic_raw
+                                          ? decode_sync_exch_expected_arrive_count(
+                                                inst.sync_semantic_raw)
+                                          : 0;
+      barrier.arrive_count = 0;
+      barrier.expected_tx_bytes = 0;
+      barrier.completed_tx_bytes = 0;
+      barrier.ready = false;
+      debug_log_sync_event(
+          "exch warp=" + std::to_string(warp_id) + " cta=" +
+          std::to_string(key.cta_id) + " barrier=0x" +
+          format_hex_u64(key.barrier_addr) + " raw=0x" +
+          format_hex_u64(inst.sync_semantic_raw) + " (0x200000-raw)=" +
+          std::to_string(0x200000ULL - inst.sync_semantic_raw) +
+          " expected_arrive(logical=/2)=" +
+          std::to_string(barrier.expected_arrive_count));
+      break;
+    case SyncInstructionKind::ARRIVE:
+      m_sync_debug_arrive++;
+      barrier.arrive_count += active_threads;
+      debug_log_sync_event(
+          "arrive warp=" + std::to_string(warp_id) + " cta=" +
+          std::to_string(key.cta_id) + " barrier=0x" +
+          format_hex_u64(key.barrier_addr) + " +active=" +
+          std::to_string(active_threads) + "(mask=0x" + active_mask_hex +
+          ") arrive=" + std::to_string(barrier.arrive_count) + "/" +
+          std::to_string(barrier.expected_arrive_count));
+      recompute_sync_barrier_ready_and_maybe_flip_phase(barrier,
+                                                        key.barrier_addr);
+      break;
+    case SyncInstructionKind::ARRIVE_COUNTED:
+      m_sync_debug_arrive++;
+      barrier.arrive_count +=
+          inst.sync_has_semantic_raw
+              ? static_cast<uint32_t>(inst.sync_semantic_raw)
+              : active_threads;
+      debug_log_sync_event(
+          "arrive_counted warp=" + std::to_string(warp_id) + " cta=" +
+          std::to_string(key.cta_id) + " barrier=0x" +
+          format_hex_u64(key.barrier_addr) + " +active=" +
+          std::to_string(active_threads) + "(mask=0x" + active_mask_hex +
+          ") arrive=" + std::to_string(barrier.arrive_count) + "/" +
+          std::to_string(barrier.expected_arrive_count));
+      recompute_sync_barrier_ready_and_maybe_flip_phase(barrier,
+                                                        key.barrier_addr);
+      break;
+    case SyncInstructionKind::ARRIVE_EXPECT_TX: {
+      // The resolver labels every arrive ARRIVE_EXPECT_TX; the real behavior is
+      // decided here from the captured semantic_raw (see .plan/SYNC_ISA.md):
+      //   semantic_raw == 0 -> plain arrive (operand2 = RZ, no tx bytes)
+      //   semantic_raw != 0 -> arrive + expect tx bytes
+      const bool is_expect_tx =
+          inst.sync_has_semantic_raw && inst.sync_semantic_raw != 0;
+      if (is_expect_tx) {
+        m_sync_debug_arrive_expect_tx++;
+        barrier.arrive_count += active_threads;
+        uint32_t tx_bytes = static_cast<uint32_t>(inst.sync_semantic_raw);
+        barrier.expected_tx_bytes += tx_bytes;
+        bind_tma_completion_to_sync_barrier(warp_id, key, tx_bytes);
+        debug_log_sync_event(
+            "arrive_expect_tx warp=" + std::to_string(warp_id) + " cta=" +
+            std::to_string(key.cta_id) + " barrier=0x" +
+            format_hex_u64(key.barrier_addr) + " +active=" +
+            std::to_string(active_threads) + "(mask=0x" + active_mask_hex +
+            ") arrive=" + std::to_string(barrier.arrive_count) + "/" +
+            std::to_string(barrier.expected_arrive_count) + " +tx=" +
+            std::to_string(tx_bytes) + " tx=" +
+            std::to_string(barrier.expected_tx_bytes));
+      } else {
+        m_sync_debug_arrive++;
+        barrier.arrive_count += active_threads;
+        debug_log_sync_event(
+            "arrive warp=" + std::to_string(warp_id) + " cta=" +
+            std::to_string(key.cta_id) + " barrier=0x" +
+            format_hex_u64(key.barrier_addr) + " +active=" +
+            std::to_string(active_threads) + "(mask=0x" + active_mask_hex +
+            ") arrive=" + std::to_string(barrier.arrive_count) + "/" +
+            std::to_string(barrier.expected_arrive_count));
+      }
+      recompute_sync_barrier_ready_and_maybe_flip_phase(barrier,
+                                                        key.barrier_addr);
+      break;
+    }
+    case SyncInstructionKind::NONE:
+    case SyncInstructionKind::PHASECHK:
+    case SyncInstructionKind::TRYWAIT:
+      break;
+  }
+}
+
+void SM::clear_sync_barrier_state_for_cta(unsigned int cta_id) {
+  for (auto it = m_hopper_mbarriers.begin(); it != m_hopper_mbarriers.end();) {
+    if (it->first.cta_id == cta_id) {
+      it = m_hopper_mbarriers.erase(it);
+    } else {
+      ++it;
+    }
+  }
+  for (HopperMBarrierPendingWait &pending_wait : m_pending_sync_waits) {
+    if (pending_wait.valid && pending_wait.key.cta_id == cta_id) {
+      pending_wait = HopperMBarrierPendingWait();
+    }
+  }
+  for (auto &bindings : m_pending_tma_barrier_binds_per_warp) {
+    while (!bindings.empty() && bindings.front().key.cta_id == cta_id) {
+      bindings.pop_front();
+    }
+    if (!bindings.empty()) {
+      std::deque<HopperMBarrierPendingTxBinding> filtered;
+      for (const auto &binding : bindings) {
+        if (binding.key.cta_id != cta_id) {
+          filtered.push_back(binding);
+        }
+      }
+      bindings.swap(filtered);
+    }
+  }
+}
+
+void SM::bind_tma_completion_to_sync_barrier(unsigned int warp_id,
+                                             const HopperMBarrierKey &key,
+                                             uint32_t tx_bytes) {
+  if (warp_id >= m_pending_tma_barrier_binds_per_warp.size() || tx_bytes == 0) {
+    return;
+  }
+  HopperMBarrierPendingTxBinding binding;
+  binding.key = key;
+  binding.pending_tx_bytes = tx_bytes;
+  m_pending_tma_barrier_binds_per_warp[warp_id].push_back(binding);
+  debug_log_sync_event("bind_tma warp=" + std::to_string(warp_id) + " cta=" +
+                       std::to_string(key.cta_id) + " barrier=0x" +
+                       format_hex_u64(key.barrier_addr) + " tx=" +
+                       std::to_string(tx_bytes) + " queued_binds=" +
+                       std::to_string(
+                           m_pending_tma_barrier_binds_per_warp[warp_id].size()));
+}
+
+void SM::notify_tma_completion(unsigned int warp_id,
+                               uint32_t completed_tx_bytes) {
+  if (warp_id >= m_pending_tma_barrier_binds_per_warp.size() ||
+      completed_tx_bytes == 0) {
+    return;
+  }
+  m_sync_debug_tma_completions++;
+  uint32_t remaining_bytes = completed_tx_bytes;
+  std::deque<HopperMBarrierPendingTxBinding> &bindings =
+      m_pending_tma_barrier_binds_per_warp[warp_id];
+  while (remaining_bytes > 0 && !bindings.empty()) {
+    HopperMBarrierPendingTxBinding &binding = bindings.front();
+    HopperMBarrierObject &barrier = get_or_create_sync_barrier(binding.key);
+    uint32_t applied_bytes = std::min(remaining_bytes, binding.pending_tx_bytes);
+    barrier.completed_tx_bytes += applied_bytes;
+    debug_log_sync_event(
+        "tma_complete warp=" + std::to_string(warp_id) + " cta=" +
+        std::to_string(binding.key.cta_id) + " barrier=0x" +
+        format_hex_u64(binding.key.barrier_addr) + " applied=" +
+        std::to_string(applied_bytes) + " completed_tx=" +
+        std::to_string(barrier.completed_tx_bytes) + "/" +
+        std::to_string(barrier.expected_tx_bytes));
+    recompute_sync_barrier_ready_and_maybe_flip_phase(barrier,
+                                                      binding.key.barrier_addr);
+    remaining_bytes -= applied_bytes;
+    binding.pending_tx_bytes -= applied_bytes;
+    if (binding.pending_tx_bytes == 0) {
+      bindings.pop_front();
+    }
+  }
 }
 
 bool SM::are_all_wait_barrier_ready(unsigned int warp_id) {

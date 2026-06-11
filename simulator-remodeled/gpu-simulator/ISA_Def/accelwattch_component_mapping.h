@@ -196,6 +196,7 @@ static const std::unordered_map<unsigned, unsigned> OpcodePowerMap = {
     {OP_BMMA, TENSOR__OP},
     {OP_MOVM, INT__OP},
     {OP_LDSM, OTHER_OP},
+    {OP_STSM, OTHER_OP},
     {OP_R2UR, INT__OP},
     {OP_S2UR, INT__OP},
     {OP_UBMSK, INT__OP},

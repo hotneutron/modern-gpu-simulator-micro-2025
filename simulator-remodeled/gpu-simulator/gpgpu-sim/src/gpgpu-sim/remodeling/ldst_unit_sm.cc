@@ -68,7 +68,7 @@ ldst_unit_sm::ldst_unit_sm(
     : functional_unit_shared_sm_part(result_ports, config, 0,
                              "MEM_SM_shared", core, MEM__OP, false, false, 1,
                              reception_ports, NUM_INTERMEDIATE_CYCLES_UN_BETWEEN_ISSUE_AND_FU_EXECUTION_FOR_FIXED_LATENCY_INST, nullptr, 0, false, TraceEnhancedOperandType::NONE),
-                             m_access_queue_to_l1c(config->sm_memory_unit_l1c_access_queue_size), m_access_queue_to_l1t(config->sm_memory_unit_l1t_access_queue_size), m_access_queue_to_l1d_preTLB(config->m_L1D_config.l1_banks), m_access_queue_to_l1d_postTLB(config->m_L1D_config.l1_banks), m_access_queue_to_shmem(config->sm_memory_unit_shmem_access_queue_size), m_access_queue_to_bypass_to_l2(config->sm_memory_unit_bypass_l1d_directly_go_to_l2_access_queue_size), m_access_queue_to_miscellaneous(config->sm_memory_unit_miscellaneous_access_queue_size) {
+                             m_access_queue_to_l1c(config->sm_memory_unit_l1c_access_queue_size), m_access_queue_to_l1t(config->sm_memory_unit_l1t_access_queue_size), m_access_queue_to_l1d_preTLB(config->m_L1D_config.l1_banks), m_access_queue_to_l1d_postTLB(config->m_L1D_config.l1_banks), m_access_queue_to_shmem_load(config->sm_memory_unit_shmem_access_queue_size), m_access_queue_to_shmem_store(config->sm_memory_unit_shmem_access_queue_size), m_access_queue_to_bypass_to_l2(config->sm_memory_unit_bypass_l1d_directly_go_to_l2_access_queue_size), m_access_queue_to_miscellaneous(config->sm_memory_unit_miscellaneous_access_queue_size) {
   assert(config->maximum_shared_memory_latency_at_sm_structure > 1);
   m_max_size_arbiter_to_subpipeline_reg_for_icnt_and_subcores =
       max_size_arbiter_to_subpipeline_reg_for_icnt_and_subcores;
@@ -113,7 +113,7 @@ ldst_unit_sm::ldst_unit_sm(
     : functional_unit_shared_sm_part(result_ports, config, 0,
                              "MEM_SM_shared", core, MEM__OP, false, false, 1,
                              reception_ports, NUM_INTERMEDIATE_CYCLES_UN_BETWEEN_ISSUE_AND_FU_EXECUTION_FOR_FIXED_LATENCY_INST, nullptr, 0, false, TraceEnhancedOperandType::NONE),
-      m_L1D(new_l1d_cache), m_access_queue_to_l1c(config->sm_memory_unit_l1c_access_queue_size), m_access_queue_to_l1t(config->sm_memory_unit_l1t_access_queue_size), m_access_queue_to_l1d_preTLB(config->m_L1D_config.l1_banks), m_access_queue_to_l1d_postTLB(config->m_L1D_config.l1_banks), m_access_queue_to_shmem(config->sm_memory_unit_shmem_access_queue_size), m_access_queue_to_bypass_to_l2(config->sm_memory_unit_bypass_l1d_directly_go_to_l2_access_queue_size), m_access_queue_to_miscellaneous(config->sm_memory_unit_miscellaneous_access_queue_size)  {
+      m_L1D(new_l1d_cache), m_access_queue_to_l1c(config->sm_memory_unit_l1c_access_queue_size), m_access_queue_to_l1t(config->sm_memory_unit_l1t_access_queue_size), m_access_queue_to_l1d_preTLB(config->m_L1D_config.l1_banks), m_access_queue_to_l1d_postTLB(config->m_L1D_config.l1_banks), m_access_queue_to_shmem_load(config->sm_memory_unit_shmem_access_queue_size), m_access_queue_to_shmem_store(config->sm_memory_unit_shmem_access_queue_size), m_access_queue_to_bypass_to_l2(config->sm_memory_unit_bypass_l1d_directly_go_to_l2_access_queue_size), m_access_queue_to_miscellaneous(config->sm_memory_unit_miscellaneous_access_queue_size)  {
   m_max_size_arbiter_to_subpipeline_reg_for_icnt_and_subcores =
       max_size_arbiter_to_subpipeline_reg_for_icnt_and_subcores;
   init(icnt, icnt_L1C_L1_half_C, mf_allocator, core, scoreboard, Scoreboard_reads,
@@ -254,23 +254,38 @@ void ldst_unit_sm::invalidate() {
   m_L1D->invalidate();
 }
 
-void ldst_unit_sm::shared_dispatch() {
-  if(!m_access_queue_to_shmem.empty()) {
-    mem_access_t *acc = m_access_queue_to_shmem.front();
-    assert(acc->get_inst()->m_prt_assigned);
-    mem_stage_stall_type rc_fail = NO_RC_FAIL;
-    bool is_shd_mem_available = m_shmem_pipeline[acc->get_inst()->m_latency_of_mem_operation_at_sm_structure - 1] == nullptr;
+bool ldst_unit_sm::try_shared_dispatch_from_queue(AccessQueue &queue) {
+  if (queue.empty()) {
+    return false;
+  }
+  mem_access_t *acc = queue.front();
+  assert(acc->get_inst()->m_prt_assigned);
+  bool is_shd_mem_available =
+      m_shmem_pipeline[acc->get_inst()->m_latency_of_mem_operation_at_sm_structure -
+                       1] == nullptr;
 
-    if(!is_shd_mem_available) {
-      m_stats->gpgpu_n_shmem_bank_access[m_sid]++;
-      rc_fail = DATA_PORT_STALL;
-      m_sm->m_sm_stats.m_stats_map["gpgpu_n_shmem_port_conflict"]->increment_with_integer(1);
-    }else {
-      m_shmem_pipeline[acc->get_inst()->m_latency_of_mem_operation_at_sm_structure - 1] = acc;
-    }
-    if (rc_fail == NO_RC_FAIL) {
-      m_access_queue_to_shmem.pop();
-    }
+  if (!is_shd_mem_available) {
+    m_stats->gpgpu_n_shmem_bank_access[m_sid]++;
+    m_sm->m_sm_stats.m_stats_map["gpgpu_n_shmem_port_conflict"]->increment_with_integer(1);
+    return false;
+  }
+
+  m_shmem_pipeline[acc->get_inst()->m_latency_of_mem_operation_at_sm_structure - 1] = acc;
+  queue.pop();
+  return true;
+}
+
+void ldst_unit_sm::shared_dispatch() {
+  AccessQueue &preferred_queue =
+      m_next_shared_dispatch_prefers_load ? m_access_queue_to_shmem_load
+                                          : m_access_queue_to_shmem_store;
+  AccessQueue &fallback_queue =
+      m_next_shared_dispatch_prefers_load ? m_access_queue_to_shmem_store
+                                          : m_access_queue_to_shmem_load;
+
+  if (try_shared_dispatch_from_queue(preferred_queue) ||
+      try_shared_dispatch_from_queue(fallback_queue)) {
+    m_next_shared_dispatch_prefers_load = !m_next_shared_dispatch_prefers_load;
   }
 }
 
@@ -986,9 +1001,12 @@ void ldst_unit_sm::cycle() {
         }
       }
     }else if(acc_candidate->get_space() == shared_space) {
-      if(!m_access_queue_to_shmem.full()) {
+      AccessQueue &target_queue =
+          acc_candidate->get_inst()->is_store() ? m_access_queue_to_shmem_store
+                                                : m_access_queue_to_shmem_load;
+      if(!target_queue.full()) {
         inserted_acc = true;
-        m_access_queue_to_shmem.push(acc_candidate);
+        target_queue.push(acc_candidate);
       }
     }else if(acc_candidate->get_space() == const_space) {
        if(!m_access_queue_to_l1c.full()) {

@@ -72,6 +72,7 @@ struct inst_memadd_info_t {
   uint64_t addrs[WARP_SIZE];
   int16_t width;
   uint32_t u_desc_value;
+  uint32_t u_desc_value_hi;
 
   void base_stride_decompress(unsigned long long base_address, int stride,
                               const std::bitset<WARP_SIZE> &mask);
@@ -95,6 +96,15 @@ struct inst_trace_t {
   uint16_t block_idx_y;
   uint16_t block_idx_z;
   bool is_constant_addr_already_calculated;
+  bool sync_site_valid;
+  SyncInstructionKind sync_kind;
+  SyncSemanticOperandRole sync_semantic_operand_role;
+  int sync_barrier_operand_index;
+  int sync_semantic_operand_index;
+  bool sync_runtime_valid;
+  uint64_t sync_barrier_addr;
+  bool sync_has_semantic_raw;
+  uint64_t sync_semantic_raw;
   std::vector<std::unique_ptr<inst_memadd_info_t>> memadd_info;
 
   void parse_memref(unsigned int idx, unsigned int mem_width, const std::bitset<WARP_SIZE> &mask_bits, dynamic_trace::address addr_info);

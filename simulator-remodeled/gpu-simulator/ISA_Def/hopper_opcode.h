@@ -130,7 +130,7 @@ static const std::unordered_map<std::string, OpcodeChar> Hopper_OpcodeMap = {
     {"STL", OpcodeChar(OP_STL, STORE_OP)},
     {"STS", OpcodeChar(OP_STS, STORE_OP)},
     {"STAS", OpcodeChar(OP_STAS, STORE_OP)},
-    {"SYNCS", OpcodeChar(OP_SYNCS, BARRIER_OP)},
+    {"SYNCS", OpcodeChar(OP_SYNCS, MBARRIER_OP)},
     {"MATCH", OpcodeChar(OP_MATCH, MEMORY_MISCELLANEOUS_OP)},
     {"QSPC", OpcodeChar(OP_QSPC, MEMORY_MISCELLANEOUS_OP)},
     {"ATOM", OpcodeChar(OP_ATOM, STORE_OP)},
@@ -195,15 +195,15 @@ static const std::unordered_map<std::string, OpcodeChar> Hopper_OpcodeMap = {
     {"WARPGROUPSET", OpcodeChar(OP_WARPGROUPSET, MISCELLANEOUS_NO_QUEUE_OP)},
 
     // Tensor Memory Access (TMA) - Hopper new
-    {"UBLKCP", OpcodeChar(OP_UBLKCP, LOAD_OP)},
-    {"UBLKPF", OpcodeChar(OP_UBLKPF, LOAD_OP)},
-    {"UBLKRED", OpcodeChar(OP_UBLKRED, STORE_OP)},
-    {"UTMACCTL", OpcodeChar(OP_UTMACCTL, MEMORY_MISCELLANEOUS_OP)},
-    {"UTMACMDFLUSH", OpcodeChar(OP_UTMACMDFLUSH, MEMORY_MISCELLANEOUS_OP)},
-    {"UTMALDG", OpcodeChar(OP_UTMALDG, LOAD_OP)},
-    {"UTMAPF", OpcodeChar(OP_UTMAPF, LOAD_OP)},
-    {"UTMAREDG", OpcodeChar(OP_UTMAREDG, STORE_OP)},
-    {"UTMASTG", OpcodeChar(OP_UTMASTG, STORE_OP)},
+    {"UBLKCP", OpcodeChar(OP_UBLKCP, TMA_LOAD_OP)},
+    {"UBLKPF", OpcodeChar(OP_UBLKPF, TMA_LOAD_OP)},
+    {"UBLKRED", OpcodeChar(OP_UBLKRED, TMA_STORE_OP)},
+    {"UTMACCTL", OpcodeChar(OP_UTMACCTL, TMA_MISCELLANEOUS_OP)},
+    {"UTMACMDFLUSH", OpcodeChar(OP_UTMACMDFLUSH, TMA_MISCELLANEOUS_OP)},
+    {"UTMALDG", OpcodeChar(OP_UTMALDG, TMA_LOAD_OP)},
+    {"UTMAPF", OpcodeChar(OP_UTMAPF, TMA_LOAD_OP)},
+    {"UTMAREDG", OpcodeChar(OP_UTMAREDG, TMA_STORE_OP)},
+    {"UTMASTG", OpcodeChar(OP_UTMASTG, TMA_STORE_OP)},
 
     // Texture Instructions
     {"TEX", OpcodeChar(OP_TEX, TEXTURE_OP)},

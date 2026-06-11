@@ -33,6 +33,7 @@
 #include <queue>
 #include <memory>
 #include <deque>
+#include <functional>
 
 #include "../stats.h"
 #include "../shader.h"
@@ -328,6 +329,7 @@ class ldst_unit_sm : public functional_unit_shared_sm_part {
   void cache_cycles();
     
   void shared_dispatch();
+  bool try_shared_dispatch_from_queue(AccessQueue &queue);
   void execute_miscellaneous_dispatch();
   void execute_cache_dispatch(AccessQueue *qu, cache_t *cache, std::function<mem_stage_stall_type(cache_t&, mem_access_t*)> func_process);  
   bool can_merge_with_queued_l1d_access(mem_fetch *queued_mf, const mem_access_t *acc) const;
@@ -383,7 +385,8 @@ class ldst_unit_sm : public functional_unit_shared_sm_part {
   AccessQueue m_access_queue_to_l1t;
   std::vector<AccessQueue*> m_access_queue_to_l1d_preTLB;
   std::vector<AccessQueue*> m_access_queue_to_l1d_postTLB;
-  AccessQueue m_access_queue_to_shmem;
+  AccessQueue m_access_queue_to_shmem_load;
+  AccessQueue m_access_queue_to_shmem_store;
   AccessQueue m_access_queue_to_bypass_to_l2;
   AccessQueue m_access_queue_to_miscellaneous;
   std::queue<mem_access_t*> m_next_access_to_queue;
@@ -392,5 +395,6 @@ class ldst_unit_sm : public functional_unit_shared_sm_part {
   
 
   mem_access_t **m_shmem_pipeline;
+  bool m_next_shared_dispatch_prefers_load = true;
   register_set_uniptr m_ldgsts_aux = register_set_uniptr(1, "ldgsts_aux");
 };

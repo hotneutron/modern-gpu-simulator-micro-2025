@@ -36,6 +36,7 @@
 #include <unordered_map>
 #include <vector>
 #include <stack>
+#include <deque>
 #include <memory>
 #include "ldst_unit_sm.h"
 
@@ -66,6 +67,7 @@ class Scoreboard_reads;
 class functional_unit;
 class coalescingStatsPerSm;
 class coalescingStatsAcrossSms;
+class tma_unit_sm;
 
 enum subcore_dispatch_latch_name_t {
   DISPATCH_SP = 0, // FP32
@@ -331,6 +333,22 @@ class SM : public core_t, public shader_core_ctx_wrapper {
   bool is_using_interwarp_coal_warps_waiting_dep_counter();
   void enqueue_instruction_region_prewarm(kernel_info_t &kernel);
   void issue_pending_instruction_region_prewarm();
+  void handle_sync_instruction(warp_inst_t &inst, unsigned int warp_id);
+  HopperMBarrierKey build_sync_barrier_key(const warp_inst_t &inst,
+                                           unsigned int warp_id) const;
+  HopperMBarrierObject &get_or_create_sync_barrier(
+      const HopperMBarrierKey &key);
+  void recompute_sync_barrier_ready_and_maybe_flip_phase(
+      HopperMBarrierObject &barrier, uint64_t barrier_addr);
+  bool is_sync_wait_satisfied(
+      const HopperMBarrierPendingWait &pending_wait) const;
+  void clear_sync_barrier_state_for_cta(unsigned int cta_id);
+  void bind_tma_completion_to_sync_barrier(unsigned int warp_id,
+                                           const HopperMBarrierKey &key,
+                                           uint32_t tx_bytes);
+  void notify_tma_completion(unsigned int warp_id, uint32_t completed_tx_bytes);
+  void debug_log_sync_event(const std::string &message);
+  void debug_dump_sync_counters() const;
 
   InterWarp_Coalescing_Waiting_Dep_Counters *m_interwarp_coal_warps_waiting_dep_counter;
 
@@ -353,6 +371,7 @@ class SM : public core_t, public shader_core_ctx_wrapper {
 
   std::vector<register_set_uniptr*> m_EX_WB_sm_shared_units_subcore_latches; 
   std::vector<register_set_uniptr*> m_EX_MEM_reception_latches_per_subcore;
+  std::vector<register_set_uniptr*> m_EX_TMA_reception_latches_per_subcore;
   register_set_uniptr m_EX_DP_shared_sm_reception_latch = register_set_uniptr(1,"EX_DP_shared_sm_reception_latch");
   functional_unit *m_shared_dp_unit;
 
@@ -363,6 +382,7 @@ class SM : public core_t, public shader_core_ctx_wrapper {
   // In order to be perfect, another icnt from memory_unit_subcore to shared
   // structures of memory of the subcore needs to be places here.
   ldst_unit_sm *m_ldst_unit_shared_of_sm;
+  tma_unit_sm *m_tma_unit_shared_of_sm = nullptr;
   std::shared_ptr<shader_core_mem_fetch_allocator> m_mem_fetch_allocator;
 
   std::vector<shd_warp_t *> m_physical_warp;  // per warp information array
@@ -374,6 +394,22 @@ class SM : public core_t, public shader_core_ctx_wrapper {
   std::stack<Wait_Barrier_Entry_Modifier> m_pending_wait_barrier_increments;
 
   barrier_set_t m_barriers;
+  std::map<HopperMBarrierKey, HopperMBarrierObject> m_hopper_mbarriers;
+  mutable std::vector<HopperMBarrierPendingWait> m_pending_sync_waits;
+  std::vector<std::deque<HopperMBarrierPendingTxBinding>>
+      m_pending_tma_barrier_binds_per_warp;
+  // Initialized from shader_core_config in SM::SM(); 0 disables logging.
+  uint64_t m_sync_debug_print_budget = 0;
+  uint64_t m_sync_debug_skip_runtime_budget = 0;
+  uint64_t m_sync_debug_sync_insts = 0;
+  uint64_t m_sync_debug_exch = 0;
+  uint64_t m_sync_debug_arrive = 0;
+  uint64_t m_sync_debug_arrive_expect_tx = 0;
+  uint64_t m_sync_debug_wait_pending = 0;
+  uint64_t m_sync_debug_wait_released = 0;
+  uint64_t m_sync_debug_phase_flip = 0;
+  uint64_t m_sync_debug_tma_completions = 0;
+  uint64_t m_sync_debug_missing_runtime = 0;
 
   // thread contexts
   thread_ctx_t *m_threadState;

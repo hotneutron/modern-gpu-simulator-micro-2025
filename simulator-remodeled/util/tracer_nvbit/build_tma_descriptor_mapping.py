@@ -175,18 +175,33 @@ def infer_rank_from_related_usage(entry, runtime_groups, pc_opcode_map):
     return None, None
 
 
-def derive_handle_family_map_by_rank(configs):
+def derive_handle_family_map_by_rank(configs, runtime_groups, pc_opcode_map):
     grouped = {}
     for config in configs:
         grouped.setdefault(config["tensor_rank"], []).append(config)
+    observed_handles_by_rank = {}
+    for entry in runtime_groups:
+        handle_hi_hex = entry["handle_hi_hex"]
+        if handle_hi_hex == "0x00000000":
+            continue
+        opcode = pc_opcode_map.get((entry["unique_function_id"], entry["pc_hex"]))
+        rank = extract_rank_from_opcode(opcode)
+        if rank is None:
+            rank, _ = infer_rank_from_related_usage(entry, runtime_groups, pc_opcode_map)
+        if rank is None:
+            continue
+        observed_handles_by_rank.setdefault(rank, set()).add(handle_hi_hex)
     mapping = {}
     for rank, rank_configs in grouped.items():
         sorted_configs = sorted(rank_configs, key=box_volume, reverse=True)
+        observed_handles = sorted(
+            observed_handles_by_rank.get(rank, []),
+            key=lambda value: parse_int(value),
+            reverse=True,
+        )
         rank_map = {}
-        if len(sorted_configs) >= 1:
-            rank_map["0x14f00000"] = sorted_configs[0]["config_id"]
-        if len(sorted_configs) >= 2:
-            rank_map["0x12f00000"] = sorted_configs[-1]["config_id"]
+        for handle_hi_hex, config in zip(observed_handles, sorted_configs):
+            rank_map[handle_hi_hex] = config["config_id"]
         mapping[rank] = rank_map
     return mapping
 
@@ -217,6 +232,8 @@ def finalize_unresolved_entries(resolver):
             entry["confidence"] = "medium"
             entry["mapping_method"] = "same_function_desc_reg_config_reuse"
             del entry["candidate_config_ids"]
+    for entry in resolver:
+        entry["binding_status"] = "resolved" if entry.get("config_id") else "unresolved"
 
 
 def build_resolver_entries(runtime_groups, handle_map_by_rank, configs, pc_opcode_map):
@@ -259,6 +276,52 @@ def build_resolver_entries(runtime_groups, handle_map_by_rank, configs, pc_opcod
     return resolver
 
 
+def is_descriptor_involved_opcode(opcode):
+    if not opcode:
+        return False
+    opcode_family = opcode.split()[0]
+    descriptor_prefixes = (
+        "UTMALDG",
+        "UTMAREDG",
+        "UTMASTG",
+        "UBLKRED",
+    )
+    return opcode_family.startswith(descriptor_prefixes)
+
+
+def should_verify_binding(entry):
+    opcode = entry.get("opcode")
+    return is_descriptor_involved_opcode(opcode)
+
+
+def format_binding_failure(entry):
+    candidate_config_ids = entry.get("candidate_config_ids", [])
+    candidate_text = ",".join(candidate_config_ids) if candidate_config_ids else "<none>"
+    return (
+        "[TMA][DescriptorMapping][Error] executed descriptor-involved site has no "
+        "unique final binding: "
+        f"ufid={entry['unique_function_id']} "
+        f"pc={entry['pc_hex']} "
+        f"opcode={entry.get('opcode')} "
+        f"handle_hi={entry['handle_hi_hex']} "
+        f"desc_regs={entry['desc_reg_ids']} "
+        f"mapping_method={entry.get('mapping_method')} "
+        f"candidate_configs={candidate_text}"
+    )
+
+
+def verify_executed_bindings_or_fail(resolver):
+    failures = [
+        entry
+        for entry in resolver
+        if should_verify_binding(entry) and not entry.get("config_id")
+    ]
+    if not failures:
+        return
+    failure_lines = [format_binding_failure(entry) for entry in failures]
+    raise SystemExit("\n".join(failure_lines))
+
+
 def write_json(path: Path, payload):
     path.write_text(json.dumps(payload, indent=2) + "\n")
 
@@ -268,14 +331,21 @@ def main():
     parser.add_argument("extra_info_dir", type=Path)
     parser.add_argument("--configs-out", type=Path)
     parser.add_argument("--resolver-out", type=Path)
+    parser.add_argument(
+        "--fail-on-missing-binding",
+        action="store_true",
+        help="Fail if any executed descriptor runtime site lacks a unique config_id",
+    )
     args = parser.parse_args()
 
     extra_info_dir = args.extra_info_dir
     tensor_rows, configs = load_tensor_map_configs(extra_info_dir)
     runtime_groups = load_runtime_groups(extra_info_dir)
     pc_opcode_map = load_pc_opcode_map(extra_info_dir)
-    handle_map_by_rank = derive_handle_family_map_by_rank(configs)
+    handle_map_by_rank = derive_handle_family_map_by_rank(configs, runtime_groups, pc_opcode_map)
     resolver = build_resolver_entries(runtime_groups, handle_map_by_rank, configs, pc_opcode_map)
+    if args.fail_on_missing_binding:
+        verify_executed_bindings_or_fail(resolver)
 
     configs_out = args.configs_out or (extra_info_dir / "tma_descriptor_configs.json")
     resolver_out = args.resolver_out or (extra_info_dir / "tma_descriptor_resolver.json")
@@ -292,7 +362,7 @@ def main():
         "version": 1,
         "source": {
             "runtime_group_count": len(runtime_groups),
-            "mapping_method": "handle_hi_to_box_dim_family_with_opcode_rank",
+            "mapping_method": "runtime_observed_handle_hi_to_box_dim_family_with_opcode_rank",
         },
         "resolver": resolver,
     })

@@ -225,6 +225,16 @@ class shd_warp_t {
     }
   }
 
+  bool has_function_call_context() const {
+    return !m_function_call_stack.empty();
+  }
+
+  size_t get_function_call_depth() const { return m_function_call_stack.size(); }
+
+  bool can_pop_non_root_function_call() const {
+    return m_function_call_stack.size() > 1;
+  }
+
   unsigned int get_current_unique_function_id_call() {
     assert(!m_function_call_stack.empty());
     return m_function_call_stack.top().unique_function_id;
@@ -2089,6 +2099,7 @@ class shader_core_config : public core_config {
   unsigned int num_cycles_to_wait_to_dispatch_another_inst_from_subcore_to_sm_shared_pipeline_when_is_dp_inst;
   unsigned int memory_shared_memory_minimum_latency;
   unsigned int memory_shared_memory_extra_latency_ldsm_multiple_matrix;
+  unsigned int memory_shared_memory_extra_latency_stsm_multiple_matrix;
   unsigned int memmory_max_concurrent_requests_shmem_per_sm;
   unsigned int memmory_max_concurrent_requests_standard_per_sm;
   unsigned int sm_memory_unit_l1c_access_queue_size;
@@ -2143,6 +2154,11 @@ class shader_core_config : public core_config {
   unsigned int instruction_region_prewarm_min_observed_warps;
   unsigned int instruction_region_prewarm_max_regions;
   unsigned int instruction_region_prewarm_max_lines_per_cycle;
+
+  // Hopper mbarrier sync debug logging (SYNCDBG). Disabled by default.
+  bool sync_debug_enable;
+  unsigned int sync_debug_print_budget;
+  unsigned int sync_debug_skip_runtime_budget;
 
   bool is_rf_cache_enabled;
   int max_operands_regular_register_file; 
@@ -3042,8 +3058,10 @@ class shader_core_ctx : public core_t, public shader_core_ctx_wrapper {
     assert(k);
     m_kernel = k;
     //        k->inc_running();
-    printf("GPGPU-Sim uArch: Shader %d bind to kernel %u \'%s\'\n", m_sid,
-           m_kernel->get_uid(), m_kernel->name().c_str());
+    printf(
+        "GPGPU-Sim uArch: Shader %d bind to kernel launch_uid=%u trace_kernel_id=%u \'%s\'\n",
+        m_sid, m_kernel->get_uid(), m_kernel->get_trace_kernel_id(),
+        m_kernel->name().c_str());
   }
   PowerscalingCoefficients *scaling_coeffs;
   // accessors
