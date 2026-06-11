@@ -260,6 +260,14 @@ Decoding the new FA3 per-CTA `.pb` joined with `sync_operand_resolver.json` acro
 This confirms: `.RED.A1T0` is a plain/counted arrive (not expect-tx), and the
 expect-tx arrive is the register-op2 variant.
 
+These two roles are also confirmed **at runtime** by the full FA3 bf16 bwd-causal
+simulation (`...-53cb9e043fde.e297`, kernel-10): the count barriers flip at
+`arrive=256/256` (6,527 flips) and the tx barriers flip with tx bytes exactly filled
+(`16896/16896` ×6,528, `32768/32768` ×384). The kernel runs to completion (`*** exit
+detected ***`) with no deadlock, and `gpu_sim_cycle = 336,579` is within 0.8% of the
+sync-skip baseline (`339,429`), confirming the bit-31 parity decode and the `!=`
+completion polarity below are correct in practice (not just by the truth table).
+
 ---
 
 ## Simulator mapping cheat-sheet

@@ -507,6 +507,15 @@ Validated status:
 - existing `utmapf` sync-only-by-runtime configs now also complete successfully:
   - `utmapf_exch_arrive_micro:utmapf-exch-arrive-1`
   - `utmapf_exch_multiphase_micro:utmapf-exch-multiphase-1x1x4`
+- **the full FA3 bf16 bwd-causal trace now runs to completion with sync modeled**
+  (`...-53cb9e043fde.{o297,e297}`, kernel-10): `*** exit detected ***`, no
+  deadlock/abort/FATAL. `gpu_sim_cycle = 336,579` vs the sync-skip baseline `339,429`
+  (−0.8%, i.e. no spurious over-stall). Both barrier roles cycle correctly: count
+  barriers flip at `arrive=256/256` (6,527 flips), tx barriers flip with tx bytes
+  exactly filled (`16896/16896` ×6,528, `32768/32768` ×384). `skip sync` is only
+  predicated-off `EXCH`/`PHASECHK`; zero `ARRIVE`/wait sites dropped. This validates the
+  sync **state machine** functionally; sync *timing* is still gated on real TMA latency,
+  and other kernels / mbarrier patterns are not yet exercised.
 
 This means:
 
