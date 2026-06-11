@@ -1829,6 +1829,21 @@ void shader_core_config::reg_options(class OptionParser *opp) {
                          "Maximum number of instruction-region prewarm lines issued per cycle."
                          "(default=1)",
                          "1");
+  option_parser_register(opp, "-sync_debug_enable", OPT_BOOL,
+                         &sync_debug_enable,
+                         "Enable Hopper mbarrier sync debug logging (SYNCDBG)."
+                         "(default=0)",
+                         "0");
+  option_parser_register(opp, "-sync_debug_print_budget", OPT_UINT32,
+                         &sync_debug_print_budget,
+                         "Maximum number of SYNCDBG event lines to print per SM when "
+                         "sync_debug_enable is set. (default=20000000)",
+                         "20000000");
+  option_parser_register(opp, "-sync_debug_skip_runtime_budget", OPT_UINT32,
+                         &sync_debug_skip_runtime_budget,
+                         "Maximum number of SYNCDBG 'skip sync' lines to print per SM when "
+                         "sync_debug_enable is set. (default=1024)",
+                         "1024");
   option_parser_register(opp, "-is_rf_cache_enabled", OPT_BOOL,
                          &is_rf_cache_enabled,
                          "If enabled, Regular register file has the register file feature enabled."

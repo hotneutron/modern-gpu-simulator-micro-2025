@@ -2155,6 +2155,11 @@ class shader_core_config : public core_config {
   unsigned int instruction_region_prewarm_max_regions;
   unsigned int instruction_region_prewarm_max_lines_per_cycle;
 
+  // Hopper mbarrier sync debug logging (SYNCDBG). Disabled by default.
+  bool sync_debug_enable;
+  unsigned int sync_debug_print_budget;
+  unsigned int sync_debug_skip_runtime_budget;
+
   bool is_rf_cache_enabled;
   int max_operands_regular_register_file; 
   int max_latency_regular_register_file_latency; 

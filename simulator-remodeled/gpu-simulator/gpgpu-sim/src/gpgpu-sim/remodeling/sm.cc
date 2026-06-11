@@ -226,6 +226,10 @@ SM::SM(unsigned int num_subcores, gpgpu_sim *gpu, simt_core_cluster *cluster,
   m_num_cycles_to_wait_to_dispatch_another_inst_from_subcore_to_sm_shared_pipeline = 0;
   m_pending_sync_waits.resize(config->max_warps_per_shader);
   m_pending_tma_barrier_binds_per_warp.resize(config->max_warps_per_shader);
+  if (config->sync_debug_enable) {
+    m_sync_debug_print_budget = config->sync_debug_print_budget;
+    m_sync_debug_skip_runtime_budget = config->sync_debug_skip_runtime_budget;
+  }
   if(config->is_interwarp_coalescing_enabled && is_using_interwarp_coal_warps_waiting_dep_counter()) {
     m_interwarp_coal_warps_waiting_dep_counter = new InterWarp_Coalescing_Waiting_Dep_Counters(config->max_warps_per_shader);
   }
