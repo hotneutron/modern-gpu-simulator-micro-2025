@@ -59,54 +59,15 @@
   - Post-fix verification from ongoing run `...-3a4ac87c71bd.{o293,e293}` shows the simulator progressed well past the old `STSM` crash point and reached later FA3/TMA regions (`0xadc0`, `0xaf30`, `0xb270`, `0x90a0`, `0x97d0`) without reproducing the previous `unsupported-space` assert.
   - This is strong evidence that the old `STSM` blocker has been cleared, although the run is still ongoing.
 
-## Open Issues
-
-### `BAR.SYNC.DEFER_BLOCKING` Modeling
+### Original `SYNC + TMA` Problem (resolved for the FA3-bwd trace)
 - **Symptom**
-  - Trace shows real operands for `BAR.SYNC.DEFER_BLOCKING`, but current decode routes it through generic `OP_BAR`.
-- **Root Cause**
-  - Current handling hardcodes `bar_id = 0`, `bar_count = -1`, and `bar_type = SYNC`.
-  - This discards the actual barrier operands in the trace.
-- **Findings From Old Branch**
-  - Historical commit `aad6763487cfcfbfc5a6a182d262c47c0179f71e` on branch `tma-impl-sync-temp` did not implement operand-aware `BAR.SYNC.DEFER_BLOCKING` semantics.
-  - What that branch primarily fixed was separation of Hopper `SYNCS` from the legacy CTA barrier path:
-    - `SYNCS` mapped to `MBARRIER_OP`
-    - extra Hopper sync metadata/debug plumbing
-    - assertions/logs when Hopper sync leaks into legacy barrier handling
-  - The current branch already contains the main architectural separation (`SYNCS -> MBARRIER_OP` and skip of legacy CTA barrier handling for `MBARRIER_OP`), so the remaining `BAR` problem still needs a fresh implementation here.
-- **Fix Direction**
-  - Decode and preserve operand-derived barrier identity/count.
-  - Distinguish `BAR.SYNC`, `BAR.ARV`, and `BAR.SYNC.DEFER_BLOCKING` semantics.
-  - Add stronger assertion/logging to catch unexpected leakage of Hopper sync / mbarrier instructions into legacy CTA barrier handling.
-- **Planned Implementation**
-  - In `trace-driven/trace_driven.cc`, parse static `OP_BAR` operands from traced instruction metadata instead of hardcoding `bar_id=0` and `bar_count=-1`.
-  - Map `BAR.ARV` to legacy barrier type `ARRIVE`.
-  - Map `BAR.RED*` to `RED` if encountered.
-  - Keep `BAR.SYNC` and `BAR.SYNC.DEFER_BLOCKING` on legacy barrier type `SYNC`, but with real operand-derived `bar_id` / `bar_count`.
-  - In legacy CTA barrier handling, add assertion/logging so Hopper `SYNCS` / `MBARRIER_OP` cannot silently leak into the CTA `BAR` path.
-  - Rebuild and run a fresh post-BAR experiment using the existing `SYNCDBG` logs to verify:
-    - `BAR.SYNC.DEFER_BLOCKING` no longer uses fake operands
-    - `BAR.ARV` is decoded as arrival-only
-    - the remaining failure, if any, is the deeper `SYNC + TMA` issue
-- **Status**
-  - Not fixed yet.
-  - Known FA3 correctness gap, but not the direct cause of the `STSM` crash.
-  - Implementation intentionally deferred until the current simulator run finishes and the current FA3-enablement fixes are committed.
-
-### Original `SYNC + TMA` Problem
-- **Symptom**
-  - Arrival-only microbench passes, but FA3-style `SYNC + TMA` does not.
+  - Arrival-only microbench passes, but FA3-style `SYNC + TMA` did not.
 - **Current Understanding**
   - The direct `STSM` crash was a secondary enablement blocker, not the underlying `SYNC + TMA` failure.
   - TMA ops in the examined failing run stayed on the TMA path; they were not the direct source of the `generate_mem_accesses()` abort.
   - Finished post-`STSM` run `...-17cf425686f3.{o295,e295}` ran the FA3-bwd kernel (`kernel-10`) to completion: all 384 CTAs were launched (`thread block = 0,0,0` → `383,0,0`) and the simulator reported `gpu_tot_issued_cta = 384` / `gpu_completed_cta = 384`, ending with `GPGPU-Sim: *** exit detected ***`, with no simulator-declared deadlock or assert.
-  - The final `SYNCDBG` summaries show:
-    - many `wait_released`
-    - some `EXCH`
-    - nonzero `tma_completions`
-    - but zero `arrive`, zero `arrive_expect_tx`, and zero `phase_flip`
-  - This strengthens the view that the remaining issue is in deeper sync / barrier / TMA binding semantics rather than the old `STSM` path.
-- **Root Cause Of Zero `arrive` (now identified)**
+  - That run's `SYNCDBG` summaries showed many `wait_released`, some `EXCH`, nonzero `tma_completions`, but zero `arrive`, zero `arrive_expect_tx`, and zero `phase_flip` — pointing at deeper sync / barrier / TMA binding semantics rather than the old `STSM` path.
+- **Root Cause Of Zero `arrive` (identified)**
   - The zero-`arrive` counters were caused by the tracer not recognizing the FA3 `SYNCS.ARRIVE.TRANS64` variants:
     - the static resolver (`build_sync_operand_mapping.py`) and the runtime capture (`tracer_tool.cu`) matched only nonexistent opcode spellings (e.g. `.RED.A0TR`), so every FA3 arrive site got `sync_site_valid=0` / `kind=NONE` / `sync_runtime_valid=0` and was dropped at the `handle_sync_instruction` early-return gate.
   - After fixing both opcode matchers, a fresh FA3 trace now emits `sync_operand_resolver.json` with 187 sync sites (EXCH 32, ARRIVE 30, PHASECHK 39, TRYWAIT 86) and the protobuf `instruction.sync` payload is populated.
@@ -127,10 +88,6 @@
   - `remodeling/sm.cc` `handle_sync_instruction` now branches the `ARRIVE_EXPECT_TX` case on the captured `semantic_raw`: `== 0` → plain arrive (`m_sync_debug_arrive`), `!= 0` → expect-tx (`m_sync_debug_arrive_expect_tx`, tx bytes accumulated + TMA completion binding). Both paths now do `arrive_count += active_threads` (= `inst.active_count()`).
   - Both the resolver build (`build_sync_operand_mapping.py`, `VALIDATED_ARRIVE_OPCODES`) and the simulator (`is_validated_arrive_opcode`) now reject any `SYNCS.ARRIVE.TRANS64*` variant that executes but has not been runtime-validated (`SystemExit` / `abort()` with diagnostics). See `.plan/SYNC_ISA.md`.
   - No re-tracing required: trace format/content is unchanged. Validation done: FA3 resolver still yields 187 sites (arrive = 2 validated variants), all 5 nvcc microbenches pass, an injected `.RED.A0T1` is correctly rejected, and the simulator builds clean (`accel-sim.out`).
-- **Likely Remaining Areas**
-  - TMA completion to mbarrier identity/binding
-  - byte-count semantics
-  - `BAR.SYNC.DEFER_BLOCKING` correctness
 - **Resolved**
   - **Phase/wait parity semantics fixed (was an FA3-bwd deadlock).** Diagnosed from run
     `...-53cb9e043fde.{o296,e296}`: after barriers flipped to `phase=1`, consumer
@@ -178,8 +135,42 @@
     polarity (`!=`) are all fixed, the simulator builds clean (`accel-sim.out`), and the
     full kernel-10 run completes with no deadlock, correct phase cycling on both barrier
     roles, and a cycle count within 0.8% of the sync-skip baseline. Remaining work is
-    *timing* fidelity (gated on real TMA latency) and validation on other kernels /
-    mbarrier patterns.
+    *timing* fidelity (gated on real TMA latency, tracked under the TMA work) and
+    validation on other kernels / mbarrier patterns.
+
+## Open Issues
+
+### `BAR.SYNC.DEFER_BLOCKING` Modeling
+- **Symptom**
+  - Trace shows real operands for `BAR.SYNC.DEFER_BLOCKING`, but current decode routes it through generic `OP_BAR`.
+- **Root Cause**
+  - Current handling hardcodes `bar_id = 0`, `bar_count = -1`, and `bar_type = SYNC`.
+  - This discards the actual barrier operands in the trace.
+- **Findings From Old Branch**
+  - Historical commit `aad6763487cfcfbfc5a6a182d262c47c0179f71e` on branch `tma-impl-sync-temp` did not implement operand-aware `BAR.SYNC.DEFER_BLOCKING` semantics.
+  - What that branch primarily fixed was separation of Hopper `SYNCS` from the legacy CTA barrier path:
+    - `SYNCS` mapped to `MBARRIER_OP`
+    - extra Hopper sync metadata/debug plumbing
+    - assertions/logs when Hopper sync leaks into legacy barrier handling
+  - The current branch already contains the main architectural separation (`SYNCS -> MBARRIER_OP` and skip of legacy CTA barrier handling for `MBARRIER_OP`), so the remaining `BAR` problem still needs a fresh implementation here.
+- **Fix Direction**
+  - Decode and preserve operand-derived barrier identity/count.
+  - Distinguish `BAR.SYNC`, `BAR.ARV`, and `BAR.SYNC.DEFER_BLOCKING` semantics.
+  - Add stronger assertion/logging to catch unexpected leakage of Hopper sync / mbarrier instructions into legacy CTA barrier handling.
+- **Planned Implementation**
+  - In `trace-driven/trace_driven.cc`, parse static `OP_BAR` operands from traced instruction metadata instead of hardcoding `bar_id=0` and `bar_count=-1`.
+  - Map `BAR.ARV` to legacy barrier type `ARRIVE`.
+  - Map `BAR.RED*` to `RED` if encountered.
+  - Keep `BAR.SYNC` and `BAR.SYNC.DEFER_BLOCKING` on legacy barrier type `SYNC`, but with real operand-derived `bar_id` / `bar_count`.
+  - In legacy CTA barrier handling, add assertion/logging so Hopper `SYNCS` / `MBARRIER_OP` cannot silently leak into the CTA `BAR` path.
+  - Rebuild and run a fresh post-BAR experiment using the existing `SYNCDBG` logs to verify:
+    - `BAR.SYNC.DEFER_BLOCKING` no longer uses fake operands
+    - `BAR.ARV` is decoded as arrival-only
+    - the remaining failure, if any, is the deeper `SYNC + TMA` issue
+- **Status**
+  - Not fixed yet.
+  - Known FA3 correctness gap, but not the direct cause of the `STSM` crash.
+  - Implementation intentionally deferred until the current simulator run finishes and the current FA3-enablement fixes are committed.
 
 ## Relevant Runs
 - Original failing stderr:
