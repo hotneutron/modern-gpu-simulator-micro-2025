@@ -156,6 +156,29 @@ Candidate families:
 
 Do not add `TMA_RED_OP` or `TMA_CTRL_OP` at this stage. Reduction vs. non-reduction and control vs. prefetch distinctions should remain command-level fields, not top-level execution-domain splits.
 
+#### Per-Opcode Implementation Phase Map
+
+This table records, for each TMA opcode family, its op-class (verified against `ISA_Def/hopper_opcode.h`), which implementation phase owns its behavior, and the current status. This is the authoritative cross-reference so work can resume after any context loss.
+
+| Opcode | Op class | Direction / role | Owning phase | Status |
+|---|---|---|---|---|
+| `UTMALDG` | `TMA_LOAD_OP` | GMEM→SMEM load | **Phase 3** | ✅ Implemented + validated (real 32B-sector mf issue, L1 bypass, mbarrier completion) |
+| `UBLKCP` | `TMA_LOAD_OP` | GMEM→SMEM bulk copy | **Phase 3** | ✅ Implemented + validated (same load mover; observed `family=4`, `bytes=512` complete) |
+| `UTMAPF` | `TMA_LOAD_OP` | GMEM→L2 prefetch (no SMEM landing) | **Phase 4.5** | ⬜ Not implemented. Currently passthrough. Not runtime-observed in the FA3 backward trace, but must be modeled separately (L2 prefetch timing, fire-and-forget). |
+| `UBLKPF` | `TMA_LOAD_OP` | bulk prefetch | **Phase 4.5** | ⬜ Not implemented (same prefetch family as `UTMAPF`). |
+| `UTMASTG` | `TMA_STORE_OP` | SMEM→GMEM store | **Phase 4** | ⬜ Not implemented. Currently store-passthrough (no crash). FA3 backward writes dQ/dK/dV via this. |
+| `UTMAREDG` | `TMA_STORE_OP` | SMEM→GMEM reduction store | **Phase 4** | ⬜ Not implemented (reduction-tagged store). |
+| `UBLKRED` | `TMA_STORE_OP` | bulk reduce-store | **Phase 4** (descriptor-backed) | ⬜ Not implemented. Bulk non-descriptor form deferred to a later follow-on. |
+| `UTMACCTL` | `TMA_MISCELLANEOUS_OP` | control / prefetch state setup | **Phase 4.5** | ⬜ Currently passthrough. `UTMACCTL.PF` sets up state later consumed by `UTMAPF`, so the simulator must **record** that prefetch control state (not just drop it), even though it moves no bytes. |
+| `UTMACMDFLUSH` | `TMA_MISCELLANEOUS_OP` | store commit-group flush | **Phase 4** | ⬜ Currently passthrough. This is the SASS form of the store-side commit-group / wait-group completion; it is the wait point for `UTMASTG`/`UTMAREDG`/`UBLKRED`. |
+
+Notes:
+
+- **`UTMALDG.MULTICAST` is explicitly out of scope** for now and is hard-blocked by an `assert` in `tma_unit_sm` (it must not be silently downgraded to a single-CTA load). Revisit only when an FA2-oriented multicast path is needed.
+- **Phase 4.5** is a new sub-phase (not in the original roadmap) covering the prefetch family: `UTMAPF` / `UBLKPF` data movement *and* the `UTMACCTL.PF` state recording that feeds it. It runs **after** Phase 4 (store) completes, per the decision that store is the higher-priority gap for FA3 backward.
+- `UTMACMDFLUSH` is logically part of the Phase 4 store completion mechanism (commit-group / wait-group), distinct from the mbarrier path used by loads (see "TMA load vs store use different completion mechanisms").
+- **Phase 5 (mbarrier completion) was done as a separate SYNC work stream**, not as part of this TMA effort. See the reference documents linked in the Phase 5 section: [SYNC_ISA.md](file:///home/jihyun/project/modern-gpu-simulator-micro-2025/.plan/SYNC_ISA.md) and [Full_sync_impl.md](file:///home/jihyun/project/modern-gpu-simulator-micro-2025/.plan/Full_sync_impl.md).
+
 ### 2. New Subcore-Side Pipeline
 
 Add a new subcore-side pipeline, e.g.:
@@ -863,7 +886,11 @@ Test plan:
 - add negative tests confirming that ordinary load/store instructions do not try to consume TMA descriptor metadata
 - run a TMA trace with debug counters/logging and verify the number of formed TMA commands matches the number of decoded TMA instructions
 
-### Phase 3: GMEM -> SMEM TMA Data Movement
+### Phase 3: GMEM -> SMEM TMA Data Movement  ✅ COMPLETED + VALIDATED
+
+**Status:** Implemented and validated on the FA3 backward trace. `UTMALDG` and `UBLKCP` issue real 32B-sector `mem_fetch`es through the shared interconnect to L2 (L1 bypassed), and completion drives the Phase 5 mbarrier path. Validation evidence: thousands of `complete uid=...` events with exact byte accounting (`bytes=24576` for the 192-request UTMALDG, `bytes=512` for the 4-request UBLKCP) and zero `CACHE-FILL-MISS` / assert / signal events. `UTMAPF`/`UBLKPF` are **not** covered here — they were moved to Phase 4.5 (see phase map).
+
+**Key implementation detail (L2-friendly issue):** the TMA mover emits each 128B AGU request as `SECTOR_CHUNCK_SIZE` (4) separate 32B sector mem_fetches, each carrying a single-bit `sector_mask` and matching `byte_mask`, exactly like a coalesced ldst request. This keeps the L2 from re-splitting the request (`breakdown_request_to_sector_requests` passes `data_size==32 && sector_mask.count()==1` unchanged), so one issued mf maps to exactly one response. AGU throughput remains modeled in 128B cache-line units (`requests_total`); only the wire-level mf granularity is 32B.
 
 Goal:
 
@@ -871,7 +898,7 @@ Goal:
 
 Tasks:
 
-- support `UTMALDG`, `UTMAPF`, `UBLKCP`, `UBLKPF`
+- support `UTMALDG`, `UBLKCP` (load-side data movement). `UTMAPF`/`UBLKPF` are handled in Phase 4.5, not here.
 - add AGU-based address generation
 - emit bulk transfer work
 - land into shared memory model
@@ -931,7 +958,45 @@ Test plan:
 - add a fire-and-forget store test where no later wait occurs and confirm the simulator does not introduce unnecessary stalls
 - add an overlap test where unrelated compute or memory-independent work continues while the store-side TMA transfer is still in flight
 
-### Phase 5: TMA Completion / Barrier Model
+### Phase 4.5: Prefetch Family (UTMAPF / UBLKPF) + Control-State Recording
+
+**Runs after Phase 4 (store).** This sub-phase was split out because the prefetch family is a distinct memory behavior (GMEM→L2, no SMEM landing) and because `UTMACCTL.PF` is a control op that *sets up* state later consumed by `UTMAPF` — so it cannot simply be dropped as passthrough.
+
+Goal:
+
+- model TMA L2 prefetch and the control-state it depends on
+
+Tasks:
+
+- support `UTMAPF` / `UBLKPF`: issue prefetch requests that target L2 only (no SMEM landing, no mbarrier `complete_tx`), modeled as fire-and-forget. Reuse the Phase 3 32B-sector L2-friendly issue path; the difference is the destination/landing and the lack of a completion-wait consumer.
+- **record `UTMACCTL.PF` control state** in `tma_unit_sm` (or the command-formation layer) rather than discarding it. `UTMACCTL.PF` configures prefetch state that a subsequent `UTMAPF` consumes; the simulator must keep enough of that state (e.g. the prefetch descriptor/handle association) so the later `UTMAPF` can be modeled correctly.
+- preserve `descriptor_link` resolution: `UTMAPF` carries no explicit `desc[URx]`; its descriptor association is pre-resolved at JSON load time (see Phase 2 `UTMAPF descriptor_link handling`).
+
+Success criterion:
+
+- `UTMAPF`/`UBLKPF` generate prefetch traffic toward L2 distinct from both ordinary loads and from completion-bearing `UTMALDG` loads
+- `UTMACCTL.PF` state is recorded and observable by the consuming prefetch op rather than silently dropped
+
+Test plan:
+
+- add a micro-trace with `UTMACCTL.PF` followed by `UTMAPF` and verify the control state is recorded and linked to the prefetch
+- verify prefetch traffic is counted on prefetch-specific counters and does **not** drive any mbarrier completion / consumer wait
+- verify a fire-and-forget `UTMAPF` introduces no spurious consumer stall
+- regression: confirm the FA3 backward trace (which has no runtime-observed `UTMAPF`) is unchanged
+
+### Phase 5: TMA Completion / Barrier Model  ✅ COMPLETED (separate SYNC work)
+
+**Status:** Implemented and validated as a **separate, independent work stream** (the Hopper `SYNCS` mbarrier / synchronization model), not as part of this TMA architecture effort. It was completed and full-trace validated before Phase 3 of this plan. The TMA load completion implemented in Phase 3 simply *plugs into* the mbarrier `complete_tx` path that the SYNC work already provides.
+
+What the SYNC work delivered: `MBARRIER_OP`, address-keyed barrier objects keyed on `(trace_kernel_id, cta_id, barrier_addr)`, pending-wait tracking, classification by operand 2 (`semantic_raw`) rather than opcode suffix, bit31 phase-parity decode, the TMA-instruction→barrier-register binding rules (`dst_reg+1` for `UTMALDG`/`UTMAPF`, explicit 3rd operand for `UBLKCP`, none for stores), and the TMA-completion→barrier-progress connection.
+
+The store-side commit-group / wait-group completion (Phase 4, `UTMACMDFLUSH`) is a **separate** mechanism and is *not* covered by this mbarrier model.
+
+**Reference documents (SYNC work, maintained separately from this plan):**
+
+- [SYNC_ISA.md](file:///home/jihyun/project/modern-gpu-simulator-micro-2025/.plan/SYNC_ISA.md) — Hopper `SYNCS` mbarrier SASS-level ISA notes (operand layout, `semantic_raw` semantics, classification rules), derived from real traces incl. CUTLASS FA3 backward.
+- [Full_sync_impl.md](file:///home/jihyun/project/modern-gpu-simulator-micro-2025/.plan/Full_sync_impl.md) — the deterministic hardware-rule mbarrier implementation (TMA register binding, deadlock-free async-TMA synchronization, removal of the old heuristic Python/JSON inference).
+- [FA3-enablement.md](file:///home/jihyun/project/modern-gpu-simulator-micro-2025/.plan/FA3-enablement.md) — FA3 backward enablement notes (referenced by the SYNC work).
 
 Goal:
 

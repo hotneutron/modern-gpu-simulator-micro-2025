@@ -5,7 +5,9 @@
 #include <set>
 #include <tuple>
 
+#include "../../abstract_hardware_model.h"
 #include "../gpu-sim.h"
+#include "../mem_fetch.h"
 #include "sm.h"
 
 namespace {
@@ -65,16 +67,6 @@ TMAOperandForm classify_tma_operand_form(TMAOpcodeFamily family) {
     default:
       return TMAOperandForm::GENERIC;
   }
-}
-
-uint32_t infer_minimum_request_count(const TMACommand &cmd) {
-  if (cmd.requests_total > 0) {
-    return cmd.requests_total;
-  }
-  if (cmd.total_bytes > 0) {
-    return 1;
-  }
-  return 0;
 }
 
 uint32_t infer_descriptor_total_bytes(
@@ -312,19 +304,25 @@ TMAPhase2BindingStats &get_tma_phase2_binding_stats() {
 
 tma_unit_sm::tma_unit_sm(std::vector<register_set_uniptr *> result_ports,
                          std::vector<register_set_uniptr *> reception_ports,
-                         const shader_core_config *config, SM *sm)
+                         const shader_core_config *config, SM *sm,
+                         mem_fetch_interface *icnt,
+                         mem_fetch_allocator *mf_allocator)
     : functional_unit_shared_sm_part(
           result_ports, config, 1, "TMA_SM_shared", sm, MEM__OP, false, false,
           1, reception_ports, 1, nullptr, 0, false,
-          TraceEnhancedOperandType::NONE) {}
+          TraceEnhancedOperandType::NONE),
+      m_icnt(icnt),
+      m_mf_allocator(mf_allocator) {}
+
+tma_unit_sm::~tma_unit_sm() { debug_dump_tma_counters(); }
 
 void tma_unit_sm::issue(register_set_uniptr &source_reg) {
   warp_inst_t *ready_inst = source_reg.get_ready();
   if (ready_inst != nullptr) {
     if (ready_inst->active_count() > 0) {
       TMACommand cmd = build_tma_command(*ready_inst);
-      cmd.completion_id = allocate_completion_object(cmd);
       m_command_queue.push(cmd);
+      ++m_stat_commands_issued;
     }
   }
   functional_unit_shared_sm_part::issue(source_reg);
@@ -337,6 +335,18 @@ void tma_unit_sm::cycle() {
 }
 
 TMACommand tma_unit_sm::build_tma_command(const warp_inst_t &inst) const {
+  // UTMALDG.MULTICAST distributes one descriptor load across multiple CTAs via
+  // a ctaMask. The ctaMask is not tracked in the trace/sidecar, so modeling it
+  // as a single-CTA load would silently misattribute traffic. Refuse it
+  // explicitly until ctaMask handling is implemented (FA2-only feature).
+  if (inst.tma_is_multicast) {
+    m_sm->debug_log_tma_event(
+        "MULTICAST-refused warp=" + std::to_string(inst.warp_id()) +
+        " pc=" + std::to_string(inst.pc) +
+        " (UTMALDG.MULTICAST not implemented, ctaMask unmodeled)");
+  }
+  assert(!inst.tma_is_multicast &&
+         "UTMALDG.MULTICAST not implemented (ctaMask unmodeled)");
   TMACommand cmd;
   TMAResolvedSiteMetadata metadata;
   cmd.warp_id = inst.warp_id();
@@ -446,19 +456,6 @@ TMACommand tma_unit_sm::build_tma_command(const warp_inst_t &inst) const {
   return cmd;
 }
 
-uint32_t tma_unit_sm::allocate_completion_object(const TMACommand &cmd) {
-  TMACompletionObject completion;
-  completion.expected_tx_bytes = cmd.total_bytes;
-  completion.completed_tx_bytes = 0;
-  completion.phase = 0;
-  completion.ready = false;
-  completion.warp_id = cmd.warp_id;
-  completion.cta_id = cmd.cta_id;
-  completion.cycle_ready = -1;
-  m_completion_objects.push_back(completion);
-  return static_cast<uint32_t>(m_completion_objects.size() - 1);
-}
-
 void tma_unit_sm::enqueue_issued_commands() {
   if (m_command_queue.empty()) {
     return;
@@ -468,9 +465,16 @@ void tma_unit_sm::enqueue_issued_commands() {
   entry.cmd = m_command_queue.front();
   entry.state = TMATransferEntry::State::ENQUEUED;
   entry.cycle_enqueued = static_cast<int>(m_sm->get_current_gpu_cycle());
-  entry.completion_id = entry.cmd.completion_id;
+  entry.transfer_uid = m_next_transfer_uid++;
   m_in_flight_transfers.push_back(entry);
   m_command_queue.pop();
+
+  m_sm->debug_log_tma_event(
+      "enqueue uid=" + std::to_string(entry.transfer_uid) +
+      " warp=" + std::to_string(entry.cmd.warp_id) +
+      " dir=" + std::to_string(static_cast<int>(entry.cmd.direction)) +
+      " requests_total=" + std::to_string(entry.cmd.requests_total) +
+      " total_bytes=" + std::to_string(entry.cmd.total_bytes));
 }
 
 void tma_unit_sm::advance_in_flight_transfers() {
@@ -478,44 +482,203 @@ void tma_unit_sm::advance_in_flight_transfers() {
   for (auto &entry : m_in_flight_transfers) {
     switch (entry.state) {
       case TMATransferEntry::State::ENQUEUED:
+        // Descriptor / AGU block: compute transfer geometry. requests_total is
+        // already derived from box_dim/element_size in Phase 2.
         entry.state = TMATransferEntry::State::AGU_READY;
         entry.cycle_agu_ready = current_cycle;
         break;
       case TMATransferEntry::State::AGU_READY:
-        entry.state = TMATransferEntry::State::IN_FLIGHT;
-        entry.cycle_first_request = current_cycle;
-        break;
-      case TMATransferEntry::State::IN_FLIGHT: {
-        uint32_t request_goal = infer_minimum_request_count(entry.cmd);
-        if (request_goal == 0) {
+        // Phase 3 implements GMEM->SMEM (load) data movement only. Store-class
+        // transfers (SMEM->GMEM) use a different completion mechanism
+        // (commit-group / wait-group) and are deferred to Phase 4: pass them
+        // through here without issuing traffic so the simulation does not crash.
+        if (entry.cmd.direction != TMADirection::GMEM_TO_SMEM) {
           entry.state = TMATransferEntry::State::COMPLETED;
           entry.cycle_last_completion = current_cycle;
+          m_sm->debug_log_tma_event(
+              "store-passthrough uid=" + std::to_string(entry.transfer_uid) +
+              " (SMEM->GMEM not implemented in Phase 3)");
           break;
         }
-        if (entry.requests_issued < request_goal) {
-          entry.requests_issued++;
-        }
-        if (entry.requests_completed < entry.requests_issued) {
-          entry.requests_completed++;
-        }
-        if (entry.requests_completed >= request_goal) {
-          entry.state = TMATransferEntry::State::COMPLETED;
-          entry.cycle_last_completion = current_cycle;
-          if (entry.completion_id < m_completion_objects.size()) {
-            TMACompletionObject &completion =
-                m_completion_objects[entry.completion_id];
-            completion.completed_tx_bytes = entry.cmd.total_bytes;
-            completion.ready = true;
-            completion.cycle_ready = current_cycle;
-          }
-          m_sm->notify_tma_completion(entry.cmd.warp_id, entry.cmd.total_bytes);
-        }
+        entry.state = TMATransferEntry::State::IN_FLIGHT;
+        entry.cycle_first_request = current_cycle;
+        m_sm->debug_log_tma_event(
+            "in-flight uid=" + std::to_string(entry.transfer_uid) +
+            " cycle=" + std::to_string(current_cycle));
         break;
-      }
+      case TMATransferEntry::State::IN_FLIGHT:
+        mover_issue_requests(entry, current_cycle);
+        break;
       case TMATransferEntry::State::COMPLETED:
       case TMATransferEntry::State::WAIT_SATISFIED:
       case TMATransferEntry::State::ISSUED:
         break;
     }
   }
+
+  // Reclaim finished transfers so the deque does not grow without bound.
+  while (!m_in_flight_transfers.empty() &&
+         (m_in_flight_transfers.front().state ==
+              TMATransferEntry::State::COMPLETED ||
+          m_in_flight_transfers.front().state ==
+              TMATransferEntry::State::WAIT_SATISFIED)) {
+    m_in_flight_transfers.pop_front();
+  }
+}
+
+// ---- Hopper data mover (Blackwell plugs a different mover at these hooks) ----
+
+void tma_unit_sm::mover_issue_requests(TMATransferEntry &entry,
+                                       int current_cycle) {
+  // AGU throughput is modelled in units of 128B cache-line requests (the rate
+  // at which the TMA address-generation unit can emit line addresses). The
+  // descriptor's requests_total already counts those 128B requests.
+  uint32_t agu_request_goal = entry.cmd.requests_total;
+  if (agu_request_goal == 0 && entry.cmd.total_bytes > 0) {
+    agu_request_goal = 1;
+  }
+  if (agu_request_goal == 0) {
+    // Nothing to move (e.g. control op routed here): complete immediately.
+    entry.state = TMATransferEntry::State::COMPLETED;
+    entry.cycle_last_completion = current_cycle;
+    return;
+  }
+
+  // Each 128B AGU request is sent to memory as SECTOR_CHUNCK_SIZE (4) separate
+  // 32B sector mem_fetches, exactly like a normal ldst request that has been
+  // coalesced to 32B sectors. Emitting 32B + a single-bit sector mask keeps the
+  // L2 from re-splitting the request (see
+  // memory_sub_partition::breakdown_request_to_sector_requests), so one issued
+  // mf maps to exactly one response and the parent/child mismatch disappears.
+  // requests_issued / requests_completed are therefore counted in sector mfs.
+  const uint32_t kSectorMfGoal = agu_request_goal * SECTOR_CHUNCK_SIZE;
+
+  uint32_t agu_requests_this_cycle = 0;
+  while (entry.requests_issued < kSectorMfGoal &&
+         agu_requests_this_cycle < kMaxRequestsPerCycle) {
+    if (m_icnt == nullptr || m_mf_allocator == nullptr) {
+      break;
+    }
+
+    // The index of the 128B AGU request currently being expanded.
+    uint32_t agu_index = entry.requests_issued / SECTOR_CHUNCK_SIZE;
+
+    // Synthetic, deterministic GMEM base address for this 128B AGU request. The
+    // trace does not carry the descriptor base, so we fabricate a per-transfer
+    // address range purely to exercise memory-hierarchy timing. TMA loads
+    // bypass L1 and go directly to L2/DRAM via the shared interconnect.
+    new_addr_type agu_base =
+        (static_cast<new_addr_type>(entry.transfer_uid) << 20) +
+        (static_cast<new_addr_type>(agu_index) * MAX_MEMORY_ACCESS_SIZE);
+
+    bool icnt_blocked = false;
+    uint32_t sector_in_line = entry.requests_issued % SECTOR_CHUNCK_SIZE;
+    for (; sector_in_line < SECTOR_CHUNCK_SIZE; ++sector_in_line) {
+      // Back-pressure: stop on the first sector that the interconnect cannot
+      // accept; we resume from the same sector next cycle.
+      if (m_icnt->full(SECTOR_SIZE, /*write=*/false)) {
+        icnt_blocked = true;
+        break;
+      }
+
+      new_addr_type addr = agu_base + sector_in_line * SECTOR_SIZE;
+
+      // 32B request carrying a single-sector mask, matching what the ldst path
+      // produces after coalescing. byte_mask covers the 32 bytes of the sector.
+      mem_access_sector_mask_t sector_mask;
+      sector_mask.set(sector_in_line);
+      mem_access_byte_mask_t byte_mask;
+      for (unsigned b = 0; b < SECTOR_SIZE; ++b) {
+        byte_mask.set(sector_in_line * SECTOR_SIZE + b);
+      }
+
+      mem_fetch *mf = m_mf_allocator->alloc(
+          addr, GLOBAL_ACC_R, active_mask_t().set(0), byte_mask, sector_mask,
+          SECTOR_SIZE, /*wr=*/false, m_sm->get_current_gpu_cycle(),
+          /*wid=*/(unsigned)-1, m_sm->get_sid(), m_sm->get_tpc_id(),
+          /*original_mf=*/nullptr);
+      mf->set_is_tma(true);
+
+      if (entry.requests_issued == 0) {
+        m_sm->debug_log_tma_event(
+            "first-request uid=" + std::to_string(entry.transfer_uid) +
+            " addr=" + std::to_string(addr) +
+            " agu_requests=" + std::to_string(agu_request_goal) +
+            " sector_mfs=" + std::to_string(kSectorMfGoal) +
+            " (32B sector, L1-bypass, shared icnt)");
+      }
+
+      m_outstanding_requests[mf] = entry.transfer_uid;
+      m_icnt->push(mf);
+
+      ++entry.requests_issued;
+      ++m_stat_requests_issued;
+      m_stat_bytes_issued += SECTOR_SIZE;
+    }
+
+    if (icnt_blocked) {
+      break;
+    }
+    // One 128B AGU request worth of sectors emitted this iteration.
+    ++agu_requests_this_cycle;
+  }
+}
+
+void tma_unit_sm::mover_on_response(TMATransferEntry &entry, mem_fetch *mf,
+                                    int current_cycle) {
+  ++entry.requests_completed;
+  ++m_stat_requests_completed;
+  entry.bytes_completed += mf->get_data_size();
+  m_stat_bytes_completed += mf->get_data_size();
+
+  uint32_t agu_request_goal = entry.cmd.requests_total;
+  if (agu_request_goal == 0 && entry.cmd.total_bytes > 0) {
+    agu_request_goal = 1;
+  }
+  // requests are counted in 32B sector mfs (see mover_issue_requests).
+  uint32_t sector_mf_goal = agu_request_goal * SECTOR_CHUNCK_SIZE;
+  if (entry.requests_completed >= sector_mf_goal) {
+    // All bulk reads have landed in SMEM. Credit the transaction-count barrier
+    // with the descriptor's full byte count (Hopper mbarrier complete_tx).
+    entry.state = TMATransferEntry::State::COMPLETED;
+    entry.cycle_last_completion = current_cycle;
+    ++m_stat_transfers_completed;
+    m_sm->debug_log_tma_event(
+        "complete uid=" + std::to_string(entry.transfer_uid) +
+        " warp=" + std::to_string(entry.cmd.warp_id) +
+        " bytes=" + std::to_string(entry.cmd.total_bytes) +
+        " requests=" + std::to_string(entry.requests_completed) +
+        " cycle=" + std::to_string(current_cycle));
+    m_sm->notify_tma_completion(entry.cmd.warp_id, entry.cmd.total_bytes);
+  }
+}
+
+void tma_unit_sm::fill(mem_fetch *mf) {
+  auto it = m_outstanding_requests.find(mf);
+  assert(it != m_outstanding_requests.end() &&
+         "TMA fill received a mem_fetch not issued by the TMA unit");
+  uint64_t transfer_uid = it->second;
+  m_outstanding_requests.erase(it);
+
+  int current_cycle = static_cast<int>(m_sm->get_current_gpu_cycle());
+  for (auto &entry : m_in_flight_transfers) {
+    if (entry.transfer_uid == transfer_uid) {
+      mover_on_response(entry, mf, current_cycle);
+      break;
+    }
+  }
+}
+
+void tma_unit_sm::debug_dump_tma_counters() const {
+  if (m_stat_commands_issued == 0) {
+    return;
+  }
+  std::cerr << "[TMA][Phase3][Stats] sm=" << m_sm->get_sid()
+            << " commands_issued=" << m_stat_commands_issued
+            << " transfers_completed=" << m_stat_transfers_completed
+            << " requests_issued=" << m_stat_requests_issued
+            << " requests_completed=" << m_stat_requests_completed
+            << " bytes_issued=" << m_stat_bytes_issued
+            << " bytes_completed=" << m_stat_bytes_completed
+            << " (TMA traffic counted separately from L1/ldst)" << std::endl;
 }

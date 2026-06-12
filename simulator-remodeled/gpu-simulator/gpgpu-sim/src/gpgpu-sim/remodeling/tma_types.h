@@ -259,7 +259,6 @@ struct TMACommand {
   uint32_t oob_fill = 0;
   uint32_t l2_promotion = 0;
   TMAOperandForm operand_form = TMAOperandForm::GENERIC;
-  uint32_t completion_id = 0;
 };
 
 struct TMATransferEntry {
@@ -276,19 +275,10 @@ struct TMATransferEntry {
   State state = State::ISSUED;
   uint32_t requests_issued = 0;
   uint32_t requests_completed = 0;
+  uint32_t bytes_completed = 0;
+  uint64_t transfer_uid = 0;
   int cycle_enqueued = -1;
   int cycle_agu_ready = -1;
   int cycle_first_request = -1;
   int cycle_last_completion = -1;
-  uint32_t completion_id = 0;
-};
-
-struct TMACompletionObject {
-  uint32_t expected_tx_bytes = 0;
-  uint32_t completed_tx_bytes = 0;
-  uint32_t phase = 0;
-  bool ready = false;
-  uint32_t warp_id = 0;
-  uint32_t cta_id = 0;
-  int cycle_ready = -1;
 };

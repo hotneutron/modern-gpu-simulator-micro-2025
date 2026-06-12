@@ -348,6 +348,7 @@ class SM : public core_t, public shader_core_ctx_wrapper {
                                            uint32_t tx_bytes);
   void notify_tma_completion(unsigned int warp_id, uint32_t completed_tx_bytes);
   void debug_log_sync_event(const std::string &message);
+  void debug_log_tma_event(const std::string &message);
   void debug_dump_sync_counters() const;
 
   InterWarp_Coalescing_Waiting_Dep_Counters *m_interwarp_coal_warps_waiting_dep_counter;

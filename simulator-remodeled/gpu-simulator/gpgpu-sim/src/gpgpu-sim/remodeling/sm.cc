@@ -355,6 +355,17 @@ void SM::debug_log_sync_event(const std::string &message) {
   --m_sync_debug_print_budget;
 }
 
+// TMA per-event log. Shares the SYNC print budget so a single config knob
+// bounds total debug output; tagged [TMADBG] so TMA traffic is greppable
+// separately from SYNC events.
+void SM::debug_log_tma_event(const std::string &message) {
+  if (m_sync_debug_print_budget == 0) {
+    return;
+  }
+  std::cerr << "[TMADBG][SM" << m_sm_id << "] " << message << std::endl;
+  --m_sync_debug_print_budget;
+}
+
 void SM::debug_dump_sync_counters() const {
   if (m_sync_debug_sync_insts == 0 && m_sync_debug_tma_completions == 0 &&
       m_sync_debug_missing_runtime == 0) {
@@ -1047,7 +1058,8 @@ void SM::create_memory_interfaces() {
       m_sm_id, m_tpc_id, m_config->memory_sm_prt_size);
   m_tma_unit_shared_of_sm =
       new tma_unit_sm(m_EX_WB_sm_shared_units_subcore_latches,
-                      m_EX_TMA_reception_latches_per_subcore, m_config, this);
+                      m_EX_TMA_reception_latches_per_subcore, m_config, this,
+                      m_icnt, m_mem_fetch_allocator.get());
   static_cast<L0_icnt *>(m_icnt_L0s)
         ->add_L0(static_cast<read_only_cache *>(m_ldst_unit_shared_of_sm->get_L1C()));
 }
@@ -1334,6 +1346,13 @@ void SM::accept_fetch_response(mem_fetch *mf) {
 }
 
 void SM::accept_ldst_unit_response(mem_fetch *mf) {
+  // TMA bulk responses are owned by the TMA unit, not the ldst unit. This is
+  // the only behavioral change to the response path; ordinary LD/ST responses
+  // continue to flow to the ldst unit unchanged.
+  if (mf != nullptr && mf->is_tma()) {
+    m_tma_unit_shared_of_sm->fill(mf);
+    return;
+  }
   m_ldst_unit_shared_of_sm->fill(mf);
 }
 
