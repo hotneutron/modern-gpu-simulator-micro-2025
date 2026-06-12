@@ -281,4 +281,8 @@ struct TMATransferEntry {
   int cycle_agu_ready = -1;
   int cycle_first_request = -1;
   int cycle_last_completion = -1;
+  // Debug-only: ensure the first read mf and first write mf of a store/reduce
+  // transfer are each logged exactly once (so RMW issue is observable).
+  bool logged_first_write = false;
+  bool logged_first_read = false;
 };

@@ -168,7 +168,7 @@ This table records, for each TMA opcode family, its op-class (verified against `
 | `UBLKPF` | `TMA_LOAD_OP` | bulk prefetch | **Phase 4.5** | ⬜ Not implemented (same prefetch family as `UTMAPF`). |
 | `UTMASTG` | `TMA_STORE_OP` | SMEM→GMEM store | **Phase 4** | ⬜ Not implemented. Currently store-passthrough (no crash). FA3 backward writes dQ/dK/dV via this. |
 | `UTMAREDG` | `TMA_STORE_OP` | SMEM→GMEM reduction store | **Phase 4** | ⬜ Not implemented (reduction-tagged store). |
-| `UBLKRED` | `TMA_STORE_OP` | bulk reduce-store | **Phase 4** (descriptor-backed) | ⬜ Not implemented. Bulk non-descriptor form deferred to a later follow-on. |
+| `UBLKRED` | `TMA_STORE_OP` | bulk reduce-store | **Phase 4** (both descriptor-backed and bulk non-descriptor) | ⬜ Not implemented. Both forms covered in Phase 4 (covered-span size source already exists). ⚠️ Only the descriptor-backed form is runtime-observed in FA3 backward; the bulk non-descriptor form (`covered_bytes = operand_3 * 16`) is implemented but **NOT validated** (no FA3 coverage). |
 | `UTMACCTL` | `TMA_MISCELLANEOUS_OP` | control / prefetch state setup | **Phase 4.5** | ⬜ Currently passthrough. `UTMACCTL.PF` sets up state later consumed by `UTMAPF`, so the simulator must **record** that prefetch control state (not just drop it), even though it moves no bytes. |
 | `UTMACMDFLUSH` | `TMA_MISCELLANEOUS_OP` | store commit-group flush | **Phase 4** | ⬜ Currently passthrough. This is the SASS form of the store-side commit-group / wait-group completion; it is the wait point for `UTMASTG`/`UTMAREDG`/`UBLKRED`. |
 
@@ -886,11 +886,60 @@ Test plan:
 - add negative tests confirming that ordinary load/store instructions do not try to consume TMA descriptor metadata
 - run a TMA trace with debug counters/logging and verify the number of formed TMA commands matches the number of decoded TMA instructions
 
+### Shared: TMA Transfer Size Computation (used by Phase 3, 4, 4.5)
+
+How `total_bytes` / `requests_total` / `covered_bytes` are derived for every TMA data-movement op. This is computed once at command-formation time (Phase 2 binding, in `tma_unit_sm.cc`) and reused unchanged by the load (Phase 3), store/reduce (Phase 4), and prefetch (Phase 4.5) movers. All inputs are trace-derived metadata; asserts guarantee nonzero values for executed ops.
+
+There are **two size sources**, selected by op family:
+
+**A. Descriptor-geometry source — `UTMALDG`, `UTMASTG`, `UTMAPF`, `UTMAREDG`** (tensor-map / box-shaped ops)
+
+From `infer_descriptor_total_bytes` and `infer_descriptor_request_total` (`tma_unit_sm.cc`):
+
+```text
+total_bytes    = (product of all nonzero box_dim[i]) * element_size
+requests_per_row = ceil( box_dim[0] * element_size / 128 )   // 128B = MAX_MEMORY_ACCESS_SIZE
+outer_iters    = product of box_dim[1..]                      // rows beyond the innermost
+requests_total = requests_per_row * outer_iters              // count of 128B AGU line requests
+```
+
+- `box_dim`, `element_size` come from the resolved descriptor config (tensor map).
+- `box_dim[0]` is the innermost (row) extent; the rest are outer iterations. This is why two transfers with equal `total_bytes` but different `box_dim[0]` aspect ratios produce **different** `requests_total` (AGU throughput depends on row shape, not just byte count).
+- Validated example (FA3): `box_dim=[64,128]`, `element_size=2` (bf16) → `total_bytes = 64*128*2 = 16384`; the FA3 `UTMALDG` site observed `bytes=24576`, `requests=768` (after the 32B-sector expansion, see below).
+
+**B. Covered-span source — `UBLKCP`, `UBLKPF`, `UBLKRED`** (1D bulk ops, no box geometry)
+
+From the operand resolver (`covered_bytes`, decoded from operand 3) and `infer_request_total_from_covered_bytes`:
+
+```text
+total_bytes    = covered_bytes
+requests_total = ceil( covered_bytes / 128 )
+```
+
+- `covered_bytes` is taken from `metadata.covered_bytes` (operand-3 decode), **not** recomputed from box geometry. For the non-descriptor bulk form the decode is `covered_bytes = operand_3 * 16` (16B units); for descriptor-backed `UBLKRED` the raw operand-3 value is preserved and `covered_bytes` is supplied by the resolver (the bulk `operand_3 * 16` formula is **not** assumed for the descriptor-backed form). See [TMA_TRACING.md](file:///home/jihyun/project/modern-gpu-simulator-micro-2025/.plan/TMA_TRACING.md) "Bulk `UBLKRED` Follow-up Findings".
+- Asserts enforce `total_bytes == covered_bytes` and `requests_total == ceil(covered_bytes/128)` for `UBLKCP`/`UBLKPF` and descriptor-backed `UBLKRED`.
+- Validated example (FA3): `UBLKCP` site observed `bytes=512`, `requests=16`.
+
+**Wire-level expansion (issue granularity).** `requests_total` counts **128B** AGU line requests (the address-generation throughput unit). At issue, the mover expands each 128B request into `SECTOR_CHUNCK_SIZE` (= 4) separate **32B** sector `mem_fetch`es, so the count of issued sector mfs is `requests_total * 4`. Byte accounting uses 32B per sector mf. AGU timing is still modeled in 128B units; only the wire granularity is 32B (L2-friendly, see Phase 3).
+
+**Read vs write byte volume per op.** The size computation above gives the *moved region* size. How it maps to read/write traffic depends on direction:
+
+| op | reads | writes | notes |
+|---|---|---|---|
+| `UTMALDG` / `UBLKCP` (load) | `total_bytes` from GMEM | — (lands in SMEM model) | Phase 3 |
+| `UTMASTG` (pure store) | — | `total_bytes` to GMEM | Phase 4 |
+| `UBLKRED` / `UTMAREDG` (reduce-store) | `covered_bytes` from GMEM (read dst) | `covered_bytes` to GMEM (write dst) | Phase 4; RMW, see Phase 4 reduction model |
+| `UTMAPF` / `UBLKPF` (prefetch) | `total_bytes` into L2 only | — | Phase 4.5, fire-and-forget |
+
+For reduce-store the moved region is read **and** written (`dst[i] += src[i]` over the covered region), so read bytes = write bytes = `covered_bytes`. This is an elementwise reduce-store, **not** a many-to-one atomic (see Phase 4 reduction model).
+
 ### Phase 3: GMEM -> SMEM TMA Data Movement  ✅ COMPLETED + VALIDATED
 
 **Status:** Implemented and validated on the FA3 backward trace. `UTMALDG` and `UBLKCP` issue real 32B-sector `mem_fetch`es through the shared interconnect to L2 (L1 bypassed), and completion drives the Phase 5 mbarrier path. Validation evidence: thousands of `complete uid=...` events with exact byte accounting (`bytes=24576` for the 192-request UTMALDG, `bytes=512` for the 4-request UBLKCP) and zero `CACHE-FILL-MISS` / assert / signal events. `UTMAPF`/`UBLKPF` are **not** covered here — they were moved to Phase 4.5 (see phase map).
 
 **Key implementation detail (L2-friendly issue):** the TMA mover emits each 128B AGU request as `SECTOR_CHUNCK_SIZE` (4) separate 32B sector mem_fetches, each carrying a single-bit `sector_mask` and matching `byte_mask`, exactly like a coalesced ldst request. This keeps the L2 from re-splitting the request (`breakdown_request_to_sector_requests` passes `data_size==32 && sector_mask.count()==1` unchanged), so one issued mf maps to exactly one response. AGU throughput remains modeled in 128B cache-line units (`requests_total`); only the wire-level mf granularity is 32B.
+
+**Transfer-size derivation** for the Phase 3 loads (`total_bytes` / `requests_total`) is documented in the **Shared: TMA Transfer Size Computation** section above (`UTMALDG` uses the descriptor-geometry source, `UBLKCP` uses the covered-span source).
 
 Goal:
 
@@ -933,30 +982,84 @@ Test plan:
 
 Goal:
 
-- support reverse-direction TMA behavior
+- support reverse-direction (store / reduce-store) TMA data movement using the same dedicated `tma_unit_sm` engine as Phase 3, and model the store-side completion-wait correctly.
+
+#### Trace evidence (FA3 backward, verified)
+
+Confirmed against the real backward SASS (`flash_bwd_hdim64_bf16_softcapall_sm90.sm_90a.sass`):
+
+- The high-level PTX `cp.async.bulk.commit_group` and `cp.async.bulk.wait_group N` do **not** appear as separate SASS opcodes. The compiler folds the group commit + group wait into a single **`UTMACMDFLUSH`** instruction emitted right after a run of store/reduce ops. Example (`...:2981-2987`):
+
+  ```
+  UTMASTG.4D [UR8], [UR6]    // store 1 issued
+  UTMASTG.4D [UR8], [UR14]   // store 2 issued
+  UTMACMDFLUSH               // commit_group + wait_group folded here
+  ```
+
+- `UBLKRED.G.S.ADD.F32.RN ... , desc[URx]` (reduce-store) shows the same pattern: each reduce-store run is terminated by a `UTMACMDFLUSH`. This recurs at every reduction-loop tail and just before `BSYNC`/`EXIT`, i.e. `UTMACMDFLUSH` sits at natural *drain points* (right before something depends on the store result), not after every individual store.
+- `UTMACMDFLUSH` is operand-less / control-only in this trace, so the `wait_group` count `N` is **not** recoverable from the trace.
+
+#### Async semantics (NVIDIA docs) — store stays asynchronous
+
+Per the CUDA Programming Guide completion-mechanism table and the Colfax TMA tutorial, TMA store has a **different** completion mechanism from TMA load and must remain fire-and-forget at issue:
+
+- TMA **load** (GMEM→SMEM): completion via shared-memory barrier (`mbarrier` `complete_tx`) — already handled by the separate SYNC work (Phase 5).
+- TMA **store** (SMEM→GMEM): completion via a **bulk async-group** mechanism; only the initiating thread can wait.
+  - `commit_group` (`tma_store_arrive`): seals the issued stores into a group. **No stall.**
+  - `wait_group N` (`tma_store_wait<N>`): stalls only until at most `N` committed groups remain pending. `N=0` = drain all. This is what allows an N-deep store pipeline and preserves latency hiding.
+
+Therefore issuing a store must **not** stall the warp; only a flush/wait point may stall, and the async idea is preserved.
+
+#### Modeling decision (confirmed with user)
+
+Transfer sizes for all store/reduce ops come from the **Shared: TMA Transfer Size Computation** section above; Phase 4 does not recompute them.
+
+- **`UTMASTG` (pure store)**: issue `GLOBAL_ACC_W` (`wr=true`) data-movement requests through the same 32B-sector, L2-friendly issue path built in Phase 3 (so L2 does not re-split), covering `total_bytes`. Then let the warp **proceed immediately** (fire-and-forget; no warp serialization at issue). Store back-pressure uses the write side of the interconnect (`m_icnt->full(size, /*write=*/true)`).
+- **`UBLKRED` / `UTMAREDG` (reduce-store)**: this is an **elementwise read-modify-write** over the covered region (`dst[i] = dst[i] + src[i]`), **not** a many-to-one atomic. So:
+  - `UBLKRED` vs `UTMAREDG` differ **only in data layout / size source**, not in reduce behavior: `UBLKRED` is a 1D bulk reduce-store sized from the covered-span source (operand-3 `covered_bytes`; the reduce counterpart of `UBLKCP`), while `UTMAREDG` is a tensor-map (box-shaped) reduce-store sized from the descriptor-geometry source (the reduce counterpart of `UTMASTG`, always descriptor-backed). In the FA3 backward trace only `UBLKRED` is runtime-observed; `UTMAREDG` is not present but shares the same reduce path.
+  - **Both `UBLKRED` forms are implemented in Phase 4:** the descriptor-backed form (FA3-observed) and the bulk non-descriptor form (`covered_bytes = operand_3 * 16`). The non-descriptor form reuses the same covered-span size source and RMW issue path, so it is nearly free to support — but it is **NOT validated**, because it does not appear in the FA3 backward trace. Treat its byte/request accounting as unverified until a trace that exercises it is available.
+  - It is modeled as a true RMW: for each 32B sector of the covered region, issue **one read** (`GLOBAL_ACC_R`, `wr=false`) to fetch the destination **and one write** (`GLOBAL_ACC_W`, `wr=true`) to store the reduced value. Read bytes = write bytes = `covered_bytes`.
+  - It is **not** flagged `isatomic`. The simulator's `isatomic` path models lane-level many-to-one atomics with `do_atomic()` serialization, which is the wrong semantics here. TMA reduce-store has no cross-lane contention; it is a region-wide elementwise update. Using the atomic flag would inject incorrect contention/serialization.
+  - The actual arithmetic (`+`) is **not** performed (timing-only simulator, no real SMEM payload); only the reduction tag (`ADD.F32.RN` etc.) is preserved in the transfer record, and the read+write memory traffic is modeled for bandwidth/latency.
+  - `requests_completed` accounting must expect **2×** the sector count of a pure store (read mf + write mf per sector). Same fire-and-forget issue rule as `UTMASTG`.
+- **`UTMACMDFLUSH`**: model as a **warp-local drain-all** wait. Because the trace does not expose `N`, treat each flush as `wait_group 0`: stall the issuing warp until **all** outstanding store/reduce transfers it has issued have reached GMEM completion, then release. This matches the observed placement of `UTMACMDFLUSH` at dependency/exit drain points and does not penalize the issue or overlap windows.
+  - **Scope: applies to ALL store-class TMA, not just reduce.** The drain-all target is every outstanding transfer that warp issued with `direction == SMEM_TO_GMEM` — i.e. pure stores (`UTMASTG`) AND reduce-stores (`UBLKRED` / `UTMAREDG`) alike. This follows the hardware: `commit_group` seals the whole bulk async-store group (stores + reduce-stores together), and `wait_group` waits on that combined group. The trace confirms `UTMASTG ... UTMACMDFLUSH` appears after plain stores, not only after reductions.
+  - **Loads are excluded.** Transfers with `direction == GMEM_TO_SMEM` (`UTMALDG` / `UBLKCP` / prefetch) must NOT be waited on by `UTMACMDFLUSH`; their completion is the mbarrier `complete_tx` domain. The flush only drains the SMEM->GMEM set.
+- The store/reduce completion path is tracked **inside `tma_unit_sm`** (its own outstanding-transfer accounting from the `fill` callback). It does **not** use the mbarrier `complete_tx` path (that is load-only) and does **not** call `notify_tma_completion` (that drives the load-side mbarrier).
+
+#### Out of scope / already handled
+
+- `BSYNC` / `BSSY` (seen immediately after `UTMACMDFLUSH`) are warp **convergence/reconvergence barriers**, mapped to `BRANCH_OP` in `hopper_opcode.h` and already handled by the existing control-flow path. They are unrelated to TMA store completion and require **no** new work in this phase.
 
 Tasks:
 
-- support `UTMASTG`, `UTMAREDG`, `UBLKRED`
-- add source-side shared-memory handling
-- support descriptor-backed `UBLKRED` execution setup with operand-3 size/span control preserved conservatively
-- track optional completion dependencies
-- preserve the same async ownership split used by load-side TMA so store transfer lifetime remains inside `tma_unit_sm`
+- support `UTMASTG`, `UTMAREDG`, `UBLKRED` as store/reduce-direction transfers in `tma_unit_sm`, reusing the Shared size computation (no recompute)
+- replace the Phase-3 store-passthrough stub in `advance_in_flight_transfers` with a real store/reduce mover
+- extend `mover_issue_requests` to support three issue shapes over the shared 32B-sector + sector_mask logic: load (`GLOBAL_ACC_R` only), pure store (`GLOBAL_ACC_W` only), reduce-store (`GLOBAL_ACC_R` **and** `GLOBAL_ACC_W` per sector — RMW, not atomic)
+- adjust `requests_completed` / sector-goal accounting so reduce-store expects 2× the sector mf count (read + write) and store/load expect 1×
+- support descriptor-backed `UBLKRED` execution setup with operand-3 size/span control preserved conservatively, and preserve the reduction tag (`ADD.F32.RN` etc.) in the transfer record even if the arithmetic is not actually performed (timing-only)
+- do **not** set `isatomic` on reduce-store mfs
+- implement `UTMACMDFLUSH` as a warp-local drain-all wait consumer over the store/reduce-side outstanding-transfer set
+- keep the async ownership split: store/reduce issue is fire-and-forget, only `UTMACMDFLUSH` may stall
 
 Success criterion:
 
 - TMA stores/reductions use the dedicated TMA engine rather than the normal store datapath, including descriptor-backed `UBLKRED` with descriptor layout plus operand-3 size/span control
-- issuing a TMA store does not serialize the warp for the full transfer lifetime unless a later wait/completion dependency requires it
+- issuing a TMA store does **not** serialize the warp; the warp continues to the next instruction immediately
+- `UTMACMDFLUSH` stalls the issuing warp until all of that warp's outstanding TMA stores have completed, then releases
+- ordinary `STG` / `RED*` instructions are unaffected and still use the normal store datapath and counters
 
 Test plan:
 
-- create a focused micro-trace or synthetic test with `UTMASTG` and verify the source is taken from the TMA-side shared-memory model and the transfer is issued by `tma_unit_sm`
-- add a reduction-tag propagation test for `UTMAREDG` / `UBLKRED` to ensure the reduction mode is preserved in the transfer record even if arithmetic semantics remain simplified
-- add a descriptor-backed `UBLKRED` test that verifies it goes through descriptor resolution when `desc[URx]` is present and preserves operand-3 size/span runtime state without assuming the bulk-only formula
+- create a focused micro-trace or synthetic test with `UTMASTG` and verify the source is the TMA-side shared-memory model and the transfer is issued by `tma_unit_sm` as `GLOBAL_ACC_W`
+- add a reduction-tag propagation test for `UTMAREDG` / `UBLKRED` to ensure the reduction mode is preserved in the transfer record
+- add a reduce-store RMW-traffic test: confirm `UBLKRED`/`UTMAREDG` issues both `GLOBAL_ACC_R` and `GLOBAL_ACC_W` sector mfs (read bytes == write bytes == `covered_bytes`, ~2× the sector mf count of a same-size pure store) and that the mfs are **not** flagged `isatomic`
+- add a descriptor-backed `UBLKRED` test that goes through descriptor resolution when `desc[URx]` is present and preserves operand-3 size/span runtime state
+- add a fire-and-forget store test (store issued, no following flush) and confirm the warp does not stall at issue
+- add a flush test (`UTMASTG ... UTMACMDFLUSH`) and confirm the warp stalls until store completion is reported by `fill`, then resumes
+- add an overlap test where unrelated compute continues while the store-side TMA transfer is in flight, up to the flush point
 - verify ordinary `STG` and `RED*` instructions still use the normal store datapath and counters
-- add a completion-dependency test where later code waits for store completion and confirm the TMA completion object changes state correctly
-- add a fire-and-forget store test where no later wait occurs and confirm the simulator does not introduce unnecessary stalls
-- add an overlap test where unrelated compute or memory-independent work continues while the store-side TMA transfer is still in flight
+- regression: confirm the FA3 backward trace's `UTMASTG`/`UBLKRED`/`UTMACMDFLUSH` sequences are routed to the TMA engine and the run completes without asserts
 
 ### Phase 4.5: Prefetch Family (UTMAPF / UBLKPF) + Control-State Recording
 

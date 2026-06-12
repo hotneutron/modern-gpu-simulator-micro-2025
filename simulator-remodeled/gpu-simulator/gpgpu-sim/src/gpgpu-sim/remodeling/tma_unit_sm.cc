@@ -59,10 +59,13 @@ TMAOperandForm classify_tma_operand_form(TMAOpcodeFamily family) {
     case TMAOpcodeFamily::UBLKPF:
       return TMAOperandForm::BULK_OPERAND;
     case TMAOpcodeFamily::UBLKRED:
-      // FA3 backward trace uses descriptor-backed UBLKRED (EXPLICIT_DESC).
-      // Non-descriptor bulk UBLKRED also exists but is a Phase 4 extension.
-      // Phase 2 metadata binding will override this per-site via the operand
-      // resolver; BULK_OPERAND here is only the static default.
+      // Both forms are handled in Phase 4 via the same covered-span size source
+      // and REDUCTION transfer type (see classify_tma_transfer_type, which keys
+      // off the family, not the operand form). The FA3 backward trace only
+      // exercises the descriptor-backed form (EXPLICIT_DESC, set per-site by the
+      // operand resolver below); the bulk non-descriptor form also routes here
+      // but is NOT validated (no FA3 coverage). BULK_OPERAND is the static
+      // default before the resolver overrides it.
       return TMAOperandForm::BULK_OPERAND;
     default:
       return TMAOperandForm::GENERIC;
@@ -488,22 +491,27 @@ void tma_unit_sm::advance_in_flight_transfers() {
         entry.cycle_agu_ready = current_cycle;
         break;
       case TMATransferEntry::State::AGU_READY:
-        // Phase 3 implements GMEM->SMEM (load) data movement only. Store-class
-        // transfers (SMEM->GMEM) use a different completion mechanism
-        // (commit-group / wait-group) and are deferred to Phase 4: pass them
-        // through here without issuing traffic so the simulation does not crash.
-        if (entry.cmd.direction != TMADirection::GMEM_TO_SMEM) {
+        // CONTROL transfers (UTMACCTL / UTMACMDFLUSH) carry no data movement.
+        // The store-side wait modeled by UTMACMDFLUSH is handled separately
+        // (warp-stall gate); here it just completes without issuing traffic.
+        if (entry.cmd.transfer_type == TMATransferType::CONTROL ||
+            entry.cmd.direction == TMADirection::NONE) {
           entry.state = TMATransferEntry::State::COMPLETED;
           entry.cycle_last_completion = current_cycle;
           m_sm->debug_log_tma_event(
-              "store-passthrough uid=" + std::to_string(entry.transfer_uid) +
-              " (SMEM->GMEM not implemented in Phase 3)");
+              "control-passthrough uid=" + std::to_string(entry.transfer_uid) +
+              " family=" +
+              std::to_string(static_cast<int>(entry.cmd.opcode_family)));
           break;
         }
+        // Both GMEM->SMEM (load) and SMEM->GMEM (store/reduce) data movement
+        // are issued through the same mover; mover_issue_requests selects the
+        // access type (read / write / read+write RMW) from the transfer type.
         entry.state = TMATransferEntry::State::IN_FLIGHT;
         entry.cycle_first_request = current_cycle;
         m_sm->debug_log_tma_event(
             "in-flight uid=" + std::to_string(entry.transfer_uid) +
+            " dir=" + std::to_string(static_cast<int>(entry.cmd.direction)) +
             " cycle=" + std::to_string(current_cycle));
         break;
       case TMATransferEntry::State::IN_FLIGHT:
@@ -544,14 +552,28 @@ void tma_unit_sm::mover_issue_requests(TMATransferEntry &entry,
     return;
   }
 
+  // Direction / access shape selects how each 32B sector is moved:
+  //   LOAD  (GMEM->SMEM): one read  (GLOBAL_ACC_R) per sector
+  //   STORE (SMEM->GMEM): one write (GLOBAL_ACC_W) per sector
+  //   REDUCE-STORE      : one read  + one write per sector (elementwise RMW,
+  //                       NOT a many-to-one atomic; see TMA_ARCH.md Phase 4)
+  const bool is_reduction =
+      (entry.cmd.transfer_type == TMATransferType::REDUCTION);
+  const bool is_store =
+      (entry.cmd.direction == TMADirection::SMEM_TO_GMEM) && !is_reduction;
+  // Number of sector mem_fetches emitted per 32B sector of the moved region.
+  const uint32_t mfs_per_sector = is_reduction ? 2u : 1u;
+
   // Each 128B AGU request is sent to memory as SECTOR_CHUNCK_SIZE (4) separate
   // 32B sector mem_fetches, exactly like a normal ldst request that has been
   // coalesced to 32B sectors. Emitting 32B + a single-bit sector mask keeps the
   // L2 from re-splitting the request (see
   // memory_sub_partition::breakdown_request_to_sector_requests), so one issued
   // mf maps to exactly one response and the parent/child mismatch disappears.
-  // requests_issued / requests_completed are therefore counted in sector mfs.
-  const uint32_t kSectorMfGoal = agu_request_goal * SECTOR_CHUNCK_SIZE;
+  // requests_issued / requests_completed are therefore counted in sector mfs;
+  // a reduce-store counts 2x (read + write) per sector.
+  const uint32_t kSectorMfGoal =
+      agu_request_goal * SECTOR_CHUNCK_SIZE * mfs_per_sector;
 
   uint32_t agu_requests_this_cycle = 0;
   while (entry.requests_issued < kSectorMfGoal &&
@@ -560,23 +582,36 @@ void tma_unit_sm::mover_issue_requests(TMATransferEntry &entry,
       break;
     }
 
-    // The index of the 128B AGU request currently being expanded.
-    uint32_t agu_index = entry.requests_issued / SECTOR_CHUNCK_SIZE;
+    // Convert the flat sector-mf index back to (128B AGU line, 32B sector,
+    // rmw slot). For non-reduction mfs_per_sector == 1, so rmw_slot is always 0.
+    uint32_t sector_unit = entry.requests_issued / mfs_per_sector;
+    uint32_t agu_index = sector_unit / SECTOR_CHUNCK_SIZE;
 
     // Synthetic, deterministic GMEM base address for this 128B AGU request. The
     // trace does not carry the descriptor base, so we fabricate a per-transfer
-    // address range purely to exercise memory-hierarchy timing. TMA loads
+    // address range purely to exercise memory-hierarchy timing. TMA transfers
     // bypass L1 and go directly to L2/DRAM via the shared interconnect.
     new_addr_type agu_base =
         (static_cast<new_addr_type>(entry.transfer_uid) << 20) +
         (static_cast<new_addr_type>(agu_index) * MAX_MEMORY_ACCESS_SIZE);
 
     bool icnt_blocked = false;
-    uint32_t sector_in_line = entry.requests_issued % SECTOR_CHUNCK_SIZE;
-    for (; sector_in_line < SECTOR_CHUNCK_SIZE; ++sector_in_line) {
-      // Back-pressure: stop on the first sector that the interconnect cannot
-      // accept; we resume from the same sector next cycle.
-      if (m_icnt->full(SECTOR_SIZE, /*write=*/false)) {
+    // Emit one 128B AGU line worth of sector mfs (mfs_per_sector each), resuming
+    // mid-line from wherever the previous cycle stopped.
+    while (entry.requests_issued < kSectorMfGoal) {
+      sector_unit = entry.requests_issued / mfs_per_sector;
+      if (sector_unit / SECTOR_CHUNCK_SIZE != agu_index) {
+        break;  // crossed into the next 128B AGU line
+      }
+      uint32_t sector_in_line = sector_unit % SECTOR_CHUNCK_SIZE;
+      uint32_t rmw_slot = entry.requests_issued % mfs_per_sector;
+      // rmw_slot 0 = read (fetch dst), rmw_slot 1 = write (store reduced value).
+      const bool this_mf_is_write = is_store || (is_reduction && rmw_slot == 1);
+
+      // Back-pressure: stop on the first sector mf the interconnect cannot
+      // accept; resume from the same mf next cycle. Stores/reductions use the
+      // write side of the interconnect.
+      if (m_icnt->full(SECTOR_SIZE, /*write=*/this_mf_is_write)) {
         icnt_blocked = true;
         break;
       }
@@ -592,9 +627,10 @@ void tma_unit_sm::mover_issue_requests(TMATransferEntry &entry,
         byte_mask.set(sector_in_line * SECTOR_SIZE + b);
       }
 
+      mem_access_type acc_type = this_mf_is_write ? GLOBAL_ACC_W : GLOBAL_ACC_R;
       mem_fetch *mf = m_mf_allocator->alloc(
-          addr, GLOBAL_ACC_R, active_mask_t().set(0), byte_mask, sector_mask,
-          SECTOR_SIZE, /*wr=*/false, m_sm->get_current_gpu_cycle(),
+          addr, acc_type, active_mask_t().set(0), byte_mask, sector_mask,
+          SECTOR_SIZE, /*wr=*/this_mf_is_write, m_sm->get_current_gpu_cycle(),
           /*wid=*/(unsigned)-1, m_sm->get_sid(), m_sm->get_tpc_id(),
           /*original_mf=*/nullptr);
       mf->set_is_tma(true);
@@ -602,10 +638,35 @@ void tma_unit_sm::mover_issue_requests(TMATransferEntry &entry,
       if (entry.requests_issued == 0) {
         m_sm->debug_log_tma_event(
             "first-request uid=" + std::to_string(entry.transfer_uid) +
+            " family=" +
+            std::to_string(static_cast<int>(entry.cmd.opcode_family)) +
+            " ttype=" +
+            std::to_string(static_cast<int>(entry.cmd.transfer_type)) +
             " addr=" + std::to_string(addr) +
+            " dir=" + std::to_string(static_cast<int>(entry.cmd.direction)) +
+            " store=" + std::to_string(is_store ? 1 : 0) +
+            " reduce=" + std::to_string(is_reduction ? 1 : 0) +
+            " mfs_per_sector=" + std::to_string(mfs_per_sector) +
             " agu_requests=" + std::to_string(agu_request_goal) +
             " sector_mfs=" + std::to_string(kSectorMfGoal) +
             " (32B sector, L1-bypass, shared icnt)");
+      }
+      // For store/reduce, log the first read mf and first write mf separately so
+      // the RMW (read+write) issue of a reduce-store is observable in the trace.
+      if ((is_store || is_reduction)) {
+        if (this_mf_is_write && !entry.logged_first_write) {
+          entry.logged_first_write = true;
+          m_sm->debug_log_tma_event(
+              "store-write-issue uid=" + std::to_string(entry.transfer_uid) +
+              " addr=" + std::to_string(addr) + " acc=GLOBAL_ACC_W" +
+              " reduce=" + std::to_string(is_reduction ? 1 : 0));
+        } else if (!this_mf_is_write && !entry.logged_first_read) {
+          entry.logged_first_read = true;
+          m_sm->debug_log_tma_event(
+              "reduce-read-issue uid=" + std::to_string(entry.transfer_uid) +
+              " addr=" + std::to_string(addr) + " acc=GLOBAL_ACC_R" +
+              " (RMW dst fetch)");
+        }
       }
 
       m_outstanding_requests[mf] = entry.transfer_uid;
@@ -635,21 +696,33 @@ void tma_unit_sm::mover_on_response(TMATransferEntry &entry, mem_fetch *mf,
   if (agu_request_goal == 0 && entry.cmd.total_bytes > 0) {
     agu_request_goal = 1;
   }
-  // requests are counted in 32B sector mfs (see mover_issue_requests).
-  uint32_t sector_mf_goal = agu_request_goal * SECTOR_CHUNCK_SIZE;
+  // requests are counted in 32B sector mfs (see mover_issue_requests). A
+  // reduce-store emits 2 mfs (read + write) per sector, so its goal is 2x.
+  const bool is_reduction =
+      (entry.cmd.transfer_type == TMATransferType::REDUCTION);
+  const uint32_t mfs_per_sector = is_reduction ? 2u : 1u;
+  uint32_t sector_mf_goal =
+      agu_request_goal * SECTOR_CHUNCK_SIZE * mfs_per_sector;
   if (entry.requests_completed >= sector_mf_goal) {
-    // All bulk reads have landed in SMEM. Credit the transaction-count barrier
-    // with the descriptor's full byte count (Hopper mbarrier complete_tx).
     entry.state = TMATransferEntry::State::COMPLETED;
     entry.cycle_last_completion = current_cycle;
     ++m_stat_transfers_completed;
     m_sm->debug_log_tma_event(
         "complete uid=" + std::to_string(entry.transfer_uid) +
         " warp=" + std::to_string(entry.cmd.warp_id) +
+        " dir=" + std::to_string(static_cast<int>(entry.cmd.direction)) +
+        " reduce=" + std::to_string(is_reduction ? 1 : 0) +
         " bytes=" + std::to_string(entry.cmd.total_bytes) +
         " requests=" + std::to_string(entry.requests_completed) +
+        " sector_goal=" + std::to_string(sector_mf_goal) +
         " cycle=" + std::to_string(current_cycle));
-    m_sm->notify_tma_completion(entry.cmd.warp_id, entry.cmd.total_bytes);
+    // Only GMEM->SMEM loads credit the Hopper mbarrier transaction-count
+    // (complete_tx). Store/reduce completion uses the bulk async-group
+    // (commit-group / wait-group) mechanism, modeled separately by the
+    // UTMACMDFLUSH warp-stall; it must NOT drive the load-side mbarrier.
+    if (entry.cmd.direction == TMADirection::GMEM_TO_SMEM) {
+      m_sm->notify_tma_completion(entry.cmd.warp_id, entry.cmd.total_bytes);
+    }
   }
 }
 
