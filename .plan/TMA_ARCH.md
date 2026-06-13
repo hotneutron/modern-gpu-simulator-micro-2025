@@ -1066,31 +1066,63 @@ Test plan:
 - verify ordinary `STG` and `RED*` instructions still use the normal store datapath and counters
 - regression: confirm the FA3 backward trace's `UTMASTG`/`UBLKRED`/`UTMACMDFLUSH` sequences are routed to the TMA engine and the run completes without asserts
 
-### Phase 4.5: Prefetch Family (UTMAPF / UBLKPF) + Control-State Recording
+### Phase 4.5: Prefetch Family (UTMAPF / UBLKPF)
 
-**Runs after Phase 4 (store).** This sub-phase was split out because the prefetch family is a distinct memory behavior (GMEM→L2, no SMEM landing) and because `UTMACCTL.PF` is a control op that *sets up* state later consumed by `UTMAPF` — so it cannot simply be dropped as passthrough.
+**Runs after Phase 4 (store).** Split out because the prefetch family is a distinct memory behavior (GMEM→L2, no SMEM landing, no completion consumer).
+
+> **Status (this session):** Task 1 (mis-credit fix) and Task 2 (prefetch issue classification/log) are **✅ IMPLEMENTED** (build pending). **Task 3 (UTMACCTL.PF state recording) is DROPPED** — see "UTMACCTL.PF: control-only, no state recording needed" below.
+
+#### Trace evidence (FA3 backward, b1-s2048-hd64-nh24)
+
+Static decode (`traces/.../extra_info/tma_discovery.json`) does contain prefetch:
+
+- `UTMAPF.L2.4D` : 72 static occurrences, tagged `"role": "prefetch"`, form `@!UP2 UTMAPF.L2.4D [URx], [URy]` (predicate-guarded).
+- `UTMACCTL.PF` : 777 static occurrences (prefetch state-setup control).
+
+Whether `UTMAPF` *executes at runtime* is **NOT yet confirmed**. The dynamic trace (`instruction.proto`) stores only `pc` + `predicate_mask`, not the opcode string, so a binary grep cannot decide it (verified: grepping any opcode string in the `.pb` returns 0). The kernel-10 validation run observed **0** runtime `UTMAPF` in its first ~3h window, but that does NOT prove the remaining window is prefetch-free — the `@!UP2` predicate may enable it later. Treat prefetch as **possible at runtime** until a proper proto decode (pc 0x91e0 → UTMAPF) over the full kernel-10 trace says otherwise.
+
+#### Current behavior is a latent correctness bug (must fix)
+
+`UTMAPF` and `UBLKPF` are both mapped to `TMA_LOAD_OP` ([hopper_opcode.h:199,204](file:///home/jihyun/project/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/ISA_Def/hopper_opcode.h#L199-L204)). Consequences in the current TMA unit:
+
+- `classify_tma_direction` → `GMEM_TO_SMEM` (same as a load); `classify_tma_transfer_type` → `PREFETCH` ([tma_unit_sm.cc:15-46](file:///home/jihyun/project/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/tma_unit_sm.cc#L15-L46)).
+- Subcore routes all TMA op-classes to `m_tma_pipeline` ([subcore.cc:957-961](file:///home/jihyun/project/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/subcore.cc#L957-L961)), so prefetch enters the TMA unit.
+- In `advance_in_flight_transfers` the passthrough path only fires for CONTROL or `direction==NONE`; PREFETCH is neither, so it falls through to the mover and issues read traffic like a load.
+- **The bug (now fixed — Task 1):** `mover_on_response` originally keyed its completion path on `direction==GMEM_TO_SMEM` and called `notify_tma_completion(warp_id, total_bytes)`. A prefetch would therefore **credit the mbarrier `complete_tx`**, corrupting the completion accounting of unrelated `UTMALDG` loads. This was harmless only while `UTMAPF` never executes; if it executed in the run window, the whole run would be invalidated. The gate is now `transfer_type==LOAD` with a separate PREFETCH branch ([tma_unit_sm.cc:734-751](file:///home/jihyun/project/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/tma_unit_sm.cc#L734-L751)).
+
+Size binding already works for prefetch (no work needed): Phase 2 treats `UTMAPF` as descriptor-backed (`config_id` + `total_bytes` + `requests_total`, [tma_unit_sm.cc:426-436](file:///home/jihyun/project/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/tma_unit_sm.cc#L426-L436)) and `UBLKPF` as covered-span ([tma_unit_sm.cc:447-456](file:///home/jihyun/project/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/tma_unit_sm.cc#L447-L456)).
 
 Goal:
 
-- model TMA L2 prefetch and the control-state it depends on
+- model TMA L2 prefetch as fire-and-forget GMEM→L2 traffic with **no** mbarrier completion.
 
 Tasks:
 
-- support `UTMAPF` / `UBLKPF`: issue prefetch requests that target L2 only (no SMEM landing, no mbarrier `complete_tx`), modeled as fire-and-forget. Reuse the Phase 3 32B-sector L2-friendly issue path; the difference is the destination/landing and the lack of a completion-wait consumer.
-- **record `UTMACCTL.PF` control state** in `tma_unit_sm` (or the command-formation layer) rather than discarding it. `UTMACCTL.PF` configures prefetch state that a subsequent `UTMAPF` consumes; the simulator must keep enough of that state (e.g. the prefetch descriptor/handle association) so the later `UTMAPF` can be modeled correctly.
-- preserve `descriptor_link` resolution: `UTMAPF` carries no explicit `desc[URx]`; its descriptor association is pre-resolved at JSON load time (see Phase 2 `UTMAPF descriptor_link handling`).
+1. **Fix the completion mis-credit (highest priority).** ✅ DONE. In `mover_on_response`, `notify_tma_completion` is now gated on `transfer_type==LOAD` (not direction), and PREFETCH has its own completion branch that retires the transfer silently with a `prefetch-complete` log ([tma_unit_sm.cc:734-751](file:///home/jihyun/project/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/tma_unit_sm.cc#L734-L751)). PREFETCH never credits an mbarrier.
+2. **Issue prefetch traffic toward L2 only.** ✅ DONE (no datapath change needed). Prefetch reuses the Phase 3 32B-sector read issue path (`GLOBAL_ACC_R`): it has `is_store=false`/`is_reduction=false`, so it emits the same read shape as a load. It is not counted as an outstanding store (the store counter keys on `direction==SMEM_TO_GMEM`). A `prefetch-issue` log marks its issue distinctly; `enqueue`/`first-request` logs now carry `ttype` so prefetch (`ttype=2`) is distinguishable from a load in the trace.
+3. ~~Record `UTMACCTL.PF` control state~~ **DROPPED.** See below.
+4. Preserve `descriptor_link` resolution (unchanged): `UTMAPF` carries no explicit `desc[URx]`; its descriptor association is pre-resolved at JSON load time (Phase 2 `UTMAPF descriptor_link handling`). Size binding already works for prefetch.
+5. Debug logging: ✅ `prefetch-issue` (uid/warp/family/total_bytes) and `prefetch-complete` (uid/warp/family/ttype/bytes/`mbarrier_credited=0`/cycle) added; `enqueue`/`first-request` carry `ttype`. One-event-per-episode discipline preserved.
+
+#### UTMACCTL.PF: control-only, no state recording needed (Task 3 dropped)
+
+`UTMACCTL.PF` is a 1-operand control op (`UTMACCTL.PF [UR6]`) whose single operand is a **state token** (`prefetch_control_state`), not a byte count — its value matches the `operand_1` of nearby `UTMAPF`/`UTMALDG` (see [TMA_TRACING.md:136-183](file:///home/jihyun/project/modern-gpu-simulator-micro-2025/.plan/TMA_TRACING.md#L136-L183)). The original motivation for "recording its state" was that `UTMAPF` consumes that token. **But TMA_TRACING.md already concludes** the data-size path comes entirely from `UTMAPF → descriptor_link → UTMALDG → descriptor config`, so:
+
+- `UTMACCTL.PF` needs **no** byte-movement accounting and can stay a control/passthrough op.
+- Recording the token would additionally require touching the decode stage — the `.PF` suffix is collapsed into `OP_UTMACCTL` in [trace_driven.cc:314-323](file:///home/jihyun/project/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/trace-driven/trace_driven.cc#L314-L323) — for no timing-model benefit.
+
+Therefore Task 3 is dropped; `UTMACCTL.PF` keeps its existing control-passthrough handling.
 
 Success criterion:
 
-- `UTMAPF`/`UBLKPF` generate prefetch traffic toward L2 distinct from both ordinary loads and from completion-bearing `UTMALDG` loads
-- `UTMACCTL.PF` state is recorded and observable by the consuming prefetch op rather than silently dropped
+- `UTMAPF`/`UBLKPF` generate prefetch traffic toward L2, distinct from ordinary loads, and **never** call `notify_tma_completion`.
+- No mbarrier `complete_tx` is credited by any prefetch, even if `UTMAPF` executes at runtime.
 
 Test plan:
 
-- add a micro-trace with `UTMACCTL.PF` followed by `UTMAPF` and verify the control state is recorded and linked to the prefetch
-- verify prefetch traffic is counted on prefetch-specific counters and does **not** drive any mbarrier completion / consumer wait
-- verify a fire-and-forget `UTMAPF` introduces no spurious consumer stall
-- regression: confirm the FA3 backward trace (which has no runtime-observed `UTMAPF`) is unchanged
+- micro-trace `UTMAPF`: verify prefetch traffic issues toward L2 (`prefetch-issue`/`prefetch-complete` logs), no mbarrier completion, no consumer stall.
+- regression: re-run FA3 backward and confirm load/store/reduce/flush logs are unchanged AND that any runtime `UTMAPF` (if it now appears) produces `prefetch-*` logs with zero mbarrier credit — i.e. confirm the latent bug above is closed.
+- **Before trusting Phase 4.5 validation on FA3:** decode the kernel-10 dynamic trace (pc 0x91e0) to establish whether/where `UTMAPF` actually executes; if it never executes, FA3 can only show the regression-unchanged case and a dedicated micro-trace is required for positive validation.
 
 ### Phase 5: TMA Completion / Barrier Model  ✅ COMPLETED (separate SYNC work)
 
@@ -1138,11 +1170,27 @@ Goal:
 
 - capture the separation between generic execution and async proxy
 
+> **Trace evidence (FA3 bwd, `flash_bwd_hdim64_bf16_softcapall_sm90` SASS):**
+> The exact spelling `FENCE.PROXY.ASYNC` does **not** appear. The async-proxy
+> visibility fence in this kernel is **`FENCE.VIEW.ASYNC.S` (399 occurrences)**.
+> Plain CTA/GPU barriers are `MEMBAR.ALL.CTA` (372) and `MEMBAR.ALL.GPU` (120).
+>
+> **Current handling (the gap this phase closes):**
+> - `FENCE*` decodes to `OP_FENCE`/`MEMORY_BARRIER_OP` ([hopper_opcode.h:118](file:///home/jihyun/project/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/ISA_Def/hopper_opcode.h#L118)).
+> - `is_lightweight_fence_memory_barrier` ([sm.cc:155-162](file:///home/jihyun/project/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/sm.cc#L155-L162)) treats any `FENCE*` as a lightweight membar: it sets the membar flag but **skips** the barrier reach/complete logic, so `FENCE.VIEW.ASYNC.S` carries **no async-proxy ordering dependency** today.
+> - `MEMBAR.ALL.*` gets a fixed `m_num_cycles_to_stall_SM` stall ([sm.cc:598-612](file:///home/jihyun/project/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/sm.cc#L598-L612)) — approximate, but timing is reflected.
+> - `.VIEW.ASYNC.S` / `.PROXY` suffixes are dropped at decode.
+>
+> **Note:** this is **not a small change** — it must wire an ordering dependency
+> between the async-proxy fence and TMA store visibility / mbarrier completion,
+> plus a dedicated micro-benchmark to validate. Schedule it as a standalone phase
+> after the Phase 4.5 build is validated, never bundled into the same run.
+
 Tasks:
 
-- add a simplified `FENCE.PROXY.ASYNC` visibility model
+- distinguish the async-proxy fence (`FENCE.VIEW.ASYNC.S`) from a plain lightweight fence and add a simplified async-proxy visibility model for it
 - model the ordering needed before TMA stores source from shared memory
-- model the ordering needed **after `mbarrier.init`** — a `FENCE.PROXY.ASYNC` is required after initializing an mbarrier object to ensure the async proxy can observe the initialized state before any thread arrives or waits on it
+- model the ordering needed **after `mbarrier.init`** — an async-proxy fence is required after initializing an mbarrier object to ensure the async proxy can observe the initialized state before any thread arrives or waits on it
 
 Success criterion:
 

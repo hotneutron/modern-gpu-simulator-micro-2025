@@ -487,10 +487,24 @@ void tma_unit_sm::enqueue_issued_commands() {
         " outstanding=" + std::to_string(outstanding));
   }
 
+  // Prefetch (UTMAPF / UBLKPF) shares the GMEM->SMEM direction and read-shape of
+  // a load, but is fire-and-forget: it has no consumer mbarrier and must not be
+  // counted as an outstanding store. Logged here so its issue is observable in
+  // the trace distinct from a real load.
+  if (entry.cmd.transfer_type == TMATransferType::PREFETCH) {
+    m_sm->debug_log_tma_event(
+        "prefetch-issue uid=" + std::to_string(entry.transfer_uid) +
+        " warp=" + std::to_string(entry.cmd.warp_id) +
+        " family=" +
+        std::to_string(static_cast<int>(entry.cmd.opcode_family)) +
+        " total_bytes=" + std::to_string(entry.cmd.total_bytes));
+  }
+
   m_sm->debug_log_tma_event(
       "enqueue uid=" + std::to_string(entry.transfer_uid) +
       " warp=" + std::to_string(entry.cmd.warp_id) +
       " dir=" + std::to_string(static_cast<int>(entry.cmd.direction)) +
+      " ttype=" + std::to_string(static_cast<int>(entry.cmd.transfer_type)) +
       " requests_total=" + std::to_string(entry.cmd.requests_total) +
       " total_bytes=" + std::to_string(entry.cmd.total_bytes));
 }
@@ -731,12 +745,30 @@ void tma_unit_sm::mover_on_response(TMATransferEntry &entry, mem_fetch *mf,
         " requests=" + std::to_string(entry.requests_completed) +
         " sector_goal=" + std::to_string(sector_mf_goal) +
         " cycle=" + std::to_string(current_cycle));
-    // Only GMEM->SMEM loads credit the Hopper mbarrier transaction-count
-    // (complete_tx). Store/reduce completion uses the bulk async-group
-    // (commit-group / wait-group) mechanism, modeled separately by the
-    // UTMACMDFLUSH warp-stall; it must NOT drive the load-side mbarrier.
-    if (entry.cmd.direction == TMADirection::GMEM_TO_SMEM) {
+    // Only real GMEM->SMEM loads (UTMALDG/UBLKCP) credit the Hopper mbarrier
+    // transaction-count (complete_tx). Prefetch (UTMAPF/UBLKPF) also has
+    // direction GMEM_TO_SMEM but must NOT credit any mbarrier: it carries no
+    // arrive/complete_tx contract, so crediting it would corrupt the
+    // transaction-count accounting of an unrelated UTMALDG load. Store/reduce
+    // completion uses the bulk async-group (commit-group / wait-group)
+    // mechanism, modeled separately by the UTMACMDFLUSH warp-stall.
+    if (entry.cmd.transfer_type == TMATransferType::LOAD) {
       m_sm->notify_tma_completion(entry.cmd.warp_id, entry.cmd.total_bytes);
+    } else if (entry.cmd.transfer_type == TMATransferType::PREFETCH) {
+      // Fire-and-forget prefetch: data has landed in L2/SMEM-staging but there
+      // is no consumer barrier to signal. Just log and retire silently.
+      // ttype is logged so the trace can prove this transfer took the PREFETCH
+      // branch and therefore did NOT call notify_tma_completion (the latent bug
+      // this branch closes).
+      m_sm->debug_log_tma_event(
+          "prefetch-complete uid=" + std::to_string(entry.transfer_uid) +
+          " warp=" + std::to_string(entry.cmd.warp_id) +
+          " family=" +
+          std::to_string(static_cast<int>(entry.cmd.opcode_family)) +
+          " ttype=" + std::to_string(static_cast<int>(entry.cmd.transfer_type)) +
+          " bytes=" + std::to_string(entry.cmd.total_bytes) +
+          " mbarrier_credited=0"
+          " cycle=" + std::to_string(current_cycle));
     } else {
       // Store-class transfer finished: retire it from the warp's bulk
       // async-group so a UTMACMDFLUSH waiting on this warp can make progress.
