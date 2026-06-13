@@ -234,6 +234,10 @@ class SM : public core_t, public shader_core_ctx_wrapper {
   bool warp_waiting_at_barrier(unsigned warp_id) const override;
   bool check_if_non_released_reduction_barrier(warp_inst_t &inst);
   bool warp_waiting_at_mem_barrier(unsigned warp_id) override;
+  // True when `pI` is a UTMACMDFLUSH (cp.async.bulk.wait_group 0) and the
+  // issuing warp still has outstanding store-class TMA transfers. The warp must
+  // stall (warp-local drain-all) until all its store/reduce transfers complete.
+  bool warp_waiting_at_tma_flush(unsigned warp_id, const warp_inst_t *pI);
   bool warp_waiting_grid_barrier(unsigned warp_id) override;
   void clear_gridbar(unsigned int kernel_id);
   void broadcast_barrier_reduction(unsigned cta_id, unsigned bar_id,
@@ -357,6 +361,9 @@ class SM : public core_t, public shader_core_ctx_wrapper {
   unsigned int m_sm_id;
   unsigned int m_tpc_id;
   unsigned int m_num_subcores;
+  // Warps currently parked on a UTMACMDFLUSH store-drain wait. Used only to
+  // emit a single enter/release log per stall episode (avoids per-cycle spam).
+  std::set<unsigned int> m_warps_waiting_tma_flush;
 
   unsigned int m_num_cycles_to_wait_to_dispatch_another_inst_from_subcore_to_sm_shared_pipeline;
 

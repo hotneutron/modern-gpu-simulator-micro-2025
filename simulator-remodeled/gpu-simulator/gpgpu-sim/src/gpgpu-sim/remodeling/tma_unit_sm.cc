@@ -472,6 +472,21 @@ void tma_unit_sm::enqueue_issued_commands() {
   m_in_flight_transfers.push_back(entry);
   m_command_queue.pop();
 
+  // Track store-class transfers (SMEM->GMEM: UTMASTG / UTMAREDG / UBLKRED) per
+  // warp from enqueue until completion. A UTMACMDFLUSH (wait_group 0) drains all
+  // of them for its warp. Counting from enqueue (not from IN_FLIGHT) keeps the
+  // drain-all semantics exact even for stores still waiting in the AGU stage.
+  if (entry.cmd.direction == TMADirection::SMEM_TO_GMEM) {
+    uint32_t outstanding = ++m_outstanding_stores_per_warp[entry.cmd.warp_id];
+    m_sm->debug_log_tma_event(
+        "store-outstanding++ uid=" + std::to_string(entry.transfer_uid) +
+        " warp=" + std::to_string(entry.cmd.warp_id) +
+        " reduce=" +
+        std::to_string(
+            entry.cmd.transfer_type == TMATransferType::REDUCTION ? 1 : 0) +
+        " outstanding=" + std::to_string(outstanding));
+  }
+
   m_sm->debug_log_tma_event(
       "enqueue uid=" + std::to_string(entry.transfer_uid) +
       " warp=" + std::to_string(entry.cmd.warp_id) +
@@ -722,8 +737,26 @@ void tma_unit_sm::mover_on_response(TMATransferEntry &entry, mem_fetch *mf,
     // UTMACMDFLUSH warp-stall; it must NOT drive the load-side mbarrier.
     if (entry.cmd.direction == TMADirection::GMEM_TO_SMEM) {
       m_sm->notify_tma_completion(entry.cmd.warp_id, entry.cmd.total_bytes);
+    } else {
+      // Store-class transfer finished: retire it from the warp's bulk
+      // async-group so a UTMACMDFLUSH waiting on this warp can make progress.
+      auto it = m_outstanding_stores_per_warp.find(entry.cmd.warp_id);
+      uint32_t outstanding = 0;
+      if (it != m_outstanding_stores_per_warp.end() && it->second > 0) {
+        outstanding = --(it->second);
+      }
+      m_sm->debug_log_tma_event(
+          "store-outstanding-- uid=" + std::to_string(entry.transfer_uid) +
+          " warp=" + std::to_string(entry.cmd.warp_id) +
+          " reduce=" + std::to_string(is_reduction ? 1 : 0) +
+          " outstanding=" + std::to_string(outstanding));
     }
   }
+}
+
+bool tma_unit_sm::warp_has_outstanding_stores(unsigned int warp_id) const {
+  auto it = m_outstanding_stores_per_warp.find(warp_id);
+  return it != m_outstanding_stores_per_warp.end() && it->second > 0;
 }
 
 void tma_unit_sm::fill(mem_fetch *mf) {

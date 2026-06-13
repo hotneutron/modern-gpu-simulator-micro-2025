@@ -509,6 +509,10 @@ void Subcore::issue(SM *shared_sm) {
 
         bool is_not_warp_waiting_ldgdepbar = !is_waiting_ldgdepbar(pI, subcore_warp_id);
         bool is_not_warp_waiting_in_programmer_barrier = !c_warp->waiting();
+        // UTMACMDFLUSH (cp.async.bulk.wait_group 0) stalls its warp until all of
+        // that warp's outstanding store-class TMA transfers drain (warp-local).
+        bool is_not_warp_waiting_tma_flush =
+            !shared_sm->warp_waiting_at_tma_flush(sm_warp_id, pI);
         functional_unit* fu = get_fu(pI);
         bool is_fu_available = true;;
         bool is_fixed_latency_inst = fu->is_fixed_latency_unit();
@@ -531,10 +535,16 @@ void Subcore::issue(SM *shared_sm) {
           }
         }
 
+        // Despite the name, this is the "this warp is eligible to issue now"
+        // predicate, not a literal warp switch. If false, the warp is simply
+        // skipped this cycle and the scheduler tries another warp; the warp
+        // becomes issuable again once its condition clears (e.g. is_not_warp_
+        // waiting_tma_flush goes true when its store-class transfers drain). So
+        // a stalling UTMACMDFLUSH only parks its own warp, never the whole core.
         bool are_switch_warp_conditions_ready =
             is_not_yield && is_stall_counter_0 && are_wait_barriers_ready &&
             is_fu_available && is_not_warp_waiting_in_programmer_barrier &&
-            is_not_warp_waiting_ldgdepbar && are_traditional_scoreaboards_ready && is_write_available_result_queue_for_fixed_latency_available;
+            is_not_warp_waiting_ldgdepbar && is_not_warp_waiting_tma_flush && are_traditional_scoreaboards_ready && is_write_available_result_queue_for_fixed_latency_available;
 
         bool can_l1c_switch_warp = true;
 

@@ -1788,6 +1788,33 @@ bool SM::warp_waiting_grid_barrier(unsigned warp_id) {
   return m_physical_warp[warp_id]->get_gridbar();
 }
 
+bool SM::warp_waiting_at_tma_flush(unsigned warp_id, const warp_inst_t *pI) {
+  if (pI == nullptr ||
+      pI->tma_opcode_family != TMAOpcodeFamily::UTMACMDFLUSH) {
+    return false;
+  }
+  bool waiting =
+      m_tma_unit_shared_of_sm->warp_has_outstanding_stores(warp_id);
+  bool was_waiting =
+      m_warps_waiting_tma_flush.find(warp_id) != m_warps_waiting_tma_flush.end();
+  if (waiting && !was_waiting) {
+    // Stall episode begins: log once on entry (not every cycle).
+    m_warps_waiting_tma_flush.insert(warp_id);
+    debug_log_tma_event("flush-wait-enter warp=" + std::to_string(warp_id) +
+                        " pc=" + format_hex_u64(pI->pc));
+  } else if (!waiting && was_waiting) {
+    // All store-class transfers drained: warp may now issue the flush.
+    m_warps_waiting_tma_flush.erase(warp_id);
+    debug_log_tma_event("flush-wait-release warp=" + std::to_string(warp_id) +
+                        " pc=" + format_hex_u64(pI->pc));
+  } else if (!waiting && !was_waiting) {
+    // Flush issued with no outstanding store-class transfers (pass-through).
+    debug_log_tma_event("flush-pass warp=" + std::to_string(warp_id) +
+                        " pc=" + format_hex_u64(pI->pc));
+  }
+  return waiting;
+}
+
 void SM::clear_gridbar(unsigned int kernel_id) {
   for (unsigned int i = 0; i < m_config->max_warps_per_shader; i++) {
     if (m_physical_warp[i]->m_kernel_id == kernel_id) {

@@ -166,11 +166,11 @@ This table records, for each TMA opcode family, its op-class (verified against `
 | `UBLKCP` | `TMA_LOAD_OP` | GMEM→SMEM bulk copy | **Phase 3** | ✅ Implemented + validated (same load mover; observed `family=4`, `bytes=512` complete) |
 | `UTMAPF` | `TMA_LOAD_OP` | GMEM→L2 prefetch (no SMEM landing) | **Phase 4.5** | ⬜ Not implemented. Currently passthrough. Not runtime-observed in the FA3 backward trace, but must be modeled separately (L2 prefetch timing, fire-and-forget). |
 | `UBLKPF` | `TMA_LOAD_OP` | bulk prefetch | **Phase 4.5** | ⬜ Not implemented (same prefetch family as `UTMAPF`). |
-| `UTMASTG` | `TMA_STORE_OP` | SMEM→GMEM store | **Phase 4** | ⬜ Not implemented. Currently store-passthrough (no crash). FA3 backward writes dQ/dK/dV via this. |
-| `UTMAREDG` | `TMA_STORE_OP` | SMEM→GMEM reduction store | **Phase 4** | ⬜ Not implemented (reduction-tagged store). |
-| `UBLKRED` | `TMA_STORE_OP` | bulk reduce-store | **Phase 4** (both descriptor-backed and bulk non-descriptor) | ⬜ Not implemented. Both forms covered in Phase 4 (covered-span size source already exists). ⚠️ Only the descriptor-backed form is runtime-observed in FA3 backward; the bulk non-descriptor form (`covered_bytes = operand_3 * 16`) is implemented but **NOT validated** (no FA3 coverage). |
+| `UTMASTG` | `TMA_STORE_OP` | SMEM→GMEM store | **Phase 4** | ✅ Implemented (Step 1, validation pending). Routed through the store mover (`GLOBAL_ACC_W` per sector). FA3 backward writes dQ/dK/dV via UBLKRED; pure UTMASTG not observed in that trace. |
+| `UTMAREDG` | `TMA_STORE_OP` | SMEM→GMEM reduction store | **Phase 4** | ✅ Implemented (Step 1, validation pending). Reduce-store RMW (read+write per sector, non-atomic). |
+| `UBLKRED` | `TMA_STORE_OP` | bulk reduce-store | **Phase 4** (both descriptor-backed and bulk non-descriptor) | ✅ Implemented (Step 1). Reduce-store RMW via covered-span size source. ⚠️ Only the descriptor-backed form is runtime-observed in FA3 backward; the bulk non-descriptor form (`covered_bytes = operand_3 * 16`) is implemented but **NOT validated** (no FA3 coverage). |
 | `UTMACCTL` | `TMA_MISCELLANEOUS_OP` | control / prefetch state setup | **Phase 4.5** | ⬜ Currently passthrough. `UTMACCTL.PF` sets up state later consumed by `UTMAPF`, so the simulator must **record** that prefetch control state (not just drop it), even though it moves no bytes. |
-| `UTMACMDFLUSH` | `TMA_MISCELLANEOUS_OP` | store commit-group flush | **Phase 4** | ⬜ Currently passthrough. This is the SASS form of the store-side commit-group / wait-group completion; it is the wait point for `UTMASTG`/`UTMAREDG`/`UBLKRED`. |
+| `UTMACMDFLUSH` | `TMA_MISCELLANEOUS_OP` | store commit-group flush | **Phase 4** | ✅ Implemented as warp-local drain-all wait (Step 2). SASS form of the store-side commit-group / wait-group completion; wait point for `UTMASTG`/`UTMAREDG`/`UBLKRED`. |
 
 Notes:
 
@@ -983,6 +983,11 @@ Test plan:
 Goal:
 
 - support reverse-direction (store / reduce-store) TMA data movement using the same dedicated `tma_unit_sm` engine as Phase 3, and model the store-side completion-wait correctly.
+
+#### Implementation status (two-step)
+
+- **Step 1 — store/reduce data movement: ✅ IMPLEMENTED (validation pending).** Store-class transfers (`UTMASTG` / `UTMAREDG` / `UBLKRED`) are routed through the same mover as loads; `mover_issue_requests` selects read / write / read+write-RMW per 32B sector (reduce = 2× sector mfs), and only `GMEM_TO_SMEM` loads credit the mbarrier `complete_tx`. Validation blocked only on a new-binary run reaching the kernel epilogue (stores first appear ~73% through the FA3 backward kernel-10 trace).
+- **Step 2 — `UTMACMDFLUSH` warp-local drain-all wait: ✅ IMPLEMENTED.** `tma_unit_sm` keeps a per-warp count of outstanding store-class transfers (incremented at enqueue when `direction == SMEM_TO_GMEM`, decremented at transfer completion in `mover_on_response`; counted per **transfer/command**, not per sector mf). `SM::warp_waiting_at_tma_flush(warp, pI)` returns true iff `pI` is a `UTMACMDFLUSH` and that warp's count is > 0; the subcore issue-eligibility gate (`is_not_warp_waiting_tma_flush`) stalls only that warp until the count drains to zero. Loads are excluded (their count is never incremented). Fire-and-forget store issue is preserved — only `UTMACMDFLUSH` may stall.
 
 #### Trace evidence (FA3 backward, verified)
 

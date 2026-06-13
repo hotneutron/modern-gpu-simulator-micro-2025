@@ -33,6 +33,14 @@ class tma_unit_sm : public functional_unit_shared_sm_part {
 
   void debug_dump_tma_counters() const;
 
+  // True while `warp_id` still has store-class TMA transfers (UTMASTG /
+  // UTMAREDG / UBLKRED) that have been enqueued but not yet completed. A
+  // UTMACMDFLUSH (cp.async.bulk.wait_group 0) must stall its issuing warp until
+  // this drains to zero (warp-local drain-all). Loads do not count: their
+  // completion is tracked by the mbarrier transaction count, not the bulk
+  // async-group.
+  bool warp_has_outstanding_stores(unsigned int warp_id) const;
+
  private:
   // Maximum number of bulk requests the TMA engine launches into the shared
   // interconnect per cycle. Conservative first-model bandwidth bound.
@@ -51,6 +59,12 @@ class tma_unit_sm : public functional_unit_shared_sm_part {
   // so a returning response credits the correct in-flight transfer.
   std::unordered_map<mem_fetch *, uint64_t> m_outstanding_requests;
   uint64_t m_next_transfer_uid = 1;
+
+  // Per-warp count of store-class transfers (UTMASTG / UTMAREDG / UBLKRED) that
+  // have been enqueued but not yet completed. Incremented when a store-class
+  // command is enqueued, decremented when its data movement completes. Drives
+  // the UTMACMDFLUSH warp-local drain-all wait (see warp_has_outstanding_stores).
+  std::unordered_map<unsigned int, uint32_t> m_outstanding_stores_per_warp;
 
   // ---- TMA-private debug counters (separate from L1/ldst counters) ----
   uint64_t m_stat_commands_issued = 0;
