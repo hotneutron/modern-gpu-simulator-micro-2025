@@ -1124,6 +1124,12 @@ Test plan:
 - regression: re-run FA3 backward and confirm load/store/reduce/flush logs are unchanged AND that any runtime `UTMAPF` (if it now appears) produces `prefetch-*` logs with zero mbarrier credit — i.e. confirm the latent bug above is closed.
 - **Before trusting Phase 4.5 validation on FA3:** decode the kernel-10 dynamic trace (pc 0x91e0) to establish whether/where `UTMAPF` actually executes; if it never executes, FA3 can only show the regression-unchanged case and a dedicated micro-trace is required for positive validation.
 
+**Validation status — FA3 bwd full run (.e304/.o304, kernel-10, sim 31 h):** ✅ **Regression PASSED, prefetch positive NOT covered.**
+
+- Simulation terminated cleanly (`GPGPU-Sim: *** exit detected ***`) with `-gpgpu_deadlock_detect 1` active → **no deadlock**. `gpu_tot_sim_cycle=376735`, `gpu_sim_insn=629197320`, `gpu_ipc=1670.13`. Zero FATAL/assert/segfault.
+- Store/reduce accounting: `store-outstanding++ == store-outstanding-- == 7296` (no leak). Flush stall: `flush-wait-enter == flush-wait-release == 1987` (every UTMACMDFLUSH stall released; no hang).
+- Prefetch: `prefetch-issue == prefetch-complete == 0` — **`UTMAPF` never executed at runtime in this whole trace.** The mis-credit fix (Task 1) is therefore a latent-bug closure with no effect on FA3 bwd accuracy; its positive path (prefetch issuing real L2 traffic with zero mbarrier credit) is **still unverified** and requires the dedicated `UTMAPF` micro-trace below.
+
 ### Phase 5: TMA Completion / Barrier Model  ✅ COMPLETED (separate SYNC work)
 
 **Status:** Implemented and validated as a **separate, independent work stream** (the Hopper `SYNCS` mbarrier / synchronization model), not as part of this TMA architecture effort. It was completed and full-trace validated before Phase 3 of this plan. The TMA load completion implemented in Phase 3 simply *plugs into* the mbarrier `complete_tx` path that the SYNC work already provides.
@@ -1164,45 +1170,38 @@ Test plan:
 - add regression tests confirming existing `BAR`, `MEMBAR`, `DEPBAR`, and `LDGDEPBAR` behavior is unchanged
 - add a mixed-workload test containing both LDGSTS and TMA to confirm the two completion mechanisms stay independent
 
-### Phase 6: Proxy-Fence / Ordering Model
+### Phase 6: Proxy-Fence / Ordering Model — ✅ ANALYZED, NO IMPLEMENTATION NEEDED
 
-Goal:
-
-- capture the separation between generic execution and async proxy
+**Conclusion: the simulator already handles this correctly; no code change required.**
 
 > **Trace evidence (FA3 bwd, `flash_bwd_hdim64_bf16_softcapall_sm90` SASS):**
 > The exact spelling `FENCE.PROXY.ASYNC` does **not** appear. The async-proxy
 > visibility fence in this kernel is **`FENCE.VIEW.ASYNC.S` (399 occurrences)**.
 > Plain CTA/GPU barriers are `MEMBAR.ALL.CTA` (372) and `MEMBAR.ALL.GPU` (120).
->
-> **Current handling (the gap this phase closes):**
-> - `FENCE*` decodes to `OP_FENCE`/`MEMORY_BARRIER_OP` ([hopper_opcode.h:118](file:///home/jihyun/project/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/ISA_Def/hopper_opcode.h#L118)).
-> - `is_lightweight_fence_memory_barrier` ([sm.cc:155-162](file:///home/jihyun/project/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/sm.cc#L155-L162)) treats any `FENCE*` as a lightweight membar: it sets the membar flag but **skips** the barrier reach/complete logic, so `FENCE.VIEW.ASYNC.S` carries **no async-proxy ordering dependency** today.
-> - `MEMBAR.ALL.*` gets a fixed `m_num_cycles_to_stall_SM` stall ([sm.cc:598-612](file:///home/jihyun/project/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/sm.cc#L598-L612)) — approximate, but timing is reflected.
-> - `.VIEW.ASYNC.S` / `.PROXY` suffixes are dropped at decode.
->
-> **Note:** this is **not a small change** — it must wire an ordering dependency
-> between the async-proxy fence and TMA store visibility / mbarrier completion,
-> plus a dedicated micro-benchmark to validate. Schedule it as a standalone phase
-> after the Phase 4.5 build is validated, never bundled into the same run.
 
-Tasks:
+**What `FENCE.VIEW.ASYNC.S` does (from the SASS context):** it appears almost
+exclusively immediately **before an mbarrier-init store** (`@UP0 SYNCS.EXCH.64 [smem], ...`)
+or just before a `BAR.ARV`. Its purpose is the generic↔async proxy split on
+Hopper: a generic-proxy write (the mbarrier init) must be made visible to the
+**async proxy** (the TMA hardware) before TMA can observe the initialized
+mbarrier. It corresponds to PTX `fence.proxy.async`.
 
-- distinguish the async-proxy fence (`FENCE.VIEW.ASYNC.S`) from a plain lightweight fence and add a simplified async-proxy visibility model for it
-- model the ordering needed before TMA stores source from shared memory
-- model the ordering needed **after `mbarrier.init`** — an async-proxy fence is required after initializing an mbarrier object to ensure the async proxy can observe the initialized state before any thread arrives or waits on it
+**Why no modeling is needed — the proxy split does not exist in this simulator:**
 
-Success criterion:
+- The mbarrier is a single object keyed by `(kernel, cta, addr)`. `SYNCS.EXCH`
+  (init) writes its fields **immediately, in the same cycle** ([sm.cc:1580-1598](file:///home/jihyun/project/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/sm.cc#L1580-L1598)). The generic-proxy writer (`EXCH`) and the async-proxy consumer (TMA `complete_tx`) read/write the **same object** — there is no separate proxy view to make consistent, so the proxy-visibility delay the fence guards against is **already zero** in the model.
+- Therefore neither an "ordering gate before TMA store" nor an "mbarrier-init visibility edge" would release any latency that exists in the model; they would only add unnecessary stalls and deadlock risk against FA3's already-dense mbarrier dependencies.
 
-- TMA stores have a distinct ordering requirement from ordinary stores
+**Current handling is already correct and conservative:**
 
-Test plan:
+- `FENCE*` decodes to `OP_FENCE`/`MEMORY_BARRIER_OP` ([hopper_opcode.h:118](file:///home/jihyun/project/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/ISA_Def/hopper_opcode.h#L118)).
+- `FENCE.VIEW.ASYNC.S` is classified lightweight ([sm.cc:155-162](file:///home/jihyun/project/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/sm.cc#L155-L162)): it **still receives the default fixed stall** of `num_cycles_to_stall_SM_at_gpu_memory_barrier` (186 cycles in the H100 config) ([sm.cc:598-604](file:///home/jihyun/project/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/sm.cc#L598-L604)), sets the membar flag, and skips only the CTA-barrier reach logic (correct — it is not a CTA join).
+- `MEMBAR.ALL.GPU` (186) / `MEMBAR.ALL.CTA` (53) get their own fixed stalls via the system/CTA flags.
+- The warp is released by `warp_waiting_at_mem_barrier` once its scoreboard pending mem ops drain ([sm.cc:1763-1784](file:///home/jihyun/project/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/sm.cc#L1763-L1784)).
 
-- create an ordering-focused test where generic-path writes populate shared memory before a TMA store and verify the modeled proxy-fence path is required for correct visibility
-- create a negative test that omits the proxy-fence condition and verify the simulator records an ordering hazard, delayed visibility, or the intended fallback behavior
-- verify ordinary non-TMA stores are unaffected by the new proxy-fence logic
-- add a regression test for TMA loads to ensure introducing store-side ordering rules does not disturb GMEM -> SMEM behavior
-- compare store-heavy traces before and after the phase to ensure only TMA-store synchronization behavior changes
+So the desired behavior ("a fence applies a default-cycle stall like other fences, with no false ordering hazard") is **exactly what already happens**. Validated implicitly by the FA3 bwd full run (.e304/.o304): 399 such fences executed with the default stall and the run terminated cleanly, deadlock-free.
+
+**Phase 6 is closed as analyzed-only.** Revisit only if a future model introduces a real generic/async proxy split (separate physical views), at which point the fence would have a latency to release.
 
 ### Phase 7: Fidelity Refinements
 
