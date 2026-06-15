@@ -1120,15 +1120,39 @@ Success criterion:
 
 Test plan:
 
-- micro-trace `UTMAPF`: verify prefetch traffic issues toward L2 (`prefetch-issue`/`prefetch-complete` logs), no mbarrier completion, no consumer stall.
+- micro-trace `UTMAPF` + `UBLKPF`: verify prefetch traffic issues toward L2 (`prefetch-issue`/`prefetch-complete` logs), no mbarrier completion, no consumer stall.
 - regression: re-run FA3 backward and confirm load/store/reduce/flush logs are unchanged AND that any runtime `UTMAPF` (if it now appears) produces `prefetch-*` logs with zero mbarrier credit — i.e. confirm the latent bug above is closed.
 - **Before trusting Phase 4.5 validation on FA3:** decode the kernel-10 dynamic trace (pc 0x91e0) to establish whether/where `UTMAPF` actually executes; if it never executes, FA3 can only show the regression-unchanged case and a dedicated micro-trace is required for positive validation.
+
+**Dedicated prefetch micro-trace (positive path) — harness prepared:**
+
+The `utmapf_probe` microbench now emits **both** prefetch opcodes in every variant, so a single kernel trace exercises both Phase 4.5 size sources:
+- `UTMAPF.L2.4D` (descriptor-backed tensor prefetch) — pre-existing `cp.async.bulk.prefetch.tensor.4d.L2.global.tile`.
+- `UBLKPF.L2` (covered-span bulk prefetch) — new `cp.async.bulk.prefetch.L2.global [src], bytes` path added to `utmapf_probe.cu` (`issue_ublkpf`, gated by `--issue-bulk-prefetch`, default on; size via `--bulk-prefetch-bytes`, multiple of 16, clamped to the global input buffer). Verified in SASS: `@UPx UTMAPF.L2.4D` and `@UP4 UBLKPF.L2` both present alongside `UTMALDG.4D` consumers (nvcc 12.8, `arch=sm_90a`).
+
+New job suite entry `utmapf-prefetch-both` added to [define-utmapf.yml](file:///home/jihyun/project/modern-gpu-simulator-micro-2025/simulator-remodeled/util/job_launching/apps/define-utmapf.yml) (`--issue-prefetch 1 --issue-bulk-prefetch 1 --bulk-prefetch-bytes 256 --use-load 1`).
+
+Run procedure (requires a Hopper GPU + NVBit; the current dev box has nvcc 12.8 but no NVIDIA driver, so trace generation must run on the Hopper trace host):
+1. Build: `cd gpu-app-collection/src/cuda/GPU_Microbenchmark/utmapf_probe && make` (or build the whole collection so it lands in `$GPUAPPS_ROOT/bin/$CUDA_VERSION/release/`).
+2. Trace: `cd util/tracer_nvbit && ./run_hw_trace.py -B utmapf_micro -D 0` (auto-runs the TMA post-passes; `discover_tma_producers.py` already classifies both `UTMAPF`/`UBLKPF` as `"prefetch"`).
+3. Simulate (run by user) with the H100 config pair `SM90_H100_L2_50MB_80GB`, then check for: `prefetch-issue`/`prefetch-complete` events with `mbarrier_credited=0`, `ttype=2` on `enqueue`/`first-request`, no consumer stall, clean exit (no deadlock).
 
 **Validation status — FA3 bwd full run (.e304/.o304, kernel-10, sim 31 h):** ✅ **Regression PASSED, prefetch positive NOT covered.**
 
 - Simulation terminated cleanly (`GPGPU-Sim: *** exit detected ***`) with `-gpgpu_deadlock_detect 1` active → **no deadlock**. `gpu_tot_sim_cycle=376735`, `gpu_sim_insn=629197320`, `gpu_ipc=1670.13`. Zero FATAL/assert/segfault.
 - Store/reduce accounting: `store-outstanding++ == store-outstanding-- == 7296` (no leak). Flush stall: `flush-wait-enter == flush-wait-release == 1987` (every UTMACMDFLUSH stall released; no hang).
-- Prefetch: `prefetch-issue == prefetch-complete == 0` — **`UTMAPF` never executed at runtime in this whole trace.** The mis-credit fix (Task 1) is therefore a latent-bug closure with no effect on FA3 bwd accuracy; its positive path (prefetch issuing real L2 traffic with zero mbarrier credit) is **still unverified** and requires the dedicated `UTMAPF` micro-trace below.
+- Prefetch: `prefetch-issue == prefetch-complete == 0` — **`UTMAPF` never executed at runtime in this whole trace.** The mis-credit fix (Task 1) is therefore a latent-bug closure with no effect on FA3 bwd accuracy; its positive path (prefetch issuing real L2 traffic with zero mbarrier credit) is **still unverified** and requires the dedicated prefetch micro-trace above.
+
+**Validation status — prefetch micro-trace (`utmapf_micro`):** ❌ **NOT VALIDATED.** Prefetch (`UTMAPF` *and* `UBLKPF`) is **not verified** in the simulator. A dedicated `utmapf_probe` micro-trace was attempted but abandoned — the verification cost was judged too high relative to its priority. The harness and findings below are kept for whoever resumes this.
+
+**What was tried and why it stalled (descriptor dependency is the crux):**
+- `UTMAPF` (`cp.async.bulk.prefetch.tensor.4d`) needs the **descriptor (tensor map)** to compute `box_dim × element_size`. In the micro-trace the TMA post-pass left the descriptor binding unresolved (`desc_refs:[]` at the top level, despite `descriptor_link.status:"matched"`). The release build has `assert` enabled, so a descriptor-required site with empty `config_id` / zero `total_bytes` does **not** become a no-op — it **aborts** (`abort`, signal 6) inside [`build_tma_command`](file:///home/jihyun/project/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/tma_unit_sm.cc#L426-L436). This is the simulator-side confirmation that **descriptor-less tensor prefetch fails outright** — it cannot be positively validated from this trace.
+- The same abort path also hits descriptor-required `UTMALDG` in the probe (`use-load 1`), so any kernel emitting them on this micro-trace crashes before reaching prefetch issue (observed: `prefetch-issue == 0`, sim aborted at `thread block = 0,0,0`).
+- `UBLKPF` (`cp.async.bulk.prefetch.L2.global [src], bytes`) is descriptor-independent (size = explicit covered-bytes operand; the trace did capture `covered_bytes=16`), so it *could* be validated in isolation by disabling all descriptor-required sites (`--issue-prefetch 0 --use-load 0 --use-expect-tx 0 --issue-bulk-prefetch 1`). That isolated run was **not** carried out.
+
+**To resume prefetch validation later, two independent gaps must be closed:**
+1. `UBLKPF` positive path: trace + sim a UBLKPF-only kernel (descriptor sites disabled) and confirm `prefetch-issue`/`prefetch-complete` with `total_bytes>0`, `mbarrier_credited=0`, no consumer stall, clean exit.
+2. `UTMAPF` positive path: root-fix the descriptor-binding post-pass so `desc_refs` is populated for generic-operand (`[URx]`) TMA sites; only then can `UTMAPF` (and descriptor-backed `UTMALDG` on the micro-trace) avoid the abort.
 
 ### Phase 5: TMA Completion / Barrier Model  ✅ COMPLETED (separate SYNC work)
 
