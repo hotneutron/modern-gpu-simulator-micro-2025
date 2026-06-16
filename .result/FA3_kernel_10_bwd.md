@@ -304,6 +304,50 @@ breakdown + all-SM TMA events — in a single pass.
 
 ---
 
+## Pre-run cycle-reduction analysis (no experiment, code + NCU only)
+
+Before spending another ~40 h run, the existing data was used to locate the
+over-estimation **quantitatively**. The NCU raw report contains 11 kernel
+invocations; the target (FlashAttnBwdSm90, k10) is the row with
+`smsp__average_warp_latency_per_inst_issued.ratio = 7.531`
+(`inst_executed=19,952,816`, `tma_ld=13,824`, `tma_st=7,296`,
+`shared_gmma=835,584`, `sm__pipe_tensor_cycles_active=53.6%`, `gpc_cycles_elapsed=131,632`).
+
+### The decisive contradiction
+- Sim **L2 hit rate = 98.7%** is *higher* than HW **82.3%**, yet sim cycles are **2.86×** HW.
+- A higher hit rate should make sim *faster*. It is slower → the inflation is **per-access modeled latency / non-overlap**, **not** bandwidth or miss count. DRAM is only 14.85% busy on HW and L2 miss is 1.3% in sim, so DRAM/L2-miss tuning cannot explain the gap.
+
+### Ranked over-estimation candidates
+
+| # | Candidate | Evidence | Verdict |
+|---|---|---|---|
+| **1** | **L2 ROP delay `rop_latency=211` on every global/TMA access** | [l2cache.cc:811-818](file:///home/jihyun/project/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/l2cache.cc#L811-L818): `r.ready_cycle = cycle + rop_latency` is added to **all non-texture reqs before L2 lookup**, so even the 98.7% L2 hits pay +211 one-way (~422 RT). HW Hopper L2-hit **round-trip** ≈ 150–220 cyc. Directly inflates HW `long_scoreboard` (20.2%). | **REDUCE → done (211→100)** |
+| 2 | `dram_latency=243` stacked on rop for L2 miss (rop+dram+rop ≈ 665) | Sim L2 miss only 1.3% in this kernel → small effect here | keep (not the driver) |
+| 3 | Clock 1800 MHz vs NCU-measured 1430 MHz (`-gpgpu_clock_domains 1800:...`) | cycle-vs-cycle comparison is clock-independent for fixed-cycle latencies | **not touched this run** (per decision) |
+| 4 | WGMMA/tensor latency | [abstract_hardware_model.cc:427-438](file:///home/jihyun/project/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/abstract_hardware_model.cc#L427-L443) `M·N·K·bits/rate` → II=16–64 cyc; serialized ≈ 25k–100k cyc, consistent with HW tensor-pipe 53.6% busy; HW `gmma` stall only 5.4% | **DO NOT touch** (`tensor_latency=32`) |
+| 5 | TMA issue serialization (`kMaxRequestsPerCycle` in [tma_unit_sm.cc](file:///home/jihyun/project/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/tma_unit_sm.cc)) | could inflate `barrier` (17.8%) | confirm via new `lat_issue` log post-run |
+
+### Additional findings (beyond the ranked latency knobs)
+
+**[B] `barrier` stall (HW 17.8%, the 2nd-largest reason) is a *downstream* effect of the TMA memory latency, not an independent knob.**
+- In the model, the consumer's mbarrier credit is granted **only when the TMA transfer completes** ([tma_unit_sm.cc:789-797](file:///home/jihyun/project/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/tma_unit_sm.cc#L789-L797)). So the time a consumer warp spends blocked on the mbarrier == the TMA transfer's `rop + L2/DRAM` round-trip.
+- Therefore lowering `rop_latency` (#1) shrinks **both** `long_scoreboard` (the producer's data-arrival wait, 20.2%) **and** `barrier` (the consumer's mbarrier wait, 17.8%) at once. Together these are the two largest stalls (≈38%), which is why #1 is the single highest-leverage change.
+- Action: none separate from #1; verify after the run that the emitted `..._stall_tma_axis` percentage (which lumps both) drops proportionally to the rop reduction.
+
+**[C] TMA AGU request throttle `kMaxRequestsPerCycle = 2`** ([tma_unit_sm.h:47](file:///home/jihyun/project/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/tma_unit_sm.h#L47)) **may over-serialize TMA transfer *issue*.**
+- A transfer emits its data as 32B sector mem-fetches; the loop caps emission at **2 sector mfs per cycle** ([tma_unit_sm.cc:614-615](file:///home/jihyun/project/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/tma_unit_sm.cc#L613-L666)). A 16 KB tile = 512 sectors ⇒ **~256 cycles just to *emit* one transfer** before any memory latency.
+- HW says the TMA unit is essentially idle: `sm__pipe_tma_cycles_active = 0.33%`. So this emission throttle could be a **structural over-serialization absent on HW**, inflating `barrier`/`long_scoreboard`.
+- **Uncertainty**: emission overlaps with in-flight memory latency, so the net impact may be partly hidden. **Do not change blindly.** The new per-transfer `lat_issue` field (`agu_ready → first_request`, in the `complete` TMA log) will quantify it; if `lat_issue` is large, raise `kMaxRequestsPerCycle` in the next iteration.
+
+> Note: TMA bypassing L1 (GMEM↔SMEM direct, going through L2) is the **correct** Hopper behavior ([tma_unit_sm.cc:628](file:///home/jihyun/project/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/tma_unit_sm.cc#L628), [tma_unit_sm.h:83](file:///home/jihyun/project/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/tma_unit_sm.h#L83)) and is **not** a problem — the low sim L1 access count is expected.
+
+### Change applied for this run
+- `gpgpusim.config`: **`-gpgpu_l2_rop_latency 211 → 100`** ([config](file:///home/jihyun/project/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/configs/tested-cfgs/SM90_H100_L2_50MB_80GB/gpgpusim.config#L169-L176)). Runtime config → no rebuild needed.
+- Rationale: rop is the **only** latency paid by 100% of global/TMA accesses (incl. L2 hits), so it is the single highest-leverage knob for the `long_scoreboard` axis and the overall 2.86× gap; via [B] it also shrinks `barrier`.
+- Everything else (tensor, dram, clock, `kMaxRequestsPerCycle`) left unchanged so this run isolates the rop effect, while the new `[LATCFG]` dump + per-transfer TMA `lat_*` breakdown still capture candidates #2/#5/[C] for the next iteration.
+
+---
+
 ## Summary
 
 1. **Cycle accuracy**: the simulator overestimates cycles by **~2.8–3.2×** vs real H100 (+183% on Elapsed basis). Significant room for improvement.
