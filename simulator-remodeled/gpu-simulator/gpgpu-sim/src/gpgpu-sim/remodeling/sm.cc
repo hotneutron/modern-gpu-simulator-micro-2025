@@ -355,10 +355,19 @@ void SM::debug_log_sync_event(const std::string &message) {
   --m_sync_debug_print_budget;
 }
 
-// TMA per-event log. Shares the SYNC print budget so a single config knob
-// bounds total debug output; tagged [TMADBG] so TMA traffic is greppable
-// separately from SYNC events.
+// TMA per-event log. Two independent sinks:
+//  1) [TMADBG] on stderr, gated by -sync_debug_enable (shares the SYNC budget).
+//  2) The GPGPU-Sim trace system (-trace_enabled 1 -trace_components TMA),
+//     which prints on stdout in the standard "GPGPU-Sim Cycle N: TMA - ..."
+//     format and honors -trace_sampling_core. The TMA unit is a newly added
+//     architecture component, so its activity is exposed as a first-class
+//     trace stream alongside WARP_SCHEDULER / SCOREBOARD / INTERCONNECT.
 void SM::debug_log_tma_event(const std::string &message) {
+  if (DTRACE(TMA) &&
+      (Trace::sampling_core == m_sm_id ||
+       Trace::sampling_core == (unsigned int)-1)) {
+    DPRINTF(TMA, "SM %u - %s\n", m_sm_id, message.c_str());
+  }
   if (m_sync_debug_print_budget == 0) {
     return;
   }

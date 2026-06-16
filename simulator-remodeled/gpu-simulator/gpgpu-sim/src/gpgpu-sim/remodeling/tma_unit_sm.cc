@@ -518,6 +518,12 @@ void tma_unit_sm::advance_in_flight_transfers() {
         // already derived from box_dim/element_size in Phase 2.
         entry.state = TMATransferEntry::State::AGU_READY;
         entry.cycle_agu_ready = current_cycle;
+        m_sm->debug_log_tma_event(
+            "agu-ready uid=" + std::to_string(entry.transfer_uid) +
+            " warp=" + std::to_string(entry.cmd.warp_id) +
+            " requests_total=" + std::to_string(entry.cmd.requests_total) +
+            " enqueued_cycle=" + std::to_string(entry.cycle_enqueued) +
+            " cycle=" + std::to_string(current_cycle));
         break;
       case TMATransferEntry::State::AGU_READY:
         // CONTROL transfers (UTMACCTL / UTMACMDFLUSH) carry no data movement.
@@ -642,6 +648,20 @@ void tma_unit_sm::mover_issue_requests(TMATransferEntry &entry,
       // write side of the interconnect.
       if (m_icnt->full(SECTOR_SIZE, /*write=*/this_mf_is_write)) {
         icnt_blocked = true;
+        // Interconnect back-pressure: the transfer cannot drain its sector mfs
+        // and will resume next cycle. This is a TMA-side stall source (feeds the
+        // long_scoreboard axis); log once per transfer to keep it observable
+        // without flooding the trace on a sustained stall.
+        if (!entry.logged_backpressure) {
+          entry.logged_backpressure = true;
+          m_sm->debug_log_tma_event(
+              "icnt-backpressure uid=" + std::to_string(entry.transfer_uid) +
+              " warp=" + std::to_string(entry.cmd.warp_id) +
+              " write=" + std::to_string(this_mf_is_write ? 1 : 0) +
+              " requests_issued=" + std::to_string(entry.requests_issued) +
+              " sector_goal=" + std::to_string(kSectorMfGoal) +
+              " cycle=" + std::to_string(current_cycle));
+        }
         break;
       }
 
@@ -744,6 +764,18 @@ void tma_unit_sm::mover_on_response(TMATransferEntry &entry, mem_fetch *mf,
         " bytes=" + std::to_string(entry.cmd.total_bytes) +
         " requests=" + std::to_string(entry.requests_completed) +
         " sector_goal=" + std::to_string(sector_mf_goal) +
+        // Per-transfer latency breakdown (cycles). This is the primary signal
+        // for the HW-vs-sim cycle gap: it splits the modeled transfer latency
+        // into queueing / issue-serialization / memory-roundtrip so the
+        // dominant over-estimated stage is identifiable per transfer.
+        //   lat_total = enqueue -> complete
+        //   lat_queue = enqueue -> agu_ready   (descriptor/AGU wait)
+        //   lat_issue = agu_ready -> first_req  (request-issue serialization)
+        //   lat_mem   = first_req -> complete   (interconnect+L2+DRAM roundtrip)
+        " lat_total=" + std::to_string(current_cycle - entry.cycle_enqueued) +
+        " lat_queue=" + std::to_string(entry.cycle_agu_ready - entry.cycle_enqueued) +
+        " lat_issue=" + std::to_string(entry.cycle_first_request - entry.cycle_agu_ready) +
+        " lat_mem=" + std::to_string(current_cycle - entry.cycle_first_request) +
         " cycle=" + std::to_string(current_cycle));
     // Only real GMEM->SMEM loads (UTMALDG/UBLKCP) credit the Hopper mbarrier
     // transaction-count (complete_tx). Prefetch (UTMAPF/UBLKPF) also has
@@ -754,6 +786,16 @@ void tma_unit_sm::mover_on_response(TMATransferEntry &entry, mem_fetch *mf,
     // mechanism, modeled separately by the UTMACMDFLUSH warp-stall.
     if (entry.cmd.transfer_type == TMATransferType::LOAD) {
       m_sm->notify_tma_completion(entry.cmd.warp_id, entry.cmd.total_bytes);
+      // Symmetric with the prefetch branch's "mbarrier_credited=0": make the
+      // producer->consumer handshake observable. A real load credits the
+      // consumer mbarrier's transaction-count (complete_tx) with total_bytes,
+      // which is what releases a warp stalled in wait_barrier (the TMA axis).
+      m_sm->debug_log_tma_event(
+          "load-mbarrier-credit uid=" + std::to_string(entry.transfer_uid) +
+          " warp=" + std::to_string(entry.cmd.warp_id) +
+          " bytes=" + std::to_string(entry.cmd.total_bytes) +
+          " mbarrier_credited=1"
+          " cycle=" + std::to_string(current_cycle));
     } else if (entry.cmd.transfer_type == TMATransferType::PREFETCH) {
       // Fire-and-forget prefetch: data has landed in L2/SMEM-staging but there
       // is no consumer barrier to signal. Just log and retire silently.

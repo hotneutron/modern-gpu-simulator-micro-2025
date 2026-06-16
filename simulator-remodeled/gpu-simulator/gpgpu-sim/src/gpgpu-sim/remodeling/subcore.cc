@@ -389,13 +389,22 @@ void Subcore::issue(SM *shared_sm) {
   bool is_any_invalid_head_waiting_frontend_hit_status = false;
   bool is_any_invalid_head_ibuffer_empty = false;
   bool is_any_invalid_head_unknown = false;
-  // bool has_been_possible_to_switch_warp = false;
-  // bool is_any_waiting_in_inst_barrier = false;
-  // bool is_any_waiting_in_stall_count = false;
-  // bool is_any_waiting_in_wait_barrier = false;
-  // bool is_any_waiting_in_yield = false;
-  // bool is_any_waiting_in_fu_occupied = false;
-  // bool is_any_waiting_l1c = false;
+  // Per-reason "no_warps_ready" stall attribution. Each flag becomes true if, in
+  // this cycle, at least one warp with a valid head instruction was blocked for
+  // that reason. Reasons are grouped so they can be compared against NCU's
+  // smsp__average_warps_issue_stalled_<reason> decomposition:
+  //   TMA axis     : wait_barrier (mbarrier) + tma_flush + inst_barrier(ldgdepbar/named)
+  //   non-TMA axis : fu_occupied (gmma/math pipe) + stall_count (wait) + l1c (short scoreboard)
+  //                  + scoreboard (traditional RAW/WAR) + yield
+  bool is_any_waiting_in_inst_barrier = false;   // named barrier / ldgdepbar (TMA)
+  bool is_any_waiting_in_stall_count = false;    // fixed-latency dep -> NCU "wait" (non-TMA)
+  bool is_any_waiting_in_wait_barrier = false;   // mbarrier -> NCU "barrier/long_scoreboard" (TMA)
+  bool is_any_waiting_in_tma_flush = false;      // cp.async.bulk.wait_group drain (TMA)
+  bool is_any_waiting_in_yield = false;          // YIELD control bit (non-TMA)
+  bool is_any_waiting_in_fu_occupied = false;    // FU busy -> NCU "gmma/math_pipe_throttle" (non-TMA)
+  bool is_any_waiting_in_scoreboard = false;     // traditional scoreboard collision (non-TMA)
+  bool is_any_waiting_in_result_queue_full = false; // RF result-queue full (non-TMA)
+  bool is_any_waiting_l1c = false;               // const cache -> NCU "short_scoreboard" (non-TMA)
 
   modify_warp_state();
   if(m_num_pending_cycles_with_issue_port_busy > 0) {
@@ -576,33 +585,39 @@ void Subcore::issue(SM *shared_sm) {
           break;
         }else {
           if(!are_switch_warp_conditions_ready) {
-            // has_been_possible_to_switch_warp = true;
-            // if(!is_fu_available) {
-            //   is_any_waiting_in_fu_occupied = true;
-            // }
-            // if(!is_not_warp_waiting_in_programmer_barrier || !is_not_warp_waiting_ldgdepbar) {
-            //   is_any_waiting_in_inst_barrier = true;
-            // }
-            // if(!is_not_yield) {
-            //   is_any_waiting_in_yield = true;
-            // }
-            // if(!is_stall_counter_0) {
-            //   is_any_waiting_in_stall_count = true;
-            // }
-            // if(!are_wait_barriers_ready) {
-            //   is_any_waiting_in_wait_barrier = true;
-            // }
-            // if(!is_l1c_ready) {
-            //   is_any_waiting_l1c = true;
-            // }
+            if(!is_fu_available) {
+              is_any_waiting_in_fu_occupied = true;
+            }
+            if(!is_not_warp_waiting_in_programmer_barrier || !is_not_warp_waiting_ldgdepbar) {
+              is_any_waiting_in_inst_barrier = true;
+            }
+            if(!is_not_warp_waiting_tma_flush) {
+              is_any_waiting_in_tma_flush = true;
+            }
+            if(!is_not_yield) {
+              is_any_waiting_in_yield = true;
+            }
+            if(!is_stall_counter_0) {
+              is_any_waiting_in_stall_count = true;
+            }
+            if(!are_wait_barriers_ready) {
+              is_any_waiting_in_wait_barrier = true;
+            }
+            if(!are_traditional_scoreaboards_ready) {
+              is_any_waiting_in_scoreboard = true;
+            }
+            if(!is_write_available_result_queue_for_fixed_latency_available) {
+              is_any_waiting_in_result_queue_full = true;
+            }
+            if(!is_l1c_ready) {
+              is_any_waiting_l1c = true;
+            }
           }else {
             if(!is_the_greedy_warp || (can_l1c_switch_warp)) {
-              // has_been_possible_to_switch_warp = true;
-              // if(!is_l1c_ready) {
-              //   is_any_waiting_l1c = true;
-              // }
+              if(!is_l1c_ready) {
+                is_any_waiting_l1c = true;
+              }
             }else {
-              // has_been_possible_to_switch_warp = false;
               break;
             }
           }
@@ -638,12 +653,19 @@ void Subcore::issue(SM *shared_sm) {
     shared_sm->m_sm_stats.m_stats_map["total_num_cycles_issue_stage_stall_no_valid_instruction_unknown"]->increment_with_integer(is_any_invalid_head_unknown);
   }else { // It has been possible to switch to another warp, but none where ready to issue
     shared_sm->m_sm_stats.m_stats_map["total_num_cycles_issue_stage_stall_no_warps_ready"]->increment_with_integer(1);
-    // m_stats->total_num_cycles_issue_stage_stall_at_least_one_warp_with_fu_occupied += is_any_waiting_in_fu_occupied;
-    // m_stats->total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_inst_barrier += is_any_waiting_in_inst_barrier;
-    // m_stats->total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_yield += is_any_waiting_in_yield;
-    // m_stats->total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_stall_count += is_any_waiting_in_stall_count;
-    // m_stats->total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_wait_barrier += is_any_waiting_in_wait_barrier;
-    // m_stats->total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_l1c += is_any_waiting_l1c;
+    // Per-reason attribution of the no_warps_ready stall (at least one warp
+    // blocked for the given reason this cycle). Reasons are not mutually
+    // exclusive across warps, so the sub-counters can sum to more than
+    // no_warps_ready; compare relative shape against NCU stall decomposition.
+    shared_sm->m_sm_stats.m_stats_map["total_num_cycles_issue_stage_stall_at_least_one_warp_with_fu_occupied"]->increment_with_integer(is_any_waiting_in_fu_occupied);
+    shared_sm->m_sm_stats.m_stats_map["total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_inst_barrier"]->increment_with_integer(is_any_waiting_in_inst_barrier);
+    shared_sm->m_sm_stats.m_stats_map["total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_tma_flush"]->increment_with_integer(is_any_waiting_in_tma_flush);
+    shared_sm->m_sm_stats.m_stats_map["total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_yield"]->increment_with_integer(is_any_waiting_in_yield);
+    shared_sm->m_sm_stats.m_stats_map["total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_stall_count"]->increment_with_integer(is_any_waiting_in_stall_count);
+    shared_sm->m_sm_stats.m_stats_map["total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_wait_barrier"]->increment_with_integer(is_any_waiting_in_wait_barrier);
+    shared_sm->m_sm_stats.m_stats_map["total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_scoreboard"]->increment_with_integer(is_any_waiting_in_scoreboard);
+    shared_sm->m_sm_stats.m_stats_map["total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_result_queue_full"]->increment_with_integer(is_any_waiting_in_result_queue_full);
+    shared_sm->m_sm_stats.m_stats_map["total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_l1c"]->increment_with_integer(is_any_waiting_l1c);
   }
   shared_sm->m_sm_stats.m_stats_map["total_num_cycles_issue_stage_evaluated"]->increment_with_integer(1);
 

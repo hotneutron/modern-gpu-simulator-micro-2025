@@ -285,4 +285,7 @@ struct TMATransferEntry {
   // transfer are each logged exactly once (so RMW issue is observable).
   bool logged_first_write = false;
   bool logged_first_read = false;
+  // Debug-only: log interconnect back-pressure (icnt full) at most once per
+  // transfer, so a recurring stall is observable without flooding the trace.
+  bool logged_backpressure = false;
 };

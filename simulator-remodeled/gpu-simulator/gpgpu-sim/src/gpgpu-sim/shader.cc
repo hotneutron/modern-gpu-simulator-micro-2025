@@ -1318,6 +1318,16 @@ void shader_core_stats::print_remodeling_stats(FILE *fout) {
   unsigned long long total_num_ibuffer_entries_decoded_with_response_ready_cycle = m_gpu-> m_gpu_per_sm_stats.m_stats_map["total_num_ibuffer_entries_decoded_with_response_ready_cycle"]->get_value();
   unsigned long long total_num_cycles_ibuffer_entry_response_ready_to_decode = m_gpu-> m_gpu_per_sm_stats.m_stats_map["total_num_cycles_ibuffer_entry_response_ready_to_decode"]->get_value();
   unsigned long long total_num_cycles_issue_stage_stall_no_warps_ready = m_gpu-> m_gpu_per_sm_stats.m_stats_map["total_num_cycles_issue_stage_stall_no_warps_ready"]->get_value();
+  // Per-reason no_warps_ready breakdown (for NCU warp-issue stall comparison).
+  unsigned long long total_num_cycles_issue_stage_stall_at_least_one_warp_with_fu_occupied = m_gpu-> m_gpu_per_sm_stats.m_stats_map["total_num_cycles_issue_stage_stall_at_least_one_warp_with_fu_occupied"]->get_value();
+  unsigned long long total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_inst_barrier = m_gpu-> m_gpu_per_sm_stats.m_stats_map["total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_inst_barrier"]->get_value();
+  unsigned long long total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_tma_flush = m_gpu-> m_gpu_per_sm_stats.m_stats_map["total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_tma_flush"]->get_value();
+  unsigned long long total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_yield = m_gpu-> m_gpu_per_sm_stats.m_stats_map["total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_yield"]->get_value();
+  unsigned long long total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_stall_count = m_gpu-> m_gpu_per_sm_stats.m_stats_map["total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_stall_count"]->get_value();
+  unsigned long long total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_wait_barrier = m_gpu-> m_gpu_per_sm_stats.m_stats_map["total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_wait_barrier"]->get_value();
+  unsigned long long total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_scoreboard = m_gpu-> m_gpu_per_sm_stats.m_stats_map["total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_scoreboard"]->get_value();
+  unsigned long long total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_result_queue_full = m_gpu-> m_gpu_per_sm_stats.m_stats_map["total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_result_queue_full"]->get_value();
+  unsigned long long total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_l1c = m_gpu-> m_gpu_per_sm_stats.m_stats_map["total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_l1c"]->get_value();
   unsigned long long total_num_cycles_issue_stage_stall_next_stage_not_available = m_gpu-> m_gpu_per_sm_stats.m_stats_map["total_num_cycles_issue_stage_stall_next_stage_not_available"]->get_value();
   total_num_cycles_issue_stage_evaluated = m_gpu-> m_gpu_per_sm_stats.m_stats_map["total_num_cycles_issue_stage_evaluated"]->get_value();
   fprintf(fout, "total_num_cycles_issue_stage_evaluated = %llu\n", total_num_cycles_issue_stage_evaluated);
@@ -1422,6 +1432,40 @@ void shader_core_stats::print_remodeling_stats(FILE *fout) {
   fprintf(fout, "total_num_ibuffer_entries_decoded_with_response_ready_cycle = %llu\n", total_num_ibuffer_entries_decoded_with_response_ready_cycle);
   fprintf(fout, "total_num_cycles_ibuffer_entry_response_ready_to_decode = %llu\n", total_num_cycles_ibuffer_entry_response_ready_to_decode);
   fprintf(fout, "total_num_cycles_issue_stage_stall_no_warps_ready = %llu\n", total_num_cycles_issue_stage_stall_no_warps_ready);
+  // --- no_warps_ready per-reason breakdown (counts) ; grouped TMA vs non-TMA ---
+  fprintf(fout, "total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_wait_barrier = %llu\n", total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_wait_barrier);
+  fprintf(fout, "total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_inst_barrier = %llu\n", total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_inst_barrier);
+  fprintf(fout, "total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_tma_flush = %llu\n", total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_tma_flush);
+  fprintf(fout, "total_num_cycles_issue_stage_stall_at_least_one_warp_with_fu_occupied = %llu\n", total_num_cycles_issue_stage_stall_at_least_one_warp_with_fu_occupied);
+  fprintf(fout, "total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_stall_count = %llu\n", total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_stall_count);
+  fprintf(fout, "total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_l1c = %llu\n", total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_l1c);
+  fprintf(fout, "total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_scoreboard = %llu\n", total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_scoreboard);
+  fprintf(fout, "total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_result_queue_full = %llu\n", total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_result_queue_full);
+  fprintf(fout, "total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_yield = %llu\n", total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_yield);
+  // --- TMA vs non-TMA grouped percentages (of evaluated issue cycles) ---
+  {
+    long double denom = total_num_cycles_issue_stage_evaluated ? (long double) total_num_cycles_issue_stage_evaluated : 1;
+    unsigned long long tma_axis = total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_wait_barrier
+                                + total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_inst_barrier
+                                + total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_tma_flush;
+    unsigned long long non_tma_axis = total_num_cycles_issue_stage_stall_at_least_one_warp_with_fu_occupied
+                                + total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_stall_count
+                                + total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_l1c
+                                + total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_scoreboard
+                                + total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_result_queue_full
+                                + total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_yield;
+    fprintf(fout, "total_percentage_cycles_issue_stage_stall_tma_axis = %.4Lf\n", ((long double) tma_axis / denom) * 100);
+    fprintf(fout, "total_percentage_cycles_issue_stage_stall_non_tma_axis = %.4Lf\n", ((long double) non_tma_axis / denom) * 100);
+    fprintf(fout, "total_percentage_cycles_issue_stage_stall_at_least_one_warp_waiting_wait_barrier = %.4Lf\n", ((long double) total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_wait_barrier / denom) * 100);
+    fprintf(fout, "total_percentage_cycles_issue_stage_stall_at_least_one_warp_waiting_inst_barrier = %.4Lf\n", ((long double) total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_inst_barrier / denom) * 100);
+    fprintf(fout, "total_percentage_cycles_issue_stage_stall_at_least_one_warp_waiting_tma_flush = %.4Lf\n", ((long double) total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_tma_flush / denom) * 100);
+    fprintf(fout, "total_percentage_cycles_issue_stage_stall_at_least_one_warp_with_fu_occupied = %.4Lf\n", ((long double) total_num_cycles_issue_stage_stall_at_least_one_warp_with_fu_occupied / denom) * 100);
+    fprintf(fout, "total_percentage_cycles_issue_stage_stall_at_least_one_warp_waiting_stall_count = %.4Lf\n", ((long double) total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_stall_count / denom) * 100);
+    fprintf(fout, "total_percentage_cycles_issue_stage_stall_at_least_one_warp_waiting_l1c = %.4Lf\n", ((long double) total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_l1c / denom) * 100);
+    fprintf(fout, "total_percentage_cycles_issue_stage_stall_at_least_one_warp_waiting_scoreboard = %.4Lf\n", ((long double) total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_scoreboard / denom) * 100);
+    fprintf(fout, "total_percentage_cycles_issue_stage_stall_at_least_one_warp_waiting_result_queue_full = %.4Lf\n", ((long double) total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_result_queue_full / denom) * 100);
+    fprintf(fout, "total_percentage_cycles_issue_stage_stall_at_least_one_warp_waiting_yield = %.4Lf\n", ((long double) total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_yield / denom) * 100);
+  }
   long double total_percentage_cycles_issue_stage_issuing = total_num_cycles_issue_stage_evaluated ? (((long double) total_num_cycles_issue_stage_issuing / total_num_cycles_issue_stage_evaluated) * 100) : 0;
   long double total_percentage_cycles_issue_stage_stall_next_stage_not_available = total_num_cycles_issue_stage_evaluated ? (((long double) total_num_cycles_issue_stage_stall_next_stage_not_available / total_num_cycles_issue_stage_evaluated) * 100) : 0;
   long double total_percentage_cycles_issue_stage_stall_issue_port_busy = total_num_cycles_issue_stage_evaluated ? (((long double) total_num_cycles_issue_stage_stall_issue_port_busy / total_num_cycles_issue_stage_evaluated) * 100) : 0;
@@ -3890,6 +3934,35 @@ void shader_core_config::set_pipeline_latency() {
   max_int_latency = std::max(max_int_latency, predicate_latency);
   max_dp_latency = dp_latency[1];
   max_tensor_core_latency = tensor_latency;
+
+  // One-time consolidated dump of every latency/initiation-interval knob that
+  // feeds the warp-issue stall axes. Printed once at init (no per-cycle cost),
+  // so a single (multi-hour) run captures all timing-model parameters needed to
+  // diagnose the HW-vs-sim cycle gap without ever re-running:
+  //   * Tensor/WGMMA  -> NCU "gmma" / math_pipe_throttle (non-TMA axis)
+  //   * shared/L1D/const -> NCU "short_scoreboard" / mio_throttle (non-TMA axis)
+  //   * RF / fixed-latency -> NCU "wait" (non-TMA axis)
+  //   * L2/DRAM/launch -> NCU "long_scoreboard" (TMA + global axis)
+  printf("[LATCFG] ===== timing-model latency dump (once) =====\n");
+  printf("[LATCFG] compute  sp_fp(add/min/mul/mad/div)=%u/%u/%u/%u/%u sfu=%u tensor=%u tensor_init=%d\n",
+         fp_latency[0], fp_latency[1], fp_latency[2], fp_latency[3], fp_latency[4],
+         sfu_latency, tensor_latency, tensor_initiation);
+  printf("[LATCFG] compute  int(add/min/mul/mad/div/shfl)=%u/%u/%u/%u/%u/%u dp_div=%u\n",
+         int_latency[0], int_latency[1], int_latency[2], int_latency[3], int_latency[4],
+         int_latency[5], dp_latency[4]);
+  printf("[LATCFG] tensor   tensor_latency_cfg=%d tensor_rate_per_cycle=%d extra_16816_fp32=%d branch=%d half=%d uniform=%d predicate=%u\n",
+         this->tensor_latency, tensor_rate_per_cycle, tensor_extra_latency_16816_fp32_1688_fp32,
+         branch_latency, half_latency, uniform_latency, predicate_latency);
+  printf("[LATCFG] memSM    shared_min=%u ldsm_extra=%u stsm_extra=%u l1d_min=%u ldgsts_global_shared=%u const_l1c=%u const_miss=%u\n",
+         memory_shared_memory_minimum_latency,
+         memory_shared_memory_extra_latency_ldsm_multiple_matrix,
+         memory_shared_memory_extra_latency_stsm_multiple_matrix,
+         memory_l1d_minimum_latency, memory_global_shared_latency_for_ldgsts,
+         constant_cache_latency_at_sm_structure,
+         constant_cache_miss_latency_at_subcore_to_access_upper_level);
+  printf("[LATCFG] regfile  rf_fixed_latency=%u\n", max_latency_regular_register_file_latency);
+  printf("[LATCFG] (L2/DRAM/kernel-launch latencies are in gpgpusim.config: -gpgpu_l2_rop_latency / -dram_latency / -gpgpu_kernel_launch_latency)\n");
+  printf("[LATCFG] =============================================\n");
 }
 
 void shader_core_ctx::cycle() {
