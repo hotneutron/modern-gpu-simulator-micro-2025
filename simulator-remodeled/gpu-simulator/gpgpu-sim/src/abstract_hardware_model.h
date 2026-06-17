@@ -1217,6 +1217,7 @@ class inst_t {
   op_type op;       // opcode (uarch visible)
   TMAOpcodeFamily tma_opcode_family = TMAOpcodeFamily::UNKNOWN;
   uint32_t tma_handle_hi = 0;
+  bool tma_is_multicast = false;
   bool sync_site_valid = false;
   SyncInstructionKind sync_kind = SyncInstructionKind::NONE;
   SyncSemanticOperandRole sync_semantic_operand_role =

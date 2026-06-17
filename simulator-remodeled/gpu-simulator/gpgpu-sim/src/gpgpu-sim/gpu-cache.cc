@@ -1145,6 +1145,20 @@ bool baseline_cache::fill(mem_fetch *mf, unsigned time) { // MOD. Added L0I
   }
 
   extra_mf_fields_lookup::iterator e = m_extra_mf_fields.find(mf);
+  if (e == m_extra_mf_fields.end()) {
+    // TMADBG diagnostic: dump the offending mf so we can see why a TMA (or any)
+    // request reached fill() without being registered in m_extra_mf_fields.
+    fprintf(stderr,
+            "[TMADBG][CACHE-FILL-MISS] cache=%s is_tma=%d mshr_type=%d "
+            "addr=%llu data_size=%u access_type=%d is_write=%d "
+            "sector_mask_count=%zu original_mf=%p type=%d\n",
+            m_name.c_str(), mf->is_tma() ? 1 : 0, (int)m_config.m_mshr_type,
+            (unsigned long long)mf->get_addr(), mf->get_data_size(),
+            (int)mf->get_access_type(), mf->get_is_write() ? 1 : 0,
+            mf->get_access_sector_mask().count(), (void *)mf->get_original_mf(),
+            (int)mf->get_type());
+    fflush(stderr);
+  }
   assert(e != m_extra_mf_fields.end());
   assert(e->second.m_valid);
   mf->set_data_size(e->second.m_data_size);

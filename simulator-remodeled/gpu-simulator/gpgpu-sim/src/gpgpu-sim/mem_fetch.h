@@ -148,6 +148,12 @@ class mem_fetch {
 
   void set_is_prefetch(bool is_prefetch) { m_is_prefetch = is_prefetch; }
 
+  // TMA-issued bulk request: bypasses L1 and is routed back to the TMA unit
+  // (not the ldst unit) on response.
+  bool is_tma() const { return m_is_tma; }
+
+  void set_is_tma(bool is_tma) { m_is_tma = is_tma; }
+
   bool get_is_instruction_region_prewarm() {
     return m_is_instruction_region_prewarm;
   }
@@ -185,6 +191,7 @@ class mem_fetch {
   int m_subcore; // MOD. Added L0I
   bool m_is_filling_L0; // MOD. Added L0I
   bool m_is_prefetch;
+  bool m_is_tma = false;
   bool m_is_instruction_region_prewarm;
   unsigned int m_stream_buffer_id;
   unsigned int m_prefetch_l1i_fate;

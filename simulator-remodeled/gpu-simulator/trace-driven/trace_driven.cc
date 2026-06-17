@@ -322,6 +322,11 @@ bool trace_warp_inst_t::parse_from_trace_struct(
         case OP_UTMACMDFLUSH: tma_opcode_family = TMAOpcodeFamily::UTMACMDFLUSH; break;
         default:              tma_opcode_family = TMAOpcodeFamily::UNKNOWN;      break;
       }
+      // The full opcode text (e.g. "UTMALDG.MULTICAST.4D") carries variant
+      // suffixes; only opcode1 is mapped above. Detect MULTICAST here so the
+      // TMA unit can refuse it (ctaMask is not modeled).
+      tma_is_multicast =
+          trace.opcode.find(".MULTICAST") != std::string::npos;
     }
     const std::unordered_map<unsigned, unsigned> *OpcPowerMap = &OpcodePowerMap;
     std::unordered_map<unsigned, unsigned>::const_iterator it2 =

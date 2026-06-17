@@ -176,7 +176,11 @@ bool is_validated_arrive_opcode(const std::string &opcode) {
 
 void debug_print_sm_barrier_issue(const warp_inst_t &inst,
                                   unsigned int warp_id,
-                                  unsigned int sm_id) {
+                                  unsigned int sm_id,
+                                  bool enable) {
+  if (!enable) {
+    return;
+  }
   static int budget = 64;
   if (budget <= 0) {
     return;
@@ -352,6 +356,26 @@ void SM::debug_log_sync_event(const std::string &message) {
     return;
   }
   std::cerr << "[SYNCDBG][SM" << m_sm_id << "] " << message << std::endl;
+  --m_sync_debug_print_budget;
+}
+
+// TMA per-event log. Two independent sinks:
+//  1) [TMADBG] on stderr, gated by -sync_debug_enable (shares the SYNC budget).
+//  2) The GPGPU-Sim trace system (-trace_enabled 1 -trace_components TMA),
+//     which prints on stdout in the standard "GPGPU-Sim Cycle N: TMA - ..."
+//     format and honors -trace_sampling_core. The TMA unit is a newly added
+//     architecture component, so its activity is exposed as a first-class
+//     trace stream alongside WARP_SCHEDULER / SCOREBOARD / INTERCONNECT.
+void SM::debug_log_tma_event(const std::string &message) {
+  if (DTRACE(TMA) &&
+      (Trace::sampling_core == m_sm_id ||
+       Trace::sampling_core == (unsigned int)-1)) {
+    DPRINTF(TMA, "SM %u - %s\n", m_sm_id, message.c_str());
+  }
+  if (m_sync_debug_print_budget == 0) {
+    return;
+  }
+  std::cerr << "[TMADBG][SM" << m_sm_id << "] " << message << std::endl;
   --m_sync_debug_print_budget;
 }
 
@@ -580,7 +604,8 @@ void SM::issue_warp(register_set_uniptr &pipe_reg_set, warp_inst_t *next_inst,
   if (pipe_reg->op == MBARRIER_OP) {
     handle_sync_instruction(*pipe_reg, warp_id);
   } else if (pipe_reg->op == BARRIER_OP) {
-    debug_print_sm_barrier_issue(*pipe_reg, warp_id, m_sm_id);
+    debug_print_sm_barrier_issue(*pipe_reg, warp_id, m_sm_id,
+                                 m_config->sync_debug_enable);
     m_physical_warp[warp_id]->store_info_of_last_inst_at_barrier(pipe_reg.get());
     m_barriers.warp_reaches_barrier(m_physical_warp[warp_id]->get_cta_id(),
                                     warp_id, pipe_reg.get());
@@ -593,7 +618,8 @@ void SM::issue_warp(register_set_uniptr &pipe_reg_set, warp_inst_t *next_inst,
       }
       m_physical_warp[warp_id]->set_membar();
       if (!is_lightweight_fence_memory_barrier(*pipe_reg)) {
-        debug_print_sm_barrier_issue(*pipe_reg, warp_id, m_sm_id);
+        debug_print_sm_barrier_issue(*pipe_reg, warp_id, m_sm_id,
+                                     m_config->sync_debug_enable);
         m_physical_warp[warp_id]->store_info_of_last_inst_at_barrier(
             pipe_reg.get());
         m_barriers.warp_reaches_barrier(m_physical_warp[warp_id]->get_cta_id(),
@@ -1047,7 +1073,8 @@ void SM::create_memory_interfaces() {
       m_sm_id, m_tpc_id, m_config->memory_sm_prt_size);
   m_tma_unit_shared_of_sm =
       new tma_unit_sm(m_EX_WB_sm_shared_units_subcore_latches,
-                      m_EX_TMA_reception_latches_per_subcore, m_config, this);
+                      m_EX_TMA_reception_latches_per_subcore, m_config, this,
+                      m_icnt, m_mem_fetch_allocator.get());
   static_cast<L0_icnt *>(m_icnt_L0s)
         ->add_L0(static_cast<read_only_cache *>(m_ldst_unit_shared_of_sm->get_L1C()));
 }
@@ -1334,6 +1361,13 @@ void SM::accept_fetch_response(mem_fetch *mf) {
 }
 
 void SM::accept_ldst_unit_response(mem_fetch *mf) {
+  // TMA bulk responses are owned by the TMA unit, not the ldst unit. This is
+  // the only behavioral change to the response path; ordinary LD/ST responses
+  // continue to flow to the ldst unit unchanged.
+  if (mf != nullptr && mf->is_tma()) {
+    m_tma_unit_shared_of_sm->fill(mf);
+    return;
+  }
   m_ldst_unit_shared_of_sm->fill(mf);
 }
 
@@ -1767,6 +1801,33 @@ bool SM::warp_waiting_at_mem_barrier(unsigned warp_id) {
 
 bool SM::warp_waiting_grid_barrier(unsigned warp_id) {
   return m_physical_warp[warp_id]->get_gridbar();
+}
+
+bool SM::warp_waiting_at_tma_flush(unsigned warp_id, const warp_inst_t *pI) {
+  if (pI == nullptr ||
+      pI->tma_opcode_family != TMAOpcodeFamily::UTMACMDFLUSH) {
+    return false;
+  }
+  bool waiting =
+      m_tma_unit_shared_of_sm->warp_has_outstanding_stores(warp_id);
+  bool was_waiting =
+      m_warps_waiting_tma_flush.find(warp_id) != m_warps_waiting_tma_flush.end();
+  if (waiting && !was_waiting) {
+    // Stall episode begins: log once on entry (not every cycle).
+    m_warps_waiting_tma_flush.insert(warp_id);
+    debug_log_tma_event("flush-wait-enter warp=" + std::to_string(warp_id) +
+                        " pc=" + format_hex_u64(pI->pc));
+  } else if (!waiting && was_waiting) {
+    // All store-class transfers drained: warp may now issue the flush.
+    m_warps_waiting_tma_flush.erase(warp_id);
+    debug_log_tma_event("flush-wait-release warp=" + std::to_string(warp_id) +
+                        " pc=" + format_hex_u64(pI->pc));
+  } else if (!waiting && !was_waiting) {
+    // Flush issued with no outstanding store-class transfers (pass-through).
+    debug_log_tma_event("flush-pass warp=" + std::to_string(warp_id) +
+                        " pc=" + format_hex_u64(pI->pc));
+  }
+  return waiting;
 }
 
 void SM::clear_gridbar(unsigned int kernel_id) {

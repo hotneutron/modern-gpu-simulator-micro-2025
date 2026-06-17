@@ -69,6 +69,10 @@ mem_fetch::mem_fetch(const mem_access_t &access, const warp_inst_t *inst,
   if (m_original_mf) {
     m_raw_addr.chip = m_original_mf->get_tlx_addr().chip;
     m_raw_addr.sub_partition = m_original_mf->get_tlx_addr().sub_partition;
+    // Inherit the TMA tag so that L2 sector-split children are still routed
+    // back to the TMA unit (not the ldst unit) on response. Ordinary requests
+    // keep m_is_tma=false because their parents are not TMA either.
+    m_is_tma = m_original_mf->is_tma();
   }
   m_subcore = -1; // MOD. Added L0I
   m_is_filling_L0 = false; // MOD. Added L0I

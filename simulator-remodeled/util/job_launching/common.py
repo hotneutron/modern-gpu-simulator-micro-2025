@@ -48,7 +48,7 @@ def get_argfoldername( args ):
         foldername = re.sub(r"[^a-z^A-Z^0-9]", "_", str(args).strip())
         # For every long arg lists - create a hash of the input args
         if len(str(args)) > 256:
-            foldername = "hashed_args_" + hashlib.md5(args).hexdigest()
+            foldername = "hashed_args_" + hashlib.md5(str(args).encode("utf-8")).hexdigest()
         return foldername
 
 # Test to see if the passed config adheres to any defined configs and add it to the configrations to run/collect.
