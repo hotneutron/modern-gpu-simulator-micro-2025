@@ -176,7 +176,11 @@ bool is_validated_arrive_opcode(const std::string &opcode) {
 
 void debug_print_sm_barrier_issue(const warp_inst_t &inst,
                                   unsigned int warp_id,
-                                  unsigned int sm_id) {
+                                  unsigned int sm_id,
+                                  bool enable) {
+  if (!enable) {
+    return;
+  }
   static int budget = 64;
   if (budget <= 0) {
     return;
@@ -600,7 +604,8 @@ void SM::issue_warp(register_set_uniptr &pipe_reg_set, warp_inst_t *next_inst,
   if (pipe_reg->op == MBARRIER_OP) {
     handle_sync_instruction(*pipe_reg, warp_id);
   } else if (pipe_reg->op == BARRIER_OP) {
-    debug_print_sm_barrier_issue(*pipe_reg, warp_id, m_sm_id);
+    debug_print_sm_barrier_issue(*pipe_reg, warp_id, m_sm_id,
+                                 m_config->sync_debug_enable);
     m_physical_warp[warp_id]->store_info_of_last_inst_at_barrier(pipe_reg.get());
     m_barriers.warp_reaches_barrier(m_physical_warp[warp_id]->get_cta_id(),
                                     warp_id, pipe_reg.get());
@@ -613,7 +618,8 @@ void SM::issue_warp(register_set_uniptr &pipe_reg_set, warp_inst_t *next_inst,
       }
       m_physical_warp[warp_id]->set_membar();
       if (!is_lightweight_fence_memory_barrier(*pipe_reg)) {
-        debug_print_sm_barrier_issue(*pipe_reg, warp_id, m_sm_id);
+        debug_print_sm_barrier_issue(*pipe_reg, warp_id, m_sm_id,
+                                     m_config->sync_debug_enable);
         m_physical_warp[warp_id]->store_info_of_last_inst_at_barrier(
             pipe_reg.get());
         m_barriers.warp_reaches_barrier(m_physical_warp[warp_id]->get_cta_id(),

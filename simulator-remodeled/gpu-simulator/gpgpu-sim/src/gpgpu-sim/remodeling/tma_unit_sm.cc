@@ -157,7 +157,11 @@ bool tma_family_requires_operand_metadata(TMAOpcodeFamily family) {
 }
 
 void log_tma_phase2_binding_once(const warp_inst_t &inst,
-                                 const TMACommand &cmd) {
+                                 const TMACommand &cmd,
+                                 bool enable) {
+  if (!enable) {
+    return;
+  }
   static std::set<std::tuple<unsigned int, uint64_t, uint32_t>> logged_sites;
   auto key = std::make_tuple(inst.unique_function_id, static_cast<uint64_t>(inst.pc),
                              inst.tma_handle_hi);
@@ -455,7 +459,7 @@ TMACommand tma_unit_sm::build_tma_command(const warp_inst_t &inst) const {
            "Phase 2 bulk UBLKCP/UBLKPF should derive requests_total from covered_bytes");
   }
   get_tma_phase2_binding_stats().record(inst, metadata);
-  log_tma_phase2_binding_once(inst, cmd);
+  log_tma_phase2_binding_once(inst, cmd, m_config->sync_debug_enable);
   return cmd;
 }
 

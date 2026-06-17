@@ -630,14 +630,16 @@ void gpgpu_sim::parse_extra_trace_info(std::string filepath, bool is_extra_trace
     load_tma_descriptor_resolver(extra_info_dir, m_tma_sidecar_db);
     load_tma_operand_resolver(extra_info_dir, m_tma_sidecar_db);
     load_sync_operand_resolver(extra_info_dir, m_sync_sidecar_db);
-    std::cerr << "[TMA][Phase2] loaded descriptor_configs="
-              << m_tma_sidecar_db.descriptor_configs.size()
-              << " descriptor_sites="
-              << m_tma_sidecar_db.descriptor_site_records.size()
-              << " operand_sites="
-              << m_tma_sidecar_db.operand_site_records.size() << std::endl;
-    std::cerr << "[SYNC] loaded operand_sites="
-              << m_sync_sidecar_db.site_records.size() << std::endl;
+    if (m_shader_config->sync_debug_enable) {
+      std::cerr << "[TMA][Phase2] loaded descriptor_configs="
+                << m_tma_sidecar_db.descriptor_configs.size()
+                << " descriptor_sites="
+                << m_tma_sidecar_db.descriptor_site_records.size()
+                << " operand_sites="
+                << m_tma_sidecar_db.operand_site_records.size() << std::endl;
+      std::cerr << "[SYNC] loaded operand_sites="
+                << m_sync_sidecar_db.site_records.size() << std::endl;
+    }
   }
 }
 // MOD. End. Improved tracer
