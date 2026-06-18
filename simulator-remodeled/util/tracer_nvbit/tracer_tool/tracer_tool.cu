@@ -204,6 +204,21 @@ struct sync_runtime_capture_site_info {
 };
 std::map<int, std::map<int, sync_runtime_capture_site_info>>
     sync_runtime_capture_sites_by_pc;
+// BAR.SYNC / BAR.ARV named-barrier register-operand capture. Mirrors the sync site map:
+// records, per (function_id, pc), which device callback_index carries the runtime value of
+// a register-form barrier id (operand 0) and/or count (operand 1). Immediate operands are
+// not captured here (the decoder reads them statically).
+struct bar_runtime_capture_site_info {
+  bar_runtime_capture_site_info()
+      : enabled(false),
+        id_callback_index(-1),
+        count_callback_index(-1) {}
+  bool enabled;
+  int id_callback_index;
+  int count_callback_index;
+};
+std::map<int, std::map<int, bar_runtime_capture_site_info>>
+    bar_runtime_capture_sites_by_pc;
 uint64_t tma_memcpy_dump_id = 0;
 uint64_t tensor_map_encode_dump_id = 0;
 struct tma_desc_producer_candidate_t {
@@ -368,6 +383,32 @@ static sync_runtime_capture_site_info build_sync_runtime_capture_site_info(
     } else {
       info.semantic_callback_index = callback_index;
     }
+  }
+  return info;
+}
+
+static bar_runtime_capture_site_info build_bar_runtime_capture_site_info(
+    const std::string &opcode, int operand_position, int callback_index,
+    InstrType::OperandType operand_type) {
+  bar_runtime_capture_site_info info;
+  // Only BAR.SYNC / BAR.ARV named barriers. (MEMBAR/CGAERRBAR are not BAR.*)
+  if (opcode.rfind("BAR.", 0) != 0 && opcode != "BAR") {
+    return info;
+  }
+  // operand 0 = barrier id, operand 1 = count. Capture only when register-form; the
+  // decoder reads immediate operands statically. A register-form operand emits a
+  // device-side reg-value callback, so its runtime value is recoverable at callback_index.
+  bool is_reg = (operand_type == InstrType::OperandType::REG ||
+                 operand_type == InstrType::OperandType::UREG);
+  if (!is_reg) {
+    return info;
+  }
+  if (operand_position == 0) {
+    info.enabled = true;
+    info.id_callback_index = callback_index;
+  } else if (operand_position == 1) {
+    info.enabled = true;
+    info.count_callback_index = callback_index;
   }
   return info;
 }
@@ -1525,6 +1566,7 @@ void instrument_function_if_needed(CUcontext ctx, CUfunction func, int device_id
       uint32_t num_of_injects = 0;
       std::string opcode_str = instr->getOpcode() ? std::string(instr->getOpcode()) : "";
       sync_runtime_capture_site_info sync_site_info;
+      bar_runtime_capture_site_info bar_site_info;
 
       if(inst_parsed->is_tensor_core_op()) {
         inst_parsed->set_tensor_core_instruction_info();
@@ -1547,6 +1589,19 @@ void instrument_function_if_needed(CUcontext ctx, CUfunction func, int device_id
           }
           if (sync_operand_info.semantic_is_zero_literal) {
             sync_site_info.semantic_is_zero_literal = true;
+          }
+        }
+        bar_runtime_capture_site_info bar_operand_info =
+            build_bar_runtime_capture_site_info(opcode_str, i, num_of_injects,
+                                                op->type);
+        if (bar_operand_info.enabled) {
+          bar_site_info.enabled = true;
+          if (bar_operand_info.id_callback_index >= 0) {
+            bar_site_info.id_callback_index = bar_operand_info.id_callback_index;
+          }
+          if (bar_operand_info.count_callback_index >= 0) {
+            bar_site_info.count_callback_index =
+                bar_operand_info.count_callback_index;
           }
         }
         if(is_tma_desc_consumer_instruction && operand_str.find("desc[UR") != std::string::npos) {
@@ -1617,6 +1672,10 @@ void instrument_function_if_needed(CUcontext ctx, CUfunction func, int device_id
       if (sync_site_info.enabled) {
         sync_runtime_capture_sites_by_pc[next_candidate_unique_function_id][vpc] =
             sync_site_info;
+      }
+      if (bar_site_info.enabled) {
+        bar_runtime_capture_sites_by_pc[next_candidate_unique_function_id][vpc] =
+            bar_site_info;
       }
 
       if(num_of_injects == 0) {
@@ -2325,6 +2384,40 @@ void *recv_thread_fun(void *args) {
                 sync->set_valid(true);
                 sync->set_has_semantic_raw(true);
                 sync->set_semantic_raw(ma->addrs_or_reg_val_0[first_lane]);
+              }
+            }
+          }
+        }
+        auto bar_function_it =
+            bar_runtime_capture_sites_by_pc.find(ma->unique_function_id);
+        if (bar_function_it != bar_runtime_capture_sites_by_pc.end()) {
+          auto bar_pc_it = bar_function_it->second.find(ma->vpc);
+          if (bar_pc_it != bar_function_it->second.end()) {
+            const bar_runtime_capture_site_info &bar_site = bar_pc_it->second;
+            // Register-form barrier operands take the REGULAR callback path, where the
+            // live register value lands in addrs_or_reg_val_0[lane] with mem_type==NONE.
+            // Pick the first predicated-active lane: if the warp did not actually execute
+            // this BAR (no active+predicated lane), nothing is captured for this instance.
+            int first_lane =
+                get_first_predicated_lane(ma->active_mask, ma->predicate_mask);
+            if (first_lane >= 0 && ma->mem_type == MEM_TYPE::NONE) {
+              if (bar_site.id_callback_index >= 0 &&
+                  callback_index ==
+                      static_cast<unsigned int>(bar_site.id_callback_index)) {
+                dynamic_trace::instruction::bar_runtime_info *bar =
+                    inst->mutable_bar_runtime();
+                bar->set_valid(true);
+                bar->set_has_id(true);
+                bar->set_id(static_cast<uint32_t>(ma->addrs_or_reg_val_0[first_lane]));
+              } else if (bar_site.count_callback_index >= 0 &&
+                         callback_index ==
+                             static_cast<unsigned int>(
+                                 bar_site.count_callback_index)) {
+                dynamic_trace::instruction::bar_runtime_info *bar =
+                    inst->mutable_bar_runtime();
+                bar->set_valid(true);
+                bar->set_has_count(true);
+                bar->set_count(static_cast<uint32_t>(ma->addrs_or_reg_val_0[first_lane]));
               }
             }
           }

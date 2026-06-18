@@ -177,26 +177,33 @@ bool is_validated_arrive_opcode(const std::string &opcode) {
 void debug_print_sm_barrier_issue(const warp_inst_t &inst,
                                   unsigned int warp_id,
                                   unsigned int sm_id,
-                                  bool enable) {
+                                  bool enable,
+                                  unsigned int issue_budget) {
   if (!enable) {
     return;
   }
-  static int budget = 64;
-  if (budget <= 0) {
+  static unsigned int budget_left = 0;
+  static bool budget_init = false;
+  if (!budget_init) {
+    budget_left = issue_budget;
+    budget_init = true;
+  }
+  if (budget_left == 0) {
     return;
   }
   const std::string trace_opcode =
       inst.has_extra_trace_instruction_info()
           ? inst.get_extra_trace_instruction_info().get_op_code()
           : "<no-trace-opcode>";
-  std::cerr << "[SMDBG][barrier-issue] sm=" << sm_id
+  std::cerr << "[BARDBG][issue] sm=" << sm_id
             << " warp=" << warp_id
             << " pc=0x" << format_hex_u64(inst.pc)
             << " op=" << static_cast<int>(inst.op)
             << " trace_opcode=" << trace_opcode
+            << " bar_type=" << static_cast<int>(inst.bar_type)
             << " bar_id=" << inst.bar_id
-            << " bar_count=" << inst.bar_count << std::endl;
-  --budget;
+            << " bar_count=" << static_cast<int>(inst.bar_count) << std::endl;
+  --budget_left;
 }
 
 }  // namespace
@@ -609,8 +616,14 @@ void SM::issue_warp(register_set_uniptr &pipe_reg_set, warp_inst_t *next_inst,
     handle_sync_instruction(*pipe_reg, warp_id);
   } else if (pipe_reg->op == BARRIER_OP) {
     debug_print_sm_barrier_issue(*pipe_reg, warp_id, m_sm_id,
-                                 m_config->sync_debug_enable);
-    m_physical_warp[warp_id]->store_info_of_last_inst_at_barrier(pipe_reg.get());
+                                 m_config->bar_debug_enable,
+                                 m_config->bar_debug_issue_budget);
+    // B2: an ARRIVE (BAR.ARV) only signals arrival and keeps issuing; it must not be
+    // recorded as "last inst at barrier" (that bookkeeping is for blocking SYNC/RED warps).
+    // Still call warp_reaches_barrier so the arrival is registered on the id.
+    if (pipe_reg->bar_type != ARRIVE) {
+      m_physical_warp[warp_id]->store_info_of_last_inst_at_barrier(pipe_reg.get());
+    }
     m_barriers.warp_reaches_barrier(m_physical_warp[warp_id]->get_cta_id(),
                                     warp_id, pipe_reg.get());
   } else if (pipe_reg->op == MEMORY_BARRIER_OP) {
@@ -623,7 +636,8 @@ void SM::issue_warp(register_set_uniptr &pipe_reg_set, warp_inst_t *next_inst,
       m_physical_warp[warp_id]->set_membar();
       if (!is_lightweight_fence_memory_barrier(*pipe_reg)) {
         debug_print_sm_barrier_issue(*pipe_reg, warp_id, m_sm_id,
-                                     m_config->sync_debug_enable);
+                                     m_config->bar_debug_enable,
+                                     m_config->bar_debug_issue_budget);
         m_physical_warp[warp_id]->store_info_of_last_inst_at_barrier(
             pipe_reg.get());
         m_barriers.warp_reaches_barrier(m_physical_warp[warp_id]->get_cta_id(),

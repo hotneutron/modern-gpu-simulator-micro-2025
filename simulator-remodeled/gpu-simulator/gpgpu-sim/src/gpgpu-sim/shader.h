@@ -2166,6 +2166,13 @@ class shader_core_config : public core_config {
   bool tma_debug_enable;
   unsigned int tma_debug_print_budget;
 
+  // BAR named-barrier (BAR.SYNC / BAR.ARV) debug logging (BARDBG). Independent of
+  // sync_debug_enable / tma_debug_enable so the named-barrier decode + release +
+  // end-of-kernel summary can be captured without other log noise. Used for the
+  // long FA3-bwd verification run.
+  bool bar_debug_enable;
+  unsigned int bar_debug_issue_budget;
+
   bool is_rf_cache_enabled;
   int max_operands_regular_register_file; 
   int max_latency_regular_register_file_latency; 

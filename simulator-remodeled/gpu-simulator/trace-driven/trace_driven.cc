@@ -539,17 +539,57 @@ bool trace_warp_inst_t::parse_from_trace_struct(
       break;
     case OP_CGAERRBAR:
     case OP_MEMBAR:
-    case OP_BAR:
-      // TO DO: fill this correctly
+      // MEMBAR / CGAERRBAR are not CTA named barriers; keep the legacy placeholder.
       bar_id = 0;
       bar_count = (unsigned)-1;
       bar_type = SYNC;
-      // TO DO
-      // if bar_type = RED;
-      // set bar_type
-      // barrier_type bar_type;
-      // reduction_type red_type;
       break;
+    case OP_BAR: {
+      // CTA named barrier (PTX bar.sync / bar.arrive). Decode the real id / count / type
+      // from the static operands + opcode modifier instead of the legacy placeholder.
+      // operand 0 = barrier id, operand 1 = thread count.
+      // Type: opcode token "ARV" => arrive-only (non-blocking); otherwise SYNC.
+      bool is_arrive = false;
+      for (const auto &tok : opcode_tokens) {
+        if (tok == "ARV") { is_arrive = true; break; }
+      }
+      bar_type = is_arrive ? ARRIVE : SYNC;
+
+      traced_instruction &bar_inst =
+          static_trace_info.get_kernel_by_unique_function_id(unique_function_id)
+              .get_instruction(pc);
+      std::size_t n_ops = bar_inst.get_num_operands();
+
+      // --- bar_id (operand 0): IMM (static) -> runtime reg capture -> fallback 0 ---
+      if (n_ops > 0 && bar_inst.get_operand(0).get_has_inmediate() &&
+          !bar_inst.get_operand(0).get_operands_inmediates().empty()) {
+        bar_id = (unsigned)bar_inst.get_operand(0).get_operands_inmediates()[0];
+      } else if (trace.bar_runtime_valid && trace.bar_runtime_has_id) {
+        bar_id = trace.bar_runtime_id;
+      } else {
+        bar_id = 0;  // register-form id with no runtime capture (old trace)
+      }
+
+      // --- bar_count (operand 1): IMM (static) -> runtime reg capture ->
+      //     no 2nd operand (bare bar.sync 0) => full CTA -> register fallback full CTA ---
+      if (n_ops > 1 && bar_inst.get_operand(1).get_has_inmediate() &&
+          !bar_inst.get_operand(1).get_operands_inmediates().empty()) {
+        bar_count = (unsigned)bar_inst.get_operand(1).get_operands_inmediates()[0];
+      } else if (trace.bar_runtime_valid && trace.bar_runtime_has_count) {
+        bar_count = trace.bar_runtime_count;
+      } else {
+        bar_count = (unsigned)-1;  // bare bar.sync / unresolved register count => whole CTA
+      }
+
+      // B4: id must be representable by the barrier set.
+      assert(bar_id < MAX_BARRIERS_PER_CTA &&
+             "BAR bar_id out of range (see -gpgpu_num_cta_barriers / MAX_BARRIERS_PER_CTA)");
+      // B5: warp-granularity engine requires a whole-warp (multiple of 32) count.
+      assert((bar_count == (unsigned)-1 ||
+              (bar_count % config_warp_size) == 0) &&
+             "BAR bar_count is not a multiple of warp_size (sub-warp barriers unmodeled)");
+      break;
+    }
     case OP_HADD2:
     case OP_HADD2_32I:
     case OP_HFMA2:

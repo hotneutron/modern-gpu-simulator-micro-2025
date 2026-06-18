@@ -1856,6 +1856,18 @@ void shader_core_config::reg_options(class OptionParser *opp) {
                          "Maximum number of TMADBG event lines to print per SM when "
                          "tma_debug_enable is set. (default=20000000)",
                          "20000000");
+  option_parser_register(opp, "-bar_debug_enable", OPT_BOOL,
+                         &bar_debug_enable,
+                         "Enable BAR.SYNC / BAR.ARV named-barrier debug logging (BARDBG) "
+                         "to stderr (issue decode + first-seen release + end-of-kernel "
+                         "summary and unreleased-barrier dump). Independent of "
+                         "sync_debug_enable / tma_debug_enable. (default=0)",
+                         "0");
+  option_parser_register(opp, "-bar_debug_issue_budget", OPT_UINT32,
+                         &bar_debug_issue_budget,
+                         "Maximum number of BARDBG per-issue decode lines to print "
+                         "(global) when bar_debug_enable is set. (default=20000)",
+                         "20000");
   option_parser_register(opp, "-is_rf_cache_enabled", OPT_BOOL,
                          &is_rf_cache_enabled,
                          "If enabled, Regular register file has the register file feature enabled."

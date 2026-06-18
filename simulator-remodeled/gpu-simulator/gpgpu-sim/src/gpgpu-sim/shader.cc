@@ -62,6 +62,7 @@
 #include <limits.h>
 #include <string.h>
 #include <memory>
+#include <set>
 #include "../../libcuda/gpgpu_context.h"
 #include "../cuda-sim/cuda-sim.h"
 #include "../cuda-sim/ptx-stats.h"
@@ -4194,6 +4195,21 @@ void barrier_set_t::deallocate_barrier(unsigned cta_id) {
   if (w == m_cta_to_warps.end()) return;
   warp_set_t warps = w->second;
   warp_set_t at_barrier = warps & m_warp_at_barrier;
+  // BARDBG: if a CTA is being deallocated while warps are still parked at a barrier
+  // (i.e. an unreleased / stuck named barrier), dump the per-id state before the
+  // assert fires so the offending bar_id is visible in the long-run log.
+  if (at_barrier.any() && m_shader->get_config()->bar_debug_enable) {
+    std::cerr << "[BARDBG][stuck] cta_id=" << cta_id
+              << " warps_still_at_barrier=" << at_barrier.to_string()
+              << std::endl;
+    for (unsigned i = 0; i < m_max_barriers_per_cta; i++) {
+      warp_set_t stuck_i = warps & m_bar_id_to_warps[i];
+      if (stuck_i.any()) {
+        std::cerr << "[BARDBG][stuck]   bar_id=" << i
+                  << " warps=" << stuck_i.to_string() << std::endl;
+      }
+    }
+  }
   assert(at_barrier.any() == false);  // no warps stuck at barrier
   warp_set_t active = warps & m_warp_active;
   assert(active.any() == false);  // no warps in CTA still running
@@ -4215,6 +4231,11 @@ void barrier_set_t::warp_reaches_barrier(unsigned cta_id, unsigned warp_id,
   unsigned bar_id = inst->bar_id;
   unsigned bar_count = inst->bar_count;
   assert(bar_id != (unsigned)-1);
+  // B4: id must index within the barrier set. B5: count must be a whole-warp multiple.
+  assert(bar_id < m_max_barriers_per_cta &&
+         "bar_id out of range in warp_reaches_barrier");
+  assert((bar_count == (unsigned)-1 || (bar_count % m_warp_size) == 0) &&
+         "bar_count is not a multiple of warp_size (sub-warp barriers unmodeled)");
   cta_to_warp_t::iterator w = m_cta_to_warps.find(cta_id);
 
   if (w == m_cta_to_warps.end()) {  // cta is active
@@ -4227,16 +4248,25 @@ void barrier_set_t::warp_reaches_barrier(unsigned cta_id, unsigned warp_id,
   }
   assert(w->second.test(warp_id) == true);  // warp is in cta
 
+  // B3: re-arrival on the same id is idempotent (bitset .set on an already-set bit does
+  // not change the count), so producer warps that loop over the same BAR.ARV are not
+  // double-counted.
   m_bar_id_to_warps[bar_id].set(warp_id);
+  // B2: ARRIVE registers the arrival on the id (so a later SYNC on this id can release)
+  // but never parks the issuing warp; only SYNC/RED block.
   if (bar_type == SYNC || bar_type == RED) {
     m_warp_at_barrier.set(warp_id);
   }
   warp_set_t warps_in_cta = w->second;
   warp_set_t at_barrier = warps_in_cta & m_bar_id_to_warps[bar_id];
   warp_set_t active = warps_in_cta & m_warp_active;
+  bool released = false;
+  unsigned released_warp_count = 0;
   if (bar_count == (unsigned)-1) {
     if (at_barrier == active) {
       // all warps have reached barrier, so release waiting warps...
+      released = true;
+      released_warp_count = at_barrier.count();
       m_bar_id_to_warps[bar_id] &= ~at_barrier;
       m_warp_at_barrier &= ~at_barrier;
       if (bar_type == RED) {
@@ -4246,15 +4276,35 @@ void barrier_set_t::warp_reaches_barrier(unsigned cta_id, unsigned warp_id,
       }
     }
   } else {
-    // TODO: check on the hardware if the count should include warp that exited
-    if ((at_barrier.count() * m_warp_size) == bar_count) {
+    // B1: release once the required thread count has arrived. Use >= (not ==) because
+    // ARRIVE+SYNC arrivals on a named barrier can accumulate and overshoot the exact
+    // equality window between cycles; >= still fires correctly and releases the whole
+    // id cohort together.
+    if ((at_barrier.count() * m_warp_size) >= bar_count) {
       // required number of warps have reached barrier, so release waiting
       // warps...
+      released = true;
+      released_warp_count = at_barrier.count();
       m_bar_id_to_warps[bar_id] &= ~at_barrier;
       m_warp_at_barrier &= ~at_barrier;
       if (bar_type == RED) {
         m_shader->broadcast_barrier_reduction(cta_id, bar_id, at_barrier);
       }
+    }
+  }
+  // BARDBG: log the FIRST release seen for each (bar_id, bar_type, bar_count) tuple so
+  // the decode + release path can be verified in the long run without log explosion.
+  if (released && m_shader->get_config()->bar_debug_enable) {
+    static std::set<unsigned long long> seen_release_keys;
+    unsigned long long key = ((unsigned long long)bar_id << 40) ^
+                             ((unsigned long long)(int)bar_type << 36) ^
+                             (unsigned long long)bar_count;
+    if (seen_release_keys.insert(key).second) {
+      std::cerr << "[BARDBG][release] bar_id=" << bar_id
+                << " bar_type=" << (int)bar_type
+                << " bar_count=" << (int)bar_count
+                << " released_warps=" << released_warp_count
+                << " (first occurrence)" << std::endl;
     }
   }
 }

@@ -348,6 +348,90 @@ invocations; the target (FlashAttnBwdSm90, k10) is the row with
 
 ---
 
+## Post-run results (rop=100, full trace) — 2026-06-16
+
+Run output: `sim_run_12.8/.../H100_80GB-OnlyKernel10/...warmup_-fe2c19726f6a.o307` (rop=100, `-trace_enabled 1`, full `trace_components`, `-sync_debug_enable 0`).
+
+### rop 211→100 effect: almost none
+
+| Metric | baseline (rop=211) | this run (rop=100) | Δ |
+|---|---|---|---|
+| `gpu_tot_sim_cycle` | 376,735 | **361,760** | **−14,975 (−4.0%)** |
+| `gpu_sim_insn` | 629,197,320 | 629,197,320 | identical (sanity OK) |
+| `gpu_ipc` | 1670.13 | 1739.27 | +4.1% |
+
+Cutting rop by more than half (−111 cyc/access) moved total cycles by only **4%**. This **falsifies the #1 hypothesis** that per-access L2 latency (`long_scoreboard`) was the dominant inflation source. The memory latency is almost entirely overlapped/hidden behind another stall.
+
+### Where the cycles actually go — top-level issue-stage breakdown (mutually exclusive, sums to 100%)
+
+Denominator = `total_num_cycles_issue_stage_evaluated` = 178,008,343 (per-subcore issue cycles, summed).
+
+| Class | % | Note |
+|---|---|---|
+| **no_warps_ready** | **66.64%** | no eligible warp to issue — the bottleneck |
+| issuing | 12.71% | actually issued |
+| next_stage_not_available | 10.69% | downstream pipe back-pressure |
+| no_valid_instruction | 8.96% | (frontend / L0I miss 8.95%) |
+| issue_port_busy | 1.01% | |
+| **sum** | **100.0%** | ✓ verified exclusive |
+
+### Inside `no_warps_ready` — why warps aren't ready (overlapping counters, NOT exclusive)
+
+These `..._at_least_one_warp_waiting_*` counters answer "in this stalled cycle, was there ≥1 warp blocked on reason X?", so they double-count and do **not** sum to 100. Read as relative intensity. (% normalized to the 118,616,507 no_warps_ready cycles.)
+
+| Wait reason | % of all eval cycles | % of no_warps_ready | maps to (this workload) |
+|---|---|---|---|
+| **inst_barrier** | 58.47% | **87.7%** | **BAR.SYNC only** (`__syncthreads`) |
+| fu_occupied (tensor/WGMMA) | 11.55% | 17.3% | function-unit busy |
+| wait_barrier | 7.98% | 12.0% | **DEPBAR** (SB phase wait = TMA mbarrier) |
+| stall_count | 4.11% | 6.2% | explicit stall cycles |
+| tma_flush | 0.83% | 1.2% | UTMACMDFLUSH |
+| yield | 0.68% | 1.0% | YIELD |
+| result_queue_full | 0.03% | — | fixed-latency result queue |
+| l1c | 0.03% | — | L1 constant |
+| **scoreboard (memory)** | **0.00%** | **0.0%** | traditional scoreboard (unused here) |
+
+#### What `inst_barrier` and `wait_barrier` actually count (verified against the SASS)
+
+The increment site ([subcore.cc:591-593](file:///home/jihyun/project/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/subcore.cc#L591-L593)) sets `inst_barrier` when a warp is blocked on **`programmer_barrier` OR `ldgdepbar`**:
+- `programmer_barrier` = `c_warp->waiting()` → **BAR.SYNC / `__syncthreads`** (CTA-wide barrier).
+- `ldgdepbar` = `pI->op == LDGDEPBAR_OP && are_ldgsts_pending()` ([subcore.cc:741-742](file:///home/jihyun/project/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/subcore.cc#L741-L742)) → cp.async (LDGSTS) dependency barrier.
+
+**This is a pure-TMA workload, so the `ldgdepbar` term is always false.** Verified by counting opcodes in the kernel-10 backward SASS (`extra_info/sass/flash_bwd_hdim64_bf16_softcapall_sm90.sm_90a.sass`):
+
+| opcode | count | note |
+|---|---|---|
+| **LDGDEPBAR** | **0** | ⇒ `inst_barrier`'s ldgdepbar branch never fires |
+| LDGSTS | 0 | no cp.async at all |
+| BAR.SYNC | 678 | `__syncthreads` |
+| DEPBAR | 828 | SB scoreboard phase wait |
+| UTMALDG | 480 | TMA load |
+| UTMACMDFLUSH | 348 | = `tma_flush` |
+| WARPGROUP | 960 | WGMMA |
+
+Therefore:
+- **`inst_barrier` (58.47%) ≡ BAR.SYNC (`__syncthreads`) alone** — *not* TMA-related, *not* cp.async.
+- **TMA mbarrier waits land in `wait_barrier` (7.98%)** via the **DEPBAR** path ([subcore.cc:754](file:///home/jihyun/project/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/subcore.cc#L754), `inst->op == DEPBAR_OP` + wait-barrier mask), which is a **separate, correctly-isolated** counter.
+- The earlier framing ("inst_barrier ≈ waiting on TMA completion") was **wrong**. The dominant stall is **CTA-barrier serialization**, while TMA-completion waits are only ~8%.
+
+> Caveat: the `tma_axis` grouping ([shader.cc:1448-1450](file:///home/jihyun/project/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/shader.cc#L1448-L1450)) lumps `wait_barrier + inst_barrier + tma_flush` together and so is **mislabeled** for this workload — most of its 67% is actually BAR.SYNC, not TMA.
+
+> Counter mechanics: top-level classes are exclusive ([shader.cc:1486-1504](file:///home/jihyun/project/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/shader.cc#L1486-L1504)); the `at_least_one_warp_waiting_*` and `tma_axis`/`non_tma_axis` are overlap counts ([shader.cc:1437-1467](file:///home/jihyun/project/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/shader.cc#L1437-L1467)) — that is why they exceed 100%.
+
+### Revised conclusions
+
+1. **Memory latency (`scoreboard`) is 0%** of the stall — confirming the rop change was nearly inert. Per-access latency (rop/dram) is **not** the lever; do not pursue it further.
+2. **The single dominant bottleneck is `BAR.SYNC` (`__syncthreads`)**: in **87.7%** of no_warps_ready cycles at least one warp is blocked on a CTA-wide instruction barrier. Verified that `inst_barrier` is BAR.SYNC-only here (LDGDEPBAR=0, no cp.async). The warp-specialized pipeline is serializing at `__syncthreads`, leaving the GPU stalled ~2/3 of the time.
+3. **TMA-completion waits are NOT the dominant term**: the TMA mbarrier wait shows up as `wait_barrier` (DEPBAR) at only **~8%**. So the gap is driven by how the model serializes the CTA barrier, not by TMA latency or TMA-credit timing. ([B]/[C] are secondary.)
+
+### Next direction (data-driven)
+- **Drop** per-access memory-latency tuning (rop/dram) — proven near-zero leverage.
+- **Primary target = the `BAR.SYNC` / `__syncthreads` model** in [sm.cc](file:///home/jihyun/project/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/sm.cc): how long a warp sits at `c_warp->waiting()`, whether all warps in the CTA are forced to rendezvous more strictly/slowly than on HW (e.g. barrier release timing, arrival accounting). This is the 58%/87.7% term.
+- **Secondary**: the `wait_barrier`/DEPBAR (TMA mbarrier, ~8%) and `fu_occupied` (WGMMA, ~17%) paths.
+- Use the captured trace (WARP_SCHEDULER / SCOREBOARD / TMA) to locate which BAR.SYNC PCs dominate and how long warps sit there.
+
+---
+
 ## Summary
 
 1. **Cycle accuracy**: the simulator overestimates cycles by **~2.8–3.2×** vs real H100 (+183% on Elapsed basis). Significant room for improvement.

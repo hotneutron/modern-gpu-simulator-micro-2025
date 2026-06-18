@@ -17,4 +17,16 @@ message instruction {
     uint64 semantic_raw = 4;
   }
   sync_runtime_info sync = 6;
+  // Runtime values of register-form operands of BAR.SYNC / BAR.ARV named-barrier
+  // instructions. Immediate-form operands are recovered statically by the decoder, so
+  // only register-form barrier id / count are captured here. has_id / has_count tell the
+  // decoder which fields were actually resolved from a register at runtime.
+  message bar_runtime_info {
+    bool valid = 1;
+    bool has_id = 2;
+    uint32 id = 3;
+    bool has_count = 4;
+    uint32 count = 5;
+  }
+  bar_runtime_info bar_runtime = 7;
 }

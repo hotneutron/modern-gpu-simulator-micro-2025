@@ -105,6 +105,12 @@ struct inst_trace_t {
   uint64_t sync_barrier_addr;
   bool sync_has_semantic_raw;
   uint64_t sync_semantic_raw;
+  // Runtime values of register-form BAR.SYNC / BAR.ARV operands (Phase A capture).
+  bool bar_runtime_valid;
+  bool bar_runtime_has_id;
+  unsigned bar_runtime_id;
+  bool bar_runtime_has_count;
+  unsigned bar_runtime_count;
   std::vector<std::unique_ptr<inst_memadd_info_t>> memadd_info;
 
   void parse_memref(unsigned int idx, unsigned int mem_width, const std::bitset<WARP_SIZE> &mask_bits, dynamic_trace::address addr_info);
