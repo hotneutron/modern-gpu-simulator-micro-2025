@@ -2160,6 +2160,12 @@ class shader_core_config : public core_config {
   unsigned int sync_debug_print_budget;
   unsigned int sync_debug_skip_runtime_budget;
 
+  // TMA-only debug logging (TMADBG). Independent of sync_debug_enable so the TMA
+  // unit's per-event stderr logs (first-request / fill-retire / backpressure /
+  // complete) can be captured without the SYNCDBG / SMDBG noise from all SMs.
+  bool tma_debug_enable;
+  unsigned int tma_debug_print_budget;
+
   bool is_rf_cache_enabled;
   int max_operands_regular_register_file; 
   int max_latency_regular_register_file_latency; 

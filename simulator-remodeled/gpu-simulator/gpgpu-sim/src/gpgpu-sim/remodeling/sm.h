@@ -409,6 +409,8 @@ class SM : public core_t, public shader_core_ctx_wrapper {
   // Initialized from shader_core_config in SM::SM(); 0 disables logging.
   uint64_t m_sync_debug_print_budget = 0;
   uint64_t m_sync_debug_skip_runtime_budget = 0;
+  // Independent budget for TMA-only stderr logs (TMADBG); 0 disables.
+  uint64_t m_tma_debug_print_budget = 0;
   uint64_t m_sync_debug_sync_insts = 0;
   uint64_t m_sync_debug_exch = 0;
   uint64_t m_sync_debug_arrive = 0;

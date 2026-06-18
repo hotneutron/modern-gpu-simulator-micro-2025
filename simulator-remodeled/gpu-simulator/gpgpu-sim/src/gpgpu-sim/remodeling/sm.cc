@@ -234,6 +234,9 @@ SM::SM(unsigned int num_subcores, gpgpu_sim *gpu, simt_core_cluster *cluster,
     m_sync_debug_print_budget = config->sync_debug_print_budget;
     m_sync_debug_skip_runtime_budget = config->sync_debug_skip_runtime_budget;
   }
+  if (config->tma_debug_enable) {
+    m_tma_debug_print_budget = config->tma_debug_print_budget;
+  }
   if(config->is_interwarp_coalescing_enabled && is_using_interwarp_coal_warps_waiting_dep_counter()) {
     m_interwarp_coal_warps_waiting_dep_counter = new InterWarp_Coalescing_Waiting_Dep_Counters(config->max_warps_per_shader);
   }
@@ -360,7 +363,8 @@ void SM::debug_log_sync_event(const std::string &message) {
 }
 
 // TMA per-event log. Two independent sinks:
-//  1) [TMADBG] on stderr, gated by -sync_debug_enable (shares the SYNC budget).
+//  1) [TMADBG] on stderr, gated by -tma_debug_enable (its own budget, separate
+//     from -sync_debug_enable so TMA logs come without SYNCDBG/SMDBG noise).
 //  2) The GPGPU-Sim trace system (-trace_enabled 1 -trace_components TMA),
 //     which prints on stdout in the standard "GPGPU-Sim Cycle N: TMA - ..."
 //     format and honors -trace_sampling_core. The TMA unit is a newly added
@@ -372,11 +376,11 @@ void SM::debug_log_tma_event(const std::string &message) {
        Trace::sampling_core == (unsigned int)-1)) {
     DPRINTF(TMA, "SM %u - %s\n", m_sm_id, message.c_str());
   }
-  if (m_sync_debug_print_budget == 0) {
+  if (m_tma_debug_print_budget == 0) {
     return;
   }
   std::cerr << "[TMADBG][SM" << m_sm_id << "] " << message << std::endl;
-  --m_sync_debug_print_budget;
+  --m_tma_debug_print_budget;
 }
 
 void SM::debug_dump_sync_counters() const {

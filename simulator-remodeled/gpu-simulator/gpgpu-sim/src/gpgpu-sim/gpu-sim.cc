@@ -1846,6 +1846,16 @@ void shader_core_config::reg_options(class OptionParser *opp) {
                          "Maximum number of SYNCDBG 'skip sync' lines to print per SM when "
                          "sync_debug_enable is set. (default=1024)",
                          "1024");
+  option_parser_register(opp, "-tma_debug_enable", OPT_BOOL,
+                         &tma_debug_enable,
+                         "Enable TMA-only per-event debug logging (TMADBG) to stderr, "
+                         "independent of sync_debug_enable. (default=0)",
+                         "0");
+  option_parser_register(opp, "-tma_debug_print_budget", OPT_UINT32,
+                         &tma_debug_print_budget,
+                         "Maximum number of TMADBG event lines to print per SM when "
+                         "tma_debug_enable is set. (default=20000000)",
+                         "20000000");
   option_parser_register(opp, "-is_rf_cache_enabled", OPT_BOOL,
                          &is_rf_cache_enabled,
                          "If enabled, Regular register file has the register file feature enabled."
