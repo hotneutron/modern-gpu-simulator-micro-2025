@@ -195,14 +195,16 @@ void debug_print_sm_barrier_issue(const warp_inst_t &inst,
       inst.has_extra_trace_instruction_info()
           ? inst.get_extra_trace_instruction_info().get_op_code()
           : "<no-trace-opcode>";
-  std::cerr << "[BARDBG][issue] sm=" << sm_id
-            << " warp=" << warp_id
-            << " pc=0x" << format_hex_u64(inst.pc)
-            << " op=" << static_cast<int>(inst.op)
-            << " trace_opcode=" << trace_opcode
-            << " bar_type=" << static_cast<int>(inst.bar_type)
-            << " bar_id=" << inst.bar_id
-            << " bar_count=" << static_cast<int>(inst.bar_count) << std::endl;
+  std::ostringstream oss;
+  oss << "[BARDBG][issue] sm=" << sm_id
+      << " warp=" << warp_id
+      << " pc=0x" << format_hex_u64(inst.pc)
+      << " op=" << static_cast<int>(inst.op)
+      << " trace_opcode=" << trace_opcode
+      << " bar_type=" << static_cast<int>(inst.bar_type)
+      << " bar_id=" << inst.bar_id
+      << " bar_count=" << static_cast<int>(inst.bar_count) << "\n";
+  std::cerr << oss.str();
   --budget_left;
 }
 
@@ -615,17 +617,26 @@ void SM::issue_warp(register_set_uniptr &pipe_reg_set, warp_inst_t *next_inst,
   if (pipe_reg->op == MBARRIER_OP) {
     handle_sync_instruction(*pipe_reg, warp_id);
   } else if (pipe_reg->op == BARRIER_OP) {
-    debug_print_sm_barrier_issue(*pipe_reg, warp_id, m_sm_id,
-                                 m_config->bar_debug_enable,
-                                 m_config->bar_debug_issue_budget);
-    // B2: an ARRIVE (BAR.ARV) only signals arrival and keeps issuing; it must not be
-    // recorded as "last inst at barrier" (that bookkeeping is for blocking SYNC/RED warps).
-    // Still call warp_reaches_barrier so the arrival is registered on the id.
-    if (pipe_reg->bar_type != ARRIVE) {
-      m_physical_warp[warp_id]->store_info_of_last_inst_at_barrier(pipe_reg.get());
+    // A predicated-off BAR (active_count()==0, e.g. a warp-specialized BAR.ARV/BAR.SYNC
+    // executed only by a subset of warps) is a no-op for this warp: the warp does not
+    // actually arrive at the barrier on hardware. Skip the barrier-set update entirely;
+    // otherwise it would (a) register a spurious arrival and (b) decode to a fallback
+    // bar_id=0 since no register operand value was captured for the inactive lanes.
+    if (pipe_reg->active_count() == 0) {
+      // nothing to do for this warp
+    } else {
+      debug_print_sm_barrier_issue(*pipe_reg, warp_id, m_sm_id,
+                                   m_config->bar_debug_enable,
+                                   m_config->bar_debug_issue_budget);
+      // B2: an ARRIVE (BAR.ARV) only signals arrival and keeps issuing; it must not be
+      // recorded as "last inst at barrier" (that bookkeeping is for blocking SYNC/RED warps).
+      // Still call warp_reaches_barrier so the arrival is registered on the id.
+      if (pipe_reg->bar_type != ARRIVE) {
+        m_physical_warp[warp_id]->store_info_of_last_inst_at_barrier(pipe_reg.get());
+      }
+      m_barriers.warp_reaches_barrier(m_physical_warp[warp_id]->get_cta_id(),
+                                      warp_id, pipe_reg.get());
     }
-    m_barriers.warp_reaches_barrier(m_physical_warp[warp_id]->get_cta_id(),
-                                    warp_id, pipe_reg.get());
   } else if (pipe_reg->op == MEMORY_BARRIER_OP) {
       pipe_reg->m_num_cycles_to_stall_SM = m_config->num_cycles_to_stall_SM_at_gpu_memory_barrier;
       if(m_config->is_trace_mode && pipe_reg->get_extra_trace_instruction_info().get_is_system_memory_barrier()) {

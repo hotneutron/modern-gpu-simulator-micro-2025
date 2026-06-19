@@ -63,6 +63,7 @@
 #include <string.h>
 #include <memory>
 #include <set>
+#include <sstream>
 #include "../../libcuda/gpgpu_context.h"
 #include "../cuda-sim/cuda-sim.h"
 #include "../cuda-sim/ptx-stats.h"
@@ -4199,16 +4200,17 @@ void barrier_set_t::deallocate_barrier(unsigned cta_id) {
   // (i.e. an unreleased / stuck named barrier), dump the per-id state before the
   // assert fires so the offending bar_id is visible in the long-run log.
   if (at_barrier.any() && m_shader->get_config()->bar_debug_enable) {
-    std::cerr << "[BARDBG][stuck] cta_id=" << cta_id
-              << " warps_still_at_barrier=" << at_barrier.to_string()
-              << std::endl;
+    std::ostringstream oss;
+    oss << "[BARDBG][stuck] cta_id=" << cta_id
+        << " warps_still_at_barrier=" << at_barrier.to_string() << "\n";
     for (unsigned i = 0; i < m_max_barriers_per_cta; i++) {
       warp_set_t stuck_i = warps & m_bar_id_to_warps[i];
       if (stuck_i.any()) {
-        std::cerr << "[BARDBG][stuck]   bar_id=" << i
-                  << " warps=" << stuck_i.to_string() << std::endl;
+        oss << "[BARDBG][stuck]   bar_id=" << i
+            << " warps=" << stuck_i.to_string() << "\n";
       }
     }
+    std::cerr << oss.str();
   }
   assert(at_barrier.any() == false);  // no warps stuck at barrier
   warp_set_t active = warps & m_warp_active;
@@ -4300,11 +4302,13 @@ void barrier_set_t::warp_reaches_barrier(unsigned cta_id, unsigned warp_id,
                              ((unsigned long long)(int)bar_type << 36) ^
                              (unsigned long long)bar_count;
     if (seen_release_keys.insert(key).second) {
-      std::cerr << "[BARDBG][release] bar_id=" << bar_id
-                << " bar_type=" << (int)bar_type
-                << " bar_count=" << (int)bar_count
-                << " released_warps=" << released_warp_count
-                << " (first occurrence)" << std::endl;
+      std::ostringstream oss;
+      oss << "[BARDBG][release] bar_id=" << bar_id
+          << " bar_type=" << (int)bar_type
+          << " bar_count=" << (int)bar_count
+          << " released_warps=" << released_warp_count
+          << " (first occurrence)\n";
+      std::cerr << oss.str();
     }
   }
 }
