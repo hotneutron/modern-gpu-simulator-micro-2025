@@ -545,15 +545,29 @@ bool trace_warp_inst_t::parse_from_trace_struct(
       bar_type = SYNC;
       break;
     case OP_BAR: {
-      // CTA named barrier (PTX bar.sync / bar.arrive). Decode the real id / count / type
-      // from the static operands + opcode modifier instead of the legacy placeholder.
+      // CTA named barrier (PTX bar.sync / bar.arrive). Decode id / count from the static
+      // operands (with runtime-register fallback), then decide blocking-vs-non-blocking
+      // from the verified rule below.
       // operand 0 = barrier id, operand 1 = thread count.
-      // Type: opcode token "ARV" => arrive-only (non-blocking); otherwise SYNC.
-      bool is_arrive = false;
+      //
+      // Opcode handling (only the two forms observed across all 9 traced kernels are
+      // accepted; anything else aborts so an unverified BAR form is never silently
+      // mis-modeled):
+      //   - BAR.ARV                 -> arrive-only
+      //   - BAR.SYNC.DEFER_BLOCKING -> arrive whose real wait is split off into the
+      //                                instruction's scoreboard wait (wait_barrier_bits),
+      //                                EXCEPT the plain full-CTA __syncthreads form.
+      bool is_arv = false;
+      bool is_sync_defer = false;
       for (const auto &tok : opcode_tokens) {
-        if (tok == "ARV") { is_arrive = true; break; }
+        if (tok == "ARV") is_arv = true;
+        if (tok == "DEFER_BLOCKING") is_sync_defer = true;
       }
-      bar_type = is_arrive ? ARRIVE : SYNC;
+      // trace.opcode is the full mnemonic, e.g. "BAR.SYNC.DEFER_BLOCKING" / "BAR.ARV".
+      assert((is_arv || is_sync_defer) &&
+             "Unverified BAR opcode form reached OP_BAR decode (only BAR.ARV and "
+             "BAR.SYNC.DEFER_BLOCKING have been characterized); see "
+             ".plan/fix_op_bar_named_barrier_decoding.md");
 
       traced_instruction &bar_inst =
           static_trace_info.get_kernel_by_unique_function_id(unique_function_id)
@@ -580,6 +594,20 @@ bool trace_warp_inst_t::parse_from_trace_struct(
       } else {
         bar_count = (unsigned)-1;  // bare bar.sync / unresolved register count => whole CTA
       }
+
+      // --- bar_type (blocking vs non-blocking), verified across all 9 traced kernels ---
+      // The ONLY blocking case is a plain full-CTA __syncthreads: id==0, full-CTA count,
+      // and no scoreboard wait. Every other observed BAR (BAR.ARV, any named id, any
+      // partial count, or a full-CTA SYNC whose wait is offloaded to a scoreboard wait on
+      // a preceding SYNCS/FENCE) is a non-blocking arrive; its actual synchronization is
+      // handled by the scoreboard / mbarrier models. Blocking those produces deadlocks
+      // (verified on FA3 fwd kernel 5 and bwd kernel 10).
+      unsigned wait_barrier_bits =
+          bar_inst.get_control_bits().get_wait_barrier_bits();
+      bool is_plain_full_cta_syncthreads =
+          is_sync_defer && (bar_id == 0) && (bar_count == (unsigned)-1) &&
+          (wait_barrier_bits == 0);
+      bar_type = is_plain_full_cta_syncthreads ? SYNC : ARRIVE;
 
       // B4: id must be representable by the barrier set.
       assert(bar_id < MAX_BARRIERS_PER_CTA &&

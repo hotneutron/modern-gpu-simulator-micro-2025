@@ -225,8 +225,81 @@ verified do we touch the decoder (Change 1-3) and the barrier engine (B1-B4).
   matching the `at_barrier.count()*warp_size` test. The engine assumes each participating
   warp contributes a full 32 threads, so counts MUST be multiples of 32; this is enforced
   by the explicit guard B5 (`bar_count % warp_size == 0`), not just assumed.
-- **A3**: `BAR.ARV` = arrive-only, non-blocking; `BAR.SYNC[.DEFER_BLOCKING]` = blocking.
-  `DEFER_BLOCKING` is treated as ordinary blocking SYNC (no separate modeling).
+- **A3 (CORRECTED after the deadlock investigation)**: `BAR.ARV` = arrive-only,
+  non-blocking. **`BAR.SYNC.DEFER_BLOCKING` is NOT a plain blocking `bar.sync`.** It
+  performs a named-barrier arrive whose actual *wait* is split off and expressed by the
+  instruction's `control_bits.wait_barrier_bits` (a scoreboard wait), NOT by a CTA-wide
+  rendezvous block at the BAR itself. Treating it as an immediate blocking SYNC was wrong
+  and produced a real deadlock (see "Deadlock root cause" below). The correct blocking-vs-
+  non-blocking signal is `wait_barrier_bits`, not the opcode:
+  - `wait_barrier_bits != 0` → the wait is handled by the scoreboard model
+    (`Subcore::is_wait_barriers_ready_entry_point`, already implemented). The BAR should
+    be modeled as a non-blocking ARRIVE; blocking it causes producer/consumer cycles.
+  - `wait_barrier_bits == 0` → no scoreboard wait, so the BAR itself must block as a real
+    CTA-wide `__syncthreads` (e.g. reduce_kernel id=0).
+
+### Deadlock root cause (FA3 bwd full run, gpu_sim_cycle≈128751) and the BAR.SYNC.DEFER_BLOCKING semantics
+
+The first full OnlyKernel10 run terminated via `-gpgpu_deadlock_detect`, not `exit
+detected`. Investigation (BARDBG logs + per-CTA `.pb` walk + SASS `control_bits`):
+
+- The named-barrier groups form a producer/consumer handshake, e.g. id=13 needs
+  `SYNC(warp1) + ARV(warp4..7)` and id=10 needs `SYNC(warp4..7) + ARV(warp1)`. Modeling
+  every `BAR.SYNC.DEFER_BLOCKING` as an immediate CTA block makes warp1 park at id=13
+  before it can issue its `BAR.ARV id=10`, while warp4 parks at id=10 before issuing its
+  `BAR.ARV id=13` → cyclic deadlock. This is independent of in-order issue (HW is also
+  in-order and does NOT deadlock).
+- SASS `control_bits` for the *executed* `BAR.SYNC.DEFER_BLOCKING` in func 8 show
+  `is_new_*_barrier=False` and `wait_barrier_bits=22 (0b010110 = SB 1,2,4)`. Tracing the
+  setters: SB 1/2/4 are written by the immediately-preceding `SYNCS.EXCH.64` (mbarrier
+  init) at pc 0x510/0x530/0x540. So the BAR's wait is waiting on the warp's own
+  `SYNCS.*` completion — NOT on a cross-warp named-barrier rendezvous. The named-barrier
+  arrive is just a count signal; the real synchronization is scoreboard + mbarrier
+  (`SYNC_ISA.md`), both already modeled.
+
+### kernel 5 (reduce_kernel, ufid 4) cross-check — different scenario
+`reduce_kernel` uses 9x `BAR.SYNC.DEFER_BLOCKING 0x0` (full-CTA, no count) with
+**`wait_barrier_bits=0`** on every one. With no scoreboard wait, these ARE real CTA-wide
+`__syncthreads` and MUST block. This is why the blocking decision must key off
+`wait_barrier_bits`, not the `DEFER_BLOCKING` suffix: the same opcode is a non-blocking
+arrive in FA3 (wait offloaded to scoreboard) but a blocking sync in reduce_kernel (no
+scoreboard wait. The decoder/engine fix must preserve blocking for the
+`wait_barrier_bits==0` case so reduce_kernel does not lose synchronization.
+
+### All-kernel census (9 traced kernels) and the FINAL blocking rule
+Every `BAR*` instruction in `enhanced_execution_info.json` was categorized by
+(opcode, id-kind, count-kind, wait_barrier_bits, predicate). Result:
+
+| kernel(s) | category | classification |
+|---|---|---|
+| distribution(1), reduce(4), BwdPostprocess(9) | `SYNC.DEFER` id=0 full-CTA **wait==0** | **SYNC (blocking __syncthreads)** |
+| FA3 fwd(3), FA3 bwd(8) | `SYNC.DEFER` id=0 full-CTA **wait!=0** | ARRIVE (wait is a scoreboard wait on the warp's own preceding `SYNCS.EXCH`) |
+| FA3 fwd(3), FA3 bwd(8) | `SYNC.DEFER` named(id!=0) and/or partial count | ARRIVE (named handshake; any `wait!=0` waits on a preceding `FENCE.VIEW.ASYNC.S`, traced) |
+| FA3 fwd(3), FA3 bwd(8) | `BAR.ARV` (any id/count, wait 0 or !=0) | ARRIVE |
+
+Only two opcode forms appear across all kernels: `BAR.ARV` and `BAR.SYNC.DEFER_BLOCKING`
+(no plain `BAR.SYNC`, no `BAR.RED`, no `BAR.ALL.*` as `OP_BAR`). The `wait_barrier_bits`
+of every non-blocking case was traced to a scoreboard set by a preceding `SYNCS.EXCH.64`
+(mbarrier init) or `FENCE.VIEW.ASYNC.S` — i.e. the warp's own async ordering, never a
+cross-warp named-barrier rendezvous. So those waits are already modeled by the scoreboard
+path (`Subcore::is_wait_barriers_ready_entry_point`) and the BAR itself must NOT block.
+
+**FINAL rule (implemented in `trace_driven.cc` OP_BAR):**
+```
+is_plain_full_cta_syncthreads = SYNC.DEFER && id==0 && count==full(-1) && wait_barrier_bits==0
+bar_type = is_plain_full_cta_syncthreads ? SYNC : ARRIVE
+```
+- `BAR.ARV` and `BAR.SYNC.DEFER_BLOCKING` are the only accepted opcode forms; **any other
+  BAR form reaching `OP_BAR` aborts** (`assert(is_arv || is_sync_defer)`) so an
+  uncharacterized form can never be silently mis-modeled.
+- B4 (`bar_id < MAX_BARRIERS_PER_CTA`) and B5 (`bar_count % warp_size == 0`) asserts remain.
+
+### Deadlock confirmed on FA3 fwd too (kernel 5 / ufid 3)
+The OnlyKernel5 run (FA3 fwd) hit the same `-gpgpu_deadlock_detect` abort
+(`gpu_sim_cycle 101251`), with the same named/partial handshake pattern (id 4/8/9 SYNC at
+count 416/256 + matching ARV). The FINAL rule reclassifies all of these as ARRIVE and so
+resolves the fwd deadlock identically to bwd.
+
 - **D1**: Register-form id/count → fall back to (0, -1). Not exact, but safe and bounded
   (only 5/23 barriers, mostly the dynamically-scheduled paths).
 - **D2**: Scope is the `OP_BAR` decode + barrier-set plumbing only. No changes to TMA,

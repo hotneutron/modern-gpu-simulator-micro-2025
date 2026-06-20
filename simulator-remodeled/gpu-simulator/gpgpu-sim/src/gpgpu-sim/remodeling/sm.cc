@@ -195,6 +195,10 @@ void debug_print_sm_barrier_issue(const warp_inst_t &inst,
       inst.has_extra_trace_instruction_info()
           ? inst.get_extra_trace_instruction_info().get_op_code()
           : "<no-trace-opcode>";
+  int wait_barrier_bits =
+      inst.has_extra_trace_instruction_info()
+          ? inst.get_extra_trace_instruction_info().get_control_bits().get_wait_barrier_bits()
+          : -1;
   std::ostringstream oss;
   oss << "[BARDBG][issue] sm=" << sm_id
       << " warp=" << warp_id
@@ -203,7 +207,8 @@ void debug_print_sm_barrier_issue(const warp_inst_t &inst,
       << " trace_opcode=" << trace_opcode
       << " bar_type=" << static_cast<int>(inst.bar_type)
       << " bar_id=" << inst.bar_id
-      << " bar_count=" << static_cast<int>(inst.bar_count) << "\n";
+      << " bar_count=" << static_cast<int>(inst.bar_count)
+      << " wait_bits=" << wait_barrier_bits << "\n";
   std::cerr << oss.str();
   --budget_left;
 }
