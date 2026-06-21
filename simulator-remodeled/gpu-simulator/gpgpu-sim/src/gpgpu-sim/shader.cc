@@ -4170,6 +4170,8 @@ barrier_set_t::barrier_set_t(shader_core_ctx_wrapper *shader,
   m_warp_at_barrier.reset();
   for (unsigned i = 0; i < max_barriers_per_cta; i++) {
     m_bar_id_to_warps[i].reset();
+    m_bar_id_to_arrive_credited_warps[i].reset();
+    m_bar_id_to_sync_credited_warps[i].reset();
   }
 }
 
@@ -4187,6 +4189,8 @@ void barrier_set_t::allocate_barrier(unsigned cta_id, warp_set_t warps) {
   m_warp_at_barrier &= ~warps;
   for (unsigned i = 0; i < m_max_barriers_per_cta; i++) {
     m_bar_id_to_warps[i] &= ~warps;
+    m_bar_id_to_arrive_credited_warps[i] &= ~warps;
+    m_bar_id_to_sync_credited_warps[i] &= ~warps;
   }
 }
 
@@ -4196,24 +4200,51 @@ void barrier_set_t::deallocate_barrier(unsigned cta_id) {
   if (w == m_cta_to_warps.end()) return;
   warp_set_t warps = w->second;
   warp_set_t at_barrier = warps & m_warp_at_barrier;
-  // BARDBG: if a CTA is being deallocated while warps are still parked at a barrier
-  // (i.e. an unreleased / stuck named barrier), dump the per-id state before the
-  // assert fires so the offending bar_id is visible in the long-run log.
-  if (at_barrier.any() && m_shader->get_config()->bar_debug_enable) {
+  warp_set_t active = warps & m_warp_active;
+  // BARDBG: emit a compact CTA-teardown summary on every deallocation, and if any
+  // participant / credit state remains, dump the per-id details even when no warp is
+  // currently parked at the barrier. This catches participant-only leaks that would
+  // otherwise bypass the older at_barrier.any() debug condition.
+  if (m_shader->get_config()->bar_debug_enable) {
+    unsigned leaked_ids = 0;
+    unsigned leaked_participant_warps = 0;
+    unsigned leaked_arrive_credits = 0;
+    unsigned leaked_sync_credits = 0;
     std::ostringstream oss;
-    oss << "[BARDBG][stuck] cta_id=" << cta_id
-        << " warps_still_at_barrier=" << at_barrier.to_string() << "\n";
+    const unsigned long long cycle =
+        m_shader->get_gpu()->gpu_tot_sim_cycle +
+        m_shader->get_gpu()->gpu_sim_cycle;
     for (unsigned i = 0; i < m_max_barriers_per_cta; i++) {
-      warp_set_t stuck_i = warps & m_bar_id_to_warps[i];
-      if (stuck_i.any()) {
-        oss << "[BARDBG][stuck]   bar_id=" << i
-            << " warps=" << stuck_i.to_string() << "\n";
+      warp_set_t participant_i = warps & m_bar_id_to_warps[i];
+      warp_set_t arrive_i = warps & m_bar_id_to_arrive_credited_warps[i];
+      warp_set_t sync_i = warps & m_bar_id_to_sync_credited_warps[i];
+      if (participant_i.any() || arrive_i.any() || sync_i.any()) {
+        ++leaked_ids;
+        leaked_participant_warps += participant_i.count();
+        leaked_arrive_credits += arrive_i.count();
+        leaked_sync_credits += sync_i.count();
+        unsigned arrive_credits =
+            arrive_i.count();
+        unsigned sync_credits = sync_i.count();
+        oss << "[BARDBG][leak]   bar_id=" << i
+            << " warps=" << participant_i.to_string()
+            << " arrive_credits=" << arrive_credits
+            << " sync_credits=" << sync_credits << "\n";
       }
     }
-    std::cerr << oss.str();
+    std::cerr << "[BARDBG][summary] cta_id=" << cta_id
+              << " cycle=" << cycle
+              << " active=" << active.to_string()
+              << " parked=" << at_barrier.to_string()
+              << " leaked_ids=" << leaked_ids
+              << " leaked_participant_warps=" << leaked_participant_warps
+              << " leaked_arrive_credits=" << leaked_arrive_credits
+              << " leaked_sync_credits=" << leaked_sync_credits << "\n";
+    if (leaked_ids > 0) {
+      std::cerr << oss.str();
+    }
   }
   assert(at_barrier.any() == false);  // no warps stuck at barrier
-  warp_set_t active = warps & m_warp_active;
   assert(active.any() == false);  // no warps in CTA still running
   m_warp_active &= ~warps;
   m_warp_at_barrier &= ~warps;
@@ -4221,7 +4252,14 @@ void barrier_set_t::deallocate_barrier(unsigned cta_id) {
   for (unsigned i = 0; i < m_max_barriers_per_cta; i++) {
     warp_set_t at_a_specific_barrier = warps & m_bar_id_to_warps[i];
     assert(at_a_specific_barrier.any() == false);  // no warps stuck at barrier
+    warp_set_t arrive_credited =
+        warps & m_bar_id_to_arrive_credited_warps[i];
+    assert(arrive_credited.any() == false);
+    warp_set_t sync_credited = warps & m_bar_id_to_sync_credited_warps[i];
+    assert(sync_credited.any() == false);
     m_bar_id_to_warps[i] &= ~warps;
+    m_bar_id_to_arrive_credited_warps[i] &= ~warps;
+    m_bar_id_to_sync_credited_warps[i] &= ~warps;
   }
   m_cta_to_warps.erase(w);
 }
@@ -4250,10 +4288,20 @@ void barrier_set_t::warp_reaches_barrier(unsigned cta_id, unsigned warp_id,
   }
   assert(w->second.test(warp_id) == true);  // warp is in cta
 
-  // B3: re-arrival on the same id is idempotent (bitset .set on an already-set bit does
-  // not change the count), so producer warps that loop over the same BAR.ARV are not
-  // double-counted.
+  // Keep the per-id participant set so release can clear the whole cohort at once.
   m_bar_id_to_warps[bar_id].set(warp_id);
+  // B3: split arrival accounting. Repeated ARRIVE by the same warp is idempotent, but a
+  // later SYNC on the same id may contribute one additional credit for the current epoch.
+  if (bar_type == ARRIVE) {
+    if (!m_bar_id_to_arrive_credited_warps[bar_id].test(warp_id) &&
+        !m_bar_id_to_sync_credited_warps[bar_id].test(warp_id)) {
+      m_bar_id_to_arrive_credited_warps[bar_id].set(warp_id);
+    }
+  } else if (bar_type == SYNC || bar_type == RED) {
+    if (!m_bar_id_to_sync_credited_warps[bar_id].test(warp_id)) {
+      m_bar_id_to_sync_credited_warps[bar_id].set(warp_id);
+    }
+  }
   // B2: ARRIVE registers the arrival on the id (so a later SYNC on this id can release)
   // but never parks the issuing warp; only SYNC/RED block.
   if (bar_type == SYNC || bar_type == RED) {
@@ -4261,15 +4309,22 @@ void barrier_set_t::warp_reaches_barrier(unsigned cta_id, unsigned warp_id,
   }
   warp_set_t warps_in_cta = w->second;
   warp_set_t at_barrier = warps_in_cta & m_bar_id_to_warps[bar_id];
+  unsigned arrival_credit_count =
+      (warps_in_cta & m_bar_id_to_arrive_credited_warps[bar_id]).count() +
+      (warps_in_cta & m_bar_id_to_sync_credited_warps[bar_id]).count();
   warp_set_t active = warps_in_cta & m_warp_active;
   bool released = false;
   unsigned released_warp_count = 0;
+  unsigned released_credit_count = 0;
   if (bar_count == (unsigned)-1) {
     if (at_barrier == active) {
       // all warps have reached barrier, so release waiting warps...
       released = true;
       released_warp_count = at_barrier.count();
+      released_credit_count = arrival_credit_count;
       m_bar_id_to_warps[bar_id] &= ~at_barrier;
+      m_bar_id_to_arrive_credited_warps[bar_id] &= ~at_barrier;
+      m_bar_id_to_sync_credited_warps[bar_id] &= ~at_barrier;
       m_warp_at_barrier &= ~at_barrier;
       if (bar_type == RED) {
         m_shader->broadcast_barrier_reduction(cta_id, bar_id, at_barrier);
@@ -4278,16 +4333,17 @@ void barrier_set_t::warp_reaches_barrier(unsigned cta_id, unsigned warp_id,
       }
     }
   } else {
-    // B1: release once the required thread count has arrived. Use >= (not ==) because
-    // ARRIVE+SYNC arrivals on a named barrier can accumulate and overshoot the exact
-    // equality window between cycles; >= still fires correctly and releases the whole
-    // id cohort together.
-    if ((at_barrier.count() * m_warp_size) >= bar_count) {
+    // B1/B3: counted named barriers release on arrival credits, not just unique warp ids.
+    // A same-warp ARRIVE followed by a later SYNC can contribute two credits in one epoch.
+    if ((arrival_credit_count * m_warp_size) >= bar_count) {
       // required number of warps have reached barrier, so release waiting
       // warps...
       released = true;
       released_warp_count = at_barrier.count();
+      released_credit_count = arrival_credit_count;
       m_bar_id_to_warps[bar_id] &= ~at_barrier;
+      m_bar_id_to_arrive_credited_warps[bar_id] &= ~at_barrier;
+      m_bar_id_to_sync_credited_warps[bar_id] &= ~at_barrier;
       m_warp_at_barrier &= ~at_barrier;
       if (bar_type == RED) {
         m_shader->broadcast_barrier_reduction(cta_id, bar_id, at_barrier);
@@ -4307,6 +4363,7 @@ void barrier_set_t::warp_reaches_barrier(unsigned cta_id, unsigned warp_id,
           << " bar_type=" << (int)bar_type
           << " bar_count=" << (int)bar_count
           << " released_warps=" << released_warp_count
+          << " released_credits=" << released_credit_count
           << " (first occurrence)\n";
       std::cerr << oss.str();
     }
@@ -4332,6 +4389,8 @@ void barrier_set_t::warp_exit(unsigned warp_id) {
     if (at_a_specific_barrier == active) {
       // all warps have reached barrier, so release waiting warps...
       m_bar_id_to_warps[i] &= ~at_a_specific_barrier;
+      m_bar_id_to_arrive_credited_warps[i] &= ~at_a_specific_barrier;
+      m_bar_id_to_sync_credited_warps[i] &= ~at_a_specific_barrier;
       m_warp_at_barrier &= ~at_a_specific_barrier;
     }
   }
@@ -4359,8 +4418,12 @@ void barrier_set_t::dump() {
   printf("  warp_at_barrier: %s\n", m_warp_at_barrier.to_string().c_str());
   for (unsigned i = 0; i < m_max_barriers_per_cta; i++) {
     warp_set_t warps_reached_barrier = m_bar_id_to_warps[i];
-    printf("  warp_at_barrier %u: %s\n", i,
-           warps_reached_barrier.to_string().c_str());
+    warp_set_t arrive_credited = m_bar_id_to_arrive_credited_warps[i];
+    warp_set_t sync_credited = m_bar_id_to_sync_credited_warps[i];
+    printf("  warp_at_barrier %u: %s arrive=%s sync=%s\n", i,
+           warps_reached_barrier.to_string().c_str(),
+           arrive_credited.to_string().c_str(),
+           sync_credited.to_string().c_str());
   }
   fflush(stdout);
 }

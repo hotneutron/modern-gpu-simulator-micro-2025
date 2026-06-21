@@ -1866,8 +1866,8 @@ void shader_core_config::reg_options(class OptionParser *opp) {
   option_parser_register(opp, "-bar_debug_issue_budget", OPT_UINT32,
                          &bar_debug_issue_budget,
                          "Maximum number of BARDBG per-issue decode lines to print "
-                         "(global) when bar_debug_enable is set. (default=20000)",
-                         "20000");
+                         "(global) when bar_debug_enable is set. (default=2000000)",
+                         "2000000");
   option_parser_register(opp, "-is_rf_cache_enabled", OPT_BOOL,
                          &is_rf_cache_enabled,
                          "If enabled, Regular register file has the register file feature enabled."

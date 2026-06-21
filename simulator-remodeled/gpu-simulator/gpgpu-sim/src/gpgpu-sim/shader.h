@@ -1368,6 +1368,8 @@ class barrier_set_t {
   unsigned m_warp_size;
   cta_to_warp_t m_cta_to_warps;
   bar_id_to_warp_t m_bar_id_to_warps;
+  bar_id_to_warp_t m_bar_id_to_arrive_credited_warps;
+  bar_id_to_warp_t m_bar_id_to_sync_credited_warps;
   warp_set_t m_warp_active;
   warp_set_t m_warp_at_barrier;
   shader_core_ctx_wrapper *m_shader;

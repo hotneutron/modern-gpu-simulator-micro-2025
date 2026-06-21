@@ -237,6 +237,14 @@ verified do we touch the decoder (Change 1-3) and the barrier engine (B1-B4).
     be modeled as a non-blocking ARRIVE; blocking it causes producer/consumer cycles.
   - `wait_barrier_bits == 0` → no scoreboard wait, so the BAR itself must block as a real
     CTA-wide `__syncthreads` (e.g. reduce_kernel id=0).
+- **A4 (REVISED after the teardown-assert investigation)**: a named barrier's counted
+  release is NOT always representable as "one credit per unique warp id". The current
+  engine stores only `m_bar_id_to_warps[bar_id]` (a warp bitset), so a warp that performs
+  `BAR.ARV` and later a matching `BAR.SYNC.DEFER_BLOCKING` on the SAME id contributes only
+  one bit. The new logs from FA3 show barriers whose required `bar_count` is satisfied only
+  if that later SYNC contributes an additional arrival credit. Therefore the current B3
+  assumption ("same-warp re-arrival is always idempotent") is too strong for these named
+  handshake barriers.
 
 ### Deadlock root cause (FA3 bwd full run, gpu_sim_cycle≈128751) and the BAR.SYNC.DEFER_BLOCKING semantics
 
@@ -300,6 +308,45 @@ The OnlyKernel5 run (FA3 fwd) hit the same `-gpgpu_deadlock_detect` abort
 count 416/256 + matching ARV). The FINAL rule reclassifies all of these as ARRIVE and so
 resolves the fwd deadlock identically to bwd.
 
+### Post-deadlock follow-up: teardown assert shows undercounted named-barrier credits
+After the FINAL blocking rule was implemented, the early producer/consumer deadlock went
+away, but both kernels later failed at CTA teardown:
+
+- `shader.cc:4223` `deallocate_barrier()` asserts that no per-id barrier state remains.
+- OnlyKernel10 and OnlyKernel5 both terminate on that assert, which means a named-barrier
+  id cohort never reached its release threshold and remained recorded until CTA exit.
+
+The new BARDBG logs show a very specific pattern:
+
+- **OnlyKernel10**: `bar_id=1, bar_count=288` never releases. The observed participants are
+  `warp 4..11` doing `BAR.ARV` at `pc=0x7df0` (8 warps total), and then `warp 11` doing a
+  later `BAR.SYNC.DEFER_BLOCKING` on the SAME id/count at `pc=0x7e10`. `288 / 32 = 9`, so
+  the logs match **8 ARRIVE credits + 1 later SYNC credit**, not 9 distinct warp ids.
+- **OnlyKernel5**: `bar_id=1, bar_count=416` shows the analogous pattern. `warp 4..15` do
+  `BAR.ARV` at `pc=0x80f0` (12 warps), and then `warp 15` later executes
+  `BAR.SYNC.DEFER_BLOCKING` on the SAME id/count at `pc=0x8170`. `416 / 32 = 13`, so this
+  likewise matches **12 ARRIVE credits + 1 later SYNC credit**.
+- In contrast, barriers that release successfully under the current engine are exactly the
+  ones whose `bar_count/32` already matches the number of UNIQUE participating warps
+  (e.g. OnlyKernel10 `bar_id=9,count=256`, OnlyKernel5 `bar_id=1,count=384`).
+
+This strongly suggests the new failure mode is NOT a generic decode bug that adds `+32`
+threads to every barrier count. Instead, it is an **engine accounting bug**: some named
+handshake barriers require one additional arrival credit from a warp that first arrives
+non-blockingly and later performs the matching SYNC, but the current bitset-based state
+(`m_bar_id_to_warps`) collapses both events into one bit.
+
+The secondary `undefined instruction` asserts seen in stdout/stderr are treated as
+post-abort noise, not the root cause:
+
+- the barrier teardown assert fires first;
+- only afterwards does another thread trip `trace_driven.cc:341` while running the
+  instruction-region prewarm path (`get_instruction_regions_to_prewarm` /
+  `enqueue_instruction_region_prewarm`).
+
+So the next fix target is the barrier engine's counted-release accounting, not opcode-map
+coverage.
+
 - **D1**: Register-form id/count → fall back to (0, -1). Not exact, but safe and bounded
   (only 5/23 barriers, mostly the dynamically-scheduled paths).
 - **D2**: Scope is the `OP_BAR` decode + barrier-set plumbing only. No changes to TMA,
@@ -354,6 +401,8 @@ current behavior (read from source) and the precise change for each case.
     `warp_waiting_at_barrier(warp_id)` returns exactly this bit (`shader.cc:4287-4289`),
     and `shd_warp_t::waiting()` ORs it into issue-gating (`subcore.cc:520`).
   - `m_bar_id_to_warps[bar_id]` — one warp_set_t per id; "which warps have arrived at id".
+    This can represent only UNIQUE participating warps. It cannot represent multiple
+    arrival credits from the same warp in one barrier epoch.
 - Arrival (`warp_reaches_barrier`, `shader.cc:4212-4260`):
   1. `assert(bar_id != -1)`; `m_bar_id_to_warps[bar_id].set(warp_id)`.
   2. if `SYNC||RED` → `m_warp_at_barrier.set(warp_id)` (block). ARRIVE does NOT block. ✅
@@ -381,12 +430,18 @@ silently mis-counting and either hanging or releasing early. This converts the u
 case into a clear, diagnosable failure rather than a wrong result.
 
 ### B1 — exact-count release (`==`) → make it `>=`
-`shader.cc:4250`: `(at_barrier.count()*warp_size) == bar_count`. With named barriers an
-id can legitimately accumulate arrivals across ARRIVE+SYNC and momentarily overshoot the
-exact equality window between cycles, never firing. **Change**: use `>=`:
-`(at_barrier.count()*warp_size) >= bar_count`. On release, clear ONLY the participating
-warps (current `&= ~at_barrier` already clears all arrived-at-this-id warps, which is
-correct since the whole id cohort is releasing together).
+`shader.cc:4250` currently uses the number of UNIQUE participating warps:
+`at_barrier.count()*warp_size`. That is insufficient for the new failure mode: some named
+barriers require `ARRIVE + later SYNC` from the SAME warp to contribute **two** credits in
+one epoch. **Change**:
+
+- keep `m_bar_id_to_warps[bar_id]` as the participating-warp set to clear on release;
+- add a separate per-id `arrival_credit_count`;
+- counted release becomes `arrival_credit_count * warp_size >= bar_count`.
+
+Use `>=`, not `==`, for the same reason as before: once credit accounting is fixed,
+ARRIVE+SYNC sequences can legally overshoot the equality boundary before the release test
+fires.
 
 ### B2 — ARRIVE must not park the warp, and must not be treated as "last inst at barrier"
 - Blocking is already skipped for ARRIVE (`shader.cc:4231`). ✅ (no change)
@@ -397,19 +452,43 @@ correct since the whole id cohort is releasing together).
   `bar_type != ARRIVE` (i.e. for SYNC/RED). Still call `warp_reaches_barrier` for ARRIVE so
   the arrival is recorded on the id.
 - **ARRIVE semantics decided**: an ARRIVE warp is added to `m_bar_id_to_warps[bar_id]` and
-  counts toward that id's release total, exactly like a SYNC arrival, but its own
-  `m_warp_at_barrier` bit is never set, so it keeps issuing. When a later SYNC on the same
-  id pushes the total to `>= bar_count`, the whole cohort (including the earlier ARRIVE
-  warps) is cleared from the id. This matches HW arrive/wait split.
+  contributes one arrival credit, but its own `m_warp_at_barrier` bit is never set, so it
+  keeps issuing. A later SYNC on the same id may contribute an ADDITIONAL arrival credit
+  before parking, depending on whether that warp has already consumed its per-epoch SYNC
+  credit for this id. Release still clears the whole participating cohort from the id.
 
-### B3 — ARRIVE re-entry / producer loop correctness
-FA3 producers execute the same `BAR.ARV` repeatedly across the K-loop. Because B2 clears
-the id only on release, an ARRIVE warp that arrives again before release would call
-`.set(warp_id)` on an already-set bit (idempotent — fine), but two arrivals from the SAME
-warp must not be double-counted. Since `m_bar_id_to_warps` is a bitset keyed by warp_id,
-re-arrival is naturally idempotent (count unchanged). **Action**: confirm by assertion
-that a warp re-arriving at an id it is already recorded on does not inflate the count;
-add a one-line guard/comment. No structural change expected.
+### B3 — replace "idempotent re-arrival" with split accounting
+The earlier B3 assumption is now contradicted by the logs. "Same-warp re-arrival is
+idempotent" is true only for repeated ARRIVE of the SAME role. It is NOT generally true
+for the mixed named-handshake pattern:
+
+- `BAR.ARV (warp X, id=k)` may contribute one arrival credit without blocking.
+- the SAME `warp X` may later execute `BAR.SYNC.DEFER_BLOCKING (id=k)` and contribute one
+  additional arrival credit before parking.
+
+Therefore the engine needs split state:
+
+- `participant_warps[bar_id]` — which warps are recorded on this id and must be cleared on
+  release;
+- `sync_credited_warps[bar_id]` — which warps have already consumed their per-epoch extra
+  SYNC credit on this id;
+- `arrival_credit_count[bar_id]` — total credit count used by the release threshold.
+
+Minimal policy:
+
+- ARRIVE: always add the warp to `participant_warps`; increment `arrival_credit_count` by 1.
+- SYNC/RED:
+  - add the warp to `participant_warps`;
+  - if this warp has not yet consumed its per-epoch SYNC credit for this id, increment
+    `arrival_credit_count` by 1 and mark it in `sync_credited_warps`;
+  - still park the warp in `m_warp_at_barrier` for true blocking forms.
+- Release on id `k`: clear `participant_warps[k]`, `sync_credited_warps[k]`,
+  `arrival_credit_count[k]`, and the parked-warp bits that were waiting on that id.
+
+This is the smallest change that explains BOTH problematic cases:
+
+- OnlyKernel10 `bar_id=1,count=288` = `8 ARV + 1 later SYNC`.
+- OnlyKernel5 `bar_id=1,count=416` = `12 ARV + 1 later SYNC`.
 
 ### B4 — id range safety
 `m_max_barriers_per_cta` comes from `-gpgpu_num_cta_barriers`; hard cap
@@ -425,14 +504,17 @@ diagnostic (pc / bar_id / bar_count). This makes any unmodeled sub-warp/divergen
 abort loudly instead of silently hanging or releasing early.
 
 ### Decision order (these interlock)
-B2 (ARRIVE counts toward the id, never blocks) defines the accounting; B1 (`>=`) makes the
-SYNC release robust given that accounting; B3 guarantees idempotent re-arrival; B4 (id
-range) and B5 (count%32) are independent safety asserts. Implement B4+B5 → B2 → B1 → B3,
-then wire decode (Change 1-3).
+B2 (ARRIVE non-blocking) defines the behavior; B3 (split arrival-credit accounting) fixes
+the undercounted named-handshake barriers; B1 (`>=` on the new credit count) makes release
+robust once that accounting is correct; B4 (id range) and B5 (count%32) remain independent
+safety asserts. Implement B4+B5 → B2 → B3 → B1.
 
 ### Files touched by the engine work
-- `gpu-simulator/gpgpu-sim/src/gpgpu-sim/shader.cc` — `warp_reaches_barrier` (`==`→`>=`,
-  re-arrival guard, id assert B4, count%32 assert B5).
+- `gpu-simulator/gpgpu-sim/src/gpgpu-sim/shader.h` — add per-id arrival-credit state
+  (credit count + SYNC-credit bookkeeping).
+- `gpu-simulator/gpgpu-sim/src/gpgpu-sim/shader.cc` — reset the new state at allocate /
+  release / deallocate, and change `warp_reaches_barrier` from UNIQUE-warp counting to
+  split participant-set + arrival-credit accounting.
 - `gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/sm.cc` — gate
   `store_info_of_last_inst_at_barrier` on `bar_type != ARRIVE`.
 - `gpu-simulator/trace-driven/trace_driven.cc` — decode-time B4/B5 asserts.
