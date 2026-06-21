@@ -291,6 +291,7 @@ bool trace_warp_inst_t::parse_from_trace_struct(
   mem_op = NOT_TEX;
   const_cache_operand = 0;
   oprnd_type = UN_OP;
+  bar_subop = BAR_SUBOP_NONE;
 
   // MOD. Begin. VPREG
   vpreg_virtual_ar1 = 0;
@@ -595,7 +596,7 @@ bool trace_warp_inst_t::parse_from_trace_struct(
         bar_count = (unsigned)-1;  // bare bar.sync / unresolved register count => whole CTA
       }
 
-      // --- bar_type (blocking vs non-blocking), verified across all 9 traced kernels ---
+      // --- bar_type (blocking vs non-blocking) and BAR subtype ---
       // The ONLY blocking case is a plain full-CTA __syncthreads: id==0, full-CTA count,
       // and no scoreboard wait. Every other observed BAR (BAR.ARV, any named id, any
       // partial count, or a full-CTA SYNC whose wait is offloaded to a scoreboard wait on
@@ -607,7 +608,16 @@ bool trace_warp_inst_t::parse_from_trace_struct(
       bool is_plain_full_cta_syncthreads =
           is_sync_defer && (bar_id == 0) && (bar_count == (unsigned)-1) &&
           (wait_barrier_bits == 0);
-      bar_type = is_plain_full_cta_syncthreads ? SYNC : ARRIVE;
+      if (is_arv) {
+        bar_subop = BAR_SUBOP_ARV;
+        bar_type = ARRIVE;
+      } else if (is_plain_full_cta_syncthreads) {
+        bar_subop = BAR_SUBOP_SYNC_PLAIN;
+        bar_type = SYNC;
+      } else {
+        bar_subop = BAR_SUBOP_SYNC_DEFER_BLOCKING;
+        bar_type = ARRIVE;
+      }
 
       // B4: id must be representable by the barrier set.
       assert(bar_id < MAX_BARRIERS_PER_CTA &&

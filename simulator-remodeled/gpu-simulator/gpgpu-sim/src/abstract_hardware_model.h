@@ -150,6 +150,15 @@ typedef unsigned long long addr_t;
 enum uarch_bar_t { NOT_BAR = -1, SYNC = 1, ARRIVE, RED };
 typedef enum uarch_bar_t barrier_type;
 
+enum uarch_bar_subop_t {
+  BAR_SUBOP_NONE = 0,
+  BAR_SUBOP_ARV,
+  BAR_SUBOP_SYNC_DEFER_BLOCKING,
+  BAR_SUBOP_SYNC_PLAIN,
+  BAR_SUBOP_RED
+};
+typedef enum uarch_bar_subop_t bar_subop_type;
+
 // MOD. Begin. MOD. VPREG. MOD. Improving branch behavior in traces
 enum uarch_trace_control_flow_t { NOT_DEFINED = -1, IS_BRANCH = 1, IS_ENDCALL = 2, IS_JUMP = 3, IS_BSYNC = 4, IS_WARPSYNC = 5, IS_RPCMOV = 6, IS_YIELD = 7  };
 typedef enum uarch_trace_control_flow_t trace_control_flow_type;
@@ -1096,6 +1105,7 @@ class inst_t {
     reconvergence_pc = (address_type)-1;
     op = NO_OP;
     bar_type = NOT_BAR;
+    bar_subop = BAR_SUBOP_NONE;
     control_flow_type = NOT_DEFINED; // MOD. VPREG. Improving branch behavior in traces
     red_type = NOT_RED;
     bar_id = (unsigned)-1;
@@ -1208,6 +1218,7 @@ class inst_t {
   void set_num_operands(unsigned num) { num_operands = num; }
   void set_bar_id(unsigned id) { bar_id = id; }
   void set_bar_count(unsigned count) { bar_count = count; }
+  void set_bar_subop(bar_subop_type subop) { bar_subop = subop; }
 
   unsigned int unique_function_id;
 
@@ -1232,6 +1243,7 @@ class inst_t {
   bool skip_wb;
 
   barrier_type bar_type;
+  bar_subop_type bar_subop;
   trace_control_flow_type control_flow_type; // MOD. VPREG. Improving branch behavior in traces
   reduction_type red_type;
   unsigned bar_id;

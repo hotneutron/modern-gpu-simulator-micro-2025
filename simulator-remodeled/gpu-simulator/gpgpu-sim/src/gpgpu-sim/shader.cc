@@ -4208,8 +4208,8 @@ void barrier_set_t::deallocate_barrier(unsigned cta_id) {
   if (m_shader->get_config()->bar_debug_enable) {
     unsigned leaked_ids = 0;
     unsigned leaked_participant_warps = 0;
-    unsigned leaked_arrive_credits = 0;
-    unsigned leaked_sync_credits = 0;
+    unsigned leaked_arv_seen = 0;
+    unsigned leaked_defer_sync_extra_credits = 0;
     std::ostringstream oss;
     const unsigned long long cycle =
         m_shader->get_gpu()->gpu_tot_sim_cycle +
@@ -4221,15 +4221,12 @@ void barrier_set_t::deallocate_barrier(unsigned cta_id) {
       if (participant_i.any() || arrive_i.any() || sync_i.any()) {
         ++leaked_ids;
         leaked_participant_warps += participant_i.count();
-        leaked_arrive_credits += arrive_i.count();
-        leaked_sync_credits += sync_i.count();
-        unsigned arrive_credits =
-            arrive_i.count();
-        unsigned sync_credits = sync_i.count();
+        leaked_arv_seen += arrive_i.count();
+        leaked_defer_sync_extra_credits += sync_i.count();
         oss << "[BARDBG][leak]   bar_id=" << i
             << " warps=" << participant_i.to_string()
-            << " arrive_credits=" << arrive_credits
-            << " sync_credits=" << sync_credits << "\n";
+            << " arv_seen=" << arrive_i.count()
+            << " defer_sync_extra_credits=" << sync_i.count() << "\n";
       }
     }
     std::cerr << "[BARDBG][summary] cta_id=" << cta_id
@@ -4238,8 +4235,9 @@ void barrier_set_t::deallocate_barrier(unsigned cta_id) {
               << " parked=" << at_barrier.to_string()
               << " leaked_ids=" << leaked_ids
               << " leaked_participant_warps=" << leaked_participant_warps
-              << " leaked_arrive_credits=" << leaked_arrive_credits
-              << " leaked_sync_credits=" << leaked_sync_credits << "\n";
+              << " leaked_arv_seen=" << leaked_arv_seen
+              << " leaked_defer_sync_extra_credits="
+              << leaked_defer_sync_extra_credits << "\n";
     if (leaked_ids > 0) {
       std::cerr << oss.str();
     }
@@ -4268,6 +4266,7 @@ void barrier_set_t::deallocate_barrier(unsigned cta_id) {
 void barrier_set_t::warp_reaches_barrier(unsigned cta_id, unsigned warp_id,
                                          warp_inst_t *inst) {
   barrier_type bar_type = inst->bar_type;
+  bar_subop_type bar_subop = inst->bar_subop;
   unsigned bar_id = inst->bar_id;
   unsigned bar_count = inst->bar_count;
   assert(bar_id != (unsigned)-1);
@@ -4290,16 +4289,25 @@ void barrier_set_t::warp_reaches_barrier(unsigned cta_id, unsigned warp_id,
 
   // Keep the per-id participant set so release can clear the whole cohort at once.
   m_bar_id_to_warps[bar_id].set(warp_id);
-  // B3: split arrival accounting. Repeated ARRIVE by the same warp is idempotent, but a
-  // later SYNC on the same id may contribute one additional credit for the current epoch.
-  if (bar_type == ARRIVE) {
-    if (!m_bar_id_to_arrive_credited_warps[bar_id].test(warp_id) &&
-        !m_bar_id_to_sync_credited_warps[bar_id].test(warp_id)) {
-      m_bar_id_to_arrive_credited_warps[bar_id].set(warp_id);
-    }
-  } else if (bar_type == SYNC || bar_type == RED) {
-    if (!m_bar_id_to_sync_credited_warps[bar_id].test(warp_id)) {
+  // B3: keep execution semantics (bar_type) separate from BAR subtype semantics
+  // (bar_subop). BAR.ARV marks that the warp has already contributed its base arrival.
+  // BAR.SYNC.DEFER_BLOCKING is still non-blocking for scheduling, but if it arrives after
+  // a prior BAR.ARV on the same id/epoch it contributes one additional deferred-sync
+  // credit. Plain blocking BAR.SYNC does not get this extra credit.
+  bool deferred_sync_had_prior_arv = false;
+  bool deferred_sync_already_extra_credited = false;
+  bool deferred_sync_extra_credit_granted = false;
+  if (bar_subop == BAR_SUBOP_ARV) {
+    m_bar_id_to_arrive_credited_warps[bar_id].set(warp_id);
+  } else if (bar_subop == BAR_SUBOP_SYNC_DEFER_BLOCKING) {
+    deferred_sync_had_prior_arv =
+        m_bar_id_to_arrive_credited_warps[bar_id].test(warp_id);
+    deferred_sync_already_extra_credited =
+        m_bar_id_to_sync_credited_warps[bar_id].test(warp_id);
+    if (deferred_sync_had_prior_arv &&
+        !deferred_sync_already_extra_credited) {
       m_bar_id_to_sync_credited_warps[bar_id].set(warp_id);
+      deferred_sync_extra_credit_granted = true;
     }
   }
   // B2: ARRIVE registers the arrival on the id (so a later SYNC on this id can release)
@@ -4309,10 +4317,36 @@ void barrier_set_t::warp_reaches_barrier(unsigned cta_id, unsigned warp_id,
   }
   warp_set_t warps_in_cta = w->second;
   warp_set_t at_barrier = warps_in_cta & m_bar_id_to_warps[bar_id];
-  unsigned arrival_credit_count =
-      (warps_in_cta & m_bar_id_to_arrive_credited_warps[bar_id]).count() +
+  unsigned arrival_credit_count = at_barrier.count() +
       (warps_in_cta & m_bar_id_to_sync_credited_warps[bar_id]).count();
   warp_set_t active = warps_in_cta & m_warp_active;
+  if (bar_subop == BAR_SUBOP_SYNC_DEFER_BLOCKING &&
+      m_shader->get_config()->bar_debug_enable) {
+    static std::set<unsigned long long> seen_deferred_sync_credit_grants;
+    static std::set<unsigned long long> seen_deferred_sync_credit_misses;
+    unsigned long long key = ((unsigned long long)bar_id << 40) ^
+                             ((unsigned long long)(int)bar_subop << 32) ^
+                             (unsigned long long)bar_count;
+    std::ostringstream oss;
+    oss << " cta_id=" << cta_id
+        << " warp=" << warp_id
+        << " bar_id=" << bar_id
+        << " bar_count=" << static_cast<int>(bar_count)
+        << " had_prior_arv=" << (deferred_sync_had_prior_arv ? 1 : 0)
+        << " already_extra_credited="
+        << (deferred_sync_already_extra_credited ? 1 : 0)
+        << " participant_warps=" << at_barrier.count()
+        << " total_credits=" << arrival_credit_count << "\n";
+    if (deferred_sync_extra_credit_granted) {
+      if (seen_deferred_sync_credit_grants.insert(key).second) {
+        std::cerr << "[BARDBG][deferred-sync-credit]" << oss.str();
+      }
+    } else {
+      if (seen_deferred_sync_credit_misses.insert(key).second) {
+        std::cerr << "[BARDBG][deferred-sync-miss]" << oss.str();
+      }
+    }
+  }
   bool released = false;
   unsigned released_warp_count = 0;
   unsigned released_credit_count = 0;
@@ -4350,17 +4384,20 @@ void barrier_set_t::warp_reaches_barrier(unsigned cta_id, unsigned warp_id,
       }
     }
   }
-  // BARDBG: log the FIRST release seen for each (bar_id, bar_type, bar_count) tuple so
+  // BARDBG: log the FIRST release seen for each (bar_id, bar_type, bar_subop, bar_count)
+  // tuple so
   // the decode + release path can be verified in the long run without log explosion.
   if (released && m_shader->get_config()->bar_debug_enable) {
     static std::set<unsigned long long> seen_release_keys;
     unsigned long long key = ((unsigned long long)bar_id << 40) ^
-                             ((unsigned long long)(int)bar_type << 36) ^
+                            ((unsigned long long)(int)bar_type << 36) ^
+                            ((unsigned long long)(int)bar_subop << 32) ^
                              (unsigned long long)bar_count;
     if (seen_release_keys.insert(key).second) {
       std::ostringstream oss;
       oss << "[BARDBG][release] bar_id=" << bar_id
           << " bar_type=" << (int)bar_type
+          << " bar_subop=" << (int)bar_subop
           << " bar_count=" << (int)bar_count
           << " released_warps=" << released_warp_count
           << " released_credits=" << released_credit_count

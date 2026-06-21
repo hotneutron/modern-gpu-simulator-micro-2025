@@ -245,6 +245,14 @@ verified do we touch the decoder (Change 1-3) and the barrier engine (B1-B4).
   if that later SYNC contributes an additional arrival credit. Therefore the current B3
   assumption ("same-warp re-arrival is always idempotent") is too strong for these named
   handshake barriers.
+- **A5 (NEW after the first accounting patch failed)**: preserving only `bar_type` is NOT
+  sufficient. `BAR.ARV` and `BAR.SYNC.DEFER_BLOCKING` can both be non-blocking from the
+  scheduler's point of view (`bar_type = ARRIVE`), but they are NOT the same for counted
+  release accounting. The decode must preserve a BAR-internal subtype (`bar_subop`) so the
+  engine can distinguish:
+  - `BAR.ARV` = base arrive credit
+  - `BAR.SYNC.DEFER_BLOCKING` = non-blocking execution, but potentially an additional
+    deferred-sync credit if the same warp already executed `BAR.ARV` for that id/epoch.
 
 ### Deadlock root cause (FA3 bwd full run, gpu_sim_cycle≈128751) and the BAR.SYNC.DEFER_BLOCKING semantics
 
@@ -292,7 +300,7 @@ of every non-blocking case was traced to a scoreboard set by a preceding `SYNCS.
 cross-warp named-barrier rendezvous. So those waits are already modeled by the scoreboard
 path (`Subcore::is_wait_barriers_ready_entry_point`) and the BAR itself must NOT block.
 
-**FINAL rule (implemented in `trace_driven.cc` OP_BAR):**
+**FINAL blocking rule (implemented in `trace_driven.cc` OP_BAR):**
 ```
 is_plain_full_cta_syncthreads = SYNC.DEFER && id==0 && count==full(-1) && wait_barrier_bits==0
 bar_type = is_plain_full_cta_syncthreads ? SYNC : ARRIVE
@@ -301,6 +309,21 @@ bar_type = is_plain_full_cta_syncthreads ? SYNC : ARRIVE
   BAR form reaching `OP_BAR` aborts** (`assert(is_arv || is_sync_defer)`) so an
   uncharacterized form can never be silently mis-modeled.
 - B4 (`bar_id < MAX_BARRIERS_PER_CTA`) and B5 (`bar_count % warp_size == 0`) asserts remain.
+
+**NEW subtype rule (must be preserved alongside `bar_type`):**
+```
+if opcode == BAR.ARV:
+    bar_subop = BAR_SUBOP_ARV
+elif is_plain_full_cta_syncthreads:
+    bar_subop = BAR_SUBOP_SYNC_PLAIN
+elif opcode == BAR.SYNC.DEFER_BLOCKING:
+    bar_subop = BAR_SUBOP_SYNC_DEFER_BLOCKING
+```
+
+This is the missing piece from the first fix: deadlock avoidance requires
+`BAR.SYNC.DEFER_BLOCKING` to stay non-blocking in many FA3 cases, but counted-release
+accounting still needs to know that it is a deferred-sync form, not the same event as
+`BAR.ARV`.
 
 ### Deadlock confirmed on FA3 fwd too (kernel 5 / ufid 3)
 The OnlyKernel5 run (FA3 fwd) hit the same `-gpgpu_deadlock_detect` abort
@@ -335,6 +358,30 @@ threads to every barrier count. Instead, it is an **engine accounting bug**: som
 handshake barriers require one additional arrival credit from a warp that first arrives
 non-blockingly and later performs the matching SYNC, but the current bitset-based state
 (`m_bar_id_to_warps`) collapses both events into one bit.
+
+### Follow-up after the first accounting patch: why the extra-credit fix did not fire
+The first accounting patch added separate "ARRIVE credited" and "SYNC credited" state, but
+it keyed the extra-credit path on `bar_type == SYNC`. That patch still failed on
+OnlyKernel10, and the new BARDBG summary/leak logs explained why:
+
+- the teardown assert remained (`shader.cc:4223`);
+- `BARDBG[summary]` showed `parked=0` but `leaked_ids>0`, so this is a participant-only
+  leak, not a warp-still-blocked case;
+- `BARDBG[leak]` for the failing CTA showed `bar_id=1` with `arv_seen=8` and
+  `defer_sync_extra_credits=0`;
+- all `BARDBG[release]` lines still had `released_credits == released_warps`, i.e. the
+  expected extra credit was never granted.
+
+Root cause: `BAR.SYNC.DEFER_BLOCKING` had already been intentionally reclassified to
+`bar_type = ARRIVE` to avoid the original deadlock. That is still correct for blocking
+semantics, but it means the engine cannot use `bar_type` alone to tell `BAR.ARV` apart from
+`BAR.SYNC.DEFER_BLOCKING`. So the extra-credit patch never triggered.
+
+This proves the next fix must preserve **two orthogonal dimensions**:
+
+- `bar_type`: scheduler / parking semantics (`SYNC` vs non-blocking `ARRIVE`);
+- `bar_subop`: BAR-internal semantic subtype (`ARV`, `SYNC_DEFER_BLOCKING`, plain
+  full-CTA `SYNC`, `RED`).
 
 The secondary `undefined instruction` asserts seen in stdout/stderr are treated as
 post-abort noise, not the root cause:
@@ -457,7 +504,7 @@ fires.
   before parking, depending on whether that warp has already consumed its per-epoch SYNC
   credit for this id. Release still clears the whole participating cohort from the id.
 
-### B3 — replace "idempotent re-arrival" with split accounting
+### B3 — replace "idempotent re-arrival" with split accounting AND subtype preservation
 The earlier B3 assumption is now contradicted by the logs. "Same-warp re-arrival is
 idempotent" is true only for repeated ARRIVE of the SAME role. It is NOT generally true
 for the mixed named-handshake pattern:
@@ -466,24 +513,36 @@ for the mixed named-handshake pattern:
 - the SAME `warp X` may later execute `BAR.SYNC.DEFER_BLOCKING (id=k)` and contribute one
   additional arrival credit before parking.
 
-Therefore the engine needs split state:
+Therefore the engine needs split state, and decode must preserve which BAR subtype actually
+arrived:
 
 - `participant_warps[bar_id]` — which warps are recorded on this id and must be cleared on
   release;
-- `sync_credited_warps[bar_id]` — which warps have already consumed their per-epoch extra
-  SYNC credit on this id;
-- `arrival_credit_count[bar_id]` — total credit count used by the release threshold.
+- `arv_seen_warps[bar_id]` — which warps executed `BAR.ARV` on this id in the current
+  epoch;
+- `deferred_sync_extra_credit_warps[bar_id]` — which warps have already consumed their
+  per-epoch extra credit via `BAR.SYNC.DEFER_BLOCKING` on this id.
 
 Minimal policy:
 
-- ARRIVE: always add the warp to `participant_warps`; increment `arrival_credit_count` by 1.
-- SYNC/RED:
+- `BAR.ARV`:
   - add the warp to `participant_warps`;
-  - if this warp has not yet consumed its per-epoch SYNC credit for this id, increment
-    `arrival_credit_count` by 1 and mark it in `sync_credited_warps`;
-  - still park the warp in `m_warp_at_barrier` for true blocking forms.
-- Release on id `k`: clear `participant_warps[k]`, `sync_credited_warps[k]`,
-  `arrival_credit_count[k]`, and the parked-warp bits that were waiting on that id.
+  - mark it in `arv_seen_warps`;
+  - contributes the base credit already represented by `participant_warps.count()`.
+- `BAR.SYNC.DEFER_BLOCKING`:
+  - add the warp to `participant_warps`;
+  - execution stays non-blocking (`bar_type = ARRIVE`);
+  - if this warp is already in `arv_seen_warps` and not yet in
+    `deferred_sync_extra_credit_warps`, grant one extra credit and mark it there.
+- plain blocking `BAR.SYNC` / `BAR.RED`:
+  - add the warp to `participant_warps`;
+  - park it according to `bar_type`;
+  - no deferred extra credit unless a future kernel proves otherwise.
+- total counted-release credit:
+  - `participant_warps.count() + deferred_sync_extra_credit_warps.count()`
+- Release on id `k`: clear `participant_warps[k]`, `arv_seen_warps[k]`,
+  `deferred_sync_extra_credit_warps[k]`, and the parked-warp bits that were waiting on that
+  id.
 
 This is the smallest change that explains BOTH problematic cases:
 
@@ -503,21 +562,40 @@ The release math `at_barrier.count()*warp_size` assumes full-32-thread warps (se
 diagnostic (pc / bar_id / bar_count). This makes any unmodeled sub-warp/divergent barrier
 abort loudly instead of silently hanging or releasing early.
 
+### Debug signals required for the next validation run
+The next validation run must print enough information to prove the subtype-aware credit path
+is or is not firing:
+
+- `BARDBG[issue]` must include both `bar_type` and `bar_subop`;
+- `BARDBG[deferred-sync-credit]` should print the first successful extra-credit grant for a
+  `(bar_id, bar_subop, bar_count)` tuple;
+- `BARDBG[deferred-sync-miss]` should print the first miss, with
+  `had_prior_arv` / `already_extra_credited`;
+- `BARDBG[release]` must include `released_warps` and `released_credits`;
+- `BARDBG[summary]` / `BARDBG[leak]` must remain enabled so participant-only leaks are still
+  visible at CTA teardown.
+
 ### Decision order (these interlock)
-B2 (ARRIVE non-blocking) defines the behavior; B3 (split arrival-credit accounting) fixes
-the undercounted named-handshake barriers; B1 (`>=` on the new credit count) makes release
-robust once that accounting is correct; B4 (id range) and B5 (count%32) remain independent
-safety asserts. Implement B4+B5 → B2 → B3 → B1.
+B2 (ARRIVE non-blocking) defines blocking behavior; the new subtype rule preserves
+`BAR.ARV` vs `BAR.SYNC.DEFER_BLOCKING`; B3 (split arrival-credit accounting keyed by
+subtype) fixes the undercounted named-handshake barriers; B1 (`>=` on the new credit
+count) makes release robust once that accounting is correct; B4 (id range) and B5
+(count%32) remain independent safety asserts. Implement B4+B5 → B2 → subtype preservation
+→ B3 → B1.
 
 ### Files touched by the engine work
-- `gpu-simulator/gpgpu-sim/src/gpgpu-sim/shader.h` — add per-id arrival-credit state
-  (credit count + SYNC-credit bookkeeping).
+- `gpu-simulator/gpgpu-sim/src/abstract_hardware_model.h` — add `bar_subop` so `BAR.ARV`
+  and `BAR.SYNC.DEFER_BLOCKING` remain distinguishable after decode.
+- `gpu-simulator/trace-driven/trace_driven.cc` — preserve both `bar_type` and `bar_subop`
+  in `OP_BAR` decode.
+- `gpu-simulator/gpgpu-sim/src/gpgpu-sim/shader.h` — add per-id participant / ARV-seen /
+  deferred-sync-extra-credit state.
 - `gpu-simulator/gpgpu-sim/src/gpgpu-sim/shader.cc` — reset the new state at allocate /
   release / deallocate, and change `warp_reaches_barrier` from UNIQUE-warp counting to
-  split participant-set + arrival-credit accounting.
+  subtype-aware split participant-set + deferred-sync-credit accounting.
 - `gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/sm.cc` — gate
-  `store_info_of_last_inst_at_barrier` on `bar_type != ARRIVE`.
-- `gpu-simulator/trace-driven/trace_driven.cc` — decode-time B4/B5 asserts.
+  `store_info_of_last_inst_at_barrier` on `bar_type != ARRIVE`, and print `bar_subop` in
+  `BARDBG[issue]`.
 - (config) `gpgpusim.config` `-gpgpu_num_cta_barriers` = 16 if not already.
 
 These are the "does it run correctly" guarantees; they gate the plan as much as the

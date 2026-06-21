@@ -206,6 +206,7 @@ void debug_print_sm_barrier_issue(const warp_inst_t &inst,
       << " op=" << static_cast<int>(inst.op)
       << " trace_opcode=" << trace_opcode
       << " bar_type=" << static_cast<int>(inst.bar_type)
+      << " bar_subop=" << static_cast<int>(inst.bar_subop)
       << " bar_id=" << inst.bar_id
       << " bar_count=" << static_cast<int>(inst.bar_count)
       << " wait_bits=" << wait_barrier_bits << "\n";
