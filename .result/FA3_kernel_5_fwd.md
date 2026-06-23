@@ -1,5 +1,64 @@
 # FA3 Kernel 5 (FWD) — Simulator vs. Real H100 Comparison
 
+---
+
+## UPDATE — after the OP_BAR named/counted-barrier fix (2026-06)
+
+The numbers in the original sections below ("Simulator" = **220,024 cycles**) were produced
+**before** the named/counted-barrier engine fix. The barrier model was over-serializing the
+warp-specialized FA3 pipeline (`inst_barrier` ≈ 56% of issue-stage stall). After fixing the
+`OP_BAR` decode + the barrier engine (see `.plan/BAR_OP_H100.md`), the same OnlyKernel5 run
+completes cleanly (`*** exit detected ***`, no assert / deadlock) and the accuracy improves
+substantially.
+
+### Before vs. After (FA3 fwd, trace kernel 5, `FlashAttnFwdSm90`)
+
+| Metric | Real H100 (NCU) | Before (sim) | After fix (sim) | Note |
+|---|---|---|---|---|
+| **Elapsed / sim cycles** | 67,696 | **220,024** (3.25×) | **162,582** (2.40×) | **−26% cycles; 3.25× → 2.40×** |
+| gpu_sim_insn | — | 455,639,416 | 455,648,438 | ≈ identical (decode unchanged) |
+| gpu_occupancy | 20.14% | 19.85% | 19.30% | unchanged (resource model intact) |
+| `inst_barrier` stall share | barrier ≈ 10.9% | **56.09%** | **9.09%** | now matches HW barrier share |
+| `wait_barrier` (mbarrier) share | — | 6.64% | 8.07% | similar |
+| **TMA-axis stall share** | ≈ 23.8% | **62.73%** | **17.16%** | inverted attribution removed |
+| non-TMA-axis stall share | ≈ 57.8% | 17.80% | 17.34% | still under-attributed |
+| `issuing` share | 13.9% | 14.56% | 21.17% | closer to HW |
+| `no_valid_instruction` (frontend) | ≈ 4.5% | 9.52% | 39.12% | **new dominant bucket (next target)** |
+| shared-mem bank conflicts | 281 | 38,016 | 38,016 | untouched (separate model bug) |
+| run termination | — | abort (deadlock / teardown assert) | `*** exit detected ***` (12h38m) | **fixed** |
+
+> Caveat on the percentage rows: the issue-stage normalization denominator
+> (`total_num_cycles_issue_stage_evaluated`) changed between runs (110.4M → 75.9M), so the
+> percentages are **not** on an identical base — read them as a *trend* (barrier share
+> collapsing), not an exact like-for-like delta. The cycle counts (220,024 → 162,582) and the
+> termination status are directly comparable.
+
+### What the fix changed (engine, not decode)
+
+- The `OP_BAR` decode and the blocking-vs-arrive rule were already correct (see
+  `.plan/BAR_OP_H100.md` FINAL rule). The residual failure was a **CTA-teardown leak**:
+  in a warp-specialized kernel the producer/consumer warpgroups exit at different times, and
+  a counted/named barrier whose closing credit would have come from an already-exited warp
+  was never released, tripping `shader.cc:4252 deallocate_barrier` assert.
+- `barrier_set_t::warp_exit` now removes the exiting warp from every per-id participant /
+  arrive-credit / sync-credit set, and a new helper `release_satisfiable_barriers()`
+  generalizes the legacy full-CTA release (`at_barrier == active`) to counted/named barriers
+  so they drain once the remaining active participants have all arrived.
+- BARDBG verification on this run: all 40 CTA teardowns report `leaked_ids=0` (was 6),
+  8 `[BARDBG][exit-release]` events (ids 1,4,5,8,9,10,11), and `0` `exit-clear was_parked=1`
+  (no warp wrongly parked at a blocking SYNC ⇒ decode classification confirmed sound).
+
+### Residual gap (unchanged conclusion, smaller magnitude)
+
+With the spurious barrier serialization removed, the remaining 2.40× over-estimation is no
+longer barrier-dominated. The new largest bucket is the **frontend**
+(`no_valid_instruction = 39.1%`, almost entirely `head_invalid_waiting_frontend` = I-cache
+prefetch / stream-buffer wait), followed by the still-under-modeled non-TMA scheduler axis.
+The TMA-emission-serialization / mbarrier-credit-timing candidates from the analysis below
+remain the next levers; the ROP-latency conclusion is unchanged.
+
+---
+
 ## Target Information
 
 - **Workload**: `flashattn-fa3-bf16-bwd-causal-b1-s2048-hd64-nh24`

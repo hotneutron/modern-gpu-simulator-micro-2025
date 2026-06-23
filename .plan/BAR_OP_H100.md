@@ -1,4 +1,4 @@
-# Fix OP_BAR named/partial/arrive barrier decoding (FA3 bwd kernel 10 CTA serialization)
+# BAR_OP on H100: named/partial/arrive barrier decoding + warp-exit drain (FA3 warp-specialized kernels)
 
 ## Summary
 
@@ -666,9 +666,96 @@ B8. **Regression guard**: a plain full-CTA `__syncthreads` kernel (e.g. `reduce_
 ## Files to touch
 - `gpu-simulator/trace-driven/trace_driven.cc` — `OP_BAR` decode (Change 1).
 - `gpu-simulator/gpgpu-sim/src/gpgpu-sim/shader.cc` — verify/guard ARRIVE non-block
-  (Change 2), `m_max_barriers_per_cta` sizing + bounds (Change 3).
+  (Change 2), `m_max_barriers_per_cta` sizing + bounds (Change 3), **and the warp-exit
+  drain (B6, see below)**.
+- `gpu-simulator/gpgpu-sim/src/gpgpu-sim/shader.h` — declaration of the new
+  `release_satisfiable_barriers()` helper (B6).
 - `gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/sm.cc` — verify `BARRIER_OP` dispatch
   respects `bar_type == ARRIVE` (Change 2).
 
 (Read-only references used for grounding: `trace_parser.cc`, `abstract_hardware_model.h`,
 `subcore.cc`, `enhanced_execution_info.json`, `dynamic_trace.pb`, `instruction.proto`.)
+
+---
+
+## B6 — The decisive fix: drain named/counted barriers at warp-specialized exit (IMPLEMENTED)
+
+### Correction to the earlier teardown-leak diagnosis
+The "Post-deadlock follow-up" sections above concluded the teardown leak
+(`shader.cc:4252 deallocate_barrier(): Assertion at_a_specific_barrier.any() == false`) was
+purely a **counted-release accounting bug** solvable by adding an ARRIVE+later-SYNC extra
+credit (B1/B3). That accounting fix (`m_bar_id_to_arrive_credited_warps` /
+`m_bar_id_to_sync_credited_warps`, `>=` release) was implemented and is correct **for a
+single barrier epoch**, but it was **not sufficient** and the earlier diagnosis was
+**incomplete**. The actual residual root cause is an **exit-timing** problem, not a
+per-epoch credit problem:
+
+- FA3 is warp-specialized: producer and consumer warpgroups reach `exit` at **different**
+  times. After a counted/named barrier releases once and is **re-armed for a later epoch**,
+  the warp that would contribute the *closing* credit (e.g. the 13th credit of
+  `id=1 count=416`, or the full-CTA quorum of `id=0 count=-1`) may have **already exited**
+  the kernel. That credit can therefore never arrive, the release threshold is never met,
+  and the participant bits stay recorded until CTA teardown → the assert fires.
+- Evidence (BARDBG on the failing run): `[BARDBG][summary]` showed `parked=0` (no warp
+  blocked) but `leaked_ids>0` (participant-only leak), and the leaked ids were exactly the
+  re-armed named/counted barriers (`id=0,1,8,9,10,11`) — i.e. a release-quorum problem, not
+  a still-blocked-warp problem.
+- Why B1/B3 alone did not fix it: the extra-credit accounting only helps **while all
+  participants are still alive**. Once a participant exits, no amount of credit re-counting
+  on the *remaining* warps can reach a threshold that assumed the exited warp would arrive.
+
+The decode + blocking rule (FINAL rule, Change 1) and B1–B5 remain correct and necessary;
+B6 is the missing piece that makes the engine robust to warpgroup-staggered exit.
+
+### The change (`barrier_set_t::warp_exit` + new helper)
+`gpu-simulator/gpgpu-sim/src/gpgpu-sim/shader.cc`,
+`gpu-simulator/gpgpu-sim/src/gpgpu-sim/shader.h`:
+
+- **`warp_exit(warp_id)`** now, in addition to `m_warp_active.reset(warp_id)`:
+  - removes the exiting warp from **every** per-id set
+    (`m_bar_id_to_warps`, `m_bar_id_to_arrive_credited_warps`,
+    `m_bar_id_to_sync_credited_warps`) and from `m_warp_at_barrier` — an exited warp can
+    never arrive at a future epoch, so leaving its bit set is what caused the leak. This
+    also preserves the invariant *participant ⊆ active*.
+  - calls the new helper to re-evaluate releases against the shrunken active set.
+- **`release_satisfiable_barriers(cta_id)`** (new private helper): for each barrier id,
+  release the whole arrived cohort when `at_a_specific_barrier.any() && at_a_specific_barrier
+  == active`. This **generalizes the legacy full-CTA release** (which only the old
+  `bar_count==-1` path performed) to **counted and named** barriers, so any id whose
+  *remaining active* participants have all arrived drains immediately once the other
+  participants exit — instead of dangling until teardown.
+
+Semantics note: this is the same "all still-alive participants have arrived → release"
+rule the legacy full-CTA `warp_exit` already used; B6 only extends it to the counted/named
+ids and adds the per-id state cleanup. It does **not** weaken the normal in-flight release
+paths in `warp_reaches_barrier` (B1/B3), which still fire first during normal execution.
+
+### B6 debug signals (gated by `-bar_debug_enable`, first-occurrence rate-limited)
+- `[BARDBG][exit-clear]`: which `bar_id` an exiting warp was still recorded on, plus
+  `was_parked` — surfaces a genuine mis-decode (a warp exiting while parked at a *real*
+  blocking SYNC) instead of silently swallowing it.
+- `[BARDBG][exit-release]`: first exit-triggered release per `bar_id` — confirms the new
+  path actually fires and measures how much the kernel relies on it.
+
+### B6 verification (OnlyKernel5 = FA3 fwd, `FlashAttnFwdSm90`)
+- Terminates cleanly: `*** exit detected ***`, **no** assert / signal / `-gpgpu_deadlock_detect`
+  abort (12h38m wall).
+- **All 40 CTA teardowns report `leaked_ids=0`** (was `leaked_ids=6`).
+- **8 `[BARDBG][exit-release]`** events (ids 1,4,5,8,9,10,11); **0 `[BARDBG][exit-clear]
+  was_parked=1`** ⇒ no warp wrongly parked at a blocking SYNC, confirming the FINAL decode
+  rule is sound.
+- Cycle accuracy vs real H100: **3.25× → 2.40×** (220,024 → 162,582 cycles);
+  `inst_barrier` issue-stage stall **56.09% → 9.09%** (HW barrier ≈ 10.9%); TMA-axis stall
+  **62.73% → 17.16%**, removing the inverted barrier-stall attribution documented in
+  `.result/FA3_kernel_5_fwd.md`.
+- (Note: this validation is on **kernel 5 (fwd)**, which hit the same teardown leak; D3's
+  "kernel 10 only" scope is superseded — both fwd and bwd share the warp-specialized exit
+  pattern and are fixed by B6.)
+
+### Remaining known limitations (unchanged by B6, currently inactive)
+- Register-form `(0,-1)` fallback (D1) can collide on `id=0`; not hit on the current trace
+  (runtime capture present).
+- `>=` release does not explicitly track epoch boundaries; safe under the in-order trace but
+  could over/early-release if a future kernel reuses the same id within a single warp's
+  in-flight window.
+- `BAR.RED` + ARRIVE path is dead code (decode never produces `RED`).

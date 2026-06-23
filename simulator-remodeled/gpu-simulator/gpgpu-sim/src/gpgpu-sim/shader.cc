@@ -4413,18 +4413,78 @@ void barrier_set_t::warp_exit(unsigned warp_id) {
   // stack to see it has only one entry during exit_impl()
   m_warp_active.reset(warp_id);
 
-  // test for barrier release
+  // find the CTA this warp belongs to
   cta_to_warp_t::iterator w = m_cta_to_warps.begin();
   for (; w != m_cta_to_warps.end(); ++w) {
     if (w->second.test(warp_id) == true) break;
   }
+  if (w == m_cta_to_warps.end()) return;
+  unsigned cta_id = w->first;
+
+  // An exiting warp can no longer arrive at any future barrier epoch. Drop it from every
+  // per-id participant / credit set so a re-armed named/counted barrier is not waiting on
+  // a warp that has already left the kernel. Without this, a counted barrier (e.g. id=1
+  // count=416) whose closing SYNC credit would have come from a warp that exits first is
+  // never satisfied and leaks until CTA teardown (shader.cc:4252 assert).
+  warp_set_t exiting;
+  exiting.set(warp_id);
+  // BARDBG: record which barrier ids this exiting warp was still recorded on, so a real
+  // mis-decode (a warp that exits while genuinely parked at a blocking SYNC) is visible
+  // rather than silently swallowed. This is rate-limited to the first occurrence per
+  // (bar_id) to keep the 12h-run log bounded.
+  if (m_shader->get_config()->bar_debug_enable) {
+    static std::set<unsigned> seen_exit_clear_ids;
+    for (unsigned i = 0; i < m_max_barriers_per_cta; i++) {
+      bool was_participant = m_bar_id_to_warps[i].test(warp_id);
+      bool was_parked = m_warp_at_barrier.test(warp_id);
+      if (was_participant && seen_exit_clear_ids.insert(i).second) {
+        std::cerr << "[BARDBG][exit-clear] cta_id=" << cta_id
+                  << " warp=" << warp_id << " bar_id=" << i
+                  << " was_parked=" << (was_parked ? 1 : 0)
+                  << " participants_before="
+                  << (w->second & m_bar_id_to_warps[i]).count()
+                  << " (first occurrence)\n";
+      }
+    }
+  }
+  for (unsigned i = 0; i < m_max_barriers_per_cta; i++) {
+    m_bar_id_to_warps[i] &= ~exiting;
+    m_bar_id_to_arrive_credited_warps[i] &= ~exiting;
+    m_bar_id_to_sync_credited_warps[i] &= ~exiting;
+  }
+  m_warp_at_barrier &= ~exiting;
+
+  // Re-evaluate every barrier id against the shrunken active set and release any whose
+  // remaining active participants have all arrived.
+  release_satisfiable_barriers(cta_id);
+}
+
+// Release any barrier id in this CTA whose still-active participants have all arrived.
+// This generalizes the legacy full-CTA release so that counted/named barriers also drain
+// correctly once some of their participants have exited the kernel and can never arrive.
+void barrier_set_t::release_satisfiable_barriers(unsigned cta_id) {
+  cta_to_warp_t::iterator w = m_cta_to_warps.find(cta_id);
+  if (w == m_cta_to_warps.end()) return;
   warp_set_t warps_in_cta = w->second;
   warp_set_t active = warps_in_cta & m_warp_active;
 
   for (unsigned i = 0; i < m_max_barriers_per_cta; i++) {
     warp_set_t at_a_specific_barrier = warps_in_cta & m_bar_id_to_warps[i];
-    if (at_a_specific_barrier == active) {
-      // all warps have reached barrier, so release waiting warps...
+    if (at_a_specific_barrier.any() && at_a_specific_barrier == active) {
+      // every warp still alive in this CTA that participates in id i has arrived ->
+      // release the whole cohort (works for full-CTA, counted and named barriers alike).
+      // BARDBG: log the first exit-triggered release per bar_id so we can confirm the fix
+      // actually fires (vs. the barrier draining through the normal counted path) and
+      // measure how often the kernel relies on it.
+      if (m_shader->get_config()->bar_debug_enable) {
+        static std::set<unsigned> seen_exit_release_ids;
+        if (seen_exit_release_ids.insert(i).second) {
+          std::cerr << "[BARDBG][exit-release] cta_id=" << cta_id
+                    << " bar_id=" << i
+                    << " released_warps=" << at_a_specific_barrier.count()
+                    << " active=" << active.count() << " (first occurrence)\n";
+        }
+      }
       m_bar_id_to_warps[i] &= ~at_a_specific_barrier;
       m_bar_id_to_arrive_credited_warps[i] &= ~at_a_specific_barrier;
       m_bar_id_to_sync_credited_warps[i] &= ~at_a_specific_barrier;

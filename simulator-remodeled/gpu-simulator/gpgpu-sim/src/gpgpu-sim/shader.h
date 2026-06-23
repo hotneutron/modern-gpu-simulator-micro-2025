@@ -1362,6 +1362,12 @@ class barrier_set_t {
   void dump();
 
  private:
+  // Re-evaluate every barrier id for one CTA against its CURRENT active-warp set and
+  // release any whose still-active participants have all arrived. Used when a warp exits
+  // (so a counted/named barrier whose remaining arrivals can never come because the other
+  // participants already exited is not left dangling until CTA teardown).
+  void release_satisfiable_barriers(unsigned cta_id);
+
   unsigned m_max_cta_per_core;
   unsigned m_max_warps_per_core;
   unsigned m_max_barriers_per_cta;
