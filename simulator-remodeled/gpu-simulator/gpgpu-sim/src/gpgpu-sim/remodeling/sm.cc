@@ -701,13 +701,17 @@ void SM::issue_warp(register_set_uniptr &pipe_reg_set, warp_inst_t *next_inst,
             pipe_reg->has_extra_trace_instruction_info()
                 ? pipe_reg->get_extra_trace_instruction_info().get_op_code()
                 : "<no-op>";
-        std::cerr << "[MEMBARDBG][fence-enter] sm=" << m_sm_id
-                  << " warp=" << warp_id << " op=" << fop
-                  << " scope=" << (int)scope
-                  << " cta=" << m_physical_warp[warp_id]->get_pending_stores_cta_visible()
-                  << " gpu=" << m_physical_warp[warp_id]->get_pending_stores_gpu_visible()
-                  << " tma=" << (m_tma_unit_shared_of_sm->warp_has_outstanding_stores(warp_id) ? 1 : 0)
-                  << " cycle=" << get_current_gpu_cycle() << std::endl;
+        // Build the whole line first, then emit with a single stream insertion so
+        // concurrent SM threads do not interleave tokens within one log line.
+        std::ostringstream oss;
+        oss << "[MEMBARDBG][fence-enter] sm=" << m_sm_id
+            << " warp=" << warp_id << " op=" << fop
+            << " scope=" << (int)scope
+            << " cta=" << m_physical_warp[warp_id]->get_pending_stores_cta_visible()
+            << " gpu=" << m_physical_warp[warp_id]->get_pending_stores_gpu_visible()
+            << " tma=" << (m_tma_unit_shared_of_sm->warp_has_outstanding_stores(warp_id) ? 1 : 0)
+            << " cycle=" << get_current_gpu_cycle() << "\n";
+        std::cerr << oss.str();
       }
       // Non-rendezvous fences (FENCE.*, MEMBAR.ALL.CTA/GPU) must NOT enter the CTA
       // barrier engine. Only an unverified/legacy form would fall through here.
@@ -1892,10 +1896,12 @@ bool SM::warp_waiting_at_mem_barrier(unsigned warp_id) {
   }
   if(clear_membar) {
     if (m_config->bar_debug_enable) {
-      std::cerr << "[MEMBARDBG][fence-release] sm=" << m_sm_id
-                << " warp=" << warp_id
-                << " scope=" << (int)m_physical_warp[warp_id]->get_membar_scope()
-                << " cycle=" << get_current_gpu_cycle() << std::endl;
+      std::ostringstream oss;
+      oss << "[MEMBARDBG][fence-release] sm=" << m_sm_id
+          << " warp=" << warp_id
+          << " scope=" << (int)m_physical_warp[warp_id]->get_membar_scope()
+          << " cycle=" << get_current_gpu_cycle() << "\n";
+      std::cerr << oss.str();
     }
     m_membar_wait_start_cycle.erase(warp_id);
     m_membar_last_stuck_warn_cycle.erase(warp_id);
@@ -1927,14 +1933,16 @@ bool SM::warp_waiting_at_mem_barrier(unsigned warp_id) {
                                       : 0;
         if (now - last >= kWarnInterval) {
           m_membar_last_stuck_warn_cycle[warp_id] = now;
-          std::cerr << "[MEMBARDBG][stuck] sm=" << m_sm_id << " warp=" << warp_id
-                    << " scope=" << (int)m_physical_warp[warp_id]->get_membar_scope()
-                    << " waited=" << waited
-                    << " cta=" << m_physical_warp[warp_id]->get_pending_stores_cta_visible()
-                    << " gpu=" << m_physical_warp[warp_id]->get_pending_stores_gpu_visible()
-                    << " tma=" << (m_tma_unit_shared_of_sm->warp_has_outstanding_stores(warp_id) ? 1 : 0)
-                    << " stores_outstanding=" << (m_physical_warp[warp_id]->stores_done() ? 0 : 1)
-                    << " cycle=" << now << std::endl;
+          std::ostringstream oss;
+          oss << "[MEMBARDBG][stuck] sm=" << m_sm_id << " warp=" << warp_id
+              << " scope=" << (int)m_physical_warp[warp_id]->get_membar_scope()
+              << " waited=" << waited
+              << " cta=" << m_physical_warp[warp_id]->get_pending_stores_cta_visible()
+              << " gpu=" << m_physical_warp[warp_id]->get_pending_stores_gpu_visible()
+              << " tma=" << (m_tma_unit_shared_of_sm->warp_has_outstanding_stores(warp_id) ? 1 : 0)
+              << " stores_outstanding=" << (m_physical_warp[warp_id]->stores_done() ? 0 : 1)
+              << " cycle=" << now << "\n";
+          std::cerr << oss.str();
         }
       }
     }
@@ -2335,11 +2343,13 @@ void SM::inc_fence_store(unsigned warp_id, int fence_vis_level, unsigned n) {
     m_physical_warp[warp_id]->inc_pending_stores_gpu_visible(n);
   }
   if (m_config->bar_debug_enable) {
-    std::cerr << "[MEMBARDBG][store++] sm=" << m_sm_id << " warp=" << warp_id
-              << " level=" << fence_vis_level << " n=" << n
-              << " cta=" << m_physical_warp[warp_id]->get_pending_stores_cta_visible()
-              << " gpu=" << m_physical_warp[warp_id]->get_pending_stores_gpu_visible()
-              << " cycle=" << get_current_gpu_cycle() << std::endl;
+    std::ostringstream oss;
+    oss << "[MEMBARDBG][store++] sm=" << m_sm_id << " warp=" << warp_id
+        << " level=" << fence_vis_level << " n=" << n
+        << " cta=" << m_physical_warp[warp_id]->get_pending_stores_cta_visible()
+        << " gpu=" << m_physical_warp[warp_id]->get_pending_stores_gpu_visible()
+        << " cycle=" << get_current_gpu_cycle() << "\n";
+    std::cerr << oss.str();
   }
 }
 
@@ -2350,11 +2360,13 @@ void SM::dec_fence_store(unsigned warp_id, int fence_vis_level, unsigned n) {
     m_physical_warp[warp_id]->dec_pending_stores_gpu_visible(n);
   }
   if (m_config->bar_debug_enable) {
-    std::cerr << "[MEMBARDBG][store--] sm=" << m_sm_id << " warp=" << warp_id
-              << " level=" << fence_vis_level << " n=" << n
-              << " cta=" << m_physical_warp[warp_id]->get_pending_stores_cta_visible()
-              << " gpu=" << m_physical_warp[warp_id]->get_pending_stores_gpu_visible()
-              << " cycle=" << get_current_gpu_cycle() << std::endl;
+    std::ostringstream oss;
+    oss << "[MEMBARDBG][store--] sm=" << m_sm_id << " warp=" << warp_id
+        << " level=" << fence_vis_level << " n=" << n
+        << " cta=" << m_physical_warp[warp_id]->get_pending_stores_cta_visible()
+        << " gpu=" << m_physical_warp[warp_id]->get_pending_stores_gpu_visible()
+        << " cycle=" << get_current_gpu_cycle() << "\n";
+    std::cerr << oss.str();
   }
 }
 
