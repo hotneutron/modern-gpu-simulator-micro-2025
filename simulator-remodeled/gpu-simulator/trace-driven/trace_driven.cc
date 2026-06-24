@@ -540,7 +540,12 @@ bool trace_warp_inst_t::parse_from_trace_struct(
       break;
     case OP_CGAERRBAR:
     case OP_MEMBAR:
-      // MEMBAR / CGAERRBAR are not CTA named barriers; keep the legacy placeholder.
+      // MEMBAR / CGAERRBAR are ordering/visibility fences, not CTA named
+      // barriers. They are handled on the MEMORY_BARRIER_OP path in sm.cc as a
+      // per-warp memory-dependency wait (set_membar) and deliberately bypass the
+      // CTA barrier engine, so these bar_id/bar_count/bar_type fields are dead
+      // (never consumed for MEMBAR). They are left here only to keep the struct
+      // initialized; do NOT interpret them as a real full-CTA SYNC barrier.
       bar_id = 0;
       bar_count = (unsigned)-1;
       bar_type = SYNC;

@@ -101,6 +101,17 @@ class mem_fetch {
   unsigned get_sid() const { return m_sid; }
   unsigned get_tpc() const { return m_tpc; }
   unsigned get_wid() const { return m_wid; }
+  // Fence visibility level a store request contributes to, so the per-warp
+  // scope-aware store counters can be decremented on the correct level when this
+  // request is acked, regardless of which ack path (L1 hit / L2 WRITE_ACK) fires.
+  //   0 = none/not-a-tracked-store, 1 = CTA-visible (L1), 2 = GPU-visible (L2)
+  enum fence_visibility_level_t {
+    FENCE_VIS_NONE = 0,
+    FENCE_VIS_CTA = 1,
+    FENCE_VIS_GPU = 2,
+  };
+  void set_fence_visibility_level(fence_visibility_level_t lvl) { m_fence_vis_level = lvl; }
+  fence_visibility_level_t get_fence_visibility_level() const { return m_fence_vis_level; }
   bool istexture() const;
   bool isconst() const;
   enum mf_type get_type() const { return m_type; }
@@ -197,6 +208,8 @@ class mem_fetch {
   unsigned int m_prefetch_l1i_fate;
   bool m_is_fixed_latency_constant_access;
   unsigned int m_unique_function_id;
+  // Fence visibility level this (store) request contributes to (see accessor).
+  fence_visibility_level_t m_fence_vis_level = FENCE_VIS_NONE;
 
   // where is this request now?
   enum mem_fetch_status m_status;

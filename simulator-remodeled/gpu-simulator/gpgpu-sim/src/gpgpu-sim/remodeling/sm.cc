@@ -152,13 +152,57 @@ const char *sync_kind_to_string(SyncInstructionKind kind) {
   }
 }
 
-bool is_lightweight_fence_memory_barrier(const warp_inst_t &inst) {
+// A memory barrier (MEMBAR / FENCE) is an ordering/visibility fence, NOT a
+// thread rendezvous: only the issuing warp waits (until its own outstanding
+// memory writes are visible at the requested scope), and it never waits for the
+// other warps of the CTA to arrive. Such barriers must therefore bypass the
+// CTA barrier engine (warp_reaches_barrier()) and be modeled purely as a
+// per-warp memory-dependency wait (set_membar() -> warp_waiting_at_mem_barrier).
+//
+// Returns true for every memory-barrier form whose non-rendezvous semantics
+// have been verified against the FA3 fwd/bwd traces:
+//   - FENCE.*            (e.g. FENCE.VIEW.ASYNC.S / .G)  async-proxy fences
+//   - MEMBAR.ALL.CTA / MEMBAR.ALL.GPU                    CTA/GPU-scope fences
+// Any other MEMBAR form (e.g. MEMBAR.*.SYS) has not been characterized; rather
+// than silently mis-model it, abort so an unverified form is never treated as a
+// fence (mirrors the OP_BAR decode guard).
+bool is_non_rendezvous_memory_barrier(const warp_inst_t &inst) {
   if (inst.op != MEMORY_BARRIER_OP || !inst.has_extra_trace_instruction_info()) {
     return false;
   }
   const std::string opcode =
       inst.get_extra_trace_instruction_info().get_op_code();
-  return opcode.rfind("FENCE", 0) == 0;
+  if (opcode.rfind("FENCE", 0) == 0) return true;
+  if (opcode.rfind("MEMBAR", 0) == 0) {
+    if (opcode == "MEMBAR.ALL.CTA" || opcode == "MEMBAR.ALL.GPU") {
+      return true;
+    }
+    assert(false &&
+           "Unverified MEMBAR form reached the memory-barrier path (only "
+           "MEMBAR.ALL.CTA and MEMBAR.ALL.GPU have been characterized as "
+           "non-rendezvous fences); characterize it before modeling.");
+  }
+  return false;
+}
+
+// Determine the visibility scope a memory fence enforces, from the trace opcode.
+//   MEMBAR.ALL.GPU            -> GPU scope (drain to L2, all SMs)
+//   MEMBAR.ALL.CTA           -> CTA scope (drain to shared/L1, same SM)
+//   FENCE.* (async proxy)    -> CTA scope (intra-SM ordering); its real SB wait is
+//                               enforced separately via wait_barrier_bits.
+// Only forms verified for the FA3 fwd/bwd traces are mapped; anything else that
+// reaches here returns NONE (no per-warp store drain) but is still gated by the
+// generic wait-barrier path. (MEMBAR.*.SYS is already asserted out upstream.)
+static membar_scope_t fence_scope_of(const warp_inst_t &inst) {
+  if (inst.op != MEMORY_BARRIER_OP || !inst.has_extra_trace_instruction_info()) {
+    return MEMBAR_SCOPE_NONE;
+  }
+  const std::string opcode =
+      inst.get_extra_trace_instruction_info().get_op_code();
+  if (opcode == "MEMBAR.ALL.GPU") return MEMBAR_SCOPE_GPU;
+  if (opcode == "MEMBAR.ALL.CTA") return MEMBAR_SCOPE_CTA;
+  if (opcode.rfind("FENCE", 0) == 0) return MEMBAR_SCOPE_CTA;
+  return MEMBAR_SCOPE_NONE;
 }
 
 // SYNCS.ARRIVE.TRANS64 variants whose runtime semantics have been validated end
@@ -644,14 +688,30 @@ void SM::issue_warp(register_set_uniptr &pipe_reg_set, warp_inst_t *next_inst,
                                       warp_id, pipe_reg.get());
     }
   } else if (pipe_reg->op == MEMORY_BARRIER_OP) {
-      pipe_reg->m_num_cycles_to_stall_SM = m_config->num_cycles_to_stall_SM_at_gpu_memory_barrier;
-      if(m_config->is_trace_mode && pipe_reg->get_extra_trace_instruction_info().get_is_system_memory_barrier()) {
-        pipe_reg->m_num_cycles_to_stall_SM = m_config->num_cycles_to_stall_SM_at_system_memory_barrier;
-      }else if(m_config->is_trace_mode && pipe_reg->get_extra_trace_instruction_info().get_is_cta_memory_barrier()) {
-        pipe_reg->m_num_cycles_to_stall_SM = m_config->num_cycles_to_stall_SM_at_cta_memory_barrier;
+      // A memory barrier is an ordering/visibility fence, not a CTA rendezvous.
+      // Record the fence scope so warp_waiting_at_mem_barrier can drain only the
+      // stores visible at that scope (CTA = shared/L1, GPU = L2 + TMA). Modeling
+      // this as a full-CTA rendezvous + fixed SM-wide stall (the legacy path) was
+      // both wrong (membar is per-warp, scope-only) and the dominant inflation in
+      // FA3 bwd, where MEMBAR.ALL.CTA executes 55k+ times.
+      membar_scope_t scope = fence_scope_of(*pipe_reg);
+      m_physical_warp[warp_id]->set_membar(scope);
+      if (m_config->bar_debug_enable) {
+        const std::string fop =
+            pipe_reg->has_extra_trace_instruction_info()
+                ? pipe_reg->get_extra_trace_instruction_info().get_op_code()
+                : "<no-op>";
+        std::cerr << "[MEMBARDBG][fence-enter] sm=" << m_sm_id
+                  << " warp=" << warp_id << " op=" << fop
+                  << " scope=" << (int)scope
+                  << " cta=" << m_physical_warp[warp_id]->get_pending_stores_cta_visible()
+                  << " gpu=" << m_physical_warp[warp_id]->get_pending_stores_gpu_visible()
+                  << " tma=" << (m_tma_unit_shared_of_sm->warp_has_outstanding_stores(warp_id) ? 1 : 0)
+                  << " cycle=" << get_current_gpu_cycle() << std::endl;
       }
-      m_physical_warp[warp_id]->set_membar();
-      if (!is_lightweight_fence_memory_barrier(*pipe_reg)) {
+      // Non-rendezvous fences (FENCE.*, MEMBAR.ALL.CTA/GPU) must NOT enter the CTA
+      // barrier engine. Only an unverified/legacy form would fall through here.
+      if (!is_non_rendezvous_memory_barrier(*pipe_reg)) {
         debug_print_sm_barrier_issue(*pipe_reg, warp_id, m_sm_id,
                                      m_config->bar_debug_enable,
                                      m_config->bar_debug_issue_budget);
@@ -1815,11 +1875,30 @@ bool SM::warp_waiting_at_mem_barrier(unsigned warp_id) {
   bool use_traditional_scoreboarding = !m_physical_warp[warp_id]->get_kernel_info()->is_captured_from_binary || m_config->is_remodeling_scoreboarding_enabled || !m_config->is_trace_mode;
   bool clear_membar = false;
   if (use_traditional_scoreboarding) {
+    // Baseline / non-trace model: keep the original register-scoreboard drain.
     clear_membar = (!m_scoreboard->pendingWrites(warp_id) && !m_scoreboard_WAR->pendingReads(warp_id)) ;
-  }else {
-     clear_membar = are_all_wait_barrier_ready(warp_id);
+  } else {
+    // Trace model: scope-aware fence. A MEMBAR/FENCE is an ordering fence (not a
+    // CTA rendezvous): drain only this warp's stores that must be visible at the
+    // fence scope.
+    //   CTA -> shared + L1-level stores; GPU -> + L2-level + TMA stores.
+    membar_scope_t scope = m_physical_warp[warp_id]->get_membar_scope();
+    if (scope == MEMBAR_SCOPE_NONE) {
+      // Unmapped/legacy fence form: nothing scope-specific to wait on.
+      clear_membar = true;
+    } else {
+      clear_membar = !warp_has_pending_fence_stores(warp_id, (int)scope);
+    }
   }
   if(clear_membar) {
+    if (m_config->bar_debug_enable) {
+      std::cerr << "[MEMBARDBG][fence-release] sm=" << m_sm_id
+                << " warp=" << warp_id
+                << " scope=" << (int)m_physical_warp[warp_id]->get_membar_scope()
+                << " cycle=" << get_current_gpu_cycle() << std::endl;
+    }
+    m_membar_wait_start_cycle.erase(warp_id);
+    m_membar_last_stuck_warn_cycle.erase(warp_id);
     m_physical_warp[warp_id]->clear_membar();
     if (m_gpu->get_config().flush_l1()) {
       // Mahmoud fixed this on Nov 2019
@@ -1828,6 +1907,36 @@ bool SM::warp_waiting_at_mem_barrier(unsigned warp_id) {
       //(1) wait for all pending writes till they are acked
       //(2) invalidate L1 cache to ensure coherence and avoid reading stall data
       data_cache_invalidate();
+    }
+  } else {
+    // Deadlock watchdog: a scope-aware fence should drain in at most a few hundred
+    // cycles. If a warp stays blocked far longer, a per-warp store counter likely
+    // never got its matching dec (counter leak -> deadlock). Emit a periodic dump
+    // of the exact pending counts so the offending level is obvious.
+    unsigned long long now = get_current_gpu_cycle();
+    auto it = m_membar_wait_start_cycle.find(warp_id);
+    if (it == m_membar_wait_start_cycle.end()) {
+      m_membar_wait_start_cycle[warp_id] = now;
+    } else {
+      const unsigned long long kStuckThreshold = 5000;   // cycles blocked
+      const unsigned long long kWarnInterval = 5000;     // re-warn cadence
+      unsigned long long waited = now - it->second;
+      if (waited >= kStuckThreshold) {
+        unsigned long long last = m_membar_last_stuck_warn_cycle.count(warp_id)
+                                      ? m_membar_last_stuck_warn_cycle[warp_id]
+                                      : 0;
+        if (now - last >= kWarnInterval) {
+          m_membar_last_stuck_warn_cycle[warp_id] = now;
+          std::cerr << "[MEMBARDBG][stuck] sm=" << m_sm_id << " warp=" << warp_id
+                    << " scope=" << (int)m_physical_warp[warp_id]->get_membar_scope()
+                    << " waited=" << waited
+                    << " cta=" << m_physical_warp[warp_id]->get_pending_stores_cta_visible()
+                    << " gpu=" << m_physical_warp[warp_id]->get_pending_stores_gpu_visible()
+                    << " tma=" << (m_tma_unit_shared_of_sm->warp_has_outstanding_stores(warp_id) ? 1 : 0)
+                    << " stores_outstanding=" << (m_physical_warp[warp_id]->stores_done() ? 0 : 1)
+                    << " cycle=" << now << std::endl;
+        }
+      }
     }
   }
   return !clear_membar;
@@ -2206,10 +2315,63 @@ void SM::store_ack(class mem_fetch *mf) {
          (m_config->gpgpu_perfect_mem && mf->get_is_write()));
   unsigned warp_id = mf->get_wid();
   m_physical_warp[warp_id]->dec_store_req();
+  // Scope-aware fence accounting: decrement the per-warp visibility-level store
+  // counter this request was tagged with at issue time (see ldst_unit_sm store
+  // issue sites). One mem_fetch == one sector ack, matching the inc granularity.
+  mem_fetch::fence_visibility_level_t lvl = mf->get_fence_visibility_level();
+  if (lvl != mem_fetch::FENCE_VIS_NONE) {
+    dec_fence_store(warp_id, (int)lvl, 1);
+  }
 }
 
 void SM::inc_store_req(unsigned warp_id) {
   m_physical_warp[warp_id]->inc_store_req();
+}
+
+void SM::inc_fence_store(unsigned warp_id, int fence_vis_level, unsigned n) {
+  if (fence_vis_level == mem_fetch::FENCE_VIS_CTA) {
+    m_physical_warp[warp_id]->inc_pending_stores_cta_visible(n);
+  } else if (fence_vis_level == mem_fetch::FENCE_VIS_GPU) {
+    m_physical_warp[warp_id]->inc_pending_stores_gpu_visible(n);
+  }
+  if (m_config->bar_debug_enable) {
+    std::cerr << "[MEMBARDBG][store++] sm=" << m_sm_id << " warp=" << warp_id
+              << " level=" << fence_vis_level << " n=" << n
+              << " cta=" << m_physical_warp[warp_id]->get_pending_stores_cta_visible()
+              << " gpu=" << m_physical_warp[warp_id]->get_pending_stores_gpu_visible()
+              << " cycle=" << get_current_gpu_cycle() << std::endl;
+  }
+}
+
+void SM::dec_fence_store(unsigned warp_id, int fence_vis_level, unsigned n) {
+  if (fence_vis_level == mem_fetch::FENCE_VIS_CTA) {
+    m_physical_warp[warp_id]->dec_pending_stores_cta_visible(n);
+  } else if (fence_vis_level == mem_fetch::FENCE_VIS_GPU) {
+    m_physical_warp[warp_id]->dec_pending_stores_gpu_visible(n);
+  }
+  if (m_config->bar_debug_enable) {
+    std::cerr << "[MEMBARDBG][store--] sm=" << m_sm_id << " warp=" << warp_id
+              << " level=" << fence_vis_level << " n=" << n
+              << " cta=" << m_physical_warp[warp_id]->get_pending_stores_cta_visible()
+              << " gpu=" << m_physical_warp[warp_id]->get_pending_stores_gpu_visible()
+              << " cycle=" << get_current_gpu_cycle() << std::endl;
+  }
+}
+
+bool SM::warp_has_pending_fence_stores(unsigned warp_id, int membar_scope) const {
+  unsigned cta_pending = m_physical_warp[warp_id]->get_pending_stores_cta_visible();
+  if (membar_scope == MEMBAR_SCOPE_CTA) {
+    // CTA fence: shared + L1-level stores must be visible (same SM).
+    return cta_pending > 0;
+  }
+  if (membar_scope == MEMBAR_SCOPE_GPU) {
+    // GPU fence subsumes CTA: also wait on L2-level global stores and TMA stores.
+    unsigned gpu_pending = m_physical_warp[warp_id]->get_pending_stores_gpu_visible();
+    bool tma_pending =
+        m_tma_unit_shared_of_sm->warp_has_outstanding_stores(warp_id);
+    return (cta_pending > 0) || (gpu_pending > 0) || tma_pending;
+  }
+  return false;
 }
 
 void SM::display_simt_state(FILE *fout, int mask) const {

@@ -141,6 +141,14 @@ struct function_call_entry_info {
   active_mask_t active_mask;
 };
 
+// Visibility scope of a memory fence (MEMBAR/FENCE). NONE = not at a fence.
+// CTA = ordering up to shared/L1 (same SM); GPU = ordering up to L2 (all SMs).
+enum membar_scope_t {
+  MEMBAR_SCOPE_NONE = 0,
+  MEMBAR_SCOPE_CTA = 1,
+  MEMBAR_SCOPE_GPU = 2,
+};
+
 class shd_warp_t {
  public:
   shd_warp_t(class shader_core_ctx_wrapper *shader, unsigned warp_size, shader_core_stats *stats) 
@@ -169,6 +177,9 @@ class shd_warp_t {
     n_completed = m_warp_size;
     m_n_atomic = 0;
     m_membar = false;
+    m_membar_scope = MEMBAR_SCOPE_NONE;
+    m_pending_stores_cta_visible = 0;
+    m_pending_stores_gpu_visible = 0;
     m_done_exit = true;
     m_last_fetch = 0;
     m_next = 0;
@@ -281,8 +292,26 @@ class shd_warp_t {
   bool is_atomic_pending() const { return m_n_atomic > 0; }
 
   void set_membar() { m_membar = true; }
-  void clear_membar() { m_membar = false; }
+  void clear_membar() { m_membar = false; m_membar_scope = MEMBAR_SCOPE_NONE; }
   bool get_membar() const { return m_membar; }
+  // Scope-aware fence: remember the fence scope when entering a memory barrier.
+  void set_membar(membar_scope_t scope) { m_membar = true; m_membar_scope = scope; }
+  membar_scope_t get_membar_scope() const { return m_membar_scope; }
+
+  // Per-warp store-visibility counters for scope-aware memory fences.
+  void inc_pending_stores_cta_visible(unsigned n = 1) { m_pending_stores_cta_visible += n; }
+  void dec_pending_stores_cta_visible(unsigned n = 1) {
+    assert(m_pending_stores_cta_visible >= n);
+    m_pending_stores_cta_visible -= n;
+  }
+  unsigned get_pending_stores_cta_visible() const { return m_pending_stores_cta_visible; }
+  void inc_pending_stores_gpu_visible(unsigned n = 1) { m_pending_stores_gpu_visible += n; }
+  void dec_pending_stores_gpu_visible(unsigned n = 1) {
+    assert(m_pending_stores_gpu_visible >= n);
+    m_pending_stores_gpu_visible -= n;
+  }
+  unsigned get_pending_stores_gpu_visible() const { return m_pending_stores_gpu_visible; }
+
   void set_gridbar() { m_gridbar = true; }
   void clear_gridbar() { m_gridbar = false; }
   bool get_gridbar() const { return m_gridbar; }
@@ -440,7 +469,20 @@ class shd_warp_t {
 
   unsigned m_n_atomic;  // number of outstanding atomic operations
   bool m_membar;        // if true, warp is waiting at memory barrier
+  // MEMBAR/FENCE is an ordering fence, not a CTA rendezvous. When the warp is at
+  // a memory fence we remember its scope so the wait condition can drain only the
+  // stores visible at that scope (see warp_waiting_at_mem_barrier).
+  membar_scope_t m_membar_scope;
   bool m_gridbar;      // if true, warp is waiting at grid barrier
+
+  // Per-warp store-visibility tracking for scope-aware memory fences. These are
+  // separate from m_stores_outstanding (which backs stores_done()/exit) and are
+  // counted at sector granularity.
+  //  - cta_visible: shared stores (STS/STSM) + L1-level global stores
+  //  - gpu_visible: L2-level (L1-bypass, .cg) global stores
+  // (TMA stores are tracked separately in tma_unit_sm and folded in by the SM.)
+  unsigned m_pending_stores_cta_visible;
+  unsigned m_pending_stores_gpu_visible;
 
   bool m_done_exit;  // true once thread exit has been registered for threads in
                      // this warp
