@@ -23,9 +23,10 @@ To keep this file easy to extend, use the following update pattern whenever a ne
 
 | Version | Opt item | Value / change | FA3 fwd (kernel 5) | FA3 bwd (kernel 10) | Status |
 |---|---|---|---|---|---|
+| Target HW | Real H100 (NCU) | Actual hardware measurements | 67,696 cycles | 132,901 cycles | Target |
 | Init | Baseline simulator | Original simulator state before the targeted fixes below | Not available as a standalone cycle in the current notes | 376,735 cycles (2.83x vs HW) | Fwd missing, bwd available |
 | Opt 1 | ROP latency tuning | `-gpgpu_l2_rop_latency 211 -> 100` | 220,024 cycles (3.25x vs HW). This run already used `rop=100`, so there is no separate init cycle to compare against. | 361,760 cycles (2.72x vs HW, -4.0% vs init) | Done |
-| Opt 2 | BAR implementation | `OP_BAR` handling + barrier engine fix + warp-exit drain fix | 162,582 cycles (2.40x vs HW, -26% vs Opt 1). Run exits cleanly. | BAR-enabled cycle not available yet. Run is still in progress. | Fwd done, bwd running |
+| Opt 2 | BAR implementation | `OP_BAR` handling + barrier engine fix + warp-exit drain fix | 162,582 cycles (2.40x vs HW, -26% vs Opt 1). Run exits cleanly. | 328,643 cycles (2.47x vs HW, -9.1% vs Opt 1). Run exits cleanly. | Done |
 
 ### Simulator Cycle Breakdown
 
@@ -61,27 +62,29 @@ To keep this file easy to extend, use the following update pattern whenever a ne
 
 | Class | Init | Opt 1 (`rop=100`) | Opt 2 (BAR impl) | Note |
 |---|---|---|---|---|
-| `sim_cycle` | 376,735 | 361,760 | — | BAR-enabled cycle is not available yet because the run is still in progress. |
-| `no_warps_ready` | — | 66.64% | — | This is the dominant top-level class in Opt 1. |
-| `issuing` | — | 12.71% | — | |
-| `next_stage_not_available` | — | 10.69% | — | downstream pipe back-pressure |
-| `no_valid_instruction` | — | 8.96% | — | frontend / L0I miss |
-| `issue_port_busy` | — | 1.01% | — | |
-| `sum` | — | 100.00% | — | Verified exclusive in the source doc. |
+| `sim_cycle` | 376,735 | 361,760 | 328,643 | The Opt 2 run exits cleanly without leaks. |
+| `no_warps_ready` | — | 66.64% | 58.27% | Still the dominant class, but reduced after the BAR fix. |
+| `issuing` | — | 12.71% | 14.06% | |
+| `next_stage_not_available` | — | 10.69% | 11.41% | downstream pipe back-pressure |
+| `no_valid_instruction` | — | 8.96% | 15.02% | frontend / L0I miss |
+| `issue_port_busy` | — | 1.01% | 1.24% | |
+| `sum` | — | 100.00% | 100.00% | |
 
 #### FA3 bwd - inner stall / wait breakdown
 
 | Wait reason | Init | Opt 1 (`rop=100`) | Opt 2 (BAR impl) | Note |
 |---|---|---|---|---|
-| `inst_barrier` | — | 58.47% / 87.70% of `no_warps_ready` | — | `BAR.SYNC` only (`__syncthreads`) |
-| `fu_occupied` | — | 11.55% / 17.30% of `no_warps_ready` | — | function-unit busy |
-| `wait_barrier` | — | 7.98% / 12.00% of `no_warps_ready` | — | `DEPBAR` (SB phase wait = TMA mbarrier) |
-| `stall_count` | — | 4.11% / 6.20% of `no_warps_ready` | — | explicit stall cycles |
-| `tma_flush` | — | 0.83% / 1.20% of `no_warps_ready` | — | `UTMACMDFLUSH` |
-| `yield` | — | 0.68% / 1.00% of `no_warps_ready` | — | `YIELD` |
-| `result_queue_full` | — | 0.03% / — | — | fixed-latency result queue |
-| `l1c` | — | 0.03% / — | — | L1 constant |
-| `scoreboard (memory)` | — | 0.00% / 0.00% of `no_warps_ready` | — | traditional scoreboard (unused here) |
+| `inst_barrier` | — | 58.47% / 87.70% of `no_warps_ready` | 44.78% / 76.84% of `no_warps_ready` | Drops significantly but remains the largest stall. |
+| `tma_axis` | — | — | 58.09% | Added in `.o13` output. |
+| `non_tma_axis` | — | — | 18.08% | Added in `.o13` output. |
+| `fu_occupied` | — | 11.55% / 17.30% of `no_warps_ready` | 12.63% | function-unit busy |
+| `wait_barrier` | — | 7.98% / 12.00% of `no_warps_ready` | 8.62% | `DEPBAR` (SB phase wait = TMA mbarrier) |
+| `stall_count` | — | 4.11% / 6.20% of `no_warps_ready` | 4.63% | explicit stall cycles |
+| `tma_flush` | — | 0.83% / 1.20% of `no_warps_ready` | 4.69% | `UTMACMDFLUSH` |
+| `yield` | — | 0.68% / 1.00% of `no_warps_ready` | 0.76% | `YIELD` |
+| `result_queue_full` | — | 0.03% / — | 0.03% | fixed-latency result queue |
+| `l1c` | — | 0.03% / — | 0.03% | L1 constant |
+| `scoreboard (memory)` | — | 0.00% / 0.00% of `no_warps_ready` | 0.00% | traditional scoreboard (unused here) |
 
 ### Run Paths
 
@@ -113,9 +116,9 @@ FA3 bwd
   - Note: `rop=100`, full trace run
 
 - Opt 2 (BAR impl)
-  - Stats run: `—`
-  - Event / debug run: `—`
-  - Note: run is still in progress
+  - Stats run: `H100_80GB-OnlyKernel10/flashattn-fa3-bf16-bwd-causal-b1-s2048-hd64-nh24-flashattn_fa3_bf16_bwd_causal_b1_s2048_hd64_nh24___warmup_-63a73d452237.o13`
+  - Event / debug run: `H100_80GB-OnlyKernel10/flashattn-fa3-bf16-bwd-causal-b1-s2048-hd64-nh24-flashattn_fa3_bf16_bwd_causal_b1_s2048_hd64_nh24___warmup_-63a73d452237.e13`
+  - Note: clean exit, BAR debug summary shows `leaked_ids=0`
 
 ## 2. Optimization Details
 
@@ -218,4 +221,4 @@ sequenceDiagram
   - `inst_barrier` went from 56.09% to 9.09%.
   - `tma_axis` went from 62.73% to 17.16%.
 - The next major fwd bottleneck is now `no_valid_instruction = 39.12%`, so the dominant problem moved away from barriers after this fix.
-- For FA3 bwd, the same BAR work is the right next step based on the Opt 1 breakdown, but the BAR-enabled cycle result is not available yet because that run is still in progress.
+- For FA3 bwd, the cycle count dropped from 361,760 to 328,643 (-9.1%). While `inst_barrier` stalls decreased significantly (from 58.47% to 44.78%), they remain the largest bottleneck, indicating that further barrier optimizations or related pipeline fixes are needed for the backward kernel.
