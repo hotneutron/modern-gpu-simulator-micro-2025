@@ -1418,6 +1418,10 @@ class barrier_set_t {
   bar_id_to_warp_t m_bar_id_to_warps;
   bar_id_to_warp_t m_bar_id_to_arrive_credited_warps;
   bar_id_to_warp_t m_bar_id_to_sync_credited_warps;
+  // DIAG (B7): last bar_count requested per (cta,bar_id). Used only for diagnostics at the
+  // teardown leak so the required threshold can be compared against arrived credits. Keyed
+  // by cta_id then bar_id. (unsigned)-1 == full-CTA. Absent == never reached this epoch.
+  std::map<unsigned, std::map<unsigned, unsigned>> m_bar_id_to_count_diag;
   warp_set_t m_warp_active;
   warp_set_t m_warp_at_barrier;
   shader_core_ctx_wrapper *m_shader;

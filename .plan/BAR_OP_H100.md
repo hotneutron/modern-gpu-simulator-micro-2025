@@ -759,3 +759,57 @@ paths in `warp_reaches_barrier` (B1/B3), which still fire first during normal ex
   could over/early-release if a future kernel reuses the same id within a single warp's
   in-flight window.
 - `BAR.RED` + ARRIVE path is dead code (decode never produces `RED`).
+
+## B7 — `release_satisfiable_barriers` strict `== active` test leaked under prefetch retiming (DIAGNOSING)
+
+### Symptom (recurrence of the B6 two-error signature)
+A FA3 fwd (OnlyKernel5) run with `-prefetch_per_stream_buffer_size 4` (vs the validated
+Opt 2 run's `1`) aborted after ~24h at `gpu_sim_cycle≈132026` with the SAME two-error
+pattern B6 already documents:
+1. `shader.cc:4252 deallocate_barrier(): Assertion at_a_specific_barrier.any()==false failed`
+   (signal 6) — fires FIRST.
+2. `trace_driven.cc:342 ... "undefined instruction" : SYNCS.PHASECHK.TRANS64` (signal 11/6)
+   from the instruction-region prewarm path (`get_instruction_regions_to_prewarm`) — post-
+   abort noise on another OpenMP thread, exactly as B6 notes.
+
+So this is a barrier teardown leak, not an opcode-map gap. The only functional config change
+vs the clean run was the I-prefetch stream-buffer size (it perturbs per-warp fetch/decode/exit
+ordering without changing functional results).
+
+### Suspected root cause (the gap B6 left)
+B6's `release_satisfiable_barriers` releases id `i` only when
+`at_a_specific_barrier == active`, where `active` = ALL still-alive warps in the CTA. That is
+suspected to be wrong for a NAMED/PARTIAL barrier: FA3 fwd block is (512,1,1) = 16 warps, but
+`bar_id=1,count=416` is reached by only 13 warps (12 ARV + 1 closing SYNC); the other 3
+(producer warpgroup) never participate in id 1. If the closing-credit warp exits before the
+count is met while a non-participant producer is still alive, `at_a_specific_barrier != active`
+forever → id 1 leaks to teardown → assert.
+
+### Why the first fix was REVERTED (over-release risk)
+The first attempt added a `drain_nonblocking` path: release any arrived cohort on id `i` that
+has no parked warp. This is **wrong** — `release_satisfiable_barriers` runs on EVERY warp exit,
+and a still-progressing consumer cohort that is legitimately mid-fill (more arrivals coming
+from still-alive warps) would be force-released when an UNRELATED producer warp exits. That
+early-releases a partially-filled barrier and corrupts cycle accuracy. The strict `== active`
+test in B6 was conservative precisely because the engine cannot tell "more arrivals are still
+coming" from "the remaining arrivals can never come". The fix has been reverted to B6 state.
+
+### Diagnostics added (this pass; gated by `-bar_debug_enable`)
+To choose a correct (non-over-releasing) fix we need the exact leak shape. Added:
+- per-`(cta,bar_id)` `m_bar_id_to_count_diag` recorded in `warp_reaches_barrier` (the
+  requested `bar_count` for the epoch; diagnostics only, cleared at deallocate).
+- `[BARDBG][leak]` now prints, per leaked id: `requested_count`, `arrived_credits`
+  (participants + deferred-sync extra credits), `arrived_warps*32` and `credits*32` vs the
+  requested threshold, `parked_here` (is any participant genuinely blocked), and
+  `active_eq_participant`.
+
+This distinguishes the two competing hypotheses:
+- **below threshold** (`credits*32 < requested_count`): a true closing-credit-exited leak →
+  the fix must drain only when no further arrival can come.
+- **at/above threshold** (`credits*32 >= requested_count`): an accounting/ordering bug in the
+  counted-release path itself, not an exit-timing problem.
+
+### Verification plan
+Re-run FA3 fwd (OnlyKernel5) with `-prefetch_per_stream_buffer_size 4`,
+`-bar_debug_enable 1`, `-gpgpu_deadlock_detect 1` (full run). Read the `[BARDBG][leak]` line at
+the failing CTA to confirm the leak shape, THEN design the precise release condition.

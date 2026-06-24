@@ -4223,10 +4223,29 @@ void barrier_set_t::deallocate_barrier(unsigned cta_id) {
         leaked_participant_warps += participant_i.count();
         leaked_arv_seen += arrive_i.count();
         leaked_defer_sync_extra_credits += sync_i.count();
+        // DIAG (B7): requested bar_count for this (cta,bar_id), and the arrived credit count
+        // (participants + extra deferred-sync credits) the same way warp_reaches_barrier
+        // computes it. This shows, at the leak, whether the cohort was BELOW its threshold
+        // (true closing-credit-exited leak) vs. AT/ABOVE it (an accounting/ordering bug),
+        // and whether the strict `==active` release was blocked by NON-participant warps.
+        int requested = -2;  // -2 == never recorded this epoch
+        auto cta_it = m_bar_id_to_count_diag.find(cta_id);
+        if (cta_it != m_bar_id_to_count_diag.end()) {
+          auto id_it = cta_it->second.find(i);
+          if (id_it != cta_it->second.end()) requested = (int)id_it->second;
+        }
+        unsigned arrived_credits = participant_i.count() + sync_i.count();
         oss << "[BARDBG][leak]   bar_id=" << i
-            << " warps=" << participant_i.to_string()
+            << " requested_count=" << requested
+            << " arrived_credits=" << arrived_credits
+            << " (warps*32=" << (participant_i.count() * m_warp_size)
+            << ", credits*32=" << (arrived_credits * m_warp_size) << ")"
+            << " participant_warps=" << participant_i.to_string()
             << " arv_seen=" << arrive_i.count()
-            << " defer_sync_extra_credits=" << sync_i.count() << "\n";
+            << " defer_sync_extra_credits=" << sync_i.count()
+            << " parked_here=" << (participant_i & m_warp_at_barrier).to_string()
+            << " active_eq_participant="
+            << ((participant_i == active) ? 1 : 0) << "\n";
       }
     }
     std::cerr << "[BARDBG][summary] cta_id=" << cta_id
@@ -4259,6 +4278,9 @@ void barrier_set_t::deallocate_barrier(unsigned cta_id) {
     m_bar_id_to_arrive_credited_warps[i] &= ~warps;
     m_bar_id_to_sync_credited_warps[i] &= ~warps;
   }
+  // DIAG (B7): drop this CTA's recorded counts so the diagnostic map does not grow as CTA
+  // slots are reused. Only populated when bar_debug_enable is set.
+  m_bar_id_to_count_diag.erase(cta_id);
   m_cta_to_warps.erase(w);
 }
 
@@ -4286,6 +4308,12 @@ void barrier_set_t::warp_reaches_barrier(unsigned cta_id, unsigned warp_id,
     abort();
   }
   assert(w->second.test(warp_id) == true);  // warp is in cta
+
+  // DIAG (B7): remember the requested count for this (cta,bar_id) so the teardown leak dump
+  // can show the required threshold vs the arrived credits. Diagnostics only.
+  if (m_shader->get_config()->bar_debug_enable) {
+    m_bar_id_to_count_diag[cta_id][bar_id] = bar_count;
+  }
 
   // Keep the per-id participant set so release can clear the whole cohort at once.
   m_bar_id_to_warps[bar_id].set(warp_id);
