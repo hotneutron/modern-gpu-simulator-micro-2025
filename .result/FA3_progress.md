@@ -5,6 +5,7 @@ This document tracks the current optimization status for FA3 using the existing 
 - `.result/FA3_kernel_5_fwd.md`
 - `.result/FA3_kernel_10_bwd.md`
 - `.plan/BAR_OP_H100.md`
+- `.plan/MEMBAR_SCOPE_AWARE_H100.md`
 
 To keep this file easy to extend, use the following update pattern whenever a new optimization is added:
 
@@ -27,7 +28,7 @@ To keep this file easy to extend, use the following update pattern whenever a ne
 | Init | Baseline simulator | Original simulator state before the targeted fixes below | Not available as a standalone cycle in the current notes | 376,735 cycles (2.83x vs HW) | Fwd missing, bwd available |
 | Opt 1 | ROP latency tuning | `-gpgpu_l2_rop_latency 211 -> 100` | 220,024 cycles (3.25x vs HW). This run already used `rop=100`, so there is no separate init cycle to compare against. | 361,760 cycles (2.72x vs HW, -4.0% vs init) | Done |
 | Opt 2 | BAR implementation | `OP_BAR` handling + barrier engine fix + warp-exit drain fix | 162,582 cycles (2.40x vs HW, -26% vs Opt 1). Run exits cleanly. | 328,643 cycles (2.47x vs HW, -9.1% vs Opt 1). Run exits cleanly. | Done |
-| Opt 3 | MEMBAR Scope-Aware Fix | Scope-aware memory fence (CTA/GPU level) | — | — | Pending experiment |
+| Opt 3 | MEMBAR Scope-Aware Fix | Scope-aware memory fence (CTA/GPU level) | 158,990 cycles (2.35x vs HW, -2.2% vs Opt 2). Run exits cleanly and `inst_barrier` nearly disappears. | — | FA3 fwd done, bwd pending |
 
 ### Simulator Cycle Breakdown
 
@@ -35,29 +36,29 @@ To keep this file easy to extend, use the following update pattern whenever a ne
 
 | Class | Init | Opt 1 (`rop=100`) | Opt 2 (BAR impl) | Opt 3 (MEMBAR) | Note |
 |---|---|---|---|---|---|
-| `sim_cycle` | — | 220,024 | 162,582 | — | No standalone init cycle is available in the current notes. The Opt 2 run also exits cleanly. |
-| `no_warps_ready` | — | 64.02% | 23.83% | — | This drops sharply after the BAR fix. |
-| `issuing` | — | 14.56% | 21.17% | — | Issuing share improves after the BAR fix. |
-| `next_stage_not_available` | — | 11.40% | 15.25% | — | Present in the Opt 2 run output (`.o12`). |
-| `no_valid_instruction` | — | 9.52% | 39.12% | — | This becomes the new dominant bucket after the BAR fix. |
-| `issue_port_busy` | — | 0.50% | 0.63% | — | Present in the run outputs (`.o3`, `.o12`). |
-| `sum` | — | 100.00% | 100.00% | — | Top-level classes sum to 100% in both runs. |
+| `sim_cycle` | — | 220,024 | 162,582 | 158,990 | No standalone init cycle is available in the current notes. Opt 2 and Opt 3 both exit cleanly. |
+| `no_warps_ready` | — | 64.02% | 23.83% | 20.98% | This drops sharply after the BAR fix and improves further with the MEMBAR fix. |
+| `issuing` | — | 14.56% | 21.17% | 24.05% | Issuing share improves across Opt 2 -> Opt 3. |
+| `next_stage_not_available` | — | 11.40% | 15.25% | 17.26% | Present in the run outputs (`.o12`, `.o15`). |
+| `no_valid_instruction` | — | 9.52% | 39.12% | 37.01% | This remains the dominant bucket after the barrier-related fixes. |
+| `issue_port_busy` | — | 0.50% | 0.63% | 0.71% | Present in the run outputs (`.o3`, `.o12`, `.o15`). |
+| `sum` | — | 100.00% | 100.00% | 100.00% | Top-level classes sum to 100% in all completed fwd runs. |
 
 #### FA3 fwd - inner stall / wait breakdown
 
 | Wait reason | Init | Opt 1 (`rop=100`) | Opt 2 (BAR impl) | Opt 3 (MEMBAR) | Note |
 |---|---|---|---|---|---|
-| `inst_barrier` | — | 56.09% | 9.09% | — | Barrier inflation drops sharply after the BAR fix. |
-| `wait_barrier` | — | 6.64% | 8.07% | — | mbarrier wait remains present. |
-| `tma_axis` | — | 62.73% | 17.16% | — | Grouped TMA-side stall share falls substantially. |
-| `non_tma_axis` | — | 17.80% | 17.34% | — | Grouped non-TMA stall share stays similar. |
-| `fu_occupied` | — | 11.83% | 9.91% | — | Present in the run outputs (`.o3`, `.o12`). |
-| `stall_count` | — | 5.00% | 5.97% | — | Present in the run outputs (`.o3`, `.o12`). |
-| `tma_flush` | — | 0.00% | 0.00% | — | Present in the run outputs (`.o3`, `.o12`). |
-| `yield` | — | 0.92% | 1.21% | — | Present in the run outputs (`.o3`, `.o12`). |
-| `result_queue_full` | — | 0.05% | 0.25% | — | Present in the run outputs (`.o3`, `.o12`). |
-| `l1c` | — | 0.00% | 0.00% | — | Present in the run outputs (`.o3`, `.o12`). |
-| `scoreboard (memory)` | — | 0.00% | 0.00% | — | Present in the run outputs (`.o3`, `.o12`). |
+| `inst_barrier` | — | 56.09% | 9.09% | 0.05% | Barrier inflation drops sharply after the BAR fix and is nearly eliminated by the MEMBAR fix. |
+| `wait_barrier` | — | 6.64% | 8.07% | 9.01% | mbarrier-style wait remains present even after MEMBAR rendezvous removal. |
+| `tma_axis` | — | 62.73% | 17.16% | 9.06% | Grouped TMA-side stall share falls substantially again in Opt 3. |
+| `non_tma_axis` | — | 17.80% | 17.34% | 19.07% | Grouped non-TMA stall share stays in a similar range. |
+| `fu_occupied` | — | 11.83% | 9.91% | 10.91% | Present in the run outputs (`.o3`, `.o12`, `.o15`). |
+| `stall_count` | — | 5.00% | 5.97% | 6.56% | Present in the run outputs (`.o3`, `.o12`, `.o15`). |
+| `tma_flush` | — | 0.00% | 0.00% | 0.00% | Present in the run outputs (`.o3`, `.o12`, `.o15`). |
+| `yield` | — | 0.92% | 1.21% | 1.30% | Present in the run outputs (`.o3`, `.o12`, `.o15`). |
+| `result_queue_full` | — | 0.05% | 0.25% | 0.29% | Present in the run outputs (`.o3`, `.o12`, `.o15`). |
+| `l1c` | — | 0.00% | 0.00% | 0.00% | Present in the run outputs (`.o3`, `.o12`, `.o15`). |
+| `scoreboard (memory)` | — | 0.00% | 0.00% | 0.00% | Present in the run outputs (`.o3`, `.o12`, `.o15`). |
 
 #### FA3 bwd - top-level simulator breakdown
 
@@ -103,6 +104,11 @@ FA3 fwd
   - Stats run: `H100_80GB-OnlyKernel5/flashattn-fa3-bf16-bwd-causal-b1-s2048-hd64-nh24-flashattn_fa3_bf16_bwd_causal_b1_s2048_hd64_nh24___warmup_-63a73d452237.o12`
   - Event / debug run: `H100_80GB-OnlyKernel5/flashattn-fa3-bf16-bwd-causal-b1-s2048-hd64-nh24-flashattn_fa3_bf16_bwd_causal_b1_s2048_hd64_nh24___warmup_-63a73d452237.e12`
   - Note: clean exit, BAR debug summary shows `leaked_ids=0`
+
+- Opt 3 (MEMBAR)
+  - Stats run: `H100_80GB-OnlyKernel5/flashattn-fa3-bf16-bwd-causal-b1-s2048-hd64-nh24-flashattn_fa3_bf16_bwd_causal_b1_s2048_hd64_nh24___warmup_-63a73d452237.o15`
+  - Event / debug run: `H100_80GB-OnlyKernel5/flashattn-fa3-bf16-bwd-causal-b1-s2048-hd64-nh24-flashattn_fa3_bf16_bwd_causal_b1_s2048_hd64_nh24___warmup_-63a73d452237.e15`
+  - Note: clean exit, verified as `FlashAttnFwdSm90` / `trace_kernel_id=5`; `MEMBAR.ALL.CTA` takes the fence path and no `[MEMBARDBG][stuck]` is reported
 
 FA3 bwd
 
@@ -271,6 +277,9 @@ A deadlock-detection watchdog (`[MEMBARDBG][stuck]`) was also added so any warp 
 
 #### Result
 
-- The experiment is currently running and has been verified to execute smoothly without deadlocks or counter leaks: the `[MEMBARDBG][stuck]` watchdog stays silent, `MEMBAR.ALL.CTA` is confirmed to take the new fence path (`[MEMBARDBG][fence-enter]`) instead of the barrier engine, and store++/store-- and fence-enter/release counters stay balanced (per-warp counters return toward 0 on release). Scope-aware waiting is observed working in practice (e.g. `op=MEMBAR.ALL.CTA scope=1 cta=2 gpu=0 tma=0` waits only on its 2 CTA-visible stores).
-- Expected effect (per the plan's verification criteria): `MEMBAR.ALL.CTA` should disappear from `[BARDBG][issue]` (it now bypasses the barrier engine), `inst_barrier` (44.78%) and `no_warps_ready` (58.27%) should drop sharply, and `gpu_tot_sim_cycle` should fall from 328,643 toward the HW target of 132,901, with membar stalls collapsing into a small per-warp wait bucket consistent with HW (~0%).
-- The cycle breakdowns and top-level metrics in the tables above will be filled in once the simulation completes.
+- FA3 fwd improved from 162,582 cycles to 158,990 cycles after the MEMBAR scope-aware fence work, a further **-2.2%** reduction vs Opt 2. This places fwd at **2.35x** the HW target (158,990 vs 67,696 cycles).
+- The run exits cleanly. In the debug log, `MEMBAR.ALL.CTA` is confirmed to use the new fence path (`[MEMBARDBG][fence-enter]`) and the watchdog stays silent (`[MEMBARDBG][stuck]` not observed).
+- The main MEMBAR-specific symptom is essentially removed in fwd: `inst_barrier` drops from **9.09%** to **0.05%**. The grouped TMA-side stall share also falls again, from **17.16%** to **9.06%**.
+- Top-level issue-stage balance improves in the same direction: `no_warps_ready` falls from **23.83%** to **20.98%**, while `issuing` rises from **21.17%** to **24.05%**.
+- The dominant remaining fwd bottlenecks are now frontend / availability related rather than barrier related: `no_valid_instruction = 37.01%` and `next_stage_not_available = 17.26%`.
+- FA3 bwd Opt 3 remains tracked separately and is still pending in the tables above.
