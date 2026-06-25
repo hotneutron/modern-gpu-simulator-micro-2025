@@ -132,6 +132,7 @@ void ptx_stats::ptx_file_line_stats_write_file() {
   FILE *pfile;
 
   pfile = fopen(ptx_line_stats_filename, "w");
+  if (pfile == NULL) return;
   fprintf(
       pfile,
       "kernel line : count latency dram_traffic smem_bk_conflicts smem_warp "
