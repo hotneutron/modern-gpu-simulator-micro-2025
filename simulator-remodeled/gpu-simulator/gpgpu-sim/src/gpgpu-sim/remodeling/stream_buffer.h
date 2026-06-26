@@ -91,6 +91,9 @@ struct prefetch_element {
   unsigned long long m_first_demand_cycle;
   bool m_has_first_demand;
   unsigned int m_prefetch_l1i_fate;
+  // L1I eager-promote: cycle at which the prefetch became ready (filled into the
+  // stream buffer). Used only for debug/lead-time accounting on eager promote.
+  unsigned long long m_ready_cycle = 0;
   std::map<unsigned int, std::set<new_addr_type>> waiting_warp_ids_and_its_addrs;
   std::set<new_addr_type> waiting_addrs_of_the_block;
 };
@@ -138,6 +141,12 @@ class single_stream_buffer {
 
   bool send_to_cache();
 
+  // L1I eager-promote (Option B): if the head entry is ready and no demand has
+  // yet requested it, promote it into the L1I tag array immediately. Gated by
+  // the cache fill-port availability. Returns true if a promote was performed.
+  // Does NOT create an L0I response (m_next_response).
+  bool try_eager_promote_head();
+
   bool has_ready_requested_head() const;
 
   bool classify_waiting_requested_head(new_addr_type addr, bool &is_ready) const;
@@ -178,6 +187,11 @@ class multiple_stream_buffers {
   void set_new_stream(new_addr_type addr, unsigned int unique_function_id, unsigned long long gpu_cycle, unsigned int warp_id, bool is_early_trigger_candidate);
 
   void cycle(bool can_sb_send_to_cache);
+
+  // L1I eager-promote (Option B): walk the stream buffers and promote any ready,
+  // not-yet-demanded head entry into the L1I tag array. Best-effort, gated by the
+  // cache fill-port availability inside single_stream_buffer::try_eager_promote_head.
+  void eager_promote_cycle();
 
   void flush();
 

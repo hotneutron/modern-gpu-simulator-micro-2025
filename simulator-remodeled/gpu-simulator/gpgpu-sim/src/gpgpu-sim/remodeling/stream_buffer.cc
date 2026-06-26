@@ -206,6 +206,7 @@ bool single_stream_buffer::fill(mem_fetch *mf, unsigned time) {
             get_sm()->m_sm_stats.m_stats_map["total_num_l0i_stream_buffer_prefetch_l1i_miss_fill_matched"]->increment_with_integer(1);
         }
         it->second.is_ready = true;
+        it->second.m_ready_cycle = get_sm()->get_current_gpu_cycle();
         if (it->second.m_has_first_demand) {
             unsigned long long ready_cycle = get_sm()->get_current_gpu_cycle();
             if (ready_cycle > it->second.m_first_demand_cycle) {
@@ -266,6 +267,51 @@ bool single_stream_buffer::has_ready_requested_head() const {
     auto it = m_all_prefetches.find(addr);
     assert(it != m_all_prefetches.end());
     return it->second.is_ready && it->second.is_request_to_cache;
+}
+
+// L1I eager-promote (Option B). Promote the head entry into the L1I tag array if
+// it is ready and has NOT yet been demanded. Guards:
+//  - is_ready == true (data actually returned into the stream buffer)
+//  - is_request_to_cache == false (no demand has claimed it yet; the demand path
+//    owns those, and double-driving would race the L0I response)
+//  - waiting_warp_ids_and_its_addrs empty (Risk B: never strand a waiter)
+//  - fill-port available (Risk: Option B defers rather than dropping)
+// Returns true iff a promote was performed (head popped).
+bool single_stream_buffer::try_eager_promote_head() {
+    if(!m_is_enabled) return false;
+    if(m_queue_ordered_prefetches.empty()) return false;
+    first_level_instruction_cache *cache = get_cache();
+    if(!cache->eager_promote_enabled()) return false;
+
+    new_addr_type addr = m_queue_ordered_prefetches.front();
+    auto it = m_all_prefetches.find(addr);
+    assert(it != m_all_prefetches.end());
+    prefetch_element &elem = it->second;
+
+    if(!elem.is_ready) return false;             // data not back yet
+    if(elem.is_request_to_cache) return false;   // demand owns this; leave it
+    SM *sm = get_sm();
+    if(!elem.waiting_warp_ids_and_its_addrs.empty() ||
+       !elem.waiting_addrs_of_the_block.empty()) {  // Risk B guard
+        sm->m_sm_stats.m_stats_map["total_num_l0i_sb_eager_promote_skipped_has_waiter"]->increment_with_integer(1);
+        return false;
+    }
+    if(cache->is_eager_promote_blocked_by_port()) {  // Option B: defer
+        sm->m_sm_stats.m_stats_map["total_num_l0i_sb_eager_promote_skipped_fill_port_busy"]->increment_with_integer(1);
+        return false;
+    }
+
+    bool promoted = cache->promote_prefetch_to_cache(addr, elem);
+    if(promoted) {
+        m_queue_ordered_prefetches.pop();
+        m_all_prefetches.erase(addr);
+    } else {
+        // probe-skip (already cached / misaligned): drop the SB entry too, since
+        // the line is (or will be) serviced by the cache directly.
+        m_queue_ordered_prefetches.pop();
+        m_all_prefetches.erase(addr);
+    }
+    return promoted;
 }
 
 bool single_stream_buffer::classify_waiting_requested_head(new_addr_type addr,
@@ -473,6 +519,17 @@ void multiple_stream_buffers::cycle(bool can_sb_send_to_cache) {
             can_send_to_cache = m_stream_buffers[m_next_sb_send_request]->send_to_cache();
             m_next_sb_send_request = (m_next_sb_send_request + 1) % m_num_stream_buffers;
         }  
+    }
+}
+
+void multiple_stream_buffers::eager_promote_cycle() {
+    if(!m_is_enabled) return;
+    // Best-effort: try to promote one ready/not-demanded head per stream buffer.
+    // single_stream_buffer::try_eager_promote_head() internally gates on the
+    // cache fill port (Option B), so at most one promote actually consumes the
+    // port per cycle; the rest see the port busy and defer.
+    for(unsigned int i = 0; i < m_num_stream_buffers; i++) {
+        m_stream_buffers[i]->try_eager_promote_head();
     }
 }
 

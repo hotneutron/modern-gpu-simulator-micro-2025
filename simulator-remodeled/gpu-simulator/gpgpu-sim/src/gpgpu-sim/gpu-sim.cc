@@ -1831,6 +1831,24 @@ void shader_core_config::reg_options(class OptionParser *opp) {
                          "Maximum number of instruction-region prewarm lines issued per cycle."
                          "(default=1)",
                          "1");
+  option_parser_register(opp, "-is_instruction_prefetch_eager_promote_enabled", OPT_BOOL,
+                         &is_instruction_prefetch_eager_promote_enabled,
+                         "If enabled, a prefetched L1I line is promoted into the L1I tag array "
+                         "as soon as it becomes ready in the stream buffer, without waiting for a "
+                         "demand and without producing an L0I response. Gated by L1I fill-port "
+                         "availability (Option B). See .plan/L1I_prefetch_redesign.md."
+                         "(default = disabled)",
+                         "0");
+  option_parser_register(opp, "-l1i_prefetch_debug_enable", OPT_BOOL,
+                         &l1i_prefetch_debug_enable,
+                         "Enable L1I prefetch eager-promote debug logging ([L1IPFDBG])."
+                         "(default=0)",
+                         "0");
+  option_parser_register(opp, "-l1i_prefetch_debug_budget", OPT_UINT32,
+                         &l1i_prefetch_debug_budget,
+                         "Maximum number of [L1IPFDBG] event lines to print per SM when "
+                         "l1i_prefetch_debug_enable is set. (default=2000000)",
+                         "2000000");
   option_parser_register(opp, "-sync_debug_enable", OPT_BOOL,
                          &sync_debug_enable,
                          "Enable Hopper mbarrier sync debug logging (SYNCDBG)."
@@ -2533,6 +2551,13 @@ void gpgpu_sim::create_gpu_per_sm_stats() {
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_l0i_stream_buffer_prefetch_issued", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_l0i_stream_buffer_prefetch_blocked_memport_full", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_l0i_stream_buffer_prefetch_blocked_sb_full", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  // L1I eager-promote (Option B) counters. See .plan/L1I_prefetch_redesign.md.
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_l0i_sb_eager_promote_to_cache", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_l0i_sb_eager_promote_skipped_already_cached", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_l0i_sb_eager_promote_skipped_fill_port_busy", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_l0i_sb_eager_promote_skipped_has_waiter", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_l0i_sb_eager_promote_demand_hit_later", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_l0i_sb_eager_promote_demand_miss_after_promote", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_l0i_stream_buffer_prefetch_l1i_accesses", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_l0i_stream_buffer_prefetch_l1i_hits", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_l0i_stream_buffer_prefetch_l1i_misses", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);

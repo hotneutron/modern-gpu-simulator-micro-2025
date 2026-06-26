@@ -2209,6 +2209,14 @@ class shader_core_config : public core_config {
   unsigned int instruction_region_prewarm_max_regions;
   unsigned int instruction_region_prewarm_max_lines_per_cycle;
 
+  // L1I prefetch eager-promote: when a prefetched line becomes ready in the
+  // stream buffer, promote it into the L1I tag array immediately (without waiting
+  // for a demand and without producing an L0I response). See
+  // .plan/L1I_prefetch_redesign.md.
+  bool is_instruction_prefetch_eager_promote_enabled;
+  bool l1i_prefetch_debug_enable;
+  unsigned int l1i_prefetch_debug_budget;
+
   // Hopper mbarrier sync debug logging (SYNCDBG). Disabled by default.
   bool sync_debug_enable;
   unsigned int sync_debug_print_budget;
