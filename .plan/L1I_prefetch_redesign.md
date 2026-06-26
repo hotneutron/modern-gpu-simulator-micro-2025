@@ -114,10 +114,10 @@ L1I" from "produce L0I response".
 
 | Mode | Trigger | Action |
 |---|---|---|
-| **(new) eager promote** | prefetch fill complete (`is_ready == true`, `is_request_to_cache == false`) | fill the L1I tag array + pop from SB. **Does NOT create `m_next_response`.** Gated by `fill_port_free()` (option B). |
+| **(new) eager promote** | prefetch fill complete (`is_ready == true`, `is_request_to_cache == false`) | fill the L1I tag array + pop from SB. **Does NOT create `m_next_response`.** Gated by `fill_port_free()` (defer when busy). |
 | (existing) demand path | demand arrives + SB hit | unchanged; lines already eager-promoted are naturally served as L1I HIT. |
 
-### Port handling — Option B (chosen)
+### Port handling (chosen: defer-when-busy)
 
 eager promote uses the same fill port. We model the 1-port constraint strictly
 and give demand fill priority:
@@ -201,7 +201,7 @@ The per-cycle order inside `first_level_instruction_cache::cycle()` is:
   **data** port stays 0% as before.
 - If a demand fill (`fill_from_stream_buffer`, step 2) takes the fill port first
   in the same cycle, the step-3 eager promote sees `fill_port_free() == false` and
-  defers => Option B gives demand priority, as intended.
+  defers => demand gets fill-port priority, as intended.
 
 ### 6.1 Failure modes
 
@@ -215,7 +215,7 @@ The per-cycle order inside `first_level_instruction_cache::cycle()` is:
 | (D) Useless prefetch polluting L1I (eviction) | monitor `prefetched_l1i_lines_evicted` (currently 0; low risk). |
 | (E) invalidate/flush consistency at kernel end | eager promote drains SB earlier, so teardown is safer. Confirm interaction with `-invalidate_instruction_caches_at_kernel_end 1`. |
 | Deadlock interaction with `num_stream_buffers` | eager promote drains the head without demand, which *reduces* HOL/deadlock pressure. Validate first with `num_stream_buffers = 1`. |
-| Port starvation of eager promote | Option B defers (does not drop). Data stays in SB; retried next cycle. |
+| Port starvation of eager promote | Defers (does not drop). Data stays in SB; retried next cycle. |
 
 ## 7. Instrumentation (new counters)
 

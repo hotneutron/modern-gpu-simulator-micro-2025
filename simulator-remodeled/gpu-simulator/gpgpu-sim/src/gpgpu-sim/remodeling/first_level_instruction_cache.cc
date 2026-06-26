@@ -451,15 +451,38 @@ void first_level_instruction_cache::note_demand_on_eager_promoted(
             fprintf(stderr, "%s", oss.str().c_str());
         }
     } else {
-        // CRITICAL (Risk A): a demand MISSed even though the line was promoted.
-        sm->m_sm_stats.m_stats_map["total_num_l0i_sb_eager_promote_demand_miss_after_promote"]->increment_with_integer(1);
-        // Always print (budget-independent) so this never gets silently dropped.
-        std::ostringstream oss;
-        oss << "[L1IPFDBG][demand-MISS-after-promote] sm=" << sm->get_sid()
-            << " addr=0x" << std::hex << base_addr << std::dec
-            << " promote_cyc=" << promote_cyc
-            << " cycle=" << demand_cyc << "\n";
-        fprintf(stderr, "%s", oss.str().c_str());
+        // A demand MISSed on a line we eager-promoted earlier. Distinguish two
+        // very different cases by the promote->miss gap:
+        //  - small gap  => the line was (almost) never in L1I after the promote:
+        //                  a true correctness signal (Risk A, e.g. mshr mismatch).
+        //  - large gap  => the line WAS promoted but got evicted from L1I long
+        //                  before this demand (normal capacity eviction).
+        const unsigned long long kImmediateMissGap = 100;
+        unsigned long long gap = (demand_cyc >= promote_cyc) ? (demand_cyc - promote_cyc) : 0;
+        if(gap < kImmediateMissGap) {
+            // CRITICAL (Risk A): a demand MISSed right after the promote.
+            sm->m_sm_stats.m_stats_map["total_num_l0i_sb_eager_promote_demand_miss_after_promote"]->increment_with_integer(1);
+            // Always print (budget-independent) so this never gets silently dropped.
+            std::ostringstream oss;
+            oss << "[L1IPFDBG][demand-MISS-after-promote] sm=" << sm->get_sid()
+                << " addr=0x" << std::hex << base_addr << std::dec
+                << " promote_cyc=" << promote_cyc
+                << " gap=" << gap
+                << " cycle=" << demand_cyc << "\n";
+            fprintf(stderr, "%s", oss.str().c_str());
+        } else {
+            // Normal capacity eviction before the next demand. Not a bug.
+            sm->m_sm_stats.m_stats_map["total_num_l0i_sb_eager_promote_evicted_before_demand"]->increment_with_integer(1);
+            if(l1i_pf_debug_take_budget()) {
+                std::ostringstream oss;
+                oss << "[L1IPFDBG][evicted-before-demand] sm=" << sm->get_sid()
+                    << " addr=0x" << std::hex << base_addr << std::dec
+                    << " promote_cyc=" << promote_cyc
+                    << " gap=" << gap
+                    << " cycle=" << demand_cyc << "\n";
+                fprintf(stderr, "%s", oss.str().c_str());
+            }
+        }
     }
     m_eager_promoted_base_addr_cycle.erase(it);
 }

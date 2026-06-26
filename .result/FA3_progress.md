@@ -30,37 +30,38 @@ To keep this file easy to extend, use the following update pattern whenever a ne
 | Opt 1 | ROP latency tuning | `-gpgpu_l2_rop_latency 211 -> 100` | 220,024 cycles (3.25x vs HW). This run already used `rop=100`, so there is no separate init cycle to compare against. | 361,760 cycles (2.72x vs HW, -4.0% vs init) | Done |
 | Opt 2 | BAR implementation | `OP_BAR` handling + barrier engine fix + warp-exit drain fix | 162,582 cycles (2.40x vs HW, -26% vs Opt 1). Run exits cleanly. | 328,643 cycles (2.47x vs HW, -9.1% vs Opt 1). Run exits cleanly. | Done |
 | Opt 3 | MEMBAR Scope-Aware Fix | Scope-aware memory fence (CTA/GPU level) | 158,990 cycles (2.35x vs HW, -2.2% vs Opt 2). Run exits cleanly and `inst_barrier` nearly disappears. | 259,456 cycles (1.95x vs HW, -21.1% vs Opt 2). Run exits cleanly. | Done |
-| Opt 4 | Prefetch improvement | (a) `-prefetch_per_stream_buffer_size 1 -> 4` (deeper stream buffer, config-only). (b) L1I eager-promote (Option B): promote a ready prefetched line into L1I without waiting for a demand (code change, pending run). | 155,765 cycles (2.30x vs HW, -2.0% vs Opt 3) **with (a) only**. (b) not yet run. | 241,528 cycles (1.82x vs HW, -6.9% vs Opt 3) **with (a) only**. (b) not yet run. | (a) done; (b) pending build/run |
+| Opt 4 | Prefetch (deeper stream buffer) | `-prefetch_per_stream_buffer_size 1 -> 4` (deeper stream buffer, config-only) | 155,765 cycles (2.30x vs HW, -2.0% vs Opt 3) | 241,528 cycles (1.82x vs HW, -6.9% vs Opt 3) | Done |
+| Opt 5 | L1I eager-promote | Promote a ready prefetched line into L1I as soon as it is filled in the stream buffer, without waiting for a demand and without an L0I response (code change, on top of Opt 4 sb=4) | 150,755 cycles (2.23x vs HW, -3.2% vs Opt 4, -5.2% vs Opt 3) | — | FA3 fwd done, bwd pending |
 
 ### Simulator Cycle Breakdown
 
 #### FA3 fwd - top-level simulator breakdown
 
-| Class | Init | Opt 1 (`rop=100`) | Opt 2 (BAR impl) | Opt 3 (MEMBAR) | Opt 4 (prefetch, sb=4) | Note |
-|---|---|---|---|---|---|---|
-| `sim_cycle` | — | 220,024 | 162,582 | 158,990 | 155,765 | Opt 4 column is the `sb=4` run only (`.o16`); eager-promote not yet included. |
-| `no_warps_ready` | — | 64.02% | 23.83% | 20.98% | 26.81% | Frontend pressure shifts here once `no_valid_instruction` drops in Opt 4. |
-| `issuing` | — | 14.56% | 21.17% | 24.05% | 31.18% | Issuing share rises further with the deeper stream buffer. |
-| `next_stage_not_available` | — | 11.40% | 15.25% | 17.26% | — | Not separately re-summarized for `.o16` yet. |
-| `no_valid_instruction` | — | 9.52% | 39.12% | 37.01% | 18.63% | Large drop with `sb=4` (deeper buffer relieves the frontend). |
-| `issue_port_busy` | — | 0.50% | 0.63% | 0.71% | — | Not separately re-summarized for `.o16` yet. |
-| `sum` | — | 100.00% | 100.00% | 100.00% | — | |
+| Class | Init | Opt 1 (`rop=100`) | Opt 2 (BAR impl) | Opt 3 (MEMBAR) | Opt 4 (prefetch, sb=4) | Opt 5 (eager-promote) | Note |
+|---|---|---|---|---|---|---|---|
+| `sim_cycle` | — | 220,024 | 162,582 | 158,990 | 155,765 | 150,755 | Opt 4 = `.o16` (sb=4 only); Opt 5 = `.o18` (sb=4 + eager-promote). |
+| `no_warps_ready` | — | 64.02% | 23.83% | 20.98% | 26.81% | 27.82% | Now the dominant class; frontend is no longer #1. |
+| `issuing` | — | 14.56% | 21.17% | 24.05% | 31.18% | 31.36% | Roughly flat vs Opt 4. |
+| `next_stage_not_available` | — | 11.40% | 15.25% | 17.26% | 22.45% | 22.58% | Downstream pipes; roughly flat vs Opt 4. |
+| `no_valid_instruction` | — | 9.52% | 39.12% | 37.01% | 18.63% | 17.32% | Frontend drops a bit further with eager-promote. |
+| `issue_port_busy` | — | 0.50% | 0.63% | 0.71% | 0.92% | 0.92% | Present in `.o18`. |
+| `sum` | — | 100.00% | 100.00% | 100.00% | 100.00% | 100.00% | |
 
 #### FA3 fwd - inner stall / wait breakdown
 
-| Wait reason | Init | Opt 1 (`rop=100`) | Opt 2 (BAR impl) | Opt 3 (MEMBAR) | Opt 4 (prefetch, sb=4) | Note |
-|---|---|---|---|---|---|---|
-| `inst_barrier` | — | 56.09% | 9.09% | 0.05% | 0.07% | Stays negligible (barrier already fixed in Opt 2/3). |
-| `wait_barrier` | — | 6.64% | 8.07% | 9.01% | 11.98% | mbarrier-style wait. |
-| `tma_axis` | — | 62.73% | 17.16% | 9.06% | 12.05% | Grouped TMA-side stall share. |
-| `non_tma_axis` | — | 17.80% | 17.34% | 19.07% | 24.10% | Rises as the frontend unblocks and work shifts to execution/resources. |
-| `fu_occupied` | — | 11.83% | 9.91% | 10.91% | 13.53% | Present in `.o16`. |
-| `stall_count` | — | 5.00% | 5.97% | 6.56% | 8.47% | Present in `.o16`. |
-| `tma_flush` | — | 0.00% | 0.00% | 0.00% | 0.00% | Present in `.o16`. |
-| `yield` | — | 0.92% | 1.21% | 1.30% | 1.69% | Present in `.o16`. |
-| `result_queue_full` | — | 0.05% | 0.25% | 0.29% | 0.40% | Present in `.o16`. |
-| `l1c` | — | 0.00% | 0.00% | 0.00% | 0.00% | Present in `.o16`. |
-| `scoreboard (memory)` | — | 0.00% | 0.00% | 0.00% | 0.00% | Present in `.o16`. |
+| Wait reason | Init | Opt 1 (`rop=100`) | Opt 2 (BAR impl) | Opt 3 (MEMBAR) | Opt 4 (prefetch, sb=4) | Opt 5 (eager-promote) | Note |
+|---|---|---|---|---|---|---|---|
+| `inst_barrier` | — | 56.09% | 9.09% | 0.05% | 0.07% | 0.07% | Negligible. |
+| `wait_barrier` | — | 6.64% | 8.07% | 9.01% | 11.98% | 12.97% | mbarrier-style wait. |
+| `tma_axis` | — | 62.73% | 17.16% | 9.06% | 12.05% | 13.04% | Grouped TMA-side stall share. |
+| `non_tma_axis` | — | 17.80% | 17.34% | 19.07% | 24.10% | 24.25% | Execution/resource-side waits. |
+| `fu_occupied` | — | 11.83% | 9.91% | 10.91% | 13.53% | 13.60% | Present in `.o18`. |
+| `stall_count` | — | 5.00% | 5.97% | 6.56% | 8.47% | 8.53% | Present in `.o18`. |
+| `tma_flush` | — | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | Present in `.o18`. |
+| `yield` | — | 0.92% | 1.21% | 1.30% | 1.69% | 1.71% | Present in `.o18`. |
+| `result_queue_full` | — | 0.05% | 0.25% | 0.29% | 0.40% | 0.41% | Present in `.o18`. |
+| `l1c` | — | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | Present in `.o18`. |
+| `scoreboard (memory)` | — | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | Present in `.o18`. |
 
 #### FA3 bwd - top-level simulator breakdown
 
@@ -112,10 +113,15 @@ FA3 fwd
   - Event / debug run: `H100_80GB-OnlyKernel5/flashattn-fa3-bf16-bwd-causal-b1-s2048-hd64-nh24-flashattn_fa3_bf16_bwd_causal_b1_s2048_hd64_nh24___warmup_-63a73d452237.e15`
   - Note: clean exit, verified as `FlashAttnFwdSm90` / `trace_kernel_id=5`; `MEMBAR.ALL.CTA` takes the fence path and no `[MEMBARDBG][stuck]` is reported
 
-- Opt 4 (prefetch, sb=4 only)
+- Opt 4 (prefetch, sb=4)
   - Stats run: `H100_80GB-OnlyKernel5/flashattn-fa3-bf16-bwd-causal-b1-s2048-hd64-nh24-flashattn_fa3_bf16_bwd_causal_b1_s2048_hd64_nh24___warmup_-63a73d452237.o16`
   - Event / debug run: `H100_80GB-OnlyKernel5/flashattn-fa3-bf16-bwd-causal-b1-s2048-hd64-nh24-flashattn_fa3_bf16_bwd_causal_b1_s2048_hd64_nh24___warmup_-63a73d452237.e16`
-  - Note: `-prefetch_per_stream_buffer_size 4` only; clean exit. This run does NOT include the eager-promote code (no eager-promote counters present). Eager-promote run is pending.
+  - Note: `-prefetch_per_stream_buffer_size 4` only; clean exit. No eager-promote code in this run.
+
+- Opt 5 (L1I eager-promote, on top of sb=4)
+  - Stats run: `H100_80GB-OnlyKernel5/flashattn-fa3-bf16-bwd-causal-b1-s2048-hd64-nh24-flashattn_fa3_bf16_bwd_causal_b1_s2048_hd64_nh24___warmup_-63a73d452237.o18`
+  - Event / debug run: `H100_80GB-OnlyKernel5/flashattn-fa3-bf16-bwd-causal-b1-s2048-hd64-nh24-flashattn_fa3_bf16_bwd_causal_b1_s2048_hd64_nh24___warmup_-63a73d452237.e18`
+  - Note: `sb=4` + `-is_instruction_prefetch_eager_promote_enabled 1`; clean exit. `eager_promote_to_cache=663,598`, `demand_hit_later=266,752`, `demand_miss_after_promote=498` (all capacity eviction, gap>1k cycles; no immediate-miss = no real Risk A). L1I miss rate 0.6715 -> 0.3387.
 
 FA3 bwd
 
@@ -299,33 +305,85 @@ A deadlock-detection watchdog (`[MEMBARDBG][stuck]`) was also added so any warp 
 - The old barrier-engine artifact is almost eliminated in bwd: `inst_barrier` drops from **44.78%** to **1.01%**. The top-level `no_warps_ready` class also falls from **58.27%** to **29.80%**, while `issuing` rises from **14.06%** to **20.93%**.
 - After the MEMBAR fix, the dominant remaining bwd bottlenecks shift away from `inst_barrier` and toward frontend / wait-path pressure: `no_valid_instruction = 33.59%`, `non_tma_axis = 21.99%`, `tma_axis = 17.13%`, and `next_stage_not_available = 15.11%`.
 
-### Opt 4 - Prefetch improvement
-
-> Full root-cause analysis and the eager-promote design are documented in [L1I_prefetch_redesign.md](file:///home/jihyun/modern-gpu-simulator-micro-2025/.plan/L1I_prefetch_redesign.md). This section summarizes the two parts of Opt 4.
+### Opt 4 - Prefetch (deeper stream buffer)
 
 #### Why this optimization
 
 - After Opt 3, the #1 fwd stall became the instruction frontend: `no_valid_instruction = 37.01%`, almost entirely `head_invalid_waiting_frontend` -> `stream_buffer_wait` -> `prefetch_issued_not_ready = 11,710,629 cycles`.
-- Root cause analysis (see plan) showed the prefetch path is bottlenecked two ways:
-  1. A single shallow stream buffer causes head-of-line blocking: `prefetch_blocked_sb_full = 59,742,797` and `new_stream_rejected_head_waiting_for_cache = 246,187` (~77% of candidates rejected).
-  2. Prefetched lines are not promoted into L1I until a demand arrives, so a prefetch can never become ready ahead of its demand: `head_demand_arrived_after_ready = 0` (never, not once), while the prefetch is issued ~236 cycles ahead on average. The promote is also gated on the single L0I response slot (`m_stream_buffers->cycle(!m_next_response)`).
+- Root-cause analysis (see [L1I_prefetch_redesign.md](file:///home/jihyun/modern-gpu-simulator-micro-2025/.plan/L1I_prefetch_redesign.md)) found a single shallow stream buffer causing head-of-line blocking: `prefetch_blocked_sb_full = 59,742,797` and `new_stream_rejected_head_waiting_for_cache = 246,187` (~77% of candidates rejected).
 
 #### How to implement
 
-Opt 4 has two independent parts:
-
-**(a) Deeper stream buffer (config-only, DONE).** `-prefetch_per_stream_buffer_size 1 -> 4`. A deeper FIFO relieves the head-of-line blocking directly, without code changes.
-
-**(b) L1I eager-promote, Option B (code change, PENDING run).** Promote a prefetched line into the L1I tag array as soon as it becomes ready in the stream buffer, without waiting for a demand and without producing an L0I response, so a later demand simply hits in L1I. Gated by L1I fill-port availability (Option B defers, never drops). Guards: promote only when the head is ready, not yet demanded, and has no waiter (Risk B); probe-skip if already HIT/MSHR-pending (Risk C); fill with the same `mshr_addr(base_addr)` the demand probes (Risk A). New config flags: `-is_instruction_prefetch_eager_promote_enabled`, `-l1i_prefetch_debug_enable`, `-l1i_prefetch_debug_budget`. New counters `total_num_l0i_sb_eager_promote_*` and `[L1IPFDBG]` debug logs (including a critical `demand-MISS-after-promote` signal and a `[stuck]` watchdog). Code touches `shader.h`, `gpu-sim.cc`, `shader.cc`, `stream_buffer.{h,cc}`, `first_level_instruction_cache.{h,cc}`.
+- Config-only: `-prefetch_per_stream_buffer_size 1 -> 4`. A deeper FIFO relieves the head-of-line blocking directly, no code changes.
 
 #### Result
 
-- **Part (a) only** (`.o16`, `sb=4`, no eager-promote): FA3 fwd improved from 158,990 to **155,765 cycles** (**-2.0%** vs Opt 3, **2.30x** vs HW). Run exits cleanly.
-  - Frontend pressure dropped sharply: `no_valid_instruction` **37.01% -> 18.63%**, `stream_buffer_wait` **17.67% -> 14.03%**, `prefetch_issued_not_ready` **11,710,629 -> 7,141,887 cycles (-39%)**, `prefetch_blocked_sb_full` **59.7M -> 30.5M (-49%)**, `new_stream_rejected_head_waiting_for_cache` **246,187 -> 166,487 (-32%)**.
-  - The cycle reduction is smaller than the stall reduction because the relieved frontend pressure shifts into `no_warps_ready` (**20.98% -> 26.81%**) and execution-side waits (`non_tma_axis` 19.07% -> 24.10%, `fu_occupied` 10.91% -> 13.53%). `issuing` rises **24.05% -> 31.18%**.
-  - Notably `head_demand_arrived_after_ready` is **still 0**: deeper buffering does not fix the structural "prefetch can never beat demand" problem. That is exactly what part (b) targets.
-- **Part (a) only** (`.o1`, `sb=4`, no eager-promote): FA3 bwd improved from 259,456 to **241,528 cycles** (**-6.9%** vs Opt 3, **1.82x** vs HW). Run exits cleanly.
-  - Top-level balance shifts in the expected direction: `no_valid_instruction` **33.59% -> 17.59%**, `issuing` **20.93% -> 26.18%**, while `no_warps_ready` rises **29.80% -> 36.56%** and `next_stage_not_available` rises **15.11% -> 18.96%** as the frontend bottleneck is relieved.
-  - The stream-buffer counters point to the same root cause seen in fwd, but with a meaningful reduction in pressure: `prefetch_issued_not_ready = 13,800,213 cycles`, `prefetch_blocked_sb_full = 105,274,640`, and `new_stream_rejected_head_waiting_for_cache = 190,437`.
-  - Notably `head_demand_arrived_after_ready` is **still 0** here as well, and no eager-promote counters or `[L1IPFDBG]` messages appear. So the deeper buffer helps bwd materially, but it still does not solve the structural "prefetch can never beat demand" limitation by itself.
-- **Part (b) eager-promote**: implemented (build error fixed); **not yet run**. Expected effect: `head_demand_arrived_after_ready` rises above 0, demands hit in L1I directly, and `prefetch_issued_not_ready` collapses further. To be filled in once the `sb=4 + eager_promote=1` run completes.
+- FA3 fwd (`.o16`): 158,990 -> **155,765 cycles** (**-2.0%** vs Opt 3, **2.30x** vs HW). Clean exit.
+  - Frontend pressure dropped sharply: `no_valid_instruction` **37.01% -> 18.63%**, `stream_buffer_wait` **17.67% -> 14.03%**, `prefetch_issued_not_ready` **11,710,629 -> 7,141,887 (-39%)**, `prefetch_blocked_sb_full` **59.7M -> 30.5M (-49%)**, `new_stream_rejected_head_waiting_for_cache` **246,187 -> 166,487 (-32%)**.
+  - The cycle reduction is smaller than the stall reduction because relieved frontend pressure shifts into `no_warps_ready` (**20.98% -> 26.81%**) and execution-side waits (`non_tma_axis` 19.07% -> 24.10%, `fu_occupied` 10.91% -> 13.53%). `issuing` rises **24.05% -> 31.18%**.
+  - Notably `head_demand_arrived_after_ready` is **still 0**: deeper buffering does not fix the structural "prefetch can never beat demand" problem. That is what Opt 5 targets.
+- FA3 bwd (`.o1`): 259,456 -> **241,528 cycles** (**-6.9%** vs Opt 3, **1.82x** vs HW). Clean exit.
+  - Top-level balance shifts as expected: `no_valid_instruction` **33.59% -> 17.59%**, `issuing` **20.93% -> 26.18%**, while `no_warps_ready` rises **29.80% -> 36.56%**.
+  - `head_demand_arrived_after_ready` is **still 0** here too.
+
+### Opt 5 - L1I eager-promote
+
+> Full root-cause analysis and design are documented in [L1I_prefetch_redesign.md](file:///home/jihyun/modern-gpu-simulator-micro-2025/.plan/L1I_prefetch_redesign.md). Opt 5 is a code change applied on top of Opt 4 (sb=4).
+
+#### Why this optimization
+
+- Even with the deeper buffer (Opt 4), `head_demand_arrived_after_ready` stayed at 0: a prefetch could never be cached before its demand. The cause is structural - a prefetched line sits in the stream buffer and is only copied into the L1I tag array when a demand arrives (promote and L0I response were fused, and the promote was gated on the single L0I response slot).
+
+#### How to implement
+
+*Core idea.* Split the promote from the L0I response. As soon as a prefetched
+line is filled in the stream buffer (becomes `is_ready`), promote it straight into
+the L1I tag array with **no L0I response generated**. A later demand then simply
+HITs in L1I.
+
+*Trigger / scheduling.*
+- Runs once per cache cycle, after the demand path has had its turn at the fill
+  port that cycle.
+- Port gating: the promote consumes the L1I fill port via `use_fill_port()`. If
+  the port is already busy this cycle, the promote is **deferred to a later cycle,
+  never dropped** (the line stays safely in the stream buffer). This keeps the L1I
+  `fill_port_util` metric honest and gives demand fills priority.
+
+*Safety guards (each maps to a failure mode in the plan):*
+- **Risk A (silent miss):** fill with the exact key the demand probes -
+  `mshr_addr(base_addr)`, asserting `prefetch_addr == base_addr`.
+- **Risk B (stranded waiter / deadlock):** promote only when the head is ready,
+  not yet demanded, and has **no waiting warp** attached.
+- **Risk C (duplicate fill):** probe first; skip if the line is already HIT or has
+  an in-flight MSHR entry.
+
+*Observability.*
+- Config flags: `-is_instruction_prefetch_eager_promote_enabled` (default off, for
+  clean A/B), `-l1i_prefetch_debug_enable`, `-l1i_prefetch_debug_budget`.
+- Counters: `total_num_l0i_sb_eager_promote_{to_cache, demand_hit_later,
+  demand_miss_after_promote, skipped_already_cached, skipped_fill_port_busy,
+  skipped_has_waiter}`.
+- `[L1IPFDBG]` logs: success signal `demand-hit-promoted`, critical signal
+  `demand-MISS-after-promote`, and a `[stuck]` deadlock watchdog (critical signals
+  print regardless of budget).
+
+*Files touched:* `shader.h`, `gpu-sim.cc`, `shader.cc`, `stream_buffer.{h,cc}`,
+`first_level_instruction_cache.{h,cc}`.
+
+#### Result
+
+- FA3 fwd (`.o18`, sb=4 + eager-promote): 155,765 -> **150,755 cycles** (**-3.2%** vs Opt 4, **-5.2%** vs Opt 3, **2.23x** vs HW). Clean exit, no deadlock.
+- The mechanism works as designed: `eager_promote_to_cache = 663,598`, `demand_hit_later = 266,752` (the success path that was impossible before), `skipped_fill_port_busy = 19,678` (port gating active), `skipped_has_waiter = 0`. **L1I miss rate halved: 0.6715 -> 0.3387.**
+- Frontend stall fell only modestly further: `no_valid_instruction` **18.63% -> 17.32%**, `prefetch_issued_not_ready` **7,141,887 -> 6,795,212 (-4.9%)**. The remaining bottleneck is no longer the frontend but `no_warps_ready = 27.82%` and execution-side waits (`non_tma_axis = 24.25%`, `fu_occupied = 13.60%`).
+- `demand_miss_after_promote = 498`. Investigation (promote->miss gap distribution: 86% over 1,000 cycles, 0 under 100 cycles; hot lines re-promoted up to 16x per SM) shows these are **capacity evictions**, not a correctness bug: the promoted line is evicted from L1I long before its next demand. **No real Risk A** (immediate miss = mshr mismatch) occurred. Note: the metric currently conflates "evicted before demand" with true immediate miss; see the metric-accuracy follow-up below.
+- The gain is smaller than expected. A dedicated re-analysis of why eager-promote yields only -3.2% (despite halving L1I miss rate) is tracked separately.
+
+##### Metric accuracy follow-up (planned)
+
+- `m_eager_promoted_base_addr_cycle` records a promoted base addr but is only
+  cleared when a demand observes it. If the line is evicted before any demand, the
+  entry lingers; a much later demand then MISSes and is counted as
+  `demand_miss_after_promote`, even though the promote was correct.
+- Fix direction: classify by promote->miss gap (or check eviction explicitly), so
+  a small-gap immediate miss is the only true Risk-A signal and large-gap evictions
+  go to a separate `eager_promote_evicted_before_demand` bucket.

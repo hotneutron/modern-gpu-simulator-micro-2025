@@ -1279,6 +1279,7 @@ void shader_core_stats::print_remodeling_stats(FILE *fout) {
   unsigned long long total_num_l0i_sb_eager_promote_skipped_has_waiter = m_gpu-> m_gpu_per_sm_stats.m_stats_map["total_num_l0i_sb_eager_promote_skipped_has_waiter"]->get_value();
   unsigned long long total_num_l0i_sb_eager_promote_demand_hit_later = m_gpu-> m_gpu_per_sm_stats.m_stats_map["total_num_l0i_sb_eager_promote_demand_hit_later"]->get_value();
   unsigned long long total_num_l0i_sb_eager_promote_demand_miss_after_promote = m_gpu-> m_gpu_per_sm_stats.m_stats_map["total_num_l0i_sb_eager_promote_demand_miss_after_promote"]->get_value();
+  unsigned long long total_num_l0i_sb_eager_promote_evicted_before_demand = m_gpu-> m_gpu_per_sm_stats.m_stats_map["total_num_l0i_sb_eager_promote_evicted_before_demand"]->get_value();
   unsigned long long total_num_l0i_stream_buffer_prefetch_l1i_accesses = m_gpu-> m_gpu_per_sm_stats.m_stats_map["total_num_l0i_stream_buffer_prefetch_l1i_accesses"]->get_value();
   unsigned long long total_num_l0i_stream_buffer_prefetch_l1i_hits = m_gpu-> m_gpu_per_sm_stats.m_stats_map["total_num_l0i_stream_buffer_prefetch_l1i_hits"]->get_value();
   unsigned long long total_num_l0i_stream_buffer_prefetch_l1i_misses = m_gpu-> m_gpu_per_sm_stats.m_stats_map["total_num_l0i_stream_buffer_prefetch_l1i_misses"]->get_value();
@@ -1399,6 +1400,7 @@ void shader_core_stats::print_remodeling_stats(FILE *fout) {
   fprintf(fout, "total_num_l0i_sb_eager_promote_skipped_has_waiter = %llu\n", total_num_l0i_sb_eager_promote_skipped_has_waiter);
   fprintf(fout, "total_num_l0i_sb_eager_promote_demand_hit_later = %llu\n", total_num_l0i_sb_eager_promote_demand_hit_later);
   fprintf(fout, "total_num_l0i_sb_eager_promote_demand_miss_after_promote = %llu\n", total_num_l0i_sb_eager_promote_demand_miss_after_promote);
+  fprintf(fout, "total_num_l0i_sb_eager_promote_evicted_before_demand = %llu\n", total_num_l0i_sb_eager_promote_evicted_before_demand);
   fprintf(fout, "total_num_l0i_stream_buffer_prefetch_l1i_accesses = %llu\n", total_num_l0i_stream_buffer_prefetch_l1i_accesses);
   fprintf(fout, "total_num_l0i_stream_buffer_prefetch_l1i_hits = %llu\n", total_num_l0i_stream_buffer_prefetch_l1i_hits);
   fprintf(fout, "total_num_l0i_stream_buffer_prefetch_l1i_misses = %llu\n", total_num_l0i_stream_buffer_prefetch_l1i_misses);
