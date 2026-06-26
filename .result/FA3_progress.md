@@ -53,7 +53,7 @@ To keep this file easy to extend, use the following update pattern whenever a ne
 |---|---|---|---|---|---|---|---|
 | `inst_barrier` | — | 56.09% | 9.09% | 0.05% | 0.07% | 0.07% | Negligible. |
 | `wait_barrier` | — | 6.64% | 8.07% | 9.01% | 11.98% | 12.97% | mbarrier-style wait. |
-| `tma_axis` | — | 62.73% | 17.16% | 9.06% | 12.05% | 13.04% | Grouped TMA-side stall share. |
+| `tma_axis` | — | 62.73% | 17.16% | 9.06% | 12.05% | 13.04% | Grouped TMA-side stall share. See note [1] below. |
 | `non_tma_axis` | — | 17.80% | 17.34% | 19.07% | 24.10% | 24.25% | Execution/resource-side waits. |
 | `fu_occupied` | — | 11.83% | 9.91% | 10.91% | 13.53% | 13.60% | Present in `.o18`. |
 | `stall_count` | — | 5.00% | 5.97% | 6.56% | 8.47% | 8.53% | Present in `.o18`. |
@@ -63,25 +63,27 @@ To keep this file easy to extend, use the following update pattern whenever a ne
 | `l1c` | — | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | Present in `.o18`. |
 | `scoreboard (memory)` | — | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | Present in `.o18`. |
 
+> **[1] On the Opt 1 `tma_axis = 62.73%`.** This is a correctly-recorded value, not an input error. `tma_axis` is the grouped sum `wait_barrier + inst_barrier + tma_flush`, and the **same formula is applied in every column** (e.g. Opt 1: 6.64+56.09+0.00=62.73; Opt 2: 8.07+9.09+0.00=17.16) — it is not split differently between columns. Opt 1 only looks large because the pre-BAR-fix `inst_barrier` (56.09%) is folded in; that is not a real TMA cost. It collapses to 17.16% in Opt 2 purely because `inst_barrier` itself drops (56.09% -> 9.09%) after the BAR implementation. The HW TMA axis is ~23.8%, so the Opt 1 value is an over-attribution driven by the unfixed barrier model.
+
 #### FA3 bwd - top-level simulator breakdown
 
 | Class | Init | Opt 1 (`rop=100`) | Opt 2 (BAR impl) | Opt 3 (MEMBAR) | Opt 4 (prefetch, sb=4) | Note |
 |---|---|---|---|---|---|---|
 | `sim_cycle` | 376,735 | 361,760 | 328,643 | 259,456 | 241,528 | Opt 4 column is the `sb=4` run only (`.o1`); eager-promote not yet included. |
-| `no_warps_ready` | — | 66.64% | 58.27% | 29.80% | 36.56% | Frontend pressure drops in Opt 4, but more cycles shift into wait/resource buckets. |
-| `issuing` | — | 12.71% | 14.06% | 20.93% | 26.18% | |
-| `next_stage_not_available` | — | 10.69% | 11.41% | 15.11% | 18.96% | downstream pipe back-pressure |
-| `no_valid_instruction` | — | 8.96% | 15.02% | 33.59% | 17.59% | Frontend / L0I miss pressure drops sharply with the deeper stream buffer. |
-| `issue_port_busy` | — | 1.01% | 1.24% | 0.57% | 0.71% | |
-| `sum` | — | 100.00% | 100.00% | 100.00% | 100.00% | |
+| `no_warps_ready` | 66.40% | 66.64% | 58.27% | 29.80% | 36.56% | Init from `.o304` (rop=211); frontend pressure drops in Opt 4, but more cycles shift into wait/resource buckets. |
+| `issuing` | 12.12% | 12.71% | 14.06% | 20.93% | 26.18% | Init from `.o304`. |
+| `next_stage_not_available` | 10.17% | 10.69% | 11.41% | 15.11% | 18.96% | downstream pipe back-pressure |
+| `no_valid_instruction` | 10.37% | 8.96% | 15.02% | 33.59% | 17.59% | Frontend / L0I miss pressure drops sharply with the deeper stream buffer. |
+| `issue_port_busy` | 0.95% | 1.01% | 1.24% | 0.57% | 0.71% | |
+| `sum` | 100.00% | 100.00% | 100.00% | 100.00% | 100.00% | Init columns sum to ~100% after rounding. |
 
 #### FA3 bwd - inner stall / wait breakdown
 
 | Wait reason | Init | Opt 1 (`rop=100`) | Opt 2 (BAR impl) | Opt 3 (MEMBAR) | Opt 4 (prefetch, sb=4) | Note |
 |---|---|---|---|---|---|---|
 | `inst_barrier` | — | 58.47% / 87.70% of `no_warps_ready` | 44.78% / 76.84% of `no_warps_ready` | 1.01% / 3.40% of `no_warps_ready` | 1.30% / 3.57% of `no_warps_ready` | Remains low after the MEMBAR fix; Opt 4 does not reintroduce the old barrier artifact. |
-| `tma_axis` | — | — | 58.09% | 17.13% / 57.49% of `no_warps_ready` | 21.96% / 60.06% of `no_warps_ready` | Present in `.o1` as a grouped percentage counter. |
-| `non_tma_axis` | — | — | 18.08% | 21.99% / 73.79% of `no_warps_ready` | 27.15% / 74.25% of `no_warps_ready` | Present in `.o1` as a grouped percentage counter. |
+| `tma_axis` | — | 67.28% / 90.90% of `no_warps_ready` | 58.09% | 17.13% / 57.49% of `no_warps_ready` | 21.96% / 60.06% of `no_warps_ready` | Opt 1 computed, not emitted; see note [2]. |
+| `non_tma_axis` | — | 16.40% / 24.50% of `no_warps_ready` | 18.08% | 21.99% / 73.79% of `no_warps_ready` | 27.15% / 74.25% of `no_warps_ready` | Opt 1 computed, not emitted; see note [2]. |
 | `fu_occupied` | — | 11.55% / 17.30% of `no_warps_ready` | 12.63% | 14.67% / 49.21% of `no_warps_ready` | 18.09% / 49.47% of `no_warps_ready` | function-unit busy |
 | `wait_barrier` | — | 7.98% / 12.00% of `no_warps_ready` | 8.62% | 11.76% / 39.46% of `no_warps_ready` | 14.66% / 40.12% of `no_warps_ready` | `DEPBAR` (SB phase wait = TMA mbarrier) |
 | `stall_count` | — | 4.11% / 6.20% of `no_warps_ready` | 4.63% | 6.18% / 20.73% of `no_warps_ready` | 7.55% / 20.65% of `no_warps_ready` | explicit stall cycles |
@@ -90,6 +92,12 @@ To keep this file easy to extend, use the following update pattern whenever a ne
 | `result_queue_full` | — | 0.03% / — | 0.03% | 0.09% / 0.30% of `no_warps_ready` | 0.12% / 0.33% of `no_warps_ready` | fixed-latency result queue |
 | `l1c` | — | 0.03% / — | 0.03% | 0.04% / 0.14% of `no_warps_ready` | 0.13% / 0.36% of `no_warps_ready` | L1 constant |
 | `scoreboard (memory)` | — | 0.00% / 0.00% of `no_warps_ready` | 0.00% | 0.00% / 0.00% of `no_warps_ready` | 0.00% / 0.00% of `no_warps_ready` | traditional scoreboard (unused here) |
+
+> **[2] On the bwd Opt 1 `tma_axis` / `non_tma_axis`.** These were not emitted as single grouped counters in the Opt 1 run (`.o307`), so the cells are **computed** from the per-reason rows in the same column (the later runs emit them directly):
+> - `tma_axis` = `wait_barrier + inst_barrier + tma_flush` = 7.98+58.47+0.83 = **67.28%** (of `no_warps_ready`: 12.00+87.70+1.20 = 90.90%).
+> - `non_tma_axis` = `fu_occupied + stall_count + l1c + scoreboard + result_queue_full + yield` = 11.55+4.11+0.03+0.00+0.03+0.68 = **16.40%** (of `no_warps_ready`: 17.30+6.20+1.00 = 24.50%; the `result_queue_full`/`l1c` sub-shares are `—` in this run).
+>
+> **[3] On the bwd `Init` column.** `sim_cycle` and the top-level breakdown are from the baseline `.o304` run (rop=211). The inner stall/wait per-reason counters were not yet implemented at the `Init` stage, so those cells remain `—` (no source value to report).
 
 ### Run Paths
 
