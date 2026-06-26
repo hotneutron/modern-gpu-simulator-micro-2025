@@ -30,7 +30,7 @@ To keep this file easy to extend, use the following update pattern whenever a ne
 | Opt 1 | ROP latency tuning | `-gpgpu_l2_rop_latency 211 -> 100` | 220,024 cycles (3.25x vs HW). This run already used `rop=100`, so there is no separate init cycle to compare against. | 361,760 cycles (2.72x vs HW, -4.0% vs init) | Done |
 | Opt 2 | BAR implementation | `OP_BAR` handling + barrier engine fix + warp-exit drain fix | 162,582 cycles (2.40x vs HW, -26% vs Opt 1). Run exits cleanly. | 328,643 cycles (2.47x vs HW, -9.1% vs Opt 1). Run exits cleanly. | Done |
 | Opt 3 | MEMBAR Scope-Aware Fix | Scope-aware memory fence (CTA/GPU level) | 158,990 cycles (2.35x vs HW, -2.2% vs Opt 2). Run exits cleanly and `inst_barrier` nearly disappears. | 259,456 cycles (1.95x vs HW, -21.1% vs Opt 2). Run exits cleanly. | Done |
-| Opt 4 | Prefetch improvement | (a) `-prefetch_per_stream_buffer_size 1 -> 4` (deeper stream buffer, config-only). (b) L1I eager-promote (Option B): promote a ready prefetched line into L1I without waiting for a demand (code change, pending run). | 155,765 cycles (2.30x vs HW, -2.0% vs Opt 3) **with (a) only**. (b) not yet run. | — | (a) done; (b) pending build/run |
+| Opt 4 | Prefetch improvement | (a) `-prefetch_per_stream_buffer_size 1 -> 4` (deeper stream buffer, config-only). (b) L1I eager-promote (Option B): promote a ready prefetched line into L1I without waiting for a demand (code change, pending run). | 155,765 cycles (2.30x vs HW, -2.0% vs Opt 3) **with (a) only**. (b) not yet run. | 241,528 cycles (1.82x vs HW, -6.9% vs Opt 3) **with (a) only**. (b) not yet run. | (a) done; (b) pending build/run |
 
 ### Simulator Cycle Breakdown
 
@@ -64,31 +64,31 @@ To keep this file easy to extend, use the following update pattern whenever a ne
 
 #### FA3 bwd - top-level simulator breakdown
 
-| Class | Init | Opt 1 (`rop=100`) | Opt 2 (BAR impl) | Opt 3 (MEMBAR) | Note |
-|---|---|---|---|---|---|
-| `sim_cycle` | 376,735 | 361,760 | 328,643 | 259,456 | The Opt 3 run exits cleanly. |
-| `no_warps_ready` | — | 66.64% | 58.27% | 29.80% | Drops sharply after the MEMBAR scope-aware fence fix. |
-| `issuing` | — | 12.71% | 14.06% | 20.93% | |
-| `next_stage_not_available` | — | 10.69% | 11.41% | 15.11% | downstream pipe back-pressure |
-| `no_valid_instruction` | — | 8.96% | 15.02% | 33.59% | frontend / L0I miss becomes the largest top-level bucket |
-| `issue_port_busy` | — | 1.01% | 1.24% | 0.57% | |
-| `sum` | — | 100.00% | 100.00% | 100.00% | |
+| Class | Init | Opt 1 (`rop=100`) | Opt 2 (BAR impl) | Opt 3 (MEMBAR) | Opt 4 (prefetch, sb=4) | Note |
+|---|---|---|---|---|---|---|
+| `sim_cycle` | 376,735 | 361,760 | 328,643 | 259,456 | 241,528 | Opt 4 column is the `sb=4` run only (`.o1`); eager-promote not yet included. |
+| `no_warps_ready` | — | 66.64% | 58.27% | 29.80% | 36.56% | Frontend pressure drops in Opt 4, but more cycles shift into wait/resource buckets. |
+| `issuing` | — | 12.71% | 14.06% | 20.93% | 26.18% | |
+| `next_stage_not_available` | — | 10.69% | 11.41% | 15.11% | 18.96% | downstream pipe back-pressure |
+| `no_valid_instruction` | — | 8.96% | 15.02% | 33.59% | 17.59% | Frontend / L0I miss pressure drops sharply with the deeper stream buffer. |
+| `issue_port_busy` | — | 1.01% | 1.24% | 0.57% | 0.71% | |
+| `sum` | — | 100.00% | 100.00% | 100.00% | 100.00% | |
 
 #### FA3 bwd - inner stall / wait breakdown
 
-| Wait reason | Init | Opt 1 (`rop=100`) | Opt 2 (BAR impl) | Opt 3 (MEMBAR) | Note |
-|---|---|---|---|---|---|
-| `inst_barrier` | — | 58.47% / 87.70% of `no_warps_ready` | 44.78% / 76.84% of `no_warps_ready` | 1.01% / 3.40% of `no_warps_ready` | The MEMBAR fix removes the old barrier-engine distortion almost completely. |
-| `tma_axis` | — | — | 58.09% | 17.13% / 57.49% of `no_warps_ready` | Present in `.o319` output. |
-| `non_tma_axis` | — | — | 18.08% | 21.99% / 73.79% of `no_warps_ready` | Present in `.o319` output. |
-| `fu_occupied` | — | 11.55% / 17.30% of `no_warps_ready` | 12.63% | 14.67% / 49.21% of `no_warps_ready` | function-unit busy |
-| `wait_barrier` | — | 7.98% / 12.00% of `no_warps_ready` | 8.62% | 11.76% / 39.46% of `no_warps_ready` | `DEPBAR` (SB phase wait = TMA mbarrier) |
-| `stall_count` | — | 4.11% / 6.20% of `no_warps_ready` | 4.63% | 6.18% / 20.73% of `no_warps_ready` | explicit stall cycles |
-| `tma_flush` | — | 0.83% / 1.20% of `no_warps_ready` | 4.69% | 4.36% / 14.62% of `no_warps_ready` | `UTMACMDFLUSH` |
-| `yield` | — | 0.68% / 1.00% of `no_warps_ready` | 0.76% | 1.02% / 3.41% of `no_warps_ready` | `YIELD` |
-| `result_queue_full` | — | 0.03% / — | 0.03% | 0.09% / 0.30% of `no_warps_ready` | fixed-latency result queue |
-| `l1c` | — | 0.03% / — | 0.03% | 0.04% / 0.14% of `no_warps_ready` | L1 constant |
-| `scoreboard (memory)` | — | 0.00% / 0.00% of `no_warps_ready` | 0.00% | 0.00% / 0.00% of `no_warps_ready` | traditional scoreboard (unused here) |
+| Wait reason | Init | Opt 1 (`rop=100`) | Opt 2 (BAR impl) | Opt 3 (MEMBAR) | Opt 4 (prefetch, sb=4) | Note |
+|---|---|---|---|---|---|---|
+| `inst_barrier` | — | 58.47% / 87.70% of `no_warps_ready` | 44.78% / 76.84% of `no_warps_ready` | 1.01% / 3.40% of `no_warps_ready` | 1.30% / 3.57% of `no_warps_ready` | Remains low after the MEMBAR fix; Opt 4 does not reintroduce the old barrier artifact. |
+| `tma_axis` | — | — | 58.09% | 17.13% / 57.49% of `no_warps_ready` | 21.96% / 60.06% of `no_warps_ready` | Present in `.o1` as a grouped percentage counter. |
+| `non_tma_axis` | — | — | 18.08% | 21.99% / 73.79% of `no_warps_ready` | 27.15% / 74.25% of `no_warps_ready` | Present in `.o1` as a grouped percentage counter. |
+| `fu_occupied` | — | 11.55% / 17.30% of `no_warps_ready` | 12.63% | 14.67% / 49.21% of `no_warps_ready` | 18.09% / 49.47% of `no_warps_ready` | function-unit busy |
+| `wait_barrier` | — | 7.98% / 12.00% of `no_warps_ready` | 8.62% | 11.76% / 39.46% of `no_warps_ready` | 14.66% / 40.12% of `no_warps_ready` | `DEPBAR` (SB phase wait = TMA mbarrier) |
+| `stall_count` | — | 4.11% / 6.20% of `no_warps_ready` | 4.63% | 6.18% / 20.73% of `no_warps_ready` | 7.55% / 20.65% of `no_warps_ready` | explicit stall cycles |
+| `tma_flush` | — | 0.83% / 1.20% of `no_warps_ready` | 4.69% | 4.36% / 14.62% of `no_warps_ready` | 5.99% / 16.38% of `no_warps_ready` | `UTMACMDFLUSH` |
+| `yield` | — | 0.68% / 1.00% of `no_warps_ready` | 0.76% | 1.02% / 3.41% of `no_warps_ready` | 1.26% / 3.45% of `no_warps_ready` | `YIELD` |
+| `result_queue_full` | — | 0.03% / — | 0.03% | 0.09% / 0.30% of `no_warps_ready` | 0.12% / 0.33% of `no_warps_ready` | fixed-latency result queue |
+| `l1c` | — | 0.03% / — | 0.03% | 0.04% / 0.14% of `no_warps_ready` | 0.13% / 0.36% of `no_warps_ready` | L1 constant |
+| `scoreboard (memory)` | — | 0.00% / 0.00% of `no_warps_ready` | 0.00% | 0.00% / 0.00% of `no_warps_ready` | 0.00% / 0.00% of `no_warps_ready` | traditional scoreboard (unused here) |
 
 ### Run Paths
 
@@ -138,6 +138,11 @@ FA3 bwd
   - Stats run: `H100_80GB-OnlyKernel10/flashattn-fa3-bf16-bwd-causal-b1-s2048-hd64-nh24-flashattn_fa3_bf16_bwd_causal_b1_s2048_hd64_nh24___warmup_-8c670b063c3c.o319`
   - Event / debug run: `H100_80GB-OnlyKernel10/flashattn-fa3-bf16-bwd-causal-b1-s2048-hd64-nh24-flashattn_fa3_bf16_bwd_causal_b1_s2048_hd64_nh24___warmup_-8c670b063c3c.e319`
   - Note: clean exit. Final cycle = `259,456`. `MEMBAR.ALL.CTA` uses the new fence path (`[MEMBARDBG][fence-enter]`), no `[MEMBARDBG][stuck]` deadlocks are reported, and the run exits cleanly (`GPGPU-Sim: *** exit detected ***`).
+
+- Opt 4 (prefetch, sb=4 only)
+  - Stats run: `H100_80GB-OnlyKernel10/flashattn-fa3-bf16-bwd-causal-b1-s2048-hd64-nh24-flashattn_fa3_bf16_bwd_causal_b1_s2048_hd64_nh24___warmup_-63a73d452237.o1`
+  - Event / debug run: `H100_80GB-OnlyKernel10/flashattn-fa3-bf16-bwd-causal-b1-s2048-hd64-nh24-flashattn_fa3_bf16_bwd_causal_b1_s2048_hd64_nh24___warmup_-63a73d452237.e1`
+  - Note: `-prefetch_per_stream_buffer_size 4` only; clean exit. Final cycle = `241,528`. No eager-promote counters or `[L1IPFDBG]` logs are present, so this run does NOT include the eager-promote path. `head_demand_arrived_after_ready` remains `0`.
 
 ## 2. Optimization Details
 
@@ -319,4 +324,8 @@ Opt 4 has two independent parts:
   - Frontend pressure dropped sharply: `no_valid_instruction` **37.01% -> 18.63%**, `stream_buffer_wait` **17.67% -> 14.03%**, `prefetch_issued_not_ready` **11,710,629 -> 7,141,887 cycles (-39%)**, `prefetch_blocked_sb_full` **59.7M -> 30.5M (-49%)**, `new_stream_rejected_head_waiting_for_cache` **246,187 -> 166,487 (-32%)**.
   - The cycle reduction is smaller than the stall reduction because the relieved frontend pressure shifts into `no_warps_ready` (**20.98% -> 26.81%**) and execution-side waits (`non_tma_axis` 19.07% -> 24.10%, `fu_occupied` 10.91% -> 13.53%). `issuing` rises **24.05% -> 31.18%**.
   - Notably `head_demand_arrived_after_ready` is **still 0**: deeper buffering does not fix the structural "prefetch can never beat demand" problem. That is exactly what part (b) targets.
+- **Part (a) only** (`.o1`, `sb=4`, no eager-promote): FA3 bwd improved from 259,456 to **241,528 cycles** (**-6.9%** vs Opt 3, **1.82x** vs HW). Run exits cleanly.
+  - Top-level balance shifts in the expected direction: `no_valid_instruction` **33.59% -> 17.59%**, `issuing` **20.93% -> 26.18%**, while `no_warps_ready` rises **29.80% -> 36.56%** and `next_stage_not_available` rises **15.11% -> 18.96%** as the frontend bottleneck is relieved.
+  - The stream-buffer counters point to the same root cause seen in fwd, but with a meaningful reduction in pressure: `prefetch_issued_not_ready = 13,800,213 cycles`, `prefetch_blocked_sb_full = 105,274,640`, and `new_stream_rejected_head_waiting_for_cache = 190,437`.
+  - Notably `head_demand_arrived_after_ready` is **still 0** here as well, and no eager-promote counters or `[L1IPFDBG]` messages appear. So the deeper buffer helps bwd materially, but it still does not solve the structural "prefetch can never beat demand" limitation by itself.
 - **Part (b) eager-promote**: implemented (build error fixed); **not yet run**. Expected effect: `head_demand_arrived_after_ready` rises above 0, demands hit in L1I directly, and `prefetch_issued_not_ready` collapses further. To be filled in once the `sb=4 + eager_promote=1` run completes.
