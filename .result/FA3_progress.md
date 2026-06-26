@@ -29,7 +29,7 @@ To keep this file easy to extend, use the following update pattern whenever a ne
 | Init | Baseline simulator | Original simulator state before the targeted fixes below | Not available as a standalone cycle in the current notes | 376,735 cycles (2.83x vs HW) | Fwd missing, bwd available |
 | Opt 1 | ROP latency tuning | `-gpgpu_l2_rop_latency 211 -> 100` | 220,024 cycles (3.25x vs HW). This run already used `rop=100`, so there is no separate init cycle to compare against. | 361,760 cycles (2.72x vs HW, -4.0% vs init) | Done |
 | Opt 2 | BAR implementation | `OP_BAR` handling + barrier engine fix + warp-exit drain fix | 162,582 cycles (2.40x vs HW, -26% vs Opt 1). Run exits cleanly. | 328,643 cycles (2.47x vs HW, -9.1% vs Opt 1). Run exits cleanly. | Done |
-| Opt 3 | MEMBAR Scope-Aware Fix | Scope-aware memory fence (CTA/GPU level) | 158,990 cycles (2.35x vs HW, -2.2% vs Opt 2). Run exits cleanly and `inst_barrier` nearly disappears. | — | FA3 fwd done, bwd pending |
+| Opt 3 | MEMBAR Scope-Aware Fix | Scope-aware memory fence (CTA/GPU level) | 158,990 cycles (2.35x vs HW, -2.2% vs Opt 2). Run exits cleanly and `inst_barrier` nearly disappears. | 259,456 cycles (1.95x vs HW, -21.1% vs Opt 2). Run exits cleanly. | Done |
 | Opt 4 | Prefetch improvement | (a) `-prefetch_per_stream_buffer_size 1 -> 4` (deeper stream buffer, config-only). (b) L1I eager-promote (Option B): promote a ready prefetched line into L1I without waiting for a demand (code change, pending run). | 155,765 cycles (2.30x vs HW, -2.0% vs Opt 3) **with (a) only**. (b) not yet run. | — | (a) done; (b) pending build/run |
 
 ### Simulator Cycle Breakdown
@@ -66,29 +66,29 @@ To keep this file easy to extend, use the following update pattern whenever a ne
 
 | Class | Init | Opt 1 (`rop=100`) | Opt 2 (BAR impl) | Opt 3 (MEMBAR) | Note |
 |---|---|---|---|---|---|
-| `sim_cycle` | 376,735 | 361,760 | 328,643 | — | The Opt 2 run exits cleanly without leaks. |
-| `no_warps_ready` | — | 66.64% | 58.27% | — | Still the dominant class, but reduced after the BAR fix. |
-| `issuing` | — | 12.71% | 14.06% | — | |
-| `next_stage_not_available` | — | 10.69% | 11.41% | — | downstream pipe back-pressure |
-| `no_valid_instruction` | — | 8.96% | 15.02% | — | frontend / L0I miss |
-| `issue_port_busy` | — | 1.01% | 1.24% | — | |
-| `sum` | — | 100.00% | 100.00% | — | |
+| `sim_cycle` | 376,735 | 361,760 | 328,643 | 259,456 | The Opt 3 run exits cleanly. |
+| `no_warps_ready` | — | 66.64% | 58.27% | 29.80% | Drops sharply after the MEMBAR scope-aware fence fix. |
+| `issuing` | — | 12.71% | 14.06% | 20.93% | |
+| `next_stage_not_available` | — | 10.69% | 11.41% | 15.11% | downstream pipe back-pressure |
+| `no_valid_instruction` | — | 8.96% | 15.02% | 33.59% | frontend / L0I miss becomes the largest top-level bucket |
+| `issue_port_busy` | — | 1.01% | 1.24% | 0.57% | |
+| `sum` | — | 100.00% | 100.00% | 100.00% | |
 
 #### FA3 bwd - inner stall / wait breakdown
 
 | Wait reason | Init | Opt 1 (`rop=100`) | Opt 2 (BAR impl) | Opt 3 (MEMBAR) | Note |
 |---|---|---|---|---|---|
-| `inst_barrier` | — | 58.47% / 87.70% of `no_warps_ready` | 44.78% / 76.84% of `no_warps_ready` | — | Drops significantly but remains the largest stall. |
-| `tma_axis` | — | — | 58.09% | — | Added in `.o13` output. |
-| `non_tma_axis` | — | — | 18.08% | — | Added in `.o13` output. |
-| `fu_occupied` | — | 11.55% / 17.30% of `no_warps_ready` | 12.63% | — | function-unit busy |
-| `wait_barrier` | — | 7.98% / 12.00% of `no_warps_ready` | 8.62% | — | `DEPBAR` (SB phase wait = TMA mbarrier) |
-| `stall_count` | — | 4.11% / 6.20% of `no_warps_ready` | 4.63% | — | explicit stall cycles |
-| `tma_flush` | — | 0.83% / 1.20% of `no_warps_ready` | 4.69% | — | `UTMACMDFLUSH` |
-| `yield` | — | 0.68% / 1.00% of `no_warps_ready` | 0.76% | — | `YIELD` |
-| `result_queue_full` | — | 0.03% / — | 0.03% | — | fixed-latency result queue |
-| `l1c` | — | 0.03% / — | 0.03% | — | L1 constant |
-| `scoreboard (memory)` | — | 0.00% / 0.00% of `no_warps_ready` | 0.00% | — | traditional scoreboard (unused here) |
+| `inst_barrier` | — | 58.47% / 87.70% of `no_warps_ready` | 44.78% / 76.84% of `no_warps_ready` | 1.01% / 3.40% of `no_warps_ready` | The MEMBAR fix removes the old barrier-engine distortion almost completely. |
+| `tma_axis` | — | — | 58.09% | 17.13% / 57.49% of `no_warps_ready` | Present in `.o319` output. |
+| `non_tma_axis` | — | — | 18.08% | 21.99% / 73.79% of `no_warps_ready` | Present in `.o319` output. |
+| `fu_occupied` | — | 11.55% / 17.30% of `no_warps_ready` | 12.63% | 14.67% / 49.21% of `no_warps_ready` | function-unit busy |
+| `wait_barrier` | — | 7.98% / 12.00% of `no_warps_ready` | 8.62% | 11.76% / 39.46% of `no_warps_ready` | `DEPBAR` (SB phase wait = TMA mbarrier) |
+| `stall_count` | — | 4.11% / 6.20% of `no_warps_ready` | 4.63% | 6.18% / 20.73% of `no_warps_ready` | explicit stall cycles |
+| `tma_flush` | — | 0.83% / 1.20% of `no_warps_ready` | 4.69% | 4.36% / 14.62% of `no_warps_ready` | `UTMACMDFLUSH` |
+| `yield` | — | 0.68% / 1.00% of `no_warps_ready` | 0.76% | 1.02% / 3.41% of `no_warps_ready` | `YIELD` |
+| `result_queue_full` | — | 0.03% / — | 0.03% | 0.09% / 0.30% of `no_warps_ready` | fixed-latency result queue |
+| `l1c` | — | 0.03% / — | 0.03% | 0.04% / 0.14% of `no_warps_ready` | L1 constant |
+| `scoreboard (memory)` | — | 0.00% / 0.00% of `no_warps_ready` | 0.00% | 0.00% / 0.00% of `no_warps_ready` | traditional scoreboard (unused here) |
 
 ### Run Paths
 
@@ -137,7 +137,7 @@ FA3 bwd
 - Opt 3 (MEMBAR)
   - Stats run: `H100_80GB-OnlyKernel10/flashattn-fa3-bf16-bwd-causal-b1-s2048-hd64-nh24-flashattn_fa3_bf16_bwd_causal_b1_s2048_hd64_nh24___warmup_-8c670b063c3c.o319`
   - Event / debug run: `H100_80GB-OnlyKernel10/flashattn-fa3-bf16-bwd-causal-b1-s2048-hd64-nh24-flashattn_fa3_bf16_bwd_causal_b1_s2048_hd64_nh24___warmup_-8c670b063c3c.e319`
-  - Note: Experiment currently running. In-progress verification shows MEMBAR bypassing the barrier engine via the new fence path (`[MEMBARDBG][fence-enter]`), no `[MEMBARDBG][stuck]` deadlocks, and balanced store++/store-- and fence-enter/release counters (no leaks).
+  - Note: clean exit. Final cycle = `259,456`. `MEMBAR.ALL.CTA` uses the new fence path (`[MEMBARDBG][fence-enter]`), no `[MEMBARDBG][stuck]` deadlocks are reported, and the run exits cleanly (`GPGPU-Sim: *** exit detected ***`).
 
 ## 2. Optimization Details
 
@@ -289,7 +289,10 @@ A deadlock-detection watchdog (`[MEMBARDBG][stuck]`) was also added so any warp 
 - The main MEMBAR-specific symptom is essentially removed in fwd: `inst_barrier` drops from **9.09%** to **0.05%**. The grouped TMA-side stall share also falls again, from **17.16%** to **9.06%**.
 - Top-level issue-stage balance improves in the same direction: `no_warps_ready` falls from **23.83%** to **20.98%**, while `issuing` rises from **21.17%** to **24.05%**.
 - The dominant remaining fwd bottlenecks are now frontend / availability related rather than barrier related: `no_valid_instruction = 37.01%` and `next_stage_not_available = 17.26%`.
-- FA3 bwd Opt 3 remains tracked separately and is still pending in the tables above.
+- FA3 bwd improved from 328,643 cycles to 259,456 cycles after the MEMBAR scope-aware fence work, a further **-21.1%** reduction vs Opt 2. This places bwd at **1.95x** the HW target (259,456 vs 132,901 cycles).
+- The run exits cleanly. In the debug log, `MEMBAR.ALL.CTA` is confirmed to use the new fence path (`[MEMBARDBG][fence-enter]`), the watchdog stays silent (`[MEMBARDBG][stuck]` not observed), and teardown summaries continue to report `leaked_ids=0`.
+- The old barrier-engine artifact is almost eliminated in bwd: `inst_barrier` drops from **44.78%** to **1.01%**. The top-level `no_warps_ready` class also falls from **58.27%** to **29.80%**, while `issuing` rises from **14.06%** to **20.93%**.
+- After the MEMBAR fix, the dominant remaining bwd bottlenecks shift away from `inst_barrier` and toward frontend / wait-path pressure: `no_valid_instruction = 33.59%`, `non_tma_axis = 21.99%`, `tma_axis = 17.13%`, and `next_stage_not_available = 15.11%`.
 
 ### Opt 4 - Prefetch improvement
 
