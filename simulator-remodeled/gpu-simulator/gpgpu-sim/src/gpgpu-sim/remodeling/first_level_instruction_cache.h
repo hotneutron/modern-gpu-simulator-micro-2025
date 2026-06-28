@@ -117,6 +117,11 @@ class first_level_instruction_cache : public read_only_cache {
   bool promote_prefetch_to_cache(new_addr_type prefetch_addr,
                                  const prefetch_element &pending_information);
 
+  // Budget-gated debug logging accessor for the stream buffer, which needs to
+  // emit [L1IPFDBG] lines (e.g. promoted-orphan fills) but cannot reach the
+  // private l1i_pf_debug_take_budget(). Returns true if a debug line may print.
+  bool l1i_pf_debug_take_budget_public() { return l1i_pf_debug_take_budget(); }
+
   bool waiting_for_fill(mem_fetch *mf) override;
 
   void printMapKeysMFFields();

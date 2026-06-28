@@ -168,6 +168,11 @@ class single_stream_buffer {
     std::queue<new_addr_type> m_queue_ordered_prefetches;
     std::map<new_addr_type, prefetch_element> m_all_prefetches;
     mem_fetch_interface *m_memport;
+    // Addresses whose stream-buffer tracking entry was removed by eager-promote
+    // (Opt 5) while a prefetch response could still be in flight. Used to treat a
+    // later fill for the same address as a benign "promoted-orphan" instead of a
+    // hard error, and to keep send_to_cache()/has_ready_requested_head() safe.
+    std::set<new_addr_type> m_eager_promoted_dropped_addrs;
 };
 
 class multiple_stream_buffers {
