@@ -550,7 +550,7 @@ void SM::cycle() {
 
   // [WGMMA Opt6 Step-0] (V) SM-level idle accounting. A subcore being blocked on the
   // tensor pipe is only a real cycle loss if NO subcore on this SM issued this cycle.
-  {
+  if(m_config->wgmma_step0_instrument_enable) {
     bool any_subcore_issued = false;
     bool any_subcore_tensor_only_block = false;
     for (auto subcore : m_subcores) {

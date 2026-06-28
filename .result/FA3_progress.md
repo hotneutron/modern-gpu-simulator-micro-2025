@@ -32,8 +32,6 @@ To keep this file easy to extend, use the following update pattern whenever a ne
 | Opt 3 | MEMBAR Scope-Aware Fix | Scope-aware memory fence (CTA/GPU level) | 158,990 cycles (2.35x vs HW, -2.2% vs Opt 2). Run exits cleanly and `inst_barrier` nearly disappears. | 259,456 cycles (1.95x vs HW, -21.1% vs Opt 2). Run exits cleanly. | Done |
 | Opt 4 | Prefetch (deeper stream buffer) | `-prefetch_per_stream_buffer_size 1 -> 4` (deeper stream buffer, config-only) | 155,765 cycles (2.30x vs HW, -2.0% vs Opt 3) | 241,528 cycles (1.82x vs HW, -6.9% vs Opt 3) | Done |
 | Opt 5 | L1I eager-promote | Promote a ready prefetched line into L1I as soon as it is filled in the stream buffer, without waiting for a demand and without an L0I response (code change, on top of Opt 4 sb=4) | 150,755 cycles (2.23x vs HW, -3.2% vs Opt 4, -5.2% vs Opt 3) | 242,270 cycles (1.82x vs HW, +0.3% vs Opt 4). SIGSEGV at teardown only (after all stats dumped), so the cycle is trustworthy; a fix + re-run is in progress. | Fwd done; bwd numbers preliminary (re-running) |
-| Opt 6 (deferred) | Shared-mem bank-conflict model fix | Swizzle / vector-width-aware shared bank-conflict model + counter-semantics fix (sim over-counts `gpgpu_n_shmem_bkconflict`: fwd 38,016 vs HW 281, bwd 1,327,104 vs HW 35,493). See [SHMEM_BANK_CONFLICT_H100.md](file:///home/jihyun/modern-gpu-simulator-micro-2025/.plan/SHMEM_BANK_CONFLICT_H100.md). | — | — | **Deferred** — NCU raw shows per-inst over-charge only ~3 cyc and HW stores 98.5–99.5% conflict-free; fixing it improves a metric, not the cycle gap. Parked. |
-| Opt 6 | WGMMA / tensor-pipe issue-serialization fix | Stop serializing back-to-back WGMMA issue at the per-WGMMA `initiation_interval` (~32 cyc) so consecutive HGMMAs pipeline like real async WGMMA; split the tensor-pipe issue-throughput interval from the WGMMA compute latency. Requires a Step-0 one-run instrumentation pass first. See [WGMMA_FU_OCCUPIED_H100.md](file:///home/jihyun/modern-gpu-simulator-micro-2025/.plan/WGMMA_FU_OCCUPIED_H100.md). | — | — | Planned. Full HW-vs-sim stall comparison shows `fu_occupied` is the only large bucket the sim over-states (bwd 18% vs HW gmma 5.3%; fwd 13.6% vs 1.4%); confirm tensor share via Step 0 before fixing. |
 
 ### Simulator Cycle Breakdown
 
@@ -102,6 +100,21 @@ To keep this file easy to extend, use the following update pattern whenever a ne
 > **[3] On the bwd `Init` column.** `sim_cycle` and the top-level breakdown are from the baseline `.o304` run (rop=211). The inner stall/wait per-reason counters were not yet implemented at the `Init` stage, so those cells remain `—` (no source value to report).
 >
 > **[4] On the bwd Opt 5 column (`.o320`).** The run is sb=4 + eager-promote. It does **not** end with `*** exit detected ***`; instead it raises `SIGSEGV` in the destructor chain (`gpgpu_sim::~gpgpu_sim()` -> `simt_core_cluster::~simt_core_cluster()` -> `SM::~SM()` -> `free()`) **after all simulation statistics were already printed** (the crash is the last line of the file). The simulation body therefore completed and the cycle/breakdown numbers above are trustworthy, but the clean-exit guarantee does not hold. eager-promote counters: `eager_promote_to_cache=985,114`, `demand_hit_later=365,853`, `skipped_fill_port_busy=32,540`, `skipped_has_waiter=0`, `demand_miss_after_promote=2,224`; L1I miss rate 0.1972. A fix for the teardown heap corruption (eager-promote stream-buffer ownership) plus added diagnostics is in place and a re-run is in progress; these numbers are preliminary until the clean re-run confirms them.
+
+### Deferred Opts
+
+Optimizations that were investigated and consciously **parked** because, although they fix a real
+modeling inaccuracy, the measured cycle leverage is too small to matter for the 1.8–2.2x sim-vs-HW
+gap. Kept here so they are not re-attempted blindly.
+
+| Candidate | What it was | Why deferred | Status |
+|---|---|---|---|
+| Shared-mem bank-conflict model | Swizzle/vector-width-aware shared bank-conflict + counter-semantics fix (sim over-counts `gpgpu_n_shmem_bkconflict`: fwd 38,016 vs HW 281, bwd 1,327,104 vs HW 35,493). See [SHMEM_BANK_CONFLICT_H100.md](file:///home/jihyun/modern-gpu-simulator-micro-2025/.plan/SHMEM_BANK_CONFLICT_H100.md). | NCU raw shows the per-instruction over-charge is only ~3 cyc and HW shared stores are 98.5–99.5% conflict-free; HW's real store serialization is width-based, which the sim under-states. Fixing the counter improves a metric, not the cycle gap. | Deferred (parked) |
+| WGMMA / tensor-pipe issue-serialization (`fu_occupied`) | Stop serializing back-to-back WGMMA issue at the per-WGMMA `initiation_interval` (~32 cyc) so consecutive HGMMAs pipeline like real async WGMMA. Step-0 instrumentation behind `-wgmma_step0_instrument_enable` (default off). See [WGMMA_FU_OCCUPIED_H100.md](file:///home/jihyun/modern-gpu-simulator-micro-2025/.plan/WGMMA_FU_OCCUPIED_H100.md). | Step-0 run (fwd `.o19` / bwd `.o2`): the TRUE recoverable ceiling (`sm_idle_all_blocked_by_tensor`) is only **0.65% (fwd) / 1.59% (bwd)**; the per-subcore `fu_occupied` (13.4% / 18.1%) overcounted the SM-level loss ~7x because another subcore is almost always issuing. Too small for the gap. | Deferred (parked) |
+
+> Open follow-up from the WGMMA Step-0 run: `sm_all_subcores_idle ≈ 18%` on both kernels, of which
+> only ~0.65–1.59% is tensor-only. The remaining ~16–17% of true SM-idle is the real target —
+> decompose it by the dominant per-subcore blocking reason next.
 
 ### Run Paths
 

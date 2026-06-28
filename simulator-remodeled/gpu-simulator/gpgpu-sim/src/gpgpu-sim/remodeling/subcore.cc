@@ -330,7 +330,7 @@ void Subcore::allocate(SM *shared_sm) {
         shared_sm->m_sm_stats.m_stats_map["total_num_evals_rf_with_conflict"]->increment_with_integer(1);
         // [WGMMA Opt6 Step-0] (VII) tensor-only: RF/latency conflict extended the tensor
         // re-issue lockout beyond the static initiation_interval.
-        if(current_ins->op == TENSOR_CORE_OP) {
+        if(m_config->wgmma_step0_instrument_enable && current_ins->op == TENSOR_CORE_OP) {
           shared_sm->m_sm_stats.m_stats_map["total_num_tensor_add_extra_cycle_initiation_interval"]->increment_with_integer(1);
         }
       }
@@ -338,7 +338,7 @@ void Subcore::allocate(SM *shared_sm) {
       fu->add_extra_cycle_initiation_interval();
       shared_sm->m_sm_stats.m_stats_map["total_num_evals_rf_with_conflict"]->increment_with_integer(1);
       // [WGMMA Opt6 Step-0] (VII) tensor-only lockout extension.
-      if(current_ins->op == TENSOR_CORE_OP) {
+      if(m_config->wgmma_step0_instrument_enable && current_ins->op == TENSOR_CORE_OP) {
         shared_sm->m_sm_stats.m_stats_map["total_num_tensor_add_extra_cycle_initiation_interval"]->increment_with_integer(1);
       }
     }
@@ -375,7 +375,7 @@ void Subcore::control_stage(SM *shared_sm) {
       if(is_fixed_latency_inst) {
         fu->add_extra_cycle_initiation_interval();
         // [WGMMA Opt6 Step-0] (VII) tensor-only lockout extension (CONTROL->ALLOCATE latch full).
-        if(current_ins->op == TENSOR_CORE_OP) {
+        if(m_config->wgmma_step0_instrument_enable && current_ins->op == TENSOR_CORE_OP) {
           shared_sm->m_sm_stats.m_stats_map["total_num_tensor_add_extra_cycle_initiation_interval"]->increment_with_integer(1);
         }
       }
@@ -608,6 +608,7 @@ void Subcore::issue(SM *shared_sm) {
             if(!is_fu_available) {
               is_any_waiting_in_fu_occupied = true;
               // [WGMMA Opt6 Step-0] (I) classify which pipe the blocked head targets.
+              if(m_config->wgmma_step0_instrument_enable) {
               switch(pI->op) {
                 case TENSOR_CORE_OP: is_any_fu_occupied_tensor = true; break;
                 case SFU_OP:         is_any_fu_occupied_sfu = true; break;
@@ -634,6 +635,7 @@ void Subcore::issue(SM *shared_sm) {
                   is_any_tensor_fu_occupied_and_wait_barrier = true;
                 }
               }
+              } // m_config->wgmma_step0_instrument_enable
             }
             if(!is_not_warp_waiting_in_programmer_barrier || !is_not_warp_waiting_ldgdepbar) {
               is_any_waiting_in_inst_barrier = true;

@@ -1459,7 +1459,7 @@ void shader_core_stats::print_remodeling_stats(FILE *fout) {
   fprintf(fout, "total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_result_queue_full = %llu\n", total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_result_queue_full);
   fprintf(fout, "total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_yield = %llu\n", total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_yield);
   // [WGMMA Opt6 Step-0] observe-only instrumentation dump (absolute + % of evaluated cycles).
-  {
+  if(m_gpu->get_config().get_gpgpu_sim_config().wgmma_step0_instrument_enable) {
     long double denom_step0 = total_num_cycles_issue_stage_evaluated ? (long double) total_num_cycles_issue_stage_evaluated : 1;
     auto get_step0 = [&](const char *name) -> unsigned long long {
       return m_gpu->m_gpu_per_sm_stats.m_stats_map[name]->get_value();

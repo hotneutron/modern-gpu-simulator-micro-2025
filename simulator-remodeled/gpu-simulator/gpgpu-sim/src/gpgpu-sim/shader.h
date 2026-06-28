@@ -2217,6 +2217,11 @@ class shader_core_config : public core_config {
   bool l1i_prefetch_debug_enable;
   unsigned int l1i_prefetch_debug_budget;
 
+  // [WGMMA Opt6 Step-0] Enable the observe-only tensor/fu_occupied instrumentation
+  // (per-pipe fu_occupied split, tensor reissue-lockout, SM-idle, [WGMMADBG-MNK]).
+  // Disabled by default so production runs carry no extra counters/logs.
+  bool wgmma_step0_instrument_enable;
+
   // Hopper mbarrier sync debug logging (SYNCDBG). Disabled by default.
   bool sync_debug_enable;
   unsigned int sync_debug_print_budget;

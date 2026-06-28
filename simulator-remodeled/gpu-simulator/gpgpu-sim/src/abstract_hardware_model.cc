@@ -445,8 +445,8 @@ void warp_inst_t::generate_tensor_core_latencies(gpgpu_sim *gpu) {
   // [WGMMA Opt6 Step-0] (II) one log line per distinct (M,N,K,bits,sparse) shape so we can
   // confirm the static initiation_interval / latency the model assigns to each WGMMA shape
   // (e.g. HGMMA m64n128k16 -> II=32 lat=32). Shape->II is kernel-independent, so a global
-  // dedup set is fine and never floods (only a handful of shapes).
-  {
+  // dedup set is fine and never floods (only a handful of shapes). Gated by config flag.
+  if(shader_config.wgmma_step0_instrument_enable) {
     const auto &ti = get_extra_trace_instruction_info().get_tensor_core_instruction_info();
     static std::set<unsigned long long> s_seen_wgmma_shapes;
     unsigned long long key =

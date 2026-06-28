@@ -255,4 +255,49 @@ Implementation points:
 
 ## 5. Result
 
-— (pending implementation + run) —
+### Step 0 instrumentation run (DONE) — fwd `.o19` (k5, 151,422 cyc) / bwd `.o2` (k10, 240,253 cyc)
+
+(`-wgmma_step0_instrument_enable 1`; % = of `total_num_cycles_issue_stage_evaluated`, per-subcore.)
+
+| metric | fwd (k5) | bwd (k10) |
+|---|---|---|
+| `fu_occupied` total | 13.41% | 18.09% |
+| &nbsp;&nbsp;— **tensor** (I) | **5.09%** | **11.20%** |
+| &nbsp;&nbsp;— sp_int_dp (I) | 9.76% | 8.67% |
+| &nbsp;&nbsp;— sfu (I) | 0% | 0% |
+| &nbsp;&nbsp;— other (I) | 0.76% | 0.86% |
+| `tensor_reissue_lockout_only` (III) | 4.69% | 10.58% |
+| `tensor_fu_occupied_and_wait_barrier_coupled` (VI) | **0%** | **0%** |
+| `tensor_add_extra_cycle_initiation_interval` (VII) | 0.028% | 0.024% |
+| `sm_all_subcores_idle` (V) | 18.32% | 18.43% |
+| **`sm_idle_all_blocked_by_tensor`** (V) | **0.65%** | **1.59%** |
+
+WGMMA shapes (II): both kernels use `m64n128k16` (II=32, lat=32) and `m64n64k16` (II=16, lat=16).
+
+### Findings vs the decision gate
+
+1. **(I) Tensor share is mixed.** bwd: tensor is the majority of `fu_occupied` (11.2 of 18.1%);
+   **fwd: tensor is the minority** — `sp_int_dp` (9.76%) dominates over tensor (5.09%). So the
+   "fu_occupied == WGMMA" hypothesis holds only for bwd.
+2. **(V) The TRUE recoverable ceiling is tiny.** Per-subcore `tensor_reissue_lockout_only` is
+   4.69% / 10.58%, but once corrected to SM-level (no subcore on the SM issued AND the block was
+   tensor-only), it collapses to **0.65% (fwd) / 1.59% (bwd)**. I.e. when one subcore is locked on
+   the tensor pipe, **another subcore is almost always issuing**, so the SM keeps making progress.
+   This is exactly the per-subcore overcount (V) was added to catch — it inflated the apparent gain
+   ~7×.
+3. **(VI) coupling = 0** (no stall-shift risk) and **(VII) ≈ 0** (RF/latch lockout extension
+   negligible; static II=32 is the whole story).
+
+### Conclusion — DEFERRED (do not pursue the WGMMA issue-serialization fix)
+
+Even a perfect fix that removes the tensor re-issue lockout can recover **at most ~0.65% (fwd) /
+~1.59% (bwd)** of cycles (bwd 240,253 → ~236.4k best case). That is far too small to matter for the
+1.8–2.2× sim-vs-HW gap. Like the shared-bank-conflict idea, this drifts away from the real goal.
+**Parked.** The instrumentation is retained behind `-wgmma_step0_instrument_enable` (default off).
+
+### Next direction (data-driven)
+
+`sm_all_subcores_idle ≈ 18%` on both kernels, of which only ~0.65–1.59% is tensor-only. **The
+remaining ~16–17% of true SM-idle is the real target.** Next step: decompose `sm_all_subcores_idle`
+by the dominant blocking reason across subcores (wait_barrier / inst_barrier / stall_count / etc.)
+to find what actually keeps the whole SM idle — that is where the cycle gap lives.

@@ -1849,6 +1849,13 @@ void shader_core_config::reg_options(class OptionParser *opp) {
                          "Maximum number of [L1IPFDBG] event lines to print per SM when "
                          "l1i_prefetch_debug_enable is set. (default=2000000)",
                          "2000000");
+  option_parser_register(opp, "-wgmma_step0_instrument_enable", OPT_BOOL,
+                         &wgmma_step0_instrument_enable,
+                         "Enable observe-only WGMMA/tensor fu_occupied Step-0 instrumentation "
+                         "(per-pipe fu_occupied split, tensor reissue-lockout, SM-idle counters, "
+                         "[WGMMADBG-MNK] shape log). No timing change. See "
+                         ".plan/WGMMA_FU_OCCUPIED_H100.md. (default=0)",
+                         "0");
   option_parser_register(opp, "-sync_debug_enable", OPT_BOOL,
                          &sync_debug_enable,
                          "Enable Hopper mbarrier sync debug logging (SYNCDBG)."
