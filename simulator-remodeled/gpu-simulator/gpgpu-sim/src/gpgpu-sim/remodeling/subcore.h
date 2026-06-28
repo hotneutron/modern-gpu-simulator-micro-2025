@@ -91,6 +91,10 @@ class Subcore {
 
   bool is_subcore_with_problems_of_fordward_progress() const;
 
+  // [WGMMA Opt6 Step-0] per-cycle issue outcome exported for SM-level (V) aggregation.
+  bool step0_issued_this_cycle() const { return m_step0_issued_this_cycle; }
+  bool step0_blocked_by_tensor_only_this_cycle() const { return m_step0_blocked_by_tensor_only_this_cycle; }
+
  private:
   int m_num_active_warps_subcore;
   first_level_instruction_cache* m_L0I;
@@ -116,6 +120,10 @@ class Subcore {
   unsigned int m_greedy_pointer_fetch;
 
   bool m_is_next_stage_of_issue_busy;
+
+  // [WGMMA Opt6 Step-0] per-cycle issue outcome (set at the end of Subcore::issue()).
+  bool m_step0_issued_this_cycle = false;
+  bool m_step0_blocked_by_tensor_only_this_cycle = false;
 
   register_set_uniptr m_ISSUE_CONTROL_latch = register_set_uniptr(1, "ISSUE_CONTROL_latch");
   register_set_uniptr m_CONTROL_ALLOCATE_latch = register_set_uniptr(1, "CONTROL_ALLOCATE_latch");

@@ -1458,6 +1458,29 @@ void shader_core_stats::print_remodeling_stats(FILE *fout) {
   fprintf(fout, "total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_scoreboard = %llu\n", total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_scoreboard);
   fprintf(fout, "total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_result_queue_full = %llu\n", total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_result_queue_full);
   fprintf(fout, "total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_yield = %llu\n", total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_yield);
+  // [WGMMA Opt6 Step-0] observe-only instrumentation dump (absolute + % of evaluated cycles).
+  {
+    long double denom_step0 = total_num_cycles_issue_stage_evaluated ? (long double) total_num_cycles_issue_stage_evaluated : 1;
+    auto get_step0 = [&](const char *name) -> unsigned long long {
+      return m_gpu->m_gpu_per_sm_stats.m_stats_map[name]->get_value();
+    };
+    const char *names[] = {
+      "total_num_cycles_issue_stage_stall_at_least_one_warp_with_fu_occupied_tensor",
+      "total_num_cycles_issue_stage_stall_at_least_one_warp_with_fu_occupied_sfu",
+      "total_num_cycles_issue_stage_stall_at_least_one_warp_with_fu_occupied_sp_int_dp",
+      "total_num_cycles_issue_stage_stall_at_least_one_warp_with_fu_occupied_other",
+      "total_num_cycles_tensor_reissue_lockout_only",
+      "total_num_cycles_tensor_fu_occupied_and_wait_barrier_coupled",
+      "total_num_tensor_add_extra_cycle_initiation_interval",
+      "total_num_cycles_sm_all_subcores_idle",
+      "total_num_cycles_sm_idle_all_blocked_by_tensor",
+    };
+    for (const char *nm : names) {
+      unsigned long long v = get_step0(nm);
+      fprintf(fout, "%s = %llu\n", nm, v);
+      fprintf(fout, "percentage_%s = %.4Lf\n", nm, ((long double) v / denom_step0) * 100);
+    }
+  }
   // --- TMA vs non-TMA grouped percentages (of evaluated issue cycles) ---
   {
     long double denom = total_num_cycles_issue_stage_evaluated ? (long double) total_num_cycles_issue_stage_evaluated : 1;

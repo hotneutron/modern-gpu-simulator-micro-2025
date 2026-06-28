@@ -63,6 +63,8 @@
 #include <iostream>
 #include <sstream>
 #include <regex>
+#include <set>
+#include <cstdio>
 
 #include "../libcuda/gpgpu_context.h"
 #include "cuda-sim/cuda-sim.h"
@@ -439,6 +441,24 @@ void warp_inst_t::generate_tensor_core_latencies(gpgpu_sim *gpu) {
   if(get_extra_trace_instruction_info().get_tensor_core_instruction_info().is_16816_fp32_1688_fp32) {
     initiation_interval += gpu->get_config().get_gpgpu_sim_config().tensor_extra_latency_16816_fp32_1688_fp32;
     latency += gpu->get_config().get_gpgpu_sim_config().tensor_extra_latency_16816_fp32_1688_fp32;
+  }
+  // [WGMMA Opt6 Step-0] (II) one log line per distinct (M,N,K,bits,sparse) shape so we can
+  // confirm the static initiation_interval / latency the model assigns to each WGMMA shape
+  // (e.g. HGMMA m64n128k16 -> II=32 lat=32). Shape->II is kernel-independent, so a global
+  // dedup set is fine and never floods (only a handful of shapes).
+  {
+    const auto &ti = get_extra_trace_instruction_info().get_tensor_core_instruction_info();
+    static std::set<unsigned long long> s_seen_wgmma_shapes;
+    unsigned long long key =
+        ( (unsigned long long)ti.size_m << 40 ) ^ ( (unsigned long long)ti.size_n << 24 ) ^
+        ( (unsigned long long)ti.size_k << 8 ) ^ ( (unsigned long long)ti.operand_bit_size << 1 ) ^
+        ( ti.is_sparse ? 1ull : 0ull );
+    if(s_seen_wgmma_shapes.insert(key).second) {
+      std::fprintf(stderr,
+        "[WGMMADBG-MNK] m=%u n=%u k=%u bits=%u sparse=%d number_of_cycles=%u II=%u latency=%u\n",
+        ti.size_m, ti.size_n, ti.size_k, ti.operand_bit_size, (int)ti.is_sparse,
+        number_of_cycles, initiation_interval, latency);
+    }
   }
 }
 

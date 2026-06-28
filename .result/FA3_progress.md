@@ -32,6 +32,8 @@ To keep this file easy to extend, use the following update pattern whenever a ne
 | Opt 3 | MEMBAR Scope-Aware Fix | Scope-aware memory fence (CTA/GPU level) | 158,990 cycles (2.35x vs HW, -2.2% vs Opt 2). Run exits cleanly and `inst_barrier` nearly disappears. | 259,456 cycles (1.95x vs HW, -21.1% vs Opt 2). Run exits cleanly. | Done |
 | Opt 4 | Prefetch (deeper stream buffer) | `-prefetch_per_stream_buffer_size 1 -> 4` (deeper stream buffer, config-only) | 155,765 cycles (2.30x vs HW, -2.0% vs Opt 3) | 241,528 cycles (1.82x vs HW, -6.9% vs Opt 3) | Done |
 | Opt 5 | L1I eager-promote | Promote a ready prefetched line into L1I as soon as it is filled in the stream buffer, without waiting for a demand and without an L0I response (code change, on top of Opt 4 sb=4) | 150,755 cycles (2.23x vs HW, -3.2% vs Opt 4, -5.2% vs Opt 3) | 242,270 cycles (1.82x vs HW, +0.3% vs Opt 4). SIGSEGV at teardown only (after all stats dumped), so the cycle is trustworthy; a fix + re-run is in progress. | Fwd done; bwd numbers preliminary (re-running) |
+| Opt 6 (deferred) | Shared-mem bank-conflict model fix | Swizzle / vector-width-aware shared bank-conflict model + counter-semantics fix (sim over-counts `gpgpu_n_shmem_bkconflict`: fwd 38,016 vs HW 281, bwd 1,327,104 vs HW 35,493). See [SHMEM_BANK_CONFLICT_H100.md](file:///home/jihyun/modern-gpu-simulator-micro-2025/.plan/SHMEM_BANK_CONFLICT_H100.md). | — | — | **Deferred** — NCU raw shows per-inst over-charge only ~3 cyc and HW stores 98.5–99.5% conflict-free; fixing it improves a metric, not the cycle gap. Parked. |
+| Opt 6 | WGMMA / tensor-pipe issue-serialization fix | Stop serializing back-to-back WGMMA issue at the per-WGMMA `initiation_interval` (~32 cyc) so consecutive HGMMAs pipeline like real async WGMMA; split the tensor-pipe issue-throughput interval from the WGMMA compute latency. Requires a Step-0 one-run instrumentation pass first. See [WGMMA_FU_OCCUPIED_H100.md](file:///home/jihyun/modern-gpu-simulator-micro-2025/.plan/WGMMA_FU_OCCUPIED_H100.md). | — | — | Planned. Full HW-vs-sim stall comparison shows `fu_occupied` is the only large bucket the sim over-states (bwd 18% vs HW gmma 5.3%; fwd 13.6% vs 1.4%); confirm tensor share via Step 0 before fixing. |
 
 ### Simulator Cycle Breakdown
 
@@ -405,3 +407,44 @@ HITs in L1I.
 - Fix direction: classify by promote->miss gap (or check eviction explicitly), so
   a small-gap immediate miss is the only true Risk-A signal and large-gap evictions
   go to a separate `eager_promote_evicted_before_demand` bucket.
+
+## 3. Arch TODO
+
+Known modeling gaps that are **out of scope** for the current optimization pass but should be
+implemented later for higher fidelity. These are architectural model limitations, not tuning
+knobs.
+
+### TODO-1: TMA shared-memory swizzle is not modeled
+
+- **Status**: not implemented. The `swizzle` field exists in the TMA descriptor model only
+  ([tma_types.h:60](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/tma_types.h#L60), `:257`;
+  carried at [tma_unit_sm.cc:380](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/tma_unit_sm.cc#L380);
+  parsed at [gpu-sim.cc:375-377](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/gpu-sim.cc#L375-L377))
+  but the value is **carried, not used**: the TMA unit does not apply any swizzle when it writes
+  a tile into shared memory, and there is no shared-memory bank model on the TMA store path.
+- **Why it matters**: On Hopper, TMA writes (GMEM->SMEM) and the subsequent `LDSM`/`LDS`
+  consumers rely on the descriptor swizzle to be bank-conflict-free in shared memory. Because the
+  sim does not model the swizzle, the SMEM-side write/read bank behavior of TMA tiles is not
+  represented at all.
+- **TODO**: implement TMA-side shared-memory swizzle (apply the descriptor `swizzle` mode when
+  computing the SMEM destination layout) so the TMA store path and the downstream LDSM/LDS
+  consumers see the correct (swizzled) shared addresses.
+
+### TODO-2: TMA does not receive a real start (base) address from the trace
+
+- **Status**: TMA fabricates a synthetic GMEM base address per transfer. See
+  [tma_unit_sm.cc:629-635](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/tma_unit_sm.cc#L629-L635):
+  the comment states *"The trace does not carry the descriptor base, so we fabricate a
+  per-transfer address range purely to exercise memory-hierarchy timing"*, computing
+  `agu_base = (transfer_uid << 20) + agu_index * MAX_MEMORY_ACCESS_SIZE`.
+- **Why it matters**: because every transfer gets a deterministic fabricated base keyed on
+  `transfer_uid`, the model **cannot observe real address behavior** — bank conflicts, address
+  coalescing/overlap across transfers, L2 set/line reuse, and any real same-base collisions are
+  invisible. Distinct logical transfers that in reality hit the same/adjacent base look like
+  unrelated disjoint ranges (or, within a uid, always the same synthetic base), so TMA-side
+  memory effects are modeled only as generic timing, not as real address-dependent behavior.
+- **TODO**: capture and feed the real TMA descriptor base address (and per-transfer GMEM/SMEM
+  offsets) from the trace into the TMA unit, then drive the AGU requests from the real addresses
+  instead of the synthetic `agu_base`. This is a prerequisite for modeling TMA bank conflicts /
+  address coalescing correctly, and is also required before TODO-1 can be validated against real
+  addresses.

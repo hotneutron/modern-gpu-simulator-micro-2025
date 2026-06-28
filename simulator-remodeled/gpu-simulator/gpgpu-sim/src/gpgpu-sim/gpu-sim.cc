@@ -2609,6 +2609,23 @@ void gpgpu_sim::create_gpu_per_sm_stats() {
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_result_queue_full", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_l1c", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_issue_stage_evaluated", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  // [WGMMA Opt6 Step-0 instrumentation] observe-only counters (no timing change).
+  // (I) split fu_occupied by pipe op.
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_issue_stage_stall_at_least_one_warp_with_fu_occupied_tensor", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_issue_stage_stall_at_least_one_warp_with_fu_occupied_sfu", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_issue_stage_stall_at_least_one_warp_with_fu_occupied_sp_int_dp", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_issue_stage_stall_at_least_one_warp_with_fu_occupied_other", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  // (III) tensor head blocked ONLY by tensor fu (all other issue conditions of that warp true).
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_tensor_reissue_lockout_only", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  // (VI) tensor head blocked by tensor fu AND that same warp would also block on wait_barrier.
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_tensor_fu_occupied_and_wait_barrier_coupled", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  // (VII) tensor-only RF/latch conflict that extends the tensor re-issue lockout beyond static II.
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_tensor_add_extra_cycle_initiation_interval", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  // (V) SM-level: cycles where NO subcore issued anything; sub-variant where every non-issuing
+  // subcore that had an eligible-but-blocked warp was blocked specifically by the tensor pipe.
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_sm_all_subcores_idle", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_sm_idle_all_blocked_by_tensor", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_register_file_cache_hits", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_register_file_cache_allocations", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_regular_regfile_reads", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);

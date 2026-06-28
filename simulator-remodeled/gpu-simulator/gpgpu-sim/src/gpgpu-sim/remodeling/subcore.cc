@@ -328,10 +328,19 @@ void Subcore::allocate(SM *shared_sm) {
       }else {
         fu->add_extra_cycle_initiation_interval();
         shared_sm->m_sm_stats.m_stats_map["total_num_evals_rf_with_conflict"]->increment_with_integer(1);
+        // [WGMMA Opt6 Step-0] (VII) tensor-only: RF/latency conflict extended the tensor
+        // re-issue lockout beyond the static initiation_interval.
+        if(current_ins->op == TENSOR_CORE_OP) {
+          shared_sm->m_sm_stats.m_stats_map["total_num_tensor_add_extra_cycle_initiation_interval"]->increment_with_integer(1);
+        }
       }
     }else {
       fu->add_extra_cycle_initiation_interval();
       shared_sm->m_sm_stats.m_stats_map["total_num_evals_rf_with_conflict"]->increment_with_integer(1);
+      // [WGMMA Opt6 Step-0] (VII) tensor-only lockout extension.
+      if(current_ins->op == TENSOR_CORE_OP) {
+        shared_sm->m_sm_stats.m_stats_map["total_num_tensor_add_extra_cycle_initiation_interval"]->increment_with_integer(1);
+      }
     }
   }
 }
@@ -365,6 +374,10 @@ void Subcore::control_stage(SM *shared_sm) {
     }else {
       if(is_fixed_latency_inst) {
         fu->add_extra_cycle_initiation_interval();
+        // [WGMMA Opt6 Step-0] (VII) tensor-only lockout extension (CONTROL->ALLOCATE latch full).
+        if(current_ins->op == TENSOR_CORE_OP) {
+          shared_sm->m_sm_stats.m_stats_map["total_num_tensor_add_extra_cycle_initiation_interval"]->increment_with_integer(1);
+        }
       }
     }
   }
@@ -402,6 +415,13 @@ void Subcore::issue(SM *shared_sm) {
   bool is_any_waiting_in_tma_flush = false;      // cp.async.bulk.wait_group drain (TMA)
   bool is_any_waiting_in_yield = false;          // YIELD control bit (non-TMA)
   bool is_any_waiting_in_fu_occupied = false;    // FU busy -> NCU "gmma/math_pipe_throttle" (non-TMA)
+  // [WGMMA Opt6 Step-0] per-cycle flags (observe-only).
+  bool is_any_fu_occupied_tensor = false;        // (I) blocked warp's head op is TENSOR_CORE_OP
+  bool is_any_fu_occupied_sfu = false;           // (I) SFU_OP
+  bool is_any_fu_occupied_sp_int_dp = false;     // (I) SP/INT/DP/UNIFORM
+  bool is_any_fu_occupied_other = false;         // (I) any other fixed-latency pipe
+  bool is_any_tensor_reissue_lockout_only = false; // (III) tensor head blocked ONLY by tensor fu
+  bool is_any_tensor_fu_occupied_and_wait_barrier = false; // (VI) tensor fu busy AND wait_barrier not-ready on same warp
   bool is_any_waiting_in_scoreboard = false;     // traditional scoreboard collision (non-TMA)
   bool is_any_waiting_in_result_queue_full = false; // RF result-queue full (non-TMA)
   bool is_any_waiting_l1c = false;               // const cache -> NCU "short_scoreboard" (non-TMA)
@@ -587,6 +607,33 @@ void Subcore::issue(SM *shared_sm) {
           if(!are_switch_warp_conditions_ready) {
             if(!is_fu_available) {
               is_any_waiting_in_fu_occupied = true;
+              // [WGMMA Opt6 Step-0] (I) classify which pipe the blocked head targets.
+              switch(pI->op) {
+                case TENSOR_CORE_OP: is_any_fu_occupied_tensor = true; break;
+                case SFU_OP:         is_any_fu_occupied_sfu = true; break;
+                case SP_OP: case HALF_OP: case INTP_OP: case DP_OP: case UNIFORM_OP:
+                                     is_any_fu_occupied_sp_int_dp = true; break;
+                default:             is_any_fu_occupied_other = true; break;
+              }
+              if(pI->op == TENSOR_CORE_OP) {
+                // (III) tensor head blocked ONLY by the tensor fu: every other issue
+                // condition for THIS warp is satisfied (so the warp would issue if the
+                // tensor re-issue lockout were gone). This is the recoverable-cycle ceiling.
+                bool blocked_only_by_fu =
+                    is_not_yield && is_stall_counter_0 && are_wait_barriers_ready &&
+                    is_not_warp_waiting_in_programmer_barrier &&
+                    is_not_warp_waiting_ldgdepbar && is_not_warp_waiting_tma_flush &&
+                    are_traditional_scoreaboards_ready &&
+                    is_write_available_result_queue_for_fixed_latency_available;
+                if(blocked_only_by_fu) {
+                  is_any_tensor_reissue_lockout_only = true;
+                }
+                // (VI) tensor fu busy AND this same warp would next block on a wait_barrier
+                // (WGMMA.WAIT / DEPBAR). High value => lowering II only shifts the stall.
+                if(!are_wait_barriers_ready) {
+                  is_any_tensor_fu_occupied_and_wait_barrier = true;
+                }
+              }
             }
             if(!is_not_warp_waiting_in_programmer_barrier || !is_not_warp_waiting_ldgdepbar) {
               is_any_waiting_in_inst_barrier = true;
@@ -666,7 +713,19 @@ void Subcore::issue(SM *shared_sm) {
     shared_sm->m_sm_stats.m_stats_map["total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_scoreboard"]->increment_with_integer(is_any_waiting_in_scoreboard);
     shared_sm->m_sm_stats.m_stats_map["total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_result_queue_full"]->increment_with_integer(is_any_waiting_in_result_queue_full);
     shared_sm->m_sm_stats.m_stats_map["total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_l1c"]->increment_with_integer(is_any_waiting_l1c);
+    // [WGMMA Opt6 Step-0] (I)/(III)/(VI) per-pipe + tensor-specific stall attribution.
+    shared_sm->m_sm_stats.m_stats_map["total_num_cycles_issue_stage_stall_at_least_one_warp_with_fu_occupied_tensor"]->increment_with_integer(is_any_fu_occupied_tensor);
+    shared_sm->m_sm_stats.m_stats_map["total_num_cycles_issue_stage_stall_at_least_one_warp_with_fu_occupied_sfu"]->increment_with_integer(is_any_fu_occupied_sfu);
+    shared_sm->m_sm_stats.m_stats_map["total_num_cycles_issue_stage_stall_at_least_one_warp_with_fu_occupied_sp_int_dp"]->increment_with_integer(is_any_fu_occupied_sp_int_dp);
+    shared_sm->m_sm_stats.m_stats_map["total_num_cycles_issue_stage_stall_at_least_one_warp_with_fu_occupied_other"]->increment_with_integer(is_any_fu_occupied_other);
+    shared_sm->m_sm_stats.m_stats_map["total_num_cycles_tensor_reissue_lockout_only"]->increment_with_integer(is_any_tensor_reissue_lockout_only);
+    shared_sm->m_sm_stats.m_stats_map["total_num_cycles_tensor_fu_occupied_and_wait_barrier_coupled"]->increment_with_integer(is_any_tensor_fu_occupied_and_wait_barrier);
   }
+  // [WGMMA Opt6 Step-0] (V) export this subcore's per-cycle issue outcome for SM-level
+  // aggregation in SM::cycle(): did it issue, and (if not) was it blocked ONLY by the
+  // tensor pipe this cycle? Used to count true SM-wide idle cycles vs tensor-only idle.
+  m_step0_issued_this_cycle = is_issued_inst;
+  m_step0_blocked_by_tensor_only_this_cycle = is_any_tensor_reissue_lockout_only;
   shared_sm->m_sm_stats.m_stats_map["total_num_cycles_issue_stage_evaluated"]->increment_with_integer(1);
 
   m_is_next_stage_of_issue_busy = !is_next_stage_availabe;

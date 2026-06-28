@@ -548,6 +548,25 @@ void SM::cycle() {
     subcore->cycle();
   }
 
+  // [WGMMA Opt6 Step-0] (V) SM-level idle accounting. A subcore being blocked on the
+  // tensor pipe is only a real cycle loss if NO subcore on this SM issued this cycle.
+  {
+    bool any_subcore_issued = false;
+    bool any_subcore_tensor_only_block = false;
+    for (auto subcore : m_subcores) {
+      if (subcore->step0_issued_this_cycle()) any_subcore_issued = true;
+      if (subcore->step0_blocked_by_tensor_only_this_cycle()) any_subcore_tensor_only_block = true;
+    }
+    if (!any_subcore_issued) {
+      m_sm_stats.m_stats_map["total_num_cycles_sm_all_subcores_idle"]->increment_with_integer(1);
+      // Among SM-idle cycles, those where >=1 subcore was blocked specifically by the
+      // tensor re-issue lockout (upper bound on cycles the WGMMA fix could recover).
+      if (any_subcore_tensor_only_block) {
+        m_sm_stats.m_stats_map["total_num_cycles_sm_idle_all_blocked_by_tensor"]->increment_with_integer(1);
+      }
+    }
+  }
+
   consume_pending_wait_barrier_actions(m_pending_wait_barrier_increments);
   consume_pending_wait_barrier_actions(m_pending_wait_barrier_decrements);
   if(m_num_cycles_to_wait_to_dispatch_another_inst_from_subcore_to_sm_shared_pipeline > 0) {
