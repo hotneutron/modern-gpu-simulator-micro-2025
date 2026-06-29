@@ -1,5 +1,65 @@
 # FA3 BWD Kernel 10 — Simulator vs. Real H100 Comparison
 
+## UPDATE — Opt 5 (L1I eager-promote) simulator result (2026-06)
+
+The detailed sections below were written at the **Opt 1 (rop=100)** stage (sim = 361,760 cycles).
+The simulator has since improved through Opt 2 (BAR engine fix), Opt 3 (MEMBAR scope fix),
+Opt 4 (deeper L1I stream buffer, sb=4), and Opt 5 (L1I eager-promote). **Real-HW (NCU) numbers
+are unchanged**; only the simulator side is updated here.
+
+### Simulator cycle progression (FA3 bwd, trace kernel 10, `FlashAttnBwdSm90`) — HW Elapsed = 132,901
+
+| Stage | sim cycles | Sim / HW | Δ vs prev |
+|---|---|---|---|
+| Init (rop=211) | 376,735 | 2.83× | — |
+| Opt 1 (`rop=100`) | 361,760 | 2.72× | −4.0% |
+| Opt 2 (BAR engine fix) | 328,643 | 2.47× | −9.1% |
+| Opt 3 (MEMBAR scope fix) | 259,456 | 1.95× | −21.1% |
+| Opt 4 (prefetch, sb=4) | 241,528 | 1.82× | −6.9% |
+| **Opt 5 (L1I eager-promote)** | **241,425** | **1.82×** | **−0.04%** |
+
+- Opt 5 run: `.../H100_80GB-OnlyKernel10/...warmup_-63a73d452237.o3` (clean exit; Step-0
+  instrumentation counters are timing-neutral, so this is a valid Opt-5 baseline; supersedes the
+  earlier `.o320` 242,270 that hit a teardown SIGSEGV — now fixed).
+- eager-promote works (`eager_promote_to_cache=994,032`, `demand_hit_later=366,329`,
+  `demand_miss_after_promote=0`, L1I miss rate 0.1977) but gives **essentially no bwd cycle
+  benefit** — the bwd frontend stall is not on the critical path.
+
+### Opt 5 issue-stage breakdown (top-level, mutually exclusive)
+
+| Class | Opt 5 % | Note |
+|---|---|---|
+| no_warps_ready | 36.45% | dominant |
+| issuing | 25.70% | |
+| no_valid_instruction (frontend) | 18.63% | |
+| next_stage_not_available | 18.52% | downstream pipe back-pressure |
+| issue_port_busy | 0.70% | |
+
+Inside `no_warps_ready` (overlapping `..._at_least_one_warp_*`, % of all eval cycles):
+`non_tma_axis 26.66%`, `tma_axis 22.17%`, `fu_occupied 17.75%`, `wait_barrier 14.71%`,
+`stall_count 7.40%`, `tma_flush 6.20%`, `inst_barrier 1.26%`.
+
+### Opt 5 / Step-0 SM-idle decomposition (true SM-level, not per-subcore)
+
+A Step-0 instrumentation run decomposed `sm_all_subcores_idle ≈ 18.45%` (cycles where **no**
+subcore on the SM issued) by the dominant blocking reason. This corrects per-subcore over-counts:
+
+| SM-idle reason | Opt 5 % | note |
+|---|---|---|
+| **no_valid_other** (ibuffer empty / decode / not stream-buffer) | **10.55%** | #1 — next target |
+| **wait_barrier** (mbarrier / DEPBAR) | **11.09%** | #2 |
+| no_valid_frontend (incl. `sbwait` 5.31%) | 5.49% | the L1I prefetch send-bandwidth fix was deferred (only ~5% recoverable) |
+| stall_count | 3.82% | |
+| tma_flush | 4.76% | bwd-only |
+| fu_occupied (tensor 1.64%) | 2.84% | WGMMA fix deferred (≤1.6% recoverable) |
+| next_stage | 2.12% | |
+
+> Two optimizations were investigated and **deferred** after this decomposition: the WGMMA
+> tensor-pipe `fu_occupied` fix (SM-level recoverable only ~1.6%) and the L1I prefetch
+> send-bandwidth fix (frontend only ~5% of SM-idle). The current next target is `no_valid_other`.
+
+---
+
 ## Target Information
 
 - **Workload**: `flashattn-fa3-bf16-bwd-causal-b1-s2048-hd64-nh24`

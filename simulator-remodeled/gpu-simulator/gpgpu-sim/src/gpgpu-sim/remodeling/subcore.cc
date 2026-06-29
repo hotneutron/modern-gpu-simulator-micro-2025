@@ -457,8 +457,16 @@ void Subcore::issue(SM *shared_sm) {
           is_any_invalid_head_ibuffer_empty = true;
           // [Step-0] classify ibuffer-empty: is a fetch for this warp's next PC already
           // in flight in L0I (awaiting response), or has no fetch been issued yet?
-          if (m_config->wgmma_step0_instrument_enable ||
-              m_config->l1i_frontend_step0_instrument_enable) {
+          // Guard: only read get_pc() when the warp still has a next PC to fetch — once the
+          // trace is exhausted (used_insts == traced_pcs.size()) get_pc() asserts. A drained
+          // warp with an empty ibuffer is just winding down; leave it unclassified.
+          bool empty_warp_has_next_pc =
+              m_config->is_trace_mode
+                  ? !static_cast<trace_shd_warp_t *>(c_warp)->trace_done()
+                  : true;
+          if ((m_config->wgmma_step0_instrument_enable ||
+               m_config->l1i_frontend_step0_instrument_enable) &&
+              empty_warp_has_next_pc) {
             address_type empty_local_pc =
                 m_config->is_trace_mode
                     ? static_cast<trace_shd_warp_t *>(c_warp)->get_pc()
