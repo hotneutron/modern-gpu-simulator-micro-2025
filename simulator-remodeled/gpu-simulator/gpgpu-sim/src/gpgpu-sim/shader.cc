@@ -1459,7 +1459,8 @@ void shader_core_stats::print_remodeling_stats(FILE *fout) {
   fprintf(fout, "total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_result_queue_full = %llu\n", total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_result_queue_full);
   fprintf(fout, "total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_yield = %llu\n", total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_yield);
   // [WGMMA Opt6 Step-0] observe-only instrumentation dump (absolute + % of evaluated cycles).
-  if(m_gpu->get_config().get_gpgpu_sim_config().wgmma_step0_instrument_enable) {
+  if(m_gpu->get_config().get_gpgpu_sim_config().wgmma_step0_instrument_enable ||
+     m_gpu->get_config().get_gpgpu_sim_config().l1i_frontend_step0_instrument_enable) {
     long double denom_step0 = total_num_cycles_issue_stage_evaluated ? (long double) total_num_cycles_issue_stage_evaluated : 1;
     auto get_step0 = [&](const char *name) -> unsigned long long {
       return m_gpu->m_gpu_per_sm_stats.m_stats_map[name]->get_value();
@@ -1474,6 +1475,23 @@ void shader_core_stats::print_remodeling_stats(FILE *fout) {
       "total_num_tensor_add_extra_cycle_initiation_interval",
       "total_num_cycles_sm_all_subcores_idle",
       "total_num_cycles_sm_idle_all_blocked_by_tensor",
+      "total_num_cycles_sm_idle_blocked_by_frontend_sbwait",
+      "total_num_cycles_sm_idle_reason_next_stage",
+      "total_num_cycles_sm_idle_reason_issue_port_busy",
+      "total_num_cycles_sm_idle_reason_no_valid_frontend",
+      "total_num_cycles_sm_idle_reason_no_valid_sbwait",
+      "total_num_cycles_sm_idle_reason_no_valid_other",
+      "total_num_cycles_sm_idle_reason_fu_occupied",
+      "total_num_cycles_sm_idle_reason_fu_occupied_tensor",
+      "total_num_cycles_sm_idle_reason_inst_barrier",
+      "total_num_cycles_sm_idle_reason_wait_barrier",
+      "total_num_cycles_sm_idle_reason_tma_flush",
+      "total_num_cycles_sm_idle_reason_stall_count",
+      "total_num_cycles_sm_idle_reason_scoreboard",
+      "total_num_cycles_sm_idle_reason_l1c",
+      "total_num_cycles_sm_idle_reason_result_queue_full",
+      "total_num_cycles_sm_idle_reason_yield",
+      "total_num_cycles_sm_idle_reason_none",
     };
     for (const char *nm : names) {
       unsigned long long v = get_step0(nm);

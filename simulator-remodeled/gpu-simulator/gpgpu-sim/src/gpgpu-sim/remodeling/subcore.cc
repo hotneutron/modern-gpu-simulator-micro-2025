@@ -728,6 +728,37 @@ void Subcore::issue(SM *shared_sm) {
   // tensor pipe this cycle? Used to count true SM-wide idle cycles vs tensor-only idle.
   m_step0_issued_this_cycle = is_issued_inst;
   m_step0_blocked_by_tensor_only_this_cycle = is_any_tensor_reissue_lockout_only;
+  // [Frontend Step-0] also export whether this subcore had >=1 warp blocked on the L1I
+  // stream-buffer frontend this cycle, for the SM-level frontend-idle measurement.
+  m_step0_blocked_by_frontend_sbwait_this_cycle = is_any_invalid_head_waiting_frontend_in_l0i_response_queue_stream_buffer_wait;
+  // [Step-0 full SM-idle decomposition] build this subcore's per-cycle non-issue reason mask
+  // (only meaningful when it did NOT issue). SM::cycle() ORs these across the 4 subcores on
+  // true SM-idle cycles, so one run attributes ALL of sm_all_subcores_idle to every reason.
+  // Computed when EITHER Step-0 flag is on (shared infra for WGMMA + frontend measurements).
+  if(m_config->wgmma_step0_instrument_enable || m_config->l1i_frontend_step0_instrument_enable) {
+    unsigned int mask = 0;
+    if(!is_issued_inst) {
+      if(!is_next_stage_availabe)      mask |= STEP0_R_NEXT_STAGE;
+      else if(is_issue_port_busy)      mask |= STEP0_R_ISSUE_PORT_BUSY;
+      else if(!is_valid_inst) {
+        if(is_any_invalid_head_waiting_frontend) mask |= STEP0_R_NO_VALID_FRONTEND;
+        if(is_any_invalid_head_waiting_frontend_in_l0i_response_queue_stream_buffer_wait) mask |= STEP0_R_NO_VALID_SBWAIT;
+        if(!is_any_invalid_head_waiting_frontend) mask |= STEP0_R_NO_VALID_OTHER;
+      } else { // no_warps_ready: overlapping per-reason flags
+        if(is_any_waiting_in_fu_occupied)        mask |= STEP0_R_FU_OCCUPIED;
+        if(is_any_fu_occupied_tensor)            mask |= STEP0_R_FU_OCCUPIED_TENSOR;
+        if(is_any_waiting_in_inst_barrier)       mask |= STEP0_R_INST_BARRIER;
+        if(is_any_waiting_in_wait_barrier)       mask |= STEP0_R_WAIT_BARRIER;
+        if(is_any_waiting_in_tma_flush)          mask |= STEP0_R_TMA_FLUSH;
+        if(is_any_waiting_in_stall_count)        mask |= STEP0_R_STALL_COUNT;
+        if(is_any_waiting_in_scoreboard)         mask |= STEP0_R_SCOREBOARD;
+        if(is_any_waiting_l1c)                   mask |= STEP0_R_L1C;
+        if(is_any_waiting_in_result_queue_full)  mask |= STEP0_R_RESULT_QUEUE_FULL;
+        if(is_any_waiting_in_yield)              mask |= STEP0_R_YIELD;
+      }
+    }
+    m_step0_reason_mask_this_cycle = mask;
+  }
   shared_sm->m_sm_stats.m_stats_map["total_num_cycles_issue_stage_evaluated"]->increment_with_integer(1);
 
   m_is_next_stage_of_issue_busy = !is_next_stage_availabe;

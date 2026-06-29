@@ -550,20 +550,48 @@ void SM::cycle() {
 
   // [WGMMA Opt6 Step-0] (V) SM-level idle accounting. A subcore being blocked on the
   // tensor pipe is only a real cycle loss if NO subcore on this SM issued this cycle.
-  if(m_config->wgmma_step0_instrument_enable) {
+  if(m_config->wgmma_step0_instrument_enable || m_config->l1i_frontend_step0_instrument_enable) {
     bool any_subcore_issued = false;
     bool any_subcore_tensor_only_block = false;
+    bool any_subcore_frontend_block = false;
+    unsigned int sm_idle_reason_or = 0;  // OR of all subcores' non-issue reason masks
     for (auto subcore : m_subcores) {
       if (subcore->step0_issued_this_cycle()) any_subcore_issued = true;
       if (subcore->step0_blocked_by_tensor_only_this_cycle()) any_subcore_tensor_only_block = true;
+      if (subcore->step0_blocked_by_frontend_sbwait_this_cycle()) any_subcore_frontend_block = true;
+      sm_idle_reason_or |= subcore->step0_reason_mask_this_cycle();
     }
     if (!any_subcore_issued) {
       m_sm_stats.m_stats_map["total_num_cycles_sm_all_subcores_idle"]->increment_with_integer(1);
-      // Among SM-idle cycles, those where >=1 subcore was blocked specifically by the
-      // tensor re-issue lockout (upper bound on cycles the WGMMA fix could recover).
-      if (any_subcore_tensor_only_block) {
+      // WGMMA-specific: SM-idle cycles with >=1 subcore blocked only by the tensor lockout.
+      if (m_config->wgmma_step0_instrument_enable && any_subcore_tensor_only_block) {
         m_sm_stats.m_stats_map["total_num_cycles_sm_idle_all_blocked_by_tensor"]->increment_with_integer(1);
       }
+      // Frontend-specific: SM-idle cycles with >=1 subcore blocked on the L1I stream-buffer frontend.
+      if (m_config->l1i_frontend_step0_instrument_enable && any_subcore_frontend_block) {
+        m_sm_stats.m_stats_map["total_num_cycles_sm_idle_blocked_by_frontend_sbwait"]->increment_with_integer(1);
+      }
+      // FULL SM-idle decomposition: for each reason, count SM-idle cycles where >=1 subcore
+      // was blocked for that reason. Reasons overlap (sum can exceed sm_all_subcores_idle),
+      // so read as relative intensity — this attributes ALL true SM-idle in one run.
+      if (sm_idle_reason_or & Subcore::STEP0_R_NEXT_STAGE)         m_sm_stats.m_stats_map["total_num_cycles_sm_idle_reason_next_stage"]->increment_with_integer(1);
+      if (sm_idle_reason_or & Subcore::STEP0_R_ISSUE_PORT_BUSY)    m_sm_stats.m_stats_map["total_num_cycles_sm_idle_reason_issue_port_busy"]->increment_with_integer(1);
+      if (sm_idle_reason_or & Subcore::STEP0_R_NO_VALID_FRONTEND)  m_sm_stats.m_stats_map["total_num_cycles_sm_idle_reason_no_valid_frontend"]->increment_with_integer(1);
+      if (sm_idle_reason_or & Subcore::STEP0_R_NO_VALID_SBWAIT)    m_sm_stats.m_stats_map["total_num_cycles_sm_idle_reason_no_valid_sbwait"]->increment_with_integer(1);
+      if (sm_idle_reason_or & Subcore::STEP0_R_NO_VALID_OTHER)     m_sm_stats.m_stats_map["total_num_cycles_sm_idle_reason_no_valid_other"]->increment_with_integer(1);
+      if (sm_idle_reason_or & Subcore::STEP0_R_FU_OCCUPIED)        m_sm_stats.m_stats_map["total_num_cycles_sm_idle_reason_fu_occupied"]->increment_with_integer(1);
+      if (sm_idle_reason_or & Subcore::STEP0_R_FU_OCCUPIED_TENSOR) m_sm_stats.m_stats_map["total_num_cycles_sm_idle_reason_fu_occupied_tensor"]->increment_with_integer(1);
+      if (sm_idle_reason_or & Subcore::STEP0_R_INST_BARRIER)       m_sm_stats.m_stats_map["total_num_cycles_sm_idle_reason_inst_barrier"]->increment_with_integer(1);
+      if (sm_idle_reason_or & Subcore::STEP0_R_WAIT_BARRIER)       m_sm_stats.m_stats_map["total_num_cycles_sm_idle_reason_wait_barrier"]->increment_with_integer(1);
+      if (sm_idle_reason_or & Subcore::STEP0_R_TMA_FLUSH)          m_sm_stats.m_stats_map["total_num_cycles_sm_idle_reason_tma_flush"]->increment_with_integer(1);
+      if (sm_idle_reason_or & Subcore::STEP0_R_STALL_COUNT)        m_sm_stats.m_stats_map["total_num_cycles_sm_idle_reason_stall_count"]->increment_with_integer(1);
+      if (sm_idle_reason_or & Subcore::STEP0_R_SCOREBOARD)         m_sm_stats.m_stats_map["total_num_cycles_sm_idle_reason_scoreboard"]->increment_with_integer(1);
+      if (sm_idle_reason_or & Subcore::STEP0_R_L1C)                m_sm_stats.m_stats_map["total_num_cycles_sm_idle_reason_l1c"]->increment_with_integer(1);
+      if (sm_idle_reason_or & Subcore::STEP0_R_RESULT_QUEUE_FULL)  m_sm_stats.m_stats_map["total_num_cycles_sm_idle_reason_result_queue_full"]->increment_with_integer(1);
+      if (sm_idle_reason_or & Subcore::STEP0_R_YIELD)              m_sm_stats.m_stats_map["total_num_cycles_sm_idle_reason_yield"]->increment_with_integer(1);
+      // Cycles where the SM was idle and NO subcore reported any reason (pure structural idle,
+      // e.g. all warps done/sleeping) — should be small; catches unattributed idle.
+      if (sm_idle_reason_or == 0)                                 m_sm_stats.m_stats_map["total_num_cycles_sm_idle_reason_none"]->increment_with_integer(1);
     }
   }
 

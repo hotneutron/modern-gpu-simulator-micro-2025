@@ -1852,9 +1852,17 @@ void shader_core_config::reg_options(class OptionParser *opp) {
   option_parser_register(opp, "-wgmma_step0_instrument_enable", OPT_BOOL,
                          &wgmma_step0_instrument_enable,
                          "Enable observe-only WGMMA/tensor fu_occupied Step-0 instrumentation "
-                         "(per-pipe fu_occupied split, tensor reissue-lockout, SM-idle counters, "
+                         "(per-pipe fu_occupied split, tensor reissue-lockout, "
                          "[WGMMADBG-MNK] shape log). No timing change. See "
                          ".plan/WGMMA_FU_OCCUPIED_H100.md. (default=0)",
+                         "0");
+  option_parser_register(opp, "-l1i_frontend_step0_instrument_enable", OPT_BOOL,
+                         &l1i_frontend_step0_instrument_enable,
+                         "Enable observe-only L1I-frontend Step-0 instrumentation "
+                         "(sm_idle_blocked_by_frontend_sbwait). No timing change. See "
+                         ".plan/L1I_PREFETCH_LOOKAHEAD_H100.md. The full SM-idle reason "
+                         "decomposition (sm_idle_reason_*) is emitted when EITHER this or "
+                         "-wgmma_step0_instrument_enable is set. (default=0)",
                          "0");
   option_parser_register(opp, "-sync_debug_enable", OPT_BOOL,
                          &sync_debug_enable,
@@ -2632,6 +2640,31 @@ void gpgpu_sim::create_gpu_per_sm_stats() {
   // subcore that had an eligible-but-blocked warp was blocked specifically by the tensor pipe.
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_sm_all_subcores_idle", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_sm_idle_all_blocked_by_tensor", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_sm_idle_blocked_by_frontend_sbwait", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  // Full SM-idle decomposition: for each non-issue reason, SM-idle cycles where >=1 subcore had it.
+  {
+    const char *step0_sm_idle_reason_names[] = {
+      "total_num_cycles_sm_idle_reason_next_stage",
+      "total_num_cycles_sm_idle_reason_issue_port_busy",
+      "total_num_cycles_sm_idle_reason_no_valid_frontend",
+      "total_num_cycles_sm_idle_reason_no_valid_sbwait",
+      "total_num_cycles_sm_idle_reason_no_valid_other",
+      "total_num_cycles_sm_idle_reason_fu_occupied",
+      "total_num_cycles_sm_idle_reason_fu_occupied_tensor",
+      "total_num_cycles_sm_idle_reason_inst_barrier",
+      "total_num_cycles_sm_idle_reason_wait_barrier",
+      "total_num_cycles_sm_idle_reason_tma_flush",
+      "total_num_cycles_sm_idle_reason_stall_count",
+      "total_num_cycles_sm_idle_reason_scoreboard",
+      "total_num_cycles_sm_idle_reason_l1c",
+      "total_num_cycles_sm_idle_reason_result_queue_full",
+      "total_num_cycles_sm_idle_reason_yield",
+      "total_num_cycles_sm_idle_reason_none",
+    };
+    for (const char *nm : step0_sm_idle_reason_names) {
+      m_gpu_per_sm_stats.add_unsigned_long_long_stat(nm, AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+    }
+  }
 
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_register_file_cache_hits", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_register_file_cache_allocations", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
