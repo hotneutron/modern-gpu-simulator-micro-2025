@@ -1,5 +1,12 @@
 # Opt 6 — L1I Frontend `stream_buffer_wait` (prefetch send-bandwidth) — Step-0 measure first
 
+> **STATUS: DEFERRED — frontend GATE FAILED.** Step-0 SM-idle decomposition (fwd `.o20`, bwd
+> `.o3`) shows the L1I frontend (`sm_idle_blocked_by_frontend_sbwait`) is only **fwd 3.99% /
+> bwd 5.31%** of evaluated cycles — the per-subcore `stream_buffer_wait` (14.8/15.6%) shrank ~3x at
+> SM level, exactly the WGMMA per-subcore mirage. So widening the L0→L1 send bandwidth can recover
+> at most ~4–5%; it is not the dominant SM-idle cause. **Parked.** The §4 fix design is kept for
+> reference. See §3 for the full SM-idle decomposition and the next target.
+
 > Target: FA3 fwd (k5) / bwd (k10), on top of Opt 5. Supersedes the earlier
 > `L1I_PREFETCH_LOOKAHEAD_H100.md` draft, whose diagnosis ("lookahead = 1 line") was **wrong**
 > (the stream buffer already prefetches ~4 lines ahead via `do_prefetch`). This plan records the
@@ -71,6 +78,43 @@ printed via the Step-0 dump in shader.cc.)
 - If frontend is a **majority** of true SM-idle → proceed to §4 fix.
 - If it collapses to a few % (like WGMMA) → frontend is NOT on the critical path; do not fix it,
   re-target the rest of `sm_all_subcores_idle`.
+
+### Step-0 RESULT (fwd `.o20` 149,727 cyc / bwd `.o3` 241,425 cyc) — GATE FAILED
+
+`sm_all_subcores_idle ≈ 18.3% (fwd) / 18.5% (bwd)`. SM-idle decomposed by reason (≥1 subcore
+blocked on that reason during a true SM-idle cycle; reasons overlap, read as relative intensity):
+
+| reason | fwd | bwd | note |
+|---|---|---|---|
+| **no_valid_other** (ibuffer empty / decode pending) | **11.90%** | **10.55%** | **#1 — never analyzed; NOT stream_buffer** |
+| **wait_barrier** (mbarrier / DEPBAR, TMA data arrival) | **9.71%** | **11.09%** | **#2 — HW long_scoreboard+barrier analog** |
+| no_valid_frontend | 4.23% | 5.49% | |
+| &nbsp;&nbsp;— `sm_idle_blocked_by_frontend_sbwait` (this Opt) | **3.99%** | **5.31%** | GATE metric — too small |
+| stall_count (fixed-latency dep) | 3.76% | 3.82% | |
+| fu_occupied (all pipes) | 2.10% | 2.84% | |
+| &nbsp;&nbsp;— tensor | 0.67% | 1.64% | matches WGMMA Step-0 |
+| next_stage | 1.78% | 2.12% | 1-deep latch backpressure |
+| tma_flush | 0.00% | 4.76% | bwd-only (UTMACMDFLUSH) |
+| inst_barrier / l1c / scoreboard / yield / result_queue | ≤0.3% | ≤0.4% | negligible |
+| none (unattributed) | 0.00% | 0.00% | full coverage ✓ |
+
+**Verdict:** frontend `sbwait` is only ~4–5% of SM-idle (vs the 14.8/15.6% per-subcore figure) →
+GATE fails, fix parked. **The real SM-idle drivers are `no_valid_other` (~11%) and `wait_barrier`
+(~10%).** `none = 0` confirms the decomposition accounts for all SM-idle.
+
+> Next target: **`no_valid_other`** — SM-idle where the head warp has no valid instruction but it
+> is NOT a stream-buffer wait (ibuffer empty / decode pending). This is a *different* frontend
+> stage (fetch→decode→ibuffer) than the prefetch send path, and has never been analyzed.
+
+> **Follow-up instrumentation added (for the NEXT run):** the current `no_valid_other` bit is too
+> coarse — it lumps ibuffer-empty / decode-pending / l0i-response-ready / unknown. Note the apparent
+> paradox: per-subcore counters say `head_invalid_waiting_frontend = 18.2%` with
+> `ibuffer_empty = 0.03%`, yet the SM-idle `no_valid_other` is ~10–11%. This is because on a true
+> SM-idle cycle different subcores can be in different no_valid sub-states and the SM-level OR
+> catches the non-frontend ones. To resolve it, the reason bitmask now splits `no_valid_other` into
+> `nv_ibuffer_empty`, `nv_decode_pending`, `nv_l0i_resp_ready`, `nv_unknown`
+> (`Subcore::STEP0_R_NV_*`, emitted as `sm_idle_reason_nv_*`). Run again (Step-0 flags on) to learn
+> which one actually dominates the #1 SM-idle bucket before designing a fix.
 
 > **This run must be PURE instrumentation (no fix in the same run).** All Step-0 counters are
 > observe-only (timing unchanged), so this run must reproduce the Opt-5 baseline cycle exactly —

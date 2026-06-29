@@ -108,6 +108,14 @@ class Subcore {
     STEP0_R_L1C                 = 1u << 12, // const cache
     STEP0_R_RESULT_QUEUE_FULL   = 1u << 13, // RF result-queue full
     STEP0_R_YIELD               = 1u << 14, // YIELD
+    // sub-reasons of NO_VALID_OTHER (head invalid but NOT waiting on the L1I frontend):
+    STEP0_R_NV_IBUFFER_EMPTY    = 1u << 15, // ibuffer empty (no fetched line to decode yet)
+    STEP0_R_NV_DECODE_PENDING   = 1u << 16, // line fetched, decode in flight
+    STEP0_R_NV_L0I_RESP_READY   = 1u << 17, // L0I response ready but not yet consumed
+    STEP0_R_NV_UNKNOWN          = 1u << 18, // unclassified invalid head
+    // sub-cause of NV_IBUFFER_EMPTY:
+    STEP0_R_NV_IBUF_FETCH_INFLIGHT  = 1u << 19, // fetch for next PC already in flight in L0I
+    STEP0_R_NV_IBUF_FETCH_NOT_ISSUED = 1u << 20, // no fetch issued yet (fetch scheduling behind)
   };
 
   // [WGMMA Opt6 Step-0] per-cycle issue outcome exported for SM-level (V) aggregation.

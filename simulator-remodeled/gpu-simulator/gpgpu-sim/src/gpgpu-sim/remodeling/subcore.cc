@@ -402,6 +402,10 @@ void Subcore::issue(SM *shared_sm) {
   bool is_any_invalid_head_waiting_frontend_hit_status = false;
   bool is_any_invalid_head_ibuffer_empty = false;
   bool is_any_invalid_head_unknown = false;
+  // [Step-0] sub-cause of ibuffer-empty: is the head PC's fetch already in flight in L0I
+  // (awaiting a response) or has no fetch been issued yet (fetch scheduling behind)?
+  bool is_any_invalid_head_ibuffer_empty_fetch_inflight = false;
+  bool is_any_invalid_head_ibuffer_empty_fetch_not_issued = false;
   // Per-reason "no_warps_ready" stall attribution. Each flag becomes true if, in
   // this cycle, at least one warp with a valid head instruction was blocked for
   // that reason. Reasons are grouped so they can be compared against NCU's
@@ -451,6 +455,27 @@ void Subcore::issue(SM *shared_sm) {
         IBuffer_Remodeled *ibuffer = c_warp->get_IBuffer_remodeled();
         if (ibuffer->get_is_empty()) {
           is_any_invalid_head_ibuffer_empty = true;
+          // [Step-0] classify ibuffer-empty: is a fetch for this warp's next PC already
+          // in flight in L0I (awaiting response), or has no fetch been issued yet?
+          if (m_config->wgmma_step0_instrument_enable ||
+              m_config->l1i_frontend_step0_instrument_enable) {
+            address_type empty_local_pc =
+                m_config->is_trace_mode
+                    ? static_cast<trace_shd_warp_t *>(c_warp)->get_pc()
+                    : c_warp->get_pc();
+            unsigned int empty_ufid =
+                c_warp->get_current_unique_function_id_call();
+            address_type empty_global_pc =
+                shared_sm->from_local_pc_to_global_pc_address(empty_local_pc,
+                                                              empty_ufid);
+            cache_request_status empty_status = RESERVATION_FAIL;
+            if (m_L0I->get_access_status_for_warp_pc(sm_warp_id, empty_global_pc,
+                                                     empty_status)) {
+              is_any_invalid_head_ibuffer_empty_fetch_inflight = true;
+            } else {
+              is_any_invalid_head_ibuffer_empty_fetch_not_issued = true;
+            }
+          }
           continue;
         }
 
@@ -744,6 +769,14 @@ void Subcore::issue(SM *shared_sm) {
         if(is_any_invalid_head_waiting_frontend) mask |= STEP0_R_NO_VALID_FRONTEND;
         if(is_any_invalid_head_waiting_frontend_in_l0i_response_queue_stream_buffer_wait) mask |= STEP0_R_NO_VALID_SBWAIT;
         if(!is_any_invalid_head_waiting_frontend) mask |= STEP0_R_NO_VALID_OTHER;
+        // Sub-reasons of the "no_valid but NOT frontend-wait" case, so the SM-idle decomposition
+        // can tell ibuffer-empty (fetch behind) from decode-pending from response-ready.
+        if(is_any_invalid_head_ibuffer_empty)       mask |= STEP0_R_NV_IBUFFER_EMPTY;
+        if(is_any_invalid_head_ibuffer_empty_fetch_inflight)   mask |= STEP0_R_NV_IBUF_FETCH_INFLIGHT;
+        if(is_any_invalid_head_ibuffer_empty_fetch_not_issued) mask |= STEP0_R_NV_IBUF_FETCH_NOT_ISSUED;
+        if(is_any_invalid_head_decode_pending)      mask |= STEP0_R_NV_DECODE_PENDING;
+        if(is_any_invalid_head_l0i_response_ready)  mask |= STEP0_R_NV_L0I_RESP_READY;
+        if(is_any_invalid_head_unknown)             mask |= STEP0_R_NV_UNKNOWN;
       } else { // no_warps_ready: overlapping per-reason flags
         if(is_any_waiting_in_fu_occupied)        mask |= STEP0_R_FU_OCCUPIED;
         if(is_any_fu_occupied_tensor)            mask |= STEP0_R_FU_OCCUPIED_TENSOR;

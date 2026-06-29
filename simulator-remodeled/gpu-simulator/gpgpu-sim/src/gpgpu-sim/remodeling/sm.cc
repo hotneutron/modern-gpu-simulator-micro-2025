@@ -579,6 +579,12 @@ void SM::cycle() {
       if (sm_idle_reason_or & Subcore::STEP0_R_NO_VALID_FRONTEND)  m_sm_stats.m_stats_map["total_num_cycles_sm_idle_reason_no_valid_frontend"]->increment_with_integer(1);
       if (sm_idle_reason_or & Subcore::STEP0_R_NO_VALID_SBWAIT)    m_sm_stats.m_stats_map["total_num_cycles_sm_idle_reason_no_valid_sbwait"]->increment_with_integer(1);
       if (sm_idle_reason_or & Subcore::STEP0_R_NO_VALID_OTHER)     m_sm_stats.m_stats_map["total_num_cycles_sm_idle_reason_no_valid_other"]->increment_with_integer(1);
+      if (sm_idle_reason_or & Subcore::STEP0_R_NV_IBUFFER_EMPTY)   m_sm_stats.m_stats_map["total_num_cycles_sm_idle_reason_nv_ibuffer_empty"]->increment_with_integer(1);
+      if (sm_idle_reason_or & Subcore::STEP0_R_NV_IBUF_FETCH_INFLIGHT)   m_sm_stats.m_stats_map["total_num_cycles_sm_idle_reason_nv_ibuf_fetch_inflight"]->increment_with_integer(1);
+      if (sm_idle_reason_or & Subcore::STEP0_R_NV_IBUF_FETCH_NOT_ISSUED) m_sm_stats.m_stats_map["total_num_cycles_sm_idle_reason_nv_ibuf_fetch_not_issued"]->increment_with_integer(1);
+      if (sm_idle_reason_or & Subcore::STEP0_R_NV_DECODE_PENDING)  m_sm_stats.m_stats_map["total_num_cycles_sm_idle_reason_nv_decode_pending"]->increment_with_integer(1);
+      if (sm_idle_reason_or & Subcore::STEP0_R_NV_L0I_RESP_READY)  m_sm_stats.m_stats_map["total_num_cycles_sm_idle_reason_nv_l0i_resp_ready"]->increment_with_integer(1);
+      if (sm_idle_reason_or & Subcore::STEP0_R_NV_UNKNOWN)         m_sm_stats.m_stats_map["total_num_cycles_sm_idle_reason_nv_unknown"]->increment_with_integer(1);
       if (sm_idle_reason_or & Subcore::STEP0_R_FU_OCCUPIED)        m_sm_stats.m_stats_map["total_num_cycles_sm_idle_reason_fu_occupied"]->increment_with_integer(1);
       if (sm_idle_reason_or & Subcore::STEP0_R_FU_OCCUPIED_TENSOR) m_sm_stats.m_stats_map["total_num_cycles_sm_idle_reason_fu_occupied_tensor"]->increment_with_integer(1);
       if (sm_idle_reason_or & Subcore::STEP0_R_INST_BARRIER)       m_sm_stats.m_stats_map["total_num_cycles_sm_idle_reason_inst_barrier"]->increment_with_integer(1);

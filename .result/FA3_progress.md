@@ -31,8 +31,8 @@ To keep this file easy to extend, use the following update pattern whenever a ne
 | Opt 2 | BAR implementation | `OP_BAR` handling + barrier engine fix + warp-exit drain fix | 162,582 cycles (2.40x vs HW, -26% vs Opt 1). Run exits cleanly. | 328,643 cycles (2.47x vs HW, -9.1% vs Opt 1). Run exits cleanly. | Done |
 | Opt 3 | MEMBAR Scope-Aware Fix | Scope-aware memory fence (CTA/GPU level) | 158,990 cycles (2.35x vs HW, -2.2% vs Opt 2). Run exits cleanly and `inst_barrier` nearly disappears. | 259,456 cycles (1.95x vs HW, -21.1% vs Opt 2). Run exits cleanly. | Done |
 | Opt 4 | Prefetch (deeper stream buffer) | `-prefetch_per_stream_buffer_size 1 -> 4` (deeper stream buffer, config-only) | 155,765 cycles (2.30x vs HW, -2.0% vs Opt 3) | 241,528 cycles (1.82x vs HW, -6.9% vs Opt 3) | Done |
-| Opt 5 | L1I eager-promote | Promote a ready prefetched line into L1I as soon as it is filled in the stream buffer, without waiting for a demand and without an L0I response (code change, on top of Opt 4 sb=4) | 150,755 cycles (2.23x vs HW, -3.2% vs Opt 4, -5.2% vs Opt 3) | 242,270 cycles (1.82x vs HW, +0.3% vs Opt 4). SIGSEGV at teardown only (after all stats dumped), so the cycle is trustworthy; a fix + re-run is in progress. | Fwd done; bwd numbers preliminary (re-running) |
-| Opt 6 | L1I frontend `stream_buffer_wait` (prefetch send-bandwidth) | Real cause is the L0→L1 prefetch send port (`m_memport` = single per-SM L0_icnt, `max_request_allowed_to_L1I 1`, shared by 4 subcores' demand+prefetch+const): `prefetch_blocked_memport_full 1.9M > prefetch_issued 1.1M`, and `head_demand_arrived_after_ready = 0` despite 521-cyc prefetch lead. (Earlier "lookahead=1" diagnosis was wrong — do_prefetch already fills ~4 lines.) See [L1I_PREFETCH_LOOKAHEAD_H100.md](file:///home/jihyun/modern-gpu-simulator-micro-2025/.plan/L1I_PREFETCH_LOOKAHEAD_H100.md). | — | — | Step-0 GATE first: added `sm_idle_blocked_by_frontend_sbwait` (behind `-wgmma_step0_instrument_enable`) to check the per-subcore 14.8/15.6% at SM level before fixing — avoids the WGMMA per-subcore over-estimate trap. |
+| Opt 5 | L1I eager-promote | Promote a ready prefetched line into L1I as soon as it is filled in the stream buffer, without waiting for a demand and without an L0I response (code change, on top of Opt 4 sb=4) | 149,727 cycles (2.21x vs HW, -3.4% vs Opt 4). From the clean-exit Step-0 instrumentation run (fwd `.o20`); Step-0 counters are timing-neutral. | 241,425 cycles (1.82x vs HW, -0.04% vs Opt 4). From the clean-exit Step-0 run (bwd `.o3`); supersedes the earlier 242,270 figure that hit a teardown SIGSEGV. | Done (cycles from clean-exit `.o20`/`.o3`) |
+| Opt 6 | L1I frontend `stream_buffer_wait` (prefetch send-bandwidth) | Real cause is the L0→L1 prefetch send port (`m_memport` = single per-SM L0_icnt, `max_request_allowed_to_L1I 1`, shared by 4 subcores' demand+prefetch+const): `prefetch_blocked_memport_full 1.9M > prefetch_issued 1.1M`, and `head_demand_arrived_after_ready = 0` despite 521-cyc prefetch lead. (Earlier "lookahead=1" diagnosis was wrong — do_prefetch already fills ~4 lines.) See [L1I_PREFETCH_LOOKAHEAD_H100.md](file:///home/jihyun/modern-gpu-simulator-micro-2025/.plan/L1I_PREFETCH_LOOKAHEAD_H100.md). | — | — | **Deferred — GATE failed.** SM-idle decomposition (fwd `.o20` / bwd `.o3`) shows `sm_idle_blocked_by_frontend_sbwait` is only **3.99% (fwd) / 5.31% (bwd)** of cycles (per-subcore 14.8/15.6% shrank ~3x at SM level — WGMMA-style mirage). Real SM-idle drivers: **`no_valid_other` ~11% (#1)** and **`wait_barrier` ~10% (#2)**. Next: re-run with `no_valid_other` split into nv_ibuffer_empty/decode_pending/l0i_resp_ready/unknown to find the true #1 cause. |
 
 ### Simulator Cycle Breakdown
 
@@ -40,12 +40,12 @@ To keep this file easy to extend, use the following update pattern whenever a ne
 
 | Class | Init | Opt 1 (`rop=100`) | Opt 2 (BAR impl) | Opt 3 (MEMBAR) | Opt 4 (prefetch, sb=4) | Opt 5 (eager-promote) | Note |
 |---|---|---|---|---|---|---|---|
-| `sim_cycle` | — | 220,024 | 162,582 | 158,990 | 155,765 | 150,755 | Opt 4 = `.o16` (sb=4 only); Opt 5 = `.o18` (sb=4 + eager-promote). |
-| `no_warps_ready` | — | 64.02% | 23.83% | 20.98% | 26.81% | 27.82% | Now the dominant class; frontend is no longer #1. |
-| `issuing` | — | 14.56% | 21.17% | 24.05% | 31.18% | 31.36% | Roughly flat vs Opt 4. |
-| `next_stage_not_available` | — | 11.40% | 15.25% | 17.26% | 22.45% | 22.58% | Downstream pipes; roughly flat vs Opt 4. |
-| `no_valid_instruction` | — | 9.52% | 39.12% | 37.01% | 18.63% | 17.32% | Frontend drops a bit further with eager-promote. |
-| `issue_port_busy` | — | 0.50% | 0.63% | 0.71% | 0.92% | 0.92% | Present in `.o18`. |
+| `sim_cycle` | — | 220,024 | 162,582 | 158,990 | 155,765 | 149,727 | Opt 4 = `.o16` (sb=4 only); Opt 5 = `.o20` (sb=4 + eager-promote, clean-exit Step-0 run). |
+| `no_warps_ready` | — | 64.02% | 23.83% | 20.98% | 26.81% | 27.32% | Now the dominant class; frontend is no longer #1. |
+| `issuing` | — | 14.56% | 21.17% | 24.05% | 31.18% | 31.19% | Roughly flat vs Opt 4. |
+| `next_stage_not_available` | — | 11.40% | 15.25% | 17.26% | 22.45% | 22.46% | Downstream pipes; roughly flat vs Opt 4. |
+| `no_valid_instruction` | — | 9.52% | 39.12% | 37.01% | 18.63% | 18.11% | Frontend drops a bit further with eager-promote. |
+| `issue_port_busy` | — | 0.50% | 0.63% | 0.71% | 0.92% | 0.92% | Present in `.o20`. |
 | `sum` | — | 100.00% | 100.00% | 100.00% | 100.00% | 100.00% | |
 
 #### FA3 fwd - inner stall / wait breakdown
@@ -53,16 +53,16 @@ To keep this file easy to extend, use the following update pattern whenever a ne
 | Wait reason | Init | Opt 1 (`rop=100`) | Opt 2 (BAR impl) | Opt 3 (MEMBAR) | Opt 4 (prefetch, sb=4) | Opt 5 (eager-promote) | Note |
 |---|---|---|---|---|---|---|---|
 | `inst_barrier` | — | 56.09% | 9.09% | 0.05% | 0.07% | 0.07% | Negligible. |
-| `wait_barrier` | — | 6.64% | 8.07% | 9.01% | 11.98% | 12.97% | mbarrier-style wait. |
-| `tma_axis` | — | 62.73% | 17.16% | 9.06% | 12.05% | 13.04% | Grouped TMA-side stall share. See note [1] below. |
-| `non_tma_axis` | — | 17.80% | 17.34% | 19.07% | 24.10% | 24.25% | Execution/resource-side waits. |
-| `fu_occupied` | — | 11.83% | 9.91% | 10.91% | 13.53% | 13.60% | Present in `.o18`. |
-| `stall_count` | — | 5.00% | 5.97% | 6.56% | 8.47% | 8.53% | Present in `.o18`. |
-| `tma_flush` | — | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | Present in `.o18`. |
-| `yield` | — | 0.92% | 1.21% | 1.30% | 1.69% | 1.71% | Present in `.o18`. |
-| `result_queue_full` | — | 0.05% | 0.25% | 0.29% | 0.40% | 0.41% | Present in `.o18`. |
-| `l1c` | — | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | Present in `.o18`. |
-| `scoreboard (memory)` | — | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | Present in `.o18`. |
+| `wait_barrier` | — | 6.64% | 8.07% | 9.01% | 11.98% | 12.58% | mbarrier-style wait. |
+| `tma_axis` | — | 62.73% | 17.16% | 9.06% | 12.05% | 12.65% | Grouped TMA-side stall share. See note [1] below. |
+| `non_tma_axis` | — | 17.80% | 17.34% | 19.07% | 24.10% | 24.07% | Execution/resource-side waits. |
+| `fu_occupied` | — | 11.83% | 9.91% | 10.91% | 13.53% | 13.50% | Present in `.o20`. |
+| `stall_count` | — | 5.00% | 5.97% | 6.56% | 8.47% | 8.48% | Present in `.o20`. |
+| `tma_flush` | — | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | Present in `.o20`. |
+| `yield` | — | 0.92% | 1.21% | 1.30% | 1.69% | 1.69% | Present in `.o20`. |
+| `result_queue_full` | — | 0.05% | 0.25% | 0.29% | 0.40% | 0.40% | Present in `.o20`. |
+| `l1c` | — | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | Present in `.o20`. |
+| `scoreboard (memory)` | — | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | Present in `.o20`. |
 
 > **[1] On the Opt 1 `tma_axis = 62.73%`.** This is a correctly-recorded value, not an input error. `tma_axis` is the grouped sum `wait_barrier + inst_barrier + tma_flush`, and the **same formula is applied in every column** (e.g. Opt 1: 6.64+56.09+0.00=62.73; Opt 2: 8.07+9.09+0.00=17.16) — it is not split differently between columns. Opt 1 only looks large because the pre-BAR-fix `inst_barrier` (56.09%) is folded in; that is not a real TMA cost. It collapses to 17.16% in Opt 2 purely because `inst_barrier` itself drops (56.09% -> 9.09%) after the BAR implementation. The HW TMA axis is ~23.8%, so the Opt 1 value is an over-attribution driven by the unfixed barrier model.
 
@@ -70,28 +70,28 @@ To keep this file easy to extend, use the following update pattern whenever a ne
 
 | Class | Init | Opt 1 (`rop=100`) | Opt 2 (BAR impl) | Opt 3 (MEMBAR) | Opt 4 (prefetch, sb=4) | Opt 5 (eager-promote) | Note |
 |---|---|---|---|---|---|---|---|
-| `sim_cycle` | 376,735 | 361,760 | 328,643 | 259,456 | 241,528 | 242,270 | Opt 4 = `.o1` (sb=4 only); Opt 5 = `.o320` (sb=4 + eager-promote). Opt 5 SIGSEGV at teardown only (stats already dumped); see note [4]. |
-| `no_warps_ready` | 66.40% | 66.64% | 58.27% | 29.80% | 36.56% | 36.30% | Init from `.o304` (rop=211); frontend pressure drops in Opt 4, but more cycles shift into wait/resource buckets. |
-| `issuing` | 12.12% | 12.71% | 14.06% | 20.93% | 26.18% | 25.65% | Init from `.o304`. |
-| `next_stage_not_available` | 10.17% | 10.69% | 11.41% | 15.11% | 18.96% | 18.53% | downstream pipe back-pressure |
-| `no_valid_instruction` | 10.37% | 8.96% | 15.02% | 33.59% | 17.59% | 18.83% | Frontend / L0I miss pressure drops sharply with the deeper stream buffer. |
-| `issue_port_busy` | 0.95% | 1.01% | 1.24% | 0.57% | 0.71% | 0.69% | |
+| `sim_cycle` | 376,735 | 361,760 | 328,643 | 259,456 | 241,528 | 241,425 | Opt 4 = `.o1` (sb=4 only); Opt 5 = `.o3` (sb=4 + eager-promote, clean-exit Step-0 run; supersedes the earlier `.o320` 242,270 that hit a teardown SIGSEGV — see note [4]). |
+| `no_warps_ready` | 66.40% | 66.64% | 58.27% | 29.80% | 36.56% | 36.45% | Init from `.o304` (rop=211); frontend pressure drops in Opt 4, but more cycles shift into wait/resource buckets. |
+| `issuing` | 12.12% | 12.71% | 14.06% | 20.93% | 26.18% | 25.70% | Init from `.o304`. |
+| `next_stage_not_available` | 10.17% | 10.69% | 11.41% | 15.11% | 18.96% | 18.52% | downstream pipe back-pressure |
+| `no_valid_instruction` | 10.37% | 8.96% | 15.02% | 33.59% | 17.59% | 18.63% | Frontend / L0I miss pressure drops sharply with the deeper stream buffer. |
+| `issue_port_busy` | 0.95% | 1.01% | 1.24% | 0.57% | 0.71% | 0.70% | |
 | `sum` | 100.00% | 100.00% | 100.00% | 100.00% | 100.00% | 100.00% | Init columns sum to ~100% after rounding. |
 
 #### FA3 bwd - inner stall / wait breakdown
 
 | Wait reason | Init | Opt 1 (`rop=100`) | Opt 2 (BAR impl) | Opt 3 (MEMBAR) | Opt 4 (prefetch, sb=4) | Opt 5 (eager-promote) | Note |
 |---|---|---|---|---|---|---|---|
-| `inst_barrier` | — | 58.47% / 87.70% of `no_warps_ready` | 44.78% / 76.84% of `no_warps_ready` | 1.01% / 3.40% of `no_warps_ready` | 1.30% / 3.57% of `no_warps_ready` | 1.28% | Remains low after the MEMBAR fix; Opt 4 does not reintroduce the old barrier artifact. |
-| `tma_axis` | — | 67.28% / 90.90% of `no_warps_ready` | 58.09% | 17.13% / 57.49% of `no_warps_ready` | 21.96% / 60.06% of `no_warps_ready` | 22.07% | Opt 1 computed, not emitted; see note [2]. |
-| `non_tma_axis` | — | 16.40% / 24.50% of `no_warps_ready` | 18.08% | 21.99% / 73.79% of `no_warps_ready` | 27.15% / 74.25% of `no_warps_ready` | 26.64% | Opt 1 computed, not emitted; see note [2]. |
+| `inst_barrier` | — | 58.47% / 87.70% of `no_warps_ready` | 44.78% / 76.84% of `no_warps_ready` | 1.01% / 3.40% of `no_warps_ready` | 1.30% / 3.57% of `no_warps_ready` | 1.26% | Remains low after the MEMBAR fix; Opt 4 does not reintroduce the old barrier artifact. |
+| `tma_axis` | — | 67.28% / 90.90% of `no_warps_ready` | 58.09% | 17.13% / 57.49% of `no_warps_ready` | 21.96% / 60.06% of `no_warps_ready` | 22.17% | Opt 1 computed, not emitted; see note [2]. |
+| `non_tma_axis` | — | 16.40% / 24.50% of `no_warps_ready` | 18.08% | 21.99% / 73.79% of `no_warps_ready` | 27.15% / 74.25% of `no_warps_ready` | 26.66% | Opt 1 computed, not emitted; see note [2]. |
 | `fu_occupied` | — | 11.55% / 17.30% of `no_warps_ready` | 12.63% | 14.67% / 49.21% of `no_warps_ready` | 18.09% / 49.47% of `no_warps_ready` | 17.75% | function-unit busy |
-| `wait_barrier` | — | 7.98% / 12.00% of `no_warps_ready` | 8.62% | 11.76% / 39.46% of `no_warps_ready` | 14.66% / 40.12% of `no_warps_ready` | 14.80% | `DEPBAR` (SB phase wait = TMA mbarrier) |
-| `stall_count` | — | 4.11% / 6.20% of `no_warps_ready` | 4.63% | 6.18% / 20.73% of `no_warps_ready` | 7.55% / 20.65% of `no_warps_ready` | 7.39% | explicit stall cycles |
-| `tma_flush` | — | 0.83% / 1.20% of `no_warps_ready` | 4.69% | 4.36% / 14.62% of `no_warps_ready` | 5.99% / 16.38% of `no_warps_ready` | 5.99% | `UTMACMDFLUSH` |
+| `wait_barrier` | — | 7.98% / 12.00% of `no_warps_ready` | 8.62% | 11.76% / 39.46% of `no_warps_ready` | 14.66% / 40.12% of `no_warps_ready` | 14.71% | `DEPBAR` (SB phase wait = TMA mbarrier) |
+| `stall_count` | — | 4.11% / 6.20% of `no_warps_ready` | 4.63% | 6.18% / 20.73% of `no_warps_ready` | 7.55% / 20.65% of `no_warps_ready` | 7.40% | explicit stall cycles |
+| `tma_flush` | — | 0.83% / 1.20% of `no_warps_ready` | 4.69% | 4.36% / 14.62% of `no_warps_ready` | 5.99% / 16.38% of `no_warps_ready` | 6.20% | `UTMACMDFLUSH` |
 | `yield` | — | 0.68% / 1.00% of `no_warps_ready` | 0.76% | 1.02% / 3.41% of `no_warps_ready` | 1.26% / 3.45% of `no_warps_ready` | 1.23% | `YIELD` |
 | `result_queue_full` | — | 0.03% / — | 0.03% | 0.09% / 0.30% of `no_warps_ready` | 0.12% / 0.33% of `no_warps_ready` | 0.12% | fixed-latency result queue |
-| `l1c` | — | 0.03% / — | 0.03% | 0.04% / 0.14% of `no_warps_ready` | 0.13% / 0.36% of `no_warps_ready` | 0.15% | L1 constant |
+| `l1c` | — | 0.03% / — | 0.03% | 0.04% / 0.14% of `no_warps_ready` | 0.13% / 0.36% of `no_warps_ready` | 0.16% | L1 constant |
 | `scoreboard (memory)` | — | 0.00% / 0.00% of `no_warps_ready` | 0.00% | 0.00% / 0.00% of `no_warps_ready` | 0.00% / 0.00% of `no_warps_ready` | 0.00% | traditional scoreboard (unused here) |
 
 > **[2] On the bwd Opt 1 `tma_axis` / `non_tma_axis`.** These were not emitted as single grouped counters in the Opt 1 run (`.o307`), so the cells are **computed** from the per-reason rows in the same column (the later runs emit them directly):
@@ -100,7 +100,7 @@ To keep this file easy to extend, use the following update pattern whenever a ne
 >
 > **[3] On the bwd `Init` column.** `sim_cycle` and the top-level breakdown are from the baseline `.o304` run (rop=211). The inner stall/wait per-reason counters were not yet implemented at the `Init` stage, so those cells remain `—` (no source value to report).
 >
-> **[4] On the bwd Opt 5 column (`.o320`).** The run is sb=4 + eager-promote. It does **not** end with `*** exit detected ***`; instead it raises `SIGSEGV` in the destructor chain (`gpgpu_sim::~gpgpu_sim()` -> `simt_core_cluster::~simt_core_cluster()` -> `SM::~SM()` -> `free()`) **after all simulation statistics were already printed** (the crash is the last line of the file). The simulation body therefore completed and the cycle/breakdown numbers above are trustworthy, but the clean-exit guarantee does not hold. eager-promote counters: `eager_promote_to_cache=985,114`, `demand_hit_later=365,853`, `skipped_fill_port_busy=32,540`, `skipped_has_waiter=0`, `demand_miss_after_promote=2,224`; L1I miss rate 0.1972. A fix for the teardown heap corruption (eager-promote stream-buffer ownership) plus added diagnostics is in place and a re-run is in progress; these numbers are preliminary until the clean re-run confirms them.
+> **[4] On the bwd Opt 5 column (`.o3`, clean-exit Step-0 run).** The run is sb=4 + eager-promote. It **exits cleanly** (`exit code 0`, no teardown SIGSEGV — the earlier `.o320` run's destructor heap-corruption crash is gone), so the cycle (241,425) and breakdown are fully trustworthy and this supersedes the preliminary 242,270. eager-promote counters: `eager_promote_to_cache=994,032`, `demand_hit_later=366,329`, `skipped_fill_port_busy=31,254`, `skipped_has_waiter=0`, `demand_miss_after_promote=0` (the prior `.o320` showed 2,224 here — the teardown fix also cleared the promote-then-miss artifact); L1I miss rate 0.1977. Step-0 instrumentation counters are timing-neutral, so this is a valid Opt-5 baseline.
 
 ### Deferred Opts
 
@@ -145,9 +145,9 @@ FA3 fwd
   - Note: `-prefetch_per_stream_buffer_size 4` only; clean exit. No eager-promote code in this run.
 
 - Opt 5 (L1I eager-promote, on top of sb=4)
-  - Stats run: `H100_80GB-OnlyKernel5/flashattn-fa3-bf16-bwd-causal-b1-s2048-hd64-nh24-flashattn_fa3_bf16_bwd_causal_b1_s2048_hd64_nh24___warmup_-63a73d452237.o18`
-  - Event / debug run: `H100_80GB-OnlyKernel5/flashattn-fa3-bf16-bwd-causal-b1-s2048-hd64-nh24-flashattn_fa3_bf16_bwd_causal_b1_s2048_hd64_nh24___warmup_-63a73d452237.e18`
-  - Note: `sb=4` + `-is_instruction_prefetch_eager_promote_enabled 1`; clean exit. `eager_promote_to_cache=663,598`, `demand_hit_later=266,752`, `demand_miss_after_promote=498` (all capacity eviction, gap>1k cycles; no immediate-miss = no real Risk A). L1I miss rate 0.6715 -> 0.3387.
+  - Stats run: `H100_80GB-OnlyKernel5/flashattn-fa3-bf16-bwd-causal-b1-s2048-hd64-nh24-flashattn_fa3_bf16_bwd_causal_b1_s2048_hd64_nh24___warmup_-63a73d452237.o20`
+  - Event / debug run: `H100_80GB-OnlyKernel5/flashattn-fa3-bf16-bwd-causal-b1-s2048-hd64-nh24-flashattn_fa3_bf16_bwd_causal_b1_s2048_hd64_nh24___warmup_-63a73d452237.e20`
+  - Note: `sb=4` + `-is_instruction_prefetch_eager_promote_enabled 1`; clean-exit Step-0 instrumentation run (Step-0 counters are timing-neutral). `eager_promote_to_cache=662,658`, `demand_hit_later=252,212`, `demand_miss_after_promote=0` (no Risk A). L1I miss rate 0.3574. Supersedes the earlier `.o18` (150,755).
 
 FA3 bwd
 
@@ -176,10 +176,10 @@ FA3 bwd
   - Event / debug run: `H100_80GB-OnlyKernel10/flashattn-fa3-bf16-bwd-causal-b1-s2048-hd64-nh24-flashattn_fa3_bf16_bwd_causal_b1_s2048_hd64_nh24___warmup_-63a73d452237.e1`
   - Note: `-prefetch_per_stream_buffer_size 4` only; clean exit. Final cycle = `241,528`. No eager-promote counters or `[L1IPFDBG]` logs are present, so this run does NOT include the eager-promote path. `head_demand_arrived_after_ready` remains `0`.
 
-- Opt 5 (L1I eager-promote, on top of sb=4) — preliminary, re-running
-  - Stats run: `H100_80GB-OnlyKernel10/flashattn-fa3-bf16-bwd-causal-b1-s2048-hd64-nh24-flashattn_fa3_bf16_bwd_causal_b1_s2048_hd64_nh24___warmup_-8911b3eea0c2.o320`
-  - Event / debug run: `H100_80GB-OnlyKernel10/flashattn-fa3-bf16-bwd-causal-b1-s2048-hd64-nh24-flashattn_fa3_bf16_bwd_causal_b1_s2048_hd64_nh24___warmup_-8911b3eea0c2.e320`
-  - Note: `sb=4` + `-is_instruction_prefetch_eager_promote_enabled 1`. Final cycle = `242,270` (+0.3% vs Opt 4 `.o1`). **NOT a clean exit**: `SIGSEGV` in the teardown destructor chain after all stats were dumped (see note [4]), so the cycle is trustworthy but the run did not exit cleanly. `eager_promote_to_cache=985,114`, `demand_hit_later=365,853`, `skipped_fill_port_busy=32,540`, `skipped_has_waiter=0`, `demand_miss_after_promote=2,224`; L1I miss rate 0.1972. Teardown-heap-corruption fix + diagnostics applied; re-run in progress.
+- Opt 5 (L1I eager-promote, on top of sb=4)
+  - Stats run: `H100_80GB-OnlyKernel10/flashattn-fa3-bf16-bwd-causal-b1-s2048-hd64-nh24-flashattn_fa3_bf16_bwd_causal_b1_s2048_hd64_nh24___warmup_-63a73d452237.o3`
+  - Event / debug run: `H100_80GB-OnlyKernel10/flashattn-fa3-bf16-bwd-causal-b1-s2048-hd64-nh24-flashattn_fa3_bf16_bwd_causal_b1_s2048_hd64_nh24___warmup_-63a73d452237.e3`
+  - Note: `sb=4` + `-is_instruction_prefetch_eager_promote_enabled 1`; **clean-exit** Step-0 instrumentation run (`exit 0`, the teardown SIGSEGV is fixed; Step-0 counters are timing-neutral). Final cycle = `241,425` (-0.04% vs Opt 4 `.o1`). `eager_promote_to_cache=994,032`, `demand_hit_later=366,329`, `skipped_fill_port_busy=31,254`, `skipped_has_waiter=0`, `demand_miss_after_promote=0`; L1I miss rate 0.1977. Supersedes the earlier `.o320` (242,270, teardown SIGSEGV).
 
 ## 2. Optimization Details
 
@@ -403,14 +403,14 @@ HITs in L1I.
 
 #### Result
 
-- FA3 fwd (`.o18`, sb=4 + eager-promote): 155,765 -> **150,755 cycles** (**-3.2%** vs Opt 4, **-5.2%** vs Opt 3, **2.23x** vs HW). Clean exit, no deadlock.
-- The mechanism works as designed: `eager_promote_to_cache = 663,598`, `demand_hit_later = 266,752` (the success path that was impossible before), `skipped_fill_port_busy = 19,678` (port gating active), `skipped_has_waiter = 0`. **L1I miss rate halved: 0.6715 -> 0.3387.**
-- Frontend stall fell only modestly further: `no_valid_instruction` **18.63% -> 17.32%**, `prefetch_issued_not_ready` **7,141,887 -> 6,795,212 (-4.9%)**. The remaining bottleneck is no longer the frontend but `no_warps_ready = 27.82%` and execution-side waits (`non_tma_axis = 24.25%`, `fu_occupied = 13.60%`).
-- `demand_miss_after_promote = 498`. Investigation (promote->miss gap distribution: 86% over 1,000 cycles, 0 under 100 cycles; hot lines re-promoted up to 16x per SM) shows these are **capacity evictions**, not a correctness bug: the promoted line is evicted from L1I long before its next demand. **No real Risk A** (immediate miss = mshr mismatch) occurred. Note: the metric currently conflates "evicted before demand" with true immediate miss; see the metric-accuracy follow-up below.
-- The gain is smaller than expected. A dedicated re-analysis of why eager-promote yields only -3.2% (despite halving L1I miss rate) is tracked separately.
-- FA3 bwd (`.o320`, sb=4 + eager-promote): 241,528 -> **242,270 cycles** (**+0.3%** vs Opt 4, **1.82x** vs HW) — **preliminary**. Unlike fwd, eager-promote gives essentially no bwd cycle benefit here even though L1I miss rate drops. `eager_promote_to_cache = 985,114`, `demand_hit_later = 365,853`, `skipped_has_waiter = 0`, `demand_miss_after_promote = 2,224`.
-- The bwd run did **not** exit cleanly: it `SIGSEGV`ed in the teardown destructor chain (`gpgpu_sim::~gpgpu_sim()` -> `simt_core_cluster::~simt_core_cluster()` -> `SM::~SM()` -> `free()`) **after** all statistics were already printed, so the cycle is trustworthy but the clean-exit guarantee fails (fwd `.o18` was clean). Root cause was localized to the eager-promote stream-buffer ownership path: when `try_eager_promote_head()` removed a tracking entry while a prefetch response was still in flight, the later fill fell into the generic orphan path / `assert`, leaving the memory-fetch accounting inconsistent and corrupting the heap (only triggered by the bwd configuration's higher concurrent-prefetch pressure).
-- Fix applied (code, on top of Opt 5): `try_eager_promote_head()` now records dropped addresses in `m_eager_promoted_dropped_addrs`; `fill()` treats a later fill for such an address as a benign `[L1IPFDBG][sb-promoted-orphan-fill]` (new counter `total_num_l0i_stream_buffer_fill_eager_promoted_orphaned`) instead of re-driving the cache; and `send_to_cache()` / `has_ready_requested_head()` no longer `assert` on a missing head entry (new counter `total_num_l0i_stream_buffer_send_to_cache_head_missing_entry`, plus `[L1IPFDBG][sb-eager-drop]` logging). A clean re-run is in progress to confirm the bwd numbers.
+- FA3 fwd (`.o20`, sb=4 + eager-promote, clean-exit Step-0 run): 155,765 -> **149,727 cycles** (**-3.4%** vs Opt 4, **2.21x** vs HW). Clean exit, no deadlock. (Supersedes the earlier `.o18` 150,755; Step-0 instrumentation counters are timing-neutral.)
+- The mechanism works as designed: `eager_promote_to_cache = 662,658`, `demand_hit_later = 252,212` (the success path that was impossible before), `demand_miss_after_promote = 0`. **L1I miss rate 0.3574.**
+- Frontend stall fell only modestly further: `no_valid_instruction` **18.63% -> 18.11%**. The remaining bottleneck is no longer the frontend but `no_warps_ready = 27.32%` and execution-side waits (`non_tma_axis = 24.07%`, `fu_occupied = 13.50%`).
+- `demand_miss_after_promote = 0` in the clean-exit `.o20` run (the earlier `.o18` showed 498, all capacity evictions with gap>1k cycles — no real Risk A; the teardown fix also cleared that artifact). Note: the metric previously conflated "evicted before demand" with true immediate miss; see the metric-accuracy follow-up below.
+- The gain is smaller than expected. A dedicated re-analysis of why eager-promote yields only -3.4% (despite the L1I miss-rate drop) is tracked separately — and the subsequent Step-0 SM-idle decomposition showed the frontend is only ~4–5% of true SM-idle (see Deferred Opts), so further frontend work is not the lever.
+- FA3 bwd (`.o3`, sb=4 + eager-promote, clean-exit Step-0 run): 241,528 -> **241,425 cycles** (**-0.04%** vs Opt 4, **1.82x** vs HW). Unlike fwd, eager-promote gives essentially no bwd cycle benefit even though L1I miss rate drops. `eager_promote_to_cache = 994,032`, `demand_hit_later = 366,329`, `skipped_has_waiter = 0`, `demand_miss_after_promote = 0`; L1I miss rate 0.1977.
+- The bwd run now **exits cleanly** (`exit 0`). The earlier `.o320` run `SIGSEGV`ed in the teardown destructor chain (`gpgpu_sim::~gpgpu_sim()` -> `simt_core_cluster::~simt_core_cluster()` -> `SM::~SM()` -> `free()`) **after** all statistics were printed; root cause was the eager-promote stream-buffer ownership path: when `try_eager_promote_head()` removed a tracking entry while a prefetch response was still in flight, the later fill fell into the generic orphan path / `assert`, corrupting the heap (only triggered by the bwd configuration's higher concurrent-prefetch pressure).
+- Fix applied (code, on top of Opt 5): `try_eager_promote_head()` now records dropped addresses in `m_eager_promoted_dropped_addrs`; `fill()` treats a later fill for such an address as a benign `[L1IPFDBG][sb-promoted-orphan-fill]` (new counter `total_num_l0i_stream_buffer_fill_eager_promoted_orphaned`) instead of re-driving the cache; and `send_to_cache()` / `has_ready_requested_head()` no longer `assert` on a missing head entry (new counter `total_num_l0i_stream_buffer_send_to_cache_head_missing_entry`, plus `[L1IPFDBG][sb-eager-drop]` logging). The clean-exit `.o3` run confirms the fix.
 
 ##### Metric accuracy follow-up (planned)
 
