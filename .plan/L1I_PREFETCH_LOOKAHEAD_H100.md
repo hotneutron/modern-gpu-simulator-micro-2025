@@ -116,6 +116,42 @@ GATE fails, fix parked. **The real SM-idle drivers are `no_valid_other` (~11%) a
 > (`Subcore::STEP0_R_NV_*`, emitted as `sm_idle_reason_nv_*`). Run again (Step-0 flags on) to learn
 > which one actually dominates the #1 SM-idle bucket before designing a fix.
 
+### Step-0 FOLLOW-UP RESULT (`no_valid_other` split, fwd `.o23` / bwd `.o5`)
+
+The split run answers the open question from above: **`no_valid_other` is almost entirely
+`nv_ibuffer_empty`**, not decode / L0I-response latency.
+
+| reason | fwd `.o23` | bwd `.o5` | note |
+|---|---|---|---|
+| `sm_all_subcores_idle` | 18.6768% | 18.1723% | true SM-idle ceiling |
+| `sm_idle_reason_no_valid_other` | 12.2080% | 10.0735% | original coarse bucket |
+| `sm_idle_reason_nv_ibuffer_empty` | 12.2099% | 10.0777% | essentially all of `no_valid_other` |
+| `sm_idle_reason_nv_decode_pending` | 0.5831% | 0.5597% | small |
+| `sm_idle_reason_nv_l0i_resp_ready` | 0.0279% | 0.0237% | negligible |
+| `sm_idle_reason_nv_unknown` | 0.0000% | 0.0000% | full attribution |
+| `sm_idle_reason_nv_ibuf_fetch_inflight` | 0.0000% | 0.0000% | not a fetch-latency problem |
+| `sm_idle_reason_nv_ibuf_fetch_not_issued` | 0.0049% | 0.0043% | effectively zero |
+| `sm_idle_reason_wait_barrier` | 9.9623% | 10.9032% | still the other major bucket |
+
+**Interpretation.**
+
+- If `nv_ibuffer_empty` were a real fetch/decode bottleneck, we would expect a meaningful share of
+  `fetch_inflight` or `fetch_not_issued`. Instead both are ~0%.
+- Therefore the dominant `nv_ibuffer_empty` cycles are **not** "frontend cannot fetch the next
+  instruction fast enough". They are overwhelmingly **trace-exhausted / winding-down warps**:
+  a warp has no next instruction left to place into the ibuffer, while sibling warps / sibling CTAs
+  on the same SM are still alive, so the SM can still show up as idle on that cycle.
+- In other words, the apparent #1 SM-idle bucket is largely a **tail-drain / imbalance effect**, not
+  an actionable L1I fetch-path defect. The true frontend-fix leverage is therefore even smaller than
+  the already-failed `sm_idle_blocked_by_frontend_sbwait` gate suggested.
+
+**Updated verdict.** The Opt-6 frontend idea remains **deferred**. After the split, the remaining
+high-value targets are:
+
+- `wait_barrier` (~10-11%): real synchronization / arrival-side wait.
+- tail-drain / winding-down imbalance hidden inside `nv_ibuffer_empty` (~10-12%): likely compare
+  against HW imbalance/tail metrics before attempting any simulator-side fix.
+
 > **This run must be PURE instrumentation (no fix in the same run).** All Step-0 counters are
 > observe-only (timing unchanged), so this run must reproduce the Opt-5 baseline cycle exactly —
 > which makes it the clean baseline for the §4 A/B. Do **not** bump any bandwidth knob in this run:
@@ -175,4 +211,13 @@ its loop), `gpu-sim.cc` (register the new mid-queue knob).
 
 ## 6. Result
 
-— (Step-0 frontend-idle measurement pending; gate decision after the run) —
+- **Frontend GATE failed.** The true SM-level frontend share is only `sm_idle_blocked_by_frontend_sbwait
+  = 3.99%` (fwd `.o20`) / `5.31%` (bwd `.o3`), far below the per-subcore 14.8/15.6% figure.
+- The follow-up split shows the apparent #1 bucket `no_valid_other` is almost entirely
+  `nv_ibuffer_empty` (`12.21%` fwd / `10.08%` bwd), while its fetch sub-causes are ~0
+  (`fetch_inflight = 0`, `fetch_not_issued ~ 0.005%`).
+- So the dominant residual is **not** an L1I send / fetch / decode throughput problem. It is best
+  interpreted as **tail-drain / winding-down warp imbalance** during trace execution.
+- Practical conclusion: keep the send-bandwidth redesign parked for now; prioritize
+  `wait_barrier`-side analysis and compare the sim tail-drain interpretation against HW imbalance
+  metrics before reopening frontend work.

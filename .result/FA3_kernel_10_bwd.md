@@ -46,17 +46,19 @@ subcore on the SM issued) by the dominant blocking reason. This corrects per-sub
 
 | SM-idle reason | Opt 5 % | note |
 |---|---|---|
-| **no_valid_other** (ibuffer empty / decode / not stream-buffer) | **10.55%** | #1 — next target |
+| **no_valid_other** (ibuffer empty / decode / not stream-buffer) | **10.55%** | coarse bucket; follow-up split shows this is almost entirely `nv_ibuffer_empty` = tail-drain / winding-down warp imbalance |
 | **wait_barrier** (mbarrier / DEPBAR) | **11.09%** | #2 |
-| no_valid_frontend (incl. `sbwait` 5.31%) | 5.49% | the L1I prefetch send-bandwidth fix was deferred (only ~5% recoverable) |
+| no_valid_frontend (incl. `sbwait` 5.31%) | 5.49% | the L1I frontend send-bandwidth idea was deferred / parked (only ~5% recoverable) |
 | stall_count | 3.82% | |
 | tma_flush | 4.76% | bwd-only |
 | fu_occupied (tensor 1.64%) | 2.84% | WGMMA fix deferred (≤1.6% recoverable) |
 | next_stage | 2.12% | |
 
-> Two optimizations were investigated and **deferred** after this decomposition: the WGMMA
-> tensor-pipe `fu_occupied` fix (SM-level recoverable only ~1.6%) and the L1I prefetch
-> send-bandwidth fix (frontend only ~5% of SM-idle). The current next target is `no_valid_other`.
+> Follow-up split instrumentation resolved the old `no_valid_other` bucket: almost all of it is
+> `nv_ibuffer_empty`, while `nv_ibuf_fetch_inflight = 0` and `nv_ibuf_fetch_not_issued ~= 0`, so the
+> dominant residual is best interpreted as **tail-drain / winding-down warp imbalance**, not an
+> actionable frontend fetch bottleneck. The WGMMA idea and the L1I frontend send-bandwidth idea
+> therefore remain **deferred / parked**.
 
 ---
 

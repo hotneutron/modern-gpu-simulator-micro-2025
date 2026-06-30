@@ -45,16 +45,18 @@ subcore on the SM issued) by the dominant blocking reason:
 
 | SM-idle reason | Opt 5 % | note |
 |---|---|---|
-| **no_valid_other** (ibuffer empty / decode / not stream-buffer) | **11.90%** | #1 — next target |
+| **no_valid_other** (ibuffer empty / decode / not stream-buffer) | **11.90%** | coarse bucket; follow-up split shows this is almost entirely `nv_ibuffer_empty` = tail-drain / winding-down warp imbalance |
 | **wait_barrier** (mbarrier / DEPBAR) | **9.71%** | #2 |
-| no_valid_frontend (incl. `sbwait` 3.99%) | 4.23% | L1I prefetch send-bandwidth fix deferred (only ~4% recoverable) |
+| no_valid_frontend (incl. `sbwait` 3.99%) | 4.23% | L1I frontend send-bandwidth idea deferred / parked (only ~4% recoverable at true SM level) |
 | stall_count | 3.76% | |
 | fu_occupied (tensor 0.67%) | 2.10% | WGMMA fix deferred (≤0.7% recoverable) |
 | next_stage | 1.78% | |
 
-> Both the WGMMA tensor-pipe `fu_occupied` fix and the L1I prefetch send-bandwidth fix were
-> **deferred** after this decomposition (each recovers only a few % of true SM-idle). The current
-> next target is `no_valid_other`.
+> Follow-up split instrumentation resolved the old `no_valid_other` bucket: almost all of it is
+> `nv_ibuffer_empty`, while `nv_ibuf_fetch_inflight = 0` and `nv_ibuf_fetch_not_issued ~= 0`, so the
+> dominant residual is best interpreted as **tail-drain / winding-down warp imbalance**, not an
+> actionable frontend fetch bottleneck. Both the WGMMA idea and the L1I frontend send-bandwidth idea
+> therefore remain **deferred / parked**.
 
 ---
 
@@ -79,7 +81,7 @@ substantially.
 | **TMA-axis stall share** | ≈ 23.8% | **62.73%** | **17.16%** | inverted attribution removed |
 | non-TMA-axis stall share | ≈ 57.8% | 17.80% | 17.34% | still under-attributed |
 | `issuing` share | 13.9% | 14.56% | 21.17% | closer to HW |
-| `no_valid_instruction` (frontend) | ≈ 4.5% | 9.52% | 39.12% | **new dominant bucket (next target)** |
+| `no_valid_instruction` (frontend) | ≈ 4.5% | 9.52% | 39.12% | **new dominant bucket at this stage**; later Step-0 work showed only a small true SM-level frontend share |
 | shared-mem bank conflicts | 281 | 38,016 | 38,016 | untouched (separate model bug) |
 | run termination | — | abort (deadlock / teardown assert) | `*** exit detected ***` (12h38m) | **fixed** |
 
@@ -399,12 +401,13 @@ The re-enabled `no_warps_ready` sub-breakdown in `subcore.cc` produced the follo
 | 5 | WGMMA/tensor latency (`tensor_latency=32`) | HW `gmma` stall only 1.4%, tensor pipe 46% busy is *expected* for fwd | **DO NOT touch** |
 | 6 | shared bank-conflict model | sim 38,016 vs HW 281 — sim grossly over-counts; feeds `mio_throttle`/`short_scoreboard` non-TMA cost | investigate (small absolute vs barrier inflation) |
 
-### Highest-leverage change
-- Since `rop_latency=100` is already in effect and the gap persists, the next target is the
-  **TMA emission serialization (`kMaxRequestsPerCycle`)** and the **mbarrier-credit timing**, which
-  together drive the dominant `inst_barrier`/`wait_barrier` buckets (the 62.7% TMA axis). Use the
-  per-transfer TMA `lat_issue` / `lat_mem` log to decide whether emission serialization or memory
-  round-trip is the larger contributor before changing a knob.
+### Highest-leverage change at that stage
+- At the time of this section, with `rop_latency=100` already in effect and the gap still large,
+  the leading hypothesis was **TMA emission serialization (`kMaxRequestsPerCycle`)** plus
+  **mbarrier-credit timing**, because they appeared to drive the dominant
+  `inst_barrier`/`wait_barrier` buckets (the 62.7% TMA axis). Later work superseded this specific
+  prioritization: the barrier and MEMBAR fixes landed first, and the eventually investigated L1I
+  frontend path was also parked after Step-0 showed it was not a major true-SM bottleneck.
 - Unlike memory-bound kernels, the forward kernel's true bottleneck is the **xu (MUFU) + tensor**
   compute pipes; once the spurious barrier waits are removed, accuracy will hinge on the
   fixed-latency / scheduler (`wait`, `not_selected`, `dispatch`) modeling that the sim currently
