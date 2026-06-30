@@ -341,6 +341,12 @@ Partially exists via debug logs. Promote selected fields into summary:
 - `TMA_lat_total_mean/median/p90/max`
 - `TMA_lat_mem_mean/median/p90/max`
 - `TMA_lat_issue_mean/median/p90/max`
+- `TMA_lat_to_first_request_mean/median/p90/max`
+- `TMA_lat_emit_mean/median/p90/max`
+- `TMA_lat_drain_mean/median/p90/max`
+- `TMA_issue_active_cycles_mean`
+- `TMA_icnt_full_cycles_mean`
+- `TMA_requests_per_issue_active_cycle`
 - `TMA_icnt_backpressure_events`
 - load/store/reduce split
 

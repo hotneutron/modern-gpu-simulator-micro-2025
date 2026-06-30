@@ -80,6 +80,12 @@ class tma_unit_sm : public functional_unit_shared_sm_part {
   uint64_t m_stat_store_bytes_completed = 0;
   uint64_t m_stat_reduce_bytes_completed = 0;
   uint64_t m_stat_icnt_backpressure_events = 0;
+  uint64_t m_stat_timed_transfers = 0;
+  uint64_t m_stat_issue_active_cycles = 0;
+  uint64_t m_stat_icnt_full_cycles = 0;
+  uint64_t m_stat_to_first_request_cycles = 0;
+  uint64_t m_stat_emit_span_cycles = 0;
+  uint64_t m_stat_drain_cycles = 0;
 
   TMACommand build_tma_command(const warp_inst_t &inst) const;
   void enqueue_issued_commands();

@@ -614,6 +614,10 @@ void tma_unit_sm::mover_issue_requests(TMATransferEntry &entry,
   const uint32_t kSectorMfGoal =
       agu_request_goal * SECTOR_CHUNCK_SIZE * mfs_per_sector;
 
+  if (entry.requests_issued < kSectorMfGoal) {
+    ++entry.issue_active_cycles;
+  }
+
   uint32_t agu_requests_this_cycle = 0;
   while (entry.requests_issued < kSectorMfGoal &&
          agu_requests_this_cycle < kMaxRequestsPerCycle) {
@@ -652,6 +656,7 @@ void tma_unit_sm::mover_issue_requests(TMATransferEntry &entry,
       // write side of the interconnect.
       if (m_icnt->full(SECTOR_SIZE, /*write=*/this_mf_is_write)) {
         icnt_blocked = true;
+        ++entry.icnt_full_cycles;
         // Interconnect back-pressure: the transfer cannot drain its sector mfs
         // and will resume next cycle. This is a TMA-side stall source (feeds the
         // long_scoreboard axis); log once per transfer to keep it observable
@@ -688,6 +693,11 @@ void tma_unit_sm::mover_issue_requests(TMATransferEntry &entry,
           /*wid=*/(unsigned)-1, m_sm->get_sid(), m_sm->get_tpc_id(),
           /*original_mf=*/nullptr);
       mf->set_is_tma(true);
+
+      if (entry.cycle_first_request_issued < 0) {
+        entry.cycle_first_request_issued = current_cycle;
+      }
+      entry.cycle_last_request_issued = current_cycle;
 
       if (entry.requests_issued == 0) {
         m_sm->debug_log_tma_event(
@@ -777,6 +787,30 @@ void tma_unit_sm::mover_on_response(TMATransferEntry &entry, mem_fetch *mf,
     entry.state = TMATransferEntry::State::COMPLETED;
     entry.cycle_last_completion = current_cycle;
     ++m_stat_transfers_completed;
+    int cycle_first_request_issued = entry.cycle_first_request_issued;
+    if (cycle_first_request_issued < 0) {
+      cycle_first_request_issued = entry.cycle_first_request;
+    }
+    int cycle_last_request_issued = entry.cycle_last_request_issued;
+    if (cycle_last_request_issued < 0) {
+      cycle_last_request_issued = cycle_first_request_issued;
+    }
+    int lat_to_first_request = cycle_first_request_issued - entry.cycle_agu_ready;
+    int lat_emit = cycle_last_request_issued - cycle_first_request_issued;
+    int lat_drain = current_cycle - cycle_last_request_issued;
+    if (cycle_first_request_issued >= 0 && cycle_last_request_issued >= 0) {
+      ++m_stat_timed_transfers;
+      m_stat_issue_active_cycles += entry.issue_active_cycles;
+      m_stat_icnt_full_cycles += entry.icnt_full_cycles;
+      m_stat_to_first_request_cycles +=
+          lat_to_first_request > 0 ? lat_to_first_request : 0;
+      m_stat_emit_span_cycles += lat_emit > 0 ? lat_emit : 0;
+      m_stat_drain_cycles += lat_drain > 0 ? lat_drain : 0;
+    }
+    double requests_per_issue_active_cycle =
+        entry.issue_active_cycles
+            ? (double)entry.requests_issued / (double)entry.issue_active_cycles
+            : 0.0;
     m_sm->debug_log_tma_event(
         "complete uid=" + std::to_string(entry.transfer_uid) +
         " warp=" + std::to_string(entry.cmd.warp_id) +
@@ -797,6 +831,13 @@ void tma_unit_sm::mover_on_response(TMATransferEntry &entry, mem_fetch *mf,
         " lat_queue=" + std::to_string(entry.cycle_agu_ready - entry.cycle_enqueued) +
         " lat_issue=" + std::to_string(entry.cycle_first_request - entry.cycle_agu_ready) +
         " lat_mem=" + std::to_string(current_cycle - entry.cycle_first_request) +
+        " lat_to_first_request=" + std::to_string(lat_to_first_request) +
+        " lat_emit=" + std::to_string(lat_emit) +
+        " lat_drain=" + std::to_string(lat_drain) +
+        " issue_active_cycles=" + std::to_string(entry.issue_active_cycles) +
+        " icnt_full_cycles=" + std::to_string(entry.icnt_full_cycles) +
+        " requests_per_issue_active_cycle=" +
+        std::to_string(requests_per_issue_active_cycle) +
         " cycle=" + std::to_string(current_cycle));
     // Only real GMEM->SMEM loads (UTMALDG/UBLKCP) credit the Hopper mbarrier
     // transaction-count (complete_tx). Prefetch (UTMAPF/UBLKPF) also has
@@ -900,6 +941,31 @@ void tma_unit_sm::debug_dump_tma_counters() const {
           ? ((double)m_stat_reduce_bytes_issued / elapsed_seconds) /
                 1000000000.0
           : 0.0;
+  const double avg_issue_active_cycles =
+      m_stat_timed_transfers
+          ? (double)m_stat_issue_active_cycles / (double)m_stat_timed_transfers
+          : 0.0;
+  const double avg_icnt_full_cycles =
+      m_stat_timed_transfers
+          ? (double)m_stat_icnt_full_cycles / (double)m_stat_timed_transfers
+          : 0.0;
+  const double avg_to_first_request_cycles =
+      m_stat_timed_transfers
+          ? (double)m_stat_to_first_request_cycles /
+                (double)m_stat_timed_transfers
+          : 0.0;
+  const double avg_emit_span_cycles =
+      m_stat_timed_transfers
+          ? (double)m_stat_emit_span_cycles / (double)m_stat_timed_transfers
+          : 0.0;
+  const double avg_drain_cycles =
+      m_stat_timed_transfers
+          ? (double)m_stat_drain_cycles / (double)m_stat_timed_transfers
+          : 0.0;
+  const double avg_requests_per_issue_active_cycle =
+      m_stat_issue_active_cycles
+          ? (double)m_stat_requests_issued / (double)m_stat_issue_active_cycles
+          : 0.0;
   std::cerr << "[TMA][Phase3][Stats] sm=" << m_sm->get_sid()
             << " commands_issued=" << m_stat_commands_issued
             << " transfers_completed=" << m_stat_transfers_completed
@@ -919,5 +985,14 @@ void tma_unit_sm::debug_dump_tma_counters() const {
             << " BW_load_issued_GBps=" << load_issued_bw
             << " BW_store_issued_GBps=" << store_issued_bw
             << " BW_reduce_issued_GBps=" << reduce_issued_bw
+            << " timed_transfers=" << m_stat_timed_transfers
+            << " avg_issue_active_cycles=" << avg_issue_active_cycles
+            << " avg_icnt_full_cycles=" << avg_icnt_full_cycles
+            << " avg_to_first_request_cycles="
+            << avg_to_first_request_cycles
+            << " avg_emit_span_cycles=" << avg_emit_span_cycles
+            << " avg_drain_cycles=" << avg_drain_cycles
+            << " avg_requests_per_issue_active_cycle="
+            << avg_requests_per_issue_active_cycle
             << " (TMA traffic counted separately from L1/ldst)" << std::endl;
 }
