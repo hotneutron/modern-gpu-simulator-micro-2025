@@ -490,6 +490,7 @@ class gpgpu_sim_config : public power_config,
   }
   unsigned get_core_freq() const { return core_freq; }
   double get_core_period() const { return core_period; } // MOD. Energy
+  double get_icnt_period() const { return icnt_period; }
   double get_dram_period() const { return dram_period; } // MOD. Enegy
   int get_gpu_stat_sample_freq() const { return gpu_stat_sample_freq;}; // MOD. Energy
   unsigned num_shader() const { return m_shader_config.num_shader(); }

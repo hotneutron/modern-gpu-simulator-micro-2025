@@ -1893,7 +1893,7 @@ void shader_core_stats::print(FILE *fout) {
   m_incoming_traffic_stats->print(fout);
   double icnt_elapsed_seconds =
       (double)(m_gpu->gpu_tot_sim_cycle + m_gpu->gpu_sim_cycle) *
-      m_gpu->get_config().icnt_period;
+      m_gpu->get_config().get_icnt_period();
   m_outgoing_traffic_stats->print_bw(fout, icnt_elapsed_seconds);
   m_incoming_traffic_stats->print_bw(fout, icnt_elapsed_seconds);
 }
