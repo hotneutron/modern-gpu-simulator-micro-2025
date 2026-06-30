@@ -6,7 +6,7 @@ bandwidth, because current logs already expose the problem: `DRAM_BW_total`, `L2
 `L1D_BW_total` exist, but their meanings are mixed and they do not map cleanly to NCU summary
 metrics.
 
-## 1. Bandwidth Metrics
+## 1. Cache / Memory Metrics
 
 ### 1.1 NV - Simulator metrics mapping
 
@@ -88,12 +88,16 @@ Architecture / measurement context:
 - **Exact NCU metric name(s)**: CSV: `Memory Workload Analysis / L1/TEX Hit Rate`;
   raw/derived: `l1tex__t_sector_hit_rate.pct`.
 - **NV architecture version**: H100 / SM90a.
-- **Simulator metric**: existing `L1D_total_cache_miss_rate`, plus planned per-cache hit rates.
-- **Current status**: partial.
+- **Simulator metric**: existing `L1D_total_cache_miss_rate`, plus the implemented per-cache
+  granular breakdown `<cache>_total_cache_{hits,mshr_hits,full_misses,sector_misses,true_hit_rate}`
+  for L0I/L1I/L1D/L1C/L1T (see §6).
+- **Current status**: partial (granular per-status breakdown + `true_hit_rate` implemented for all
+  core caches; byte/throughput-side L1/TEX metrics still missing).
 - **Include in simulator summary?** Yes.
 - **Config needed?** No.
 - **Notes**: current FA3 TMA bypass means L1D accesses are tiny; must print this caveat in
-  analysis.
+  analysis. The granular fields fix a prior bug where `MSHR_HIT` was dropped and `MISS`/`SECTOR_MISS`
+  were merged (§6.1), which distorted any per-cache hit-rate derivation.
 
 #### L2 throughput, percent of peak
 
@@ -363,3 +367,58 @@ Known metrics to rename or fix:
 | `DRAM_BW_total` | Useful, but only total. No read/write/type/TMA split. | Add split metrics. |
 | `traffic_breakdown_*` | Raw byte totals only, no normalized BW. | Add GB/s normalized lines. |
 | NCU `Memory Throughput` comparison | Was sometimes compared directly to `DRAM_BW_total`. | Compare DRAM-to-DRAM and L1/L2/TMA-to-memory-side metrics separately. |
+| `<cache>_total_cache_misses` / `_miss_rate` (all caches via `cache_sub_stats`) | `cache_stats::get_sub_stats()` merged `MISS`+`SECTOR_MISS` into one `misses` field, counted only `HIT_RESERVED` as `pending_hits`, and dropped `MSHR_HIT` from every field (not in `accesses` or `misses`). Made it impossible to separate full vs sector misses, and silently lost MSHR-merged hits, distorting hit-rate math for L1/L2/L0I. | Added granular `hits`/`mshr_hits`/`full_misses`/`sector_misses` fields + `true_hit_rate`, populated at the single `get_sub_stats()` aggregation point and printed for every cache via `print_hit_breakdown()`. Legacy fields left untouched so existing numbers do not move (§6.1). |
+
+## 6. Implemented per-status cache metrics (done)
+
+These are already in the code tree (build/run validation still pending on a CUDA host). Both are
+timing-neutral observers — they only read existing per-status counters or tag classifications and
+do not change any scheduling/latency behavior.
+
+### 6.1 Generic per-status breakdown for every cache
+
+- **Problem fixed**: `cache_sub_stats` (the struct every cache aggregates through) collapsed the
+  `cache_request_status` enum: `misses = MISS + SECTOR_MISS`, `pending_hits = HIT_RESERVED` only,
+  and `MSHR_HIT` was counted **nowhere** (absent from `accesses`, `misses`, and `pending_hits`).
+- **New fields** (in [gpu-cache.h](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/gpu-cache.h#L1149-L1152) `struct cache_sub_stats`):
+  - `hits` ← `HIT`
+  - `mshr_hits` ← `MSHR_HIT` (previously dropped)
+  - `full_misses` ← `MISS`
+  - `sector_misses` ← `SECTOR_MISS`
+- **Populated** at the single aggregation point [cache_stats::get_sub_stats()](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/gpu-cache.cc#L1035-L1042); legacy
+  `accesses`/`misses`/`pending_hits`/`res_fails` are deliberately **unchanged** so historical
+  miss-rate numbers and the L2 gate do not silently shift.
+- **Printed** via `cache_sub_stats::print_hit_breakdown(fout, prefix)` for all core caches in
+  [shader.cc](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/shader.cc#L3527) (L0I, L1I, L1D, L1C, L1T) and for L2 in
+  [gpu-sim.cc](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/gpu-sim.cc#L3454).
+- **Output lines** (per cache `X` ∈ {L0I, L1I, L1D, L1C, L1T, L2}):
+  - `X_total_cache_hits`
+  - `X_total_cache_mshr_hits`
+  - `X_total_cache_full_misses`
+  - `X_total_cache_sector_misses`
+  - `X_total_cache_true_hit_rate` = `hits / accesses` (denominator = legacy `accesses` =
+    `HIT+MISS+SECTOR_MISS+HIT_RESERVED`, so it lines up with the existing `_miss_rate`).
+- **Caveat**: `mshr_hits` is outside the legacy `accesses` base, so it is reported raw (not folded
+  into `true_hit_rate`). If a future NCU correlation needs MSHR hits counted as hits, define a
+  separate rate rather than mutating `accesses`.
+- **Not touched**: the AerialVision per-window path `get_sub_stats_pw()` (time-series visualizer,
+  separate from summary hit-rate); left as-is by design.
+
+### 6.2 TMA-only L2 admission counters (Opt 6 Part-0)
+
+- **Why**: the generic `L2_total_cache_*` mixes TMA with normal LDG/STG, so it cannot attribute the
+  ADDR_MERGE synthetic-address RESERVATION_FAIL re-probe storm to TMA. These isolate `is_tma()`
+  requests at the L2 admission probe.
+- **Counted** per-sub-partition in [memory_sub_partition::cache_cycle()](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/l2cache.cc#L547-L565); members + getters in
+  [l2cache.h](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/l2cache.h#L261-L280); summed and printed in [gpu-sim.cc](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/gpu-sim.cc#L3455-L3481).
+- **Output lines**:
+  - `L2_TMA_hits` / `L2_TMA_true_hit_rate` — true HIT (genuine locality)
+  - `L2_TMA_pending_hits` / `L2_TMA_pending_hit_rate` — `HIT_RESERVED`/`MSHR_HIT`, i.e. merged onto
+    an in-flight miss (the cross-SM single-base collision fingerprint; **not** a free hit)
+  - `L2_TMA_misses` — `MISS`/`SECTOR_MISS` → DRAM
+  - `L2_TMA_reservation_fails` / `L2_TMA_res_fail_per_probe` — re-probe **cycles** (head-of-line
+    blocking from the synthetic-address hotspot), not distinct failing requests
+- **Decision gate** (vs HW L2 hit rate fwd 69.58% / bwd 82.26%): high `res_fail_per_probe` + hit
+  rate above HW ⇒ synthetic-address hotspot ⇒ **6B (address), not 6A**; low `res_fail_per_probe` ⇒
+  `lat_drain` is genuine memory latency, neither 6A nor 6B helps. Cross-referenced in
+  `.plan/TMA_LATENCY_INJECTION_H100.md` §2-C / §4.

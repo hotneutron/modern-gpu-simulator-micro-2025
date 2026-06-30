@@ -3416,6 +3416,10 @@ void gpgpu_sim::gpu_print_stat() {
     total_l2_css.clear();
 
     printf("\n========= L2 cache stats =========\n");
+    unsigned long long tma_l2_hits_total = 0;
+    unsigned long long tma_l2_pending_hits_total = 0;
+    unsigned long long tma_l2_misses_total = 0;
+    unsigned long long tma_l2_res_fails_total = 0;
     for (unsigned i = 0; i < m_memory_config->m_n_mem_sub_partition; i++) {
       m_memory_sub_partition[i]->accumulate_L2cache_stats(l2_stats);
       m_memory_sub_partition[i]->get_L2cache_sub_stats(l2_css);
@@ -3426,6 +3430,13 @@ void gpgpu_sim::gpu_print_stat() {
               i, l2_css.accesses, l2_css.misses,
               (double)l2_css.misses / (double)l2_css.accesses,
               l2_css.pending_hits, l2_css.res_fails);
+
+      tma_l2_hits_total += m_memory_sub_partition[i]->get_tma_l2_hits();
+      tma_l2_pending_hits_total +=
+          m_memory_sub_partition[i]->get_tma_l2_pending_hits();
+      tma_l2_misses_total += m_memory_sub_partition[i]->get_tma_l2_misses();
+      tma_l2_res_fails_total +=
+          m_memory_sub_partition[i]->get_tma_l2_res_fails();
 
       total_l2_css += l2_css;
     }
@@ -3440,6 +3451,35 @@ void gpgpu_sim::gpu_print_stat() {
       printf("L2_total_cache_pending_hits = %llu\n", total_l2_css.pending_hits);
       printf("L2_total_cache_reservation_fails = %llu\n",
              total_l2_css.res_fails);
+      total_l2_css.print_hit_breakdown(stdout, "L2_total_cache");
+      // Opt6 Part-0: TMA-only L2 admission breakdown. Unlike the aggregate
+      // figures above (which mix TMA with normal LDG/STG), these isolate the
+      // TMA contribution and split true hits from pending (merged-on-miss)
+      // hits. Pending hits are cross-SM reuse of an in-flight line, NOT free
+      // L2 hits, so they are reported separately to avoid the "single synthetic
+      // base => always L2 hit" illusion. res_fails counts re-probe cycles.
+      // Decision gate (vs HW L2 hit rate fwd 69.58% / bwd 82.26%):
+      //   * high res_fail_per_probe + high true hit rate -> synthetic-address
+      //     hotspot (6B address problem; 6A 128B emission cannot fix it)
+      //   * low res_fail_per_probe                       -> admission is not the
+      //     limiter; inspect lat_drain / genuine memory latency before any 6A.
+      {
+        unsigned long long tma_l2_probes = tma_l2_hits_total +
+                                           tma_l2_pending_hits_total +
+                                           tma_l2_misses_total;
+        printf("L2_TMA_hits = %llu\n", tma_l2_hits_total);
+        printf("L2_TMA_pending_hits = %llu\n", tma_l2_pending_hits_total);
+        printf("L2_TMA_misses = %llu\n", tma_l2_misses_total);
+        printf("L2_TMA_reservation_fails = %llu\n", tma_l2_res_fails_total);
+        if (tma_l2_probes > 0) {
+          printf("L2_TMA_true_hit_rate = %.4lf\n",
+                 (double)tma_l2_hits_total / (double)tma_l2_probes);
+          printf("L2_TMA_pending_hit_rate = %.4lf\n",
+                 (double)tma_l2_pending_hits_total / (double)tma_l2_probes);
+          printf("L2_TMA_res_fail_per_probe = %.4lf\n",
+                 (double)tma_l2_res_fails_total / (double)tma_l2_probes);
+        }
+      }
       double l2_elapsed_seconds =
           (double)(gpu_tot_sim_cycle + gpu_sim_cycle) * m_config.l2_period;
       double l2_bw_total =

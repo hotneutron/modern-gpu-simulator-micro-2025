@@ -3524,6 +3524,7 @@ void gpgpu_sim::shader_print_cache_stats(FILE *fout) const {
             total_css.pending_hits);
     fprintf(fout, "\tL0I_total_cache_reservation_fails = %llu\n",
             total_css.res_fails);
+    total_css.print_hit_breakdown(fout, "\tL0I_total_cache");
     fprintf(fout, "\tL0I_cache_port_available_cycles = %llu\n",
             total_css.port_available_cycles);
     fprintf(fout, "\tL0I_cache_data_port_busy_cycles = %llu\n",
@@ -3553,6 +3554,7 @@ void gpgpu_sim::shader_print_cache_stats(FILE *fout) const {
             total_css.pending_hits);
     fprintf(fout, "\tL1I_total_cache_reservation_fails = %llu\n",
             total_css.res_fails);
+    total_css.print_hit_breakdown(fout, "\tL1I_total_cache");
     fprintf(fout, "\tL1I_cache_port_available_cycles = %llu\n",
             total_css.port_available_cycles);
     fprintf(fout, "\tL1I_cache_data_port_busy_cycles = %llu\n",
@@ -3590,6 +3592,7 @@ void gpgpu_sim::shader_print_cache_stats(FILE *fout) const {
             total_css.pending_hits);
     fprintf(fout, "\tL1D_total_cache_reservation_fails = %llu\n",
             total_css.res_fails);
+    total_css.print_hit_breakdown(fout, "\tL1D_total_cache");
     print_cache_bw_stats(fout, "L1D_cache", total_css, core_elapsed_seconds);
     total_css.print_port_stats(fout, "\tL1D_cache");
   }
@@ -3613,6 +3616,7 @@ void gpgpu_sim::shader_print_cache_stats(FILE *fout) const {
             total_css.pending_hits);
     fprintf(fout, "\tL1C_total_cache_reservation_fails = %llu\n",
             total_css.res_fails);
+    total_css.print_hit_breakdown(fout, "\tL1C_total_cache");
     print_cache_bw_stats(fout, "L1C_cache", total_css, core_elapsed_seconds);
   }
 
@@ -3635,6 +3639,7 @@ void gpgpu_sim::shader_print_cache_stats(FILE *fout) const {
             total_css.pending_hits);
     fprintf(fout, "\tL1T_total_cache_reservation_fails = %llu\n",
             total_css.res_fails);
+    total_css.print_hit_breakdown(fout, "\tL1T_total_cache");
     print_cache_bw_stats(fout, "L1T_cache", total_css, core_elapsed_seconds);
   }
 }

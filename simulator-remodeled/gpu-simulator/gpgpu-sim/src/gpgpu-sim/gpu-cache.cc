@@ -1031,6 +1031,15 @@ void cache_stats::get_sub_stats(struct cache_sub_stats &css) const {
       if (status == HIT_RESERVED) t_css.pending_hits += m_stats[type][status];
 
       if (status == RESERVATION_FAIL) t_css.res_fails += m_stats[type][status];
+
+      // Granular per-status breakdown (does not alter the legacy fields above).
+      // This is where MISS/SECTOR_MISS are kept separate and MSHR_HIT — which
+      // is otherwise dropped from every legacy field — is finally counted.
+      if (status == HIT) t_css.hits += m_stats[type][status];
+      if (status == MSHR_HIT) t_css.mshr_hits += m_stats[type][status];
+      if (status == MISS) t_css.full_misses += m_stats[type][status];
+      if (status == SECTOR_MISS)
+        t_css.sector_misses += m_stats[type][status];
     }
   }
 
