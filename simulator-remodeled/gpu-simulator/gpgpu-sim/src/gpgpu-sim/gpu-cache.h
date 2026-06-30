@@ -1134,6 +1134,12 @@ struct cache_sub_stats {
   unsigned long long misses;
   unsigned long long pending_hits;
   unsigned long long res_fails;
+  unsigned long long bytes;
+  unsigned long long read_bytes;
+  unsigned long long write_bytes;
+  unsigned long long tma_bytes;
+  unsigned long long tma_read_bytes;
+  unsigned long long tma_write_bytes;
 
   unsigned long long port_available_cycles;
   unsigned long long data_port_busy_cycles;
@@ -1145,6 +1151,12 @@ struct cache_sub_stats {
     misses = 0;
     pending_hits = 0;
     res_fails = 0;
+    bytes = 0;
+    read_bytes = 0;
+    write_bytes = 0;
+    tma_bytes = 0;
+    tma_read_bytes = 0;
+    tma_write_bytes = 0;
     port_available_cycles = 0;
     data_port_busy_cycles = 0;
     fill_port_busy_cycles = 0;
@@ -1157,6 +1169,12 @@ struct cache_sub_stats {
     misses += css.misses;
     pending_hits += css.pending_hits;
     res_fails += css.res_fails;
+    bytes += css.bytes;
+    read_bytes += css.read_bytes;
+    write_bytes += css.write_bytes;
+    tma_bytes += css.tma_bytes;
+    tma_read_bytes += css.tma_read_bytes;
+    tma_write_bytes += css.tma_write_bytes;
     port_available_cycles += css.port_available_cycles;
     data_port_busy_cycles += css.data_port_busy_cycles;
     fill_port_busy_cycles += css.fill_port_busy_cycles;
@@ -1172,6 +1190,12 @@ struct cache_sub_stats {
     ret.misses = misses + cs.misses;
     ret.pending_hits = pending_hits + cs.pending_hits;
     ret.res_fails = res_fails + cs.res_fails;
+    ret.bytes = bytes + cs.bytes;
+    ret.read_bytes = read_bytes + cs.read_bytes;
+    ret.write_bytes = write_bytes + cs.write_bytes;
+    ret.tma_bytes = tma_bytes + cs.tma_bytes;
+    ret.tma_read_bytes = tma_read_bytes + cs.tma_read_bytes;
+    ret.tma_write_bytes = tma_write_bytes + cs.tma_write_bytes;
     ret.port_available_cycles =
         port_available_cycles + cs.port_available_cycles;
     ret.data_port_busy_cycles =
@@ -1252,6 +1276,8 @@ class cache_stats {
   // Clear AerialVision cache stats after each window
   void clear_pw();
   void inc_stats(int access_type, int access_outcome);
+  void inc_stats_bytes(int access_type, int access_outcome,
+                       unsigned long long bytes, bool is_write, bool is_tma);
   // Increment AerialVision cache stats
   void inc_stats_pw(int access_type, int access_outcome);
   void inc_fail_stats(int access_type, int fail_outcome);
@@ -1264,6 +1290,8 @@ class cache_stats {
   cache_stats operator+(const cache_stats &cs);
   cache_stats &operator+=(const cache_stats &cs);
   void print_stats(FILE *fout, const char *cache_name = "Cache_stats") const;
+  void print_byte_stats(FILE *fout,
+                        const char *cache_name = "Cache_byte_stats") const;
   void print_fail_stats(FILE *fout,
                         const char *cache_name = "Cache_fail_stats") const;
 
@@ -1287,6 +1315,12 @@ class cache_stats {
   bool check_fail_valid(int type, int fail) const;
 
   std::vector<std::vector<unsigned long long> > m_stats;
+  std::vector<std::vector<unsigned long long> > m_bytes;
+  std::vector<std::vector<unsigned long long> > m_read_bytes;
+  std::vector<std::vector<unsigned long long> > m_write_bytes;
+  std::vector<std::vector<unsigned long long> > m_tma_bytes;
+  std::vector<std::vector<unsigned long long> > m_tma_read_bytes;
+  std::vector<std::vector<unsigned long long> > m_tma_write_bytes;
   // AerialVision cache stats (per-window)
   std::vector<std::vector<unsigned long long> > m_stats_pw;
   std::vector<std::vector<unsigned long long> > m_fail_stats;

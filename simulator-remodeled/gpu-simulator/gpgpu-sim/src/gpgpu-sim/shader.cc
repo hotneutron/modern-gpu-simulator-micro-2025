@@ -1891,6 +1891,11 @@ void shader_core_stats::print(FILE *fout) {
   // Not paralel safe yet. Needs to be fixed
   m_outgoing_traffic_stats->print(fout);
   m_incoming_traffic_stats->print(fout);
+  double icnt_elapsed_seconds =
+      (double)(m_gpu->gpu_tot_sim_cycle + m_gpu->gpu_sim_cycle) *
+      m_gpu->get_config().icnt_period;
+  m_outgoing_traffic_stats->print_bw(fout, icnt_elapsed_seconds);
+  m_incoming_traffic_stats->print_bw(fout, icnt_elapsed_seconds);
 }
 
 void shader_core_stats::event_warp_issued(unsigned s_id, unsigned warp_id,
@@ -3456,10 +3461,47 @@ void gpgpu_sim::shader_print_scheduler_stat(FILE *fout,
   fprintf(fout, "\n");
 }
 
+static void print_cache_bw_stats(FILE *fout, const char *cache_name,
+                                 const cache_sub_stats &stats,
+                                 double elapsed_seconds) {
+  double total_bw = 0.0;
+  double read_bw = 0.0;
+  double write_bw = 0.0;
+  double tma_bw = 0.0;
+  double tma_read_bw = 0.0;
+  double tma_write_bw = 0.0;
+  if (elapsed_seconds > 0.0) {
+    total_bw = (double)stats.bytes / elapsed_seconds / 1000000000.0;
+    read_bw = (double)stats.read_bytes / elapsed_seconds / 1000000000.0;
+    write_bw = (double)stats.write_bytes / elapsed_seconds / 1000000000.0;
+    tma_bw = (double)stats.tma_bytes / elapsed_seconds / 1000000000.0;
+    tma_read_bw =
+        (double)stats.tma_read_bytes / elapsed_seconds / 1000000000.0;
+    tma_write_bw =
+        (double)stats.tma_write_bytes / elapsed_seconds / 1000000000.0;
+  }
+  fprintf(fout, "\t%s_BW_total_GBps = %.4lf\n", cache_name, total_bw);
+  fprintf(fout, "\t%s_BW_read_GBps = %.4lf\n", cache_name, read_bw);
+  fprintf(fout, "\t%s_BW_write_GBps = %.4lf\n", cache_name, write_bw);
+  fprintf(fout, "\t%s_total_bytes = %llu\n", cache_name, stats.bytes);
+  fprintf(fout, "\t%s_read_bytes = %llu\n", cache_name, stats.read_bytes);
+  fprintf(fout, "\t%s_write_bytes = %llu\n", cache_name, stats.write_bytes);
+  if (stats.tma_bytes > 0) {
+    fprintf(fout, "\t%s_TMA_BW_total_GBps = %.4lf\n", cache_name, tma_bw);
+    fprintf(fout, "\t%s_TMA_BW_read_GBps = %.4lf\n", cache_name,
+            tma_read_bw);
+    fprintf(fout, "\t%s_TMA_BW_write_GBps = %.4lf\n", cache_name,
+            tma_write_bw);
+    fprintf(fout, "\t%s_TMA_bytes = %llu\n", cache_name, stats.tma_bytes);
+  }
+}
+
 void gpgpu_sim::shader_print_cache_stats(FILE *fout) const {
   // L1I
   struct cache_sub_stats total_css;
   struct cache_sub_stats css;
+  double core_elapsed_seconds =
+      (double)(gpu_tot_sim_cycle + gpu_sim_cycle) * m_config.core_period;
 
   fprintf(fout, "\n========= Core cache stats =========\n");
 
@@ -3488,6 +3530,7 @@ void gpgpu_sim::shader_print_cache_stats(FILE *fout) const {
             total_css.data_port_busy_cycles);
     fprintf(fout, "\tL0I_cache_fill_port_busy_cycles = %llu\n",
             total_css.fill_port_busy_cycles);
+    print_cache_bw_stats(fout, "L0I_cache", total_css, core_elapsed_seconds);
     total_css.print_port_stats(fout, "\tL0I_cache");
   }
   // MOD. End. L0I
@@ -3516,6 +3559,7 @@ void gpgpu_sim::shader_print_cache_stats(FILE *fout) const {
             total_css.data_port_busy_cycles);
     fprintf(fout, "\tL1I_cache_fill_port_busy_cycles = %llu\n",
             total_css.fill_port_busy_cycles);
+    print_cache_bw_stats(fout, "L1I_cache", total_css, core_elapsed_seconds);
     total_css.print_port_stats(fout, "\tL1I_cache");
   }
 
@@ -3546,6 +3590,7 @@ void gpgpu_sim::shader_print_cache_stats(FILE *fout) const {
             total_css.pending_hits);
     fprintf(fout, "\tL1D_total_cache_reservation_fails = %llu\n",
             total_css.res_fails);
+    print_cache_bw_stats(fout, "L1D_cache", total_css, core_elapsed_seconds);
     total_css.print_port_stats(fout, "\tL1D_cache");
   }
 
@@ -3568,6 +3613,7 @@ void gpgpu_sim::shader_print_cache_stats(FILE *fout) const {
             total_css.pending_hits);
     fprintf(fout, "\tL1C_total_cache_reservation_fails = %llu\n",
             total_css.res_fails);
+    print_cache_bw_stats(fout, "L1C_cache", total_css, core_elapsed_seconds);
   }
 
   // L1T
@@ -3589,6 +3635,7 @@ void gpgpu_sim::shader_print_cache_stats(FILE *fout) const {
             total_css.pending_hits);
     fprintf(fout, "\tL1T_total_cache_reservation_fails = %llu\n",
             total_css.res_fails);
+    print_cache_bw_stats(fout, "L1T_cache", total_css, core_elapsed_seconds);
   }
 }
 

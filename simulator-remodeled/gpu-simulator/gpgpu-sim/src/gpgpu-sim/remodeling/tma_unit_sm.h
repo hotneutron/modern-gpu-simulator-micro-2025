@@ -73,6 +73,13 @@ class tma_unit_sm : public functional_unit_shared_sm_part {
   uint64_t m_stat_requests_completed = 0;
   uint64_t m_stat_bytes_issued = 0;
   uint64_t m_stat_bytes_completed = 0;
+  uint64_t m_stat_load_bytes_issued = 0;
+  uint64_t m_stat_store_bytes_issued = 0;
+  uint64_t m_stat_reduce_bytes_issued = 0;
+  uint64_t m_stat_load_bytes_completed = 0;
+  uint64_t m_stat_store_bytes_completed = 0;
+  uint64_t m_stat_reduce_bytes_completed = 0;
+  uint64_t m_stat_icnt_backpressure_events = 0;
 
   TMACommand build_tma_command(const warp_inst_t &inst) const;
   void enqueue_issued_commands();

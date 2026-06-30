@@ -115,6 +115,8 @@ memory_stats_t::memory_stats_t(unsigned n_shader,
       (unsigned int **)calloc(mem_config->m_n_mem, sizeof(unsigned int *));
   totalbankaccesses =
       (unsigned int **)calloc(mem_config->m_n_mem, sizeof(unsigned int *));
+  total_tma_dram_reads = 0;
+  total_tma_dram_writes = 0;
   mf_total_lat_table = (unsigned long long int **)calloc(
       mem_config->m_n_mem, sizeof(unsigned long long *));
   mf_max_lat_table =
@@ -274,21 +276,27 @@ void memory_stats_t::memlatstat_dram_access(mem_fetch *mf) {
   unsigned dram_id = mf->get_tlx_addr().chip;
   unsigned bank = mf->get_tlx_addr().bk;
   if (m_memory_config->gpgpu_memlatency_stat) {
+    unsigned int dram_atoms =
+        (mf->get_data_size() + m_memory_config->dram_atom_size - 1) /
+        m_memory_config->dram_atom_size;
     if (mf->get_is_write()) {
       if (mf->get_sid() < m_n_shader) {  // do not count L2_writebacks here
         bankwrites[mf->get_sid()][dram_id][bank]++;
         shader_mem_acc_log(mf->get_sid(), dram_id, bank, 'w');
       }
-      totalbankwrites[dram_id][bank] +=
-          ceil(mf->get_data_size() / m_memory_config->dram_atom_size);
+      totalbankwrites[dram_id][bank] += dram_atoms;
+      if (mf->is_tma()) {
+        total_tma_dram_writes += dram_atoms;
+      }
     } else {
       bankreads[mf->get_sid()][dram_id][bank]++;
       shader_mem_acc_log(mf->get_sid(), dram_id, bank, 'r');
-      totalbankreads[dram_id][bank] +=
-          ceil(mf->get_data_size() / m_memory_config->dram_atom_size);
+      totalbankreads[dram_id][bank] += dram_atoms;
+      if (mf->is_tma()) {
+        total_tma_dram_reads += dram_atoms;
+      }
     }
-    mem_access_type_stats[mf->get_access_type()][dram_id][bank] +=
-        ceil(mf->get_data_size() / m_memory_config->dram_atom_size);
+    mem_access_type_stats[mf->get_access_type()][dram_id][bank] += dram_atoms;
   }
 
   if (mf->get_pc() != (unsigned)-1)
@@ -517,8 +525,47 @@ void memory_stats_t::memlatstat_print(unsigned n_mem, unsigned gpu_mem_n_bk) {
     unsigned int total_writes = k;
     
     double total_accesses = total_reads + total_writes;
-    double dram_bw = ( (total_accesses * 32) / (m_gpu->dram_tot_sim_cycle * m_gpu->get_config().get_dram_period()) ) / 1000000000 ; 
+    double dram_elapsed_seconds =
+        m_gpu->dram_tot_sim_cycle * m_gpu->get_config().get_dram_period();
+    double dram_atom_bytes = m_memory_config->dram_atom_size;
+    double dram_bw =
+        dram_elapsed_seconds > 0.0
+            ? ((total_accesses * dram_atom_bytes) / dram_elapsed_seconds) /
+                  1000000000.0
+            : 0.0;
+    double dram_read_bw =
+        dram_elapsed_seconds > 0.0
+            ? ((total_reads * dram_atom_bytes) / dram_elapsed_seconds) /
+                  1000000000.0
+            : 0.0;
+    double dram_write_bw =
+        dram_elapsed_seconds > 0.0
+            ? ((total_writes * dram_atom_bytes) / dram_elapsed_seconds) /
+                  1000000000.0
+            : 0.0;
+    double dram_tma_bw =
+        dram_elapsed_seconds > 0.0
+            ? (((total_tma_dram_reads + total_tma_dram_writes) *
+                dram_atom_bytes) /
+               dram_elapsed_seconds) /
+                  1000000000.0
+            : 0.0;
+    double dram_non_tma_bw =
+        dram_elapsed_seconds > 0.0
+            ? (((total_accesses - total_tma_dram_reads -
+                 total_tma_dram_writes) *
+                dram_atom_bytes) /
+               dram_elapsed_seconds) /
+                  1000000000.0
+            : 0.0;
     printf("DRAM_BW_total = %12.4lf GB/Sec\n", dram_bw);
+    printf("DRAM_BW_total_GBps = %12.4lf\n", dram_bw);
+    printf("DRAM_BW_read_GBps = %12.4lf\n", dram_read_bw);
+    printf("DRAM_BW_write_GBps = %12.4lf\n", dram_write_bw);
+    printf("DRAM_TMA_BW_total_GBps = %12.4lf\n", dram_tma_bw);
+    printf("DRAM_nonTMA_BW_total_GBps = %12.4lf\n", dram_non_tma_bw);
+    printf("DRAM_TMA_read_atoms = %llu\n", total_tma_dram_reads);
+    printf("DRAM_TMA_write_atoms = %llu\n", total_tma_dram_writes);
     /*AVERAGE MF LATENCY PER BANK*/
     printf("average mf latency per bank:\n");
     for (i = 0; i < n_mem; i++) {
@@ -666,6 +713,8 @@ void memory_stats_t::add(const memory_stats_t *other) {
   L2_write_miss += other->L2_write_miss;
   L2_read_hit += other->L2_read_hit;
   L2_write_hit += other->L2_write_hit;
+  total_tma_dram_reads += other->total_tma_dram_reads;
+  total_tma_dram_writes += other->total_tma_dram_writes;
   total_n_access += other->total_n_access;
   total_n_reads += other->total_n_reads;
   total_n_writes += other->total_n_writes;
@@ -742,6 +791,8 @@ void memory_stats_t::reset() {
   L2_write_miss = 0;
   L2_read_hit = 0;
   L2_write_hit = 0;
+  total_tma_dram_reads = 0;
+  total_tma_dram_writes = 0;
   total_n_access = 0;
   total_n_reads = 0;
   total_n_writes = 0;

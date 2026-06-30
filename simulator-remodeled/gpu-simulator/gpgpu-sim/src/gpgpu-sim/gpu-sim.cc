@@ -3316,11 +3316,11 @@ void gpgpu_sim::gpu_print_stat() {
   // printf("partiton_replys_in_parallel = %lld\n",
   // partiton_replys_in_parallel); printf("partiton_replys_in_parallel_total =
   // %lld\n", partiton_replys_in_parallel_total );
-  printf("L2_BW  = %12.4f GB/Sec\n",
+  printf("ICNT_mem_to_core_reply_BW  = %12.4f GB/Sec\n",
          ((float)(partiton_replys_in_parallel * 32) /
           (gpu_sim_cycle * m_config.icnt_period)) /
              1000000000);
-  printf("L2_BW_total  = %12.4f GB/Sec\n",
+  printf("ICNT_mem_to_core_reply_BW_total  = %12.4f GB/Sec\n",
          ((float)((partiton_replys_in_parallel +
                    partiton_replys_in_parallel_total) *
                   32) /
@@ -3342,12 +3342,22 @@ void gpgpu_sim::gpu_print_stat() {
   for (unsigned i = 0; i < m_config.num_cluster(); i++) {
     m_cluster[i]->get_cache_stats(core_cache_stats);
   }
-  core_cache_stats.compute_total_write_and_read_accesses();
-  double total_cache_accesses = core_cache_stats.get_total_write_and_read_accesses();
-  double l1d_bw = ((total_cache_accesses * 32) / ((gpu_tot_sim_cycle + gpu_sim_cycle) * m_config.core_period)) / 1000000000;
-  printf("L1D_BW_total  = %12.4lf GB/Sec\n", l1d_bw);
+  struct cache_sub_stats core_cache_css;
+  core_cache_css.clear();
+  core_cache_stats.get_sub_stats(core_cache_css);
+  double core_elapsed_seconds =
+      (double)(gpu_tot_sim_cycle + gpu_sim_cycle) * m_config.core_period;
+  double core_ldst_cache_bw =
+      core_elapsed_seconds > 0.0
+          ? ((double)core_cache_css.bytes / core_elapsed_seconds) /
+                1000000000.0
+          : 0.0;
+  printf("Core_ldst_cache_BW_total_GBps = %12.4lf\n", core_ldst_cache_bw);
+  printf("Core_ldst_cache_total_bytes = %llu\n", core_cache_css.bytes);
   printf("\nTotal_core_cache_stats:\n");
   core_cache_stats.print_stats(stdout, "Total_core_cache_stats_breakdown");
+  printf("\nTotal_core_cache_byte_stats:\n");
+  core_cache_stats.print_byte_stats(stdout, "Total_core_cache_bytes_breakdown");
   printf("\nTotal_core_cache_fail_stats:\n");
   core_cache_stats.print_fail_stats(stdout,
                                     "Total_core_cache_fail_stats_breakdown");
@@ -3430,8 +3440,54 @@ void gpgpu_sim::gpu_print_stat() {
       printf("L2_total_cache_pending_hits = %llu\n", total_l2_css.pending_hits);
       printf("L2_total_cache_reservation_fails = %llu\n",
              total_l2_css.res_fails);
+      double l2_elapsed_seconds =
+          (double)(gpu_tot_sim_cycle + gpu_sim_cycle) * m_config.l2_period;
+      double l2_bw_total =
+          l2_elapsed_seconds > 0.0
+              ? ((double)total_l2_css.bytes / l2_elapsed_seconds) /
+                    1000000000.0
+              : 0.0;
+      double l2_bw_read =
+          l2_elapsed_seconds > 0.0
+              ? ((double)total_l2_css.read_bytes / l2_elapsed_seconds) /
+                    1000000000.0
+              : 0.0;
+      double l2_bw_write =
+          l2_elapsed_seconds > 0.0
+              ? ((double)total_l2_css.write_bytes / l2_elapsed_seconds) /
+                    1000000000.0
+              : 0.0;
+      printf("L2_cache_BW_total_GBps = %12.4lf\n", l2_bw_total);
+      printf("L2_cache_BW_read_GBps = %12.4lf\n", l2_bw_read);
+      printf("L2_cache_BW_write_GBps = %12.4lf\n", l2_bw_write);
+      printf("L2_cache_total_bytes = %llu\n", total_l2_css.bytes);
+      printf("L2_cache_read_bytes = %llu\n", total_l2_css.read_bytes);
+      printf("L2_cache_write_bytes = %llu\n", total_l2_css.write_bytes);
+      if (total_l2_css.tma_bytes > 0) {
+        double l2_tma_bw_total =
+            l2_elapsed_seconds > 0.0
+                ? ((double)total_l2_css.tma_bytes / l2_elapsed_seconds) /
+                      1000000000.0
+                : 0.0;
+        double l2_tma_bw_read =
+            l2_elapsed_seconds > 0.0
+                ? ((double)total_l2_css.tma_read_bytes / l2_elapsed_seconds) /
+                      1000000000.0
+                : 0.0;
+        double l2_tma_bw_write =
+            l2_elapsed_seconds > 0.0
+                ? ((double)total_l2_css.tma_write_bytes / l2_elapsed_seconds) /
+                      1000000000.0
+                : 0.0;
+        printf("L2_TMA_BW_total_GBps = %12.4lf\n", l2_tma_bw_total);
+        printf("L2_TMA_BW_read_GBps = %12.4lf\n", l2_tma_bw_read);
+        printf("L2_TMA_BW_write_GBps = %12.4lf\n", l2_tma_bw_write);
+        printf("L2_TMA_bytes = %llu\n", total_l2_css.tma_bytes);
+      }
       printf("L2_total_cache_breakdown:\n");
       l2_stats.print_stats(stdout, "L2_cache_stats_breakdown");
+      printf("L2_total_cache_byte_breakdown:\n");
+      l2_stats.print_byte_stats(stdout, "L2_cache_bytes_breakdown");
       printf("L2_total_cache_reservation_fail_breakdown:\n");
       l2_stats.print_fail_stats(stdout, "L2_cache_stats_fail_breakdown");
       total_l2_css.print_port_stats(stdout, "L2_cache");

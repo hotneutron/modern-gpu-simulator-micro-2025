@@ -658,6 +658,7 @@ void tma_unit_sm::mover_issue_requests(TMATransferEntry &entry,
         // without flooding the trace on a sustained stall.
         if (!entry.logged_backpressure) {
           entry.logged_backpressure = true;
+          ++m_stat_icnt_backpressure_events;
           m_sm->debug_log_tma_event(
               "icnt-backpressure uid=" + std::to_string(entry.transfer_uid) +
               " warp=" + std::to_string(entry.cmd.warp_id) +
@@ -728,6 +729,13 @@ void tma_unit_sm::mover_issue_requests(TMATransferEntry &entry,
       ++entry.requests_issued;
       ++m_stat_requests_issued;
       m_stat_bytes_issued += SECTOR_SIZE;
+      if (is_reduction) {
+        m_stat_reduce_bytes_issued += SECTOR_SIZE;
+      } else if (is_store) {
+        m_stat_store_bytes_issued += SECTOR_SIZE;
+      } else {
+        m_stat_load_bytes_issued += SECTOR_SIZE;
+      }
     }
 
     if (icnt_blocked) {
@@ -744,6 +752,17 @@ void tma_unit_sm::mover_on_response(TMATransferEntry &entry, mem_fetch *mf,
   ++m_stat_requests_completed;
   entry.bytes_completed += mf->get_data_size();
   m_stat_bytes_completed += mf->get_data_size();
+  const bool is_reduction =
+      (entry.cmd.transfer_type == TMATransferType::REDUCTION);
+  const bool is_store =
+      (entry.cmd.direction == TMADirection::SMEM_TO_GMEM) && !is_reduction;
+  if (is_reduction) {
+    m_stat_reduce_bytes_completed += mf->get_data_size();
+  } else if (is_store) {
+    m_stat_store_bytes_completed += mf->get_data_size();
+  } else {
+    m_stat_load_bytes_completed += mf->get_data_size();
+  }
 
   uint32_t agu_request_goal = entry.cmd.requests_total;
   if (agu_request_goal == 0 && entry.cmd.total_bytes > 0) {
@@ -751,8 +770,6 @@ void tma_unit_sm::mover_on_response(TMATransferEntry &entry, mem_fetch *mf,
   }
   // requests are counted in 32B sector mfs (see mover_issue_requests). A
   // reduce-store emits 2 mfs (read + write) per sector, so its goal is 2x.
-  const bool is_reduction =
-      (entry.cmd.transfer_type == TMATransferType::REDUCTION);
   const uint32_t mfs_per_sector = is_reduction ? 2u : 1u;
   uint32_t sector_mf_goal =
       agu_request_goal * SECTOR_CHUNCK_SIZE * mfs_per_sector;
@@ -857,6 +874,32 @@ void tma_unit_sm::debug_dump_tma_counters() const {
   if (m_stat_commands_issued == 0) {
     return;
   }
+  const double elapsed_seconds =
+      (double)m_sm->get_current_gpu_cycle() *
+      m_sm->get_gpu()->get_config().get_core_period();
+  const double issued_bw =
+      elapsed_seconds > 0.0
+          ? ((double)m_stat_bytes_issued / elapsed_seconds) / 1000000000.0
+          : 0.0;
+  const double completed_bw =
+      elapsed_seconds > 0.0
+          ? ((double)m_stat_bytes_completed / elapsed_seconds) / 1000000000.0
+          : 0.0;
+  const double load_issued_bw =
+      elapsed_seconds > 0.0
+          ? ((double)m_stat_load_bytes_issued / elapsed_seconds) /
+                1000000000.0
+          : 0.0;
+  const double store_issued_bw =
+      elapsed_seconds > 0.0
+          ? ((double)m_stat_store_bytes_issued / elapsed_seconds) /
+                1000000000.0
+          : 0.0;
+  const double reduce_issued_bw =
+      elapsed_seconds > 0.0
+          ? ((double)m_stat_reduce_bytes_issued / elapsed_seconds) /
+                1000000000.0
+          : 0.0;
   std::cerr << "[TMA][Phase3][Stats] sm=" << m_sm->get_sid()
             << " commands_issued=" << m_stat_commands_issued
             << " transfers_completed=" << m_stat_transfers_completed
@@ -864,5 +907,17 @@ void tma_unit_sm::debug_dump_tma_counters() const {
             << " requests_completed=" << m_stat_requests_completed
             << " bytes_issued=" << m_stat_bytes_issued
             << " bytes_completed=" << m_stat_bytes_completed
+            << " load_bytes_issued=" << m_stat_load_bytes_issued
+            << " store_bytes_issued=" << m_stat_store_bytes_issued
+            << " reduce_bytes_issued=" << m_stat_reduce_bytes_issued
+            << " load_bytes_completed=" << m_stat_load_bytes_completed
+            << " store_bytes_completed=" << m_stat_store_bytes_completed
+            << " reduce_bytes_completed=" << m_stat_reduce_bytes_completed
+            << " icnt_backpressure_events=" << m_stat_icnt_backpressure_events
+            << " BW_issued_GBps=" << issued_bw
+            << " BW_completed_GBps=" << completed_bw
+            << " BW_load_issued_GBps=" << load_issued_bw
+            << " BW_store_issued_GBps=" << store_issued_bw
+            << " BW_reduce_issued_GBps=" << reduce_issued_bw
             << " (TMA traffic counted separately from L1/ldst)" << std::endl;
 }
