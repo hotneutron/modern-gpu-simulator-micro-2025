@@ -1,0 +1,1158 @@
+simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/shader.cc
+  s_961fde6bd63f04::t_ffd611b918f20c 3464-3498,3503-3504,3533,3562,3593,3616,3638 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a442362cd7a2941012ccce2","tool_type":"agent","tool_id":"apply_patch","line_ranges":[{"Range":[3464,3498]},{"Range":[3503,3504]},{"Single":3533},{"Single":3562},{"Single":3593},{"Single":3616},{"Single":3638}]}]}
+  s_961fde6bd63f04::t_efdc8052d8c60c 1894-1898 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a442401cd7a2941012ccec7","tool_type":"agent","tool_id":"apply_patch","line_ranges":[{"Range":[1894,1898]}]}]}
+simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/tma_unit_sm.h
+  s_961fde6bd63f04::t_611a30722b5224 76-82 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a4423a8cd7a2941012ccdb1","tool_type":"agent","tool_id":"apply_patch","line_ranges":[{"Range":[76,82]}]}]}
+.plan/TMA_LATENCY_INJECTION_H100.md
+  s_961fde6bd63f04::t_723eb2b5ab7cb3 1,3-13,20-23,28-30,60,95,102-107,111-115,118-122,124-126,128,143-157,160-161,166,168-171,173-177,179-182,192,197-202 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a4410a1cd7a2941012cca9b","tool_type":"agent","tool_id":"apply_patch","line_ranges":[{"Single":1},{"Range":[3,13]},{"Range":[20,23]},{"Range":[28,30]},{"Single":60},{"Single":95},{"Range":[102,107]},{"Range":[111,115]},{"Range":[118,122]},{"Range":[124,126]},{"Single":128},{"Range":[143,157]},{"Range":[160,161]},{"Single":166},{"Range":[168,171]},{"Range":[173,177]},{"Range":[179,182]},{"Single":192},{"Range":[197,202]}]}]}
+simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/gpu-cache.h
+  s_961fde6bd63f04::t_44016aa17f09a8 1137-1142,1154-1159,1172-1177,1193-1198,1279-1280,1293-1294,1318-1323 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a44233acd7a2941012ccc52","tool_type":"agent","tool_id":"apply_patch","line_ranges":[{"Range":[1137,1142]},{"Range":[1154,1159]},{"Range":[1172,1177]},{"Range":[1193,1198]},{"Range":[1279,1280]},{"Range":[1293,1294]},{"Range":[1318,1323]}]}]}
+simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/mem_latency_stat.cc
+  s_961fde6bd63f04::t_f0901ed1f9387d 118-119,279-281,287-290,294-297,299,528-560,562-568,716-717,794-795,799 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a442394cd7a2941012ccd73","tool_type":"agent","tool_id":"apply_patch","line_ranges":[{"Range":[118,119]},{"Range":[279,281]},{"Range":[287,290]},{"Range":[294,297]},{"Single":299},{"Range":[528,560]},{"Range":[562,568]},{"Range":[716,717]},{"Range":[794,795]},{"Single":799}]}]}
+simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/tma_unit_sm.cc
+  s_961fde6bd63f04::t_d571c5c6aab4da 661,732-738,755-765,877-902,910-921 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a4423b1cd7a2941012ccdee","tool_type":"agent","tool_id":"apply_patch","line_ranges":[{"Single":661},{"Range":[732,738]},{"Range":[755,765]},{"Range":[877,902]},{"Range":[910,921]}]}]}
+simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/traffic_breakdown.cc
+  s_961fde6bd63f04::t_1957cc351ddf61 23-40 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a4423f7cd7a2941012cce96","tool_type":"agent","tool_id":"apply_patch","line_ranges":[{"Range":[23,40]}]}]}
+simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/gpu-cache.cc
+  s_961fde6bd63f04::t_9e8bd926aa77e7 1885-1888,1930-1933,2001-2005,2070-2073 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a442356cd7a2941012cccb2","tool_type":"agent","tool_id":"apply_patch","line_ranges":[{"Range":[1885,1888]},{"Range":[1930,1933]},{"Range":[2001,2005]},{"Range":[2070,2073]}]}]}
+  s_961fde6bd63f04::t_be5047160a1dbe 670-675,680-685,700-705,733-754,833-843,867-872,936-958,1018,1020-1026 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a442346cd7a2941012ccc82","tool_type":"agent","tool_id":"apply_patch","line_ranges":[{"Range":[670,675]},{"Range":[680,685]},{"Range":[700,705]},{"Range":[733,754]},{"Range":[833,843]},{"Range":[867,872]},{"Range":[936,958]},{"Single":1018},{"Range":[1020,1026]}]}]}
+simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/traffic_breakdown.h
+  s_961fde6bd63f04::t_a2715b884811a3 15 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a4423eecd7a2941012cce65","tool_type":"agent","tool_id":"apply_patch","line_ranges":[{"Single":15}]}]}
+simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/gpu-sim.cc
+  s_961fde6bd63f04::t_1f19f4c4a0d7bd 3319,3323,3345-3356,3359-3360,3443-3486,3489-3490 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a44237bcd7a2941012ccd11","tool_type":"agent","tool_id":"apply_patch","line_ranges":[{"Single":3319},{"Single":3323},{"Range":[3345,3356]},{"Range":[3359,3360]},{"Range":[3443,3486]},{"Range":[3489,3490]}]}]}
+simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/mem_latency_stat.h
+  s_961fde6bd63f04::t_f68815dd11f92c 92-93 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a44238ccd7a2941012ccd42","tool_type":"agent","tool_id":"apply_patch","line_ranges":[{"Range":[92,93]}]}]}
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "5a5ac0694e8d5e0b64bed731b66a3f58a925edd7",
+  "prompts": {},
+  "sessions": {
+    "s_961fde6bd63f04": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6a42e6d3cd7a2941012cc8b3",
+        "model": "gpt-5.5__max"
+      },
+      "human_author": "Jihyun Ryoo <jihyun.ryoo@bytedance.com>"
+    }
+  },
+  "attestation_metadata": {
+    ".plan/TMA_LATENCY_INJECTION_H100.md": [
+      {
+        "hash": "s_961fde6bd63f04::t_723eb2b5ab7cb3",
+        "line_ranges": [
+          {
+            "Single": 1
+          },
+          {
+            "Range": [
+              3,
+              13
+            ]
+          },
+          {
+            "Range": [
+              20,
+              23
+            ]
+          },
+          {
+            "Range": [
+              28,
+              30
+            ]
+          },
+          {
+            "Single": 60
+          },
+          {
+            "Single": 95
+          },
+          {
+            "Range": [
+              102,
+              107
+            ]
+          },
+          {
+            "Range": [
+              111,
+              115
+            ]
+          },
+          {
+            "Range": [
+              118,
+              122
+            ]
+          },
+          {
+            "Range": [
+              124,
+              126
+            ]
+          },
+          {
+            "Single": 128
+          },
+          {
+            "Range": [
+              143,
+              157
+            ]
+          },
+          {
+            "Range": [
+              160,
+              161
+            ]
+          },
+          {
+            "Single": 166
+          },
+          {
+            "Range": [
+              168,
+              171
+            ]
+          },
+          {
+            "Range": [
+              173,
+              177
+            ]
+          },
+          {
+            "Range": [
+              179,
+              182
+            ]
+          },
+          {
+            "Single": 192
+          },
+          {
+            "Range": [
+              197,
+              202
+            ]
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a4410a1cd7a2941012cca9b",
+            "tool_type": "agent",
+            "tool_id": "apply_patch",
+            "line_ranges": [
+              {
+                "Single": 1
+              },
+              {
+                "Range": [
+                  3,
+                  13
+                ]
+              },
+              {
+                "Range": [
+                  20,
+                  23
+                ]
+              },
+              {
+                "Range": [
+                  28,
+                  30
+                ]
+              },
+              {
+                "Single": 60
+              },
+              {
+                "Single": 95
+              },
+              {
+                "Range": [
+                  102,
+                  107
+                ]
+              },
+              {
+                "Range": [
+                  111,
+                  115
+                ]
+              },
+              {
+                "Range": [
+                  118,
+                  122
+                ]
+              },
+              {
+                "Range": [
+                  124,
+                  126
+                ]
+              },
+              {
+                "Single": 128
+              },
+              {
+                "Range": [
+                  143,
+                  157
+                ]
+              },
+              {
+                "Range": [
+                  160,
+                  161
+                ]
+              },
+              {
+                "Single": 166
+              },
+              {
+                "Range": [
+                  168,
+                  171
+                ]
+              },
+              {
+                "Range": [
+                  173,
+                  177
+                ]
+              },
+              {
+                "Range": [
+                  179,
+                  182
+                ]
+              },
+              {
+                "Single": 192
+              },
+              {
+                "Range": [
+                  197,
+                  202
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/gpu-cache.cc": [
+      {
+        "hash": "s_961fde6bd63f04::t_9e8bd926aa77e7",
+        "line_ranges": [
+          {
+            "Range": [
+              1885,
+              1888
+            ]
+          },
+          {
+            "Range": [
+              1930,
+              1933
+            ]
+          },
+          {
+            "Range": [
+              2001,
+              2005
+            ]
+          },
+          {
+            "Range": [
+              2070,
+              2073
+            ]
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a442356cd7a2941012cccb2",
+            "tool_type": "agent",
+            "tool_id": "apply_patch",
+            "line_ranges": [
+              {
+                "Range": [
+                  1885,
+                  1888
+                ]
+              },
+              {
+                "Range": [
+                  1930,
+                  1933
+                ]
+              },
+              {
+                "Range": [
+                  2001,
+                  2005
+                ]
+              },
+              {
+                "Range": [
+                  2070,
+                  2073
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "hash": "s_961fde6bd63f04::t_be5047160a1dbe",
+        "line_ranges": [
+          {
+            "Range": [
+              670,
+              675
+            ]
+          },
+          {
+            "Range": [
+              680,
+              685
+            ]
+          },
+          {
+            "Range": [
+              700,
+              705
+            ]
+          },
+          {
+            "Range": [
+              733,
+              754
+            ]
+          },
+          {
+            "Range": [
+              833,
+              843
+            ]
+          },
+          {
+            "Range": [
+              867,
+              872
+            ]
+          },
+          {
+            "Range": [
+              936,
+              958
+            ]
+          },
+          {
+            "Single": 1018
+          },
+          {
+            "Range": [
+              1020,
+              1026
+            ]
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a442346cd7a2941012ccc82",
+            "tool_type": "agent",
+            "tool_id": "apply_patch",
+            "line_ranges": [
+              {
+                "Range": [
+                  670,
+                  675
+                ]
+              },
+              {
+                "Range": [
+                  680,
+                  685
+                ]
+              },
+              {
+                "Range": [
+                  700,
+                  705
+                ]
+              },
+              {
+                "Range": [
+                  733,
+                  754
+                ]
+              },
+              {
+                "Range": [
+                  833,
+                  843
+                ]
+              },
+              {
+                "Range": [
+                  867,
+                  872
+                ]
+              },
+              {
+                "Range": [
+                  936,
+                  958
+                ]
+              },
+              {
+                "Single": 1018
+              },
+              {
+                "Range": [
+                  1020,
+                  1026
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/gpu-cache.h": [
+      {
+        "hash": "s_961fde6bd63f04::t_44016aa17f09a8",
+        "line_ranges": [
+          {
+            "Range": [
+              1137,
+              1142
+            ]
+          },
+          {
+            "Range": [
+              1154,
+              1159
+            ]
+          },
+          {
+            "Range": [
+              1172,
+              1177
+            ]
+          },
+          {
+            "Range": [
+              1193,
+              1198
+            ]
+          },
+          {
+            "Range": [
+              1279,
+              1280
+            ]
+          },
+          {
+            "Range": [
+              1293,
+              1294
+            ]
+          },
+          {
+            "Range": [
+              1318,
+              1323
+            ]
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a44233acd7a2941012ccc52",
+            "tool_type": "agent",
+            "tool_id": "apply_patch",
+            "line_ranges": [
+              {
+                "Range": [
+                  1137,
+                  1142
+                ]
+              },
+              {
+                "Range": [
+                  1154,
+                  1159
+                ]
+              },
+              {
+                "Range": [
+                  1172,
+                  1177
+                ]
+              },
+              {
+                "Range": [
+                  1193,
+                  1198
+                ]
+              },
+              {
+                "Range": [
+                  1279,
+                  1280
+                ]
+              },
+              {
+                "Range": [
+                  1293,
+                  1294
+                ]
+              },
+              {
+                "Range": [
+                  1318,
+                  1323
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/gpu-sim.cc": [
+      {
+        "hash": "s_961fde6bd63f04::t_1f19f4c4a0d7bd",
+        "line_ranges": [
+          {
+            "Single": 3319
+          },
+          {
+            "Single": 3323
+          },
+          {
+            "Range": [
+              3345,
+              3356
+            ]
+          },
+          {
+            "Range": [
+              3359,
+              3360
+            ]
+          },
+          {
+            "Range": [
+              3443,
+              3486
+            ]
+          },
+          {
+            "Range": [
+              3489,
+              3490
+            ]
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a44237bcd7a2941012ccd11",
+            "tool_type": "agent",
+            "tool_id": "apply_patch",
+            "line_ranges": [
+              {
+                "Single": 3319
+              },
+              {
+                "Single": 3323
+              },
+              {
+                "Range": [
+                  3345,
+                  3356
+                ]
+              },
+              {
+                "Range": [
+                  3359,
+                  3360
+                ]
+              },
+              {
+                "Range": [
+                  3443,
+                  3486
+                ]
+              },
+              {
+                "Range": [
+                  3489,
+                  3490
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/mem_latency_stat.cc": [
+      {
+        "hash": "s_961fde6bd63f04::t_f0901ed1f9387d",
+        "line_ranges": [
+          {
+            "Range": [
+              118,
+              119
+            ]
+          },
+          {
+            "Range": [
+              279,
+              281
+            ]
+          },
+          {
+            "Range": [
+              287,
+              290
+            ]
+          },
+          {
+            "Range": [
+              294,
+              297
+            ]
+          },
+          {
+            "Single": 299
+          },
+          {
+            "Range": [
+              528,
+              560
+            ]
+          },
+          {
+            "Range": [
+              562,
+              568
+            ]
+          },
+          {
+            "Range": [
+              716,
+              717
+            ]
+          },
+          {
+            "Range": [
+              794,
+              795
+            ]
+          },
+          {
+            "Single": 799
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a442394cd7a2941012ccd73",
+            "tool_type": "agent",
+            "tool_id": "apply_patch",
+            "line_ranges": [
+              {
+                "Range": [
+                  118,
+                  119
+                ]
+              },
+              {
+                "Range": [
+                  279,
+                  281
+                ]
+              },
+              {
+                "Range": [
+                  287,
+                  290
+                ]
+              },
+              {
+                "Range": [
+                  294,
+                  297
+                ]
+              },
+              {
+                "Single": 299
+              },
+              {
+                "Range": [
+                  528,
+                  560
+                ]
+              },
+              {
+                "Range": [
+                  562,
+                  568
+                ]
+              },
+              {
+                "Range": [
+                  716,
+                  717
+                ]
+              },
+              {
+                "Range": [
+                  794,
+                  795
+                ]
+              },
+              {
+                "Single": 799
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/mem_latency_stat.h": [
+      {
+        "hash": "s_961fde6bd63f04::t_f68815dd11f92c",
+        "line_ranges": [
+          {
+            "Range": [
+              92,
+              93
+            ]
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a44238ccd7a2941012ccd42",
+            "tool_type": "agent",
+            "tool_id": "apply_patch",
+            "line_ranges": [
+              {
+                "Range": [
+                  92,
+                  93
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/tma_unit_sm.cc": [
+      {
+        "hash": "s_961fde6bd63f04::t_d571c5c6aab4da",
+        "line_ranges": [
+          {
+            "Single": 661
+          },
+          {
+            "Range": [
+              732,
+              738
+            ]
+          },
+          {
+            "Range": [
+              755,
+              765
+            ]
+          },
+          {
+            "Range": [
+              877,
+              902
+            ]
+          },
+          {
+            "Range": [
+              910,
+              921
+            ]
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a4423b1cd7a2941012ccdee",
+            "tool_type": "agent",
+            "tool_id": "apply_patch",
+            "line_ranges": [
+              {
+                "Single": 661
+              },
+              {
+                "Range": [
+                  732,
+                  738
+                ]
+              },
+              {
+                "Range": [
+                  755,
+                  765
+                ]
+              },
+              {
+                "Range": [
+                  877,
+                  902
+                ]
+              },
+              {
+                "Range": [
+                  910,
+                  921
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/tma_unit_sm.h": [
+      {
+        "hash": "s_961fde6bd63f04::t_611a30722b5224",
+        "line_ranges": [
+          {
+            "Range": [
+              76,
+              82
+            ]
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a4423a8cd7a2941012ccdb1",
+            "tool_type": "agent",
+            "tool_id": "apply_patch",
+            "line_ranges": [
+              {
+                "Range": [
+                  76,
+                  82
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/shader.cc": [
+      {
+        "hash": "s_961fde6bd63f04::t_ffd611b918f20c",
+        "line_ranges": [
+          {
+            "Range": [
+              3464,
+              3498
+            ]
+          },
+          {
+            "Range": [
+              3503,
+              3504
+            ]
+          },
+          {
+            "Single": 3533
+          },
+          {
+            "Single": 3562
+          },
+          {
+            "Single": 3593
+          },
+          {
+            "Single": 3616
+          },
+          {
+            "Single": 3638
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a442362cd7a2941012ccce2",
+            "tool_type": "agent",
+            "tool_id": "apply_patch",
+            "line_ranges": [
+              {
+                "Range": [
+                  3464,
+                  3498
+                ]
+              },
+              {
+                "Range": [
+                  3503,
+                  3504
+                ]
+              },
+              {
+                "Single": 3533
+              },
+              {
+                "Single": 3562
+              },
+              {
+                "Single": 3593
+              },
+              {
+                "Single": 3616
+              },
+              {
+                "Single": 3638
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "hash": "s_961fde6bd63f04::t_efdc8052d8c60c",
+        "line_ranges": [
+          {
+            "Range": [
+              1894,
+              1898
+            ]
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a442401cd7a2941012ccec7",
+            "tool_type": "agent",
+            "tool_id": "apply_patch",
+            "line_ranges": [
+              {
+                "Range": [
+                  1894,
+                  1898
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/traffic_breakdown.cc": [
+      {
+        "hash": "s_961fde6bd63f04::t_1957cc351ddf61",
+        "line_ranges": [
+          {
+            "Range": [
+              23,
+              40
+            ]
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a4423f7cd7a2941012cce96",
+            "tool_type": "agent",
+            "tool_id": "apply_patch",
+            "line_ranges": [
+              {
+                "Range": [
+                  23,
+                  40
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/traffic_breakdown.h": [
+      {
+        "hash": "s_961fde6bd63f04::t_a2715b884811a3",
+        "line_ranges": [
+          {
+            "Single": 15
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a4423eecd7a2941012cce65",
+            "tool_type": "agent",
+            "tool_id": "apply_patch",
+            "line_ranges": [
+              {
+                "Single": 15
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "remote_transcripts": {
+    "s_961fde6bd63f04": {
+      "tool": "trae",
+      "conversation_id": "6a42e6d3cd7a2941012cc8b3",
+      "session_id": "6a42e6d3cd7a2941012cc8b3",
+      "status": "remote_only",
+      "message": "Remote transcript resolution is not implemented yet for TRAE prompts."
+    },
+    "s_961fde6bd63f04::t_09383f64f48cdc": {
+      "tool": "trae",
+      "conversation_id": "6a42e6d3cd7a2941012cc8b3",
+      "session_id": "6a42e6d3cd7a2941012cc8b3",
+      "status": "remote_only",
+      "message": "Remote transcript resolution is not implemented yet for TRAE prompts."
+    },
+    "s_961fde6bd63f04::t_13c51f7275c211": {
+      "tool": "trae",
+      "conversation_id": "6a42e6d3cd7a2941012cc8b3",
+      "session_id": "6a42e6d3cd7a2941012cc8b3",
+      "status": "remote_only",
+      "message": "Remote transcript resolution is not implemented yet for TRAE prompts."
+    },
+    "s_961fde6bd63f04::t_1957cc351ddf61": {
+      "tool": "trae",
+      "conversation_id": "6a42e6d3cd7a2941012cc8b3",
+      "session_id": "6a42e6d3cd7a2941012cc8b3",
+      "status": "remote_only",
+      "message": "Remote transcript resolution is not implemented yet for TRAE prompts."
+    },
+    "s_961fde6bd63f04::t_1f19f4c4a0d7bd": {
+      "tool": "trae",
+      "conversation_id": "6a42e6d3cd7a2941012cc8b3",
+      "session_id": "6a42e6d3cd7a2941012cc8b3",
+      "status": "remote_only",
+      "message": "Remote transcript resolution is not implemented yet for TRAE prompts."
+    },
+    "s_961fde6bd63f04::t_375f631e81f126": {
+      "tool": "trae",
+      "conversation_id": "6a42e6d3cd7a2941012cc8b3",
+      "session_id": "6a42e6d3cd7a2941012cc8b3",
+      "status": "remote_only",
+      "message": "Remote transcript resolution is not implemented yet for TRAE prompts."
+    },
+    "s_961fde6bd63f04::t_3d4f9eff5986a4": {
+      "tool": "trae",
+      "conversation_id": "6a42e6d3cd7a2941012cc8b3",
+      "session_id": "6a42e6d3cd7a2941012cc8b3",
+      "status": "remote_only",
+      "message": "Remote transcript resolution is not implemented yet for TRAE prompts."
+    },
+    "s_961fde6bd63f04::t_44016aa17f09a8": {
+      "tool": "trae",
+      "conversation_id": "6a42e6d3cd7a2941012cc8b3",
+      "session_id": "6a42e6d3cd7a2941012cc8b3",
+      "status": "remote_only",
+      "message": "Remote transcript resolution is not implemented yet for TRAE prompts."
+    },
+    "s_961fde6bd63f04::t_611a30722b5224": {
+      "tool": "trae",
+      "conversation_id": "6a42e6d3cd7a2941012cc8b3",
+      "session_id": "6a42e6d3cd7a2941012cc8b3",
+      "status": "remote_only",
+      "message": "Remote transcript resolution is not implemented yet for TRAE prompts."
+    },
+    "s_961fde6bd63f04::t_723eb2b5ab7cb3": {
+      "tool": "trae",
+      "conversation_id": "6a42e6d3cd7a2941012cc8b3",
+      "session_id": "6a42e6d3cd7a2941012cc8b3",
+      "status": "remote_only",
+      "message": "Remote transcript resolution is not implemented yet for TRAE prompts."
+    },
+    "s_961fde6bd63f04::t_77c9b09ab88daa": {
+      "tool": "trae",
+      "conversation_id": "6a42e6d3cd7a2941012cc8b3",
+      "session_id": "6a42e6d3cd7a2941012cc8b3",
+      "status": "remote_only",
+      "message": "Remote transcript resolution is not implemented yet for TRAE prompts."
+    },
+    "s_961fde6bd63f04::t_9e8bd926aa77e7": {
+      "tool": "trae",
+      "conversation_id": "6a42e6d3cd7a2941012cc8b3",
+      "session_id": "6a42e6d3cd7a2941012cc8b3",
+      "status": "remote_only",
+      "message": "Remote transcript resolution is not implemented yet for TRAE prompts."
+    },
+    "s_961fde6bd63f04::t_a2715b884811a3": {
+      "tool": "trae",
+      "conversation_id": "6a42e6d3cd7a2941012cc8b3",
+      "session_id": "6a42e6d3cd7a2941012cc8b3",
+      "status": "remote_only",
+      "message": "Remote transcript resolution is not implemented yet for TRAE prompts."
+    },
+    "s_961fde6bd63f04::t_be5047160a1dbe": {
+      "tool": "trae",
+      "conversation_id": "6a42e6d3cd7a2941012cc8b3",
+      "session_id": "6a42e6d3cd7a2941012cc8b3",
+      "status": "remote_only",
+      "message": "Remote transcript resolution is not implemented yet for TRAE prompts."
+    },
+    "s_961fde6bd63f04::t_d571c5c6aab4da": {
+      "tool": "trae",
+      "conversation_id": "6a42e6d3cd7a2941012cc8b3",
+      "session_id": "6a42e6d3cd7a2941012cc8b3",
+      "status": "remote_only",
+      "message": "Remote transcript resolution is not implemented yet for TRAE prompts."
+    },
+    "s_961fde6bd63f04::t_efdc8052d8c60c": {
+      "tool": "trae",
+      "conversation_id": "6a42e6d3cd7a2941012cc8b3",
+      "session_id": "6a42e6d3cd7a2941012cc8b3",
+      "status": "remote_only",
+      "message": "Remote transcript resolution is not implemented yet for TRAE prompts."
+    },
+    "s_961fde6bd63f04::t_f0901ed1f9387d": {
+      "tool": "trae",
+      "conversation_id": "6a42e6d3cd7a2941012cc8b3",
+      "session_id": "6a42e6d3cd7a2941012cc8b3",
+      "status": "remote_only",
+      "message": "Remote transcript resolution is not implemented yet for TRAE prompts."
+    },
+    "s_961fde6bd63f04::t_f3e198ef78d047": {
+      "tool": "trae",
+      "conversation_id": "6a42e6d3cd7a2941012cc8b3",
+      "session_id": "6a42e6d3cd7a2941012cc8b3",
+      "status": "remote_only",
+      "message": "Remote transcript resolution is not implemented yet for TRAE prompts."
+    },
+    "s_961fde6bd63f04::t_f68815dd11f92c": {
+      "tool": "trae",
+      "conversation_id": "6a42e6d3cd7a2941012cc8b3",
+      "session_id": "6a42e6d3cd7a2941012cc8b3",
+      "status": "remote_only",
+      "message": "Remote transcript resolution is not implemented yet for TRAE prompts."
+    },
+    "s_961fde6bd63f04::t_ffd611b918f20c": {
+      "tool": "trae",
+      "conversation_id": "6a42e6d3cd7a2941012cc8b3",
+      "session_id": "6a42e6d3cd7a2941012cc8b3",
+      "status": "remote_only",
+      "message": "Remote transcript resolution is not implemented yet for TRAE prompts."
+    }
+  }
+}
