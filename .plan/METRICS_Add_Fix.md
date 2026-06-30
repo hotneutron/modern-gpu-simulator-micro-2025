@@ -409,8 +409,8 @@ do not change any scheduling/latency behavior.
 - **Why**: the generic `L2_total_cache_*` mixes TMA with normal LDG/STG, so it cannot attribute the
   ADDR_MERGE synthetic-address RESERVATION_FAIL re-probe storm to TMA. These isolate `is_tma()`
   requests at the L2 admission probe.
-- **Counted** per-sub-partition in [memory_sub_partition::cache_cycle()](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/l2cache.cc#L547-L565); members + getters in
-  [l2cache.h](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/l2cache.h#L261-L280); summed and printed in [gpu-sim.cc](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/gpu-sim.cc#L3455-L3481).
+- **Counted** per-sub-partition in [memory_sub_partition::cache_cycle()](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/l2cache.cc#L530-L572) (admission probe + the two backpressure skip-causes); members + getters in
+  [l2cache.h](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/l2cache.h#L212-L301); summed and printed in [gpu-sim.cc](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/gpu-sim.cc#L3476-L3496).
 - **Output lines**:
   - `L2_TMA_hits` / `L2_TMA_true_hit_rate` — true HIT (genuine locality)
   - `L2_TMA_pending_hits` / `L2_TMA_pending_hit_rate` — `HIT_RESERVED`/`MSHR_HIT`, i.e. merged onto
@@ -418,7 +418,23 @@ do not change any scheduling/latency behavior.
   - `L2_TMA_misses` — `MISS`/`SECTOR_MISS` → DRAM
   - `L2_TMA_reservation_fails` / `L2_TMA_res_fail_per_probe` — re-probe **cycles** (head-of-line
     blocking from the synthetic-address hotspot), not distinct failing requests
+  - `L2_TMA_output_full_cycles` — head mf is TMA but the L2→ICNT reply queue (`m_L2_icnt_queue`) is
+    full, so `access()` is skipped this cycle (downstream reply backpressure, **not** a res_fail)
+  - `L2_TMA_port_busy_cycles` — head mf is TMA, reply queue not full, but the L2 data port is busy,
+    so `access()` is skipped (port backpressure, **not** a res_fail)
+- **Why the two backpressure counters matter (avoids a second run)**: the hit/miss/res_fail counters
+  only advance on cycles where `access()` actually runs, i.e. the admission gate
+  `!output_full && port_free` is open. A TMA head can be stuck for **four** distinct reasons; without
+  separating them a *low* `res_fail_per_probe` could be misread as "admission is not the limiter"
+  when the head is really jammed downstream. The four head-of-line causes are now fully separable
+  from a single run:
+  1. DRAM queue full → existing global `gpu_stall_dramfull`
+  2. reply queue full → `L2_TMA_output_full_cycles`
+  3. data port busy → `L2_TMA_port_busy_cycles`
+  4. L2 set/MSHR locked (the hotspot) → `L2_TMA_reservation_fails`
 - **Decision gate** (vs HW L2 hit rate fwd 69.58% / bwd 82.26%): high `res_fail_per_probe` + hit
-  rate above HW ⇒ synthetic-address hotspot ⇒ **6B (address), not 6A**; low `res_fail_per_probe` ⇒
-  `lat_drain` is genuine memory latency, neither 6A nor 6B helps. Cross-referenced in
-  `.plan/TMA_LATENCY_INJECTION_H100.md` §2-C / §4.
+  rate above HW ⇒ synthetic-address hotspot ⇒ **6B (address), not 6A**; low `res_fail_per_probe`
+  **with low `output_full`/`port_busy`** ⇒ `lat_drain` is genuine memory latency, neither 6A nor 6B
+  helps; low `res_fail_per_probe` **with high `output_full`/`port_busy`** ⇒ the limiter is
+  downstream reply/port backpressure (a different fix axis, not the address hotspot). Cross-referenced
+  in `.plan/TMA_LATENCY_INJECTION_H100.md` §2-C / §4.

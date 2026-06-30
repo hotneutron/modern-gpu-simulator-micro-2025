@@ -216,6 +216,12 @@ class memory_sub_partition {
   }
   unsigned long long get_tma_l2_misses() const { return m_tma_l2_misses; }
   unsigned long long get_tma_l2_res_fails() const { return m_tma_l2_res_fails; }
+  unsigned long long get_tma_l2_output_full_cycles() const {
+    return m_tma_l2_output_full_cycles;
+  }
+  unsigned long long get_tma_l2_port_busy_cycles() const {
+    return m_tma_l2_port_busy_cycles;
+  }
 
  private:
   // data
@@ -274,10 +280,25 @@ class memory_sub_partition {
   //  - m_tma_l2_misses      : MISS / SECTOR_MISS (goes to DRAM)
   //  - m_tma_l2_res_fails   : RESERVATION_FAIL re-probe cycles (head-of-line
   //                           blocking; the hotspot pressure signal)
+  //
+  // The four counters above only advance when access() is actually called,
+  // i.e. when the admission gate (!output_full && port_free) is open. A TMA mf
+  // can also be stuck at the queue head for two *downstream-backpressure*
+  // reasons that prevent access() entirely; without separating them, a low
+  // res_fail could be misread as "admission is not the limiter" when in fact
+  // the head is jammed downstream. These two count those blocked cycles so the
+  // four head-stall causes (dram-queue-full -> gpu_stall_dramfull; output-full;
+  // port-busy; reservation-fail) are fully separable from one TMA run:
+  //  - m_tma_l2_output_full_cycles: head is TMA and m_L2_icnt_queue is full
+  //                                 (L2->ICNT reply queue backpressure)
+  //  - m_tma_l2_port_busy_cycles  : head is TMA, output not full, but the L2
+  //                                 data port is busy this cycle
   unsigned long long m_tma_l2_hits = 0;
   unsigned long long m_tma_l2_pending_hits = 0;
   unsigned long long m_tma_l2_misses = 0;
   unsigned long long m_tma_l2_res_fails = 0;
+  unsigned long long m_tma_l2_output_full_cycles = 0;
+  unsigned long long m_tma_l2_port_busy_cycles = 0;
 };
 
 class L2interface : public mem_fetch_interface {

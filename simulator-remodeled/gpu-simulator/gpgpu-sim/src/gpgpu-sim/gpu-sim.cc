@@ -3420,6 +3420,8 @@ void gpgpu_sim::gpu_print_stat() {
     unsigned long long tma_l2_pending_hits_total = 0;
     unsigned long long tma_l2_misses_total = 0;
     unsigned long long tma_l2_res_fails_total = 0;
+    unsigned long long tma_l2_output_full_cycles_total = 0;
+    unsigned long long tma_l2_port_busy_cycles_total = 0;
     for (unsigned i = 0; i < m_memory_config->m_n_mem_sub_partition; i++) {
       m_memory_sub_partition[i]->accumulate_L2cache_stats(l2_stats);
       m_memory_sub_partition[i]->get_L2cache_sub_stats(l2_css);
@@ -3437,6 +3439,10 @@ void gpgpu_sim::gpu_print_stat() {
       tma_l2_misses_total += m_memory_sub_partition[i]->get_tma_l2_misses();
       tma_l2_res_fails_total +=
           m_memory_sub_partition[i]->get_tma_l2_res_fails();
+      tma_l2_output_full_cycles_total +=
+          m_memory_sub_partition[i]->get_tma_l2_output_full_cycles();
+      tma_l2_port_busy_cycles_total +=
+          m_memory_sub_partition[i]->get_tma_l2_port_busy_cycles();
 
       total_l2_css += l2_css;
     }
@@ -3471,6 +3477,15 @@ void gpgpu_sim::gpu_print_stat() {
         printf("L2_TMA_pending_hits = %llu\n", tma_l2_pending_hits_total);
         printf("L2_TMA_misses = %llu\n", tma_l2_misses_total);
         printf("L2_TMA_reservation_fails = %llu\n", tma_l2_res_fails_total);
+        // Head-of-line backpressure that prevents the TMA admission probe
+        // entirely (so they are NOT part of res_fails). Lets a low res_fail be
+        // distinguished from "head jammed downstream": output_full = L2->ICNT
+        // reply-queue full; port_busy = L2 data port busy. The 4th cause,
+        // dram-queue-full, is the existing global gpu_stall_dramfull.
+        printf("L2_TMA_output_full_cycles = %llu\n",
+               tma_l2_output_full_cycles_total);
+        printf("L2_TMA_port_busy_cycles = %llu\n",
+               tma_l2_port_busy_cycles_total);
         if (tma_l2_probes > 0) {
           printf("L2_TMA_true_hit_rate = %.4lf\n",
                  (double)tma_l2_hits_total / (double)tma_l2_probes);

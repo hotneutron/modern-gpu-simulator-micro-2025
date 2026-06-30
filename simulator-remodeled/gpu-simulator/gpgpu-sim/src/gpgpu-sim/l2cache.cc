@@ -529,6 +529,17 @@ void memory_sub_partition::cache_cycle(unsigned cycle) {
       // L2 is enabled and access is for L2
       bool output_full = m_L2_icnt_queue->full();
       bool port_free = m_L2cache->data_port_free();
+      // Opt6 Part-0: TMA head-of-line backpressure (timing-neutral). When the
+      // head mf is TMA but access() will be skipped this cycle, attribute the
+      // skip to its downstream cause so a low res_fail is not misread as "no
+      // admission pressure". output_full is checked first because that gate is
+      // evaluated first below; port-busy is the remaining skip cause.
+      if (mf->is_tma() && (output_full || !port_free)) {
+        if (output_full)
+          ++m_tma_l2_output_full_cycles;
+        else
+          ++m_tma_l2_port_busy_cycles;
+      }
       if (!output_full && port_free) {
         std::list<cache_event> events;
         if(m_gpu->getShaderCoreConfig()->is_global_memory_accesses_blocks_tracking_enabled && (mf->get_access_type() != CONST_ACC_R)) {

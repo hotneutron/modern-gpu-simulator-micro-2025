@@ -265,8 +265,18 @@ knob), `gpu-sim.cc` + `shader.h` (config flags). Reuse the existing `-tma_debug_
        above HW (fwd 69.58% / bwd 82.26%) ⇒ **synthetic-address hotspot** (the ADDR_MERGE §1-A
        symptom). This is a **6B address** problem; 6A 128B emission cannot fix it because the
        re-probing items are 32B children regardless of TMA emission format.
-     - `L2_TMA_res_fail_per_probe` **low** ⇒ admission is not the limiter; the `lat_drain` is
-       genuine memory round-trip. Neither 6A nor 6B helps, and shaving it would be a fake win.
+     - `L2_TMA_res_fail_per_probe` **low** is **not** conclusive on its own — the hit/miss/res_fail
+       counters only advance when the admission probe actually runs. Disambiguate with the two
+       head-of-line backpressure counters before concluding:
+       - low res_fail **and** low `L2_TMA_output_full_cycles` / `L2_TMA_port_busy_cycles` (and low
+         `gpu_stall_dramfull`) ⇒ admission is genuinely not the limiter; the `lat_drain` is real
+         memory round-trip. Neither 6A nor 6B helps, and shaving it would be a fake win.
+       - low res_fail **but** high `L2_TMA_output_full_cycles` / `L2_TMA_port_busy_cycles` ⇒ the TMA
+         head is jammed by **downstream reply/port backpressure**, a separate fix axis (reply-queue
+         depth / port width), not the address hotspot and not 6A injection.
+       - This is the four-way head-of-line split (dram-queue-full via `gpu_stall_dramfull`,
+         reply-queue-full, port-busy, reservation-fail) that lets a single Part-0 run decide the
+         direction without a follow-up run.
      - A high `L2_TMA_pending_hit_rate` specifically (vs `true_hit_rate`) is the fingerprint of the
        cross-SM single-base collision: many requests merging onto one in-flight miss line. See the
        "always an L2 hit?" note in §2-C.
