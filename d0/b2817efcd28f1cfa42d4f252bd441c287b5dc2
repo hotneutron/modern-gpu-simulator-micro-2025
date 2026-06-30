@@ -1,0 +1,92 @@
+simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/gpu-sim.h
+  s_961fde6bd63f04::t_05c2697a55f655 493 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a442932cd7a2941012ccff8","tool_type":"agent","tool_id":"apply_patch","line_ranges":[{"Single":493}]}]}
+simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/shader.cc
+  s_961fde6bd63f04::t_5c76edd9196dd2 1896 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a44293acd7a2941012cd029","tool_type":"agent","tool_id":"apply_patch","line_ranges":[{"Single":1896}]}]}
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "d0b2817efcd28f1cfa42d4f252bd441c287b5dc2",
+  "prompts": {},
+  "sessions": {
+    "s_961fde6bd63f04": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6a42e6d3cd7a2941012cc8b3",
+        "model": "gpt-5.5__max"
+      },
+      "human_author": "Jihyun Ryoo <jihyun.ryoo@bytedance.com>"
+    }
+  },
+  "attestation_metadata": {
+    "simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/gpu-sim.h": [
+      {
+        "hash": "s_961fde6bd63f04::t_05c2697a55f655",
+        "line_ranges": [
+          {
+            "Single": 493
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a442932cd7a2941012ccff8",
+            "tool_type": "agent",
+            "tool_id": "apply_patch",
+            "line_ranges": [
+              {
+                "Single": 493
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/shader.cc": [
+      {
+        "hash": "s_961fde6bd63f04::t_5c76edd9196dd2",
+        "line_ranges": [
+          {
+            "Single": 1896
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a44293acd7a2941012cd029",
+            "tool_type": "agent",
+            "tool_id": "apply_patch",
+            "line_ranges": [
+              {
+                "Single": 1896
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "remote_transcripts": {
+    "s_961fde6bd63f04": {
+      "tool": "trae",
+      "conversation_id": "6a42e6d3cd7a2941012cc8b3",
+      "session_id": "6a42e6d3cd7a2941012cc8b3",
+      "status": "remote_only",
+      "message": "Remote transcript resolution is not implemented yet for TRAE prompts."
+    },
+    "s_961fde6bd63f04::t_05c2697a55f655": {
+      "tool": "trae",
+      "conversation_id": "6a42e6d3cd7a2941012cc8b3",
+      "session_id": "6a42e6d3cd7a2941012cc8b3",
+      "status": "remote_only",
+      "message": "Remote transcript resolution is not implemented yet for TRAE prompts."
+    },
+    "s_961fde6bd63f04::t_5c76edd9196dd2": {
+      "tool": "trae",
+      "conversation_id": "6a42e6d3cd7a2941012cc8b3",
+      "session_id": "6a42e6d3cd7a2941012cc8b3",
+      "status": "remote_only",
+      "message": "Remote transcript resolution is not implemented yet for TRAE prompts."
+    }
+  }
+}
