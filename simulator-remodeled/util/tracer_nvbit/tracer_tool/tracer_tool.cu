@@ -183,6 +183,16 @@ uint64_t total_incremental_flushes = 0;  // stats counter
 uint64_t total_instructions_flushed = 0;  // stats counter
 int enable_tma_desc = 0;
 int aux_htod_dump_max_bytes = 4096;
+/* Phase 0b (TMA_BASE_ADDR.md §2.13): param-base capture for host-side descriptor
+ * deref. tma_param_base_cbank_index is the c[0x0][K] index the entry ULDC.64 loads
+ * param_base from (0x198 in FA3 fwd; auto-detected by extract_tma_descriptor_offsets.py
+ * and passed via TMA_PARAM_BASE_CBANK_INDEX). tma_param_base_region_bytes is how many
+ * bytes of the param block to cuMemcpyDtoH so the offline harness can slice each 128B
+ * descriptor at param_base + tensormap_offset. */
+int tma_param_base_cbank_index = 0x198;
+int tma_param_base_region_bytes = 8192;
+tma_param_base_capture_t *tma_param_base_capture = nullptr;
+std::unordered_set<int> tma_param_base_deref_header_written;
 std::unordered_set<int> tma_desc_runtime_debug_header_written;
 std::unordered_set<int> tma_desc_producer_debug_header_written;
 std::unordered_set<int> tma_memcpy_dump_header_written;
@@ -606,6 +616,72 @@ static void append_tensor_map_encode_dump_event(int device_id, const cuTensorMap
       << uint64_to_hex_string(qwords[7]) << ","
       << blob_path << "\n";
 }
+
+// Phase 0b (TMA_BASE_ADDR.md §2.13, host-deref Gate 0). Called from the
+// cuLaunchKernel EXIT handler, AFTER the kernel has synced and the channel has
+// flushed (so the captured param_base is populated and the param buffer is still
+// alive). Reads the device-global kernel param block at the captured param_base and
+// dumps a raw region blob + a small param-base record. The OFFSET slicing (128B at
+// param_base + tensormap_offset) and encode-blob comparison happen offline in
+// verify_tma_descriptor_deref.py, so the tracer needs no SASS/offset knowledge.
+static void append_tma_param_base_deref_event(int device_id, int kernel_trace_id) {
+  if (!enable_tma_desc || tma_param_base_capture == nullptr) {
+    return;
+  }
+  if (!tma_param_base_capture->valid || tma_param_base_capture->param_base == 0) {
+    // No entry ULDC c[0x0][K] captured this launch (kernel may not use TMA, or K
+    // mismatch). Leave a note once so a wrong TMA_PARAM_BASE_CBANK_INDEX is visible.
+    return;
+  }
+  create_folder(extrainfo_path.c_str());
+  std::string region_dir = extrainfo_path + "/tma_desc_deref_blobs";
+  create_folder(region_dir.c_str());
+
+  unsigned long long param_base = tma_param_base_capture->param_base;
+  unsigned int uid = tma_param_base_capture->unique_function_id;
+  int region_bytes = tma_param_base_region_bytes;
+  if (region_bytes <= 0) {
+    region_bytes = 8192;
+  }
+
+  std::vector<uint8_t> region(region_bytes, 0);
+  CUresult rc = cuMemcpyDtoH(region.data(),
+                             (CUdeviceptr)param_base, (size_t)region_bytes);
+
+  std::string csv_path = extrainfo_path + "/tma_param_base_deref.csv";
+  bool needs_header = tma_param_base_deref_header_written.find(device_id) ==
+                      tma_param_base_deref_header_written.end();
+  std::ofstream csv(csv_path, needs_header ? std::ios::out : std::ios::app);
+  if (csv.is_open()) {
+    if (needs_header) {
+      tma_param_base_deref_header_written.insert(device_id);
+      csv << "device_id,kernel_id,unique_function_id,param_base_hex,cbank_index_hex,"
+             "region_bytes,memcpy_ok,region_blob_path\n";
+    }
+    std::string blob_path = region_dir + "/uid_" + std::to_string(uid) + "_k_" +
+                            std::to_string(kernel_trace_id) + ".bin";
+    if (rc == CUDA_SUCCESS) {
+      std::ofstream blob(blob_path, std::ios::binary | std::ios::out);
+      if (blob.is_open()) {
+        blob.write(reinterpret_cast<const char *>(region.data()), region_bytes);
+      }
+    }
+    std::ostringstream pb_stream;
+    pb_stream << "0x" << std::hex << param_base;
+    std::ostringstream cbank_stream;
+    cbank_stream << "0x" << std::hex << tma_param_base_cbank_index;
+    csv << device_id << "," << kernel_trace_id << "," << uid << ","
+        << pb_stream.str() << "," << cbank_stream.str() << "," << region_bytes
+        << "," << (rc == CUDA_SUCCESS ? 1 : 0) << ","
+        << (rc == CUDA_SUCCESS ? blob_path : std::string("")) << "\n";
+  }
+
+  // Reset for the next launch so each launch re-captures its own param_base.
+  tma_param_base_capture->valid = 0;
+  tma_param_base_capture->param_base = 0;
+  tma_param_base_capture->unique_function_id = 0;
+}
+
 
 struct cuMemcpyHtoDAsync_v2_params_proxy {
   CUdeviceptr dstDevice;
@@ -1431,6 +1507,10 @@ void nvbit_at_init() {
               "Enable TMA descriptor capture, including runtime desc handle debug and tensor-map descriptor dumps.");
   GET_VAR_INT(aux_htod_dump_max_bytes, "AUX_HTOD_DUMP_MAX_BYTES", 4096,
               "Maximum auxiliary HtoD memcpy payload size to dump when ENABLE_TMA_DESC is enabled.");
+  GET_VAR_INT(tma_param_base_cbank_index, "TMA_PARAM_BASE_CBANK_INDEX", 0x198,
+              "Phase 0b: c[0x0][K] index the entry ULDC.64 loads param_base from (host-deref descriptor recovery).");
+  GET_VAR_INT(tma_param_base_region_bytes, "TMA_PARAM_BASE_REGION_BYTES", 8192,
+              "Phase 0b: bytes of the kernel param block to cuMemcpyDtoH for descriptor slicing.");
   std::string pad(100, '-');
   printf("%s\n", pad.c_str());
 
@@ -1809,6 +1889,46 @@ void instrument_function_if_needed(CUcontext ctx, CUfunction func, int device_id
                                         (uint64_t)&reported_dynamic_instr_counter);
           nvbit_add_call_arg_const_val64(instr, (uint64_t)&stop_report[device_id]);
       }
+
+      /* Phase 0b (TMA_BASE_ADDR.md §2.13): instrument the entry
+       * ULDC.64 URx, c[0x0][K] that loads param_base. K == tma_param_base_cbank_index.
+       * Inject capture_tma_param_base at IPOINT_AFTER so the destination UREG pair
+       * holds the loaded value (param_base). One call per matching site; the device
+       * function keeps only the first write per launch. */
+      if (enable_tma_desc && tma_param_base_capture != nullptr &&
+          opcode_str.rfind("ULDC", 0) == 0) {
+        int dest_ureg = -1;
+        bool matches_param_cbank = false;
+        for (int oi = 0; oi < instr->getNumOperands(); ++oi) {
+          const InstrType::operand_t *op = instr->getOperand(oi);
+          std::string op_text = op->str ? std::string(op->str) : "";
+          if (op->type == InstrType::OperandType::UREG && dest_ureg < 0) {
+            dest_ureg = get_ur_register(op_text);
+          }
+          if (op->type == InstrType::OperandType::CBANK) {
+            /* Match c[0x0][K] by parsing the operand string (avoids depending on
+             * the NVBit cbank struct field name across versions). The second
+             * bracketed value is the constant offset K. */
+            size_t first_lb = op_text.find('[');
+            size_t second_lb = op_text.find('[', first_lb + 1);
+            if (second_lb != std::string::npos) {
+              int parsed_offset = (int)strtol(
+                  op_text.c_str() + second_lb + 1, nullptr, 0);
+              if (parsed_offset == tma_param_base_cbank_index) {
+                matches_param_cbank = true;
+              }
+            }
+          }
+        }
+        if (matches_param_cbank && dest_ureg >= 0) {
+          nvbit_insert_call(instr, "capture_tma_param_base", IPOINT_AFTER);
+          nvbit_add_call_arg_guard_pred_val(instr);
+          nvbit_add_call_arg_const_val32(instr, next_candidate_unique_function_id);
+          nvbit_add_call_arg_ureg_val(instr, dest_ureg);      /* param_base lo */
+          nvbit_add_call_arg_ureg_val(instr, dest_ureg + 1);  /* param_base hi */
+          nvbit_add_call_arg_const_val64(instr, (uint64_t)tma_param_base_capture);
+        }
+      }
       cnt++;
     }
 
@@ -2132,6 +2252,15 @@ void nvbit_at_cuda_event(CUcontext ctx, int is_exit, nvbit_api_cuda_t cbid,
        * current kernel */
       while (recv_thread_receiving[ctx]) {
         pthread_yield();
+      }
+
+      /* Phase 0b (TMA_BASE_ADDR.md §2.13): the kernel is fully done and the channel
+       * is drained, so the captured param_base is populated and the kernel param
+       * buffer is still alive. Deref the param region on the app thread here (never
+       * from the recv thread). kernel_id was incremented at launch, so the just-
+       * finished kernel is kernel_id-1. */
+      if (enable_tma_desc && !stop_report[device_id]) {
+        append_tma_param_base_deref_event(device_id, kernel_id[device_id] - 1);
       }
 
       unsigned total_insts_per_kernel =
@@ -3052,6 +3181,16 @@ void init_context_state(CUcontext ctx) {
       stop_report[i] = false;
       kernel_id.push_back(1);
       current_stream_id.push_back(0);
+    }
+    /* Phase 0b: one managed param-base capture slot (single device assumed here,
+     * matching the rest of the tool's single-stream simplification). */
+    if (enable_tma_desc) {
+      CUDA_SAFECALL(cuMemAllocManaged(
+          reinterpret_cast<CUdeviceptr *>(&tma_param_base_capture),
+          sizeof(tma_param_base_capture_t), CU_MEM_ATTACH_GLOBAL));
+      tma_param_base_capture->param_base = 0;
+      tma_param_base_capture->unique_function_id = 0;
+      tma_param_base_capture->valid = 0;
     }
   }
   CTXstate* ctx_state = ctx_state_map[ctx];

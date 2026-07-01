@@ -61,3 +61,15 @@ typedef struct {
   uint32_t num_of_injects;
   uint32_t per_operand_type;
 } inst_trace_t;
+
+/* Phase 0b (TMA_BASE_ADDR.md §2.13, host-deref Gate 0):
+ * one managed slot per device that the entry ULDC.64 URx, c[0x0][K] writes its
+ * loaded value (param_base, the device-global pointer to the kernel param block)
+ * into, once per launch. The host reads it after cuLaunchKernel sync and
+ * cuMemcpyDtoH's the param region so the offline harness can slice each 128B
+ * descriptor at param_base + tensormap_offset. */
+typedef struct {
+  unsigned long long param_base;
+  unsigned int unique_function_id;
+  int valid;
+} tma_param_base_capture_t;

@@ -55,6 +55,44 @@ exists (device side), but there is **no reliable key that ties one executed
 `UTMALDG` to one of the 7 host bases**. Every prior attempt failed on this exact
 join. §2.9 gives the only join that actually works (host launch-argument order).
 
+## 0.01 How the gap dissolves (resolution summary — read this first)
+
+The gap was unsolvable **only because we tried to find a common field** (a value
+present on both sides). There is none: `desc_hi` is device-only + non-unique,
+`global_address` is host-only, `tensor_map_ptr` is a reused host VA. So stop matching
+fields — instead **go to the memory where the descriptor lives and read the base
+directly**, exactly like the HW does.
+
+Two device-observable facts make this work (proven in §2.10/§2.11):
+- the by-value `CUtensorMap` copy physically sits at `param_base + static_offset` in
+  **device global memory**, and
+- `static_offset` is recoverable **per pc and unique per tensor** from the SASS
+  def-chain (strictly stronger than `desc_hi` — it separates the two tensors that share
+  `desc_hi=0x14f00000`).
+
+```
+ [Host: cuTensorMapEncodeTiled]                 [Device: executed UTMALDG at pc]
+   writes 128B descriptor                         pc ──def-chain(§2.11)──▶ static_offset (unique)
+   base = qword0                                  param_base = runtime value of c[0x0][0x198]
+        │                                                  │
+        │  passed BY VALUE → the same 128B is             descriptor_VA = param_base + offset
+        │  copied into the device param buffer            │
+        │                                          deref 128B at that VA ─▶ base = qword0
+        │                                                  │
+        └── they meet HERE: the memory holding the by-value copy ──┘
+                    (host encode dump is now only a cross-check)
+```
+
+- **The "missing common key" was the wrong thing to look for.** The real join is the
+  **descriptor's memory location (VA)**, computed entirely from device-side signals
+  (`param_base` + `offset`). Whoever reads that VA — the HW, a device-side load, or a
+  host `cuMemcpyDtoH` — gets the identical bytes.
+- **Identity is decided on the device (offset), not by host matching.** `param_base`
+  (runtime) and `offset` (static per pc) both come from the device world; the host only
+  performs the final *read*. So host deref does **not** reintroduce the join problem.
+- **Host encode dump is demoted to validation.** It is no longer the authority; it is a
+  defense-in-depth cross-check that the run-time bytes equal the encode-time bytes.
+
 ## 0.05 Key concepts (plain-language glossary)
 
 Before the mechanics, the five recurring terms, by analogy to an **apartment
@@ -498,29 +536,115 @@ Two decisive facts:
 So Path B is confirmed twice: the address is recoverable (§2.10) **and** the key it
 provides is unique where `desc_hi` was not (§2.11).
 
+## 2.12 OPEN GATE (Gate 0) — prove `deref(param_base+offset)` is the right 128B for ALL offsets
+
+§2.11 proved the **key** (offset↔tensor is 1:1). It did **not** prove the **value**:
+that reading 128B at `param_base + (offset−0x198)` returns the descriptor whose
+`qword0` equals that tensor's `global_address_hex`. §2.10(c) only matched **1 of 7**
+bases directly; the rest is still assumed. This must be closed **before** writing the
+tracer, because it is the single load-bearing assumption of Path B.
+
+Gate 0 is a spike whose by-product **is** the `offset → encode-row` binding table, so
+verification and deliverable are the same artifact:
+
+1. Device: capture the runtime 64-bit `param_base` (the `ULDC.64 c[0x0][0x198]` value)
+   once per launch.
+2. For each of the 5 offsets, obtain 128B at `param_base + (offset−0x198)` (mechanism
+   per §2.13) and byte-compare against every `tensor_map_encode_blobs/*.bin`.
+3. **Pass = each offset matches exactly one encode blob, and its `qword0` equals that
+   row's `global_address_hex`.** All 5 unique ⇒ Path B holds.
+4. **Fail** (a VA is not host-readable, or a blob does not match) ⇒ fall back to
+   **Path A** (launch-arg by-value dump, §2.5-4(b)): dump the by-value `CUtensorMap`
+   bytes from `p->kernelParams` at `cuLaunchKernel` and match to an encode blob — no
+   runtime deref at all.
+
+## 2.13 DECISION (chosen: HOST DEREF) — how to obtain the 128B
+
+Both device and host deref read the **same device-global bytes** (§3.1 "where the
+descriptor lives"). **Decision: host deref**, because it needs no `inst_trace_t`/channel
+change and reuses the existing encode-blob infrastructure.
+
+| Option | Reads what HW reads | Trace-gen cost | Main risk | Status |
+|---|---|---|---|---|
+| **Host deref** (`cuMemcpyDtoH(param_base+off,128)`) | yes, same bytes | small (capture `param_base` only) | param-buffer lifetime; VA host-copyable | **CHOSEN** |
+| Device deref (inject 128B load at site) | yes, at exec time | `inst_trace_t` + channel + inject_funcs | larger diff | not chosen |
+| Path A (launch-arg by-value dump) | yes (the copied blob) | enable `nvbit_get_kernel_argument_sizes` | — | **fallback if Gate 0 fails** |
+
+**Concrete host-deref mechanism (what Phase 0b implements):**
+- **Capture `param_base`.** Instrument the kernel-entry `ULDC.64 URx, c[0x0][K]`
+  (K = the param-base cbank index, `0x198` in FA3 fwd; auto-detected by §3.1 step 1)
+  and read its **destination** UREG pair at `IPOINT_AFTER` — that is the loaded
+  `param_base` (grid-uniform, capture once per `(device, uid)`).
+- **Deref at a deadlock-free time.** Do the `cuMemcpyDtoH` from the **application
+  thread in the `cuLaunchKernel` exit handler, after `cuCtxSynchronize`** (kernel done,
+  channel drained, param buffer still alive before returning to the app). Never memcpy
+  from the recv thread mid-kernel (that can deadlock the channel).
+- **Which offsets.** Read the 5 offsets from `tma_descriptor_offsets.json` (Phase 0a),
+  compute `VA = param_base + tensormap_offset`, dump 128B + qwords to
+  `tma_descriptor_deref.csv` (+ per-offset `.bin`).
+
+This is exactly the pair of risks Gate 0 (§2.12) exists to test: (a) is the const-bank
+param VA host-copyable, and (b) is the post-sync buffer still valid. If either fails,
+switch to Path A.
+
 ## 3. Design
 
-### 3.1 Trace-gen (NVBit) — dereference the descriptor and dump ALL fields (Path B)
+### 3.1 Trace-gen (NVBit) — capture param_base + static offset, deref the descriptor, dump ALL fields (Path B)
 
 Files: `util/tracer_nvbit/tracer_tool/tracer_tool.cu`,
-`util/tracer_nvbit/tracer_tool/inject_funcs.cu`.
+`util/tracer_nvbit/tracer_tool/inject_funcs.cu`,
+`util/tracer_nvbit/discover_tma_producers.py`.
+
+**Where the descriptor actually lives (corrects a common misread).** `c[0x0][0x198]`
+does **not** hold the descriptor. It holds a 64-bit **pointer** (`param_base`) into
+**device global memory** where the by-value `CUtensorMap` copies sit (§0.05). SASS
+proof (§2.10): `ULDC.64` loads `param_base` from the constant bank, then
+`[param_base + 0x1f0]` is dereferenced as a **global address** by `UTMACCTL.PF` /
+`UTMALDG`. So the descriptor bytes are device-global and are exactly the bytes the TMA
+engine reads. This is why *both* deref options below read the identical, authoritative
+bytes — they differ only in *who* issues the read, not *which* memory.
 
 The device job is to recover, per executed descriptor-carrying TMA site, the
-**descriptor address** and dump the **whole 128B descriptor** (not just the base),
-so every descriptor field comes from **one authoritative source** and all inference
-is eliminated.
+**descriptor VA** and dump the **whole 128B descriptor** (not just the base), so every
+descriptor field comes from **one authoritative source** and all inference is
+eliminated. Two ingredients, combined per site:
 
-1. **Static per-pc offset (def-chain).** Recover the descriptor operand's origin
-   `param_base@c[0x0][K0] + fixed_offset` via the def-chain (§2.11; constant per pc).
-   Operand per family (§2.6): operand-2 for `UTMALDG`/`UTMAREDG`, operand-1 pair for
-   `UTMASTG`, `desc[URx]` for desc-backed `UBLKRED`.
-2. **Runtime descriptor VA.** Capture the runtime value of that operand — it already
-   evaluates to `param_base + fixed_offset`, i.e. the exact 64-bit **descriptor VA**.
-3. **Dereference + dump 128B.** Read 128 bytes at that VA and emit the 8 qwords per
-   site (qword0 = base; rest = dim/stride/box/swizzle/etc).
-4. Emit to `tma_transfer_addr_debug.csv`, keyed by
-   `(unique_function_id, pc_hex, descriptor_va, cta_x/y/z, warp_id_tb, sm_id)`, plus
-   the coordinate operand value for `UTMALDG`.
+1. **Static per-pc offset (def-chain, offline).** Trace the descriptor operand
+   (per family, §2.6: operand-2 for `UTMALDG`/`UTMAREDG`, operand-1 pair for
+   `UTMASTG`, `desc[URx]` for desc-backed `UBLKRED`) back to
+   `c[0x0][0x198] + Σ UIADD3 immediates`. This yields a per-pc **key** =
+   `0x198 + tensormap_offset`, exactly the 5 values verified in §2.11
+   (`0x388/0x448/0x508/0x5c8/0x688`). The global offset to add to `param_base` is
+   `(key − 0x198) = tensormap_offset ∈ {0x1f0,0x2b0,0x370,0x430,0x4f0}`.
+   **IMPORTANT:** the *executed operand's runtime value is SMEM* (§2.8) and must **NOT**
+   be used as the VA — only this static offset is the key. Fold the §2.11 script into
+   `discover_tma_producers.py` as a first-class `(uid, pc) → tensormap_offset` emitter.
+2. **Runtime `param_base`.** Capture the runtime 64-bit value loaded by
+   `ULDC.64 c[0x0][0x198]` **once per launch** (it is grid-uniform). The existing
+   `CONSTANT_MEM` / producer-capture path already reads `c[0x0][…]` values, so this is
+   cheap.
+
+`descriptor_VA = param_base + (key − 0x198)`. Deref 128B there and emit the 8 qwords
+(qword0 = base; rest = dim/stride/box/swizzle/…). The deref needs only **one read per
+distinct offset** (5 for fwd), so gate it to first-touch per `(uid, pc)`.
+
+**Deref mechanism (the one open decision — see §2.13):**
+- **(primary, "same as HW") device-side deref.** Inject a 128B global load of
+  `param_base+offset` at first-touch of each descriptor site; push the bytes on the
+  channel. Reads exactly what the TMA engine reads, at kernel-exec time, **no lifetime
+  risk**. Needs `inst_trace_t`/channel extension.
+- **(alternative) host-side deref.** Capture `param_base` on device, then
+  `cuMemcpyDtoH(param_base+offset, 128)` in the launch callback. Reads the **identical**
+  device-global bytes; lighter (no channel change). Caveat: param-buffer **lifetime** +
+  confirm the VA is host-copyable (Gate 0).
+- Either way, **cross-check** the dumped 128B against the host encode blobs
+  (`tensor_map_encode_blobs/*.bin`). This both binds `offset → encode row` and validates
+  that the encode-time base still equals the run-time base.
+
+Emit to `tma_transfer_addr_debug.csv`, keyed by
+`(unique_function_id, pc_hex, tensormap_offset, descriptor_va, cta_x/y/z, warp_id_tb,
+sm_id)`, plus the 8 qwords. **Per-transfer coordinates remain uncaptured** (§0) — that
+is a separate mini-spike and is only needed for milestone 2 (§3.3).
 
 ### 3.2 Trace-gen (python) — decode the 128B descriptor, DELETE all heuristics, assert-on-fail
 
@@ -531,16 +655,21 @@ Files: `util/tracer_nvbit/build_tma_descriptor_mapping.py`.
    element_strides, interleave, swizzle, l2_promotion, oob_fill). This is the exact
    descriptor HW used — no `handle_hi` family lookup, no rank inference, no
    box-family guessing.
-2. **Cross-check against the host encode dump (defense-in-depth).** Match the dumped
+2. **Re-key the resolver on `(uid, pc, tensormap_offset)`, not `handle_hi`.** The
+   output binding key becomes the def-chain offset (§2.11), which is strictly stronger
+   than `handle_hi` (it separates `0x448`/`0x508` that share `desc_hi=0x14f00000`).
+   `handle_hi_hex` may stay as a debug column but is no longer part of the key.
+3. **Cross-check against the host encode dump (defense-in-depth).** Match the dumped
    128B (or decoded fields) to a row in `tensor_map_encode_dump.csv` /
    `tensor_map_encode_blobs/*.bin`, validating the device decode against host truth.
-3. **DELETE every heuristic (per user).** Remove entirely, not merely as "final
+4. **DELETE every heuristic (per user).** Remove entirely, not merely as "final
    authority": `handle_hi_to_box_dim_family_with_opcode_rank`,
    `single_rank_candidate_config`, `same_function_desc_reg_config_reuse`,
-   `*_inferred_rank_from_handle_reuse`, `*_inferred_rank_from_desc_reg_reuse`. With
-   the descriptor bytes in hand the resolver becomes a direct decode, not a matcher;
-   `handle_hi`/`config_id` family logic is obsolete.
-4. **Assert-on-fail (hard, per user).** Every executed descriptor-carrying site must
+   `*_inferred_rank_from_handle_reuse`, `*_inferred_rank_from_desc_reg_reuse`
+   (build_tma_descriptor_mapping.py:152-322). With the descriptor bytes in hand the
+   resolver becomes a direct decode, not a matcher; `handle_hi`/`config_id` family
+   logic is obsolete.
+5. **Assert-on-fail (hard, per user).** Every executed descriptor-carrying site must
    yield exactly one decoded descriptor. If a site has no dumped 128B, a malformed
    blob, or a device-decode that does NOT match any host encode row, `assert`/abort
    with `(uid, pc, opcode, descriptor_va, dumped qwords, nearest encode row)`. No
@@ -548,18 +677,39 @@ Files: `util/tracer_nvbit/build_tma_descriptor_mapping.py`.
 
 ### 3.3 Simulator — carry the full decoded descriptor, compute HW address, assert on miss
 
-Files: `tma_types.h`, `gpu-sim.cc` (loader), `tma_unit_sm.{h,cc}`.
+Files: `tma_types.h`, `gpu-sim.cc` (loader + `lookup_tma_site_metadata`),
+`tma_unit_sm.{h,cc}`, and the trace-delivery path
+(`address.proto`, `trace_parser.cc`, `trace_driven.cc`, `abstract_hardware_model.h`).
 
-1. `TMADescriptorConfigMetadata` / `TMACommand`: add `global_base` (u64), keep
-   `global_strides`, populate `TMACommand.coords[]` (tma_types.h:250, currently 0).
-2. Loader (gpu-sim.cc:340-389): parse the per-site decoded descriptor (base + all
-   fields) keyed by `(uid, pc, descriptor_va)`.
-3. Mover (tma_unit_sm.cc:633-639): replace the synthetic base with
-   `agu_base = global_base + sum(coord[d]*global_stride[d]) + agu_index*128`.
-4. **Assert on lookup miss.** When a TMA command is issued and the flag is on,
-   resolving its descriptor must succeed; if the loader has no entry for `(uid, pc)`
-   or no base is present, `assert` — never silently fall back to the synthetic base.
-5. **Gated flag** `-tma_real_base_addr_enable` (default off) for clean A/B. When on,
+1. **Types (`tma_types.h`).** Add `global_base` (u64) to
+   `TMADescriptorConfigMetadata`; change the binding key
+   `TMADescriptorLookupKey` from `{uid, pc, handle_hi}` (tma_types.h:66-75) to
+   `{uid, pc, tensormap_offset}`; populate `TMACommand.global_base`,
+   `TMACommand.global_strides`, and `TMACommand.coords[]` (tma_types.h:250, currently 0).
+2. **Trace delivery (only if the offset must travel per-instruction).** The offset is
+   static per pc, so it can be joined in the loader from the resolver JSON **without a
+   proto change** — prefer that. A proto/`trace_parser`/`trace_driven` field
+   (address.proto:5-13 → trace_driven.cc:399) is only needed if per-transfer `coords`
+   are later delivered from the trace (milestone 2).
+3. **Loader (`gpu-sim.cc:330-438`, `lookup_tma_site_metadata:647-701`).** Parse the
+   per-site decoded descriptor (base + all fields) keyed by
+   `{uid, pc, tensormap_offset}`; drop `handle_hi` consumption. Set
+   `metadata.descriptor_config.global_base`.
+4. **Command build (`tma_unit_sm.cc:344-388`).** Copy `global_base`/`global_strides`
+   into the `TMACommand`; **assert on lookup miss** when the flag is on (extend the
+   existing Phase-2 assert block at tma_unit_sm.cc:415-459) — never silently fall back
+   to the synthetic base.
+5. **Mover (`tma_unit_sm.cc:633-639`), two milestones.** Replace the synthetic
+   `(transfer_uid<<20)` base:
+   - **Milestone 1 (base-only, no coords):**
+     `agu_base = global_base + agu_index*128`. Kills the cross-SM `(uid<<20)` hotspot.
+   - **Milestone 2 (coords):** `+ Σ_d coord[d]*global_stride[d]` once the coord
+     mini-spike (§3.1) lands.
+   > Accuracy caveat: milestone 1 alone makes every CTA reading the same tensor overlap
+   > on `base..base+24KB`, which can push `L2_TMA_true_hit_rate` *higher*, not lower.
+   > The hotspot artifact is gone, but real L2 realism needs coords — judge each
+   > milestone by §4.2 L2-hit realism, not by cycle sign.
+6. **Gated flag** `-tma_real_base_addr_enable` (default off) for clean A/B. When on,
    the synthetic-base path is dead code (the assert guarantees real base is used).
 
 ## 4. Verification (aligns with TMA_LATENCY_INJECTION §4 gates)
@@ -592,17 +742,67 @@ must be cross-checked together at the very end.
 2. **Spike 3 — DONE (§2.10, §2.11):** confirmed that the runtime descriptor address
    is recoverable as `param_base + static_offset`, and that this key is strictly
    stronger than `desc_hi`.
-3. **Trace-gen NVBit (§3.1):** dump the executed site's **descriptor VA + full 128B
-   descriptor bytes** for every descriptor-carrying family.
-4. **Trace-gen python (§3.2):** decode that dumped 128B directly into the final
-   descriptor metadata, delete all heuristic binding code, and `assert` on any
-   missing / malformed / ambiguous mapping.
-5. **Simulator (§3.3):** consume the decoded per-site descriptor, replace the
-   synthetic base path with real descriptor-derived address generation, and `assert`
-   on lookup miss when the feature is enabled.
-6. **Validation:** compare device-dumped 128B against host encode blobs, then run the
+3. **Gate 0 — TODO first (§2.12/§2.13):** prove `deref(param_base+offset)` returns the
+   correct 128B for **all 5 offsets** (not just 1/7), and pick the deref mechanism
+   (device vs host). Its by-product is the `offset → encode-row` binding table. Nothing
+   below starts until Gate 0 passes (or Path A fallback is chosen).
+4. **Trace-gen NVBit (§3.1):** fold the §2.11 def-chain into
+   `discover_tma_producers.py` to emit `(uid,pc)→tensormap_offset`; capture
+   `param_base`; dump the site's **128B descriptor** for every descriptor-carrying
+   family. **Do not** use the executed operand's runtime value (SMEM, §2.8) as the VA.
+5. **Trace-gen python (§3.2):** decode that dumped 128B directly into the final
+   descriptor metadata, re-key on the offset, delete all heuristic binding code, and
+   `assert` on any missing / malformed / ambiguous mapping.
+6. **Simulator (§3.3):** consume the decoded per-site descriptor keyed by offset,
+   replace the synthetic base path with real descriptor-derived address generation
+   (milestone 1 base-only, then milestone 2 coords), and `assert` on lookup miss when
+   the feature is enabled.
+7. **Validation:** compare device-dumped 128B against host encode blobs, then run the
    real-base A/B and judge success by L2-hit realism first, not by cycle sign.
 
-*Files touched (summary):* `tracer_tool.cu`, `inject_funcs.cu`,
-`build_tma_descriptor_mapping.py`, `tma_types.h`, `gpu-sim.cc`,
-`tma_unit_sm.{h,cc}`.
+*Files touched (summary):* `discover_tma_producers.py`, `tracer_tool.cu`,
+`inject_funcs.cu` (+ `common.h`, channel — device-deref only),
+`build_tma_descriptor_mapping.py`, `tma_types.h`, `gpu-sim.cc`, `tma_unit_sm.{h,cc}`;
+`address.proto` + `trace_parser.cc` + `trace_driven.cc` + `abstract_hardware_model.h`
+only if per-transfer coords are delivered (milestone 2).
+
+## 6. Implementation status (host-deref plan, confirmed)
+
+Phased execution. Phase 0 (Gate 0) gates everything else.
+
+| Phase | What | Where it runs | Status |
+|---|---|---|---|
+| **0a** | def-chain offset extractor `(uid,pc)→tensormap_offset` | offline (needs SASS) | **DONE** — `extract_tma_descriptor_offsets.py` (self-tested on synthetic SASS) |
+| **0c** | Gate 0 verify harness: dumped 128B ↔ encode blob, base==qword0, executed-only coverage | offline (pure python) | **DONE** — `verify_tma_descriptor_deref.py` (self-tested: good + 6 failure modes) |
+| **0b** | tracer: capture `param_base` (ULDC c[0x0][K] dest, IPOINT_AFTER) + `cuMemcpyDtoH` the param **region** at launch-exit → `tma_param_base_deref.csv` + region blob | GPU server (build tracer) | **CODE READY** — needs server build+run |
+| **1** | fold 0a into pipeline; run 0a on real fwd/bwd SASS | GPU server | after 0b |
+| **2** | python direct-decode + re-key on offset + delete heuristics + assert | offline | pending Gate 0 pass |
+| **3** | simulator: `global_base` field, offset key, real-addr mover (M1 base-only → M2 coords), assert | GPU server | pending Gate 0 pass |
+
+**Gate 0 run recipe (server):**
+```
+# 1. extract static offsets from SASS (writes extra_info/tma_descriptor_offsets.json)
+python3 extract_tma_descriptor_offsets.py --traces <kernel_traces_dir>
+#    → also prints the auto-detected param-base cbank index (0x198 for FA3 fwd)
+
+# 2. rebuild the tracer, then re-run the app with descriptor capture on:
+#      ENABLE_TMA_DESC=1
+#      TMA_PARAM_BASE_CBANK_INDEX=0x198   # from step 1 if not the default
+#      TMA_PARAM_BASE_REGION_BYTES=8192   # >= max(tensormap_offset)+128
+#    tracer captures param_base at the entry ULDC and, at each launch-exit (post-sync),
+#    cuMemcpyDtoH's the param region → extra_info/tma_param_base_deref.csv
+#      + extra_info/tma_desc_deref_blobs/*.bin
+
+# 3. verify: slice each 0a offset out of the region blob, match to an encode blob,
+#    check qword0 == real base, executed-only coverage
+python3 verify_tma_descriptor_deref.py --traces <kernel_traces_dir> --strict
+#    → writes extra_info/tma_descriptor_offset_binding.json (the base binding table)
+```
+PASS ⇒ proceed to Phase 2/3. FAIL ⇒ Path A fallback (§2.13).
+
+**Design note (why the tracer dumps a region, not per-offset 128B):** the tracer has no
+SASS/offset knowledge at runtime, so it dumps one raw param-region blob per launch
+(`param_base` + `TMA_PARAM_BASE_REGION_BYTES`). The offline harness slices each 128B
+descriptor at `region[tensormap_offset : +128]` using the 0a offsets. This keeps 0b
+independent of 0a (no chicken-and-egg) and puts all matching logic in one testable
+place.

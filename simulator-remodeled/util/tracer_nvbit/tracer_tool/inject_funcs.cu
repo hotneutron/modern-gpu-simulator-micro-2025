@@ -162,3 +162,30 @@ extern "C" __device__ __noinline__ void instrument_inst(
     atomicAdd((unsigned long long *)preported_dynamic_instr_counter, 1);
   }
 }
+
+/* Phase 0b (TMA_BASE_ADDR.md §2.13). Injected at IPOINT_AFTER on the kernel-entry
+ * ULDC.64 URx, c[0x0][K] that loads param_base. dst_lo/dst_hi are the loaded
+ * destination UREG pair (read post-execution => the param_base value). First
+ * active lane records it once per launch into the managed slot; the host reads it
+ * after the launch syncs and cuMemcpyDtoH's the param region. */
+extern "C" __device__ __noinline__ void capture_tma_param_base(
+    int32_t pred, uint32_t unique_function_id, uint32_t dst_lo, uint32_t dst_hi,
+    uint64_t pcapture) {
+  if (!pred) {
+    return;
+  }
+  const int active_mask = __ballot_sync(__activemask(), 1);
+  const int laneid = get_laneid();
+  const int first_laneid = __ffs(active_mask) - 1;
+  if (first_laneid != laneid) {
+    return;
+  }
+  tma_param_base_capture_t *slot = (tma_param_base_capture_t *)pcapture;
+  /* first writer per launch wins (grid-uniform value; slot->valid reset by host
+   * before each launch). */
+  if (atomicCAS(&slot->valid, 0, 1) == 0) {
+    slot->param_base =
+        ((unsigned long long)dst_hi << 32) | (unsigned long long)dst_lo;
+    slot->unique_function_id = unique_function_id;
+  }
+}
