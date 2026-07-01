@@ -294,6 +294,136 @@ knob), `gpu-sim.cc` + `shader.h` (config flags). Reuse the existing `-tma_debug_
    realistic L2 locality; a cycle win is rejected if L2 hit rate balloons above HW.
 6. Record cycle deltas vs Opt 5 (fwd 149,727 / bwd 241,425) and vs 6A in `FA3_progress.md`.
 
+## 4.5 Part-0 result (measured — fwd `.o24` / bwd `.o6`, 2026-07-01)
+
+Runs are the current tree (new `L2_TMA_*` + backpressure counters), clean exit, and **timing-neutral
+vs the pre-instrumentation runs**: fwd 151,232 (vs `.o23` 151,350, -0.08%) / bwd 240,869 (vs `.o5`
+241,238, -0.15%). SM-idle axis reproduced: fwd `wait_barrier` 9.82% / bwd 10.93% + `tma_flush`
+4.64%.
+
+**The four-way head-of-line split resolves the gate to: neither 6A nor 6B — the limiter is the
+L2→core reply path.**
+
+| Metric | FWD (`.o24`) | BWD (`.o6`) | Reading |
+|---|---|---|---|
+| `L2_TMA_res_fail_per_probe` | **0.0000** | **0.0000** | not the synthetic-address hotspot → 6B is not the current lever |
+| `L2_TMA_port_busy_cycles` | 0 | 0 | L2 data port is not the limiter |
+| `L2_TMA_output_full_cycles` | **180,998** | **314,724** | **reply queue (`m_L2_icnt_queue`) full → admission stalls** |
+| `gpu_stall_icnt2sh` | 258,818 | 464,997 | interconnect reply port has no buffer → the root upstream cause |
+| `gpu_stall_dramfull` | 189,115 | 279,825 | DRAM-return queue also backs up (secondary) |
+| TMA `lat_emit` vs `lat_drain` (sample) | 63 vs 1990 | 641 vs 2246 | `lat_drain` dominates → cost is waiting for completion, **not** injection (6A) |
+| `L2_TMA_true_hit_rate` | 0.9846 | 0.9657 | see fake-locality caveat below |
+
+**Why 6A is ruled out:** `lat_emit` is small and `L2_TMA_res_fail_per_probe`/`port_busy` are zero, so
+the 32B→128B emission change (which only relieves the mover→ICNT→`push()` segment) cannot move the
+needle. The time is in `lat_drain` — waiting for the 768 sector responses to come back.
+
+**Root cause (structural):** one TMA load = 768×32B responses that must all traverse
+`m_L2_icnt_queue`, but that queue is drained **one mf per sub-partition per cycle**, and only when
+`icnt_has_buffer` is true ([gpu-sim.cc:3993-4011](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/gpu-sim.cc#L3993-L4011)). When the interconnect reply
+port is busy (`gpu_stall_icnt2sh`), the queue fills (`output_full`), which stops L2 admission, which
+parks the consumer warpgroup on its mbarrier (`wait_barrier` SM-idle). So the chain is:
+`icnt reply port busy → m_L2_icnt_queue full → L2 admission stalls → TMA head blocked → wait_barrier`.
+
+**Correction (supersedes an earlier note): do not compare `gpu_stall_icnt2sh` against
+`output_full_cycles` as if they were the same population.** They count different scopes:
+- `L2_TMA_output_full_cycles` — only cycles where the **TMA** mf is at the queue head
+  ([l2cache.cc:537](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/l2cache.cc#L537)).
+- `gpu_stall_icnt2sh` — **all** reply mf (TMA + normal LDG/STG) that could not be injected into the
+  icnt this cycle ([gpu-sim.cc:4014](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/gpu-sim.cc#L4014)).
+So "`icnt2sh` (258K) > `output_full` (181K)" does **not** mean the consumer stalls more often than
+the queue fills. Both being large is the valid signal; their magnitudes are not directly comparable.
+
+**Why experiments 1/2/3 are related — the reply path is a 4-stage serial pipe, and the true root
+is a producer/consumer imbalance:**
+
+```
+[Producer: up to 2 push/cycle]        [Buffer]            [Drain: 1 pop/cycle]     [Network]
+ L2 fill response  ─┐  (l2cache.cc:483)
+                    ├─push→  m_L2_icnt_queue  ──pop(1/cyc)──→  icnt_push  ──→  icnt reply network
+ admission HIT     ─┘  (l2cache.cc:558)         (depth = exp2)    (rate = exp1)     (exp3)
+```
+
+- The **producer** pushes from **two** sites in one `cache_cycle` — the L2 fill response
+  ([l2cache.cc:483](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/l2cache.cc#L483)) and the admission HIT reply
+  ([l2cache.cc:558](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/l2cache.cc#L558)) — while the **consumer** pops only
+  **one** mf per sub-partition per cycle ([gpu-sim.cc:4011](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/gpu-sim.cc#L4011)). That is a
+  **structural up-to-2:1 imbalance**, amplified right now because the fake 98% L2 hit rate makes the
+  admission-HIT producer fire on almost every probe.
+- Therefore **exp 2 (queue depth) alone cannot fix it**: a deeper FIFO only absorbs a longer burst;
+  with producer > consumer the queue re-fills. Depth buys latency tolerance, not throughput.
+- **They must NOT be run together.** A serial pipe's throughput is set by its narrowest stage, so
+  changing depth (exp2) and drain-rate (exp1) and network (exp3) at once reproduces exactly the
+  confounding that Opt 6A/6B split was created to avoid. Change one stage, observe whether the
+  bottleneck *moves* to the next stage, then decide.
+
+### Proposed next experiments (in order)
+
+Run **exp 2 first as a pure config probe** (no rebuild), read the already-emitted counters, and let
+the result select the next step:
+
+| exp 2 outcome | interpretation | next |
+|---|---|---|
+| `output_full`↓ **and** cycles↓ meaningfully | depth was the limiter | done (skip 1/3) |
+| `output_full`↓ but cycles ~flat **and** `gpu_stall_icnt2sh` ~flat | the real cap is downstream **drain/icnt**, not depth | exp 1, then 3 if needed |
+| nothing moves | another queue gates (check `gpu_stall_dramfull`) | re-examine DRAM axis |
+
+Predicted outcome: the **middle row** (the 2:1 imbalance is the root, so depth alone won't move
+cycles). If confirmed, exp 1 (raise drain to N mf/sub-partition/cycle) directly targets the
+imbalance and comes before exp 3.
+
+1. **Structural (root cause): drain more than 1 reply mf per sub-partition per cycle, gated by real
+   reply bandwidth.** The single-mf-per-cycle drain in
+   [gpu-sim.cc:3993-4019](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/gpu-sim.cc#L4001-L4043) was a per-mf serialization: a 128B line
+   returns as 4×32B and each 32B ate one drain slot. **Implemented (config flag, default-off):**
+   `-gpgpu_l2_reply_drain_per_cycle N` lets each sub-partition eject up to N reply mf per ICNT tick.
+   `N=1` = original behavior. Each drained mf **still passes `icnt_has_buffer` + `icnt_push`**, so
+   the icnt reply-bandwidth accounting is unchanged — this removes only the artificial ejection cap,
+   keeping exp1 (drain rate) and exp3 (icnt bandwidth) separable. `N=4` matches 128B=4×32B.
+2. **Config-only A/B (do first as the probe above): deepen the L2→icnt queue.**
+   `-gpgpu_dram_partition_queues` (bound to `gpgpu_L2_queue_config`,
+   [gpu-sim.cc:854-855](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/gpu-sim.cc#L854-L855)) fields are
+   `icnt→L2 : L2→dram : dram→L2 : L2→icnt(reply)`; the **4th** field is the `m_L2_icnt_queue` depth.
+   **Note this config already sets `64:64:64:64` — the reply queue is already deep (64), not the
+   library default 8.** Exp 2 raises only the 4th field to `256`
+   (`-gpgpu_dram_partition_queues 64:64:64:256`, applied). Because the reply queue is *already* 64
+   and `output_full` is still large, the prior is strong that this is a **drain-rate** limit, not a
+   depth limit — a deeper queue barely helping is the expected (and informative) result pointing to
+   experiment 1. Pure knob, no rebuild, low risk — a cycle win here is suspect until cross-checked
+   against the fake-locality caveat.
+3. **Interconnect reply-port width / ejection buffer.** `gpu_stall_icnt2sh` is the upstream cause;
+   if experiments 1–2 show the queue is fed faster than icnt can eject, raise the icnt ejection
+   buffer / reply VC allocation. Validate reply BW stays within a realistic H100 envelope.
+
+### A/B run matrix (one build covers all — exp1 is now a flag)
+
+Both exp1 and exp2 are config-only on the **same rebuilt binary** (the drain-loop code adds the
+`-gpgpu_l2_reply_drain_per_cycle` knob; a rebuild is required once, then no more). Run in this order
+and read `L2_TMA_output_full_cycles`, `gpu_stall_icnt2sh`, cycles, `L2_TMA_true_hit_rate`,
+`gpu_stall_dramfull` each time:
+
+| Run | `dram_partition_queues` (4th) | `l2_reply_drain_per_cycle` | Isolates |
+|---|---|---|---|
+| A (baseline re-confirm) | 64 | 1 | reproduce `.o24`/`.o6` on the new binary (timing-neutral check) |
+| B (exp2: depth only) | 256 | 1 | is `output_full` pure queue depth? |
+| C (exp1: drain rate) | 64 | 4 | does relieving the 1-mf/cycle cap move cycles? |
+| D (exp1+2, only if needed) | 256 | 4 | depth + drain together, if C shows depth also matters |
+
+Interpretation: if **B ≈ A** (depth doesn't help) but **C improves cycles + drops `output_full`**,
+the root was the drain-rate cap (as predicted) and exp1 is the fix. If **C still leaves
+`gpu_stall_icnt2sh` high**, the next limiter is the icnt reply network (exp3). If **C balloons
+`L2_TMA_true_hit_rate` further above HW or a cycle win coincides with unchanged `gpu_stall_dramfull`
+under fake 98% L2 hit**, treat the win as suspect until TMA address realism (6B) is in.
+
+
+
+**Ordering decision (recorded):** this reply-path bottleneck is fixed **before** TMA address
+realism (6B / Arch TODO-2). It is a genuine structural defect independent of the address model, so
+it should be corrected first — but every reply-path result must still be cross-checked against
+`L2_TMA_true_hit_rate` and `gpu_stall_dramfull` (see caveat above), because the *magnitude* of the
+pressure today is inflated by fake L2 locality and will shift once addresses are realistic.
+
+
 ## 5. Rollback history & risks (why Phase A failed, must not repeat)
 
 - **Phase A was rolled back and never committed** (no `tma_mock_config_base`/`kLineMfGoal`/

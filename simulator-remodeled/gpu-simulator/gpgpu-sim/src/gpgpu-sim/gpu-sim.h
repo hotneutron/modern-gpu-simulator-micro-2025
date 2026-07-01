@@ -365,6 +365,12 @@ class memory_config {
   char *gpgpu_dram_timing_opt;
   char *gpgpu_L2_queue_config;
   bool l2_ideal;
+  // Opt6 Part-0 exp1: max reply mf drained from each sub-partition's
+  // m_L2_icnt_queue per ICNT tick. Default 1 = current behavior (so exp2's
+  // config-only depth probe is unchanged). N>1 lets a bulk TMA return (768x32B)
+  // eject faster; each mf still passes icnt_has_buffer/icnt_push, so the icnt
+  // reply-bandwidth accounting is untouched (exp1 vs exp3 stay separable).
+  unsigned gpgpu_l2_reply_drain_per_cycle;
   unsigned gpgpu_frfcfs_dram_sched_queue_size;
   unsigned gpgpu_dram_return_queue_size;
   enum dram_ctrl_t scheduler_type;

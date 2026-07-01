@@ -854,6 +854,14 @@ void memory_config::reg_options(class OptionParser *opp) {
   option_parser_register(opp, "-gpgpu_dram_partition_queues", OPT_CSTR,
                          &gpgpu_L2_queue_config, "i2$:$2d:d2$:$2i", "8:8:8:8");
 
+  option_parser_register(opp, "-gpgpu_l2_reply_drain_per_cycle", OPT_UINT32,
+                         &gpgpu_l2_reply_drain_per_cycle,
+                         "Opt6 exp1: max reply mf drained from each L2 "
+                         "sub-partition's L2->icnt queue per ICNT tick. 1 = "
+                         "current behavior. Each mf still passes icnt buffer "
+                         "check, so icnt reply BW accounting is unchanged.",
+                         "1");
+
   option_parser_register(opp, "-l2_ideal", OPT_BOOL, &l2_ideal,
                          "Use a ideal L2 cache that always hit", "0");
   option_parser_register(opp, "-gpgpu_cache:dl2", OPT_CSTR,
@@ -3991,6 +3999,15 @@ void gpgpu_sim::cycle() {
       }
     }
     for (unsigned i = 0; i < m_memory_config->m_n_mem_sub_partition; i++) {
+      // Opt6 exp1: drain up to N reply mf from this sub-partition per ICNT tick
+      // (default N=1 = original behavior). Each mf still passes the icnt buffer
+      // check + icnt_push, so reply-bandwidth accounting is unchanged; this only
+      // removes the artificial 1-mf-per-cycle ejection cap that serializes a
+      // bulk TMA return (768x32B). Stop early on icnt backpressure or an empty
+      // queue so we neither over-drain nor spin.
+      unsigned drain_budget = m_memory_config->gpgpu_l2_reply_drain_per_cycle;
+      if (drain_budget == 0) drain_budget = 1;
+      for (unsigned d = 0; d < drain_budget; d++) {
       mem_fetch *mf = m_memory_sub_partition[i]->top();
       if (mf) {
         if(m_shader_config->is_const_cache_accessed_blocks_tracking_enabled && (mf->get_access_type() == CONST_ACC_R)) {
@@ -4012,9 +4029,15 @@ void gpgpu_sim::cycle() {
           partiton_replys_in_parallel_per_cycle++;
         } else {
           gpu_stall_icnt2sh++;
+          break;  // icnt backpressure: further drains this cycle would also fail
         }
       } else {
+        // top() returns NULL for an empty queue, or after it cleaned up a WRBK
+        // head (the slot is removed by pop(), which is safe on an empty queue).
+        // Match the original one-drain-then-stop behavior for this case.
         m_memory_sub_partition[i]->pop();
+        break;
+      }
       }
     }
   }

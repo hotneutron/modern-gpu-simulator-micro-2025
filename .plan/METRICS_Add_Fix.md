@@ -438,3 +438,9 @@ do not change any scheduling/latency behavior.
   helps; low `res_fail_per_probe` **with high `output_full`/`port_busy`** ⇒ the limiter is
   downstream reply/port backpressure (a different fix axis, not the address hotspot). Cross-referenced
   in `.plan/TMA_LATENCY_INJECTION_H100.md` §2-C / §4.
+- **Measured (fwd `.o24` / bwd `.o6`, 2026-07-01)**: `res_fail_per_probe = 0`, `port_busy = 0`, but
+  `output_full_cycles = 180,998 / 314,724` and `gpu_stall_icnt2sh = 258,818 / 464,997`. → the gate
+  landed on the **third branch: L2→core reply-path backpressure**, not the hotspot and not injection.
+  The two backpressure counters were decisive here — without them a `res_fail = 0` would have been
+  misread as "no admission pressure". Full analysis + next-experiment proposals in
+  `.plan/TMA_LATENCY_INJECTION_H100.md` §4.5.
