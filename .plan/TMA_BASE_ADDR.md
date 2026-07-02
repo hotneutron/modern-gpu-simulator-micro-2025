@@ -1021,6 +1021,42 @@ all rows: space=1 (GLOBAL), read_ok=0, qword0=0
 Lesson (again): `isspacep.global` is "not shared/local/const", **not** "valid global
 pointer". Always pair it with a VA-magnitude sanity bound before dereferencing.
 
+## 2.22 SPIKE 7 (all-MREF classify) — mref-1 IS the descriptor cursor (192-byte stride). Read floor lowered.
+
+Capturing **both** MREF operands nailed the operand question. Per site:
+```
+uid=3 pc=0x94e0  mref0 0xe800   mref1 0x562804c0
+uid=3 pc=0x96b0  mref0 0x8800   mref1 0x56280400
+uid=8 pc=0xa240  mref0 0x10400  mref1 0x562a02c0
+uid=8 pc=0xa330  mref0 0x4400   mref1 0x562a0380   (+0xc0)
+uid=8 pc=0xa320  mref0 0x400    mref1 0x562a0440   (+0xc0)
+uid=8 pc=0xa610  mref0 0x18400  mref1 0x562a0500   (+0xc0)
+```
+
+- **mref-0** = tiny raw-shared **staging cursor** (`0xe800 … 0x18400`, all ≤ ~99 KiB) —
+  the §2.17(a) operand-2. NVBit orders this as mref-0. Not the descriptor.
+- **mref-1** = the **descriptor cursor** (`0x5628xxxx`/`0x562axxxx`). Two proofs it is the
+  descriptor: (1) consecutive uid8 sites step by exactly `0xc0 = 192` = the `box_dim`
+  (64×**192**) — the descriptor array stride from §2.17(f); (2) the low bits match the
+  §2.17(f) `0xffffffffc42804c0` observation (here without the generic high bits, so it
+  reads as ~`0x562804c0` ≈ 1.4 GiB).
+- Both classify GLOBAL, but that includes the isspacep false-positive for mref-0, so
+  address space alone can't separate them — the **magnitude** does.
+
+**Why the read step still showed 0/12:** the earlier guard floor was 4 GiB; the descriptor
+cursor is ~1.4 GiB, below it, so it was (correctly) not read — but neither was it probed.
+Lowered the floor to **1 MiB** (`MIN_READ_VA`): rejects every tiny mref-0 cursor
+(≤ 99 KiB) while admitting mref-1. The next `TMA_DESC_FACTCHECK_READ=1` run will attempt
+to read mref-1's 128B.
+
+**Decision this pins next:**
+- If reading mref-1 **succeeds** and `qword0 ∈ {7 bases}` (exact or base+coord near-hit) ⇒
+  the descriptor is directly readable at that VA ⇒ real base recovered on device (**D2**,
+  and host `cuMemcpyDtoH` of the same VA would also work).
+- If reading mref-1 **faults** (crash-safe now: only mref-1 is attempted, tiny cursors are
+  skipped) ⇒ that VA is a shared/generic alias the HW resolves specially ⇒ **D1** (needs a
+  shared-aware probe, not a generic load).
+
 ## 3. Design
 
 ### 3.1 Trace-gen (NVBit) — capture param_base + static offset, deref the descriptor, dump ALL fields (Path B)

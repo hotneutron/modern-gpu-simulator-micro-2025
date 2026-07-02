@@ -231,11 +231,14 @@ extern "C" __device__ __noinline__ void factcheck_tma_descriptor(
 
   unsigned int read_ok = 0;
   unsigned long long q0 = 0, q1 = 0;
-  /* Only read a GLOBAL VA that is also a plausible device pointer (>= 4 GiB). This
-   * rejects the tiny raw-shared cursors (0xe800 etc.) that isspacep mislabels GLOBAL,
-   * which is exactly what faulted the earlier read step. */
-  const unsigned long long MIN_GLOBAL_VA = 0x100000000ULL;
-  if (do_read && space == TMA_VA_GLOBAL && desc_va >= MIN_GLOBAL_VA) {
+  /* Read a GLOBAL VA that is above the tiny-cursor band. SPIKE 7 CSV: mref-0 is a tiny
+   * raw-shared cursor (<= 0x18400 ≈ 99 KiB) that isspacep mislabels GLOBAL and that
+   * faults when read; mref-1 is the descriptor cursor (~0x562804c0 ≈ 1.4 GiB, +0xc0=192
+   * stride = box_dim). A 1 MiB floor rejects the tiny cursors while admitting the
+   * descriptor cursor. NOTE: reading mref-1 may still fault if it is a shared/generic
+   * alias rather than a true global — that outcome is itself the D1-vs-D2 answer. */
+  const unsigned long long MIN_READ_VA = 0x100000ULL;  /* 1 MiB */
+  if (do_read && space == TMA_VA_GLOBAL && desc_va >= MIN_READ_VA) {
     const unsigned long long *p = (const unsigned long long *)desc_va;
     q0 = p[0];
     q1 = p[1];
