@@ -1,0 +1,148 @@
+.plan/TMA_BASE_ADDR.md
+  s_2ddd4a870b9e30::t_8187697be30d89 590-638 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a45ba5c3fe12cb0643f24db","tool_type":"agent","tool_id":"Edit","line_ranges":[{"Range":[590,638]}]}]}
+  s_2ddd4a870b9e30::t_85fe8e4300aa57 822-825,828-829,831-835,837,839-841 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a45ba843fe12cb0643f24e1","tool_type":"agent","tool_id":"Edit","line_ranges":[{"Range":[822,825]},{"Range":[828,829]},{"Range":[831,835]},{"Single":837},{"Range":[839,841]}]}]}
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "8a5b532705d50eb011c577cd5f8d3e8397300bf0",
+  "prompts": {},
+  "humans": {
+    "h_35c34d310c0197": {
+      "author": "Jihyun Ryoo <jihyun.ryoo@bytedance.com>"
+    }
+  },
+  "sessions": {
+    "s_2ddd4a870b9e30": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6a458cba3fe12cb0643f21e8",
+        "model": "openrouter-3o__max"
+      },
+      "human_author": "Jihyun Ryoo <jihyun.ryoo@bytedance.com>"
+    }
+  },
+  "attestation_metadata": {
+    ".plan/TMA_BASE_ADDR.md": [
+      {
+        "hash": "s_2ddd4a870b9e30::t_8187697be30d89",
+        "line_ranges": [
+          {
+            "Range": [
+              590,
+              638
+            ]
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a45ba5c3fe12cb0643f24db",
+            "tool_type": "agent",
+            "tool_id": "Edit",
+            "line_ranges": [
+              {
+                "Range": [
+                  590,
+                  638
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "hash": "s_2ddd4a870b9e30::t_85fe8e4300aa57",
+        "line_ranges": [
+          {
+            "Range": [
+              822,
+              825
+            ]
+          },
+          {
+            "Range": [
+              828,
+              829
+            ]
+          },
+          {
+            "Range": [
+              831,
+              835
+            ]
+          },
+          {
+            "Single": 837
+          },
+          {
+            "Range": [
+              839,
+              841
+            ]
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a45ba843fe12cb0643f24e1",
+            "tool_type": "agent",
+            "tool_id": "Edit",
+            "line_ranges": [
+              {
+                "Range": [
+                  822,
+                  825
+                ]
+              },
+              {
+                "Range": [
+                  828,
+                  829
+                ]
+              },
+              {
+                "Range": [
+                  831,
+                  835
+                ]
+              },
+              {
+                "Single": 837
+              },
+              {
+                "Range": [
+                  839,
+                  841
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "remote_transcripts": {
+    "s_2ddd4a870b9e30": {
+      "tool": "trae",
+      "conversation_id": "6a458cba3fe12cb0643f21e8",
+      "session_id": "6a458cba3fe12cb0643f21e8",
+      "status": "remote_only",
+      "message": "Remote transcript resolution is not implemented yet for TRAE prompts."
+    },
+    "s_2ddd4a870b9e30::t_8187697be30d89": {
+      "tool": "trae",
+      "conversation_id": "6a458cba3fe12cb0643f21e8",
+      "session_id": "6a458cba3fe12cb0643f21e8",
+      "status": "remote_only",
+      "message": "Remote transcript resolution is not implemented yet for TRAE prompts."
+    },
+    "s_2ddd4a870b9e30::t_85fe8e4300aa57": {
+      "tool": "trae",
+      "conversation_id": "6a458cba3fe12cb0643f21e8",
+      "session_id": "6a458cba3fe12cb0643f21e8",
+      "status": "remote_only",
+      "message": "Remote transcript resolution is not implemented yet for TRAE prompts."
+    }
+  }
+}
