@@ -149,11 +149,22 @@ def main():
     print()
     checkable = len(matched) + len(unmatched)
     if checkable == 0:
-        print("=> INCONCLUSIVE: no descriptor VA was in a readable space (all SHARED/"
-              "UNKNOWN-generic), so no bytes were read. See the address-space histogram: "
-              "if desc_va is SHARED, the descriptor is SMEM-staged and D1 must read it "
-              "as shared at issue (a generic load faults); if it is UNKNOWN/generic, the "
-              "operand is a raw cursor (e.g. 0xe800) and D2 (global original) is needed.")
+        # Distinguish "read was not enabled" from "space was unreadable".
+        readable_spaces = {"1", "3"}  # GLOBAL, CONSTANT
+        n_readable_space = sum(1 for r in rows
+                               if r.get("space") in readable_spaces)
+        if have_space and n_readable_space > 0:
+            print(f"=> RUN THE READ STEP: {n_readable_space}/{len(rows)} samples are in a "
+                  "readable space (GLOBAL/CONSTANT) but no bytes were read (read_ok=0), "
+                  "because TMA_DESC_FACTCHECK_READ was not set. Re-run with "
+                  "ENABLE_TMA_DESC=1 TMA_DESC_FACTCHECK=1 TMA_DESC_FACTCHECK_READ=1 to "
+                  "fill qword0 and confirm it equals a real base.")
+        else:
+            print("=> INCONCLUSIVE: no descriptor VA was in a readable space (all SHARED/"
+                  "UNKNOWN-generic), so no bytes were read. If desc_va is SHARED, the "
+                  "descriptor is SMEM-staged and D1 must read it as shared at issue (a "
+                  "generic load faults); if UNKNOWN/generic, the operand is a raw cursor "
+                  "(e.g. 0xe800) and D2 (global original) is needed.")
     elif matched and not unmatched:
         print("=> PASS: every read descriptor's qword0 is a real base. Path D1 "
               "(device-read the descriptor at issue) is confirmed.")

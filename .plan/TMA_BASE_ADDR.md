@@ -943,6 +943,42 @@ ENABLE_TMA_DESC=1 TMA_DESC_FACTCHECK=1 TMA_DESC_FACTCHECK_READ=1 <run cmd>
 python3 verify_tma_desc_factcheck.py --traces "$TRACES"
 ```
 
+## 2.20 SPIKE 7 RESULT (classify step, bwd uid8) — desc_va is GLOBAL, not SMEM. §2.17(f) corrected.
+
+The crash-safe classify step ran clean (no illegal access) and returned, for the bwd
+`flashattn-fa3-bf16-bwd` run:
+```
+desc_va address space (distinct samples):
+    GLOBAL           x7
+    -> read_ok (byte read performed): 0/7   (READ step not enabled yet)
+encode bases: 7 distinct (0x7f001aa00000 … 0x7f01ad800000)
+```
+
+**All 7 distinct UTMALDG first-MREF VAs classify as GLOBAL.** This **overturns my
+§2.17(f) claim** that the descriptor lives in a generic-SMEM window. That claim was an
+**offline mis-read**: I saw `0xffffffff…`-looking values in the operand JSONL and assumed
+generic→shared. The device predicate `__isGlobal` is authoritative and says the address
+the HW reads at issue is in **global memory**.
+
+Consequences:
+- The descriptor (or its live copy) is **GMEM-resident and directly readable** at issue.
+  So the recovery path is essentially **D2 / a direct global read** — *not* the SMEM-only
+  D1 that §2.17–§2.18 concluded. Host `cuMemcpyDtoH` of that GMEM VA could even work
+  (host-deref, §2.13, is **not** dead after all — it just needs the *runtime* VA, which
+  only exists at issue, not the static `param_base+offset`).
+- `read_ok=0/7` only because this run set `TMA_DESC_FACTCHECK=1` alone (classify), not
+  `TMA_DESC_FACTCHECK_READ=1`. GLOBAL is safe to read, so the read step is the immediate
+  next action — it will fill `qword0` and we check it against the 7 encode bases.
+- If the read step shows `qword0 ∈ {7 bases}` (exact or base+coord near-hit), the real
+  base recovery is **done from the device**, and the offline SMEM-staging detour is
+  closed. If it does not match, we inspect the actual `desc_va`/`qword0` values (the VA is
+  GLOBAL, so the bytes are trustworthy) to see whether it is a coords-adjusted tile
+  address or a different structure.
+
+Lesson: trust the on-device `isspacep` classification over any offline guess about what a
+`0xffffff…` operand "looks like". This one predicate invalidated three sections of prior
+SMEM reasoning.
+
 ## 3. Design
 
 ### 3.1 Trace-gen (NVBit) — capture param_base + static offset, deref the descriptor, dump ALL fields (Path B)
