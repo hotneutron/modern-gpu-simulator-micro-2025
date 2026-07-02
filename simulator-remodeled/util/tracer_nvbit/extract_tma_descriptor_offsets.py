@@ -46,6 +46,11 @@ from discover_tma_producers import (  # noqa: E402
 
 DEFAULT_MAX_DEPTH = 12
 
+# Sentinel returned by trace_offset when the def-chain forks on 2+ live register
+# sources (a UIADD3 the single-source walk cannot resolve). Distinct from None
+# (clean dead end) so callers never mistake a fork for a resolved/absent offset.
+AMBIGUOUS_FORK = object()
+
 ULDC_RE = re.compile(r"UR(\d+),\s*c\[0x0\]\[(0x[0-9a-fA-F]+)\]")
 # UIADD3[.X] URd, [UPn,] (URs|URZ), (imm|URs|URZ), ...
 UIADD3_RE = re.compile(
@@ -119,7 +124,15 @@ def is_descriptor_offset_opcode(opcode):
 
 
 def build_defs(instructions):
-    """Record every ULDC / UIADD3 def as (index, dst_reg, kind, info)."""
+    """Record every ULDC / UIADD3 def as (index, dst_reg, kind, info).
+
+    UIADD3 is `Rd = src0 + src1 + src2` (any of which may be a UR, URZ, or an
+    immediate). The linear tracer can only follow ONE register source; if TWO or more
+    sources are live registers (a fork), the single-source walk is wrong and would
+    fabricate an offset. So we parse ALL three sources and record:
+      info = (single_src_reg_or_None, imm_sum, extra_reg_source_count)
+    trace_offset treats extra_reg_source_count>0 as an ambiguous fork (returns a
+    sentinel) instead of silently dropping the second register."""
     defs = []
     for idx, ins in enumerate(instructions):
         opcode = ins["opcode"]
@@ -130,13 +143,35 @@ def build_defs(instructions):
                 defs.append((idx, int(match.group(1)), "uldc", int(match.group(2), 16)))
                 continue
         if opcode.startswith("UIADD3"):
-            match = UIADD3_RE.match(operand_text)
-            if match:
-                dst = int(match.group(1))
-                src = int(match.group(3)) if match.group(3) else None
-                imm_tok = match.group(4)
-                imm = int(imm_tok, 16) if imm_tok and imm_tok.startswith("0x") else 0
-                defs.append((idx, dst, "uiadd", (src, imm)))
+            operands = split_operands(operand_text)
+            if not operands:
+                continue
+            dst = first_ureg(operands[0])
+            if dst is None:
+                continue
+            # sources = everything after dst, skipping a leading predicate (UPn)
+            srcs = operands[1:]
+            reg_srcs = []
+            imm_sum = 0
+            for s in srcs:
+                s = s.strip()
+                if re.match(r"UP\d+$", s):
+                    continue  # carry predicate, not a value source
+                if s in ("URZ", "-URZ", "RZ"):
+                    continue
+                mreg = re.match(r"-?UR(\d+)$", s)
+                if mreg:
+                    reg_srcs.append(int(mreg.group(1)))
+                    continue
+                mimm = re.match(r"-?0x[0-9a-fA-F]+$", s)
+                if mimm:
+                    imm_sum += int(s, 16)
+                    continue
+                # unknown source form (e.g. a shifted reg) → treat as extra reg fork
+                reg_srcs.append(-1)
+            single_src = reg_srcs[0] if reg_srcs else None
+            extra_reg_count = max(0, len(reg_srcs) - 1)
+            defs.append((idx, dst, "uiadd", (single_src, imm_sum, extra_reg_count)))
     return defs
 
 
@@ -149,9 +184,9 @@ def last_def(defs, reg, before_idx):
 
 
 def trace_offset(defs, reg, before_idx, depth=0, max_depth=DEFAULT_MAX_DEPTH, chain=None):
-    """Return (cbank_index, tensormap_offset) or None if the chain does not reach a
-    ULDC c[0x0][...] param-base load. If `chain` (a list) is given, append a
-    human-readable step for each hop, for diagnosis of non-param-base chains."""
+    """Return (cbank_index, tensormap_offset), None (dead end), or the sentinel
+    AMBIGUOUS_FORK if the chain hits a UIADD3 with 2+ live register sources (which the
+    single-source walk cannot resolve). If `chain` is given, append a step per hop."""
     if depth > max_depth:
         if chain is not None:
             chain.append(f"UR{reg}: max_depth")
@@ -167,15 +202,19 @@ def trace_offset(defs, reg, before_idx, depth=0, max_depth=DEFAULT_MAX_DEPTH, ch
             chain.append(f"UR{reg} <- ULDC c[0x0][0x{info:x}]")
         return (info, 0)
     if kind == "uiadd":
-        src, imm = info
+        src, imm, extra_reg_count = info
         if chain is not None:
-            src_txt = f"UR{src}" if src is not None else "URZ/none"
-            chain.append(f"UR{reg} <- UIADD3 {src_txt} + 0x{imm:x}")
+            src_txt = f"UR{src}" if (src is not None and src >= 0) else (
+                "UR?" if src == -1 else "URZ/none")
+            fork = f" +{extra_reg_count}reg_fork" if extra_reg_count else ""
+            chain.append(f"UR{reg} <- UIADD3 {src_txt} + 0x{imm:x}{fork}")
+        if extra_reg_count > 0 or src == -1:
+            return AMBIGUOUS_FORK
         if src is None:
             return None
         sub = trace_offset(defs, src, idx, depth + 1, max_depth, chain)
-        if sub is None:
-            return None
+        if sub is None or sub is AMBIGUOUS_FORK:
+            return sub
         return (sub[0], sub[1] + imm)
     return None
 
@@ -259,7 +298,7 @@ def extract_offsets(extra_info_dir: Path, max_depth: int,
             if reg is None:
                 continue
             traced = trace_offset(defs, reg, idx, max_depth=max_depth)
-            if traced is not None:
+            if traced is not None and traced is not AMBIGUOUS_FORK:
                 prepass_cbank_counts[traced[0]] += 1
     if param_base_cbank_index_override is not None:
         param_base_cbank_index = param_base_cbank_index_override
@@ -302,7 +341,7 @@ def extract_offsets(extra_info_dir: Path, max_depth: int,
                     reg = first_ureg(brs[0])
                     if reg is not None:
                         traced = trace_offset(defs, reg, idx, max_depth=max_depth)
-                        if traced is not None:
+                        if traced is not None and traced is not AMBIGUOUS_FORK:
                             cbank_index, tensormap_offset = traced
                             prefetch_sites.append(
                                 {
@@ -330,15 +369,17 @@ def extract_offsets(extra_info_dir: Path, max_depth: int,
             param_base_operands = []
             for op_idx, hint, op_reg in enumerate_operand_regs(operand_text):
                 t = trace_offset(defs, op_reg, idx, max_depth=max_depth)
+                is_tuple = t is not None and t is not AMBIGUOUS_FORK
                 entry = {
                     "operand_index": op_idx,
                     "role_hint": hint,
                     "reg": op_reg,
-                    "cbank_index_hex": f"0x{t[0]:x}" if t else None,
-                    "tensormap_offset_hex": f"0x{t[1]:x}" if t else None,
+                    "cbank_index_hex": f"0x{t[0]:x}" if is_tuple else None,
+                    "tensormap_offset_hex": f"0x{t[1]:x}" if is_tuple else None,
+                    "ambiguous_fork": (t is AMBIGUOUS_FORK),
                 }
                 operand_probe.append(entry)
-                if t and t[0] == param_base_cbank_index:
+                if is_tuple and t[0] == param_base_cbank_index:
                     param_base_operands.append((op_idx, hint, op_reg, t[1]))
 
             record = {
@@ -378,6 +419,12 @@ def extract_offsets(extra_info_dir: Path, max_depth: int,
             chain = []
             traced = trace_offset(defs, reg, idx, max_depth=max_depth, chain=chain)
             record["chain"] = chain
+            if traced is AMBIGUOUS_FORK:
+                # UIADD3 forked on 2+ live register sources; the single-source walk
+                # cannot resolve a real offset. Do NOT fabricate one.
+                record["reason"] = "ambiguous_multisource_uiadd3"
+                sites.append(record)
+                continue
             if traced is None:
                 # Chain did not terminate at ANY ULDC c[0x0][...] (e.g. a UMOV
                 # constant, a global-memory load, or a register we do not model).
@@ -410,7 +457,8 @@ def extract_offsets(extra_info_dir: Path, max_depth: int,
     if executed_sites is not None:
         ex = [s for s in sites if s.get("executed")]
         by_family = defaultdict(lambda: {"executed": 0, "resolved": 0,
-                                         "non_param_cbank": 0, "no_cbank": 0})
+                                         "non_param_cbank": 0, "no_cbank": 0,
+                                         "ambiguous": 0})
         for s in ex:
             fam = s["opcode"].split(".")[0]
             b = by_family[fam]
@@ -421,6 +469,8 @@ def extract_offsets(extra_info_dir: Path, max_depth: int,
                 b["non_param_cbank"] += 1
             elif s["reason"] == "def_chain_did_not_reach_any_cbank_ULDC":
                 b["no_cbank"] += 1
+            elif s["reason"] == "ambiguous_multisource_uiadd3":
+                b["ambiguous"] += 1
         executed_stats = {
             "executed_site_count": len(ex),
             "executed_resolved_count": sum(1 for s in ex if s["resolved"]),
