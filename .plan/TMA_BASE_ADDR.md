@@ -1057,6 +1057,60 @@ to read mref-1's 128B.
   skipped) ⇒ that VA is a shared/generic alias the HW resolves specially ⇒ **D1** (needs a
   shared-aware probe, not a generic load).
 
+## 2.23 SPIKE 8 — device read is DEAD; switch to Path A (host launch-arg dump)
+
+**Device read is conclusively ruled out (5 crashes).** read-off classify = clean;
+reading mref-0 (tiny cursor) = fault; reading mref-1 (descriptor cursor ~0x562804c0,
+~1.4 GiB) = fault. A GPU device load that faults **aborts the whole context** — it can't
+be guarded like a CPU read. mref-1 faulting confirms §2.17(f): that VA is a TMA-engine
+generic/SMEM alias, not a warp-loadable global. So **no on-device UTMALDG-time read can
+recover the base**.
+
+**Also confirmed the base is NOT in producer_debug for uid3/8.** The only producer row is
+`ULDC.64 UR6, c[0x0][0x208]` with value 0 — the uid1 global-pointer scheme (§2.18(6)),
+not our persistent fwd/bwd. §2.17(c)'s "base is in producer_debug" was a different uid.
+
+**Everything except the join already exists on the host.** `tensor_map_encode_dump.csv`
+has the 7 real bases + all descriptor fields (strides/box/swizzle, already consumed by the
+sim). The only missing link is "which encode event ↔ which UTMALDG pc" — the original §0.0
+gap. `tensor_map_ptr_hex` is a host stack addr (`&map`, identical for all 6), so it can't
+key tensors.
+
+**Decision (user-approved): Path A — dump the host launch-argument buffer.** At
+`cuLaunchKernel` the driver hands us `p->kernelParams`, a **host** array of per-argument
+pointers. For a by-value `__grid_constant__ CUtensorMap` argument, that host pointer points
+at the 128B descriptor whose qword0 = the real base. Reading it is a **host** memory access
+— it cannot trigger the device illegal-access that killed every D1/D2 attempt.
+
+**Implemented (this iteration):**
+- Tracer `append_tma_launch_param_dump_event` (gated by `ENABLE_TMA_DESC`): at each
+  `cuLaunchKernel`, walk `p->kernelParams`, use `nvbit_get_kernel_argument_sizes(ctx, f)`
+  to derive each argument's packed **param_offset**, and dump the first 16 qwords read from
+  the host arg pointer to `extra_info/tma_launch_param_dump.csv` (columns: `device_id,
+  kernel_id,unique_function_id,arg_index,param_offset_hex,arg_size,arg_ptr_hex,qword0..15`).
+- Verifier `verify_tma_launch_param.py`: (1) flags args whose `qword0 ∈ {7 encode bases}`
+  (⇒ that arg is a by-value CUtensorMap), (2) joins `param_offset == tensormap_offset`
+  (from `extract_tma_descriptor_offsets.py`) to map **(uid,pc) → real base**, writing
+  `tma_launch_param_join.json`. Local self-test (2 by-value args, offsets 0x1f0/0x2b0)
+  passes end-to-end.
+
+**Gate outcomes (what the next run decides):**
+- **PASS** — some arg's qword0 is a real base AND its param_offset matches a site's
+  tensormap_offset ⇒ `(uid,pc)→base` recovered on the host. Build the real-address mover
+  on `tma_launch_param_join.json`.
+- **PARTIAL** — bases present but offsets don't line up ⇒ fix the arg-alignment/packing
+  model vs the SASS `c[0x0][K]+UIADD3` offsets.
+- **INVESTIGATE** — no arg exposes a base in qword0 ⇒ args are by-pointer; add an offline
+  host `cuMemcpyDtoH` of the pointer value (still host-side, still crash-free).
+
+Run recipe (no READ env; classification/dump only, cannot crash):
+```
+# rebuild tracer, then:
+ENABLE_TMA_DESC=1 <existing trace-gen run cmd>
+python3 extract_tma_descriptor_offsets.py --traces "$TRACES"   # (uid,pc)->tensormap_offset
+python3 verify_tma_launch_param.py       --traces "$TRACES"    # join to base
+```
+
 ## 3. Design
 
 ### 3.1 Trace-gen (NVBit) — capture param_base + static offset, deref the descriptor, dump ALL fields (Path B)

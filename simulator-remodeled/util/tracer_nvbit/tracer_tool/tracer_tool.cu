@@ -204,6 +204,14 @@ std::unordered_set<int> tma_desc_runtime_debug_header_written;
 std::unordered_set<int> tma_desc_producer_debug_header_written;
 std::unordered_set<int> tma_memcpy_dump_header_written;
 std::unordered_set<int> tensor_map_encode_dump_header_written;
+/* Path A (TMA_BASE_ADDR.md §2.23): host-side launch-arg dump. At cuLaunchKernel we walk
+ * p->kernelParams (a host void** of per-argument pointers) and record, per argument, its
+ * byte offset within the packed param block and the first 16 qwords read from that host
+ * pointer. A by-value __grid_constant__ CUtensorMap argument yields its 128B descriptor
+ * (qword0 = real base) directly; a pointer argument yields the pointer value (followed
+ * offline). Host memory only — no device load, so this cannot fault like the device
+ * fact-check did. Joined offline to (uid,pc) via the SASS static tensormap_offset. */
+std::unordered_set<int> tma_launch_param_dump_header_written;
 std::unordered_set<int> tma_consumer_opcode_ids;
 std::map<int, std::map<int, uint32_t>> tma_desc_ureg_by_pc;
 std::map<int, std::map<int, uint32_t>> first_dest_ureg_by_pc;
@@ -560,6 +568,70 @@ static void append_tma_memcpy_dump_event(int device_id, uint64_t stream_key, CUd
       << byte_count << ","
       << "\"" << preview_hex << "\"" << ","
       << blob_path << "\n";
+}
+
+/* Path A (TMA_BASE_ADDR.md §2.23): dump the host launch-argument buffer. Called at
+ * cuLaunchKernel (!is_exit). p->kernelParams is a host array of per-argument pointers;
+ * nvbit_get_kernel_argument_sizes gives each argument's byte size, from which we derive
+ * the packed param-block offset (the same static tensormap_offset the SASS def-chain
+ * yields). For each argument we read up to 128B from its host pointer and record the
+ * first 16 qwords. A by-value CUtensorMap arg exposes qword0 = the real base directly.
+ * All reads are host-side, so this never triggers the device illegal-access that killed
+ * the on-device fact-check. */
+static void append_tma_launch_param_dump_event(CUcontext ctx, int device_id,
+                                               int kernel_trace_id,
+                                               unsigned int unique_function_id,
+                                               const cuLaunchKernel_params *p) {
+  if (!enable_tma_desc || p == nullptr || p->kernelParams == nullptr) {
+    return;
+  }
+  std::vector<int> arg_sizes = nvbit_get_kernel_argument_sizes(ctx, p->f);
+  if (arg_sizes.empty()) {
+    return;
+  }
+  create_folder(extrainfo_path.c_str());
+  std::string csv_path = extrainfo_path + "/tma_launch_param_dump.csv";
+  bool needs_header = tma_launch_param_dump_header_written.empty();
+  std::ofstream csv(csv_path, needs_header ? std::ios::out : std::ios::app);
+  if (!csv.is_open()) {
+    return;
+  }
+  if (needs_header) {
+    tma_launch_param_dump_header_written.insert(device_id);
+    csv << "device_id,kernel_id,unique_function_id,arg_index,param_offset_hex,arg_size,"
+           "arg_ptr_hex,qword0_hex,qword1_hex,qword2_hex,qword3_hex,qword4_hex,"
+           "qword5_hex,qword6_hex,qword7_hex,qword8_hex,qword9_hex,qword10_hex,"
+           "qword11_hex,qword12_hex,qword13_hex,qword14_hex,qword15_hex\n";
+  }
+  /* CUDA packs each argument at its natural alignment; the param-block offset for a TMA
+   * descriptor is what the SASS c[0x0][K]+UIADD3 chain computes. We approximate the pack
+   * offset by aligning the running cursor to min(size, 8) before placing each argument,
+   * which matches the observed 0x1f0/0x2b0/... spacing for 128B descriptors. */
+  uint64_t offset = 0;
+  for (size_t i = 0; i < arg_sizes.size(); ++i) {
+    int sz = arg_sizes[i];
+    if (sz <= 0) {
+      continue;
+    }
+    uint64_t align = (uint64_t)(sz < 8 ? sz : 8);
+    if (align > 0 && (offset % align) != 0) {
+      offset += align - (offset % align);
+    }
+    const void *arg_ptr = p->kernelParams[i];
+    csv << device_id << "," << kernel_trace_id << "," << unique_function_id << ","
+        << i << ",0x" << std::hex << offset << std::dec << "," << sz << ",0x"
+        << std::hex << reinterpret_cast<uintptr_t>(arg_ptr) << std::dec;
+    /* read up to 16 qwords (128B) from the host argument pointer */
+    const uint64_t *qw = reinterpret_cast<const uint64_t *>(arg_ptr);
+    int nqw = sz / 8;
+    if (nqw > 16) nqw = 16;
+    for (int q = 0; q < 16; ++q) {
+      uint64_t v = (arg_ptr != nullptr && q < nqw) ? qw[q] : 0ULL;
+      csv << ",0x" << std::hex << v << std::dec;
+    }
+    csv << "\n";
+    offset += (uint64_t)sz;
+  }
 }
 
 static void append_tensor_map_encode_dump_event(int device_id, const cuTensorMapEncodeTiled_params *p) {
@@ -2263,6 +2335,12 @@ void nvbit_at_cuda_event(CUcontext ctx, int is_exit, nvbit_api_cuda_t cbid,
         ker->set_id(kernel_id[device_id]);
         ker->set_name(final_kernel_name);
         ker->set_function_unique_id(it_map_unique_function_id->second);
+        /* Path A (§2.23): dump the host launch-arg buffer once per launch (host reads
+         * only, cannot fault). Joined offline to (uid,pc) by the static tensormap_offset. */
+        if (enable_tma_desc) {
+          append_tma_launch_param_dump_event(ctx, device_id, kernel_id[device_id],
+                                             it_map_unique_function_id->second, p);
+        }
         ker->set_size_shared_memory(shmem_static_nbytes + p->sharedMemBytes);
         ker->set_number_of_registers(nregs);
         ker->set_shared_memory_base_address((uint64_t)nvbit_get_shmem_base_addr(ctx));
