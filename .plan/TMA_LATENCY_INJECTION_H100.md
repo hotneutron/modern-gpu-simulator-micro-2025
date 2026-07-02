@@ -415,13 +415,45 @@ the root was the drain-rate cap (as predicted) and exp1 is the fix. If **C still
 `L2_TMA_true_hit_rate` further above HW or a cycle win coincides with unchanged `gpu_stall_dramfull`
 under fake 98% L2 hit**, treat the win as suspect until TMA address realism (6B) is in.
 
+### A/B result (measured — FA3 fwd k5, 4 runs, 2026-07-01/02)
 
+| Run | queue 4th | drain N | `gpu_sim_cycle` | `output_full` | `gpu_stall_icnt2sh` | `dramfull` | `wait_barrier` | L2_TMA hit |
+|---|---|---|---|---|---|---|---|---|
+| A base `.o24` | 64 | 1 | 151,232 | 180,998 | 258,818 | 189,115 | 9.82% | 0.985 |
+| B depth `.o25` | 256 | 1 | **150,522** | 96,320 | 253,395 | 94,319 | 9.69% | 0.986 |
+| C drain `.o7` | 64 | 4 | 151,346 | 151,644 | **722,519** | 148,773 | 9.99% | 0.985 |
+| D both `.o8` | 256 | 4 | 152,816 | 89,023 | **820,804** | 83,404 | 10.31% | 0.987 |
 
-**Ordering decision (recorded):** this reply-path bottleneck is fixed **before** TMA address
-realism (6B / Arch TODO-2). It is a genuine structural defect independent of the address model, so
-it should be corrected first — but every reply-path result must still be cross-checked against
-`L2_TMA_true_hit_rate` and `gpu_stall_dramfull` (see caveat above), because the *magnitude* of the
-pressure today is inflated by fake L2 locality and will shift once addresses are realistic.
+**Conclusion: the reply path is NOT the cycle lever. `output_full` / `wait_barrier` are symptoms,
+not the cause.**
+
+- **All four cycles are within ±0.8% (150,522–152,816).** Quadrupling the reply queue depth,
+  quadrupling the drain rate, or both, does not move cycles.
+- **B (depth only):** `output_full` **halved** (181K→96K) yet cycles moved −0.5%. Queue depth was
+  never the limiter.
+- **C (drain only):** `output_full` barely changed while `gpu_stall_icnt2sh` **exploded 259K→722K**
+  and cycles were flat — draining the reply queue faster just **pushes the stall one stage
+  downstream to the icnt reply network** (exactly the §4.5 "middle row" → exp3 case), with no cycle
+  benefit. This is the "bottleneck simply relocates" outcome the user predicted from the start.
+- **D (both):** lowest `output_full` (89K, −51%) but the **worst** cycle count (152,816) and the
+  highest `icnt2sh` (821K). Removing reply-queue pressure entirely does not help.
+- **`wait_barrier` is pinned at 9.7–10.3% across all four runs.** The consumer warpgroup's TMA
+  mbarrier wait does not shrink no matter how fast replies drain, so TMA completion latency is
+  **not** gated by the reply queue / icnt ejection — it is set upstream (the whole issue→complete
+  span of a 768×32B transfer) and/or is an artifact of the run conditions below.
+
+**⚠ These four runs all ran on fake ~98% L2 locality** (`L2_TMA_true_hit_rate ≈ 0.985` vs HW
+0.6958). The dense, all-hit reply traffic that saturates the icnt in C/D is itself a product of the
+synthetic single-base address. With realistic addresses more responses go to DRAM, spreading them
+in time, so the reply-path pressure profile could change qualitatively. **Therefore the reply path
+cannot be judged (or fixed) until the address model is realistic.**
+
+**Decision (updated, supersedes the earlier "fix reply path first"):** the reply-path knobs (exp
+1/2/3) are **exhausted with no cycle lever**, so config is reverted to baseline
+(`64:64:64:64`, `drain=1`) and the `-gpgpu_l2_reply_drain_per_cycle` code is **kept but left at 1**
+for re-testing after addresses are realistic. The next experiment is **TMA address realism (6B /
+Arch TODO-2)**: it is now a prerequisite for interpreting the TMA bottleneck at all, not just a
+later refinement. Re-run this exp1/2/3 A/B after 6B before drawing any reply-path conclusion.
 
 
 ## 5. Rollback history & risks (why Phase A failed, must not repeat)

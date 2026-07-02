@@ -442,5 +442,10 @@ do not change any scheduling/latency behavior.
   `output_full_cycles = 180,998 / 314,724` and `gpu_stall_icnt2sh = 258,818 / 464,997`. → the gate
   landed on the **third branch: L2→core reply-path backpressure**, not the hotspot and not injection.
   The two backpressure counters were decisive here — without them a `res_fail = 0` would have been
-  misread as "no admission pressure". Full analysis + next-experiment proposals in
-  `.plan/TMA_LATENCY_INJECTION_H100.md` §4.5.
+  misread as "no admission pressure".
+- **Follow-up A/B (fwd k5, 4 runs `.o24/.o25/.o7/.o8`, 2026-07-02)**: raising reply-queue depth
+  (64→256) and/or drain rate (1→4) moved `output_full` a lot but **cycles stayed within ±0.8%**;
+  drain=4 just relocated the stall to `gpu_stall_icnt2sh` (259K→722K). So `output_full` is a
+  **symptom, not the lever**, and — critically — all runs sat on fake ~98% L2 hit, so the reply
+  path can't be judged until TMA addresses are realistic. Next step is 6B (address realism), then
+  re-run this A/B. Full result in `.plan/TMA_LATENCY_INJECTION_H100.md` §4.5.
