@@ -210,17 +210,42 @@ extern "C" __device__ __noinline__ void factcheck_tma_descriptor(
   }
   tma_desc_factcheck_t *fc = (tma_desc_factcheck_t *)pfact;
   atomicAdd(&fc->count, 1);
-  if (desc_va == 0) {
-    return;
+
+  /* Classify the generic address with non-faulting predicates (isspacep.*). This
+   * is the fix for the illegal-access crash: the descriptor-carrying operand can be
+   * either the generic-SMEM window VA (0xffffffffc428xxxx, readable) or a raw staging
+   * cursor (e.g. 0xe800) / unmapped value, which would fault a blind deref. We record
+   * the space for EVERY sample (this alone closes the §2.18 SMEM-vs-GMEM open item)
+   * and only read bytes when the address resolves to a mapped, readable window. */
+  void *gp = (void *)desc_va;
+  unsigned int space = TMA_VA_UNKNOWN;
+  if (__isGlobal(gp)) {
+    space = TMA_VA_GLOBAL;
+  } else if (__isShared(gp)) {
+    space = TMA_VA_SHARED;
+  } else if (__isConstant(gp)) {
+    space = TMA_VA_CONSTANT;
+  } else if (__isLocal(gp)) {
+    space = TMA_VA_LOCAL;
   }
-  /* generic load reaches the SMEM window too; read the first 16 bytes (base+q1). */
-  const unsigned long long *p = (const unsigned long long *)desc_va;
-  unsigned long long q0 = p[0];
-  unsigned long long q1 = p[1];
+
+  unsigned int read_ok = 0;
+  unsigned long long q0 = 0, q1 = 0;
+  if (desc_va != 0 &&
+      (space == TMA_VA_GLOBAL || space == TMA_VA_SHARED ||
+       space == TMA_VA_CONSTANT)) {
+    const unsigned long long *p = (const unsigned long long *)desc_va;
+    q0 = p[0];
+    q1 = p[1];
+    read_ok = 1;
+  }
+
   unsigned int idx = atomicAdd(&fc->stored, 1);
   if (idx < TMA_DESC_FACTCHECK_SLOTS) {
     fc->unique_function_id[idx] = unique_function_id;
     fc->pc[idx] = vpc;
+    fc->space[idx] = space;
+    fc->read_ok[idx] = read_ok;
     fc->desc_va[idx] = desc_va;
     fc->qword0[idx] = q0;
     fc->qword1[idx] = q1;

@@ -81,12 +81,23 @@ typedef struct {
  * SMEM-staged descriptor really carries the real base. A tiny fixed ring is enough —
  * we only need a handful of distinct samples, not every dynamic issue. */
 #define TMA_DESC_FACTCHECK_SLOTS 256
+/* address-space classification of desc_va (isspacep.* is a pure predicate that never
+ * faults, so we can record it for every sample even when the byte read is skipped). */
+enum TMA_DESC_VA_SPACE {
+  TMA_VA_UNKNOWN = 0,  /* generic addr in none of the mapped windows below */
+  TMA_VA_GLOBAL = 1,
+  TMA_VA_SHARED = 2,
+  TMA_VA_CONSTANT = 3,
+  TMA_VA_LOCAL = 4
+};
 typedef struct {
   unsigned int count;                              /* total attempts (atomic) */
   unsigned int stored;                             /* slots actually written  */
   unsigned int unique_function_id[TMA_DESC_FACTCHECK_SLOTS];
   unsigned int pc[TMA_DESC_FACTCHECK_SLOTS];
-  unsigned long long desc_va[TMA_DESC_FACTCHECK_SLOTS];   /* address read from */
-  unsigned long long qword0[TMA_DESC_FACTCHECK_SLOTS];    /* expected = base   */
+  unsigned int space[TMA_DESC_FACTCHECK_SLOTS];          /* TMA_DESC_VA_SPACE  */
+  unsigned int read_ok[TMA_DESC_FACTCHECK_SLOTS];        /* 1 if q0/q1 valid   */
+  unsigned long long desc_va[TMA_DESC_FACTCHECK_SLOTS];  /* address inspected  */
+  unsigned long long qword0[TMA_DESC_FACTCHECK_SLOTS];   /* expected = base    */
   unsigned long long qword1[TMA_DESC_FACTCHECK_SLOTS];
 } tma_desc_factcheck_t;

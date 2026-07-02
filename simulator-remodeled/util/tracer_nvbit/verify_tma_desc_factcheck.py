@@ -67,6 +67,9 @@ def main():
     for b, rows in sorted(bases.items()):
         print(f"    0x{b:x}  x{len(rows)}  box={rows[0][1]}")
 
+    SPACE = {"0": "UNKNOWN/generic", "1": "GLOBAL", "2": "SHARED",
+             "3": "CONSTANT", "4": "LOCAL"}
+
     # Read samples, dedup by (uid,pc,desc_va,qword0)
     seen = set()
     rows = []
@@ -79,12 +82,33 @@ def main():
             seen.add(key)
             rows.append(r)
 
+    # Address-space histogram (present since the crash-fix; older CSVs lack it).
+    have_space = rows and "space" in rows[0]
+    if have_space:
+        hist = defaultdict(int)
+        readable = 0
+        for r in rows:
+            hist[SPACE.get(r.get("space", "0"), r.get("space"))] += 1
+            if r.get("read_ok") == "1":
+                readable += 1
+        print("\ndesc_va address space (distinct samples):")
+        for sp, c in sorted(hist.items()):
+            print(f"    {sp:16s} x{c}")
+        print(f"    -> read_ok (byte read performed): {readable}/{len(rows)}")
+
+    # Only samples whose bytes were actually read can be base-checked.
+    def was_read(r):
+        return (not have_space) or r.get("read_ok") == "1"
+
     matched, unmatched = [], []
     for r in rows:
+        if not was_read(r):
+            continue
         q0 = parse_int(r["qword0_hex"])
         (matched if q0 in bases else unmatched).append(r)
 
     print(f"\ndistinct fact-check samples: {len(rows)}")
+    print(f"  bytes read (base-checkable) : {len(matched) + len(unmatched)}")
     print(f"  qword0 == a real encode base : {len(matched)}")
     print(f"  qword0 NOT a known base      : {len(unmatched)}")
 
@@ -123,15 +147,22 @@ def main():
                   f"qword0={r['qword0_hex']}{note}")
 
     print()
-    if matched and not unmatched:
-        print("=> PASS: every sampled descriptor's qword0 is a real base. Path D1 "
-              "(device-read the SMEM-staged descriptor at issue) is confirmed.")
+    checkable = len(matched) + len(unmatched)
+    if checkable == 0:
+        print("=> INCONCLUSIVE: no descriptor VA was in a readable space (all SHARED/"
+              "UNKNOWN-generic), so no bytes were read. See the address-space histogram: "
+              "if desc_va is SHARED, the descriptor is SMEM-staged and D1 must read it "
+              "as shared at issue (a generic load faults); if it is UNKNOWN/generic, the "
+              "operand is a raw cursor (e.g. 0xe800) and D2 (global original) is needed.")
+    elif matched and not unmatched:
+        print("=> PASS: every read descriptor's qword0 is a real base. Path D1 "
+              "(device-read the descriptor at issue) is confirmed.")
     elif matched:
         print("=> PARTIAL: some samples match. If unmatched are 'near base+offset' "
               "they are coords-adjusted copies (still usable: subtract the coord term); "
               "otherwise re-examine the operand choice.")
     else:
-        print("=> FAIL: no sample matched a known base. Either the descriptor VA read "
+        print("=> FAIL: no read sample matched a known base. Either the descriptor VA "
               "is wrong (try the other operand / UTMACCTL target) or the staged bytes "
               "are transformed; consider Path D2 (global original before staging).")
 
