@@ -189,3 +189,40 @@ extern "C" __device__ __noinline__ void capture_tma_param_base(
     slot->unique_function_id = unique_function_id;
   }
 }
+
+/* SPIKE 6 device fact-check (TMA_BASE_ADDR.md §2.18). Injected at IPOINT_BEFORE on an
+ * executed UTMALDG/UTMASTG. desc_va is the effective address of the descriptor-carrying
+ * memory-ref operand (the generic-SMEM tensormap address, e.g. 0xffffffffc428xxxx),
+ * passed via nvbit_add_call_arg_mref_addr64. Read 128B there and store qword0/qword1
+ * into a bounded managed ring. First active lane only; a handful of samples across pcs
+ * is enough to confirm qword0 == the real base. */
+extern "C" __device__ __noinline__ void factcheck_tma_descriptor(
+    int32_t pred, uint32_t unique_function_id, uint32_t vpc, uint64_t desc_va,
+    uint64_t pfact) {
+  if (!pred) {
+    return;
+  }
+  const int active_mask = __ballot_sync(__activemask(), 1);
+  const int laneid = get_laneid();
+  const int first_laneid = __ffs(active_mask) - 1;
+  if (first_laneid != laneid) {
+    return;
+  }
+  tma_desc_factcheck_t *fc = (tma_desc_factcheck_t *)pfact;
+  atomicAdd(&fc->count, 1);
+  if (desc_va == 0) {
+    return;
+  }
+  /* generic load reaches the SMEM window too; read the first 16 bytes (base+q1). */
+  const unsigned long long *p = (const unsigned long long *)desc_va;
+  unsigned long long q0 = p[0];
+  unsigned long long q1 = p[1];
+  unsigned int idx = atomicAdd(&fc->stored, 1);
+  if (idx < TMA_DESC_FACTCHECK_SLOTS) {
+    fc->unique_function_id[idx] = unique_function_id;
+    fc->pc[idx] = vpc;
+    fc->desc_va[idx] = desc_va;
+    fc->qword0[idx] = q0;
+    fc->qword1[idx] = q1;
+  }
+}

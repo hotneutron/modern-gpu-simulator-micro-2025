@@ -636,6 +636,272 @@ is span metadata, not a tensormap. These need no descriptor bind (TMA_TRACING §
 3. Do **not** force bwd through the fwd model — it would fabricate wrong offsets
    (the `0x40600`/`no_def`/multi-source cases prove it).
 
+## 2.15 SPIKE 5 CORRECTION (per-uid split on the SAME bwd-causal trace) — the EXECUTED workload is by-pointer for BOTH uids; §2.14(a) "fwd is clean" was about NON-executed static sites
+
+Added per-uid executed stats and re-read the trace. **§2.14's "fwd is uniformly clean"
+is misleading and is corrected here.** That statement was true only of the *static*
+(mostly non-executed) fwd kernel variants; the *executed* loads tell a different story.
+
+**(a) Both executed uids are dominated by by-pointer, not by-value.**
+```
+by uid (executed): uid 3 = 12/13 (92.3%)   uid 8 = 7/23 (30.4%)
+```
+The `--only-uid 3 --dump-chains` output shows uid 3's executed UTMALDG sites use the
+**same** non-param-base pattern as uid 8:
+```
+uid=3 pc=0x6d20 UTMALDG  UR6 <- ULDC c[0x0][0x2ac]                       (off 0x0)
+uid=3 pc=0x7370 UTMALDG  UR6 += 0x20400; UR6 += 0x20200; <- c[0x0][0x2ac] (off 0x40600)
+uid=3 pc=0x6d50 UTMALDG  UR32: no_def                                     (LDG-sourced)
+uid=3 pc=0x9650 UTMALDG  UR22 <- UR8 + 0x20000; <- c[0x0][0x2ac]          (off 0x20000)
+```
+So the "clean fwd by-value" kernel effectively **does not run** in this bwd-causal
+trace. The 92.3% is an artifact of counting a couple of by-value Q-loads plus the fact
+that most sites are static/non-executed.
+
+**(b) Self-accumulation is real, not an artifact.** `UR6 += 0x20400; UR6 += 0x20200`
+folds correctly to a fixed `0x40600` (verified). These are loop-induction walks over a
+**GMEM tensormap array** — the large offset is the array index, terminating at the
+pointer slot `c[0x0][0x2ac]` / `c[0x0][0x280]` / `c[0x0][0x2a0]`.
+
+**(c) `no_def` (UR32/UR34) = descriptor pointer comes from an `LDG`** (a memory load),
+which static analysis cannot follow at all.
+
+**Corrected conclusion:** for THIS trace the recovery is fundamentally **two-level**
+(param pointer → GMEM tensormap array → 128B descriptor), plus an `LDG`-sourced subset
+that static analysis cannot reach. The single-level host-deref (§2.13) covers only the
+minority by-value sites.
+
+**Next step (hypothesis proof before any redesign code):** prove level-1 first — that
+`c[0x0][0x2ac]` / `c[0x0][0x280]` hold **GMEM pointers** — by reading those 8 bytes out
+of the Phase-0b param-region dump (`prove_tma_tensormap_pointer.py`). If confirmed,
+design the two-level deref (dump the pointed-at GMEM range, index by the large offset,
+take qword0). A pure fwd-only trace (separate run) is still worth capturing to confirm
+the clean by-value path exists there, but it is not what this bwd-causal trace exercises.
+
+## 2.16 Per-opcode descriptor recovery — the OLD `handle_hi` join vs the NEW real-address specific mapping
+
+This is the spine of the whole effort, re-stated so it does not drift again.
+
+**What "getting the descriptor" means.** For each executed TMA op the simulator must
+know **which tensor-map (128B descriptor) that op uses**, because that descriptor holds
+`global_base + strides + box` — the inputs to the real HW address
+`addr = global_base + Σ coord·stride`. The question per opcode is only: *how do we name,
+for this exact executed site, the one descriptor it consumes?*
+
+**OLD (TMA_TRACING.md, being replaced).** Descriptor **values** came from the host
+`cuTensorMapEncodeTiled` dump; the executed site was tied to a value by a **join key**
+`(uid, pc, handle_hi)` → `config_id`. This is the part that fails: `handle_hi` (=
+`desc_value_hi`) takes only 3 values for 7 bases, so the join is **not unique** and
+needs rescue heuristics (rank reuse, desc-reg reuse, candidate lists). It never yields a
+specific GPU base.
+
+**NEW (Path B, this doc).** Stop joining by a shared field. Instead, for each executed
+site compute the **descriptor's memory address (VA)** the way HW does, then **read the
+128B there** and decode every field from those bytes. The "mapping" is no longer a
+fuzzy tag match — it is the *physical location of the descriptor the HW itself
+dereferences*. `handle_hi` is demoted to a debug column; the host encode dump is demoted
+to a cross-check.
+
+The only per-opcode difference is **where that descriptor VA comes from** (which SASS
+operand carries it). Note: `desc[URx]` is NOT the descriptor — it is a constant handle
+`{lo=0, hi=handle_hi}` (§2.5). The descriptor VA is an *address operand*, not the desc
+handle.
+
+| Opcode (FA3 form) | Descriptor-VA source (NEW key) | Level | How the 128B is obtained |
+|---|---|---|---|
+| `UTMALDG.4D [dst],[ptr],desc[URx]` | **operand-2 `[ptr]`** VA = def-chain from `ULDC c[0x0][K]` (+const adds) | **by-value** when `K` = param-base (`0x198`): `VA = param_base + off`. **by-pointer** when `K` ≠ param-base (`0x2ac/0x280/0x2a0`): `VA = deref(param_base+K) + index` | deref VA → 128B → qword0=base |
+| `UTMAREDG` (not in FA3 run) | same as `UTMALDG` (operand-2) | same rule | same |
+| `UTMASTG.4D/5D [URa],[URb]` | **operand-1 pair `[URa]`** VA (no `desc[]`; first pair is desc-like) | by-value in FA3 (reaches `0x198`) | deref VA → 128B |
+| `UBLKRED …,desc[URx]` (desc-backed) | **`desc[URx]` as a VA** *(needs recheck — see below)*; operand-3 stays span-only | mixed | deref VA → 128B; keep operand-3 separate |
+| `UBLKRED …` (non-desc / bulk) | **none** — operand already holds the real GMEM target (`0xffff…` sign-extended VA) | n/a | no descriptor bind; use operand address + `op3*16` span |
+| `UBLKCP`,`UBLKPF` | none (bulk; operands are the moved-region cursors) | n/a | no descriptor bind |
+| `UTMAPF.L2.4D [URa],[URb]` (no desc) | **inherit** from an exact-linked later `UTMALDG` (same `uid`, equal operand-1 samples) | follows the linked load | inherit that load's descriptor |
+| `UTMACCTL.PF`,`UTMACMDFLUSH` | none (control-only) | n/a | no base generation |
+
+**Two important corrections that the bwd data forced (§2.14/§2.15):**
+
+1. **`UTMALDG` has two levels, not one.** The clean fwd case is *by-value* (K=0x198,
+   descriptor inline in the param block). The executed bwd case is dominated by
+   *by-pointer*: the param slot `c[0x0][0x2ac]` holds a **GMEM pointer to a tensormap
+   array**, and the large def-chain offset (`0x40600`, `0x8000`, …) is the **array
+   index**. So `UTMALDG` recovery must support both: level-1 `VA = param_base+off`
+   (by-value) and level-2 `VA = deref(param_base+K) + index` (by-pointer). A subset is
+   `LDG`-sourced (`no_def`) and cannot be recovered statically at all.
+
+2. **`UBLKRED` splits by form (already in §2.6, reconfirmed on data).** The desc-backed
+   form has `desc[URx]`, but the FA3 bwd runtime shows its **operand ci=1 is a real GMEM
+   address** (`0xffffffffc9…`) and the handle is span-ish `{0x85,0x85}` — i.e. these
+   executed `UBLKRED` behave **operand-based**, needing no tensormap deref. This must be
+   rechecked per site before treating any `UBLKRED` as descriptor-backed: if the operand
+   already carries the GMEM target, do **not** force a descriptor VA.
+
+**Net rule for the redesign:** every descriptor-carrying site is keyed by a **real
+descriptor VA**, and the base comes from the **128B read at that VA** — never from
+`handle_hi`. `UTMALDG`/`UTMAREDG` use operand-2 (with by-value vs by-pointer levels),
+`UTMASTG` uses operand-1 pair, desc-backed `UBLKRED` uses `desc[URx]` *only if* the
+operand doesn't already carry the GMEM target, `UTMAPF` inherits via exact link, and
+bulk/control ops need no descriptor. This is the "specific per-address mapping" that
+replaces the non-unique `handle_hi` tag.
+
+## 2.17 SPIKE 6 (measured on the copied trace, fwd uid3 + bwd uid8) — the real mechanism: param holds a POINTER to the descriptor, and both fwd & bwd are identical
+
+This is the decisive spike. It resolves the §2.8 "operand is SMEM but def-chain says
+param-global" contradiction, corrects my operand-numbering error, and proves fwd and
+bwd obey **one** rule (answering the user's "fwd-only can't pass").
+
+**Data used:** `tensor_map_encode_dump.csv` (7 distinct bases, qword0=base),
+`tma_runtime_operand_debug.jsonl` (real operand values), `tma_desc_producer_debug.csv`
+(producer reg values), and the fwd SASS `flash_fwd_hdim64_bf16_sm90.sm_90a.sass`
+(uid3, verified to contain UTMALDG@0x94e0 exactly once).
+
+**(a) Operand numbering corrected.** For `UTMALDG.4D [UR16], [UR8], desc[UR10]`
+@0x94e0 the def-chains + runtime values are:
+```
+operand-1 [UR16] (ci=0): R2UR UR16,R12; +0xe400   runtime 0xffffffffc42804c0  = SMEM dst cursor
+operand-2 [UR8]  (ci=1): UR24+0x2b0; UR24=ULDC c[0x0][0x198]   runtime 0xe800/0x12800
+desc      [UR10]        : UMOV UR10,0x0            runtime {0,0x14f00000}     = constant handle
+```
+So operand-2 IS `param_base + 0x2b0` (as §2.10/§2.11 predicted), **but its runtime value
+is a SMEM address `0xe800`.** My earlier §2.14/§2.16 "by-value vs by-pointer" framing was
+wrong about which operand and about by-value.
+
+**(b) What the param slot actually contains — a POINTER, not the 128B descriptor.**
+`operand-2 = param_base + 0x2b0` is the *address of a param slot*; the value the kernel
+reads from that slot (and puts into the operand at issue) is `0xe800`, a **SMEM address**.
+The kernel entry proves the intent:
+```
+0x090 ULDC.64 UR4, c[0x0][0x198]        ; UR4 = param_base
+0x0a0 UIADD3  UR6, UR4, 0x1f0           ; &tensormap_ptr[0]
+0x0b0 UIADD3  UR8, UR4, 0x2b0           ; &tensormap_ptr[1]
+0x0c0 UIADD3  UR10,UR4, 0x370           ; &tensormap_ptr[2]
+0x0d0 UIADD3  UR4, UR4, 0x7f0           ; &tensormap_ptr[3]
+0x120 UTMACCTL.PF [UR6]                 ; TMA prefetches the descriptor pointed at by each slot
+0x130 UTMACCTL.PF [UR8]                 ; (one per tensormap)
+0x140 UTMACCTL.PF [UR10]
+0x150 UTMACCTL.PF [UR4]
+```
+So the param block at `+0x1f0/+0x2b0/+0x370/+0x7f0` holds **tensormap descriptor
+pointers**; `UTMACCTL.PF` prefetches each descriptor into the TMA descriptor cache, and
+the kernel also stages a copy the TMA engine reads (the SMEM `0xe800` seen at issue).
+The descriptor is **not** inline-by-value in the param block.
+
+**(c) The real base IS in the trace.** `tma_desc_producer_debug.csv` holds device VAs
+that match the encode dump exactly, e.g. `0x7f3f5c600000` (= encode row 7 base) appears
+66,410 times. So the true base is observable; it is reached by dereferencing the
+descriptor pointer, not by reading the param slot as 128B.
+
+**(d) Why host-deref of `param_base+offset` FAILED to map (root cause).**
+`cuMemcpyDtoH(param_base+0x2b0, 128)` reads the *param slot*, which contains the pointer
+value (→ `0xe800`, a SMEM address), **not** the 128B descriptor. The descriptor lives
+where that pointer points (descriptor cache / a staged SMEM copy / the pointed global
+buffer), which host `cuMemcpyDtoH` cannot follow — SMEM is not host-addressable. That is
+exactly why the mapping never matched. The §2.10(c) "1/7 matched" was luck: one slot
+happened to hold a value that looked like a base.
+
+**(e) fwd and bwd are the SAME.** uid8 `UTMASTG.4D` shows the identical shape:
+ci=0=`0xffffffffc42a07c0` (SMEM dst cursor), ci=1=`0x4400` (SMEM), desc handle small.
+Both kernels are CUTLASS **persistent** (`VarlenDynamicPersistentTileScheduler`) and both
+route the descriptor through a param pointer + staged copy. **There is no fwd-only path**
+— confirming the user. The 92.3% vs 30.4% "resolved" numbers were an artifact of the
+broken static assumption, not a real fwd/bwd difference.
+
+**(f) FACT-NAILED: the live descriptor is SMEM-staged, and its address is observable.**
+Cross-checking the entry `UTMACCTL.PF` (descriptor prefetch) with the `UTMALDG` operands
+and their runtime values pins the location exactly:
+```
+UTMACCTL.PF [UR6]   runtime 0xffffffffc4280400   ; descriptor prefetch target
+UTMALDG op1 [UR16]  runtime 0xffffffffc42804c0   ; SAME generic window, +0xc0
+UTMALDG op2 [UR8]   runtime 0xe800               ; separate raw-shared cursor (staging/barrier)
+UTMASTG op1 (uid8)  runtime 0xffffffffc42a07c0   ; identical scheme in bwd
+```
+`0xffffffffc428xxxx` is a **generic-address-space SMEM window** address (Hopper maps
+shared memory into the high generic window `0xffffff…`). `UTMACCTL.PF` and `UTMALDG`
+operand-1 point into the **same** window, and the strides between consecutive descriptors
+are `0xc0 = 192` — matching the `box_dim 64×192`. So the descriptor the HW dereferences
+at issue is a **SMEM-staged tensormap** at that generic-SMEM VA. This is the same in fwd
+(uid3) and bwd (uid8).
+
+Correcting my own §2.17(a): the descriptor VA is **operand-1 / the `UTMACCTL.PF` target**
+(`0xffffffffc428xxxx`, SMEM), **not** operand-2 (`0xe800`, which is a raw-shared staging/
+barrier cursor). Both are SMEM; neither is host-readable.
+
+**Consequences (this is the design break):**
+- **Host deref (§2.13) is dead** for these kernels — the descriptor is in SMEM, which
+  `cuMemcpyDtoH` cannot read. The "same device-global bytes" premise of §2.13 was false.
+- **Path A launch-arg dump (§2.12 fallback) is also dead** — at `cuLaunchKernel` the SMEM
+  copy does not exist yet; the param block holds only a pointer.
+- **Consistent with producer_debug:** 0/10 (uid3) and 0/12 (uid8) executed sites captured
+  a real base — because their bases only ever appear inside SMEM staging, which the
+  current producer capture does not read.
+- **A global original still exists** (encode dump has the 7 real bases), but for uid3/8 it
+  is only reached through the SMEM-staged copy at issue; the raw-global-pointer scheme
+  (`c[0x0][0x208]`, seen feeding `producer_debug` bases) belongs to *other* kernels
+  (uid1/6/7), not the FA3 persistent fwd/bwd.
+
+So the recovery must read the **SMEM-staged descriptor at issue** on the device. That is
+the capture decision that replaces §2.13 (see §2.18).
+
+**(g) Not every opcode knows a descriptor location.** Per the user: this does NOT mean
+all ops carry a descriptor VA. `UBLKRED` in this trace is operand-based (ci=1 is a real
+target address like `0x5d408000`, handle is span-ish `{0x85}`); `UBLKCP`/`UTMACCTL`/
+`UTMACMDFLUSH` are control/bulk with no descriptor to locate. The per-opcode table in
+§2.16 stands, but with (f)'s two-level pointer deref replacing the by-value read for
+`UTMALDG`/`UTMASTG`/desc-backed `UBLKRED`.
+
+## 2.18 What is confirmed vs still open, and the device-side capture decision (replaces §2.13)
+
+**Confirmed by trace data (SPIKE 6):**
+1. Param slots hold a pointer/staging path, **not** the 128B descriptor.
+2. The descriptor the HW reads at issue is **SMEM-staged** (`0xffffffffc428xxxx` generic
+   window; `UTMACCTL.PF` and `UTMALDG` op-1 agree; 192-byte stride = box_dim).
+3. **fwd and bwd are identical** (persistent-kernel staging) — no fwd-only path.
+4. **Host deref and Path A are both dead** for these kernels (SMEM not host-visible;
+   SMEM copy absent at launch).
+5. `producer_debug` captured 0 real bases for uid3/8, consistent with the above.
+6. `c[0x0][0x208]` is a *global* pointer used by `LDG.E desc[UR14]` — a **different**
+   scheme belonging to other kernels, not the FA3 persistent fwd/bwd descriptor path.
+
+**Still open (cannot be closed offline — SMEM is not in the trace files):**
+- Whether the SMEM-staged descriptor's `qword0` equals the real base (expected, but
+  must be verified on device).
+- Whether a global original is reachable for uid3/8 *before* staging.
+
+**Capture options (all device-side; pick after the fact-check reruns):**
+
+| Option | What it reads | Trace-gen cost | Accuracy | Risk |
+|---|---|---|---|---|
+| **D1: read SMEM descriptor at issue** | inject a 128B shared-mem load at each `UTMALDG`/`UTMASTG` from operand-1's generic-SMEM VA | `inst_trace_t` + channel + `inject_funcs` | highest — the exact bytes HW uses, incl. per-tile coords | larger diff; must read at issue (predicated lanes) |
+| **D2: read global original before staging** | find the `LDG`/bulk source that fills the SMEM copy, dump 128B there once | medium (identify the fill site) | base + static fields correct; per-tile coords may be pre-staging | must prove the fill source exists & is stable for uid3/8 |
+| **D3: capture in producer chain** | extend existing producer capture to record the staged descriptor VA + a 128B read | reuse producer path | same bytes as D1 if it reads SMEM | producer path currently only logs const/reg values, not SMEM contents |
+
+D1 is the faithful, HW-matching route (and the only one guaranteed to include per-tile
+coord edits); D2 is cheaper if a stable global source exists. The next server step is a
+**device-side fact-check**: at one `UTMALDG` issue, read 128B at operand-1's VA and
+confirm `qword0` ∈ the 7 encode bases. That single check decides D1 vs D2 and closes the
+last open item.
+
+**Fact-check tooling (implemented, ready to build/run on server):**
+- Tracer (`common.h`, `inject_funcs.cu`, `tracer_tool.cu`): gated by
+  `TMA_DESC_FACTCHECK=1`. At each executed `UTMALDG`/`UTMASTG` it device-reads 128B at
+  the descriptor-carrying **first memref** VA (the generic-SMEM tensormap address) and
+  records `qword0/qword1` into a bounded managed buffer, dumped to
+  `extra_info/tma_desc_factcheck.csv` at kernel exit.
+- Verifier `verify_tma_desc_factcheck.py`: checks each sampled `qword0` against the 7
+  bases in `tensor_map_encode_dump.csv`. Prints PASS (all match ⇒ D1 confirmed),
+  PARTIAL (matches + `base+offset` near-hits ⇒ coords-adjusted copy, subtract coord
+  term), or FAIL (none match ⇒ wrong operand / transformed bytes ⇒ consider D2).
+
+Run recipe:
+```
+# rebuild tracer, then re-run the app with:
+ENABLE_TMA_DESC=1 TMA_DESC_FACTCHECK=1 <existing trace-gen run cmd>
+# then:
+python3 verify_tma_desc_factcheck.py --traces "$TRACES"
+```
+Expected on PASS: samples for uid3 (fwd) and uid8 (bwd) with `desc_va` in the
+`0xffffffffc428xxxx` SMEM window and `qword0` ∈ {the 7 bases}. This is the same rule for
+both kernels — the whole point of §2.17(e).
+
 ## 3. Design
 
 ### 3.1 Trace-gen (NVBit) — capture param_base + static offset, deref the descriptor, dump ALL fields (Path B)

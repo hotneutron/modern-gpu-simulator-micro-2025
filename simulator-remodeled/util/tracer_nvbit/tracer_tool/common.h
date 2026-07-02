@@ -73,3 +73,20 @@ typedef struct {
   unsigned int unique_function_id;
   int valid;
 } tma_param_base_capture_t;
+
+/* SPIKE 6 device fact-check (TMA_BASE_ADDR.md §2.18):
+ * at an executed UTMALDG/UTMASTG, read 128B from the descriptor VA (the operand that
+ * holds the generic-SMEM tensormap address, e.g. 0xffffffffc428xxxx) and record the
+ * first two qwords. Offline we check qword0 in {7 encode bases} to confirm the
+ * SMEM-staged descriptor really carries the real base. A tiny fixed ring is enough —
+ * we only need a handful of distinct samples, not every dynamic issue. */
+#define TMA_DESC_FACTCHECK_SLOTS 256
+typedef struct {
+  unsigned int count;                              /* total attempts (atomic) */
+  unsigned int stored;                             /* slots actually written  */
+  unsigned int unique_function_id[TMA_DESC_FACTCHECK_SLOTS];
+  unsigned int pc[TMA_DESC_FACTCHECK_SLOTS];
+  unsigned long long desc_va[TMA_DESC_FACTCHECK_SLOTS];   /* address read from */
+  unsigned long long qword0[TMA_DESC_FACTCHECK_SLOTS];    /* expected = base   */
+  unsigned long long qword1[TMA_DESC_FACTCHECK_SLOTS];
+} tma_desc_factcheck_t;

@@ -192,6 +192,12 @@ int aux_htod_dump_max_bytes = 4096;
 int tma_param_base_cbank_index = 0x198;
 int tma_param_base_region_bytes = 8192;
 tma_param_base_capture_t *tma_param_base_capture = nullptr;
+/* SPIKE 6 device fact-check (TMA_BASE_ADDR.md §2.18): read 128B at the descriptor VA
+ * of executed UTMALDG/UTMASTG and record qword0 (expected == real base). Gated by
+ * TMA_DESC_FACTCHECK; dumped to tma_desc_factcheck.csv at kernel exit. */
+int tma_desc_factcheck_enable = 0;
+tma_desc_factcheck_t *tma_desc_factcheck = nullptr;
+std::unordered_set<int> tma_desc_factcheck_header_written;
 std::unordered_set<int> tma_param_base_deref_header_written;
 std::unordered_set<int> tma_desc_runtime_debug_header_written;
 std::unordered_set<int> tma_desc_producer_debug_header_written;
@@ -680,6 +686,41 @@ static void append_tma_param_base_deref_event(int device_id, int kernel_trace_id
   tma_param_base_capture->valid = 0;
   tma_param_base_capture->param_base = 0;
   tma_param_base_capture->unique_function_id = 0;
+}
+
+/* SPIKE 6 fact-check (§2.18): dump the device-read 128B descriptor samples (qword0 =
+ * expected real base) collected this launch, then reset the buffer. */
+static void append_tma_desc_factcheck_event(int device_id, int kernel_trace_id) {
+  if (!enable_tma_desc || !tma_desc_factcheck_enable ||
+      tma_desc_factcheck == nullptr) {
+    return;
+  }
+  if (tma_desc_factcheck->count == 0) {
+    return;  // no executed UTMALDG/UTMASTG this launch
+  }
+  create_folder(extrainfo_path.c_str());
+  std::string csv_path = extrainfo_path + "/tma_desc_factcheck.csv";
+  bool needs_header = tma_desc_factcheck_header_written.find(device_id) ==
+                      tma_desc_factcheck_header_written.end();
+  std::ofstream csv(csv_path, needs_header ? std::ios::out : std::ios::app);
+  if (csv.is_open()) {
+    if (needs_header) {
+      tma_desc_factcheck_header_written.insert(device_id);
+      csv << "device_id,kernel_id,unique_function_id,pc_hex,desc_va_hex,"
+             "qword0_hex,qword1_hex\n";
+    }
+    unsigned int n = tma_desc_factcheck->stored;
+    if (n > TMA_DESC_FACTCHECK_SLOTS) n = TMA_DESC_FACTCHECK_SLOTS;
+    for (unsigned int i = 0; i < n; ++i) {
+      csv << device_id << "," << kernel_trace_id << ","
+          << tma_desc_factcheck->unique_function_id[i] << ",0x" << std::hex
+          << tma_desc_factcheck->pc[i] << ",0x" << tma_desc_factcheck->desc_va[i]
+          << ",0x" << tma_desc_factcheck->qword0[i] << ",0x"
+          << tma_desc_factcheck->qword1[i] << std::dec << "\n";
+    }
+  }
+  // Reset for the next launch.
+  memset(tma_desc_factcheck, 0, sizeof(tma_desc_factcheck_t));
 }
 
 
@@ -1511,6 +1552,8 @@ void nvbit_at_init() {
               "Phase 0b: c[0x0][K] index the entry ULDC.64 loads param_base from (host-deref descriptor recovery).");
   GET_VAR_INT(tma_param_base_region_bytes, "TMA_PARAM_BASE_REGION_BYTES", 8192,
               "Phase 0b: bytes of the kernel param block to cuMemcpyDtoH for descriptor slicing.");
+  GET_VAR_INT(tma_desc_factcheck_enable, "TMA_DESC_FACTCHECK", 0,
+              "SPIKE 6 (§2.18): at executed UTMALDG/UTMASTG, device-read 128B at the descriptor VA and dump qword0 (expected == real base) to tma_desc_factcheck.csv.");
   std::string pad(100, '-');
   printf("%s\n", pad.c_str());
 
@@ -1929,6 +1972,32 @@ void instrument_function_if_needed(CUcontext ctx, CUfunction func, int device_id
           nvbit_add_call_arg_const_val64(instr, (uint64_t)tma_param_base_capture);
         }
       }
+
+      /* SPIKE 6 device fact-check (TMA_BASE_ADDR.md §2.18): at an executed
+       * UTMALDG/UTMASTG, read 128B at the descriptor-carrying memref address (the
+       * generic-SMEM tensormap VA, §2.17f) and record qword0/qword1. Uses the FIRST
+       * memory-ref operand (operand-1 for UTMALDG, the desc-like first pair for
+       * UTMASTG), which is the address UTMACCTL.PF prefetches. Offline we check
+       * qword0 in the 7 encode bases. Gated by TMA_DESC_FACTCHECK. */
+      if (enable_tma_desc && tma_desc_factcheck != nullptr &&
+          (opcode_str.rfind("UTMALDG", 0) == 0 ||
+           opcode_str.rfind("UTMASTG", 0) == 0)) {
+        int first_mref = -1;
+        for (int oi = 0; oi < instr->getNumOperands(); ++oi) {
+          if (instr->getOperand(oi)->type == InstrType::OperandType::MREF) {
+            first_mref = oi;
+            break;
+          }
+        }
+        if (first_mref >= 0) {
+          nvbit_insert_call(instr, "factcheck_tma_descriptor", IPOINT_BEFORE);
+          nvbit_add_call_arg_guard_pred_val(instr);
+          nvbit_add_call_arg_const_val32(instr, next_candidate_unique_function_id);
+          nvbit_add_call_arg_const_val32(instr, (int)instr->getOffset());
+          nvbit_add_call_arg_mref_addr64(instr, first_mref);
+          nvbit_add_call_arg_const_val64(instr, (uint64_t)tma_desc_factcheck);
+        }
+      }
       cnt++;
     }
 
@@ -2261,6 +2330,7 @@ void nvbit_at_cuda_event(CUcontext ctx, int is_exit, nvbit_api_cuda_t cbid,
        * finished kernel is kernel_id-1. */
       if (enable_tma_desc && !stop_report[device_id]) {
         append_tma_param_base_deref_event(device_id, kernel_id[device_id] - 1);
+        append_tma_desc_factcheck_event(device_id, kernel_id[device_id] - 1);
       }
 
       unsigned total_insts_per_kernel =
@@ -3191,6 +3261,13 @@ void init_context_state(CUcontext ctx) {
       tma_param_base_capture->param_base = 0;
       tma_param_base_capture->unique_function_id = 0;
       tma_param_base_capture->valid = 0;
+    }
+    /* SPIKE 6 fact-check (§2.18): one managed buffer for device-side 128B descriptor reads. */
+    if (enable_tma_desc && tma_desc_factcheck_enable) {
+      CUDA_SAFECALL(cuMemAllocManaged(
+          reinterpret_cast<CUdeviceptr *>(&tma_desc_factcheck),
+          sizeof(tma_desc_factcheck_t), CU_MEM_ATTACH_GLOBAL));
+      memset(tma_desc_factcheck, 0, sizeof(tma_desc_factcheck_t));
     }
   }
   CTXstate* ctx_state = ctx_state_map[ctx];
