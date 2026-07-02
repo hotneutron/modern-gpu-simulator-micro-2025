@@ -587,6 +587,55 @@ This is exactly the pair of risks Gate 0 (§2.12) exists to test: (a) is the con
 param VA host-copyable, and (b) is the post-sync buffer still valid. If either fails,
 switch to Path A.
 
+## 2.14 SPIKE 4 (measured on FA3 bwd k=uid8) — fwd is clean by-value; bwd is by-pointer + operand-based, so DO FWD FIRST
+
+Ran the def-chain extractor + runtime-operand analyzer on the **bwd** trace
+(`extract_tma_descriptor_offsets.py`, `analyze_tma_runtime_operands.py`). The bwd
+kernel does NOT match the clean fwd by-value model. Decision: **land the whole
+pipeline on fwd first (100% clean), treat bwd as a separate follow-up.**
+
+**(a) fwd is uniformly clean.** Every fwd kernel variant resolves to exactly 2
+param-base offsets (`0x2f0/0x3b0` or `0x470/0x530`) via `param_base@0x198 + offset`.
+This is the §2.10/§2.11 model and host-deref (§2.13) covers it fully.
+
+**(b) bwd executed UTMALDG operands are SMEM at runtime — same as fwd §2.8.** The
+runtime analyzer shows all 10 executed UTMALDG sites are `no_gmem_operand` (operands
+are SMEM staging cursors `0x10400/0x18400` and SMEM-window `0x2e2a0xxx`). So a
+device-side operand capture cannot recover the descriptor VA either — the **static
+param_base+offset path is still the only route** for bwd UTMALDG.
+
+**(c) but bwd passes tensormaps BY POINTER, not by value.** Executed bwd UTMALDG
+def-chains terminate at **multiple, non-0x198 cbank slots with large offsets**:
+```
+pc=0xa240  UR? <- ULDC c[0x0][0x198] + 0x2b0        (clean, by-value — 1 of 10)
+pc=0x6ea0  UR6 <- ULDC c[0x0][0x2ac] + 0x0
+pc=0x74f0  UR6 <- ULDC c[0x0][0x2ac] + 0x40600      (264 KB)
+pc=0x7670  UR14<- ULDC c[0x0][0x280] + 0x8000       (32 KB)
+pc=0xa320  UR32: no_def  (desc reg comes from an LDG / memory load)
+```
+`c[0x0][0x2ac]` / `c[0x0][0x280]` are **pointers inside the param block to a GMEM
+tensormap array**, and the large offsets index into that array. So the bwd recovery is
+a **two-level dereference**: `deref(param_base + 0x2ac)` = array pointer, then
+`deref(array_ptr + index)` = the 128B descriptor. The `no_def` sites take the pointer
+from an `LDG`, which static analysis cannot follow at all.
+
+**(d) bwd UBLKRED is operand-based, not descriptor-based.** All 6 executed UBLKRED
+sites expose a real **GMEM operand** (ci=1 = `0xffffffffc9......`, a sign-extended
+device VA = the actual reduction target), with a desc handle `{lo=0x85,hi=0x85}` that
+is span metadata, not a tensormap. These need no descriptor bind (TMA_TRACING §2.6
+"non-descriptor UBLKRED"): the GMEM address is already in the operand.
+
+**Decision (recorded):**
+1. **Phase 0b/0c/2/3 run on the FWD trace first.** fwd is 100% clean by-value; prove
+   real-base end-to-end (L2 hotspot removal, L2-hit realism) there.
+2. **bwd is a separate design** with three sub-cases, deferred until fwd lands:
+   - by-value UTMALDG (minority) → same host-deref path;
+   - by-pointer UTMALDG (majority) → **two-level deref** (array pointer then 128B),
+     plus a way to handle `LDG`-sourced descriptor pointers;
+   - UBLKRED → operand-based GMEM address, no descriptor bind.
+3. Do **not** force bwd through the fwd model — it would fabricate wrong offsets
+   (the `0x40600`/`no_def`/multi-source cases prove it).
+
 ## 3. Design
 
 ### 3.1 Trace-gen (NVBit) — capture param_base + static offset, deref the descriptor, dump ALL fields (Path B)
@@ -770,19 +819,26 @@ only if per-transfer coords are delivered (milestone 2).
 
 Phased execution. Phase 0 (Gate 0) gates everything else.
 
+**Scope decision (§2.14): land the pipeline on the FWD trace first** — fwd is 100%
+clean by-value (`param_base@0x198 + {0x2f0,0x3b0,0x470,0x530}`). bwd is by-pointer +
+operand-based and is a separate follow-up (two-level deref; not in scope for Phase 0-3).
+
 | Phase | What | Where it runs | Status |
 |---|---|---|---|
-| **0a** | def-chain offset extractor `(uid,pc)→tensormap_offset` | offline (needs SASS) | **DONE** — `extract_tma_descriptor_offsets.py` (self-tested on synthetic SASS) |
+| **0a** | def-chain offset extractor `(uid,pc)→tensormap_offset` + operand discovery + executed stats + multi-source fork guard | offline (needs SASS) | **DONE** — `extract_tma_descriptor_offsets.py` (validated on real fwd+bwd; fwd clean) |
+| **0d** | runtime operand analyzer (SMEM/GMEM bucket, decides by-value vs by-pointer) | offline | **DONE** — `analyze_tma_runtime_operands.py` (confirmed fwd by-value, bwd by-pointer) |
 | **0c** | Gate 0 verify harness: dumped 128B ↔ encode blob, base==qword0, executed-only coverage | offline (pure python) | **DONE** — `verify_tma_descriptor_deref.py` (self-tested: good + 6 failure modes) |
-| **0b** | tracer: capture `param_base` (ULDC c[0x0][K] dest, IPOINT_AFTER) + `cuMemcpyDtoH` the param **region** at launch-exit → `tma_param_base_deref.csv` + region blob | GPU server (build tracer) | **CODE READY** — needs server build+run |
-| **1** | fold 0a into pipeline; run 0a on real fwd/bwd SASS | GPU server | after 0b |
-| **2** | python direct-decode + re-key on offset + delete heuristics + assert | offline | pending Gate 0 pass |
-| **3** | simulator: `global_base` field, offset key, real-addr mover (M1 base-only → M2 coords), assert | GPU server | pending Gate 0 pass |
+| **0b** | tracer: capture `param_base` (ULDC c[0x0][K] dest, IPOINT_AFTER) + `cuMemcpyDtoH` the param **region** at launch-exit → `tma_param_base_deref.csv` + region blob | GPU server (build tracer) | **CODE READY** — run on FWD trace |
+| **1** | run 0a on real **fwd** SASS; confirm all executed UTMALDG resolve to param_base | GPU server | fwd verified in §2.14(a) |
+| **2** | python direct-decode + re-key on offset + delete heuristics + assert (fwd) | offline | pending Gate 0 pass |
+| **3** | simulator: `global_base` field, offset key, real-addr mover (M1 base-only → M2 coords), assert (fwd) | GPU server | pending Gate 0 pass |
+| **bwd** | two-level deref for by-pointer UTMALDG + operand-based UBLKRED | later | **DEFERRED** (§2.14) |
 
-**Gate 0 run recipe (server):**
+**Gate 0 run recipe — use the FWD trace (`$TRACES_FWD`):**
 ```
-# 1. extract static offsets from SASS (writes extra_info/tma_descriptor_offsets.json)
-python3 extract_tma_descriptor_offsets.py --traces <kernel_traces_dir>
+# 1. extract static offsets from FWD SASS (writes extra_info/tma_descriptor_offsets.json)
+python3 extract_tma_descriptor_offsets.py --traces $TRACES_FWD
+#    → expect EXECUTED ~100% reach param_base, offsets {0x2f0,0x3b0} / {0x470,0x530}
 #    → also prints the auto-detected param-base cbank index (0x198 for FA3 fwd)
 
 # 2. rebuild the tracer, then re-run the app with descriptor capture on:
