@@ -1,21 +1,18 @@
 #!/usr/bin/env python3
-"""Path A Gate verifier (TMA_BASE_ADDR.md §2.23).
+"""Path A Gate verifier (TMA_BASE_ADDR.md §2.23 / §2.24).
 
-The tracer, run with ENABLE_TMA_DESC=1, dumps the host launch-argument buffer to
-extra_info/tma_launch_param_dump.csv: for each kernel argument, its packed param-block
-offset and the first 16 qwords read from the *host* argument pointer (crash-free —
-no device load). This is Path A: recover the real base from the host by-value
-CUtensorMap arguments instead of the (impossible) device read.
+The tracer, run with ENABLE_TMA_DESC=1, dumps each cuLaunchKernel argument's full bytes
+to extra_info/launch_param_blobs/*.bin and metadata to tma_launch_param_dump.csv
+(device_id,kernel_id,unique_function_id,arg_index,param_offset_hex,arg_size,arg_ptr_hex,
+blob_path,qword0..3). Persistent FA3 kernels pass ONE big by-value params struct whose
+tensor bases sit at various inner offsets, so we scan every 8-aligned qword of each blob
+for a value that equals a real base from tensor_map_encode_dump.csv.
 
-This script answers two questions:
-  1. BASE PRESENT?  Does any argument's qword0 equal one of the true bases from
-     tensor_map_encode_dump.csv (global_address_hex)? If so, that argument IS a
-     by-value CUtensorMap and we have the base on the host.
-  2. JOIN?  Does an argument's param_offset match a (uid,pc)'s static
-     tensormap_offset from tma_descriptor_offsets.json? If so, we can map each
-     executed UTMALDG pc -> that argument -> its qword0 base.
-
-Emits tma_launch_param_join.json: (uid, pc_hex) -> {base_hex, param_offset_hex}.
+Outputs:
+  - prints, per (uid, arg), every inner byte offset whose qword == a real base
+  - param_block_offset = param_offset(arg) + inner_offset; joins that to the SASS static
+    tensormap_offset (tma_descriptor_offsets.json) to map (uid,pc) -> base
+  - writes tma_launch_param_join.json
 
 Usage:
   python3 verify_tma_launch_param.py --traces <dir>
@@ -24,6 +21,7 @@ Usage:
 import argparse
 import csv
 import json
+import struct
 from collections import defaultdict
 from pathlib import Path
 
@@ -63,7 +61,7 @@ def load_launch_dump(extra):
 
 
 def load_offsets(extra):
-    """Return {(uid, pc_hex): tensormap_offset_int} for resolved descriptor sites."""
+    """Return {(uid, pc_hex): tensormap_offset_int} and offset->[(uid,pc)]."""
     path = extra / "tma_descriptor_offsets.json"
     site_offsets = {}
     offset_to_sites = defaultdict(list)
@@ -84,18 +82,32 @@ def load_offsets(extra):
     return site_offsets, offset_to_sites, path
 
 
+def scan_blob_for_bases(blob_path, bases):
+    """Return list of (inner_offset, base) for every 8-aligned qword equal to a base."""
+    hits = []
+    p = Path(blob_path)
+    if not p.exists():
+        return hits
+    data = p.read_bytes()
+    n = len(data) - (len(data) % 8)
+    for off in range(0, n, 8):
+        (v,) = struct.unpack_from("<Q", data, off)
+        if v in bases:
+            hits.append((off, v))
+    return hits
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--traces", required=True)
-    ap.add_argument("--show", type=int, default=40)
+    ap.add_argument("--show", type=int, default=60)
     args = ap.parse_args()
 
     extra = Path(args.traces).resolve() / "extra_info"
     dump_rows, dump_path = load_launch_dump(extra)
     if not dump_rows:
         raise SystemExit(
-            f"missing/empty {dump_path}\n"
-            "Run the tracer with ENABLE_TMA_DESC=1 first.")
+            f"missing/empty {dump_path}\nRun the tracer with ENABLE_TMA_DESC=1 first.")
 
     bases, enc_path = load_encode_bases(extra)
     site_offsets, offset_to_sites, off_path = load_offsets(extra)
@@ -106,68 +118,76 @@ def main():
     print(f"\nlaunch-arg rows ({dump_path.name}): {len(dump_rows)}")
     print(f"resolved (uid,pc) offsets ({off_path.name}): {len(site_offsets)}")
 
-    # 1) which args carry a real base in qword0?
-    base_args = []  # (uid, arg_index, param_offset, base)
+    # For each arg blob, find every inner offset that holds a real base.
+    # base_locs[uid] = list of (param_block_offset, base, arg_index, inner_off)
+    base_locs = defaultdict(list)
+    print("\nbase locations inside launch-arg blobs (uid, arg, inner_off -> base):")
     for r in dump_rows:
-        q0 = parse_int(r.get("qword0_hex"))
-        if q0 in bases:
-            base_args.append((
-                r.get("unique_function_id"),
-                parse_int(r.get("arg_index")),
-                parse_int(r.get("param_offset_hex")),
-                q0,
-            ))
-    print(f"\nargs whose qword0 == a real base: {len(base_args)}")
-    for uid, ai, off, b in base_args[:args.show]:
-        print(f"    uid={uid} arg={ai} param_offset=0x{off:x} base=0x{b:x}")
+        uid = r.get("unique_function_id")
+        ai = parse_int(r.get("arg_index"))
+        arg_off = parse_int(r.get("param_offset_hex"))
+        blob = r.get("blob_path")
+        if not blob:
+            continue
+        hits = scan_blob_for_bases(blob, bases)
+        for inner, b in hits:
+            pbo = arg_off + inner
+            base_locs[uid].append((pbo, b, ai, inner))
+    shown = 0
+    for uid in sorted(base_locs, key=lambda x: int(x)):
+        for pbo, b, ai, inner in base_locs[uid]:
+            if shown < args.show:
+                print(f"    uid={uid} arg={ai} inner=0x{inner:x} "
+                      f"param_block_off=0x{pbo:x} -> base=0x{b:x}")
+                shown += 1
+    total_locs = sum(len(v) for v in base_locs.values())
+    print(f"  total base locations found: {total_locs}")
 
-    if not base_args:
-        # Show what qword0 looks like so we can tell by-value vs pointer.
-        print("\nno arg matched a base. First qwords of each arg (to classify):")
-        for r in dump_rows[:args.show]:
-            print(f"    uid={r.get('unique_function_id')} "
-                  f"arg={r.get('arg_index')} "
-                  f"off={r.get('param_offset_hex')} size={r.get('arg_size')} "
-                  f"q0={r.get('qword0_hex')} q1={r.get('qword1_hex')} "
-                  f"q2={r.get('qword2_hex')}")
-        print("\n=> If q0 looks like a device pointer (0x7f...), args are BY-POINTER: "
-              "follow that pointer with a host cuMemcpyDtoH offline. If q0 is a small/"
-              "zero value, the offset packing is off — compare param_offset to the "
-              "tensormap_offset set below.")
-
-    # 2) join param_offset (per uid) to the static tensormap_offset (uid,pc)
+    # Join: param_block_offset (arg_off + inner) == SASS tensormap_offset, same uid.
     join = {}
-    for uid, ai, off, b in base_args:
-        for (suid, pc) in offset_to_sites.get(off, []):
-            if suid == str(uid):
-                join[(suid, pc)] = {"base_hex": f"0x{b:x}",
-                                    "param_offset_hex": f"0x{off:x}",
-                                    "arg_index": ai}
+    for uid, locs in base_locs.items():
+        for pbo, b, ai, inner in locs:
+            for (suid, pc) in offset_to_sites.get(pbo, []):
+                if suid == str(uid):
+                    join[(suid, pc)] = {
+                        "base_hex": f"0x{b:x}",
+                        "param_block_offset_hex": f"0x{pbo:x}",
+                        "arg_index": ai,
+                        "inner_offset_hex": f"0x{inner:x}",
+                    }
 
-    print(f"\njoined (uid,pc) -> base via matching param_offset==tensormap_offset: "
+    print(f"\njoined (uid,pc) -> base via param_block_offset==tensormap_offset: "
           f"{len(join)}")
     for (uid, pc), v in sorted(join.items())[:args.show]:
         print(f"    uid={uid} pc={pc} -> base={v['base_hex']} "
-              f"(offset {v['param_offset_hex']}, arg {v['arg_index']})")
+              f"(param_block_off {v['param_block_offset_hex']}, arg {v['arg_index']})")
 
     out = extra / "tma_launch_param_join.json"
     out.write_text(json.dumps(
-        {"join": {f"{u}:{pc}": v for (u, pc), v in join.items()}},
-        indent=2) + "\n")
+        {"join": {f"{u}:{pc}": v for (u, pc), v in join.items()}}, indent=2) + "\n")
     print(f"\nwrote {out}")
+
+    # Diagnostics to help align coordinate systems if join is empty.
+    if not join and total_locs:
+        sass_offsets = sorted(set(offset_to_sites.keys()))
+        print("\nno offset match. Compare the two offset sets:")
+        print("  base param_block_offsets found:",
+              sorted({f"0x{pbo:x}" for locs in base_locs.values()
+                      for pbo, _, _, _ in locs})[:20])
+        print("  SASS tensormap_offsets (sample):",
+              [f"0x{o:x}" for o in sass_offsets[:20]])
 
     print()
     if join:
-        print("=> PASS: recovered (uid,pc) -> real base from the host launch args. "
+        print("=> PASS: recovered (uid,pc) -> real base from host launch args. "
               "Build the real-address mover on tma_launch_param_join.json.")
-    elif base_args:
-        print("=> PARTIAL: bases are present in the launch args, but param_offset did "
-              "not line up with any tensormap_offset. Check the offset packing (arg "
-              "alignment) vs the SASS c[0x0][K]+UIADD3 offsets.")
+    elif total_locs:
+        print("=> PARTIAL: bases ARE present inside the by-value param struct(s), but "
+              "param_block_offset != any tensormap_offset. The arg-pack offset model or "
+              "the SASS offset base differs; align them (see the two offset lists above).")
     else:
-        print("=> INVESTIGATE: no arg exposed a base in qword0 (see the qword preview "
-              "above) — args are likely by-pointer; add an offline host deref of the "
-              "pointer value.")
+        print("=> INVESTIGATE: no base value found inside any launch-arg blob. Args may "
+              "be by-pointer; dump/deref the pointer targets offline.")
 
 
 if __name__ == "__main__":

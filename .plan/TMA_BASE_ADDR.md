@@ -1111,6 +1111,45 @@ python3 extract_tma_descriptor_offsets.py --traces "$TRACES"   # (uid,pc)->tenso
 python3 verify_tma_launch_param.py       --traces "$TRACES"    # join to base
 ```
 
+## 2.24 SPIKE 8 RESULT — bases ARE in the host launch args (by-value params struct). Path A confirmed.
+
+First Path A run: **no crash**, and the base is on the host. The launch-arg dump
+(`tma_launch_param_dump.csv`) shows two distinct argument shapes:
+
+- **uid1/2/5 (small non-persistent kernels):** several small args; a base appears directly,
+  e.g. uid1 arg3 (24B) qword0 = `0x7f53d0a00000` = an encode base. These pass GMEM pointers
+  by value (the §2.18(6) scheme).
+- **uid3/7/8/9 (FA3 persistent kernels — our targets):** exactly ONE big by-value **params
+  struct** argument (uid3 = 2368B, uid8 = 1792B, uid7 = 240B), and the tensor bases sit at
+  **inner offsets** inside it. uid3 arg0: `qword0 = 0x7f53d0a00000` (base, box 64×192) and
+  `qword11 = 0x7f53d1000000` (base, box 64×128). uid8 arg0: `qword8 = 0x7f5369400000`.
+
+**This corrects §2.17(b).** The param slot is NOT (only) a descriptor pointer — for the
+persistent kernels the whole params struct (with the tensor **bases inlined**) is passed
+by value, so the base is present in the host launch buffer and is read with zero device
+risk. The earlier `0xffffff…` operand we chased was the *device-side* staged/aliased copy;
+the *host* launch arg carries the real base plainly.
+
+**Why the first join was 0 (and the fix):**
+1. The dump only wrote the first 16 qwords (128B); uid3's struct is 2368B, so most bases
+   were truncated. → Tracer now writes the **full arg bytes** to
+   `launch_param_blobs/k{kid}_uid{uid}_arg{i}.bin` and the verifier scans every 8-aligned
+   qword for a base.
+2. `param_offset` was the *argument index* offset (0x0/0x30…), a different coordinate
+   system than the SASS `tensormap_offset`. → The verifier now computes
+   `param_block_offset = arg_param_offset + inner_offset` (byte offset of the base inside
+   the packed block) and joins THAT to the SASS `tensormap_offset`.
+
+Verifier rewritten (`verify_tma_launch_param.py`): scans each arg blob for base values,
+reports `(uid, arg, inner_off, param_block_off, base)`, joins to `(uid,pc)`. Local
+self-test (2368B struct with bases at 0x0 and 0x58) passes end-to-end.
+
+**Open (next run decides):** whether `param_block_offset` (our arg-pack model +
+inner offset) lands exactly on the SASS `tensormap_offset`. If PARTIAL (bases found but
+offsets misaligned), the verifier prints both offset lists so we can fix the alignment
+model — but the essential result stands: **the real base is available on the host for
+uid3/8, no device read needed.**
+
 ## 3. Design
 
 ### 3.1 Trace-gen (NVBit) — capture param_base + static offset, deref the descriptor, dump ALL fields (Path B)

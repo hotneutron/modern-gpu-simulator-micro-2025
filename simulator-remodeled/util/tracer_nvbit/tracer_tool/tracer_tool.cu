@@ -590,6 +590,8 @@ static void append_tma_launch_param_dump_event(CUcontext ctx, int device_id,
     return;
   }
   create_folder(extrainfo_path.c_str());
+  std::string blob_dir = extrainfo_path + "/launch_param_blobs";
+  create_folder(blob_dir.c_str());
   std::string csv_path = extrainfo_path + "/tma_launch_param_dump.csv";
   bool needs_header = tma_launch_param_dump_header_written.empty();
   std::ofstream csv(csv_path, needs_header ? std::ios::out : std::ios::app);
@@ -599,9 +601,7 @@ static void append_tma_launch_param_dump_event(CUcontext ctx, int device_id,
   if (needs_header) {
     tma_launch_param_dump_header_written.insert(device_id);
     csv << "device_id,kernel_id,unique_function_id,arg_index,param_offset_hex,arg_size,"
-           "arg_ptr_hex,qword0_hex,qword1_hex,qword2_hex,qword3_hex,qword4_hex,"
-           "qword5_hex,qword6_hex,qword7_hex,qword8_hex,qword9_hex,qword10_hex,"
-           "qword11_hex,qword12_hex,qword13_hex,qword14_hex,qword15_hex\n";
+           "arg_ptr_hex,blob_path,qword0_hex,qword1_hex,qword2_hex,qword3_hex\n";
   }
   /* CUDA packs each argument at its natural alignment; the param-block offset for a TMA
    * descriptor is what the SASS c[0x0][K]+UIADD3 chain computes. We approximate the pack
@@ -618,14 +618,26 @@ static void append_tma_launch_param_dump_event(CUcontext ctx, int device_id,
       offset += align - (offset % align);
     }
     const void *arg_ptr = p->kernelParams[i];
-    csv << device_id << "," << kernel_trace_id << "," << unique_function_id << ","
-        << i << ",0x" << std::hex << offset << std::dec << "," << sz << ",0x"
-        << std::hex << reinterpret_cast<uintptr_t>(arg_ptr) << std::dec;
-    /* read up to 16 qwords (128B) from the host argument pointer */
+    /* Persistent-kernel params are passed as one big by-value struct (e.g. 2368B) whose
+     * tensor bases sit at various inner offsets, so 128B is not enough. Dump the FULL arg
+     * bytes to a blob and let the offline verifier scan every 8-aligned qword for a base.
+     * (Host memory only — cannot fault the device.) */
+    std::string blob_path = blob_dir + "/k" + std::to_string(kernel_trace_id) +
+                            "_uid" + std::to_string(unique_function_id) + "_arg" +
+                            std::to_string(i) + ".bin";
+    if (arg_ptr != nullptr) {
+      std::ofstream blob(blob_path, std::ios::binary | std::ios::out);
+      if (blob.is_open()) {
+        blob.write(reinterpret_cast<const char *>(arg_ptr), sz);
+      }
+    }
     const uint64_t *qw = reinterpret_cast<const uint64_t *>(arg_ptr);
     int nqw = sz / 8;
-    if (nqw > 16) nqw = 16;
-    for (int q = 0; q < 16; ++q) {
+    csv << device_id << "," << kernel_trace_id << "," << unique_function_id << ","
+        << i << ",0x" << std::hex << offset << std::dec << "," << sz << ",0x"
+        << std::hex << reinterpret_cast<uintptr_t>(arg_ptr) << std::dec << ","
+        << blob_path;
+    for (int q = 0; q < 4; ++q) {
       uint64_t v = (arg_ptr != nullptr && q < nqw) ? qw[q] : 0ULL;
       csv << ",0x" << std::hex << v << std::dec;
     }
