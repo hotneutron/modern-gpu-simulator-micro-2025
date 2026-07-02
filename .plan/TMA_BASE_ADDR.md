@@ -979,6 +979,48 @@ Lesson: trust the on-device `isspacep` classification over any offline guess abo
 `0xffffff…` operand "looks like". This one predicate invalidated three sections of prior
 SMEM reasoning.
 
+## 2.21 SPIKE 7 CSV (read step, uid3 fwd + uid8 bwd) — §2.20 was WRONG; captured operand is the raw cursor, and isspacep mislabels it GLOBAL
+
+The read step (`TMA_DESC_FACTCHECK_READ=1`) crashed again (illegal access), but the
+classify CSV from the prior run is intact and decisive. Every captured `desc_va` is a
+**small** value, not a device pointer:
+```
+uid3 (fwd): pc 0x94e0 → 0xe800 ;  0x96b0 → 0x8800 ;  0x9a80/0x9fc0 → 0x12800
+uid8 (bwd): pc 0xa240 → 0x10400 ; 0xa320 → 0x400 ;  0xa330 → 0x4400
+all rows: space=1 (GLOBAL), read_ok=0, qword0=0
+```
+
+**Two corrections to my own notes:**
+1. **§2.20 ("desc_va is GLOBAL, descriptor is in global memory") is retracted.** `space=1`
+   was an `isspacep.global` **false positive**: `0xe800` is a raw-shared *offset* that is
+   not inside the shared/local/const windows, so `isspacep.global` returns true by
+   elimination. It is **not** a global pointer — reading it faulted, which is why the read
+   step crashed. So §2.17(f)'s SMEM-staging picture is *not* overturned after all.
+2. **The captured operand was the wrong one.** These small values are exactly the
+   §2.17(a) **operand-2 raw-shared cursors** (`0xe800`, `0x12800`), i.e. NVBit's mref-0
+   for these ops maps to operand-2, not the operand-1 descriptor cursor
+   (`0xffffffffc428xxxx`). We were dereferencing the staging cursor, never the descriptor.
+
+**Fixes applied (this iteration):**
+- Instrument **all** MREF operands of each `UTMALDG`/`UTMASTG`, each tagged with a
+  `mref_ord` column, so the CSV shows which operand carries `0xffffffffc428xxxx` vs the
+  small cursor.
+- Harden the read guard: read only when `space==GLOBAL` **and** `desc_va >= 4 GiB`
+  (`MIN_GLOBAL_VA`). This rejects the isspacep-mislabeled tiny cursors that caused the
+  crash — the read step is now crash-safe regardless of which operand is picked.
+
+**What the next CSV will show (and the decision):**
+- For each site we now get mref-0 and mref-1. Expect one to be the small cursor and one to
+  be `0xffffffffc428xxxx` (the §2.17f generic-SMEM descriptor window).
+- If the `0xffffff…` operand classifies as **SHARED** ⇒ §2.17(f) confirmed, descriptor is
+  SMEM-staged ⇒ **D1** needs a `ld.shared` probe (a generic load can't read it, and
+  neither can the host) — the current read guard will (correctly) leave it unread.
+- If some operand is a real **GLOBAL** VA `>= 4 GiB` ⇒ that is the descriptor/global
+  original ⇒ the read fills `qword0`, checkable against the 7 bases (**D2**).
+
+Lesson (again): `isspacep.global` is "not shared/local/const", **not** "valid global
+pointer". Always pair it with a VA-magnitude sanity bound before dereferencing.
+
 ## 3. Design
 
 ### 3.1 Trace-gen (NVBit) — capture param_base + static offset, deref the descriptor, dump ALL fields (Path B)

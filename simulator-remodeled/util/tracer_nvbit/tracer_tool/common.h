@@ -95,6 +95,7 @@ typedef struct {
   unsigned int stored;                             /* slots actually written  */
   unsigned int unique_function_id[TMA_DESC_FACTCHECK_SLOTS];
   unsigned int pc[TMA_DESC_FACTCHECK_SLOTS];
+  unsigned int mref_ord[TMA_DESC_FACTCHECK_SLOTS];       /* which memref (0/1) */
   unsigned int space[TMA_DESC_FACTCHECK_SLOTS];          /* TMA_DESC_VA_SPACE  */
   unsigned int read_ok[TMA_DESC_FACTCHECK_SLOTS];        /* 1 if q0/q1 valid   */
   unsigned long long desc_va[TMA_DESC_FACTCHECK_SLOTS];  /* address inspected  */

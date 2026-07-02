@@ -197,8 +197,8 @@ extern "C" __device__ __noinline__ void capture_tma_param_base(
  * into a bounded managed ring. First active lane only; a handful of samples across pcs
  * is enough to confirm qword0 == the real base. */
 extern "C" __device__ __noinline__ void factcheck_tma_descriptor(
-    int32_t pred, uint32_t unique_function_id, uint32_t vpc, uint64_t desc_va,
-    uint32_t do_read, uint64_t pfact) {
+    int32_t pred, uint32_t unique_function_id, uint32_t vpc, uint32_t mref_ord,
+    uint64_t desc_va, uint32_t do_read, uint64_t pfact) {
   if (!pred) {
     return;
   }
@@ -213,29 +213,29 @@ extern "C" __device__ __noinline__ void factcheck_tma_descriptor(
 
   /* Classify the generic address with non-faulting predicates (isspacep.*). This is
    * pure classification — it never touches memory, so recording the space for every
-   * sample is always crash-safe and by itself closes the §2.18 SMEM-vs-GMEM open item.
-   * The actual 128B read is a SEPARATE, opt-in step (do_read, TMA_DESC_FACTCHECK_READ):
-   * a blind generic load of the descriptor operand faults when it lands on a raw
-   * staging cursor (e.g. 0xe800) or on a shared/tma window a generic load can't reach
-   * from the instrumentation context — which is exactly the crash we are diagnosing. */
+   * sample is always crash-safe. CAVEAT (SPIKE 7 CSV): isspacep.global returns TRUE for
+   * a small raw-shared cursor like 0xe800 (it is not in the shared/local/const window,
+   * so "global" by elimination), so GLOBAL alone does NOT mean "safe to deref". The read
+   * below additionally requires a plausibly-mapped high VA. */
   void *gp = (void *)desc_va;
   unsigned int space = TMA_VA_UNKNOWN;
-  if (__isGlobal(gp)) {
-    space = TMA_VA_GLOBAL;
-  } else if (__isShared(gp)) {
+  if (__isShared(gp)) {
     space = TMA_VA_SHARED;
   } else if (__isConstant(gp)) {
     space = TMA_VA_CONSTANT;
   } else if (__isLocal(gp)) {
     space = TMA_VA_LOCAL;
+  } else if (__isGlobal(gp)) {
+    space = TMA_VA_GLOBAL;
   }
 
   unsigned int read_ok = 0;
   unsigned long long q0 = 0, q1 = 0;
-  /* Only read when explicitly enabled AND the space is one a generic load can serve.
-   * GLOBAL is safe; SHARED is the D1 probe (may still fault → that itself is the
-   * answer, so gate it separately at the call site if needed). */
-  if (do_read && desc_va != 0 && space == TMA_VA_GLOBAL) {
+  /* Only read a GLOBAL VA that is also a plausible device pointer (>= 4 GiB). This
+   * rejects the tiny raw-shared cursors (0xe800 etc.) that isspacep mislabels GLOBAL,
+   * which is exactly what faulted the earlier read step. */
+  const unsigned long long MIN_GLOBAL_VA = 0x100000000ULL;
+  if (do_read && space == TMA_VA_GLOBAL && desc_va >= MIN_GLOBAL_VA) {
     const unsigned long long *p = (const unsigned long long *)desc_va;
     q0 = p[0];
     q1 = p[1];
@@ -246,6 +246,7 @@ extern "C" __device__ __noinline__ void factcheck_tma_descriptor(
   if (idx < TMA_DESC_FACTCHECK_SLOTS) {
     fc->unique_function_id[idx] = unique_function_id;
     fc->pc[idx] = vpc;
+    fc->mref_ord[idx] = mref_ord;
     fc->space[idx] = space;
     fc->read_ok[idx] = read_ok;
     fc->desc_va[idx] = desc_va;

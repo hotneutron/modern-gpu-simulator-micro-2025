@@ -707,8 +707,8 @@ static void append_tma_desc_factcheck_event(int device_id, int kernel_trace_id) 
   if (csv.is_open()) {
     if (needs_header) {
       tma_desc_factcheck_header_written.insert(device_id);
-      csv << "device_id,kernel_id,unique_function_id,pc_hex,space,read_ok,desc_va_hex,"
-             "qword0_hex,qword1_hex\n";
+      csv << "device_id,kernel_id,unique_function_id,pc_hex,mref_ord,space,read_ok,"
+             "desc_va_hex,qword0_hex,qword1_hex\n";
     }
     unsigned int n = tma_desc_factcheck->stored;
     if (n > TMA_DESC_FACTCHECK_SLOTS) n = TMA_DESC_FACTCHECK_SLOTS;
@@ -716,6 +716,7 @@ static void append_tma_desc_factcheck_event(int device_id, int kernel_trace_id) 
       csv << device_id << "," << kernel_trace_id << ","
           << tma_desc_factcheck->unique_function_id[i] << ",0x" << std::hex
           << tma_desc_factcheck->pc[i] << std::dec << ","
+          << tma_desc_factcheck->mref_ord[i] << ","
           << tma_desc_factcheck->space[i] << ","
           << tma_desc_factcheck->read_ok[i] << ",0x" << std::hex
           << tma_desc_factcheck->desc_va[i]
@@ -1988,26 +1989,24 @@ void instrument_function_if_needed(CUcontext ctx, CUfunction func, int device_id
       if (enable_tma_desc && tma_desc_factcheck != nullptr &&
           (opcode_str.rfind("UTMALDG", 0) == 0 ||
            opcode_str.rfind("UTMASTG", 0) == 0)) {
-        int first_mref_operand = -1;
+        /* Instrument EVERY memory-ref operand (max 2), each tagged with its 0-based
+         * MREF ordinal. SPIKE 7 showed MREF-0 is a raw-shared cursor (0xe800), so we
+         * must also capture MREF-1 to find which operand is the actual descriptor VA.
+         * The device fn classifies each VA's space and only reads a plausible GLOBAL. */
         int mref_index = 0;
         for (int oi = 0; oi < instr->getNumOperands(); ++oi) {
-          if (instr->getOperand(oi)->type == InstrType::OperandType::MREF) {
-            first_mref_operand = oi;
-            break;
+          if (instr->getOperand(oi)->type != InstrType::OperandType::MREF) {
+            continue;
           }
-        }
-        if (first_mref_operand >= 0) {
           nvbit_insert_call(instr, "factcheck_tma_descriptor", IPOINT_BEFORE);
           nvbit_add_call_arg_guard_pred_val(instr);
           nvbit_add_call_arg_const_val32(instr, next_candidate_unique_function_id);
           nvbit_add_call_arg_const_val32(instr, (int)instr->getOffset());
-          /* second mref arg is the MREF index (0-based among memory refs), not the
-           * operand index; the first MREF is always mref 0. The device fn classifies
-           * the resulting VA's address space (crash-safe) and only reads bytes when
-           * do_read is set AND the space is GLOBAL. */
+          nvbit_add_call_arg_const_val32(instr, mref_index);
           nvbit_add_call_arg_mref_addr64(instr, mref_index);
           nvbit_add_call_arg_const_val32(instr, tma_desc_factcheck_read);
           nvbit_add_call_arg_const_val64(instr, (uint64_t)tma_desc_factcheck);
+          mref_index++;
         }
       }
       cnt++;

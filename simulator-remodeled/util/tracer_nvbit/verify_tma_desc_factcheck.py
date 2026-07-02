@@ -96,6 +96,19 @@ def main():
             print(f"    {sp:16s} x{c}")
         print(f"    -> read_ok (byte read performed): {readable}/{len(rows)}")
 
+    # Per-(pc, mref_ord) breakdown: which memory-ref operand carries which VA. This is
+    # how we tell the descriptor operand from the raw-shared staging cursor.
+    have_mref = rows and "mref_ord" in rows[0]
+    if have_mref:
+        by_site = defaultdict(set)
+        for r in rows:
+            by_site[(r["unique_function_id"], r["pc_hex"], r["mref_ord"])].add(
+                (r["desc_va_hex"], SPACE.get(r.get("space", "0"), r.get("space"))))
+        print("\nper (uid, pc, mref_ord) distinct desc_va [space]:")
+        for (uid, pc, mo), vas in sorted(by_site.items()):
+            shown = ", ".join(f"{va}[{sp}]" for va, sp in sorted(vas))
+            print(f"    uid={uid} pc={pc} mref{mo}: {shown}")
+
     # Only samples whose bytes were actually read can be base-checked.
     def was_read(r):
         return (not have_space) or r.get("read_ok") == "1"
