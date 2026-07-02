@@ -123,22 +123,32 @@ def last_def(defs, reg, before_idx):
     return best
 
 
-def trace_offset(defs, reg, before_idx, depth=0, max_depth=DEFAULT_MAX_DEPTH):
+def trace_offset(defs, reg, before_idx, depth=0, max_depth=DEFAULT_MAX_DEPTH, chain=None):
     """Return (cbank_index, tensormap_offset) or None if the chain does not reach a
-    ULDC c[0x0][...] param-base load."""
+    ULDC c[0x0][...] param-base load. If `chain` (a list) is given, append a
+    human-readable step for each hop, for diagnosis of non-param-base chains."""
     if depth > max_depth:
+        if chain is not None:
+            chain.append(f"UR{reg}: max_depth")
         return None
     found = last_def(defs, reg, before_idx)
     if not found:
+        if chain is not None:
+            chain.append(f"UR{reg}: no_def")
         return None
     idx, kind, info = found
     if kind == "uldc":
+        if chain is not None:
+            chain.append(f"UR{reg} <- ULDC c[0x0][0x{info:x}]")
         return (info, 0)
     if kind == "uiadd":
         src, imm = info
+        if chain is not None:
+            src_txt = f"UR{src}" if src is not None else "URZ/none"
+            chain.append(f"UR{reg} <- UIADD3 {src_txt} + 0x{imm:x}")
         if src is None:
             return None
-        sub = trace_offset(defs, src, idx, depth + 1, max_depth)
+        sub = trace_offset(defs, src, idx, depth + 1, max_depth, chain)
         if sub is None:
             return None
         return (sub[0], sub[1] + imm)
@@ -159,7 +169,12 @@ def build_consumers_for_uid_match(function):
     return consumers
 
 
-def extract_offsets(extra_info_dir: Path, max_depth: int):
+def uid_key(uid, fname):
+    return str(uid) if uid is not None else fname
+
+
+def extract_offsets(extra_info_dir: Path, max_depth: int,
+                    param_base_cbank_index_override=None):
     nvdisasm_dir = extra_info_dir / "nvdisasm"
     sass_dir = extra_info_dir / "sass"
     functions_by_name = {}
@@ -173,6 +188,33 @@ def extract_offsets(extra_info_dir: Path, max_depth: int):
                 functions_by_name.setdefault(function["function_name"], function)
 
     kernels = load_kernel_tma_info(extra_info_dir)
+
+    # Pre-pass: determine the param-base cbank index. Trace every descriptor-carrying
+    # site's operand to its terminal ULDC c[0x0][K]; the dominant K over UTMALDG/
+    # UTMAREDG (the load family, which §2.11 verified goes through param base) is the
+    # param-base index. An explicit override wins.
+    prepass_cbank_counts = defaultdict(int)
+    for function in functions_by_name.values():
+        instructions = function["instructions"]
+        defs = build_defs(instructions)
+        for idx, ins in enumerate(instructions):
+            opcode = ins["opcode"]
+            if not (opcode.startswith("UTMALDG") or opcode.startswith("UTMAREDG")):
+                continue
+            reg, _ = select_descriptor_reg(opcode, ins.get("operand_text", ""))
+            if reg is None:
+                continue
+            traced = trace_offset(defs, reg, idx, max_depth=max_depth)
+            if traced is not None:
+                prepass_cbank_counts[traced[0]] += 1
+    if param_base_cbank_index_override is not None:
+        param_base_cbank_index = param_base_cbank_index_override
+    elif prepass_cbank_counts:
+        param_base_cbank_index = max(
+            prepass_cbank_counts.items(), key=lambda kv: kv[1]
+        )[0]
+    else:
+        param_base_cbank_index = 0x198
 
     sites = []
     prefetch_sites = []
@@ -236,28 +278,36 @@ def extract_offsets(extra_info_dir: Path, max_depth: int):
                 "cbank_index_hex": None,
                 "tensormap_offset_hex": None,
                 "key_hex": None,
+                "chain": None,
                 "reason": None,
             }
             if reg is None:
                 record["reason"] = "no_descriptor_operand_register_found"
                 sites.append(record)
                 continue
-            traced = trace_offset(defs, reg, idx, max_depth=max_depth)
+            chain = []
+            traced = trace_offset(defs, reg, idx, max_depth=max_depth, chain=chain)
+            record["chain"] = chain
             if traced is None:
-                # e.g. UTMALDG desc[URx] would resolve to a UMOV constant, not a
-                # ULDC param-base — a self-check that operand selection is correct.
-                record["reason"] = "def_chain_did_not_reach_param_base_ULDC"
+                # Chain did not terminate at ANY ULDC c[0x0][...] (e.g. a UMOV
+                # constant, a global-memory load, or a register we do not model).
+                record["reason"] = "def_chain_did_not_reach_any_cbank_ULDC"
                 sites.append(record)
                 continue
             cbank_index, tensormap_offset = traced
-            record["resolved"] = True
             record["cbank_index_hex"] = f"0x{cbank_index:x}"
             record["tensormap_offset_hex"] = f"0x{tensormap_offset:x}"
             record["key_hex"] = f"0x{cbank_index + tensormap_offset:x}"
             cbank_index_counts[cbank_index] += 1
-            offsets_by_function[str(uid) if uid is not None else fname].add(
-                tensormap_offset
-            )
+            # A site is "resolved" for our purposes ONLY if it reached the param-base
+            # cbank index. Chains that terminate at a DIFFERENT cbank slot (e.g.
+            # c[0x0][0x0]) are real but are not tensormap-in-param descriptors, so
+            # they must not pollute the descriptor offset set.
+            if cbank_index == param_base_cbank_index:
+                record["resolved"] = True
+                offsets_by_function[uid_key(uid, fname)].add(tensormap_offset)
+            else:
+                record["reason"] = "reached_non_param_base_cbank"
             sites.append(record)
 
     dominant_cbank = None
@@ -266,7 +316,8 @@ def extract_offsets(extra_info_dir: Path, max_depth: int):
 
     return {
         "extra_info_dir": str(extra_info_dir),
-        "cbank_param_base_index_hex": (
+        "param_base_cbank_index_hex": f"0x{param_base_cbank_index:x}",
+        "dominant_cbank_index_hex": (
             f"0x{dominant_cbank:x}" if dominant_cbank is not None else None
         ),
         "cbank_index_counts": {
@@ -289,6 +340,21 @@ def main():
     parser.add_argument("--output")
     parser.add_argument("--max-depth", type=int, default=DEFAULT_MAX_DEPTH)
     parser.add_argument(
+        "--param-base-cbank",
+        help="override param-base c[0x0][K] index (hex ok, e.g. 0x198); "
+        "default = auto-detect dominant over UTMALDG/UTMAREDG",
+    )
+    parser.add_argument(
+        "--only-uid",
+        help="restrict console breakdown to this unique_function_id (e.g. 8 for bwd)",
+    )
+    parser.add_argument(
+        "--dump-chains",
+        type=int,
+        default=0,
+        help="print the full def-chain for the first N unresolved sites (diagnosis)",
+    )
+    parser.add_argument(
         "--fail-on-unresolved",
         action="store_true",
         help="exit nonzero if any descriptor-carrying site did not resolve to an offset",
@@ -300,7 +366,11 @@ def main():
     if not extra_info_dir.exists():
         raise SystemExit(f"missing: {extra_info_dir}")
 
-    result = extract_offsets(extra_info_dir, args.max_depth)
+    override = None
+    if args.param_base_cbank:
+        override = int(args.param_base_cbank, 0)
+
+    result = extract_offsets(extra_info_dir, args.max_depth, override)
     output_path = (
         Path(args.output).resolve()
         if args.output
@@ -309,19 +379,58 @@ def main():
     output_path.write_text(json.dumps(result, indent=2) + "\n")
 
     print(f"wrote {output_path}")
-    print(f"cbank_param_base_index={result['cbank_param_base_index_hex']}")
+    print(f"param_base_cbank_index={result['param_base_cbank_index_hex']} "
+          f"(dominant={result['dominant_cbank_index_hex']})")
+    print(f"cbank_index_counts={result['cbank_index_counts']}")
     print(f"sites={result['site_count']} resolved={result['resolved_site_count']}")
+
+    # reason breakdown (why sites did not resolve to a param-base offset)
+    reason_counts = defaultdict(int)
+    for site in result["sites"]:
+        if not site["resolved"]:
+            reason_counts[site["reason"]] += 1
+    if reason_counts:
+        print("unresolved reasons:", dict(reason_counts))
+
+    # distinct param-base offsets per function (only the ones that matter)
     for key, offs in result["distinct_tensormap_offsets"].items():
-        print(f"  fn {key}: {len(offs)} distinct offsets {offs}")
-    unresolved = [s for s in result["sites"] if not s["resolved"]]
-    if unresolved:
-        print(f"UNRESOLVED sites={len(unresolved)} (first 8):")
-        for site in unresolved[:8]:
-            print(
-                f"  uid={site['unique_function_id']} pc={site['pc_hex']} "
-                f"{site['opcode']} reason={site['reason']}"
-            )
-        if args.fail_on_unresolved:
+        if args.only_uid and key != args.only_uid:
+            continue
+        print(f"  fn {key}: {len(offs)} param-base offsets {offs}")
+
+    # per-opcode-family view for the target uid, so bwd structure is visible
+    if args.only_uid:
+        fam = defaultdict(lambda: defaultdict(int))
+        for site in result["sites"]:
+            if str(site["unique_function_id"]) != args.only_uid:
+                continue
+            status = "resolved" if site["resolved"] else site["reason"]
+            fam[site["opcode"].split(".")[0]][status] += 1
+        print(f"  uid {args.only_uid} by opcode family:")
+        for op, statuses in sorted(fam.items()):
+            print(f"    {op}: {dict(statuses)}")
+
+    if args.dump_chains > 0:
+        shown = 0
+        print(f"def-chains for first {args.dump_chains} unresolved sites:")
+        for site in result["sites"]:
+            if site["resolved"]:
+                continue
+            if args.only_uid and str(site["unique_function_id"]) != args.only_uid:
+                continue
+            print(f"  uid={site['unique_function_id']} pc={site['pc_hex']} "
+                  f"{site['opcode']} reason={site['reason']} "
+                  f"reg=UR{site['descriptor_reg']} cbank={site['cbank_index_hex']} "
+                  f"off={site['tensormap_offset_hex']}")
+            for step in (site.get("chain") or []):
+                print(f"      {step}")
+            shown += 1
+            if shown >= args.dump_chains:
+                break
+
+    if args.fail_on_unresolved:
+        unresolved = [s for s in result["sites"] if not s["resolved"]]
+        if unresolved:
             raise SystemExit(1)
 
 
