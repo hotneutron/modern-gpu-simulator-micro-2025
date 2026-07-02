@@ -196,6 +196,7 @@ tma_param_base_capture_t *tma_param_base_capture = nullptr;
  * of executed UTMALDG/UTMASTG and record qword0 (expected == real base). Gated by
  * TMA_DESC_FACTCHECK; dumped to tma_desc_factcheck.csv at kernel exit. */
 int tma_desc_factcheck_enable = 0;
+int tma_desc_factcheck_read = 0;
 tma_desc_factcheck_t *tma_desc_factcheck = nullptr;
 std::unordered_set<int> tma_desc_factcheck_header_written;
 std::unordered_set<int> tma_param_base_deref_header_written;
@@ -1556,7 +1557,9 @@ void nvbit_at_init() {
   GET_VAR_INT(tma_param_base_region_bytes, "TMA_PARAM_BASE_REGION_BYTES", 8192,
               "Phase 0b: bytes of the kernel param block to cuMemcpyDtoH for descriptor slicing.");
   GET_VAR_INT(tma_desc_factcheck_enable, "TMA_DESC_FACTCHECK", 0,
-              "SPIKE 6 (§2.18): at executed UTMALDG/UTMASTG, device-read 128B at the descriptor VA and dump qword0 (expected == real base) to tma_desc_factcheck.csv.");
+              "SPIKE 6 (§2.18): at executed UTMALDG/UTMASTG, classify the descriptor VA address space (crash-safe) and dump it to tma_desc_factcheck.csv.");
+  GET_VAR_INT(tma_desc_factcheck_read, "TMA_DESC_FACTCHECK_READ", 0,
+              "SPIKE 6 (§2.18): opt-in — also device-read 128B at the descriptor VA (only when GLOBAL). Off by default because a generic load of a SMEM/raw operand faults.");
   std::string pad(100, '-');
   printf("%s\n", pad.c_str());
 
@@ -1998,11 +2001,12 @@ void instrument_function_if_needed(CUcontext ctx, CUfunction func, int device_id
           nvbit_add_call_arg_guard_pred_val(instr);
           nvbit_add_call_arg_const_val32(instr, next_candidate_unique_function_id);
           nvbit_add_call_arg_const_val32(instr, (int)instr->getOffset());
-          /* second arg is the MREF index (0-based among memory refs), not the operand
-           * index; the first MREF is always mref 0. The device fn classifies the
-           * resulting VA's address space before reading, so a raw/unmapped operand
-           * (e.g. UTMALDG op-2 = 0xe800) is recorded but never dereferenced. */
+          /* second mref arg is the MREF index (0-based among memory refs), not the
+           * operand index; the first MREF is always mref 0. The device fn classifies
+           * the resulting VA's address space (crash-safe) and only reads bytes when
+           * do_read is set AND the space is GLOBAL. */
           nvbit_add_call_arg_mref_addr64(instr, mref_index);
+          nvbit_add_call_arg_const_val32(instr, tma_desc_factcheck_read);
           nvbit_add_call_arg_const_val64(instr, (uint64_t)tma_desc_factcheck);
         }
       }

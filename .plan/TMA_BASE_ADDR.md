@@ -902,6 +902,47 @@ Expected on PASS: samples for uid3 (fwd) and uid8 (bwd) with `desc_va` in the
 `0xffffffffc428xxxx` SMEM window and `qword0` ∈ {the 7 bases}. This is the same rule for
 both kernels — the whole point of §2.17(e).
 
+## 2.19 SPIKE 7 (device fact-check crash) — the descriptor operand is NOT generic-readable
+
+Running the §2.18 fact-check with an **unconditional** 128B read of the first-MREF VA
+crashed the app: `CUDA error … an illegal memory access was encountered` at the tool's
+post-launch `cudaDeviceSynchronize()` (before any host deref), i.e. the fault is inside
+the injected `factcheck_tma_descriptor`, not the host code. This is itself decisive data:
+
+- The descriptor-carrying operand VA (`0xffffffffc428xxxx`, §2.17f) is **not** servable by
+  a plain generic load from the instrumentation context — a blind `*(u64*)desc_va` faults.
+  Whether that is because it is a SMEM/TMA window a generic load can't reach, or because
+  some sampled sites hand back a raw staging cursor (e.g. `0xe800`), the read is unsafe.
+- **Conclusion:** classification must be decoupled from reading. `isspacep.*`
+  (`__isGlobal/__isShared/…`) is a pure predicate that never touches memory, so we can
+  label every `desc_va`'s address space with zero crash risk. That label alone answers the
+  §2.18 open item (SMEM vs GMEM) — which is what actually decides D1 vs D2.
+
+**Two-step design (implemented):**
+1. `TMA_DESC_FACTCHECK=1` — classify only. Dump `space` (GLOBAL/SHARED/CONSTANT/LOCAL/
+   UNKNOWN-generic) + `read_ok=0` per sample. Always crash-safe. **Run this first.**
+2. `TMA_DESC_FACTCHECK_READ=1` — opt-in. Additionally read 128B, but only when the space
+   is `GLOBAL` (guaranteed safe). SHARED/generic remain unread until a shared-aware probe
+   (`ld.shared`) is added, since that is where the D1 vs D2 branch lands.
+
+Interpreting step 1:
+- mostly `SHARED` ⇒ descriptor is genuinely SMEM-staged ⇒ **D1** (must read as shared at
+  issue; a generic/host read can never work — kills §2.13 for good).
+- mostly `GLOBAL` ⇒ a global original is reachable ⇒ **D2** (and step 2's read will fill
+  `qword0`, verifiable against the 7 bases).
+- `UNKNOWN`/small ⇒ the picked operand is a raw cursor, not the descriptor ⇒ revisit the
+  operand/MREF choice (try the `UTMACCTL.PF` target).
+
+Updated recipe:
+```
+# rebuild tracer, then FIRST classify (crash-safe, no reads):
+ENABLE_TMA_DESC=1 TMA_DESC_FACTCHECK=1 <existing trace-gen run cmd>
+python3 verify_tma_desc_factcheck.py --traces "$TRACES"   # read the space histogram
+# only if the histogram shows GLOBAL, opt into the byte read:
+ENABLE_TMA_DESC=1 TMA_DESC_FACTCHECK=1 TMA_DESC_FACTCHECK_READ=1 <run cmd>
+python3 verify_tma_desc_factcheck.py --traces "$TRACES"
+```
+
 ## 3. Design
 
 ### 3.1 Trace-gen (NVBit) — capture param_base + static offset, deref the descriptor, dump ALL fields (Path B)
