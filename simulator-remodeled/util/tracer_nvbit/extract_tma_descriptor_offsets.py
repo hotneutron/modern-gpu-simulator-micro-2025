@@ -459,22 +459,31 @@ def extract_offsets(extra_info_dir: Path, max_depth: int,
         by_family = defaultdict(lambda: {"executed": 0, "resolved": 0,
                                          "non_param_cbank": 0, "no_cbank": 0,
                                          "ambiguous": 0})
+        # Per-uid resolution: this trace has BOTH fwd and bwd kernels, so split by uid
+        # to see which executed kernel is 100% clean (fwd) vs mixed (bwd).
+        by_uid = defaultdict(lambda: {"executed": 0, "resolved": 0})
         for s in ex:
             fam = s["opcode"].split(".")[0]
             b = by_family[fam]
             b["executed"] += 1
+            u = by_uid[str(s["unique_function_id"])]
+            u["executed"] += 1
             if s["resolved"]:
                 b["resolved"] += 1
+                u["resolved"] += 1
             elif s["reason"] == "reached_non_param_base_cbank":
                 b["non_param_cbank"] += 1
             elif s["reason"] == "def_chain_did_not_reach_any_cbank_ULDC":
                 b["no_cbank"] += 1
             elif s["reason"] == "ambiguous_multisource_uiadd3":
                 b["ambiguous"] += 1
+        for u in by_uid.values():
+            u["pct"] = round(100.0 * u["resolved"] / max(1, u["executed"]), 1)
         executed_stats = {
             "executed_site_count": len(ex),
             "executed_resolved_count": sum(1 for s in ex if s["resolved"]),
             "by_opcode_family": {k: dict(v) for k, v in sorted(by_family.items())},
+            "by_uid": {k: dict(v) for k, v in sorted(by_uid.items())},
         }
 
     return {
@@ -555,6 +564,11 @@ def main():
               f"({100.0*ex['executed_resolved_count']/max(1,ex['executed_site_count']):.1f}% reach param_base)")
         for fam, b in ex["by_opcode_family"].items():
             print(f"    {fam}: {b}")
+        # per-uid: this trace has BOTH fwd and bwd; 100% = clean fwd, <100% = bwd-like
+        print("  by uid (100% = clean by-value fwd; <100% = by-pointer/bwd):")
+        for u, b in ex.get("by_uid", {}).items():
+            print(f"    uid {u}: executed={b['executed']} resolved={b['resolved']} "
+                  f"({b['pct']}%)")
     else:
         print("EXECUTED stats: (no tma_runtime_operand_debug.jsonl — static-only view)")
 
