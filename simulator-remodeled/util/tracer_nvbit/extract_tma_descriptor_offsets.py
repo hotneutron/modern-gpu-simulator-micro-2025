@@ -207,11 +207,17 @@ def trace_offset(defs, reg, before_idx, depth=0, max_depth=DEFAULT_MAX_DEPTH, ch
             src_txt = f"UR{src}" if (src is not None and src >= 0) else (
                 "UR?" if src == -1 else "URZ/none")
             fork = f" +{extra_reg_count}reg_fork" if extra_reg_count else ""
-            chain.append(f"UR{reg} <- UIADD3 {src_txt} + 0x{imm:x}{fork}")
+            self_acc = " self_acc" if src == reg else ""
+            chain.append(f"UR{reg} <- UIADD3 {src_txt} + 0x{imm:x}{fork}{self_acc}")
         if extra_reg_count > 0 or src == -1:
             return AMBIGUOUS_FORK
         if src is None:
             return None
+        # NOTE: src == reg (self-accumulation) is fine here — the recursion moves to
+        # an EARLIER def (last_def uses before_idx=idx), so a chain like
+        # UR6+=0x20400; UR6+=0x20200; UR6<-ULDC still folds to a fixed sum. The bogus
+        # large offsets come from those chains terminating at a NON-param-base cbank,
+        # which is already filtered downstream (reached_non_param_base_cbank).
         sub = trace_offset(defs, src, idx, depth + 1, max_depth, chain)
         if sub is None or sub is AMBIGUOUS_FORK:
             return sub
