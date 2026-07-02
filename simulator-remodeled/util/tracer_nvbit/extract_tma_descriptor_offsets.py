@@ -84,6 +84,31 @@ def select_descriptor_reg(opcode, operand_text):
     return None, None
 
 
+def enumerate_operand_regs(operand_text):
+    """Return [(operand_index, role_hint, reg)] for EVERY operand that carries a UR
+    register — brackets, desc[URx], and bare UR. Used to DISCOVER (not assume) which
+    operand reaches param_base, since §2.6's per-family guess is wrong for bwd
+    UTMASTG/UBLKRED (see tmp.out: operand-1 goes to SMEM)."""
+    out = []
+    operands = split_operands(operand_text)
+    for i, op in enumerate(operands):
+        op = op.strip()
+        desc_m = re.search(r"desc\[UR(\d+)\]", op)
+        if desc_m:
+            out.append((i, "desc", int(desc_m.group(1))))
+            continue
+        if op.startswith("["):
+            reg = first_ureg(op)
+            if reg is not None:
+                out.append((i, "bracket", reg))
+            continue
+        # bare UR operand (some UTMASTG/UBLKRED forms pass the descriptor as a plain UR)
+        m = re.match(r"UR(\d+)$", op)
+        if m:
+            out.append((i, "bare", int(m.group(1))))
+    return out
+
+
 def is_descriptor_offset_opcode(opcode):
     return (
         opcode.startswith("UTMALDG")
@@ -173,6 +198,35 @@ def uid_key(uid, fname):
     return str(uid) if uid is not None else fname
 
 
+def load_executed_sites(extra_info_dir: Path):
+    """Executed (uid, pc_hex) set from tma_runtime_operand_debug.jsonl, restricted to
+    descriptor-carrying families. Returns None if absent. The REAL decision metric is
+    'what % of EXECUTED loads reach param_base', not the static site count."""
+    path = extra_info_dir / "tma_runtime_operand_debug.jsonl"
+    if not path.exists():
+        return None
+    executed = set()
+    try:
+        import json as _json
+        with path.open() as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = _json.loads(line)
+                except ValueError:
+                    continue
+                op = rec.get("opcode", "")
+                if not is_descriptor_offset_opcode(op):
+                    continue
+                uid = rec.get("unique_function_id")
+                executed.add((uid, rec.get("pc_hex")))
+    except OSError:
+        return None
+    return executed
+
+
 def extract_offsets(extra_info_dir: Path, max_depth: int,
                     param_base_cbank_index_override=None):
     nvdisasm_dir = extra_info_dir / "nvdisasm"
@@ -220,6 +274,7 @@ def extract_offsets(extra_info_dir: Path, max_depth: int,
     prefetch_sites = []
     cbank_index_counts = defaultdict(int)
     offsets_by_function = defaultdict(set)
+    executed_sites = load_executed_sites(extra_info_dir)
 
     for function in functions_by_name.values():
         instructions = function["instructions"]
@@ -267,6 +322,25 @@ def extract_offsets(extra_info_dir: Path, max_depth: int,
                 continue
 
             reg, role = select_descriptor_reg(opcode, operand_text)
+
+            # DISCOVER which operand actually reaches param_base (don't trust the
+            # §2.6 guess; bwd UTMASTG/UBLKRED put SMEM in operand-1). Trace every
+            # UR-bearing operand and record where each terminates.
+            operand_probe = []
+            param_base_operands = []
+            for op_idx, hint, op_reg in enumerate_operand_regs(operand_text):
+                t = trace_offset(defs, op_reg, idx, max_depth=max_depth)
+                entry = {
+                    "operand_index": op_idx,
+                    "role_hint": hint,
+                    "reg": op_reg,
+                    "cbank_index_hex": f"0x{t[0]:x}" if t else None,
+                    "tensormap_offset_hex": f"0x{t[1]:x}" if t else None,
+                }
+                operand_probe.append(entry)
+                if t and t[0] == param_base_cbank_index:
+                    param_base_operands.append((op_idx, hint, op_reg, t[1]))
+
             record = {
                 "unique_function_id": uid,
                 "function_name": fname,
@@ -274,6 +348,12 @@ def extract_offsets(extra_info_dir: Path, max_depth: int,
                 "opcode": opcode,
                 "descriptor_operand": role,
                 "descriptor_reg": reg,
+                "operand_probe": operand_probe,
+                "param_base_operand_count": len(param_base_operands),
+                "executed": (
+                    None if executed_sites is None
+                    else ((uid, ins["pc_hex"]) in executed_sites)
+                ),
                 "resolved": False,
                 "cbank_index_hex": None,
                 "tensormap_offset_hex": None,
@@ -281,6 +361,16 @@ def extract_offsets(extra_info_dir: Path, max_depth: int,
                 "chain": None,
                 "reason": None,
             }
+
+            # Prefer the data-discovered param_base operand over the §2.6 guess when
+            # they disagree and exactly one operand reaches param_base.
+            if len(param_base_operands) == 1:
+                d_idx, d_hint, d_reg, d_off = param_base_operands[0]
+                if d_reg != reg:
+                    record["descriptor_operand"] = f"discovered_idx{d_idx}_{d_hint}"
+                    record["descriptor_reg"] = d_reg
+                    reg, role = d_reg, record["descriptor_operand"]
+
             if reg is None:
                 record["reason"] = "no_descriptor_operand_register_found"
                 sites.append(record)
@@ -314,6 +404,29 @@ def extract_offsets(extra_info_dir: Path, max_depth: int,
     if cbank_index_counts:
         dominant_cbank = max(cbank_index_counts.items(), key=lambda kv: kv[1])[0]
 
+    # Executed-site resolution: the real decision metric. Of the descriptor sites
+    # that actually ran, how many reach param_base vs escape to GMEM/other cbank?
+    executed_stats = None
+    if executed_sites is not None:
+        ex = [s for s in sites if s.get("executed")]
+        by_family = defaultdict(lambda: {"executed": 0, "resolved": 0,
+                                         "non_param_cbank": 0, "no_cbank": 0})
+        for s in ex:
+            fam = s["opcode"].split(".")[0]
+            b = by_family[fam]
+            b["executed"] += 1
+            if s["resolved"]:
+                b["resolved"] += 1
+            elif s["reason"] == "reached_non_param_base_cbank":
+                b["non_param_cbank"] += 1
+            elif s["reason"] == "def_chain_did_not_reach_any_cbank_ULDC":
+                b["no_cbank"] += 1
+        executed_stats = {
+            "executed_site_count": len(ex),
+            "executed_resolved_count": sum(1 for s in ex if s["resolved"]),
+            "by_opcode_family": {k: dict(v) for k, v in sorted(by_family.items())},
+        }
+
     return {
         "extra_info_dir": str(extra_info_dir),
         "param_base_cbank_index_hex": f"0x{param_base_cbank_index:x}",
@@ -325,6 +438,7 @@ def extract_offsets(extra_info_dir: Path, max_depth: int,
         },
         "site_count": len(sites),
         "resolved_site_count": sum(1 for s in sites if s["resolved"]),
+        "executed_stats": executed_stats,
         "sites": sites,
         "prefetch_sites": prefetch_sites,
         "distinct_tensormap_offsets": {
@@ -383,6 +497,16 @@ def main():
           f"(dominant={result['dominant_cbank_index_hex']})")
     print(f"cbank_index_counts={result['cbank_index_counts']}")
     print(f"sites={result['site_count']} resolved={result['resolved_site_count']}")
+
+    ex = result.get("executed_stats")
+    if ex is not None:
+        print(f"EXECUTED sites={ex['executed_site_count']} "
+              f"resolved={ex['executed_resolved_count']} "
+              f"({100.0*ex['executed_resolved_count']/max(1,ex['executed_site_count']):.1f}% reach param_base)")
+        for fam, b in ex["by_opcode_family"].items():
+            print(f"    {fam}: {b}")
+    else:
+        print("EXECUTED stats: (no tma_runtime_operand_debug.jsonl — static-only view)")
 
     # reason breakdown (why sites did not resolve to a param-base offset)
     reason_counts = defaultdict(int)
