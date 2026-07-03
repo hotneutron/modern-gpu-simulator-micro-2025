@@ -1150,6 +1150,41 @@ offsets misaligned), the verifier prints both offset lists so we can fix the ali
 model — but the essential result stands: **the real base is available on the host for
 uid3/8, no device read needed.**
 
+## 2.25 SPIKE 9 — offset-statistics join is noise; SASS def-chain says the descriptor is INLINE at param_base+offset
+
+The `base - tensormap_offset` histogram was **noise**: bases repeat every `0xc0=192`
+inside the params struct, so any 256B window catches several (uid3 gave +0x50/+0x90;
+uid8 sprayed +0x0/+0x10/+0x40/+0x50/+0x90/+0xc0/+0xd0). You cannot key a tensor by
+"a base happens to sit near this offset". Per the user, switch to **SASS def-chain**.
+
+**The def-chain (from `tma_descriptor_offsets.json`, uid8 pc 0x73e0) is decisive:**
+```
+UTMALDG.4D [UR16], [UR8], desc[UR30]
+UR8  <- UIADD3 UR14 + 0x1f0
+UR14 <- ULDC c[0x0][0x198]          ; c[0x0][0x198] = param_base
+```
+So operand-2 = `param_base + 0x1f0`, and that value is handed to the TMA engine **as the
+descriptor address**. Therefore the params struct must contain, at inner offset `0x1f0`,
+the **full 128B CUtensorMap** — not merely a base value somewhere nearby. (This also
+reconciles §2.17(b) vs §2.24: the struct is passed by value AND the descriptor lives at
+`param_base+offset` inside it; the `0xffffff…` we chased earlier was the device-staged
+copy of that same descriptor.)
+
+**Encode dump confirms the base field:** `qword0_hex == global_address_hex` for every row
+(e.g. `0x00007f53d0a00000`). So within a 128B CUtensorMap, **qword0 = base**.
+
+**Correct join (unambiguous):** at `param_base + tensormap_offset` in the struct blob,
+the 128B should byte-for-byte equal one encoded descriptor blob
+(`tensor_map_encode_blobs/<dump_id>.bin`); that dump's qword0 is the base. Rewrote
+`diag_tma_desc_layout.py` to do this **exact 128B compare** (not a base scan) and report
+`exact matches / total`. Local self-test (128B descriptor inlined at 0x1f0) → EXACT match,
+qword0=base. This is the real key: **(uid,pc) → tensormap_offset → 128B descriptor →
+qword0 = base**, exact and per-tensor unique.
+
+**Next:** run `diag_tma_desc_layout.py` on the (blob-enabled) trace. If `exact matches`
+is high for uid3 and uid8, fold this into `verify_tma_launch_param.py` as the join (drop
+the offset-arithmetic path), emit `(uid,pc)->base`, and build the sim mover.
+
 ## 3. Design
 
 ### 3.1 Trace-gen (NVBit) — capture param_base + static offset, deref the descriptor, dump ALL fields (Path B)
