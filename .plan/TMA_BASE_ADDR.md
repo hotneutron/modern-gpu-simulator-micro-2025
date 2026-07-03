@@ -1185,6 +1185,36 @@ qword0 = base**, exact and per-tensor unique.
 is high for uid3 and uid8, fold this into `verify_tma_launch_param.py` as the join (drop
 the offset-arithmetic path), emit `(uid,pc)->base`, and build the sim mover.
 
+## 2.26 SPIKE 9 RESULT — descriptor is NOT at param_base+offset in the host struct; run discovery
+
+The exact-128B check came back **0/14 (uid8), 0/22 (uid3)**. At `param_base +
+tensormap_offset` the struct holds non-base values (`0xc000`, `0x0`, and
+`0x3f00000000000000` — which is the *qword6* of an encoded CUtensorMap). So the 128B
+descriptor is **not inlined at that offset** in the host launch buffer. Two facts sharpen
+this:
+- Several large tensormap_offsets (0x21070, 0x30d90, …) fall **outside** the struct
+  (uid8 size 0x700, uid3 size 0x940) → those are the §2.17(a) bogus multi-source-UIADD3
+  offsets, not real.
+- `0x3f00…` appearing at the offset suggests the offset lands in the *middle* of a
+  descriptor (or the host struct layout differs from the device param block).
+
+So §2.24's "bases are inlined in the struct" is true (the 7 bases DO appear in the
+struct), but they are **not** at `param_base + tensormap_offset`. The SASS offset and the
+struct layout are in different coordinate systems, OR the struct passes descriptor
+**pointers** (§2.17b) and the inlined bases we saw are a *separate* base array.
+
+**Decision: stop guessing offsets; discover where the 128B descriptors actually sit.**
+Added a discovery mode to `diag_tma_desc_layout.py` that slides every encoded 128B blob
+over each uid's full struct and reports the exact inner offsets where a descriptor lives.
+Local self-test (descriptor hidden at 0x2a0 while SASS said 0x1f0) correctly recovers
+0x2a0. Outcomes:
+- **Descriptors found inline at fixed inner offsets** ⇒ learn `inner_offset` per tensor,
+  relate to `tensormap_offset` (likely a constant per-uid delta), then join.
+- **Zero placements** ⇒ the struct holds descriptor *pointers*, not by-value descriptors.
+  Then the base is in the GMEM the pointer targets; dump/deref those offline (host-side).
+  The 0xc0-spaced bases we saw earlier would then be a separate CUTLASS base array, joined
+  by index, not by descriptor identity.
+
 ## 3. Design
 
 ### 3.1 Trace-gen (NVBit) — capture param_base + static offset, deref the descriptor, dump ALL fields (Path B)

@@ -144,6 +144,39 @@ def main():
               "NOT inlined at param_base+tensormap_offset; re-examine the SASS operand "
               "(the offset may point at a pointer to the descriptor, not the descriptor).")
 
+    # ------------------------------------------------------------------
+    # DISCOVERY MODE: where do the encoded 128B descriptors actually live inside each
+    # uid's params struct? Slide every encode blob over the whole struct and report exact
+    # 128B matches. This finds the descriptors' true inner offsets regardless of the SASS
+    # tensormap_offset coordinate system, so we can learn the offset relationship.
+    if have_encode_blobs:
+        print("\n=== descriptor location discovery (slide encode blobs over each struct) ===")
+        for uid in sorted(blob_by_uid, key=lambda x: int(x)):
+            if a.uid and uid != a.uid:
+                continue
+            _, blob_path, arg_off = blob_by_uid[uid]
+            p = Path(blob_path)
+            if not p.exists():
+                continue
+            buf = p.read_bytes()
+            hits = []
+            for did, base, box, data in encode_blobs:
+                if len(data) < 128:
+                    continue
+                needle = data[:128]
+                start = 0
+                while True:
+                    idx = buf.find(needle, start)
+                    if idx < 0:
+                        break
+                    hits.append((idx, did, base))
+                    start = idx + 8
+            hits.sort()
+            print(f"  uid{uid} struct size 0x{len(buf):x}: {len(hits)} exact 128B "
+                  f"descriptor placements")
+            for idx, did, base in hits[:a.limit]:
+                print(f"     inner 0x{idx:x}  encode#{did}  base=0x{base:x}")
+
 
 if __name__ == "__main__":
     main()
