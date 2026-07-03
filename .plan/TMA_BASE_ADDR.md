@@ -1266,6 +1266,65 @@ Emit `(uid,pc)→base`; feed the sim to replace synthetic `agu_base`.
 Next: fold this into `verify_tma_launch_param.py` (or a new `build_tma_pc_base_map.py`),
 emit the per-(uid,pc) base map, then wire the sim mover.
 
+## 2.28 SPIKE 10 build — resolution logic verified 100%; first server run mapped 0 (diagnostic added)
+
+`build_tma_pc_base_map.py` written and unit-tested (direct+chain+pool+locality all pass on
+synthetic data). On the real trace the **resolution logic is proven correct**: replaying
+the server's discovered struct slots against the local runtime SMEM offsets resolves
+**every** descriptor-op pc — uid3: 6 direct + 5 pool = 11/11; uid8: 4 direct + 8 pool =
+12/12 (chain would upgrade some pool→exact). So `struct_slots + runtime_smem` ⇒ full
+coverage.
+
+But the first server run printed `(uid,pc) mapped: 0` while discovery found 6 slots each
+for uid3/uid8. Since the logic is verified, the only possible cause is an **empty
+`smem_by_pc`** in that run (the runtime-operand read returned nothing) — e.g. the
+re-generated trace's `tma_runtime_operand_debug.jsonl` differs (uid renumbering, opcode
+string, or the file was regenerated without operands). Added a per-uid diagnostic block to
+the builder that prints: `runtime SMEM offsets` count, and for each uid its
+`smem_offsets / struct_slots / chain_keys` with the direct/chain/pool split — so the next
+server run shows exactly which stage is empty.
+
+Note: the LOCAL trace is still the OLD 16-qword CSV (no `blob_path` column, empty
+`launch_param_blobs/`), so discovery cannot run locally; the server trace (blob-enabled)
+is the source of truth. Re-run the builder on the server with the diagnostic to see the
+`smem_by_pc` count.
+
+## 2.29 SPIKE 10 build FIXED — 23/23 exact base mappings, zero pool fallback
+
+Copied the server trace locally and reproduced `mapped 0`, then found **two bugs** (both
+environmental, not logic):
+1. **blob_path was an absolute host path** (`/home/jihyun/…`) baked into
+   `tma_launch_param_dump.csv`; on any other machine the file `exists=False`, so discovery
+   was skipped. Fix: rebuild the path relative to the current `extra_info`
+   (`launch_param_blobs/<basename>`).
+2. **SMEM descriptor addresses use a different encoding in this trace** —
+   `first_lane_addr` is `0x00722a02c0` (SMEM base in bits ≥16, tensor offset in low bits),
+   not the earlier generic-neg `0xffffffffd22a02c0`. The filter only accepted the
+   `0xffffffff…` form, so `runtime SMEM offsets = 0`. Fix: `is_smem_descriptor_addr`
+   accepts both (`>0xffffffff00000000` OR `>>16 != 0`); low 16 bits are the tensor SMEM
+   offset in both.
+
+Result (copied trace, both fixes):
+```
+runtime SMEM offsets: 23 (uid,pc) across uid3, uid8
+(uid,pc) mapped: 23
+  uid3: direct=6 chain=5 pool=0 unresolved=0
+  uid8: direct=4 chain=8 pool=0 unresolved=0
+locality check (one base per SMEM offset): OK
+```
+**Every descriptor-op pc resolves to an exact real base — direct + prefetch-chain cover
+100%, no pool fallback needed.** 23 entries, 5 distinct bases, source = 10 direct + 13
+chain. Answers the user's "can we do exact mapping for all?": **yes, 23/23.**
+`tma_pc_base_map.json` = `{ "uid:pc": {base_hex, smem_offset_hex, source} }`.
+
+Locality is guaranteed: each SMEM offset (tensor ID) maps to exactly one base, so pcs
+reading the same tensor share a base — the property L2-hit modeling needs.
+
+**Next (sim wiring, Phase 4):** load `tma_pc_base_map.json` and replace the synthetic
+`agu_base = (transfer_uid<<20) + agu_index*128` (tma_unit_sm.cc:637) with
+`base(uid,pc) + agu_index*128` (falling back to synthetic only if a pc is absent, e.g.
+non-descriptor ops). Then compare L2 hit rate vs HW (fwd 70% / bwd 82%).
+
 ## 3. Design
 
 ### 3.1 Trace-gen (NVBit) — capture param_base + static offset, deref the descriptor, dump ALL fields (Path B)

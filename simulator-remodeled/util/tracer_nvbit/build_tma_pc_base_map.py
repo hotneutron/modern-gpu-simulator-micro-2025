@@ -31,6 +31,23 @@ def parse_int(x):
     return int(x, 0) if x else 0
 
 
+def is_smem_descriptor_addr(fla):
+    """True if first_lane_addr is a generic-SMEM descriptor window address (carries the
+    tensor's SMEM offset in its low bits). Two observed encodings across traces:
+      - full generic-neg form 0xffffffffXXXXX... (top 32 bits set)
+      - low-32 form 0x0072aXXXX (SMEM base in bits >=16, small tensor offset in low bits)
+    A raw staging cursor (e.g. 0x2c0/0x400) has nothing above bit 16, so >>16==0."""
+    if not isinstance(fla, int):
+        return False
+    if fla > 0xFFFFFFFF00000000:      # full generic-neg encoding
+        return True
+    return (fla >> 16) != 0           # low-32 SMEM-window encoding (base in high bits)
+
+
+def smem_offset_of(fla):
+    return fla & 0xFFFF
+
+
 def load_encode_blobs(extra):
     out = []
     p = extra / "tensor_map_encode_dump.csv"
@@ -46,7 +63,9 @@ def load_encode_blobs(extra):
 
 
 def struct_blob_by_uid(extra):
-    """largest launch arg per uid = the by-value params struct."""
+    """largest launch arg per uid = the by-value params struct. The CSV blob_path is an
+    absolute path from the tracer host, so rebuild it relative to THIS extra_info dir
+    (launch_param_blobs/<basename>) for portability across machines."""
     best = {}
     p = extra / "tma_launch_param_dump.csv"
     if not p.exists():
@@ -55,8 +74,11 @@ def struct_blob_by_uid(extra):
         for r in csv.DictReader(fh):
             uid = str(r.get("unique_function_id"))
             sz = parse_int(r.get("arg_size"))
+            raw = r.get("blob_path") or ""
+            local = extra / "launch_param_blobs" / Path(raw).name if raw else None
             if uid not in best or sz > best[uid][0]:
-                best[uid] = (sz, r.get("blob_path"), parse_int(r.get("param_offset_hex")))
+                best[uid] = (sz, str(local) if local else None,
+                             parse_int(r.get("param_offset_hex")))
     return best
 
 
@@ -96,11 +118,11 @@ def runtime_smem_offsets(extra, opcodes):
             if r.get("callback_index") != 0:
                 continue
             fla = r.get("first_lane_addr")
-            if not (isinstance(fla, int) and fla > 0xFFFFFFFF00000000):
+            if not is_smem_descriptor_addr(fla):
                 continue
             uid = str(r.get("unique_function_id"))
             pc = r.get("pc_hex")
-            off = fla & 0xFFFF
+            off = smem_offset_of(fla)
             seen_multi[(uid, pc)].add(off)
             out[(uid, pc)] = off  # deterministic per pc (verified); last wins
     return out, seen_multi
@@ -124,8 +146,8 @@ def utmacctl_chain(extra, delta, struct_slots_by_uid):
                 if r.get("callback_index") != 0:
                     continue
                 fla = r.get("first_lane_addr")
-                if isinstance(fla, int) and fla > 0xFFFFFFFF00000000:
-                    dest[(str(r.get("unique_function_id")), r.get("pc_hex"))] = fla & 0xFFFF
+                if is_smem_descriptor_addr(fla):
+                    dest[(str(r.get("unique_function_id")), r.get("pc_hex"))] = smem_offset_of(fla)
     # param sources per (uid, pc) from prefetch_sites
     off_json = extra / "tma_descriptor_offsets.json"
     src = defaultdict(set)
@@ -201,6 +223,23 @@ def main():
     print(f"struct descriptors discovered per uid:")
     for uid, slots in sorted(struct_slots_by_uid.items()):
         print(f"  uid{uid}: {len(slots)} slots, {len(set(slots.values()))} distinct bases")
+    print(f"\nruntime SMEM offsets: {len(smem_by_pc)} (uid,pc) across "
+          f"{len(set(u for u, _ in smem_by_pc))} uids")
+    # per-uid: how many descriptor-op pcs have a SMEM offset, and do their offsets fall in
+    # the discovered struct slots / chain / neither?
+    by_uid_pc = defaultdict(list)
+    for (uid, pc), sm in smem_by_pc.items():
+        by_uid_pc[uid].append(sm)
+    for uid in sorted(by_uid_pc, key=lambda x: int(x)):
+        offs = sorted(set(by_uid_pc[uid]))
+        slots = struct_slots_by_uid.get(uid, {})
+        ch = chain.get(uid, {})
+        d = [o for o in offs if o in slots]
+        c = [o for o in offs if o not in slots and o in ch]
+        n = [o for o in offs if o not in slots and o not in ch]
+        print(f"  uid{uid}: smem_offsets={[hex(o) for o in offs]}")
+        print(f"         struct_slots={[hex(o) for o in sorted(slots)]} chain_keys={[hex(o) for o in sorted(ch)]}")
+        print(f"         direct={[hex(o) for o in d]} chain={[hex(o) for o in c]} pool/none={[hex(o) for o in n]}")
     print(f"\n(uid,pc) mapped: {len(result)}  -> {out.name}")
     for uid in sorted(stats):
         s = stats[uid]
