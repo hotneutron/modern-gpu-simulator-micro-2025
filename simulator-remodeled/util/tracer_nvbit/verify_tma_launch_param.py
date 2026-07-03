@@ -101,7 +101,14 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--traces", required=True)
     ap.add_argument("--show", type=int, default=60)
+    ap.add_argument(
+        "--base-field-offset", default="0x10",
+        help="byte offset of the global base INSIDE the descriptor struct. The SASS "
+        "tensormap_offset points at the descriptor start; the base sits this many bytes "
+        "in. Measured on FA3: base_inner - 0x10 == tensormap_offset (§2.25). Set 0x0 to "
+        "match the raw base location.")
     args = ap.parse_args()
+    base_field_offset = parse_int(args.base_field_offset)
 
     extra = Path(args.traces).resolve() / "extra_info"
     dump_rows, dump_path = load_launch_dump(extra)
@@ -143,24 +150,29 @@ def main():
     total_locs = sum(len(v) for v in base_locs.values())
     print(f"  total base locations found: {total_locs}")
 
-    # Join: param_block_offset (arg_off + inner) == SASS tensormap_offset, same uid.
+    # Join: the SASS tensormap_offset points at the DESCRIPTOR START; the base sits
+    # base_field_offset bytes inside it. So descriptor_start = param_block_offset -
+    # base_field_offset must equal a site's tensormap_offset (same uid).
     join = {}
     for uid, locs in base_locs.items():
         for pbo, b, ai, inner in locs:
-            for (suid, pc) in offset_to_sites.get(pbo, []):
+            desc_start = pbo - base_field_offset
+            for (suid, pc) in offset_to_sites.get(desc_start, []):
                 if suid == str(uid):
                     join[(suid, pc)] = {
                         "base_hex": f"0x{b:x}",
-                        "param_block_offset_hex": f"0x{pbo:x}",
+                        "descriptor_offset_hex": f"0x{desc_start:x}",
+                        "base_param_block_offset_hex": f"0x{pbo:x}",
                         "arg_index": ai,
                         "inner_offset_hex": f"0x{inner:x}",
                     }
 
-    print(f"\njoined (uid,pc) -> base via param_block_offset==tensormap_offset: "
-          f"{len(join)}")
+    print(f"\njoined (uid,pc) -> base via (param_block_offset - 0x{base_field_offset:x}) "
+          f"== tensormap_offset: {len(join)}")
     for (uid, pc), v in sorted(join.items())[:args.show]:
         print(f"    uid={uid} pc={pc} -> base={v['base_hex']} "
-              f"(param_block_off {v['param_block_offset_hex']}, arg {v['arg_index']})")
+              f"(desc_off {v['descriptor_offset_hex']}, base@{v['base_param_block_offset_hex']}, "
+              f"arg {v['arg_index']})")
 
     out = extra / "tma_launch_param_join.json"
     out.write_text(json.dumps(
@@ -171,8 +183,9 @@ def main():
     if not join and total_locs:
         sass_offsets = sorted(set(offset_to_sites.keys()))
         print("\nno offset match. Compare the two offset sets:")
-        print("  base param_block_offsets found:",
-              sorted({f"0x{pbo:x}" for locs in base_locs.values()
+        print("  descriptor_offsets (base_param_block_off - "
+              f"0x{base_field_offset:x}):",
+              sorted({f"0x{pbo - base_field_offset:x}" for locs in base_locs.values()
                       for pbo, _, _, _ in locs})[:20])
         print("  SASS tensormap_offsets (sample):",
               [f"0x{o:x}" for o in sass_offsets[:20]])
