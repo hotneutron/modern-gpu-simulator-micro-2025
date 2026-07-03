@@ -1215,6 +1215,57 @@ Local self-test (descriptor hidden at 0x2a0 while SASS said 0x1f0) correctly rec
   The 0xc0-spaced bases we saw earlier would then be a separate CUTLASS base array, joined
   by index, not by descriptor identity.
 
+## 2.27 SPIKE 10 — SOLVED: exact (uid,pc)→base via the UTMACCTL prefetch chain (Rosetta stone)
+
+Exact per-pc base mapping **is** achievable. The three coordinate systems (host struct
+offset, SASS param offset, device SMEM offset) finally link through **UTMACCTL.PF**, which
+copies each descriptor from the param struct into SMEM and thus ties param↔SMEM.
+
+**The chain (verified 6/6 on uid8):**
+```
+UTMALDG(pc)  --runtime operand ci=0-->  SMEM descriptor offset   (deterministic per pc)
+UTMACCTL.PF  --def-chain / runtime-->   SMEM dest offset  <->  param source offset
+param source offset  -  0x30        =   struct descriptor offset (discovery)
+struct descriptor qword0            =   real base
+```
+uid8 UTMACCTL prefetch (param source → SMEM dest), then `param-0x30` = struct slot:
+```
+param 0xb0 →SMEM 0x2c0 ; 0xb0-0x30=0x80  → base 0x7f1958c00000
+param 0x170→SMEM 0x380 ; 0x140            → base 0x7f18f4600000
+param 0x230→SMEM 0x440 ; 0x200            → base 0x7f1959200000
+param 0x2f0→SMEM 0x500 ; 0x2c0            → base 0x7f1959800000
+param 0x4f0→SMEM 0x700 ; 0x4c0            → base 0x7f17c7600000
+param 0x5b0→SMEM 0x7c0 ; 0x580            → base 0x7f18f4000000
+```
+So the SMEM→base table is: {0x2c0→…8c00000, 0x380→…f4600000, 0x440→…59200000,
+0x500→…59800000, 0x700→…c7600000, 0x7c0→…f4000000}. All 4 executed UTMALDG SMEM offsets
+(0x2c0/0x380/0x440/0x500) resolve to a real base with **zero unresolved**.
+
+**Why earlier single-delta joins failed:** each coordinate system is a 0xc0-strided array
+with a *different start* (struct starts 0x80, param 0xb0, SMEM 0x2c0). Subtracting one
+constant only aligned some. The prefetch chain gives the true, per-pair correspondence —
+no guessing.
+
+**Per-opcode algorithm (uniform, valid for all descriptor ops; confirmed by operand
+survey):**
+- descriptor-based — `UTMALDG, UTMASTG, UTMAPF, UTMACCTL, UTMAREDG`: runtime ci=0 operand
+  is a generic-SMEM descriptor addr `0xffffff…`; its low bits = the tensor's SMEM offset =
+  a stable tensor ID. Resolve to base via the UTMACCTL SMEM→base table.
+- non-descriptor — `UBLKCP, UBLKRED, UTMACMDFLUSH`: operand survey shows **0** SMEM
+  descriptor addresses; they do SMEM↔GMEM bulk/control and reference no tensormap
+  (`UBLKRED` ci=1 is a real GMEM reduction target — use it directly if needed). Not mapped.
+
+**Build recipe (offline, host-only, crash-free):**
+1. `tensor_map_encode_dump.csv` + `launch_param_blobs/*.bin` → discover struct descriptor
+   offsets + qword0 base (slide-match, §2.26 discovery).
+2. `tma_descriptor_offsets.json` `prefetch_sites` → UTMACCTL (param source → SMEM dest).
+3. `param_source - 0x30 == struct offset` → SMEM dest → base table (per uid).
+4. `tma_runtime_operand_debug.jsonl` → each UTMALDG/UTMASTG (uid,pc) → SMEM offset → base.
+Emit `(uid,pc)→base`; feed the sim to replace synthetic `agu_base`.
+
+Next: fold this into `verify_tma_launch_param.py` (or a new `build_tma_pc_base_map.py`),
+emit the per-(uid,pc) base map, then wire the sim mover.
+
 ## 3. Design
 
 ### 3.1 Trace-gen (NVBit) — capture param_base + static offset, deref the descriptor, dump ALL fields (Path B)
