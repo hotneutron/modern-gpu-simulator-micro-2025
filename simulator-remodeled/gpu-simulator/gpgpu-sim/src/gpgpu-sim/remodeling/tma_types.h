@@ -125,20 +125,57 @@ struct TMAResolvedSiteMetadata {
   TMADescriptorConfigMetadata descriptor_config;
 };
 
+// Exact per-site descriptor binding recovered offline (build_tma_pc_base_map.py). Keyed
+// by (unique_function_id, pc) — the identity that is still live at build_tma_command,
+// before the mover loses it. Supersedes the handle_hi->config_id heuristic: carries the
+// real GMEM base plus the full descriptor shape so no config_id join is needed.
+struct TMABaseLookupKey {
+  unsigned int unique_function_id = 0;
+  uint64_t pc = 0;
+
+  bool operator<(const TMABaseLookupKey &other) const {
+    return std::tie(unique_function_id, pc) <
+           std::tie(other.unique_function_id, other.pc);
+  }
+};
+
+struct TMABaseRecord {
+  // has_static_base: this site is tensormap-addressed and we recovered the real base
+  // (UTMALDG/UTMASTG/UTMACCTL.PF). operand_addressed: this site is raw-pointer addressed
+  // (UBLKRED/UBLKCP) — no static base; keep the synthetic address, size from operands.
+  bool has_static_base = false;
+  bool operand_addressed = false;
+  uint64_t global_base = 0;
+  uint32_t tensor_rank = 0;
+  uint32_t tensor_data_type = 0;
+  uint32_t element_size = 0;
+  std::array<uint32_t, 5> global_dim = {0, 0, 0, 0, 0};
+  std::array<uint64_t, 5> global_strides = {0, 0, 0, 0, 0};
+  std::array<uint32_t, 5> box_dim = {0, 0, 0, 0, 0};
+  std::array<uint32_t, 5> element_strides = {0, 0, 0, 0, 0};
+  uint32_t interleave = 0;
+  uint32_t swizzle = 0;
+  uint32_t l2_promotion = 0;
+  uint32_t oob_fill = 0;
+  std::string source;  // "direct" | "chain" | "prefetch" | "pool"
+};
+
 struct TMASidecarMetadataDB {
   std::map<std::string, TMADescriptorConfigMetadata> descriptor_configs;
   std::map<TMADescriptorLookupKey, TMADescriptorSiteRecord> descriptor_site_records;
   std::map<TMAOperandLookupKey, TMAOperandSiteRecord> operand_site_records;
+  std::map<TMABaseLookupKey, TMABaseRecord> base_records;
 
   void clear() {
     descriptor_configs.clear();
     descriptor_site_records.clear();
     operand_site_records.clear();
+    base_records.clear();
   }
 
   bool empty() const {
     return descriptor_configs.empty() && descriptor_site_records.empty() &&
-           operand_site_records.empty();
+           operand_site_records.empty() && base_records.empty();
   }
 };
 
@@ -259,6 +296,12 @@ struct TMACommand {
   uint32_t oob_fill = 0;
   uint32_t l2_promotion = 0;
   TMAOperandForm operand_form = TMAOperandForm::GENERIC;
+  // Real GMEM base recovered from the exact (uid,pc) base map. When has_real_base is
+  // true the mover computes addr = global_base + agu_index*128 (HW-faithful, L2 reuse)
+  // instead of the synthetic (transfer_uid<<20)+agu_index*128. Populated in
+  // build_tma_command where (uid,pc) is still known; carried to mover_issue_requests.
+  uint64_t global_base = 0;
+  bool has_real_base = false;
 };
 
 struct TMATransferEntry {

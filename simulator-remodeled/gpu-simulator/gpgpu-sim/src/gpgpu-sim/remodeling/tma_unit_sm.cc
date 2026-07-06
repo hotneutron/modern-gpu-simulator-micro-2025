@@ -179,6 +179,8 @@ void log_tma_phase2_binding_once(const warp_inst_t &inst,
             << " covered_bytes=" << cmd.covered_bytes
             << " operand3_raw=" << cmd.operand3_raw
             << " operand_form=" << static_cast<int>(cmd.operand_form)
+            << " has_real_base=" << (cmd.has_real_base ? 1 : 0)
+            << " global_base=0x" << std::hex << cmd.global_base << std::dec
             << std::endl;
 }
 
@@ -206,9 +208,23 @@ struct TMAPhase2FamilyStats {
   uint64_t operand_only_commands = 0;
   uint64_t mixed_commands = 0;
   uint64_t unresolved_commands = 0;
+  // Real-base coverage (only meaningful when -tma_real_base_addr_enable is on):
+  // real_base_* = a static base was applied; synthetic_* = fell back to the
+  // transfer_uid scheme (operand_addressed sites like UBLKRED/UBLKCP, or flag off).
+  std::set<std::tuple<unsigned int, uint64_t, uint32_t>> real_base_sites;
+  std::set<std::tuple<unsigned int, uint64_t, uint32_t>> synthetic_sites;
+  uint64_t real_base_commands = 0;
+  uint64_t synthetic_commands = 0;
 
   void record(const std::tuple<unsigned int, uint64_t, uint32_t> &key,
-              const TMAResolvedSiteMetadata &metadata) {
+              const TMAResolvedSiteMetadata &metadata, bool has_real_base) {
+    if (has_real_base) {
+      real_base_sites.insert(key);
+      ++real_base_commands;
+    } else {
+      synthetic_sites.insert(key);
+      ++synthetic_commands;
+    }
     if (metadata.descriptor_lookup_hit && metadata.operand_lookup_hit) {
       mixed_sites.insert(key);
       ++mixed_commands;
@@ -261,14 +277,15 @@ struct TMAPhase2BindingStats {
     }
   }
 
-  void record(const warp_inst_t &inst, const TMAResolvedSiteMetadata &metadata) {
+  void record(const warp_inst_t &inst, const TMAResolvedSiteMetadata &metadata,
+              bool has_real_base) {
     auto key = std::make_tuple(inst.unique_function_id,
                                static_cast<uint64_t>(inst.pc),
                                inst.tma_handle_hi);
-    overall.record(key, metadata);
+    overall.record(key, metadata, has_real_base);
     TMAPhase2FamilyStats *family_stats = select_family_stats(inst.tma_opcode_family);
     if (family_stats != nullptr) {
-      family_stats->record(key, metadata);
+      family_stats->record(key, metadata, has_real_base);
     }
   }
 
@@ -288,6 +305,14 @@ struct TMAPhase2BindingStats {
               << " operand_only=" << stats.operand_only_commands
               << " mixed=" << stats.mixed_commands
               << " unresolved=" << stats.unresolved_commands << std::endl;
+    // Real-base coverage: how many sites/commands used the exact GMEM base vs the
+    // synthetic fallback. With the flag on, real_base should cover all descriptor
+    // sites; synthetic should be only operand_addressed (UBLKRED/UBLKCP).
+    std::cerr << "[TMA][Phase2][Stats][" << label << "] real_base sites="
+              << stats.real_base_sites.size()
+              << " synthetic_sites=" << stats.synthetic_sites.size()
+              << " | real_base_commands=" << stats.real_base_commands
+              << " synthetic_commands=" << stats.synthetic_commands << std::endl;
   }
 
   ~TMAPhase2BindingStats() {
@@ -412,6 +437,68 @@ TMACommand tma_unit_sm::build_tma_command(const warp_inst_t &inst) const {
       }
     }
   }
+  // Real per-site GMEM base (tma_pc_base_map.json), looked up here because (uid,pc) is
+  // still available — the mover only sees TMATransferEntry and cannot re-derive it.
+  // Gated by -tma_real_base_addr_enable; when off, has_real_base stays false and the
+  // mover keeps the synthetic address. Only tensormap-addressed sites carry a static
+  // base (UBLKRED/UBLKCP are operand_addressed -> no real base, synthetic retained).
+  if (m_config->tma_real_base_addr_enable) {
+    TMABaseRecord base_record;
+    bool base_hit = m_sm->get_gpu()->lookup_tma_base_record(
+        inst.unique_function_id, inst.pc, base_record);
+    if (base_hit && base_record.has_static_base) {
+      cmd.global_base = base_record.global_base;
+      cmd.has_real_base = true;
+      // SIZE CROSS-CHECK (M1 prerequisite for cutting the config_id path in M3):
+      // the base map carries box_dim/element_size for the exact site, so it must
+      // produce the SAME total_bytes/requests_total as the config_id path already
+      // stored in cmd. A mismatch means the two descriptor sources disagree about
+      // how much data moves -> wrong traffic volume. Fail on the FIRST such command
+      // so a 12h run dies immediately instead of producing bad numbers.
+      TMADescriptorConfigMetadata base_shape;
+      base_shape.box_dim = base_record.box_dim;
+      base_shape.element_size = base_record.element_size;
+      uint32_t base_total_bytes = infer_descriptor_total_bytes(base_shape);
+      uint32_t base_requests_total = infer_descriptor_request_total(base_shape);
+      if (cmd.total_bytes != 0 && base_total_bytes != cmd.total_bytes) {
+        std::cerr << "[TMA][RealBase][FATAL] total_bytes mismatch ufid="
+                  << inst.unique_function_id << " pc=0x" << std::hex
+                  << static_cast<uint64_t>(inst.pc) << std::dec
+                  << " base_map=" << base_total_bytes
+                  << " config_path=" << cmd.total_bytes
+                  << " (base_map box/element_size disagrees with config_id path)"
+                  << std::endl;
+      }
+      assert((cmd.total_bytes == 0 || base_total_bytes == cmd.total_bytes) &&
+             "real-base total_bytes must match config_id path (size cross-check)");
+      if (cmd.requests_total != 0 &&
+          base_requests_total != cmd.requests_total) {
+        std::cerr << "[TMA][RealBase][FATAL] requests_total mismatch ufid="
+                  << inst.unique_function_id << " pc=0x" << std::hex
+                  << static_cast<uint64_t>(inst.pc) << std::dec
+                  << " base_map=" << base_requests_total
+                  << " config_path=" << cmd.requests_total << std::endl;
+      }
+      assert((cmd.requests_total == 0 ||
+              base_requests_total == cmd.requests_total) &&
+             "real-base requests_total must match config_id path (size cross-check)");
+    } else if (tma_family_requires_descriptor(cmd.opcode_family)) {
+      // MISSING-MAP ASSERT: a descriptor-required op (UTMALDG/UTMASTG/UTMAPF/
+      // UTMAREDG) must have an exact base when the flag is on. UBLKRED/UBLKCP are
+      // operand_addressed (no static base) and are excluded by this branch, so they
+      // fall through to the synthetic path without asserting. Fail early so a base-map
+      // coverage gap is caught before a 12h run rather than silently falling back.
+      std::cerr << "[TMA][RealBase][FATAL] descriptor-required site has no static base "
+                << "ufid=" << inst.unique_function_id << " pc=0x" << std::hex
+                << static_cast<uint64_t>(inst.pc) << std::dec
+                << " family=" << tma_phase2_family_label(cmd.opcode_family)
+                << " base_hit=" << (base_hit ? 1 : 0)
+                << " (tma_pc_base_map.json missing this (uid,pc) or operand_addressed)"
+                << std::endl;
+      assert(false &&
+             "descriptor-required TMA site missing real base (base-map coverage gap)");
+    }
+  }
   assert(metadata.operand_lookup_hit &&
          "Phase 2 expected runtime-observed operand resolver entry for executed TMA op");
   assert(metadata.runtime_observed &&
@@ -458,7 +545,7 @@ TMACommand tma_unit_sm::build_tma_command(const warp_inst_t &inst) const {
                infer_request_total_from_covered_bytes(cmd.covered_bytes) &&
            "Phase 2 bulk UBLKCP/UBLKPF should derive requests_total from covered_bytes");
   }
-  get_tma_phase2_binding_stats().record(inst, metadata);
+  get_tma_phase2_binding_stats().record(inst, metadata, cmd.has_real_base);
   log_tma_phase2_binding_once(inst, cmd, m_config->sync_debug_enable);
   return cmd;
 }
@@ -630,13 +717,17 @@ void tma_unit_sm::mover_issue_requests(TMATransferEntry &entry,
     uint32_t sector_unit = entry.requests_issued / mfs_per_sector;
     uint32_t agu_index = sector_unit / SECTOR_CHUNCK_SIZE;
 
-    // Synthetic, deterministic GMEM base address for this 128B AGU request. The
-    // trace does not carry the descriptor base, so we fabricate a per-transfer
-    // address range purely to exercise memory-hierarchy timing. TMA transfers
-    // bypass L1 and go directly to L2/DRAM via the shared interconnect.
+    // GMEM base for this 128B AGU request. When the exact per-site base is available
+    // (build_tma_command set has_real_base from tma_pc_base_map.json), use it so the
+    // same tensor's repeated tiles resolve to overlapping L2 lines exactly as on HW.
+    // Otherwise fall back to the synthetic, deterministic per-transfer range that only
+    // exercises memory-hierarchy timing (the trace lacked the descriptor base).
     new_addr_type agu_base =
-        (static_cast<new_addr_type>(entry.transfer_uid) << 20) +
-        (static_cast<new_addr_type>(agu_index) * MAX_MEMORY_ACCESS_SIZE);
+        entry.cmd.has_real_base
+            ? (static_cast<new_addr_type>(entry.cmd.global_base) +
+               static_cast<new_addr_type>(agu_index) * MAX_MEMORY_ACCESS_SIZE)
+            : ((static_cast<new_addr_type>(entry.transfer_uid) << 20) +
+               (static_cast<new_addr_type>(agu_index) * MAX_MEMORY_ACCESS_SIZE));
 
     bool icnt_blocked = false;
     // Emit one 128B AGU line worth of sector mfs (mfs_per_sector each), resuming

@@ -70,18 +70,37 @@ def build_tma_descriptor_mapping_if_available(trace_folder):
     if all(os.path.exists(path) for path in discovery_inputs):
         discovery_script = os.path.join(this_directory, "discover_tma_producers.py")
         subprocess.run([sys.executable, discovery_script, "--traces", trace_folder], check=True)
+    # Descriptor static-offset extractor (feeds the UTMACCTL prefetch chain in the base
+    # map). Needs the disassembly; runs offline.
+    if os.path.exists(os.path.join(extra_info_dir, "sass")):
+        offsets_script = os.path.join(this_directory, "extract_tma_descriptor_offsets.py")
+        subprocess.run([sys.executable, offsets_script, "--traces", trace_folder], check=True)
     mapping_inputs = [
         os.path.join(extra_info_dir, "tensor_map_encode_dump.csv"),
-        os.path.join(extra_info_dir, "tma_desc_runtime_debug.csv"),
-        os.path.join(extra_info_dir, "tma_discovery.json"),
     ]
     if not all(os.path.exists(path) for path in mapping_inputs):
         return
+    # configs-only: emit tma_descriptor_configs.json (box_dim/strides/swizzle, still used
+    # by the simulator) but NOT the handle_hi->config_id heuristic resolver — the exact
+    # (uid,pc) base map supersedes it.
     mapping_script = os.path.join(this_directory, "build_tma_descriptor_mapping.py")
     subprocess.run(
-        [sys.executable, mapping_script, extra_info_dir, "--fail-on-missing-binding"],
+        [sys.executable, mapping_script, extra_info_dir, "--configs-only"],
         check=True,
     )
+    # Exact (uid,pc) -> real GMEM base + full descriptor fields. Strict: fail if any
+    # descriptor LDG/STG site is unresolved or falls back to the pool.
+    base_map_inputs = [
+        os.path.join(extra_info_dir, "tma_launch_param_dump.csv"),
+        os.path.join(extra_info_dir, "tensor_map_encode_dump.csv"),
+        os.path.join(extra_info_dir, "tma_runtime_operand_debug.jsonl"),
+    ]
+    if all(os.path.exists(path) for path in base_map_inputs):
+        base_map_script = os.path.join(this_directory, "build_tma_pc_base_map.py")
+        subprocess.run(
+            [sys.executable, base_map_script, "--traces", trace_folder, "--strict"],
+            check=True,
+        )
 
 
 def build_tma_operand_mapping_if_available(trace_folder):

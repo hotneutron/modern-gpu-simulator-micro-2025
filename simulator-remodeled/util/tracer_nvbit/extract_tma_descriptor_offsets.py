@@ -142,6 +142,24 @@ def build_defs(instructions):
             if match:
                 defs.append((idx, int(match.group(1)), "uldc", int(match.group(2), 16)))
                 continue
+        if opcode.startswith("UMOV"):
+            # `UMOV URd, imm|URZ` writes a COMPILE-TIME CONSTANT into URd (e.g. the
+            # UBLKRED bare descriptor handle `UMOV UR16,0x0` / `UMOV UR17,0x14f00000`).
+            # Recording it as a def makes it the terminus last_def() finds, so trace_offset
+            # dead-ends here instead of skipping the UMOV and walking to a STALE UIADD3
+            # (which fabricated bogus offsets like 0x30d96, far outside the param struct).
+            # A register-copy `UMOV URd, URs` is left UNMODELED to preserve prior behavior
+            # (following the copy would redirect legit UTMALDG/UTMASTG chains).
+            operands = split_operands(operand_text)
+            if len(operands) >= 2:
+                dst = first_ureg(operands[0])
+                src = operands[1].strip()
+                if dst is not None:
+                    if re.match(r"-?0x[0-9a-fA-F]+$", src):
+                        defs.append((idx, dst, "umov_const", int(src, 16)))
+                    elif src in ("URZ", "RZ", "-URZ"):
+                        defs.append((idx, dst, "umov_const", 0))
+            continue
         if opcode.startswith("UIADD3"):
             operands = split_operands(operand_text)
             if not operands:
@@ -201,6 +219,14 @@ def trace_offset(defs, reg, before_idx, depth=0, max_depth=DEFAULT_MAX_DEPTH, ch
         if chain is not None:
             chain.append(f"UR{reg} <- ULDC c[0x0][0x{info:x}]")
         return (info, 0)
+    if kind == "umov_const":
+        # Terminal compile-time constant (not a param-base pointer). This is a genuine
+        # dead-end: the register holds an immediate (e.g. UBLKRED bare handle), so there
+        # is NO tensormap offset here. Returning None stops the walk from continuing to an
+        # older, unrelated UIADD3 def of the same register and fabricating an offset.
+        if chain is not None:
+            chain.append(f"UR{reg} <- UMOV 0x{info:x} (const dead-end)")
+        return None
     if kind == "uiadd":
         src, imm, extra_reg_count = info
         if chain is not None:
@@ -241,6 +267,38 @@ def build_consumers_for_uid_match(function):
 
 def uid_key(uid, fname):
     return str(uid) if uid is not None else fname
+
+
+def load_struct_sizes(extra_info_dir: Path):
+    """(uid -> by-value params-struct size in bytes) from tma_launch_param_dump.csv.
+
+    A valid tensormap offset must land INSIDE this struct: the by-value CUtensorMap args
+    live at param_offset..param_offset+arg_size within the kernel param block, so any
+    resolved offset >= struct_size is a def-chain fabrication (e.g. 0x30d96 for uid8 whose
+    struct is only 0x700). Size per uid = max(param_offset + arg_size) over its rows.
+    Returns {} if the CSV is absent (guard then becomes a no-op)."""
+    import csv as _csv
+    sizes = {}
+    path = extra_info_dir / "tma_launch_param_dump.csv"
+    if not path.exists():
+        return sizes
+    try:
+        with path.open(newline="") as fh:
+            for row in _csv.DictReader(fh):
+                uid = row.get("unique_function_id")
+                if uid is None:
+                    continue
+                try:
+                    off = int(str(row.get("param_offset_hex", "0")), 0)
+                    sz = int(str(row.get("arg_size", "0")), 0)
+                except ValueError:
+                    continue
+                end = off + sz
+                if uid not in sizes or end > sizes[uid]:
+                    sizes[uid] = end
+    except OSError:
+        return {}
+    return sizes
 
 
 def load_executed_sites(extra_info_dir: Path):
@@ -320,6 +378,7 @@ def extract_offsets(extra_info_dir: Path, max_depth: int,
     cbank_index_counts = defaultdict(int)
     offsets_by_function = defaultdict(set)
     executed_sites = load_executed_sites(extra_info_dir)
+    struct_sizes = load_struct_sizes(extra_info_dir)
 
     for function in functions_by_name.values():
         instructions = function["instructions"]
@@ -446,11 +505,22 @@ def extract_offsets(extra_info_dir: Path, max_depth: int,
             # cbank index. Chains that terminate at a DIFFERENT cbank slot (e.g.
             # c[0x0][0x0]) are real but are not tensormap-in-param descriptors, so
             # they must not pollute the descriptor offset set.
-            if cbank_index == param_base_cbank_index:
-                record["resolved"] = True
-                offsets_by_function[uid_key(uid, fname)].add(tensormap_offset)
-            else:
+            if cbank_index != param_base_cbank_index:
                 record["reason"] = "reached_non_param_base_cbank"
+                sites.append(record)
+                continue
+            # STRUCT-BOUNDS GUARD: the by-value CUtensorMap descriptors sit inside the
+            # kernel param struct (offset < struct_size). An offset >= struct_size is a
+            # def-chain fabrication (self-accumulating UIADD3 producing e.g. 0x30d96 while
+            # uid8's struct is 0x700) and must NOT count as resolved. When struct_size is
+            # unknown (CSV absent) the guard is skipped so behavior is unchanged.
+            struct_size = struct_sizes.get(str(uid)) if uid is not None else None
+            if struct_size is not None and not (0 <= tensormap_offset < struct_size):
+                record["reason"] = "offset_outside_param_struct"
+                sites.append(record)
+                continue
+            record["resolved"] = True
+            offsets_by_function[uid_key(uid, fname)].add(tensormap_offset)
             sites.append(record)
 
     dominant_cbank = None
@@ -464,7 +534,7 @@ def extract_offsets(extra_info_dir: Path, max_depth: int,
         ex = [s for s in sites if s.get("executed")]
         by_family = defaultdict(lambda: {"executed": 0, "resolved": 0,
                                          "non_param_cbank": 0, "no_cbank": 0,
-                                         "ambiguous": 0})
+                                         "ambiguous": 0, "outside_struct": 0})
         # Per-uid resolution: this trace has BOTH fwd and bwd kernels, so split by uid
         # to see which executed kernel is 100% clean (fwd) vs mixed (bwd).
         by_uid = defaultdict(lambda: {"executed": 0, "resolved": 0})
@@ -483,6 +553,8 @@ def extract_offsets(extra_info_dir: Path, max_depth: int,
                 b["no_cbank"] += 1
             elif s["reason"] == "ambiguous_multisource_uiadd3":
                 b["ambiguous"] += 1
+            elif s["reason"] == "offset_outside_param_struct":
+                b["outside_struct"] += 1
         for u in by_uid.values():
             u["pct"] = round(100.0 * u["resolved"] / max(1, u["executed"]), 1)
         executed_stats = {

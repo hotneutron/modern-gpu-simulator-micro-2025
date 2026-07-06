@@ -73,7 +73,53 @@ def parse_operands_from_text(opcode: str, text: str):
     return parsed
 
 
+def config_id_from_base_map_entry(entry):
+    """Derive the config_id (same scheme as build_tma_descriptor_mapping) from the full
+    descriptor fields carried in the base map, so operand entries link to the existing
+    tma_descriptor_configs.json without the handle_hi resolver."""
+    box = "x".join(str(v) for v in entry.get("box_dim", []))
+    return f"tm_r{entry.get('tensor_rank')}_dt{entry.get('tensor_data_type')}_box_{box}"
+
+
 def load_descriptor_refs(extra_info_dir: Path):
+    """Descriptor bindings per (uid, pc, opcode), sourced from the EXACT (uid,pc) base
+    map (tma_pc_base_map.json) instead of the retired handle_hi heuristic resolver.
+
+    Each base-map entry already carries base + full descriptor fields for the precise
+    site, so this yields exactly the sites that are truly descriptor-addressed
+    (UTMALDG/UTMASTG/UTMACCTL.PF). UBLKRED is intentionally absent (it is operand/raw-
+    pointer addressed, proven by the 0/9 in-struct diagnostic), so it correctly falls
+    back to the bulk operand form. Falls back to the old resolver only if the base map
+    is missing, for backward compatibility."""
+    base_map_path = extra_info_dir / "tma_pc_base_map.json"
+    if base_map_path.exists():
+        return _load_descriptor_refs_from_base_map(base_map_path)
+    return _load_descriptor_refs_from_resolver(extra_info_dir)
+
+
+def _load_descriptor_refs_from_base_map(path: Path):
+    data = json.loads(path.read_text())
+    mapping = {}
+    for key_str, entry in data.get("map", {}).items():
+        if entry.get("operand_addressed"):
+            continue  # not tensormap-addressed (e.g. UBLKRED)
+        uid_str, _, pc_hex = key_str.partition(":")
+        try:
+            uid = int(uid_str)
+        except ValueError:
+            uid = uid_str
+        config_id = config_id_from_base_map_entry(entry)
+        # opcode is unknown here; key on opcode=None and match by (uid, pc) downstream.
+        mapping[(uid, pc_hex, None)] = {
+            "config_ids": [config_id],
+            "desc_reg_ids": [],
+            "base_hex": entry.get("base_hex"),
+            "source": entry.get("source"),
+        }
+    return mapping
+
+
+def _load_descriptor_refs_from_resolver(extra_info_dir: Path):
     path = extra_info_dir / "tma_descriptor_resolver.json"
     if not path.exists():
       return {}
@@ -97,6 +143,34 @@ def load_descriptor_refs(extra_info_dir: Path):
             "desc_reg_ids": sorted(value["desc_reg_ids"]),
         }
     return normalized
+
+
+def lookup_descriptor_ref(descriptor_refs, resolved_uid, entry):
+    """Find a descriptor binding for a discovery site.
+
+    Base-map bindings are keyed (uid, pc, None) — opcode-agnostic but uid-SPECIFIC. They
+    must be matched by exact (uid, pc): pcs repeat across kernels, so a pc-only match
+    would attach one kernel's descriptor to a different kernel's instruction. Legacy
+    resolver bindings are keyed (uid, pc, opcode); for backward compat those still allow
+    the historical pc+opcode fallback (opcode disambiguates them)."""
+    pc_hex = entry["pc_hex"]
+    opcode = entry["opcode"]
+    for uid in (resolved_uid, entry.get("unique_function_id")):
+        if uid is None:
+            continue
+        hit = descriptor_refs.get((uid, pc_hex, opcode))  # legacy exact
+        if hit is not None:
+            return hit
+        hit = descriptor_refs.get((uid, pc_hex, None))     # base-map exact (uid,pc)
+        if hit is not None:
+            return hit
+    # Legacy-only fallback: discovery uid unknown, match by pc+opcode. Restricted to keyed
+    # opcodes (op == opcode); base-map (op is None) is deliberately excluded here to avoid
+    # cross-kernel pc collisions.
+    for (ufid, pc, op), value in descriptor_refs.items():
+        if op is not None and pc == pc_hex and op == opcode:
+            return value
+    return None
 
 
 def build_function_descriptor_index(descriptor_refs):
@@ -668,16 +742,9 @@ def build_resolver(extra_info_dir: Path):
             unique_function_ids = sorted({matched_key[0] for matched_key in matched_runtime_keys if matched_key[0] is not None})
             if len(unique_function_ids) == 1:
                 resolved_unique_function_id = unique_function_ids[0]
-        descriptor_ref = descriptor_refs.get(key)
-        if descriptor_ref is None and entry["unique_function_id"] is None:
-            descriptor_ref = next(
-                (
-                    value
-                    for (ufid, pc, op), value in descriptor_refs.items()
-                    if pc == entry["pc_hex"] and op == entry["opcode"]
-                ),
-                None,
-            )
+        descriptor_ref = lookup_descriptor_ref(
+            descriptor_refs, resolved_unique_function_id, entry
+        )
         inferred_operand_kinds = infer_operand_kinds({
             "opcode": entry["opcode"],
             "operands": operands,

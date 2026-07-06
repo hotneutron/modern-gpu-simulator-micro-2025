@@ -336,20 +336,19 @@ def main():
         action="store_true",
         help="Fail if any executed descriptor runtime site lacks a unique config_id",
     )
+    parser.add_argument(
+        "--configs-only",
+        action="store_true",
+        help="Emit only tma_descriptor_configs.json (box_dim/strides/swizzle, still "
+             "needed by the simulator) and SKIP the handle_hi->config_id resolver. Use "
+             "once the exact (uid,pc) base map supersedes the handle_hi heuristic.",
+    )
     args = parser.parse_args()
 
     extra_info_dir = args.extra_info_dir
     tensor_rows, configs = load_tensor_map_configs(extra_info_dir)
-    runtime_groups = load_runtime_groups(extra_info_dir)
-    pc_opcode_map = load_pc_opcode_map(extra_info_dir)
-    handle_map_by_rank = derive_handle_family_map_by_rank(configs, runtime_groups, pc_opcode_map)
-    resolver = build_resolver_entries(runtime_groups, handle_map_by_rank, configs, pc_opcode_map)
-    if args.fail_on_missing_binding:
-        verify_executed_bindings_or_fail(resolver)
 
     configs_out = args.configs_out or (extra_info_dir / "tma_descriptor_configs.json")
-    resolver_out = args.resolver_out or (extra_info_dir / "tma_descriptor_resolver.json")
-
     write_json(configs_out, {
         "version": 1,
         "source": {
@@ -358,6 +357,21 @@ def main():
         },
         "configs": configs,
     })
+
+    if args.configs_only:
+        # The handle_hi heuristic resolver is intentionally NOT built; the exact
+        # (uid,pc) base map (build_tma_pc_base_map.py) provides base + all descriptor
+        # fields per site instead.
+        return
+
+    runtime_groups = load_runtime_groups(extra_info_dir)
+    pc_opcode_map = load_pc_opcode_map(extra_info_dir)
+    handle_map_by_rank = derive_handle_family_map_by_rank(configs, runtime_groups, pc_opcode_map)
+    resolver = build_resolver_entries(runtime_groups, handle_map_by_rank, configs, pc_opcode_map)
+    if args.fail_on_missing_binding:
+        verify_executed_bindings_or_fail(resolver)
+
+    resolver_out = args.resolver_out or (extra_info_dir / "tma_descriptor_resolver.json")
     write_json(resolver_out, {
         "version": 1,
         "source": {

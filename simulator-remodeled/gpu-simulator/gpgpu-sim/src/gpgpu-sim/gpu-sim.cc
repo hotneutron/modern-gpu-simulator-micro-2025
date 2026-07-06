@@ -389,6 +389,87 @@ void load_tma_descriptor_configs(const std::filesystem::path &extra_info_dir,
   }
 }
 
+void load_tma_pc_base_map(const std::filesystem::path &extra_info_dir,
+                          TMASidecarMetadataDB &db) {
+  rapidjson::Document doc;
+  if (!load_tma_json_document(extra_info_dir / "tma_pc_base_map.json", doc)) {
+    return;
+  }
+  if (!doc.HasMember("map") || !doc["map"].IsObject()) {
+    return;
+  }
+  for (auto it = doc["map"].MemberBegin(); it != doc["map"].MemberEnd(); ++it) {
+    // Key format is "uid:pc_hex" (e.g. "8:0x90a0"). Split on ':'.
+    std::string key = it->name.GetString();
+    std::string::size_type colon = key.find(':');
+    if (colon == std::string::npos) {
+      continue;
+    }
+    unsigned int unique_function_id = static_cast<unsigned int>(
+        std::strtoul(key.substr(0, colon).c_str(), nullptr, 0));
+    uint64_t pc = std::strtoull(key.substr(colon + 1).c_str(), nullptr, 0);
+    const rapidjson::Value &entry = it->value;
+    if (!entry.IsObject()) {
+      continue;
+    }
+    TMABaseRecord record;
+    if (entry.HasMember("operand_addressed") &&
+        entry["operand_addressed"].IsBool()) {
+      record.operand_addressed = entry["operand_addressed"].GetBool();
+    }
+    if (entry.HasMember("base_hex")) {
+      record.global_base = parse_tma_json_uint(entry["base_hex"]);
+    }
+    // A real static base exists iff this site is tensormap-addressed (not operand-
+    // addressed) and carries a nonzero base.
+    record.has_static_base = !record.operand_addressed && record.global_base != 0;
+    if (entry.HasMember("tensor_rank")) {
+      record.tensor_rank =
+          static_cast<uint32_t>(parse_tma_json_uint(entry["tensor_rank"]));
+    }
+    if (entry.HasMember("tensor_data_type")) {
+      record.tensor_data_type =
+          static_cast<uint32_t>(parse_tma_json_uint(entry["tensor_data_type"]));
+    }
+    if (entry.HasMember("element_size")) {
+      record.element_size =
+          static_cast<uint32_t>(parse_tma_json_uint(entry["element_size"]));
+    }
+    if (entry.HasMember("global_dim")) {
+      fill_tma_u32_array(entry["global_dim"], record.global_dim);
+    }
+    if (entry.HasMember("global_strides")) {
+      fill_tma_u64_array(entry["global_strides"], record.global_strides);
+    }
+    if (entry.HasMember("box_dim")) {
+      fill_tma_u32_array(entry["box_dim"], record.box_dim);
+    }
+    if (entry.HasMember("element_strides")) {
+      fill_tma_u32_array(entry["element_strides"], record.element_strides);
+    }
+    if (entry.HasMember("interleave")) {
+      record.interleave =
+          static_cast<uint32_t>(parse_tma_json_uint(entry["interleave"]));
+    }
+    if (entry.HasMember("swizzle")) {
+      record.swizzle =
+          static_cast<uint32_t>(parse_tma_json_uint(entry["swizzle"]));
+    }
+    if (entry.HasMember("l2_promotion")) {
+      record.l2_promotion =
+          static_cast<uint32_t>(parse_tma_json_uint(entry["l2_promotion"]));
+    }
+    if (entry.HasMember("oob_fill")) {
+      record.oob_fill =
+          static_cast<uint32_t>(parse_tma_json_uint(entry["oob_fill"]));
+    }
+    if (entry.HasMember("source") && entry["source"].IsString()) {
+      record.source = entry["source"].GetString();
+    }
+    db.base_records[TMABaseLookupKey{unique_function_id, pc}] = record;
+  }
+}
+
 void load_tma_descriptor_resolver(const std::filesystem::path &extra_info_dir,
                                   TMASidecarMetadataDB &db) {
   rapidjson::Document doc;
@@ -627,16 +708,40 @@ void gpgpu_sim::parse_extra_trace_info(std::string filepath, bool is_extra_trace
     std::filesystem::path metadata_path(filepath);
     std::filesystem::path extra_info_dir = metadata_path.parent_path();
     load_tma_descriptor_configs(extra_info_dir, m_tma_sidecar_db);
+    load_tma_pc_base_map(extra_info_dir, m_tma_sidecar_db);
     load_tma_descriptor_resolver(extra_info_dir, m_tma_sidecar_db);
     load_tma_operand_resolver(extra_info_dir, m_tma_sidecar_db);
     load_sync_operand_resolver(extra_info_dir, m_sync_sidecar_db);
-    if (m_shader_config->sync_debug_enable) {
+    // BASE-MAP LOAD-FAILURE ASSERT: when real-base addressing is requested, an empty
+    // base_records map means tma_pc_base_map.json was missing, unparsable, or had no
+    // descriptor sites. Every descriptor op would then hit the missing-map assert in
+    // build_tma_command. Fail here, before the kernel runs, with the expected path so a
+    // 12h run is not wasted on a file-path / pipeline gap.
+    if (m_shader_config->tma_real_base_addr_enable &&
+        m_tma_sidecar_db.base_records.empty()) {
+      std::filesystem::path base_map_path =
+          extra_info_dir / "tma_pc_base_map.json";
+      std::cerr << "[TMA][RealBase][FATAL] -tma_real_base_addr_enable is set but no base "
+                << "records loaded from " << base_map_path.string()
+                << " (exists=" << (std::filesystem::exists(base_map_path) ? 1 : 0)
+                << "). Run build_tma_pc_base_map.py in the trace pipeline first."
+                << std::endl;
+      assert(false &&
+             "tma_real_base_addr_enable set but tma_pc_base_map.json produced no base "
+             "records");
+    }
+    if (m_shader_config->sync_debug_enable ||
+        m_shader_config->tma_real_base_addr_enable) {
       std::cerr << "[TMA][Phase2] loaded descriptor_configs="
                 << m_tma_sidecar_db.descriptor_configs.size()
                 << " descriptor_sites="
                 << m_tma_sidecar_db.descriptor_site_records.size()
                 << " operand_sites="
-                << m_tma_sidecar_db.operand_site_records.size() << std::endl;
+                << m_tma_sidecar_db.operand_site_records.size()
+                << " base_records="
+                << m_tma_sidecar_db.base_records.size() << std::endl;
+    }
+    if (m_shader_config->sync_debug_enable) {
       std::cerr << "[SYNC] loaded operand_sites="
                 << m_sync_sidecar_db.site_records.size() << std::endl;
     }
@@ -698,6 +803,18 @@ bool gpgpu_sim::lookup_tma_site_metadata(unsigned int unique_function_id,
     }
   }
   return metadata.valid;
+}
+
+bool gpgpu_sim::lookup_tma_base_record(unsigned int unique_function_id,
+                                       address_type pc,
+                                       TMABaseRecord &record) const {
+  auto it = m_tma_sidecar_db.base_records.find(
+      TMABaseLookupKey{unique_function_id, static_cast<uint64_t>(pc)});
+  if (it == m_tma_sidecar_db.base_records.end()) {
+    return false;
+  }
+  record = it->second;
+  return true;
 }
 
 bool gpgpu_sim::lookup_sync_site_metadata(unsigned int unique_function_id,
@@ -1897,6 +2014,12 @@ void shader_core_config::reg_options(class OptionParser *opp) {
                          "Maximum number of TMADBG event lines to print per SM when "
                          "tma_debug_enable is set. (default=20000000)",
                          "20000000");
+  option_parser_register(opp, "-tma_real_base_addr_enable", OPT_BOOL,
+                         &tma_real_base_addr_enable,
+                         "Use the exact per-site GMEM base (tma_pc_base_map.json) for TMA "
+                         "transfer addresses instead of the synthetic transfer_uid scheme, "
+                         "so L2 locality matches HW. (default=0)",
+                         "0");
   option_parser_register(opp, "-bar_debug_enable", OPT_BOOL,
                          &bar_debug_enable,
                          "Enable BAR.SYNC / BAR.ARV named-barrier debug logging (BARDBG) "

@@ -883,6 +883,8 @@ class gpgpu_sim : public gpgpu_t {
   bool lookup_tma_site_metadata(unsigned int unique_function_id, address_type pc,
                                 uint32_t handle_hi,
                                 TMAResolvedSiteMetadata &metadata) const;
+  bool lookup_tma_base_record(unsigned int unique_function_id, address_type pc,
+                              TMABaseRecord &record) const;
   bool lookup_sync_site_metadata(unsigned int unique_function_id,
                                  address_type pc,
                                  SyncResolvedSiteMetadata &metadata) const;

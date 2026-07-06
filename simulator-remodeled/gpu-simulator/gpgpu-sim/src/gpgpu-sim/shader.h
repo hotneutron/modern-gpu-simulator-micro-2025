@@ -2236,6 +2236,12 @@ class shader_core_config : public core_config {
   bool tma_debug_enable;
   unsigned int tma_debug_print_budget;
 
+  // Use the exact per-site GMEM base recovered offline (tma_pc_base_map.json) for TMA
+  // transfer addresses instead of the synthetic (transfer_uid<<20) scheme. Makes L2
+  // locality HW-faithful (repeated tensor reads hit). Disabled by default so the
+  // synthetic-address behavior is preserved unless explicitly opted in.
+  bool tma_real_base_addr_enable;
+
   // BAR named-barrier (BAR.SYNC / BAR.ARV) debug logging (BARDBG). Independent of
   // sync_debug_enable / tma_debug_enable so the named-barrier decode + release +
   // end-of-kernel summary can be captured without other log noise. Used for the
