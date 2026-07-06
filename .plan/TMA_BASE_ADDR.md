@@ -1551,3 +1551,43 @@ SASS/offset knowledge at runtime, so it dumps one raw param-region blob per laun
 descriptor at `region[tensormap_offset : +128]` using the 0a offsets. This keeps 0b
 independent of 0a (no chicken-and-egg) and puts all matching logic in one testable
 place.
+
+---
+
+# FINAL PLAN — exact 매핑 통합 & 휴리스틱 제거 (SPIKE 10 이후)
+
+> 상세본: [.trae/documents/TMA_exact_base_mapping_integration.md](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/.trae/documents/TMA_exact_base_mapping_integration.md). 여기는 이 문서만으로 실행 가능한 요약 + 구현 전 감사 결과.
+
+## F.0 확정 사실
+`build_tma_pc_base_map.py`가 `(uid,pc) → exact real base`를 준다. 서버 재검증(M0): **23/23, direct+chain 100%, pool=0, unresolved=0, locality OK**. base는 pool 근사가 아니라 128B descriptor를 바이트 단위로 특정해 얻은 exact 값(qword0). 같은 128B에서 나머지 descriptor 필드도 전부 exact.
+
+## F.1 opcode별 처리 (실제 FA3 트레이스 + SASS로 확정)
+| opcode | base | size | 비고 |
+|---|---|---|---|
+| UTMALDG/UTMASTG | **exact**(런타임 SMEM-window offset→direct/chain→128B qword0) | box_dim×element_size (같은 128B) | M1 대상, 23/23 |
+| UTMACCTL.PF | **exact**(prologue `param_base+off`, `off−0x30`=struct slot) | n/a(control) | **prefetch 모델링용 매핑**(어느 텐서 warm하는지). 6→6 clean. per-pc emit 추가 |
+| UTMAREDG | exact(있으면, UTMALDG 동형) | 동일 | 이 트레이스엔 없음 |
+| **UBLKRED** | **합성 유지**(tensormap 아님) | covered_bytes(operand-3, **정확**) | 실행 사이트 desc=`UMOV`{0,0x14f00000} bare handle, base=raw dQaccum GMEM ptr(`c[0x0][0x280]/0x2a0`)+동적 offset. extractor offset은 UMOV 미모델 false-positive. base 정확화=M2.5 |
+| UBLKCP | 합성/operand | covered_bytes | desc_valid=false, tensormap 미참조 |
+| UTMAPF | — | — | **bwd 커널에 없음(count=0)**. 3단계 체인 아님 |
+| UTMACMDFLUSH | — | — | control, data req 없음 |
+
+**통일 규칙:** base map 대상 = struct 128B tensormap에 닿는 site(UTMALDG/UTMASTG/UTMACCTL.PF)만 exact. UBLKRED/UBLKCP는 tensormap이 아니라 raw GMEM ptr → base 합성, size(covered_bytes)만 정확. **extractor는 `UMOV` 모델링 + struct-bounds 가드를 추가**해 UBLKRED 가짜 offset(0x30d96, struct 0x700 밖)을 제거.
+
+## F.2 handle_hi가 공급하던 **전 필드**를 exact로 교체
+handle_hi→config_id가 붙이던 `TMADescriptorConfigMetadata` 11필드(rank,dtype,global_dim,global_strides,box_dim,element_strides,interleave,swizzle,l2_promotion,oob_fill,element_size)는 전부 128B descriptor 안 → `tensor_map_encode_dump.csv`에 이미 컬럼으로 존재(검증). struct discovery가 (uid,pc)→매칭 encode row를 특정하므로 그 row에서 11필드를 그대로 읽어 base map 엔트리에 동봉. handle_hi/config_id 불필요.
+
+## F.3 마일스톤
+- **M0**(완료): 23/23 재검증 + UBLKRED/UTMACCTL SASS 규명.
+- **M1**: (Python) `extract_tma_descriptor_offsets.py`에 UMOV 모델링+struct-bounds 가드; `build_tma_pc_base_map.py`에 UTMACCTL.PF per-pc emit + 전 descriptor 필드 동봉 + strict gate. (C++) `TMABaseRecord`/loader/`build_tma_command` lookup/`mover` 주입 + flag `-tma_real_base_addr_enable`. **UTMALDG/UTMASTG/UTMACCTL.PF만 real base**, UBLKRED/UBLKCP 합성. size는 base map 값과 기존 config_id 값 **교차검증(requests_total 동일)**.
+- **M2**: coords 캡처(tracer 미니-스파이크) → `addr=base+Σcoord·stride`.
+- **M2.5**: UBLKRED base 정확화 — **tensormap 아님**이 확정됐으므로 `desc handle→struct` 경로가 아니라 **raw-pointer 1-level deref**(`c[0x0][0x280]/0x2a0`의 dQaccum base) + 동적 tile coords 필요. 정적 매핑 불가(증명됨).
+- **M3**: 교차검증 통과 후 handle_hi/resolver 제거.
+
+## F.4 구현 전 감사 결과 (BLOCKER/WARN)
+- **[BLOCKER→해소] UBLKRED는 tensormap descriptor op가 아님.** 실행 사이트 desc=`UMOV`{0,0x14f00000} bare handle, base=raw dQaccum GMEM ptr(`c[0x0][0x280]/0x2a0`)+동적 offset. (내가 분석했던 0x61d0은 dead code, executed=False.) extractor의 offset(0x30d96)은 UMOV 미모델 false-positive(struct 0x700 밖). → M1 base 제외·합성 유지, size(covered_bytes)만 정확. UMOV 모델링+struct-bounds 가드로 extractor 수정.
+- **[BLOCKER-M3] 제거 순서.** `config_id`는 현재 size 공급원([tma_unit_sm.cc:374-387](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/tma_unit_sm.cc#L374)); Phase-2 assert([:415-459](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/tma_unit_sm.cc#L415))가 `!config_id.empty()`/`total_bytes>0` 강제. base map sizing 교차검증 **전 제거 금지**(안 그러면 전 descriptor op crash).
+- **[WARN] M1 locality 과대.** coord 오프셋 없어 같은 텐서 tile이 같은 주소로 붕괴 → L2 hit 과대(correctness 안전). M2에서 해소. M1 판정은 "합성 핫스팟 소멸+HW 방향"만.
+- **[WARN] operand 주소 읽기(M2.5)**: `get_addr(0)` assert 주의 → `get_per_scalar_thread_valid()` 가드 + `get_first_addr_valid()`. memref 순서 opcode별 실측 필요.
+- **[OK]** response 매칭은 mf 포인터 키라 agu_base 변경 무관([:736](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/tma_unit_sm.cc#L736)); pc==pc_hex 확정; flag는 `tma_debug_enable` 패턴.
+- **[M3 보완]** handle_hi 제거 시 stats/log 튜플 3번째 요소([tma_unit_sm.cc](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/tma_unit_sm.cc#L165) :165-167,:201-204,:210,:264-267)와 `TMAResolvedSiteMetadata.handle_hi`, `lookup_tma_site_metadata` 시그니처도 함께 수정.
