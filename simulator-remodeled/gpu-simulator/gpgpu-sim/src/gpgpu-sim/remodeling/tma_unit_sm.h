@@ -60,6 +60,13 @@ class tma_unit_sm : public functional_unit_shared_sm_part {
   std::unordered_map<mem_fetch *, uint64_t> m_outstanding_requests;
   uint64_t m_next_transfer_uid = 1;
 
+  // M2 (visit-counter tile spread): per-tensor (keyed by real global_base) count of
+  // descriptor transfers seen so far. build_tma_command uses count % num_tiles to pick
+  // the tile this transfer targets, spreading transfers across the tensor's tiles so
+  // first-touch cold misses reappear (base-only collapses all tiles to one address).
+  // mutable: build_tma_command is const but must advance the counter per transfer.
+  mutable std::unordered_map<uint64_t, uint64_t> m_tensor_visit_count;
+
   // Per-warp count of store-class transfers (UTMASTG / UTMAREDG / UBLKRED) that
   // have been enqueued but not yet completed. Incremented when a store-class
   // command is enqueued, decremented when its data movement completes. Drives

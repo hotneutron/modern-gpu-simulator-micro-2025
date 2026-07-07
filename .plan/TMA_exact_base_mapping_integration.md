@@ -141,6 +141,38 @@ Key constraint: `mover_issue_requests` ([tma_unit_sm.cc:578](file:///Users/byted
 ### M2 — coordinates (later, needs a tracer mini-spike)
 per-transfer coords are not captured today (§0). To complete `addr = base + Σ coord·stride`, add coord capture + combine with `element_stride[]` (already carried in the base map in M1). UBLKRED needs no coords (operand_addressed).
 
+## M1 verification results (FA3 fwd K5 + bwd K10, real-base flag on) — DONE
+
+Both kernels ran to completion with `-tma_real_base_addr_enable 1` (+ debug on), **no assert/crash**, size cross-check passed, base map loaded (`base_records=33`). Real-base coverage is exactly as designed:
+
+| kernel | uid | real_base coverage | L2_TMA_true_hit_rate | HW target |
+|---|---|---|---|---|
+| fwd K5 | 3 | UTMALDG 9 / UTMASTG 1 / UTMAPF 1 = 100%; synthetic = 0 | **0.9972** | ~0.70 |
+| bwd K10 | 8 | UTMALDG 10 / UTMASTG 2 = 100%; UBLKRED 6 = synthetic (operand_addressed) | **0.9785** | ~0.82 |
+
+**Base mapping is correct** (asserts would have caught any gap). The hit-rate over-estimation is the **predicted M1 limitation** (§ "locality over-estimation"): no coord offset yet.
+
+**Root cause confirmed by first-request address analysis (both kernels):** real-base descriptor tensors collapse to **one address per tensor** because `agu_base = global_base + agu_index*128` has no tile coordinate (`agu_index` is the 0..requests_total-1 index *within one transfer*, identical across transfers).
+- fwd K5: 5112 UTMALDG transfers → **2 distinct addresses** (K base, V base). The whole 6 MB tensor's 384 tiles collapse to the first 16 KB tile → 383 tiles' cold misses vanish → 0.9972.
+- bwd K10: family=0 (UTMALDG) 7293 transfers → **3 distinct addr**; family=2 (UTMASTG) 768 → **2 distinct addr**; UBLKRED (synthetic, `transfer_uid<<20`) → **~226 distinct addr**. Ironically the synthetic UBLKRED *scatters* and creates the misses that pull bwd (0.9785) below fwd, while the real-base UTMALDG over-hits from tile collapse.
+
+**Key sizing fact (decides M2):** a K/V tensor is `global_dim=[64,2048,24,1]`, tile `box=[64,128]`, element 2B → tensor = **6 MB**, **384 tiles** of 16 KB (128 lines each), 49152 lines total. L2 = **50 MB ≫ 6 MB**, so once loaded the whole tensor stays resident; repeated-tile revisits *should* hit. The missing misses are the **cold miss of first-touch across the 384 distinct tiles**, which the collapse erases.
+
+## M2 chosen approach — A: visit-counter tile spread (decided, this is what we implement)
+
+We evaluated two ways to add coords without a common trace field (coords are NOT in the trace, §0):
+- **A (chosen): visit-counter tile spread.** Keep a per-tensor (keyed by `global_base`) monotonic visit counter in the TMA unit. For each descriptor transfer compute `tile_idx = counter % num_tiles`, where `num_tiles = ⌈tensor_bytes / tile_bytes⌉` from the descriptor (`global_dim`·element_size / `box_dim`·element_size). Address becomes `agu_base = global_base + tile_idx*tile_bytes + agu_index*128`. This spreads transfers across all `num_tiles` tiles → the cold-miss of first-touch is restored (≈ `num_tiles` cold misses per tensor), while repeated visits to the same tile still hit. Deterministic; needs **no tracer change, no trace regen** — simulator-only, flag-gated.
+- **B (rejected for now): stride-based coord reconstruction.** Map `cta_x` to the seq axis and the inner-loop iteration to another axis, then `addr = base + Σ coord·stride`. More structural but requires guessing the FA3 tile scheduler's CTA→tile assignment, which is not in the trace and easy to get wrong.
+
+**Why A is sound:** what L2 realism depends on is *how many distinct tiles are touched and revisited*, not the exact HW tile order. A produces the correct count of distinct tiles (`num_tiles`) and preserves same-tile reuse. The `% num_tiles` wrap is a deterministic approximation of the real schedule, not the real schedule.
+
+**A — design details:**
+- Only applies to descriptor sites with a real base (`has_real_base`, i.e. UTMALDG/UTMASTG/UTMAPF/UTMAREDG). UBLKRED/UBLKCP keep the synthetic path (operand_addressed) — unchanged.
+- `num_tiles` and `tile_bytes` are derived from the base-map descriptor already carried in `TMACommand` (box_dim, element_size, global_dim). Carry them into `TMACommand`/`TMABaseRecord` if not already present.
+- The visit counter is per `global_base` (per tensor), stored in the `tma_unit_sm` instance (a `std::unordered_map<uint64_t,uint64_t>`). Incremented once per enqueued descriptor transfer, read in `build_tma_command` (or at enqueue) so `tile_idx` is fixed per transfer and carried to the mover in `TMACommand`.
+- Gate behind the existing `-tma_real_base_addr_enable` (M2 is the coord half of the same feature). Optionally add `-tma_real_coords_enable` if we want base-only vs base+coords A/B; default to combined.
+- Verification: rerun fwd K5 + bwd K10. Expect `L2_TMA_true_hit_rate` to drop from ~0.99 toward the HW direction (fwd 0.70 / bwd 0.82) as the 384-tile cold misses reappear. Judge by direction, not exact match (the wrap is an approximation).
+
 ### M3 — remove heuristics (after M1 verified)
 - Python: delete the resolver heuristic functions in `build_tma_descriptor_mapping.py` (`derive_handle_family_map_by_rank`, etc.) and the `tma_descriptor_resolver.json` write; keep only config emission.
 - C++: remove handle_hi from `TMADescriptorLookupKey`; delete `load_tma_descriptor_resolver` ([gpu-sim.cc:392](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/gpu-sim.cc#L392)); drop the handle_hi arg from `lookup_tma_site_metadata`; remove the `inst.tma_handle_hi` path ([tma_unit_sm.cc:370](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/tma_unit_sm.cc#L370), [trace_driven.cc:399](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/trace-driven/trace_driven.cc#L399)). **Since size has moved to the base map** (replace the config_id-based total_bytes/requests_total in [build_tma_command](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/tma_unit_sm.cc#L384) with base-map-based), the config_id dependency can be removed.

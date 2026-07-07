@@ -302,6 +302,12 @@ struct TMACommand {
   // build_tma_command where (uid,pc) is still known; carried to mover_issue_requests.
   uint64_t global_base = 0;
   bool has_real_base = false;
+  // M2 (visit-counter tile spread): per-tensor tile this transfer targets, so the
+  // mover adds tile_idx*tile_bytes to spread transfers across the tensor's tiles
+  // (restores the cold-miss of first-touch that base-only collapses away). Set in
+  // build_tma_command from the per-base visit counter; only meaningful when
+  // has_real_base is true. tile_bytes = Πbox_dim·element_size (one tile's byte span).
+  uint64_t tile_offset_bytes = 0;
 };
 
 struct TMATransferEntry {

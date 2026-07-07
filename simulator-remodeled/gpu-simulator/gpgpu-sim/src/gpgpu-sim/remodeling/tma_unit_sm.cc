@@ -482,6 +482,33 @@ TMACommand tma_unit_sm::build_tma_command(const warp_inst_t &inst) const {
       assert((cmd.requests_total == 0 ||
               base_requests_total == cmd.requests_total) &&
              "real-base requests_total must match config_id path (size cross-check)");
+      // M2 (visit-counter tile spread): base-only collapses every transfer of a tensor
+      // to global_base+agu_index*128 (one 16KB tile), erasing the cold miss of the
+      // tensor's other tiles. Spread transfers across all tiles: tile_bytes = one box
+      // (=base_total_bytes), tensor_bytes = Πglobal_dim·element_size, num_tiles =
+      // ⌈tensor_bytes/tile_bytes⌉. The per-tensor visit counter picks tile_idx =
+      // count % num_tiles so repeated visits to the same tile still hit while distinct
+      // tiles occupy distinct L2 lines. Deterministic approximation of the real
+      // schedule (coords are not in the trace).
+      uint64_t tile_bytes = base_total_bytes;  // Πbox_dim · element_size
+      if (tile_bytes > 0) {
+        uint64_t tensor_elems = 1;
+        bool has_extent = false;
+        for (uint32_t d : base_record.global_dim) {
+          if (d == 0) continue;
+          tensor_elems *= d;
+          has_extent = true;
+        }
+        uint64_t tensor_bytes =
+            has_extent ? tensor_elems * base_record.element_size : 0;
+        uint64_t num_tiles =
+            tensor_bytes > 0 ? (tensor_bytes + tile_bytes - 1) / tile_bytes : 1;
+        if (num_tiles == 0) num_tiles = 1;
+        uint64_t &visit = m_tensor_visit_count[base_record.global_base];
+        uint64_t tile_idx = visit % num_tiles;
+        ++visit;
+        cmd.tile_offset_bytes = tile_idx * tile_bytes;
+      }
     } else if (tma_family_requires_descriptor(cmd.opcode_family)) {
       // MISSING-MAP ASSERT: a descriptor-required op (UTMALDG/UTMASTG/UTMAPF/
       // UTMAREDG) must have an exact base when the flag is on. UBLKRED/UBLKCP are
@@ -718,13 +745,16 @@ void tma_unit_sm::mover_issue_requests(TMATransferEntry &entry,
     uint32_t agu_index = sector_unit / SECTOR_CHUNCK_SIZE;
 
     // GMEM base for this 128B AGU request. When the exact per-site base is available
-    // (build_tma_command set has_real_base from tma_pc_base_map.json), use it so the
-    // same tensor's repeated tiles resolve to overlapping L2 lines exactly as on HW.
+    // (build_tma_command set has_real_base from tma_pc_base_map.json), use it plus the
+    // M2 per-transfer tile offset (tile_offset_bytes) so different tiles of the same
+    // tensor land in different L2 lines while same-tile revisits still hit. Without the
+    // tile offset every transfer would collapse to the tensor's first tile (base-only).
     // Otherwise fall back to the synthetic, deterministic per-transfer range that only
     // exercises memory-hierarchy timing (the trace lacked the descriptor base).
     new_addr_type agu_base =
         entry.cmd.has_real_base
             ? (static_cast<new_addr_type>(entry.cmd.global_base) +
+               static_cast<new_addr_type>(entry.cmd.tile_offset_bytes) +
                static_cast<new_addr_type>(agu_index) * MAX_MEMORY_ACCESS_SIZE)
             : ((static_cast<new_addr_type>(entry.transfer_uid) << 20) +
                (static_cast<new_addr_type>(agu_index) * MAX_MEMORY_ACCESS_SIZE));
