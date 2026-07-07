@@ -1633,7 +1633,7 @@ void nvbit_at_init() {
   GET_VAR_INT(incremental_flush_threshold, "INCREMENTAL_FLUSH_THRESHOLD", 0,
               "Flush threadblocks to disk when instruction count exceeds this threshold. "
               "0 = disabled (default). Recommended: 50000-100000 for large kernels.");
-  GET_VAR_INT(enable_tma_desc, "ENABLE_TMA_DESC", 0,
+  GET_VAR_INT(enable_tma_desc, "ENABLE_TMA_DESC", 1,
               "Enable TMA descriptor capture, including runtime desc handle debug and tensor-map descriptor dumps.");
   GET_VAR_INT(aux_htod_dump_max_bytes, "AUX_HTOD_DUMP_MAX_BYTES", 4096,
               "Maximum auxiliary HtoD memcpy payload size to dump when ENABLE_TMA_DESC is enabled.");
