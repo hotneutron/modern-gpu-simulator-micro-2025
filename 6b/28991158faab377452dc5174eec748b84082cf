@@ -1,0 +1,226 @@
+simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/tma_unit_sm.cc
+  s_2ddd4a870b9e30::t_0f72ef6c7ef6ee 748-751,757 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a4d3a293fe12cb0643f3111","tool_type":"agent","tool_id":"Edit","line_ranges":[{"Range":[748,751]},{"Single":757}]}]}
+  s_2ddd4a870b9e30::t_b7a1d304d62a8c 485-511 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a4d3a003fe12cb0643f3108","tool_type":"agent","tool_id":"Edit","line_ranges":[{"Range":[485,511]}]}]}
+simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/tma_types.h
+  s_2ddd4a870b9e30::t_b85bad685f4bb2 305-310 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a4d399e3fe12cb0643f30f9","tool_type":"agent","tool_id":"Edit","line_ranges":[{"Range":[305,310]}]}]}
+.plan/TMA_exact_base_mapping_integration.md
+  s_2ddd4a870b9e30::t_b351e15a30a2e1 144-175 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a4d39503fe12cb0643f30f3","tool_type":"agent","tool_id":"Edit","line_ranges":[{"Range":[144,175]}]}]}
+simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/tma_unit_sm.h
+  s_2ddd4a870b9e30::t_ad6d5543fb7c3b 63-69 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a4d39af3fe12cb0643f30fc","tool_type":"agent","tool_id":"Edit","line_ranges":[{"Range":[63,69]}]}]}
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "6b28991158faab377452dc5174eec748b84082cf",
+  "prompts": {},
+  "humans": {
+    "h_35c34d310c0197": {
+      "author": "Jihyun Ryoo <jihyun.ryoo@bytedance.com>"
+    }
+  },
+  "sessions": {
+    "s_2ddd4a870b9e30": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6a458cba3fe12cb0643f21e8",
+        "model": "openrouter-3o__max"
+      },
+      "human_author": "Jihyun Ryoo <jihyun.ryoo@bytedance.com>"
+    }
+  },
+  "attestation_metadata": {
+    ".plan/TMA_exact_base_mapping_integration.md": [
+      {
+        "hash": "s_2ddd4a870b9e30::t_b351e15a30a2e1",
+        "line_ranges": [
+          {
+            "Range": [
+              144,
+              175
+            ]
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a4d39503fe12cb0643f30f3",
+            "tool_type": "agent",
+            "tool_id": "Edit",
+            "line_ranges": [
+              {
+                "Range": [
+                  144,
+                  175
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/tma_types.h": [
+      {
+        "hash": "s_2ddd4a870b9e30::t_b85bad685f4bb2",
+        "line_ranges": [
+          {
+            "Range": [
+              305,
+              310
+            ]
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a4d399e3fe12cb0643f30f9",
+            "tool_type": "agent",
+            "tool_id": "Edit",
+            "line_ranges": [
+              {
+                "Range": [
+                  305,
+                  310
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/tma_unit_sm.cc": [
+      {
+        "hash": "s_2ddd4a870b9e30::t_0f72ef6c7ef6ee",
+        "line_ranges": [
+          {
+            "Range": [
+              748,
+              751
+            ]
+          },
+          {
+            "Single": 757
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a4d3a293fe12cb0643f3111",
+            "tool_type": "agent",
+            "tool_id": "Edit",
+            "line_ranges": [
+              {
+                "Range": [
+                  748,
+                  751
+                ]
+              },
+              {
+                "Single": 757
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "hash": "s_2ddd4a870b9e30::t_b7a1d304d62a8c",
+        "line_ranges": [
+          {
+            "Range": [
+              485,
+              511
+            ]
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a4d3a003fe12cb0643f3108",
+            "tool_type": "agent",
+            "tool_id": "Edit",
+            "line_ranges": [
+              {
+                "Range": [
+                  485,
+                  511
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/tma_unit_sm.h": [
+      {
+        "hash": "s_2ddd4a870b9e30::t_ad6d5543fb7c3b",
+        "line_ranges": [
+          {
+            "Range": [
+              63,
+              69
+            ]
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a4d39af3fe12cb0643f30fc",
+            "tool_type": "agent",
+            "tool_id": "Edit",
+            "line_ranges": [
+              {
+                "Range": [
+                  63,
+                  69
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "remote_transcripts": {
+    "s_2ddd4a870b9e30": {
+      "tool": "trae",
+      "conversation_id": "6a458cba3fe12cb0643f21e8",
+      "session_id": "6a458cba3fe12cb0643f21e8",
+      "status": "remote_only",
+      "message": "Remote transcript resolution is not implemented yet for TRAE prompts."
+    },
+    "s_2ddd4a870b9e30::t_0f72ef6c7ef6ee": {
+      "tool": "trae",
+      "conversation_id": "6a458cba3fe12cb0643f21e8",
+      "session_id": "6a458cba3fe12cb0643f21e8",
+      "status": "remote_only",
+      "message": "Remote transcript resolution is not implemented yet for TRAE prompts."
+    },
+    "s_2ddd4a870b9e30::t_ad6d5543fb7c3b": {
+      "tool": "trae",
+      "conversation_id": "6a458cba3fe12cb0643f21e8",
+      "session_id": "6a458cba3fe12cb0643f21e8",
+      "status": "remote_only",
+      "message": "Remote transcript resolution is not implemented yet for TRAE prompts."
+    },
+    "s_2ddd4a870b9e30::t_b351e15a30a2e1": {
+      "tool": "trae",
+      "conversation_id": "6a458cba3fe12cb0643f21e8",
+      "session_id": "6a458cba3fe12cb0643f21e8",
+      "status": "remote_only",
+      "message": "Remote transcript resolution is not implemented yet for TRAE prompts."
+    },
+    "s_2ddd4a870b9e30::t_b7a1d304d62a8c": {
+      "tool": "trae",
+      "conversation_id": "6a458cba3fe12cb0643f21e8",
+      "session_id": "6a458cba3fe12cb0643f21e8",
+      "status": "remote_only",
+      "message": "Remote transcript resolution is not implemented yet for TRAE prompts."
+    },
+    "s_2ddd4a870b9e30::t_b85bad685f4bb2": {
+      "tool": "trae",
+      "conversation_id": "6a458cba3fe12cb0643f21e8",
+      "session_id": "6a458cba3fe12cb0643f21e8",
+      "status": "remote_only",
+      "message": "Remote transcript resolution is not implemented yet for TRAE prompts."
+    }
+  }
+}
