@@ -436,12 +436,8 @@ blockers — that is no longer true):
 4. `UBLKCP` — modeled; **synthetic base**, exact covered_bytes size
 5. `UBLKRED` — modeled; **synthetic base** (raw-ptr dest, not a tensormap), exact covered_bytes size
 
-Remaining work (address realism, not runnability):
-- **M2 coords** — spread each tensor's transfers across its tiles so the L2
-  hit-rate stops over-counting (base-only collapses all tiles to one address).
-  Implemented as visit-counter tile spread; verify hit-rate direction toward HW.
-- **M2.5 UBLKRED/UBLKCP exact base** — dereference the raw GMEM pointer
-  (`c[0x0][0x280]/0x2a0`) + dynamic tile coords; static tensormap mapping cannot
-  do this.
-- **M3** — remove the legacy `handle_hi → config_id` heuristic entirely (base +
-  all 11 descriptor fields + size now come from the exact base map).
+Remaining work (address realism, not runnability — M2 coords / M2.5 UBLKRED-UBLKCP
+exact base / M3 heuristic removal) is tracked as **next steps** in the canonical
+integration plan:
+[.plan/TMA_exact_base_mapping_integration.md](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/.plan/TMA_exact_base_mapping_integration.md)
+(see "Next steps (M2+)").
