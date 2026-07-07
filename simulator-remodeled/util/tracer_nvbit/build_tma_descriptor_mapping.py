@@ -361,7 +361,14 @@ def main():
     if args.configs_only:
         # The handle_hi heuristic resolver is intentionally NOT built; the exact
         # (uid,pc) base map (build_tma_pc_base_map.py) provides base + all descriptor
-        # fields per site instead.
+        # fields per site instead. Delete any STALE resolver from a previous run: the
+        # simulator's load_tma_descriptor_resolver would otherwise load it and its
+        # descriptor path OVERWRITES the operand path's config, reintroducing the wrong
+        # box_dim (e.g. box_192 vs the correct box_128) and tripping the size cross-check.
+        stale_resolver = extra_info_dir / "tma_descriptor_resolver.json"
+        if stale_resolver.exists():
+            stale_resolver.unlink()
+            print(f"removed stale {stale_resolver.name} (configs-only; base map supersedes it)")
         return
 
     runtime_groups = load_runtime_groups(extra_info_dir)

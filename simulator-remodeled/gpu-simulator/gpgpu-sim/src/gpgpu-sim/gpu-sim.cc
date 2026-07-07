@@ -709,7 +709,15 @@ void gpgpu_sim::parse_extra_trace_info(std::string filepath, bool is_extra_trace
     std::filesystem::path extra_info_dir = metadata_path.parent_path();
     load_tma_descriptor_configs(extra_info_dir, m_tma_sidecar_db);
     load_tma_pc_base_map(extra_info_dir, m_tma_sidecar_db);
-    load_tma_descriptor_resolver(extra_info_dir, m_tma_sidecar_db);
+    // When real-base is on, the exact (uid,pc) base map supersedes the handle_hi
+    // descriptor resolver. Do NOT load the resolver: its descriptor path runs after the
+    // operand path in lookup_tma_site_metadata and would OVERWRITE the config with the
+    // stale handle_hi box_dim (e.g. box_192 vs the correct box_128), tripping the size
+    // cross-check. Defense-in-depth alongside build_tma_descriptor_mapping --configs-only
+    // deleting the stale file.
+    if (!m_shader_config->tma_real_base_addr_enable) {
+      load_tma_descriptor_resolver(extra_info_dir, m_tma_sidecar_db);
+    }
     load_tma_operand_resolver(extra_info_dir, m_tma_sidecar_db);
     load_sync_operand_resolver(extra_info_dir, m_sync_sidecar_db);
     // BASE-MAP LOAD-FAILURE ASSERT: when real-base addressing is requested, an empty
