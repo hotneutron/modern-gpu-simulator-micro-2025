@@ -228,6 +228,147 @@ def entry_from_slot(slot, sm, source):
     return e
 
 
+# ---------------------------------------------------------------------------
+# M2.5 — UBLKRED/UBLKCP real base + mock tiling (TMA_exact_base_mapping §M2.5)
+#
+# These ops are NOT tensormap-addressed (desc is a UMOV bare handle). The real
+# GMEM base is a raw kernel-argument pointer sitting by value in the params
+# struct (launch_param_blobs), and the per-transfer GMEM offset is in the
+# runtime operand. We recover, per (uid,pc):
+#   base       = the params-struct GMEM pointer that CONTAINS this pc's runtime
+#                GMEM operand addresses (matched by low-32 containment).
+#   tile_bytes = covered_bytes = UNIFORM span operand * 16.
+#   num_tiles  = region_bytes / tile_bytes, where region_bytes is the address
+#                extent of every UBLKRED/UBLKCP transfer sharing that base.
+# The simulator then applies the same visit-counter mock tiling as the
+# descriptor family (base + tile_idx*tile_bytes + agu_index*128), so repeated
+# tile visits hit while distinct tiles miss — anchored in the real 64-bit
+# address space so cross-op L2 residency is decided by the L2 model, not assumed.
+# ---------------------------------------------------------------------------
+UBLK_OPS = ("UBLKRED", "UBLKCP")
+GMEM_VA_MIN = 0x7E00000000     # typical CUDA device VA floor
+GMEM_VA_MAX = 0x800000000000   # device VA ceiling
+
+
+def gmem_pointers_from_struct(struct_bytes):
+    """Every plausible device GMEM pointer (0x7e..0x80 range) in the by-value
+    params struct, unique and sorted by low-32 (the coordinate the runtime
+    operand exposes)."""
+    ptrs = set()
+    for off in range(0, len(struct_bytes) - 7, 8):
+        v = struct.unpack_from("<Q", struct_bytes, off)[0]
+        if GMEM_VA_MIN <= v < GMEM_VA_MAX:
+            ptrs.add(v)
+    return sorted(ptrs, key=lambda p: (p & 0xFFFFFFFF, p))
+
+
+def runtime_ublk_operands(extra, opcodes):
+    """(uid,pc) -> per-callback operand summary for executed UBLKRED/UBLKCP:
+       {opcode, cb_addrs:{cb->set(low32)}, cb_memtype:{cb->str}, uniform_vals:{cb->int}}.
+    The runtime jsonl only holds executed ops, so every entry is an executed site."""
+    per = {}
+    p = extra / "tma_runtime_operand_debug.jsonl"
+    if not p.exists():
+        return per
+    with p.open() as fh:
+        for line in fh:
+            if all(tok not in line for tok in opcodes):
+                continue
+            try:
+                r = json.loads(line)
+            except Exception:
+                continue
+            op = str(r.get("opcode", "")).split(".")[0]
+            if op not in opcodes:
+                continue
+            key = (str(r.get("unique_function_id")), r.get("pc_hex"))
+            d = per.get(key)
+            if d is None:
+                d = per[key] = {"opcode": op, "cb_addrs": defaultdict(set),
+                                "cb_memtype": {}, "uniform_vals": {}}
+            cb = r.get("callback_index")
+            fla = r.get("first_lane_addr")
+            d["cb_memtype"][cb] = r.get("mem_type")
+            if r.get("operand_type") == "UNIFORM":
+                if isinstance(fla, int):
+                    d["uniform_vals"][cb] = fla
+            elif isinstance(fla, int):
+                d["cb_addrs"][cb].add(fla & 0xFFFFFFFF)
+    return per
+
+
+def resolve_ublk_base(min_addr, struct_ptrs):
+    """The struct GMEM pointer with the largest low-32 <= min_addr — i.e. the
+    region whose start contains this pc's runtime GMEM operand addresses."""
+    best = None
+    for full in struct_ptrs:
+        lo = full & 0xFFFFFFFF
+        if lo <= min_addr and (best is None or lo > (best & 0xFFFFFFFF)):
+            best = full
+    return best
+
+
+def build_ublk_entries(per_ublk, struct_ptrs_by_uid):
+    """Resolve base/tile_bytes/num_tiles per executed UBLKRED/UBLKCP (uid,pc).
+    Returns (entries, stats, unmatched)."""
+    # pass 1: per (uid,pc) pick the GMEM callback (STANDARD_MEM with the most
+    # distinct addresses; the SMEM staging cursor is ~1 distinct) + covered_bytes.
+    resolved = {}
+    unmatched = []
+    for (uid, pc), d in per_ublk.items():
+        gmem_cb, gmem_addrs = None, set()
+        for cb, addrs in d["cb_addrs"].items():
+            if d["cb_memtype"].get(cb) == "STANDARD_MEM" and len(addrs) > len(gmem_addrs):
+                gmem_cb, gmem_addrs = cb, addrs
+        if not gmem_addrs:
+            unmatched.append(f"{uid}:{pc}(no-gmem-operand)")
+            continue
+        span = max(d["uniform_vals"].values()) if d["uniform_vals"] else 0
+        covered = span * 16
+        base = resolve_ublk_base(min(gmem_addrs), struct_ptrs_by_uid.get(uid, []))
+        if base is None:
+            unmatched.append(f"{uid}:{pc}(no-base<=0x{min(gmem_addrs):x})")
+            continue
+        resolved[(uid, pc)] = {"opcode": d["opcode"], "gmem_cb": gmem_cb,
+                               "addrs": gmem_addrs, "covered": covered, "base": base}
+
+    # pass 2: region extent per (uid, base) — the full tensor span every sharing
+    # transfer reaches (so a pc that only samples part still gets the true count).
+    region_end = defaultdict(int)      # (uid, base) -> max(addr + tile_bytes)
+    region_addrs = defaultdict(set)    # (uid, base) -> union of low-32 addrs
+    for (uid, pc), e in resolved.items():
+        tb = e["covered"] or 128
+        rk = (uid, e["base"])
+        region_end[rk] = max(region_end[rk], max(e["addrs"]) + tb)
+        region_addrs[rk] |= e["addrs"]
+
+    # emit
+    entries, stats = {}, defaultdict(lambda: {"UBLKRED": 0, "UBLKCP": 0})
+    for (uid, pc), e in sorted(resolved.items()):
+        base = e["base"]; base_lo = base & 0xFFFFFFFF
+        tb = e["covered"] or 128
+        rk = (uid, base)
+        region_bytes = region_end[rk] - base_lo
+        num_tiles = max(1, (region_bytes + tb - 1) // tb)
+        entries[f"{uid}:{pc}"] = {
+            "base_hex": f"0x{base:x}",
+            "source": "operand_raw_pointer",
+            "operand_addressed": True,
+            "raw_pointer_addressed": True,
+            "has_static_base": False,          # not a tensormap descriptor base
+            "opcode": e["opcode"],
+            "gmem_cb_index": e["gmem_cb"],
+            "covered_bytes": e["covered"],
+            "tile_bytes": tb,
+            "num_tiles": num_tiles,
+            "region_bytes": region_bytes,
+            "distinct_addrs_pc": len(e["addrs"]),
+            "distinct_addrs_region": len(region_addrs[rk]),
+        }
+        stats[uid][e["opcode"]] += 1
+    return entries, stats, unmatched
+
+
 def count_executed_ublkred_resolved(extra):
     """UBLKRED 1:1-absence proof: how many EXECUTED UBLKRED sites the def-chain still
     resolves to an in-struct param offset. Expected 0 (desc is a UMOV bare handle, dst is
@@ -261,6 +402,9 @@ def main():
     ap.add_argument("--allow-pool", action="store_true",
                     help="permit deterministic pool fallback (default: pool counts as a "
                          "failure under --strict; kept only as a locality safety net)")
+    ap.add_argument("--no-ublk", action="store_true",
+                    help="skip UBLKRED/UBLKCP raw-pointer base+mock-tiling emit (M2.5); "
+                         "leaves them synthetic in the simulator")
     a = ap.parse_args()
     delta = parse_int(a.struct_desc_delta)
     extra = Path(a.traces).resolve() / "extra_info"
@@ -268,11 +412,13 @@ def main():
     encode_blobs = load_encode_blobs(extra)
     structs = struct_blob_by_uid(extra)
     struct_slots_by_uid = {}
+    struct_ptrs_by_uid = {}
     for uid, (sz, blob, argoff) in structs.items():
         bp = Path(blob) if blob else None
         if bp and bp.exists():
-            struct_slots_by_uid[uid] = discover_struct_descriptors(bp.read_bytes(),
-                                                                   encode_blobs)
+            sbytes = bp.read_bytes()
+            struct_slots_by_uid[uid] = discover_struct_descriptors(sbytes, encode_blobs)
+            struct_ptrs_by_uid[uid] = gmem_pointers_from_struct(sbytes)
     chain, prefetch_by_pc = utmacctl_chain(extra, delta, struct_slots_by_uid)
     smem_by_pc, multi = runtime_smem_offsets(extra, DESC_OPS)
 
@@ -322,12 +468,29 @@ def main():
         stats[uid]["prefetch"] += 1
         result[key] = entry_from_slot(slot, None, "prefetch")
 
+    # (3) UBLKRED/UBLKCP raw-pointer ops (M2.5): real base from the by-value params
+    # struct + mock tiling metadata (tile_bytes/num_tiles). Not tensormap-addressed,
+    # so keyed on the runtime GMEM operand, not a SMEM descriptor offset.
+    ublk_entries, ublk_stats, ublk_unmatched = {}, {}, []
+    if not a.no_ublk:
+        per_ublk = runtime_ublk_operands(extra, UBLK_OPS)
+        ublk_entries, ublk_stats, ublk_unmatched = build_ublk_entries(
+            per_ublk, struct_ptrs_by_uid)
+        for key, e in ublk_entries.items():
+            if key in result:
+                continue  # descriptor mapping wins (should never collide)
+            result[key] = e
+
     out = extra / "tma_pc_base_map.json"
     ublkred_diag = count_executed_ublkred_resolved(extra)
     out.write_text(json.dumps({
         "delta_hex": f"0x{delta:x}",
         "field_order": list(DESC_FIELD_KEYS),
         "ublkred_diagnostic": ublkred_diag,
+        "ublk_raw_pointer_fields": [
+            "base_hex", "covered_bytes", "tile_bytes", "num_tiles",
+            "region_bytes", "gmem_cb_index", "raw_pointer_addressed",
+        ],
         "map": result,
     }, indent=2) + "\n")
 
@@ -361,6 +524,25 @@ def main():
         print(f"\nUBLKRED 1:1 diagnostic (executed sites reaching an in-struct slot): "
               f"{ublkred_diag['resolved_to_struct']}/{ublkred_diag['executed']} "
               f"(expected 0 -> UBLKRED is NOT tensormap-addressed; base stays synthetic)")
+
+    # (3) UBLKRED/UBLKCP raw-pointer base + mock tiling (M2.5) report
+    if not a.no_ublk:
+        print(f"\nUBLKRED/UBLKCP raw-pointer base+tiling (M2.5): "
+              f"{len(ublk_entries)} (uid,pc) mapped")
+        for uid in sorted(ublk_stats, key=lambda x: int(x)):
+            s = ublk_stats[uid]
+            print(f"  uid{uid}: UBLKRED={s['UBLKRED']} UBLKCP={s['UBLKCP']}")
+        # per (uid,base) region summary — one line per distinct tensor region
+        regions = {}
+        for key, e in ublk_entries.items():
+            uid = key.split(":")[0]
+            regions.setdefault((uid, e["base_hex"]), e)
+        for (uid, bh), e in sorted(regions.items()):
+            print(f"  uid{uid} base={bh} tile_bytes={e['tile_bytes']} "
+                  f"num_tiles={e['num_tiles']} region_bytes={e['region_bytes']} "
+                  f"(0x{e['region_bytes']:x}) distinct_addrs={e['distinct_addrs_region']}")
+        if ublk_unmatched:
+            print(f"  UNMATCHED ({len(ublk_unmatched)}): {ublk_unmatched[:8]}")
     # locality integrity: each SMEM offset must map to exactly one base
     bad = defaultdict(set)
     for k, v in result.items():

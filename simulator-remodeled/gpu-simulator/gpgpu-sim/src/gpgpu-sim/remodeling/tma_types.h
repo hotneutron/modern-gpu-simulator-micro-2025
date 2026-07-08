@@ -142,9 +142,14 @@ struct TMABaseLookupKey {
 struct TMABaseRecord {
   // has_static_base: this site is tensormap-addressed and we recovered the real base
   // (UTMALDG/UTMASTG/UTMACCTL.PF). operand_addressed: this site is raw-pointer addressed
-  // (UBLKRED/UBLKCP) — no static base; keep the synthetic address, size from operands.
+  // (UBLKRED/UBLKCP) — no tensormap; the base is the raw kernel-arg GMEM pointer read
+  // offline from the by-value params struct (M2.5). raw_pointer_addressed marks that
+  // operand_addressed case where we DID recover a real base + mock-tiling metadata, so
+  // the simulator applies real base + visit-counter tiling instead of the synthetic
+  // address (size still comes from operand covered_bytes, not a descriptor box).
   bool has_static_base = false;
   bool operand_addressed = false;
+  bool raw_pointer_addressed = false;
   uint64_t global_base = 0;
   uint32_t tensor_rank = 0;
   uint32_t tensor_data_type = 0;
@@ -157,7 +162,12 @@ struct TMABaseRecord {
   uint32_t swizzle = 0;
   uint32_t l2_promotion = 0;
   uint32_t oob_fill = 0;
-  std::string source;  // "direct" | "chain" | "prefetch" | "pool"
+  // M2.5 raw-pointer mock-tiling metadata (only set when raw_pointer_addressed):
+  // tile_bytes = covered_bytes (one transfer's span), num_tiles = region/tile_bytes.
+  // The mover spreads transfers as global_base + (visit%num_tiles)*tile_bytes.
+  uint32_t tile_bytes_operand = 0;
+  uint32_t num_tiles = 0;
+  std::string source;  // "direct" | "chain" | "prefetch" | "pool" | "operand_raw_pointer"
 };
 
 struct TMASidecarMetadataDB {

@@ -509,6 +509,28 @@ TMACommand tma_unit_sm::build_tma_command(const warp_inst_t &inst) const {
         ++visit;
         cmd.tile_offset_bytes = tile_idx * tile_bytes;
       }
+    } else if (base_hit && base_record.raw_pointer_addressed &&
+               m_config->tma_operand_addr_tiling_enable) {
+      // M2.5: UBLKRED/UBLKCP raw-pointer real base + mock tiling. These are NOT
+      // tensormap ops (box_dim is 0, so the descriptor size cross-check above would
+      // FATAL and the tile-spread block would divide by a zero tile) — handle them in
+      // a separate branch. Base is the real dQaccum/scratch GMEM pointer read offline
+      // from the params struct; size stays from operand covered_bytes (already set on
+      // cmd), so we ONLY inject base + tile offset here. Same visit-counter tiling as
+      // the descriptor family, but tile_bytes = covered_bytes (one transfer's span)
+      // and num_tiles comes from the base map (region / tile_bytes).
+      cmd.global_base = base_record.global_base;
+      cmd.has_real_base = true;
+      uint64_t tile_bytes = base_record.tile_bytes_operand;
+      if (tile_bytes == 0) tile_bytes = cmd.covered_bytes;  // fallback to live operand
+      uint64_t num_tiles = base_record.num_tiles;
+      if (num_tiles == 0) num_tiles = 1;
+      if (tile_bytes > 0) {
+        uint64_t &visit = m_tensor_visit_count[base_record.global_base];
+        uint64_t tile_idx = visit % num_tiles;
+        ++visit;
+        cmd.tile_offset_bytes = tile_idx * tile_bytes;
+      }
     } else if (tma_family_requires_descriptor(cmd.opcode_family)) {
       // MISSING-MAP ASSERT: a descriptor-required op (UTMALDG/UTMASTG/UTMAPF/
       // UTMAREDG) must have an exact base when the flag is on. UBLKRED/UBLKCP are

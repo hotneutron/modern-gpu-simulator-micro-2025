@@ -423,6 +423,21 @@ void load_tma_pc_base_map(const std::filesystem::path &extra_info_dir,
     // A real static base exists iff this site is tensormap-addressed (not operand-
     // addressed) and carries a nonzero base.
     record.has_static_base = !record.operand_addressed && record.global_base != 0;
+    // M2.5: UBLKRED/UBLKCP raw-pointer sites are operand_addressed but carry a real
+    // base + mock-tiling metadata (tile_bytes/num_tiles). raw_pointer_addressed tells
+    // the mover to use real base + visit-counter tiling instead of the synthetic addr.
+    if (entry.HasMember("raw_pointer_addressed") &&
+        entry["raw_pointer_addressed"].IsBool()) {
+      record.raw_pointer_addressed = entry["raw_pointer_addressed"].GetBool();
+    }
+    if (entry.HasMember("tile_bytes")) {
+      record.tile_bytes_operand =
+          static_cast<uint32_t>(parse_tma_json_uint(entry["tile_bytes"]));
+    }
+    if (entry.HasMember("num_tiles")) {
+      record.num_tiles =
+          static_cast<uint32_t>(parse_tma_json_uint(entry["num_tiles"]));
+    }
     if (entry.HasMember("tensor_rank")) {
       record.tensor_rank =
           static_cast<uint32_t>(parse_tma_json_uint(entry["tensor_rank"]));
@@ -2027,6 +2042,13 @@ void shader_core_config::reg_options(class OptionParser *opp) {
                          "Use the exact per-site GMEM base (tma_pc_base_map.json) for TMA "
                          "transfer addresses instead of the synthetic transfer_uid scheme, "
                          "so L2 locality matches HW. (default=0)",
+                         "0");
+  option_parser_register(opp, "-tma_operand_addr_tiling_enable", OPT_BOOL,
+                         &tma_operand_addr_tiling_enable,
+                         "M2.5: give UBLKRED/UBLKCP (raw-pointer, non-tensormap ops) their "
+                         "real GMEM base + visit-counter mock tiling from tma_pc_base_map.json "
+                         "instead of the synthetic address. Requires "
+                         "-tma_real_base_addr_enable. (default=0)",
                          "0");
   option_parser_register(opp, "-bar_debug_enable", OPT_BOOL,
                          &bar_debug_enable,

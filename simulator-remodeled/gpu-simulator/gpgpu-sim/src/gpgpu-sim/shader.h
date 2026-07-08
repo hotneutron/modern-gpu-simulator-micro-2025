@@ -2242,6 +2242,13 @@ class shader_core_config : public core_config {
   // synthetic-address behavior is preserved unless explicitly opted in.
   bool tma_real_base_addr_enable;
 
+  // M2.5: give UBLKRED/UBLKCP (raw-pointer, non-tensormap ops) their real GMEM base
+  // (read offline from the by-value params struct) plus visit-counter mock tiling,
+  // instead of the synthetic (transfer_uid<<20) address. Requires
+  // tma_real_base_addr_enable (the base map must be loaded). Off by default so the
+  // UBLKRED/UBLKCP synthetic-address behavior is preserved unless opted in.
+  bool tma_operand_addr_tiling_enable;
+
   // BAR named-barrier (BAR.SYNC / BAR.ARV) debug logging (BARDBG). Independent of
   // sync_debug_enable / tma_debug_enable so the named-barrier decode + release +
   // end-of-kernel summary can be captured without other log noise. Used for the
