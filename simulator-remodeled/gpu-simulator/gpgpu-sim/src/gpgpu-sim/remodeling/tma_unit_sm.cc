@@ -482,14 +482,17 @@ TMACommand tma_unit_sm::build_tma_command(const warp_inst_t &inst) const {
       assert((cmd.requests_total == 0 ||
               base_requests_total == cmd.requests_total) &&
              "real-base requests_total must match config_id path (size cross-check)");
-      // M2 (visit-counter tile spread): base-only collapses every transfer of a tensor
-      // to global_base+agu_index*128 (one 16KB tile), erasing the cold miss of the
-      // tensor's other tiles. Spread transfers across all tiles: tile_bytes = one box
-      // (=base_total_bytes), tensor_bytes = Πglobal_dim·element_size, num_tiles =
-      // ⌈tensor_bytes/tile_bytes⌉. The per-tensor visit counter picks tile_idx =
-      // count % num_tiles so repeated visits to the same tile still hit while distinct
-      // tiles occupy distinct L2 lines. Deterministic approximation of the real
-      // schedule (coords are not in the trace).
+      // M2 (CTA-indexed tile spread): base-only collapses every transfer of a
+      // tensor to global_base+agu_index*128 (one 16KB tile), erasing the cold
+      // miss of the tensor's other tiles. A per-SM visit counter cannot fix this
+      // because FA3 runs 1 CTA/SM and issues only ~24 transfers per tensor per
+      // SM, so every SM's counter stays in [0,24) and all SMs pile onto the same
+      // first tiles (=> ~0.98 L2 hit). Instead seed tile_idx from the linear
+      // GLOBAL CTA index (blockIdx), so different CTAs address different tiles of
+      // the tensor across the whole grid while repeated visits from the SAME CTA
+      // still hit. tile_bytes = one box (=base_total_bytes); tensor_bytes =
+      // Πglobal_dim·element_size; num_tiles = ⌈tensor_bytes/tile_bytes⌉.
+      // Deterministic approximation of the real schedule (coords not in trace).
       uint64_t tile_bytes = base_total_bytes;  // Πbox_dim · element_size
       if (tile_bytes > 0) {
         uint64_t tensor_elems = 1;
@@ -504,8 +507,14 @@ TMACommand tma_unit_sm::build_tma_command(const warp_inst_t &inst) const {
         uint64_t num_tiles =
             tensor_bytes > 0 ? (tensor_bytes + tile_bytes - 1) / tile_bytes : 1;
         if (num_tiles == 0) num_tiles = 1;
-        uint64_t &visit = m_tensor_visit_count[base_record.global_base];
-        uint64_t tile_idx = visit % num_tiles;
+        // Global block index for this transfer's CTA (hw slot -> global blockIdx).
+        uint64_t global_cta = m_sm->get_global_cta_id(cmd.cta_id);
+        // Per-(tensor,CTA) visit counter: repeated transfers from the same CTA to
+        // the same tensor advance through neighbouring tiles, but the CTA index
+        // sets a distinct starting tile so grid-wide the tiles are spread.
+        uint64_t &visit =
+            m_tensor_visit_count[base_record.global_base ^ (global_cta << 20)];
+        uint64_t tile_idx = (global_cta + visit) % num_tiles;
         ++visit;
         cmd.tile_offset_bytes = tile_idx * tile_bytes;
       }
@@ -526,8 +535,13 @@ TMACommand tma_unit_sm::build_tma_command(const warp_inst_t &inst) const {
       uint64_t num_tiles = base_record.num_tiles;
       if (num_tiles == 0) num_tiles = 1;
       if (tile_bytes > 0) {
-        uint64_t &visit = m_tensor_visit_count[base_record.global_base];
-        uint64_t tile_idx = visit % num_tiles;
+        // Same CTA-indexed spread as the descriptor family (M2): seed tile_idx
+        // from the global block index so per-SM transfer scarcity does not pin
+        // every CTA to tile 0. See the M2 comment above.
+        uint64_t global_cta = m_sm->get_global_cta_id(cmd.cta_id);
+        uint64_t &visit =
+            m_tensor_visit_count[base_record.global_base ^ (global_cta << 20)];
+        uint64_t tile_idx = (global_cta + visit) % num_tiles;
         ++visit;
         cmd.tile_offset_bytes = tile_idx * tile_bytes;
       }

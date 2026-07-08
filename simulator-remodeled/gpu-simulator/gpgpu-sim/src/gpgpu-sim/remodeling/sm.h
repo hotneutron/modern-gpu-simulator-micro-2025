@@ -156,6 +156,15 @@ class SM : public core_t, public shader_core_ctx_wrapper {
 
   void num_cycles_to_stall_SM(unsigned int num_cycles);
 
+  // Map a hardware CTA slot (get_cta_id()) to the linear global block index
+  // (blockIdx.x + gridDim.x*blockIdx.y + ...). Recorded at issue_block2core.
+  // Used by the TMA unit's M2 tile-spread so different CTAs address different
+  // tiles of the same tensor instead of every CTA collapsing to tile 0.
+  unsigned int get_global_cta_id(unsigned int hw_cta_slot) const {
+    if (hw_cta_slot >= MAX_CTA_PER_SHADER) return 0;
+    return m_local_to_global_cta_id[hw_cta_slot];
+  }
+
   void cycle() override;
 
   void consume_pending_wait_barrier_actions(std::stack<Wait_Barrier_Entry_Modifier> &actions);
