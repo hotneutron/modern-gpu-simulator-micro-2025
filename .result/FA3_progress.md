@@ -448,7 +448,18 @@ knobs.
 
 ### TODO-2: TMA does not receive a real start (base) address from the trace
 
-- **Status**: TMA fabricates a synthetic GMEM base address per transfer. See
+- **Status**: **Largely addressed (in progress) by the TMA exact base-mapping work — see
+  [TMA_exact_base_mapping_integration.md](file:///home/jihyun/modern-gpu-simulator-micro-2025/.plan/TMA_exact_base_mapping_integration.md).**
+  The real per-site GMEM base is now recovered offline (`tma_pc_base_map.json`, 23/23 descriptor
+  sites, pool=0) and injected via `-tma_real_base_addr_enable` (M1). Per-transfer tile spread is
+  approximated by a **CTA-indexed tile offset** (M2 / M2.5, gated by
+  `-tma_operand_addr_tiling_enable` for UBLKRED/UBLKCP) — the plain per-SM visit-counter was
+  measured to collapse all CTAs onto tile 0, so `tile_idx` is now seeded from the linear global
+  block index (`SM::get_global_cta_id`). Measured: fwd K5 distinct tiles ~24 → 132. Real per-transfer
+  *coordinates* are still not in the trace, so the tile order remains a deterministic approximation
+  (verify by L2-hit direction toward HW, not exact match). The original synthetic fallback below
+  still applies only when the flags are off / for non-FA3 traces.
+- **Original synthetic behavior (when flags off)**: TMA fabricates a synthetic GMEM base address per transfer. See
   [tma_unit_sm.cc:629-635](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/tma_unit_sm.cc#L629-L635):
   the comment states *"The trace does not carry the descriptor base, so we fabricate a
   per-transfer address range purely to exercise memory-hierarchy timing"*, computing

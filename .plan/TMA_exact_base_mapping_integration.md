@@ -158,20 +158,33 @@ Both kernels ran to completion with `-tma_real_base_addr_enable 1` (+ debug on),
 
 **Key sizing fact (decides M2):** a K/V tensor is `global_dim=[64,2048,24,1]`, tile `box=[64,128]`, element 2B → tensor = **6 MB**, **384 tiles** of 16 KB (128 lines each), 49152 lines total. L2 = **50 MB ≫ 6 MB**, so once loaded the whole tensor stays resident; repeated-tile revisits *should* hit. The missing misses are the **cold miss of first-touch across the 384 distinct tiles**, which the collapse erases.
 
-## M2 chosen approach — A: visit-counter tile spread (decided, this is what we implement)
+## M2 chosen approach — CTA-indexed tile spread (implemented; supersedes the per-SM visit-counter)
 
 We evaluated two ways to add coords without a common trace field (coords are NOT in the trace, §0):
-- **A (chosen): visit-counter tile spread.** Keep a per-tensor (keyed by `global_base`) monotonic visit counter in the TMA unit. For each descriptor transfer compute `tile_idx = counter % num_tiles`, where `num_tiles = ⌈tensor_bytes / tile_bytes⌉` from the descriptor (`global_dim`·element_size / `box_dim`·element_size). Address becomes `agu_base = global_base + tile_idx*tile_bytes + agu_index*128`. This spreads transfers across all `num_tiles` tiles → the cold-miss of first-touch is restored (≈ `num_tiles` cold misses per tensor), while repeated visits to the same tile still hit. Deterministic; needs **no tracer change, no trace regen** — simulator-only, flag-gated.
+- **A (initial, then corrected): visit-counter tile spread.** Keep a per-tensor (keyed by `global_base`) monotonic visit counter in the TMA unit. For each descriptor transfer compute `tile_idx = counter % num_tiles`, where `num_tiles = ⌈tensor_bytes / tile_bytes⌉` from the descriptor (`global_dim`·element_size / `box_dim`·element_size). Address becomes `agu_base = global_base + tile_idx*tile_bytes + agu_index*128`. Deterministic; needs **no tracer change, no trace regen** — simulator-only, flag-gated.
 - **B (rejected for now): stride-based coord reconstruction.** Map `cta_x` to the seq axis and the inner-loop iteration to another axis, then `addr = base + Σ coord·stride`. More structural but requires guessing the FA3 tile scheduler's CTA→tile assignment, which is not in the trace and easy to get wrong.
 
-**Why A is sound:** what L2 realism depends on is *how many distinct tiles are touched and revisited*, not the exact HW tile order. A produces the correct count of distinct tiles (`num_tiles`) and preserves same-tile reuse. The `% num_tiles` wrap is a deterministic approximation of the real schedule, not the real schedule.
+**[CORRECTION — measured] The plain per-SM visit counter (A) does NOT lower the hit rate.** The first M2 run (fwd K5, real-base on) still showed `L2_TMA_true_hit_rate = 0.9854` and, in the `[TMADBG] first-request` log, only **~24 distinct tiles per tensor** (16 KB stride confirmed correct) instead of the expected 384. Root cause: the visit counter (`m_tensor_visit_count`) is a **per-SM member** of `tma_unit_sm`, and FA3 runs **1 CTA/SM** issuing only ~24–38 TMA transfers per tensor per SM. So every SM's counter stays in `[0, ~24)`; all 132 SMs restart at `tile_idx=0` and pile onto the same first ~24 tiles, leaving tiles 24..383 untouched. The intended first-touch cold misses never appear → the hit rate stays ~0.98. Approach A's `count % num_tiles` is only correct if a *single* counter sweeps `num_tiles`; a per-SM counter is capped at the per-SM transfer count, not `num_tiles`.
 
-**A — design details:**
-- Only applies to descriptor sites with a real base (`has_real_base`, i.e. UTMALDG/UTMASTG/UTMAPF/UTMAREDG). In M2 UBLKRED/UBLKCP keep the synthetic path (operand_addressed); **M2.5 gives them their own real base + mock tiling under a separate flag (§M2.5)** — the same tile-spread mechanism, just with `tile_bytes=covered_bytes` and a raw-pointer base instead of the descriptor box.
-- `num_tiles` and `tile_bytes` are derived from the base-map descriptor already carried in `TMACommand` (box_dim, element_size, global_dim). Carry them into `TMACommand`/`TMABaseRecord` if not already present.
-- The visit counter is per `global_base` (per tensor), stored in the `tma_unit_sm` instance (a `std::unordered_map<uint64_t,uint64_t>`). Incremented once per enqueued descriptor transfer, read in `build_tma_command` (or at enqueue) so `tile_idx` is fixed per transfer and carried to the mover in `TMACommand`.
-- Gate behind the existing `-tma_real_base_addr_enable` (M2 is the coord half of the same feature). Optionally add `-tma_real_coords_enable` if we want base-only vs base+coords A/B; default to combined.
-- Verification: rerun fwd K5 + bwd K10. Expect `L2_TMA_true_hit_rate` to drop from ~0.99 toward the HW direction (fwd 0.70 / bwd 0.82) as the 384-tile cold misses reappear. Judge by direction, not exact match (the wrap is an approximation).
+**Fix (implemented): seed `tile_idx` from the linear GLOBAL CTA index (blockIdx).** Instead of a bare per-SM counter, use the global block index so distinct CTAs address distinct tiles across the whole grid, while repeated visits from the *same* CTA still hit:
+```
+global_cta = SM::get_global_cta_id(hw_cta_slot)          // linear blockIdx
+tile_idx   = (global_cta + visit) % num_tiles            // visit = per-(tensor,CTA) counter
+agu_base   = global_base + tile_idx*tile_bytes + agu_index*128
+```
+- `SM::get_global_cta_id()` exposes the existing `m_local_to_global_cta_id[]` map (recorded in `issue_block2core` at `sm.cc`, `ctaid = kernel.get_next_cta_id_single()`), so no new tracking is needed.
+- The visit-counter key is `global_base ^ (global_cta << 20)` so each (tensor, CTA) advances independently; same-CTA revisits to a tile still hit.
+- Applied identically to **both** the descriptor family (M2) and UBLKRED/UBLKCP (M2.5).
+- **Measured effect:** fwd K5 `[TMADBG] first-request` distinct addresses per tensor jumped **~24 → 132** (= number of CTAs), all at the correct 16 KB tile stride; bwd K10 UBLK distinct addresses spread similarly at the 16 KB `covered_bytes` stride. The tile-0 collapse is gone.
+
+**Why CTA-indexing is sound:** what L2 realism depends on is *how many distinct tiles are touched and revisited*, not the exact HW tile order. Keying on the global CTA index produces one distinct starting tile per CTA (so `min(num_CTAs, num_tiles)` distinct tiles grid-wide) and preserves same-tile reuse. It is a deterministic approximation of the real schedule, not the real schedule; judge by hit-rate *direction* toward HW, not exact match. (Note: with 132 CTAs and 384 tiles, distinct tiles cap at ~132 per tensor, i.e. the grid does not touch all 384 tiles — a known approximation limit; if the residual hit rate is still too high, escalate to approach B or real coords.)
+
+**design details:**
+- Only applies to descriptor sites with a real base (`has_real_base`, i.e. UTMALDG/UTMASTG/UTMAPF/UTMAREDG). UBLKRED/UBLKCP get the same CTA-indexed spread under `-tma_operand_addr_tiling_enable` (§M2.5), with `tile_bytes=covered_bytes` and a raw-pointer base instead of the descriptor box.
+- `num_tiles` and `tile_bytes` are derived from the base-map descriptor already carried in `TMACommand` (box_dim, element_size, global_dim).
+- The `global_cta`-keyed visit counter is stored in the `tma_unit_sm` instance (`std::unordered_map<uint64_t,uint64_t>`), read in `build_tma_command` so `tile_idx` is fixed per transfer and carried to the mover in `TMACommand.tile_offset_bytes`.
+- Gate behind the existing `-tma_real_base_addr_enable` (M2 is the coord half of the same feature). No separate `-tma_real_coords_enable` flag exists — M2 is always combined with real base.
+- Verification: rerun fwd K5 + bwd K10. Expect `L2_TMA_true_hit_rate` to drop from ~0.99 toward the HW direction (fwd 0.70 / bwd 0.82) as per-CTA tile spread restores cold misses. Judge by direction, not exact match (the wrap + CTA-count cap is an approximation).
 
 ### M2.5 — UBLKRED/UBLKCP **real base + mock tiling** (CHOSEN, verified on the local trace)
 
@@ -220,8 +233,8 @@ No proto change, no coord capture (mock tiling *replaces* real coords), no GPU r
 
 ## Next steps (M2+)
 Address realism (not runnability — the five ops already run). Moved here from `TMA_ISA.md` so the plan stays canonical:
-- **M2 coords** — spread each tensor's transfers across its tiles so the L2 hit-rate stops over-counting (base-only collapses all 384 tiles to one address). **Implemented as visit-counter tile spread (approach A, above).** Next: verify hit-rate direction toward HW (fwd 0.70 / bwd 0.82) on server rebuild.
-- **M2.5 UBLKRED/UBLKCP real base + mock tiling** — anchor at the true GMEM base (read **offline** from `launch_param_blobs/*.bin`, no trace change) + reuse the M2 visit-counter tiling with `tile_bytes=covered_bytes`, `num_tiles=region/tile`. Verified on the local trace: UBLKRED base `0x7fd661400000` / num_tiles 768; UBLKCP per-pc base (scratch + dQaccum). Cross-op overlap with descriptor tensors = 0, so real-base anchoring reproduces L2 residency structurally (§M2.5).
+- **M2 coords** — spread each tensor's transfers across its tiles so the L2 hit-rate stops over-counting (base-only collapses all 384 tiles to one address). **Implemented as CTA-indexed tile spread (the per-SM visit-counter A was measured to fail — tile-0 collapse; see the M2 section above).** Verified in-run: fwd K5 distinct tiles ~24 → 132 (= CTA count), 16 KB stride. Next: confirm `L2_TMA_true_hit_rate` direction toward HW (fwd 0.70 / bwd 0.82) when the runs finish.
+- **M2.5 UBLKRED/UBLKCP real base + mock tiling** — anchor at the true GMEM base (read **offline** from `launch_param_blobs/*.bin`, no trace change) + reuse the same CTA-indexed tiling with `tile_bytes=covered_bytes`, `num_tiles=region/tile`. Verified on the local trace: UBLKRED base `0x7fd661400000` / num_tiles 768; UBLKCP per-pc base (scratch + dQaccum). Cross-op overlap with descriptor tensors = 0, so real-base anchoring reproduces L2 residency structurally (§M2.5). In-run (bwd K10): UBLK distinct addresses spread at the 16 KB `covered_bytes` stride, clean so far.
 - **M3 heuristic removal** — remove the legacy `handle_hi → config_id` heuristic entirely; base + all 11 descriptor fields + size now come from the exact base map (§M3).
 - **M4 flag promotion** — after M1/M2/M2.5/M3 verified, drop `-tma_real_base_addr_enable` / `-tma_operand_addr_tiling_enable` from the config and make real base + mock tiling the default (delete the flags/gates). The base map is then the sole, always-on address source (§M4).
 

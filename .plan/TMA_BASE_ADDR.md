@@ -1442,11 +1442,17 @@ Files: `tma_types.h`, `gpu-sim.cc` (loader + `lookup_tma_site_metadata`),
    - **Milestone 1 (base-only, no coords):**
      `agu_base = global_base + agu_index*128`. Kills the cross-SM `(uid<<20)` hotspot.
    - **Milestone 2 (coords):** `+ Σ_d coord[d]*global_stride[d]` once the coord
-     mini-spike (§3.1) lands.
+     mini-spike (§3.1) lands. **Implemented instead as a CTA-indexed mock-tiling
+     approximation** (real coords are not in the trace): `agu_base = global_base +
+     tile_idx*tile_bytes + agu_index*128` with `tile_idx = (global_blockIdx + visit) %
+     num_tiles`, seeded from `SM::get_global_cta_id`. A plain per-SM visit counter was
+     measured to collapse every CTA onto tile 0 (fwd still 0.9854), so the global CTA
+     index is used to spread tiles across the grid (measured fwd distinct tiles ~24 → 132).
    > Accuracy caveat: milestone 1 alone makes every CTA reading the same tensor overlap
    > on `base..base+24KB`, which can push `L2_TMA_true_hit_rate` *higher*, not lower.
    > The hotspot artifact is gone, but real L2 realism needs coords — judge each
-   > milestone by §4.2 L2-hit realism, not by cycle sign.
+   > milestone by §4.2 L2-hit realism, not by cycle sign. The CTA-indexed spread is a
+   > deterministic approximation (distinct tiles cap at ~num_CTAs, not num_tiles).
 6. **Gated flag** `-tma_real_base_addr_enable` (default off) for clean A/B. When on,
    the synthetic-base path is dead code (the assert guarantees real base is used).
 

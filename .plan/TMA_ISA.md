@@ -76,7 +76,7 @@ UBLKRED/UBLKCP get **synthetic base (correct size)** in M1. **M2.5 (chosen) make
 base real without a tensormap:** the raw pointer is a plain GMEM base passed by value
 in the params struct, so it is read **offline** from `launch_param_blobs/*.bin` (no
 trace change, no device deref); the per-transfer tile offset uses **mock tiling** (the
-M2 visit-counter with `tile_bytes=covered_bytes`, `num_tiles=region/tile`). Verified on
+M2 CTA-indexed tile spread with `tile_bytes=covered_bytes`, `num_tiles=region/tile`). Verified on
 the local bwd trace — see the UBLKRED section below.
 
 **Simulator integration:** the base is looked up in `build_tma_command`
@@ -179,7 +179,8 @@ Current simulator handling:
 - decoded as `LOAD_OP`, issued to `tma_unit_sm`
 - **real base** from `tma_pc_base_map.json` (exact, gated by `-tma_real_base_addr_enable`)
 - **size** = descriptor `Πbox_dim·element_size`; emits `⌈box·elem/128⌉` 128B-sector requests
-- M2 visit-counter tile spread scatters transfers across the tensor's tiles
+- M2 CTA-indexed tile spread scatters transfers across the tensor's tiles (seeded by the
+  global blockIdx; a plain per-SM visit counter was measured to collapse every CTA onto tile 0)
 
 ### `UTMAPF.L2.4D`
 
@@ -261,7 +262,7 @@ Current simulator handling:
   raw pointer; its 64-bit base is read **offline** from the by-value param struct
   (`launch_param_blobs/*.bin`). UBLKCP is **multi-region per pc** (measured: scratch
   `0x7fd533e00000` for most pcs, dQaccum `0x7fd661400000` for pc 0x4f0), so base is
-  resolved **per pc**. tile offset = M2 visit-counter with `tile_bytes=covered_bytes`,
+  resolved **per pc**. tile offset = M2 CTA-indexed tile spread with `tile_bytes=covered_bytes`,
   `num_tiles=⌈region/tile⌉`. No trace change.
 - `⌈covered_bytes/128⌉` requests
 
@@ -298,7 +299,7 @@ Current simulator handling:
   no trace change. Verified on the local bwd trace (uid8): base **`0x7fd661400000`**,
   every runtime dst (cb=1) ∈ `[base, base+12.58MB)` (containment 6528/6528),
   **num_tiles = 768** (= 12.58MB / 16384B = distinct-address count). tile offset = M2
-  visit-counter with `tile_bytes=covered_bytes`, `num_tiles=768`. Cross-op overlap with
+  CTA-indexed tile spread with `tile_bytes=covered_bytes`, `num_tiles=768`. Cross-op overlap with
   all descriptor tensors = 0 (nearest gap 8.39MB), so real-base anchoring reproduces L2
   residency structurally rather than assuming isolation.
 - **size = operand covered_bytes (exact)**; `⌈covered_bytes/128⌉` requests
