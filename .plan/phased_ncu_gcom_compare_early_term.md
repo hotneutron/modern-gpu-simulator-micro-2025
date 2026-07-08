@@ -1,274 +1,194 @@
-# Plan: Phased NCU↔GCOM Comparison with Early-Terminated Simulation (Phase 0, 30-min cap)
+# Plan: Fast FA3 Simulation via CTA Subsetting, Validated by Per-PC Stall Fit
 
-**Date:** 2026-06-29
-**Branch:** `accorde_npu` (~/accorde)
-**Status:** Plan only — no code yet.
-**Related docs:** `~/accorde/.plan/20260512-0054-pc-sampling-debate.md` (§7.4 is exactly this idea),
-`~/accorde/.plan/20260512-0111-simpoint-cta.md` (Variant B = contiguous phase segments),
-`~/accorde/.plan/20260512-0154-reflection-simpoint-cta.md`, `~/accorde/docs/checkpointing_and_sampling.md`.
+**Date:** 2026-06-29, redesigned 2026-07-07. **Branch:** `accorde_npu` (~/accorde). **Status:** plan only, no code.
 
----
+## 1. Goal and two-stage structure
 
-## 1. Summary
+Run GCOM **faster** on FA3 (full runs exceed the budget, ~12 h) by simulating a **CTA subset**, and prove the
+subset is trustworthy. The trap (P1) is that comparing a K-CTA sim directly to full HW confounds two errors —
+**subset error** (fewer CTAs) and **model error** (sim ≠ HW). They must be separated:
 
-Build a **phased validation harness** that compares per-phase HW metrics (NCU) against per-phase
-GCOM simulator stats, where a **phase = a fixed number of warp/SASS-level instructions**. To bound
-cost, GCOM is **terminated early after the first phase** (or a 30-minute wall-clock cap, whichever
-comes first). The deliverable for this iteration is: *run phase 0 only, compare NCU(phase 0) vs
-GCOM(phase 0), within ≤30 min of sim time per kernel.*
+- **Stage 1 — pick K (speed).** K-sim vs **full-sim**: identical model, so any difference is *pure subset
+  error*. Cheap, config-only, uses existing aggregate counters. This alone answers "how small can K be."
+- **Stage 2 — model fidelity.** full-sim vs **full-HW**, per-PC stall distribution: identical scale, so any
+  difference is *pure model error*. This is the harder per-PC track (Change B′).
 
-This is the BBV/SimPoint idea reduced to its smallest validating slice: SimPoint/Variant-B says
-"decompose a kernel into contiguous instruction-window phases and label each phase's CPI." We are
-not yet clustering or projecting — we are validating that **one phase can be measured on both HW
-and sim and that they agree**, while proving the **early-termination plumbing** that the full
-pipeline will later depend on.
-
-### BBV / SimPoint context (so the harness is built the right shape)
-- **BBV (Basic Block Vector):** per-interval opcode/basic-block frequency vector. SimPoint clusters
-  BBVs (Variant A) or change-point-segments them (Variant B) to find representative phases.
-- **Variant B (contiguous phase segments)** is the relevant model here: phases are
-  **non-overlapping, contiguous instruction windows**; no skipping ⇒ no warm-up/cold-state problem.
-  Our "fixed N instructions per phase" is the simplest Variant-B segmentation (uniform K).
-- The eventual value is per-phase CPI labels; this harness produces the **first** such labeled phase
-  and the HW-vs-sim error for it.
-
-### Two confirmed design decisions (from clarification)
-1. **Per-phase HW ground truth = NCU range-replay** (nvtx ranges / `--replay-mode application` with
-   range markers), not kernel-aggregate. NCU aggregates per launch, so phases must be exposed as
-   profilable ranges.
-2. **Phase boundary unit = warp/SASS-level instructions**, aligned on both sides. GCOM counts
-   thread-level (`gpu_sim_insn += inst.active_count()`, shader.cc:2634), so the GCOM-side
-   early-termination threshold must be converted from warp-level N to thread-level, OR a warp-level
-   counter must be used (see §4.3).
+Stage 1 unblocks the speed goal without any C++; Stage 2 is a separable accuracy track. Do **not** fuse them
+into one K-sim-vs-full-HW fit.
 
 ---
 
-## 2. Current State Analysis (grounded)
+# Stage 1 — Pick K by CTA subsetting (speed)
 
-### 2.1 GCOM (simulator) — what exists
-Simulator tree: `/home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled` (the accorde repo
-refers to it as `3rdparty/modern-gpu-simulator-micro-2025`, see
-`~/accorde/docs/checkpointing_and_sampling.md:328`).
+## 2. Cut axis = CTA subset, not instruction window
 
-- **Early-termination knobs** (registered in `gpu-sim.cc::reg_options`, enforced in
-  `gpgpu_sim::active()` at `gpu-sim.cc:2970-2992`):
-  - `-gpgpu_max_insn` (gpu-sim.cc:2086; enforced 2974-2975) — **cumulative thread-level** insn stop.
-  - `-gpgpu_max_cycle` (gpu-sim.cc:2084; enforced 2971-2972).
-  - `-gpgpu_max_cta` / `-gpgpu_max_completed_cta` (gpu-sim.cc:2088-2092).
-  - These are **global/cumulative**, not per-kernel or per-segment.
-- **Instruction counting is thread-level** (`shader.cc:2634`: `gpu_sim_insn += inst.active_count()`).
-  So N warp-insns ≠ N `gpu_sim_insn` (factor = mean active lanes, 1–32).
-- **No per-instruction-window stat dump** exists. The only periodic hook is
-  `-gpgpu_runtime_stat <freq>:<flag>` (gpu-sim.cc:2093-2096; fires on `gpu_sim_cycle % freq` at
-  gpu-sim.cc:4093-4139) — **cycle-cadence, and it does not emit cumulative cycle/insn per window.**
-- **Kernel filtering**: `-filter_first_kernel_id` / `-filter_last_kernel_id` (gpu-sim.cc:2008-2013;
-  applied in trace_parser.cc:421). Lets us isolate the single target kernel (e.g. FA fwd k5).
-- **No trace-layer partial-kernel ("first K insn of this kernel") knob** — only the global
-  `active()` stops. For a single-kernel trace, `-gpgpu_max_insn` effectively becomes a
-  first-K-instructions stop.
-- **No wall-clock limit inside the simulator** — accorde already wraps the binary with shell
-  `timeout` (`~/accorde/scripts/02_run_simulation.sh:317`, `CASS_SIM_TIMEOUT`, default 120s).
+- **Instruction window (`-gpgpu_max_warp_insn`) — do NOT use.** It sees every CTA's prologue + early
+  mainloop only, never epilogue/steady-state ⇒ cold-start biased; can't represent the full kernel.
+- **CTA subset (`-gpgpu_max_cta K`, run K CTAs to completion) — correct.** Each CTA runs its full
+  prologue→mainloop→epilogue lifetime; CTAs are independent ⇒ **no deadlock** (avoids the FA3 truncation
+  problem in §6). Config-only for the basic case: `-gpgpu_max_cta`
+  ([gpu-sim.cc:2227](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/gpu-sim.cc#L2227),
+  [hit_max_cta_count:2380](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/gpu-sim.cc#L2380)).
+- Speedup roughly tracks active-SM count: FA3 bwd is 384 CTA / 132 SM ≈ 2.9 waves; icnt/L2/DRAM fixed cost
+  is the floor — measure.
 
-### 2.2 accorde (harness) — what exists
-- `~/accorde/scripts/02_run_simulation.sh` already: runs `timeout $CASS_SIM_TIMEOUT $SIMULATOR
-  -trace … -config …`, scrapes `gpu_sim_cycle` / `gpu_tot_sim_insn` / `gpu_ipc` from the log
-  (lines 317-351), emits per-config JSON. This is the reuse point for sim execution + early stop.
-- `~/accorde/scripts/intra_cta/` already has the BBV/segmentation Python:
-  `segment_changepoint.py`, `cluster_simpoint.py`, `bbv_cpi_variance.py`, `collect_corpus.py`,
-  `validate_p1.py`, plus `run_*_simpoint*.sh`.
-- `~/accorde/docs/checkpointing_and_sampling.md` documents the kernel/CTA-granularity sampling and
-  explicitly states **no arbitrary instruction-level resume / no cache-state restore** (lines
-  379-384). M2 milestone proposes PKP-style internal early-stop on IPC convergence.
-- The fwd reference numbers (Opt 5) live in
-  `/home/jihyun/modern-gpu-simulator-micro-2025/.result/FA3_kernel_5_fwd.md` (kernel-level NCU↔sim
-  table just extended).
+## 3. Causal FA3 caveat — representative sample, not first-K (P3)
 
-### 2.3 The core tension this plan must resolve
-NCU is **per-launch aggregate**; GCOM is **thread-level cumulative**; phases are **warp-level**.
-The harness therefore needs (a) a way to make NCU emit one number set *per phase* (range-replay),
-(b) a warp-level instruction boundary that both NCU ranges and GCOM stop at, (c) a GCOM stat path
-that reports phase-0 cycles before being killed.
+Causal masking makes CTAs **non-uniform**: mainloop trip count grows with query-block position. First-K (and
+CTA-0 specifically) is the *shortest, least-contended* case — unrepresentative. Need a **representative CTA
+sample** spanning the causal distribution. `-gpgpu_max_cta` only limits count in launch order, so
+arbitrary-subset selection is a small **extension** (CTA-id allow-list); precedent in the checkpoint/resume
+CTA-range gate
+([gpu-sim.cc:3964](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/gpu-sim.cc#L3964)); accorde has CTA-sampling infra (`cluster_simpoint.py`, `checkpointing_and_sampling.md`).
+CTA-0-only is a **bring-up** convenience only, never the comparison config.
+
+## 4. The K-selection loop (K-sim vs full-sim)
+
+1. Run full-sim **once** as calibration (reuse an existing 12 h run; memory shows `gpu_sim_cycle=336,579`).
+   Amortized over all later fast runs.
+2. Run K-sim for increasing K (representative sample) → compare to full-sim on **existing aggregate
+   counters** (the `m_sm_stats` issue-stall totals at
+   [subcore.cc:742-757](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/subcore.cc#L742-L757),
+   plus L2/DRAM/IPC), all normalized per-CTA or per-cycle.
+3. **Smallest K whose normalized stats match full-sim within tolerance = the fast proxy.** No per-PC code
+   needed for this stage.
+
+**Speedup is contention-bounded (P4).** Intra-CTA stalls (scoreboard, tensor-pipe, mbarrier) survive small
+K; inter-CTA/memory stalls (`long_scoreboard` from L2/DRAM-contended TMA arrival) only exist at large K.
+FA3's interesting stalls *are* the memory/mbarrier ones, so K may be pushed high and the speedup modest.
+**Quantify this first** (§9) before investing in Stage 2 — if K must be near-full, the speed goal is
+limited and Stage 2's value shifts to pure fidelity study.
 
 ---
 
-## 3. Proposed Changes
+# Stage 2 — Model fidelity by per-PC stall fit (full-sim vs full-HW)
 
-> Scope of THIS iteration: **phase 0 only**, one kernel (FA fwd, trace kernel 5), 30-min cap.
-> Everything is additive; no existing behavior changed. Files below are grouped by side.
+## 5. Comparable signal = per-PC warp-issue-stall distribution
 
-### Change A — Define the phase grid (offline, Python; accorde)
-- **New:** `~/accorde/scripts/phased_compare/define_phases.py`
-- **What:** given a kernel's total warp-level instruction count (from NVBit `opcode_hist`/instr
-  count already collected, or `nvbit instr_count`), compute phase boundaries as fixed warp-insn
-  windows `N` (default `N` chosen so phase 0 ≈ the first contiguous Variant-B segment; start with a
-  round number, e.g. 1,000,000 warp-insns, configurable). Emit `phases.json`:
-  `{kernel_id, phase_size_warp_insns, phases:[{id, start_warp_insn, end_warp_insn}], total}`.
-- **Why:** single source of truth for the boundary, consumed by both the NCU-range step and the
-  GCOM early-stop threshold so they bucket identically.
+HW attributes stalls by **PC** (spatial). An instruction-window phase is temporal and has no HW counterpart
+(FA3's mainloop revisits the same PCs; PC sampling can't separate visits). So the comparison unit is a
+**PC region**, and GCOM must also bucket stalls by PC. Aggregate PMCs (L2/DRAM/tensor) stay kernel-level.
 
-### Change B — Per-phase HW via NCU range-replay (accorde + tiny NVBit marker)
-- **New NVBit tool (or reuse pc_interval_sampler backbone):**
-  `~/accorde/.../tools/range_marker/` — instruments per-warp instruction count and calls
-  `nvtxRangePush("phase_k")` / `nvtxRangePop()` at the warp-level boundaries from `phases.json`.
-  (NVBit instruction callback + a host-side nvtx push/pop driven by a global instruction-count
-  trigger; per the pc-sampling debate §5 backbone.)
-- **New:** `~/accorde/scripts/phased_compare/run_ncu_ranges.sh` — invoke
-  `ncu --nvtx --nvtx-include "phase_0/" --replay-mode application --metrics <set> -o ncu_phase`
-  so NCU reports the metric set **for the phase-0 nvtx range only**. Capture the same metric family
-  used in the kernel-level table (cycles, issue-slots-busy, L2 hit, occupancy, stall reasons).
-- **Why:** NCU cannot window a launch by itself; the nvtx range is the only way to get true per-phase
-  HW counters. **This is the highest-risk component (see §5 holes H1/H2).**
+## 6. Why HW can only give PC sampling (not sub-kernel counters)
 
-### Change C — GCOM early termination at phase-0 boundary (config-only first; code only if needed)
-- **First attempt (no code):** isolate the kernel with `-filter_first_kernel_id 5
-  -filter_last_kernel_id 5`, and stop at phase 0 with `-gpgpu_max_insn <T>` where
-  `T = phase_size_warp_insns × mean_active_lanes`. Wrap with `timeout 1800` (30 min) like
-  `02_run_simulation.sh:317`.
-- **Decision point (warp-level alignment, per clarification):** because the boundary unit must be
-  warp/SASS-level but `-gpgpu_max_insn` is thread-level, the thread-level threshold `T` is only
-  approximate (depends on mean active lanes). If the resulting phase-0 instruction window does not
-  match the NCU nvtx range within tolerance, add a **warp-level stop knob**:
-  - **New (code, small):** `-gpgpu_max_warp_insn` in `gpu-sim.cc::reg_options` (mirror
-    `-gpgpu_max_insn` at gpu-sim.cc:2086) + a warp-level counter incremented once per issued warp
-    instruction (alongside shader.cc:2634) + an `active()` check (mirror gpu-sim.cc:2974-2975). This
-    makes GCOM stop at exactly the same warp-insn count NCU's range used.
-- **Why:** gives a phase-0-only simulation that ends in minutes, bounded by `timeout 1800`.
+- **NCU aggregates per launch and replays the whole kernel** — `Elapsed Cycles`, `sm__/lts__/dram__` are
+  launch properties; an intra-launch nvtx range is not separately counted on H100.
+- **FA3 cannot be truncated mid-flight** — warp-specialized producer/consumer with TMA `expect-tx` + mbarrier
+  phase-parity across 384 CTAs ([FA3-enablement.md](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/.plan/FA3-enablement.md)).
+  Early-return ⇒ consumers hang; predicate-off ⇒ warps spin to the end. No deadlock-free prefix on HW.
+- **Consequence:** HW's only sub-kernel signal is **PC sampling** — one full normal run recording
+  `(warp PC, stall reason)`.
 
-### Change D — GCOM phase-0 stat capture (reuse existing print path)
-- **What:** GCOM already prints `gpu_sim_cycle`, `gpu_tot_sim_insn`, `gpu_ipc`, and the rich
-  per-SM/issue-stage stats at the end of a (terminated) run. Because phase 0 is the *only* thing
-  simulated, the end-of-run dump **is** the phase-0 stat. No new per-segment partitioning needed for
-  phase 0.
-- **New:** `~/accorde/scripts/phased_compare/parse_gcom_phase.py` — scrape the phase-0 stats from
-  the GCOM log into `gcom_phase0.json` (cycles, ipc, issue-stage breakdown, L2/L1 rates), reusing
-  the grep patterns from `02_run_simulation.sh:323-325`.
-- **Why:** avoids the ~200-LoC `print_stats()` segment-partitioning (Variant B §3.5.2) until we
-  actually need phase 1+ in the same run.
+## 7. GCOM already computes an NCU-aligned stall taxonomy — but on the wrong cycles (P2)
 
-### Change E — The comparison + report (accorde)
-- **New:** `~/accorde/scripts/phased_compare/compare_phase.py` — join `ncu_phase0` and
-  `gcom_phase0` by the metric mapping already established in
-  `/home/jihyun/modern-gpu-simulator-micro-2025/.result/FA3_kernel_5_fwd.md` ("NCU ↔ GCOM-sim Metric
-  Mapping" section), emit a side-by-side `phase0_compare.csv/.md` with `Sim/HW` per metric and the
-  cycle/CPI error. Reuse the unit caveats from that doc (IPC aggregated vs per-SM; L1 bypass; insn
-  granularity).
-- **New:** `~/accorde/scripts/phased_compare/run_phase0.sh` — orchestrates A→B→C→D→E for one kernel
-  with a single `--kernel`, `--phase-size`, `--sim-timeout 1800` interface.
-- **Why:** one command produces the phase-0 NCU-vs-GCOM comparison.
+[subcore.cc:409-431](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/subcore.cc#L409-L431)
+classifies why each non-issuing warp is blocked, with comments mapping to NCU
+`smsp__average_warps_issue_stalled_<reason>`. Taxonomy:
 
----
+| GCOM counter (`...stall_at_least_one_warp_...`) | meaning | NCU reason (`smsp__pcsamp_warps_issue_stalled_*`) |
+|---|---|---|
+| `waiting_wait_barrier` | mbarrier (TMA data arrival) | `long_scoreboard` (+`barrier`) |
+| `waiting_inst_barrier` | named barrier / LDGDEPBAR | `barrier` / `long_scoreboard` |
+| `waiting_tma_flush` | `cp.async.bulk.wait_group` drain | `long_scoreboard` / `drain` |
+| `waiting_scoreboard` | traditional RAW/WAR | `short_scoreboard` |
+| `waiting_l1c` | constant-cache miss | `short_scoreboard` / `imc_miss` |
+| `waiting_stall_count` | fixed-latency dep | `wait` |
+| `with_fu_occupied` (+`_tensor`/`_sfu`/`_sp_int_dp`) | pipe busy | `mma` / `math_pipe_throttle` |
+| `waiting_result_queue_full` | RF/result-queue backpressure | `mio_throttle` / `lg_throttle` |
+| `waiting_yield` | YIELD | `drain` / `not_selected` |
+| `..._no_valid_instruction_*` (frontend/L0I/ibuffer) | fetch/decode not ready | `no_instruction` |
+| *(missing)* | eligible warp not picked this cycle | **`not_selected`** |
 
-## 4. Assumptions & Decisions
+**Three gaps, not one:**
+- **Gap A — aggregate, not per-PC.** Flat per-SM `m_sm_stats.m_stats_map[...]`
+  ([new_stats.h](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/new_stats.h#L172-L197)), no PC key.
+- **Gap B — per-cycle boolean OR, not per-warp count.** Increments `is_any_waiting_X` ("≥1 warp"), NCU
+  counts *warps*.
+- **Gap C (the P2 crux) — recorded only on no-issue cycles.** The attribution block is inside the
+  `else` at [subcore.cc:736-757](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/subcore.cc#L736-L757),
+  reached only when nothing issued, and the issue loop `break`s on first issue
+  ([subcore.cc:638](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/subcore.cc#L638)).
+  NCU PC-sampling samples **all** cycles/warps, including eligible-but-`not_selected` on issue cycles.
+  Differing populations ⇒ **normalizing to shares does NOT fix it**.
 
-- **Confirmed:** per-phase HW = **NCU range-replay** (Change B); phase unit = **warp/SASS-level**,
-  aligned on both sides (Change C decision point / `-gpgpu_max_warp_insn`).
-- **Target kernel:** FA fwd (trace kernel 5), to line up with the existing kernel-level table; the
-  harness is kernel-agnostic via `phases.json`.
-- **"First phase" + 30 min:** phase 0 only; `timeout 1800` is the hard cap (reuse
-  `02_run_simulation.sh` pattern). If 30 min is hit before phase-0 boundary, record a **partial**
-  result (cycles so far) and flag it — do not discard.
-- **No warm-up / no skipping:** phase 0 starts at kernel entry, so there is **zero cold-state /
-  state-inheritance error** (this is the Variant-B guarantee). This is *only* true for phase 0; any
-  later phase would need warm-up and is explicitly out of scope here.
-- **Reuse over rebuild:** prefer config-only GCOM stop (`-gpgpu_max_insn` + `timeout`) and only add
-  `-gpgpu_max_warp_insn` if the unit mismatch breaks alignment (§5 H4).
-- **Metric set:** reuse the kernel-level mapping doc; do not invent new metrics this iteration.
+## 8. Change B′: per-PC, per-warp, every-cycle stall pass
+
+Behind `-gpgpu_perpc_stall_instrument_enable` (default 0 ⇒ baseline unchanged):
+
+1. **Separate stall-state pass (fixes Gap C):** every cycle, classify **every** resident warp's head-PC
+   stall state — decoupled from the issue loop's early `break`. Add a `not_selected` reason for warps that
+   were eligible but not the issued winner. This is a **new per-warp pass**, more than "add a counter to the
+   existing loop."
+2. **Per-PC, per-warp counts (Gaps A/B):** `stall_by_pc[pI->pc][reason] += 1` once per warp per cycle,
+   per-SM `unordered_map<pc, array<u64, NUM_REASONS>>`. Also `issued_by_pc[pc]` for the denominator.
+3. Dump one row per PC to `gcom_stall_by_pc.csv` at kernel end / `timeout`. **No aggregation in C++** —
+   PC→region bucketing is offline.
+4. Reuse the Stage-1 representative-CTA sample so this runs at the chosen K, not full (still deterministic).
+
+## 9. Regions must be per warp-role (P5)
+
+FA3 is warp-specialized: producer (TMA) and consumer (WGMMA) warps run **disjoint instruction streams**
+behind a warp-id branch. There is no single linear mainloop PC range. `define_regions.py` emits **PC sets
+per role** (`{role, region, pc_set}`), not linear `[lo,hi]` ranges, or the "mainloop" blends two different
+stall profiles. Seed from `extra_info/sass` (same disassembly as `extract_tma_descriptor_offsets.py`).
+
+## 10. Comparison statement (apples-to-apples)
+
+Per (role, region): HW `smsp__pcsamp_*` sample counts and GCOM `stall_by_pc` cycle counts each summed into
+the **same** regions, **normalized to a reason-share vector**; compare vectors + one divergence number
+(cosine/L1). **Do not compare absolute cycles vs samples** — HW statistical, sim exact; only the reason
+*distribution* is commensurable. L2/DRAM/tensor aggregates stay kernel-level.
 
 ---
 
-## 5. Poke holes in the plan (risks & failure modes) — user explicitly requested
+## 11. Execution order
 
-**H1 — NCU range-replay may not bucket *a single kernel launch* by instruction window the way we
-want (HIGH).** `--replay-mode range` / nvtx ranges profile a *range of API/kernel activity*, but a
-range *inside one kernel launch* requires device-side nvtx push/pop, which NCU may treat as part of
-the same replayed launch rather than a separately-counted range. NCU may also **serialize/replay the
-whole kernel multiple times**, so "phase 0 only" gives no HW speedup and the per-phase counters may
-include spill from neighboring instructions. *Mitigation / pre-check:* a 1-day spike on a tiny kernel
-to confirm NCU emits distinct counters for an intra-kernel nvtx range; if it can't, fall back to the
-reflection doc's recommendation — **NVBit `clock64()` per-interval CPI** as the HW phase label (the
-option I did not pick, kept as fallback).
+1. **Spike (gating, ~1 day) — three checks, all must pass:**
+   (a) does `smsp__pcsamp_warps_issue_stalled_*` populate per-PC on this H100 + driver?
+   (b) **does NCU's SASS-PC space align with the sim trace-PC space** (P6) — same cubin/function base, not
+   just "PC exists"? If not, regioning silently misbuckets.
+   (c) **speedup vs K curve + K-sim-vs-full-sim aggregate match** (Stage 1, P4) — is there a small faithful
+   K at all, or is FA3 too contention-bound to subset? This gates whether Stage 2 is even worth it.
+   Fallbacks if (a)/(b) fail: CUPTI PC Sampling API, or `clock64()` per-region CPI (coarser).
+2. **Stage 1:** representative CTA-sample selection (allow-list extension if needed) → pick smallest faithful
+   K on existing counters. **Delivers the speed goal.**
+3. **Stage 2 code:** Change B′ (Gap-C every-cycle pass + per-PC counts + `not_selected`) behind the flag;
+   verify flag-off ⇒ identical baseline.
+4. `stall_taxonomy.json` + `define_regions.py` (per-role) + `run_ncu_pcsamp.sh`.
+5. Parse + compare: kernel-level taxonomy join first (no regioning), then per-(role,region) full-sim vs
+   full-HW.
 
-**H2 — nvtx push/pop at a warp-level instruction boundary is ill-defined across warps (HIGH).** A
-"phase boundary at warp-insn N" is per-warp; warps reach N at different real times, so a single
-host-visible nvtx Push/Pop cannot cleanly bracket "phase 0 across all warps." Phase 0 on HW is
-therefore fuzzy at its trailing edge. *Mitigation:* define phase 0 by a **grid-wide instruction
-count** (sum across warps) or by **CTA-0 only** (as P1 in the SimPoint plan does — one CTA per
-kernel), which makes the boundary single-streamed. Recommend **CTA-0-only for phase 0** to make the
-boundary well-defined; note this changes the comparison to "phase 0 of CTA 0," not the whole grid.
+## 12. Risks
 
-**H3 — NCU is per-launch aggregate; "phase 0" HW cycles may be unmeasurable in isolation (HIGH).**
-Even with ranges, NCU's `Elapsed Cycles` is a launch property. Per-range cycle attribution inside one
-launch is not a first-class NCU metric on all GPUs/driver versions. *Mitigation:* validate which
-metrics NCU actually supports per nvtx range on this H100 + driver before committing; if cycles can't
-be ranged, use issue/stall *ratios* (which are smsp per-active and may range) and treat absolute
-cycles as kernel-level only.
+- **R1 (HIGH→mitigated) — confounded fit:** dissolved by the two-stage split (subset error vs model error
+  measured separately).
+- **R2 (HIGH) — Gap C population mismatch:** the every-cycle per-warp pass (§8.1) is required; without it,
+  GCOM and NCU stall populations differ and shares are not comparable.
+- **R3 (MED) — speedup may be small (P4):** FA3 is memory/mbarrier-bound; faithful K may be near-full.
+  Quantify in spike 1(c) before building Stage 2.
+- **R4 (MED) — PC alignment (P6):** verify in spike 1(b), not assumed.
+- **R5 (MED) — GCOM↔NCU reason many-to-many:** may need a coarser grouped axis (memory-dep / pipe-busy /
+  sync-barrier / frontend / compute-dep / not-selected) before comparing.
+- **R6 (LOW) — head-PC vs blocking-PC:** confirm the pass keys on the stalling head instruction.
+- **R7 (LOW) — same PC, different dynamic visit:** PC-region bucketing merges all loop visits on both sides
+  ⇒ consistent (region = steady-state, not one iteration).
 
-**H4 — Warp-level vs thread-level instruction unit mismatch makes the two phase-0 windows different
-sets of instructions (MEDIUM).** GCOM's `-gpgpu_max_insn` is thread-level; converting via "mean
-active lanes" is approximate and **varies within the kernel** (divergent regions have fewer active
-lanes), so a fixed multiplier mis-aligns the trailing edge. *Mitigation:* implement
-`-gpgpu_max_warp_insn` (Change C decision point) so both sides stop at the same warp-insn count;
-accept the small code addition rather than rely on a lane-factor guess.
+## 13. P1–P6 resolution map
 
-**H5 — Early termination changes the simulated dynamics, biasing phase-0 stats (MEDIUM).** Killing
-the sim at phase 0 means caches, TMA pipelines, and mbarrier credits are still "warming up";
-steady-state effects that NCU's full-launch (even ranged) sees may differ. Phase 0 is *inherently*
-the cold-start phase, so GCOM-phase0 vs NCU-phase0 might both be cold — but if NCU's range can't
-isolate cold-start, we compare cold (sim) vs warm-ish (HW). *Mitigation:* explicitly label phase 0
-as "cold-start phase"; do not generalize its error to later phases.
+Origin of the two-stage redesign: the six problems found while stress-testing the prior single-fit plan.
 
-**H6 — 30-min cap may not even reach phase 0 on large kernels (MEDIUM).** FA fwd phase 0 (1M
-warp-insns) at GCOM's ~a few-thousand-cycle/sec rate (`gpgpu_simulation_rate ≈ 3 cycle/sec` seen in
-`.o20`) could exceed 30 min if phase 0 is cycle-heavy. *Mitigation:* size phase 0 from a *time
-budget* backward (pick `N` so projected sim time < 25 min using the known sim rate), not a fixed
-1M; record partial-on-timeout (Change C).
+| # | Problem | Resolved in | How | Residual risk |
+|---|---|---|---|---|
+| **P1** | K-sim-vs-full-HW fit confounds *subset error* + *model error* | Structure (§1) → Stage 1 & 2 split | Stage 1 = K-sim vs **full-sim** (subset error only); Stage 2 = **full-sim** vs full-HW (model error only); full-sim calibrated once (§4.1) | R1 (mitigated) |
+| **P2** | GCOM logs stalls only on **no-issue** cycles; NCU samples **all** cycles/warps (+ missing `not_selected`) | Stage 2 (§7 Gap C, §8.1) | New **every-cycle per-warp stall pass**, decoupled from issue-loop `break`; adds `not_selected` | R2 (HIGH — open) |
+| **P3** | CTA-0-only default, but CTA-0 is causally biased | Stage 1 (§3) | CTA-0-only demoted to **bring-up only**; comparison uses a **representative CTA sample** | — |
+| **P4** | Interesting FA3 stalls are contention-bound → forces large K → small speedup | Stage 1 (§4) + spike 1(c) | States speedup is contention-bounded; **quantify in spike before Stage 2** | R3 (MED — measure) |
+| **P5** | Linear prologue/mainloop/epilogue regions don't fit warp-specialized FA3 | Stage 2 (§9) | `define_regions.py` emits **PC sets per warp-role** (producer/consumer), not `[lo,hi]` | — |
+| **P6** | NCU SASS-PC ↔ sim trace-PC alignment assumed | Gating spike 1(b) | Alignment is an explicit **gating check** (same cubin/function base), not assumed | R4 (MED — verify) |
 
-**H7 — GCOM thread-level `gpu_sim_insn` is cumulative across kernels (LOW, but a footgun).** With
-`-filter_first/last_kernel_id` isolating k5, the counter still starts at 0 for the launch, so
-`-gpgpu_max_insn` works — *but* if the trace has preceding kernels not filtered out, the threshold is
-off. *Mitigation:* always pair `-gpgpu_max_insn`/`-gpgpu_max_warp_insn` with the kernel filter and
-verify `gpu_tot_sim_insn` at stop ≈ threshold.
-
-**H8 — The comparison is only as meaningful as the metric mapping (LOW).** The kernel-level mapping
-doc already flags IPC definition mismatch, L1-bypass, and insn-granularity. Per-phase makes these
-*worse* (e.g. phase-0 occupancy is ramp-up). *Mitigation:* carry the same caveats; report ratios and
-trends, not just absolute deltas.
-
-**H9 — "Phase = fixed instruction count" is not a real BBV/SimPoint phase (LOW/conceptual).** Uniform
-windows ignore the actual phase structure that change-point detection (Variant B) would find; phase
-0's boundary may fall mid-phase. *Mitigation:* acceptable for this validating slice; note that the
-real pipeline uses `segment_changepoint.py`, and a fixed window is the deliberate simplification.
-
-**H10 — Two NVBit/NCU passes + GCOM is a 3-tool pipeline; reproducibility/version drift (LOW).**
-*Mitigation:* pin driver/NCU/NVBit versions in `run_phase0.sh`; record them in the output JSON like
-`02_run_simulation.sh` records config.
-
----
-
-## 6. Verification
-
-1. **Boundary alignment:** GCOM stop point (`gpu_tot_sim_insn` or warp-insn counter at termination)
-   equals the phase-0 boundary in `phases.json` (within 1 warp-insn for `-gpgpu_max_warp_insn`, or
-   document the lane-factor error for `-gpgpu_max_insn`).
-2. **Time bound:** GCOM phase-0 run wall-time < 30 min (or partial-flag set), proven by the
-   `timeout 1800` wrapper exit code (124 = timeout, per `02_run_simulation.sh:355`).
-3. **NCU range sanity (the H1/H3 gate):** confirm NCU emits distinct phase-0 metrics for the nvtx
-   range on a toy kernel *before* trusting FA numbers; if not, switch to clock64() fallback.
-4. **Comparison output:** `phase0_compare.md` lists each mapped metric with NCU(phase0),
-   GCOM(phase0), Sim/HW, reusing the FA3_kernel_5_fwd.md mapping; cycle/CPI error computed.
-5. **No regression:** running the harness does not modify the simulator default behavior
-   (flag-off / no new flags set ⇒ identical to today); `git diff` on the sim tree is empty unless
-   `-gpgpu_max_warp_insn` was added, in which case flag-default-off reproduces baseline.
-
----
-
-## 7. Suggested execution order (smallest-risk-first)
-
-1. **Spike H1/H3 first** (1 day): does NCU range-replay give per-nvtx-range metrics inside one launch
-   on this H100? This gates the whole approach. If no → fallback to clock64() per-phase.
-2. Change A (`define_phases.py`) — cheap, unblocks everything.
-3. Change C config-only path (`-filter_*` + `-gpgpu_max_insn` + `timeout 1800`) on FA k5; measure
-   phase-0 sim time; size `N` from the time budget (H6).
-4. Change D + E (parse + compare) against **kernel-level** NCU first (free, no range risk) to prove
-   the plumbing, then swap in NCU-range phase-0 numbers once the spike passes.
-5. Add `-gpgpu_max_warp_insn` only if H4 alignment is out of tolerance.
+**Stage-level view:**
+- **Gating spike (§11.1)** clears feasibility: 1(a) PC-sampling exists, 1(b) P6 alignment, 1(c) P4
+  speedup-vs-K. All must pass before Stage 2 code.
+- **Stage 1** (speed, no C++) resolves P3, quantifies P4.
+- **Stage 2** (the `subcore.cc` change) resolves P2, P5; justified only after spike 1(c).
+- **P1** is resolved structurally — it is why the two stages exist.
