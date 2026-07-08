@@ -1,0 +1,119 @@
+simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/gpu-sim.cc
+  s_b8d90548aea4fa::t_c253a8f1ea86db 2046-2051
+  s_b8d90548aea4fa::t_4024e38c15c951 426-440
+  s_b8d90548aea4fa::t_653896ef90b7ed 2052
+simulator-remodeled/gpu-simulator/gpgpu-sim/configs/tested-cfgs/SM90_H100_L2_50MB_80GB/gpgpusim.config
+  s_b8d90548aea4fa::t_9aa86d4fedf37d 378-384
+simulator-remodeled/util/tracer_nvbit/build_tma_pc_base_map.py
+  s_b8d90548aea4fa::t_b29589946558c4 471-483
+  s_b8d90548aea4fa::t_0bcf4497cfaedd 405-407
+  s_b8d90548aea4fa::t_a119ac00ce83fe 490-493
+  s_b8d90548aea4fa::t_b2e6bb03f87fcd 527-545
+  s_b8d90548aea4fa::t_2d70567d620d88 231-371
+  s_b8d90548aea4fa::t_5d24b00034ebef 415,419-421
+simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/tma_unit_sm.cc
+  s_b8d90548aea4fa::t_ad72a9a57f6720 512-533
+simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/tma_types.h
+  s_b8d90548aea4fa::t_a1d65ba798c4fb 145-149,152,165-170
+.plan/TMA_exact_base_mapping_integration.md
+  s_b8d90548aea4fa::t_c1ddfe5a8f2e52 233-239 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a4d97d03fe12cb0643f36a5","tool_type":"agent","tool_id":"Edit","line_ranges":[{"Range":[233,239]}]}]}
+  s_b8d90548aea4fa::t_ba51af3142992d 226 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a4d97f33fe12cb0643f36ab","tool_type":"agent","tool_id":"Edit","line_ranges":[{"Single":226}]}]}
+simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/shader.h
+  s_b8d90548aea4fa::t_caaa66543a425d 2245-2251
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "91a7dbc5164f542293c253368470f7605b198d7b",
+  "prompts": {},
+  "humans": {
+    "h_35c34d310c0197": {
+      "author": "Jihyun Ryoo <jihyun.ryoo@bytedance.com>"
+    }
+  },
+  "sessions": {
+    "s_b8d90548aea4fa": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6a4d7d8e3fe12cb0643f3374",
+        "model": "openrouter-3o__max"
+      },
+      "human_author": "Jihyun Ryoo <jihyun.ryoo@bytedance.com>"
+    }
+  },
+  "attestation_metadata": {
+    ".plan/TMA_exact_base_mapping_integration.md": [
+      {
+        "hash": "s_b8d90548aea4fa::t_c1ddfe5a8f2e52",
+        "line_ranges": [
+          {
+            "Range": [
+              233,
+              239
+            ]
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a4d97d03fe12cb0643f36a5",
+            "tool_type": "agent",
+            "tool_id": "Edit",
+            "line_ranges": [
+              {
+                "Range": [
+                  233,
+                  239
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "hash": "s_b8d90548aea4fa::t_ba51af3142992d",
+        "line_ranges": [
+          {
+            "Single": 226
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a4d97f33fe12cb0643f36ab",
+            "tool_type": "agent",
+            "tool_id": "Edit",
+            "line_ranges": [
+              {
+                "Single": 226
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "remote_transcripts": {
+    "s_b8d90548aea4fa": {
+      "tool": "trae",
+      "conversation_id": "6a4d7d8e3fe12cb0643f3374",
+      "session_id": "6a4d7d8e3fe12cb0643f3374",
+      "status": "remote_only",
+      "message": "Remote transcript resolution is not implemented yet for TRAE prompts."
+    },
+    "s_b8d90548aea4fa::t_ba51af3142992d": {
+      "tool": "trae",
+      "conversation_id": "6a4d7d8e3fe12cb0643f3374",
+      "session_id": "6a4d7d8e3fe12cb0643f3374",
+      "status": "remote_only",
+      "message": "Remote transcript resolution is not implemented yet for TRAE prompts."
+    },
+    "s_b8d90548aea4fa::t_c1ddfe5a8f2e52": {
+      "tool": "trae",
+      "conversation_id": "6a4d7d8e3fe12cb0643f3374",
+      "session_id": "6a4d7d8e3fe12cb0643f3374",
+      "status": "remote_only",
+      "message": "Remote transcript resolution is not implemented yet for TRAE prompts."
+    }
+  }
+}
