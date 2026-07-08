@@ -1,6 +1,16 @@
 # Plan: Fast FA3 Simulation via CTA Subsetting, Validated by Per-PC Stall Fit
 
-**Date:** 2026-06-29, redesigned 2026-07-07. **Branch:** `accorde_npu` (~/accorde). **Status:** plan only, no code.
+**Date:** 2026-06-29, redesigned 2026-07-07, risk-hardened 2026-07-08. **Branch:** `accorde_npu` (~/accorde). **Status:** plan only, no code.
+
+> **2026-07-08 code-verification pass.** The plan's claims were checked against the actual
+> tree. Confirmed correct: the stall taxonomy exists and matches §7 verbatim
+> ([subcore.cc:409-431](file:///home/jihyun/project/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/subcore.cc#L409-L431),
+> [736-757](file:///home/jihyun/project/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/subcore.cc#L736-L757));
+> the Gap-C diagnosis is exact — attribution lives in the no-issue `else` and the issue loop
+> `break`s on first issue ([subcore.cc:638](file:///home/jihyun/project/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/subcore.cc#L638));
+> an existing `wgmma_step0_instrument_enable` flag gives the exact pattern for the Change-B′ flag.
+> **New defect found (see §2 and R8):** `-gpgpu_max_cta` terminates on *issued*, not *completed*,
+> CTAs — it does **not** run K CTAs to completion as the plan assumed.
 
 ## 1. Goal and two-stage structure
 
@@ -24,11 +34,25 @@ into one K-sim-vs-full-HW fit.
 
 - **Instruction window (`-gpgpu_max_warp_insn`) — do NOT use.** It sees every CTA's prologue + early
   mainloop only, never epilogue/steady-state ⇒ cold-start biased; can't represent the full kernel.
-- **CTA subset (`-gpgpu_max_cta K`, run K CTAs to completion) — correct.** Each CTA runs its full
-  prologue→mainloop→epilogue lifetime; CTAs are independent ⇒ **no deadlock** (avoids the FA3 truncation
-  problem in §6). Config-only for the basic case: `-gpgpu_max_cta`
-  ([gpu-sim.cc:2227](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/gpu-sim.cc#L2227),
-  [hit_max_cta_count:2380](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/gpu-sim.cc#L2380)).
+- **CTA subset — correct axis, but `-gpgpu_max_cta` alone is WRONG (P7, new).** The intent is "run K CTAs
+  to completion so each covers its full prologue→mainloop→epilogue lifetime." But **`-gpgpu_max_cta` counts
+  *issued* CTAs, not *completed* ones**: `active()` returns false the instant `gpu_tot_issued_cta >= K`
+  ([gpu-sim.cc:3138-3140](file:///home/jihyun/project/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/gpu-sim.cc#L3138-L3140);
+  same predicate in `cycle_insn_cta_max_hit` [gpu-sim.h:794-795](file:///home/jihyun/project/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/gpu-sim.h#L794-L795)).
+  So the last wave of in-flight CTAs is **truncated mid-lifetime** — reintroducing on the CTA axis the exact
+  epilogue/steady-state loss the plan rejected the instruction window for.
+- **Fix: use `-gpgpu_max_completed_cta K` instead** (or in addition). It keys on `gpu_completed_cta`
+  ([gpu-sim.cc:3141-3143](file:///home/jihyun/project/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/gpu-sim.cc#L3141-L3143),
+  option at [gpu-sim.cc:2251](file:///home/jihyun/project/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/gpu-sim.cc#L2251)),
+  which increments only when a CTA finishes, so **≥K CTAs are guaranteed to complete** before termination.
+  Note this lets *more than K* CTAs launch (any concurrently-resident ones finish too) — acceptable and even
+  desirable, but it means K is a completed-CTA floor, not an exact launch count.
+- **Normalization guard.** Regardless of which stop flag is used, any CTA still in-flight at termination must
+  be **excluded** from the per-CTA / per-cycle normalization (§4.2), or its missing epilogue skews the stall
+  shares. Prefer completed-CTA-only accounting. CTAs run their full lifetime; CTAs are independent ⇒ **no
+  deadlock** (avoids the FA3 truncation problem in §6). Selection precedent:
+  [gpu-sim.cc:3964](file:///home/jihyun/project/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/gpu-sim.cc#L3964),
+  [hit_max_cta_count:2402-2408](file:///home/jihyun/project/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/gpu-sim.cc#L2402-L2408).
 - Speedup roughly tracks active-SM count: FA3 bwd is 384 CTA / 132 SM ≈ 2.9 waves; icnt/L2/DRAM fixed cost
   is the floor — measure.
 
@@ -48,8 +72,10 @@ CTA-0-only is a **bring-up** convenience only, never the comparison config.
    Amortized over all later fast runs.
 2. Run K-sim for increasing K (representative sample) → compare to full-sim on **existing aggregate
    counters** (the `m_sm_stats` issue-stall totals at
-   [subcore.cc:742-757](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/subcore.cc#L742-L757),
-   plus L2/DRAM/IPC), all normalized per-CTA or per-cycle.
+   [subcore.cc:742-757](file:///home/jihyun/project/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/subcore.cc#L742-L757),
+   plus L2/DRAM/IPC), all normalized per-CTA or per-cycle. **In-flight-CTA exclusion guard (P7):** only CTAs
+   that reached completion contribute to the normalized stats; any CTA truncated at termination is dropped,
+   so a partial final wave cannot skew the stall shares. This is why §2 uses `-gpgpu_max_completed_cta`.
 3. **Smallest K whose normalized stats match full-sim within tolerance = the fast proxy.** No per-PC code
    needed for this stage.
 
@@ -143,19 +169,45 @@ the **same** regions, **normalized to a reason-share vector**; compare vectors +
 
 ## 11. Execution order
 
-1. **Spike (gating, ~1 day) — three checks, all must pass:**
-   (a) does `smsp__pcsamp_warps_issue_stalled_*` populate per-PC on this H100 + driver?
-   (b) **does NCU's SASS-PC space align with the sim trace-PC space** (P6) — same cubin/function base, not
-   just "PC exists"? If not, regioning silently misbuckets.
-   (c) **speedup vs K curve + K-sim-vs-full-sim aggregate match** (Stage 1, P4) — is there a small faithful
-   K at all, or is FA3 too contention-bound to subset? This gates whether Stage 2 is even worth it.
-   Fallbacks if (a)/(b) fail: CUPTI PC Sampling API, or `clock64()` per-region CPI (coarser).
-2. **Stage 1:** representative CTA-sample selection (allow-list extension if needed) → pick smallest faithful
-   K on existing counters. **Delivers the speed goal.**
-3. **Stage 2 code:** Change B′ (Gap-C every-cycle pass + per-PC counts + `not_selected`) behind the flag;
-   verify flag-off ⇒ identical baseline.
-4. `stall_taxonomy.json` + `define_regions.py` (per-role) + `run_ncu_pcsamp.sh`.
-5. Parse + compare: kernel-level taxonomy join first (no regioning), then per-(role,region) full-sim vs
+Each gating check below is a **concrete experiment with a pass/fail predicate and a named fallback**, not a
+prose assertion. Nothing in Stage 2 is built until spike checks (a)–(d) pass.
+
+1. **Gating spike (~1–2 days) — four checks, all must pass:**
+
+   **(a) PC sampling populates.** Run `ncu --metrics smsp__pcsamp_warps_issue_stalled_* --print-details all`
+   on one FA3 launch. **PASS:** non-zero per-PC rows appear for ≥1 stall reason. **FAIL fallback:** CUPTI PC
+   Sampling API, else `clock64()` per-region CPI (coarser, §5 comparison degrades to region-CPI not
+   reason-share).
+
+   **(b) PC-space alignment (P6).** Dump NCU's SASS PCs (`ncu -c 1 --set full` disasm / `cuobjdump -sass`)
+   and the sim trace PCs for the same cubin+function; confirm they share a base/offset mapping — reuse the
+   disassembly path already used by `extract_tma_descriptor_offsets.py`. **PASS:** a fixed offset maps every
+   NCU PC to a sim trace PC for the FA3 producer and consumer functions. **FAIL fallback:** build the map
+   from matching instruction opcodes at region boundaries; if that fails, abort Stage 2 (regioning would
+   silently misbucket).
+
+   **(c) CTA-completion sanity (P7, new).** Run FA3 with `-gpgpu_max_completed_cta K` for a small K and
+   confirm the log prints `gpu_completed_cta >= K` and that each counted CTA reached its epilogue PCs (not
+   truncated). **PASS:** completed-CTA count ≥ K and no in-flight CTA is folded into the normalized stats
+   (§4.2 guard active). **FAIL:** fix the stop flag / normalization before any K sweep.
+
+   **(d) Speedup-vs-K + subset-fidelity (Stage 1, P4).** Sweep K on the representative sample; plot wall-clock
+   speedup and the K-sim-vs-full-sim aggregate divergence (§4.2). **PASS:** there exists a K with speedup
+   ≥ target AND normalized aggregate divergence ≤ tolerance. **FAIL:** FA3 is too contention-bound to subset;
+   record the achievable speedup, and **Stage 2's value shifts to pure fidelity study at full/near-full K.**
+
+2. **R2 pre-experiment (cheap, before writing Change B′).** Prove the every-cycle pass is *necessary*, not
+   assumed: at kernel level (no regioning, no new code) compare the **existing no-issue-only** GCOM stall
+   shares (§7 counters) against NCU's all-cycle `smsp__pcsamp_*` shares. **If they already match within
+   tolerance, Change B′ (Gap C) may be unnecessary** — skip or downscope §8.1. **If they diverge, quantify
+   the gap** — this both justifies R2's HIGH rating and gives the target the every-cycle pass must close.
+
+3. **Stage 1:** representative CTA-sample selection (allow-list extension if needed), using
+   `-gpgpu_max_completed_cta` per §2 → pick smallest faithful K on existing counters. **Delivers the speed goal.**
+4. **Stage 2 code (only if step 2 shows a real gap):** Change B′ (Gap-C every-cycle pass + per-PC counts +
+   `not_selected`) behind the flag; verify flag-off ⇒ byte-identical baseline stats.
+5. `stall_taxonomy.json` + `define_regions.py` (per-role) + `run_ncu_pcsamp.sh`.
+6. Parse + compare: kernel-level taxonomy join first (no regioning), then per-(role,region) full-sim vs
    full-HW.
 
 ## 12. Risks
@@ -163,32 +215,43 @@ the **same** regions, **normalized to a reason-share vector**; compare vectors +
 - **R1 (HIGH→mitigated) — confounded fit:** dissolved by the two-stage split (subset error vs model error
   measured separately).
 - **R2 (HIGH) — Gap C population mismatch:** the every-cycle per-warp pass (§8.1) is required; without it,
-  GCOM and NCU stall populations differ and shares are not comparable.
+  GCOM and NCU stall populations differ and shares are not comparable. **De-risk:** the §11.2 pre-experiment
+  measures the gap at kernel level *before* writing any C++ — if the no-issue-only shares already match NCU,
+  Change B′ is downscoped or skipped.
 - **R3 (MED) — speedup may be small (P4):** FA3 is memory/mbarrier-bound; faithful K may be near-full.
-  Quantify in spike 1(c) before building Stage 2.
+  Quantify in spike 1(d) before building Stage 2.
 - **R4 (MED) — PC alignment (P6):** verify in spike 1(b), not assumed.
 - **R5 (MED) — GCOM↔NCU reason many-to-many:** may need a coarser grouped axis (memory-dep / pipe-busy /
   sync-barrier / frontend / compute-dep / not-selected) before comparing.
 - **R6 (LOW) — head-PC vs blocking-PC:** confirm the pass keys on the stalling head instruction.
 - **R7 (LOW) — same PC, different dynamic visit:** PC-region bucketing merges all loop visits on both sides
   ⇒ consistent (region = steady-state, not one iteration).
+- **R8 (HIGH→mitigated, new P7) — CTA truncation:** `-gpgpu_max_cta` stops on *issued* not *completed* CTAs
+  ([gpu-sim.cc:3138-3140](file:///home/jihyun/project/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/gpu-sim.cc#L3138-L3140)),
+  truncating the last wave and reintroducing the epilogue-loss the plan rejected instruction-windows for.
+  **Mitigated** by switching to `-gpgpu_max_completed_cta` + the §4.2 in-flight-CTA exclusion guard;
+  **verified** in spike 1(c).
 
-## 13. P1–P6 resolution map
+## 13. P1–P7 resolution map
 
-Origin of the two-stage redesign: the six problems found while stress-testing the prior single-fit plan.
+Origin of the two-stage redesign: the six problems found while stress-testing the prior single-fit plan,
+plus P7 found in the 2026-07-08 code-verification pass.
 
 | # | Problem | Resolved in | How | Residual risk |
 |---|---|---|---|---|
 | **P1** | K-sim-vs-full-HW fit confounds *subset error* + *model error* | Structure (§1) → Stage 1 & 2 split | Stage 1 = K-sim vs **full-sim** (subset error only); Stage 2 = **full-sim** vs full-HW (model error only); full-sim calibrated once (§4.1) | R1 (mitigated) |
-| **P2** | GCOM logs stalls only on **no-issue** cycles; NCU samples **all** cycles/warps (+ missing `not_selected`) | Stage 2 (§7 Gap C, §8.1) | New **every-cycle per-warp stall pass**, decoupled from issue-loop `break`; adds `not_selected` | R2 (HIGH — open) |
+| **P2** | GCOM logs stalls only on **no-issue** cycles; NCU samples **all** cycles/warps (+ missing `not_selected`) | Stage 2 (§7 Gap C, §8.1); §11.2 pre-experiment | New **every-cycle per-warp stall pass**, decoupled from issue-loop `break`; adds `not_selected`. Necessity first proven by §11.2 kernel-level gap measurement | R2 (HIGH — measured before build) |
 | **P3** | CTA-0-only default, but CTA-0 is causally biased | Stage 1 (§3) | CTA-0-only demoted to **bring-up only**; comparison uses a **representative CTA sample** | — |
-| **P4** | Interesting FA3 stalls are contention-bound → forces large K → small speedup | Stage 1 (§4) + spike 1(c) | States speedup is contention-bounded; **quantify in spike before Stage 2** | R3 (MED — measure) |
+| **P4** | Interesting FA3 stalls are contention-bound → forces large K → small speedup | Stage 1 (§4) + spike 1(d) | States speedup is contention-bounded; **quantify in spike before Stage 2** | R3 (MED — measure) |
 | **P5** | Linear prologue/mainloop/epilogue regions don't fit warp-specialized FA3 | Stage 2 (§9) | `define_regions.py` emits **PC sets per warp-role** (producer/consumer), not `[lo,hi]` | — |
 | **P6** | NCU SASS-PC ↔ sim trace-PC alignment assumed | Gating spike 1(b) | Alignment is an explicit **gating check** (same cubin/function base), not assumed | R4 (MED — verify) |
+| **P7** | `-gpgpu_max_cta` stops on *issued* CTAs ⇒ last wave truncated mid-lifetime (CTA-axis epilogue loss) | §2 fix + spike 1(c) | Use `-gpgpu_max_completed_cta` (keys on `gpu_completed_cta`) + exclude in-flight CTAs from normalization | R8 (mitigated — verify) |
 
 **Stage-level view:**
-- **Gating spike (§11.1)** clears feasibility: 1(a) PC-sampling exists, 1(b) P6 alignment, 1(c) P4
-  speedup-vs-K. All must pass before Stage 2 code.
-- **Stage 1** (speed, no C++) resolves P3, quantifies P4.
-- **Stage 2** (the `subcore.cc` change) resolves P2, P5; justified only after spike 1(c).
+- **Gating spike (§11.1)** clears feasibility: 1(a) PC-sampling exists, 1(b) P6 alignment, 1(c) P7
+  CTA-completion, 1(d) P4 speedup-vs-K. All must pass before Stage 2 code.
+- **§11.2 pre-experiment** measures the R2 gap at kernel level before any C++ — gates whether Change B′ is
+  built at all.
+- **Stage 1** (speed, no C++) resolves P3 and P7, quantifies P4.
+- **Stage 2** (the `subcore.cc` change) resolves P2, P5; justified only after spike 1(d) and §11.2.
 - **P1** is resolved structurally — it is why the two stages exist.
