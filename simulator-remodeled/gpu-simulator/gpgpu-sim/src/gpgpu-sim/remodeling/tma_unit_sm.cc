@@ -164,13 +164,13 @@ void log_tma_phase2_binding_once(const warp_inst_t &inst,
   }
   static std::set<std::tuple<unsigned int, uint64_t, uint32_t>> logged_sites;
   auto key = std::make_tuple(inst.unique_function_id, static_cast<uint64_t>(inst.pc),
-                             inst.tma_handle_hi);
+                             0u);
   if (!logged_sites.insert(key).second) {
     return;
   }
   std::cerr << "[TMA][Phase2] ufid=" << inst.unique_function_id
             << " pc=0x" << std::hex << static_cast<uint64_t>(inst.pc)
-            << " handle_hi=0x" << inst.tma_handle_hi << std::dec
+            << std::dec
             << " family=" << static_cast<int>(cmd.opcode_family)
             << " meta_source=" << static_cast<int>(cmd.meta_source)
             << " config_id=" << cmd.config_id
@@ -281,7 +281,7 @@ struct TMAPhase2BindingStats {
               bool has_real_base) {
     auto key = std::make_tuple(inst.unique_function_id,
                                static_cast<uint64_t>(inst.pc),
-                               inst.tma_handle_hi);
+                               0u);
     overall.record(key, metadata, has_real_base);
     TMAPhase2FamilyStats *family_stats = select_family_stats(inst.tma_opcode_family);
     if (family_stats != nullptr) {
@@ -393,7 +393,6 @@ TMACommand tma_unit_sm::build_tma_command(const warp_inst_t &inst) const {
   cmd.operand_form = classify_tma_operand_form(cmd.opcode_family);
   cmd.meta_source = TMAMetadataSource::NONE;
   if (m_sm->get_gpu()->lookup_tma_site_metadata(inst.unique_function_id, inst.pc,
-                                                inst.tma_handle_hi,
                                                 metadata)) {
     if (metadata.has_descriptor_metadata) {
       cmd.config_id = metadata.config_id;
@@ -439,8 +438,9 @@ TMACommand tma_unit_sm::build_tma_command(const warp_inst_t &inst) const {
   }
   // Real per-site GMEM base (tma_pc_base_map.json), looked up here because (uid,pc) is
   // still available — the mover only sees TMATransferEntry and cannot re-derive it.
-  // Gated by -tma_real_base_addr_enable; when off, has_real_base stays false and the
-  // mover keeps the synthetic address. Only tensormap-addressed sites carry a static
+  // Gated by -tma_real_base_addr_enable (on by default, M4). Base-map load failure is
+  // already a FATAL assert at load time, so if the flag is on the base map is present.
+  // Only tensormap-addressed sites carry a static
   // base (UBLKRED/UBLKCP are operand_addressed -> no real base, synthetic retained).
   if (m_config->tma_real_base_addr_enable) {
     TMABaseRecord base_record;

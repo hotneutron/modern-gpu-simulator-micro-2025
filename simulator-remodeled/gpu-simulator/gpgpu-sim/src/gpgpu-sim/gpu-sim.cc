@@ -312,21 +312,6 @@ bool load_tma_json_document(const std::filesystem::path &path,
   return !doc.HasParseError() && doc.IsObject();
 }
 
-void merge_tma_site_config_id(TMADescriptorSiteRecord &record,
-                              const std::string &config_id) {
-  if (config_id.empty()) {
-    return;
-  }
-  if (record.config_id.empty()) {
-    record.config_id = config_id;
-    return;
-  }
-  if (record.config_id != config_id) {
-    record.config_is_ambiguous = true;
-    record.config_id.clear();
-  }
-}
-
 void load_tma_descriptor_configs(const std::filesystem::path &extra_info_dir,
                                  TMASidecarMetadataDB &db) {
   rapidjson::Document doc;
@@ -482,54 +467,6 @@ void load_tma_pc_base_map(const std::filesystem::path &extra_info_dir,
       record.source = entry["source"].GetString();
     }
     db.base_records[TMABaseLookupKey{unique_function_id, pc}] = record;
-  }
-}
-
-void load_tma_descriptor_resolver(const std::filesystem::path &extra_info_dir,
-                                  TMASidecarMetadataDB &db) {
-  rapidjson::Document doc;
-  if (!load_tma_json_document(extra_info_dir / "tma_descriptor_resolver.json",
-                              doc)) {
-    return;
-  }
-  if (!doc.HasMember("resolver")) {
-    return;
-  }
-  const rapidjson::Value &resolver = doc["resolver"];
-  if (!resolver.IsArray()) {
-    return;
-  }
-  for (const auto &entry : resolver.GetArray()) {
-    if (!entry.IsObject() || !entry.HasMember("unique_function_id") ||
-        entry["unique_function_id"].IsNull() ||
-        !entry.HasMember("pc_hex") || !entry["pc_hex"].IsString()) {
-      continue;
-    }
-    unsigned int unique_function_id =
-        static_cast<unsigned int>(parse_tma_json_uint(
-            entry["unique_function_id"]));
-    uint64_t pc = std::strtoull(entry["pc_hex"].GetString(), nullptr, 0);
-    uint32_t handle_hi = 0;
-    if (entry.HasMember("handle_hi_hex") && entry["handle_hi_hex"].IsString()) {
-      handle_hi = static_cast<uint32_t>(
-          std::strtoul(entry["handle_hi_hex"].GetString(), nullptr, 0));
-    }
-    TMADescriptorSiteRecord &record =
-        db.descriptor_site_records[TMADescriptorLookupKey{
-            unique_function_id, pc, handle_hi}];
-    record.has_descriptor_metadata = true;
-    if (entry.HasMember("mapping_method") && entry["mapping_method"].IsString() &&
-        record.mapping_method.empty()) {
-      record.mapping_method = entry["mapping_method"].GetString();
-    }
-    if (entry.HasMember("confidence")) {
-      record.resolver_confidence =
-          std::max(record.resolver_confidence,
-                   parse_tma_confidence_score(entry["confidence"]));
-    }
-    if (entry.HasMember("config_id") && entry["config_id"].IsString()) {
-      merge_tma_site_config_id(record, entry["config_id"].GetString());
-    }
   }
 }
 
@@ -724,22 +661,17 @@ void gpgpu_sim::parse_extra_trace_info(std::string filepath, bool is_extra_trace
     std::filesystem::path extra_info_dir = metadata_path.parent_path();
     load_tma_descriptor_configs(extra_info_dir, m_tma_sidecar_db);
     load_tma_pc_base_map(extra_info_dir, m_tma_sidecar_db);
-    // When real-base is on, the exact (uid,pc) base map supersedes the handle_hi
-    // descriptor resolver. Do NOT load the resolver: its descriptor path runs after the
-    // operand path in lookup_tma_site_metadata and would OVERWRITE the config with the
-    // stale handle_hi box_dim (e.g. box_192 vs the correct box_128), tripping the size
-    // cross-check. Defense-in-depth alongside build_tma_descriptor_mapping --configs-only
-    // deleting the stale file.
-    if (!m_shader_config->tma_real_base_addr_enable) {
-      load_tma_descriptor_resolver(extra_info_dir, m_tma_sidecar_db);
-    }
+    // The exact (uid,pc) base map is the sole descriptor-address source; the legacy
+    // handle_hi descriptor resolver has been removed (M3). config_id / box_dim still
+    // flow through the operand resolver's linked_config_id -> descriptor_configs join.
     load_tma_operand_resolver(extra_info_dir, m_tma_sidecar_db);
     load_sync_operand_resolver(extra_info_dir, m_sync_sidecar_db);
-    // BASE-MAP LOAD-FAILURE ASSERT: when real-base addressing is requested, an empty
+    // BASE-MAP LOAD-FAILURE ASSERT (M4): real-base addressing is on by default. An empty
     // base_records map means tma_pc_base_map.json was missing, unparsable, or had no
-    // descriptor sites. Every descriptor op would then hit the missing-map assert in
-    // build_tma_command. Fail here, before the kernel runs, with the expected path so a
-    // 12h run is not wasted on a file-path / pipeline gap.
+    // descriptor sites. We deliberately FAIL here rather than silently falling back to the
+    // synthetic address: a quiet fallback would run a 12h job on fake locality and produce
+    // misleading results. If a non-FA3 workload legitimately has no TMA descriptors, run it
+    // with -tma_real_base_addr_enable 0.
     if (m_shader_config->tma_real_base_addr_enable &&
         m_tma_sidecar_db.base_records.empty()) {
       std::filesystem::path base_map_path =
@@ -747,7 +679,8 @@ void gpgpu_sim::parse_extra_trace_info(std::string filepath, bool is_extra_trace
       std::cerr << "[TMA][RealBase][FATAL] -tma_real_base_addr_enable is set but no base "
                 << "records loaded from " << base_map_path.string()
                 << " (exists=" << (std::filesystem::exists(base_map_path) ? 1 : 0)
-                << "). Run build_tma_pc_base_map.py in the trace pipeline first."
+                << "). Run build_tma_pc_base_map.py in the trace pipeline first, or pass "
+                << "-tma_real_base_addr_enable 0 for a trace with no TMA descriptors."
                 << std::endl;
       assert(false &&
              "tma_real_base_addr_enable set but tma_pc_base_map.json produced no base "
@@ -757,8 +690,6 @@ void gpgpu_sim::parse_extra_trace_info(std::string filepath, bool is_extra_trace
         m_shader_config->tma_real_base_addr_enable) {
       std::cerr << "[TMA][Phase2] loaded descriptor_configs="
                 << m_tma_sidecar_db.descriptor_configs.size()
-                << " descriptor_sites="
-                << m_tma_sidecar_db.descriptor_site_records.size()
                 << " operand_sites="
                 << m_tma_sidecar_db.operand_site_records.size()
                 << " base_records="
@@ -774,10 +705,8 @@ void gpgpu_sim::parse_extra_trace_info(std::string filepath, bool is_extra_trace
 
 bool gpgpu_sim::lookup_tma_site_metadata(unsigned int unique_function_id,
                                          address_type pc,
-                                         uint32_t handle_hi,
                                          TMAResolvedSiteMetadata &metadata) const {
   metadata = TMAResolvedSiteMetadata();
-  metadata.handle_hi = handle_hi;
   auto it_operand = m_tma_sidecar_db.operand_site_records.find(
       TMAOperandLookupKey{unique_function_id, pc});
   if (it_operand != m_tma_sidecar_db.operand_site_records.end()) {
@@ -800,27 +729,6 @@ bool gpgpu_sim::lookup_tma_site_metadata(unsigned int unique_function_id,
       if (it_cfg != m_tma_sidecar_db.descriptor_configs.end()) {
         metadata.has_descriptor_metadata = true;
         metadata.config_id = operand_record.linked_config_id;
-        metadata.descriptor_config = it_cfg->second;
-      }
-    }
-  }
-  auto it_descriptor = m_tma_sidecar_db.descriptor_site_records.find(
-      TMADescriptorLookupKey{unique_function_id, pc, handle_hi});
-  if (it_descriptor != m_tma_sidecar_db.descriptor_site_records.end()) {
-    const TMADescriptorSiteRecord &record = it_descriptor->second;
-    metadata.valid = true;
-    metadata.descriptor_lookup_hit = true;
-    if (!record.mapping_method.empty()) {
-      metadata.mapping_method = record.mapping_method;
-    }
-    metadata.resolver_confidence =
-        std::max(metadata.resolver_confidence, record.resolver_confidence);
-    if (record.has_descriptor_metadata && !record.config_is_ambiguous &&
-        !record.config_id.empty()) {
-      auto it_cfg = m_tma_sidecar_db.descriptor_configs.find(record.config_id);
-      if (it_cfg != m_tma_sidecar_db.descriptor_configs.end()) {
-        metadata.has_descriptor_metadata = true;
-        metadata.config_id = record.config_id;
         metadata.descriptor_config = it_cfg->second;
       }
     }
@@ -2041,15 +1949,16 @@ void shader_core_config::reg_options(class OptionParser *opp) {
                          &tma_real_base_addr_enable,
                          "Use the exact per-site GMEM base (tma_pc_base_map.json) for TMA "
                          "transfer addresses instead of the synthetic transfer_uid scheme, "
-                         "so L2 locality matches HW. (default=0)",
-                         "0");
+                         "so L2 locality matches HW. On by default (M4); auto-disabled if the "
+                         "trace has no base map (non-FA3). (default=1)",
+                         "1");
   option_parser_register(opp, "-tma_operand_addr_tiling_enable", OPT_BOOL,
                          &tma_operand_addr_tiling_enable,
                          "M2.5: give UBLKRED/UBLKCP (raw-pointer, non-tensormap ops) their "
                          "real GMEM base + visit-counter mock tiling from tma_pc_base_map.json "
                          "instead of the synthetic address. Requires "
-                         "-tma_real_base_addr_enable. (default=0)",
-                         "0");
+                         "-tma_real_base_addr_enable. On by default (M4). (default=1)",
+                         "1");
   option_parser_register(opp, "-bar_debug_enable", OPT_BOOL,
                          &bar_debug_enable,
                          "Enable BAR.SYNC / BAR.ARV named-barrier debug logging (BARDBG) "

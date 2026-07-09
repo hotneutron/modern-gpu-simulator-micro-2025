@@ -881,7 +881,6 @@ class gpgpu_sim : public gpgpu_t {
 
   void parse_extra_trace_info(std::string filepath, bool is_extra_trace_enabled); // MOD. Improved tracer
   bool lookup_tma_site_metadata(unsigned int unique_function_id, address_type pc,
-                                uint32_t handle_hi,
                                 TMAResolvedSiteMetadata &metadata) const;
   bool lookup_tma_base_record(unsigned int unique_function_id, address_type pc,
                               TMABaseRecord &record) const;
