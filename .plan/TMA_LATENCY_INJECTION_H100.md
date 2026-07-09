@@ -561,6 +561,150 @@ Instrumentation added for the 12h run (both levers now fully observable):
 
 **Judgment rule after the run:** success = `gpu_sim_cycle`↓ with `avg_icnt_full_cycles`↓ and neither `out_buffer_full` nor `gpu_stall_dramfull` exploding. If cycles are flat and `gpu_stall_dramfull` explodes → the limiter moved to the L2 admission / icnt_L2 queue depth (next lever: `-gpgpu_dram_partition_queues` 1st field), and the counters above localize it without another exploratory run.
 
+## 4.10 Reference: full memory-path pipeline (SM/TMA -> DRAM -> SM) + counter->stage map
+
+Static map of every queue/buffer/interconnect stage and the exact perf counter that flags it, so a
+run result immediately localizes the bottleneck. Verified against source (file:line inline). Depths
+shown are the H100 config defaults.
+
+```
+==================== REQUEST path (SM -> DRAM) ====================
+
+[1] TMA mover / LDST unit  (issue)
+      TMA rate: kMaxRequestsPerCycle=2 (128B lines/cyc)  [hardcoded, tma_unit_sm.h:47]
+      full: m_icnt->full()                                [tma_unit_sm.cc:814 / ldst_unit_sm.cc:1165]
+      counter: avg_icnt_full_cycles, icnt_backpressure_events (TMA)
+            gpgpu_stall_shd_mem[..][ICNT_RC_FAIL] (LDST)
+         | TMA & LDST share the SAME m_icnt (sm.cc:1195,1223,1229); push via
+         | icnt_injection_buffer_full/icnt_inject_request_packet (shader.cc:5310/5316)
+         v
+[2] REQ_NET in_buffer  (xbar input)          cap=64   -icnt_in_buffer_limit
+      counter: *Req_Network_in_buffer_full_per_cycle*   [local_interconnect.cc:442]  <-- baseline 355 = MAIN bottleneck
+         | iSLIP arbiter (xbar): <=1 pkt/(input,dest)/pass
+         | rate = grant_passes_per_cycle (LEVER 1, cfg=4)  [icnt_wrapper.cc:122]
+         | counter: Req_Network_extra_pass_grants_total, avg_passes_per_active_cycle
+         v
+[3] REQ_NET out_buffer  (xbar output)        cap=64   -icnt_out_buffer_limit
+      counter: *Req_Network_out_buffer_full_per_cycle*  [local_interconnect.cc:447]  <-- baseline 0.20
+         | rate = gpgpu_icnt_to_l2_pop_per_cycle (LEVER 2, cfg=4)  [gpu-sim.cc:4177]
+         | counter: gpu_icnt_to_l2_extra_pops
+         | full: memory_sub_partition::full(SECTOR_CHUNCK_SIZE)   [gpu-sim.cc:4180]
+         | counter: *gpu_stall_dramfull*  [gpu-sim.cc:4181]  <-- baseline 1.42M  (NAME IS MISLEADING: this is L2-INPUT queue backpressure, not DRAM)
+         v
+[4] m_icnt_L2_queue  (L2 input FIFO)         cap=8    -gpgpu_dram_partition_queues field1  [l2cache.cc:448]
+         v
+[5] L2 cache bank                            1 port/cyc   -gpgpu_cache:dl2
+      gate: output_full(=L2_icnt full) & port_free   [l2cache.cc:530-543]
+      counter: L2_total_cache_reservation_fails (baseline 0); TMA: L2_TMA_res_fail_per_probe, L2_TMA_output_full_cycles
+         | (miss)
+         v
+[6] m_L2_dram_queue                          cap=8    field2   [l2cache.cc:449]
+         | DRAM arbiter: 1 req/cyc accept, credit-based  [l2cache.cc:341-364]
+         v
+[7] mrqq (cap=2 FIXED, not configurable!)  -> FR-FCFS bank queues   [dram.cc:120]
+      full: dram_t::full()= num_pending >= -gpgpu_frfcfs_dram_sched_queue_size (0=unlimited)  [dram.cc:184]
+      counter: m_num_pending, ave_mrqs
+         v
+[8] DRAM banks/timing -> rwq (cap=CL+1)   [dram.cc:119]
+      counter: *bw_util* (=bwutil/n_cmd)  [dram.cc:724]  <-- baseline 0.078 (DRAM only 7.8% used)
+           dram_eff, idle_bw, wasted_bw_row/col
+
+==================== REPLY path (DRAM -> SM) ======================
+
+[9]  returnq (cap 0->1024)   [dram.cc:121]
+         v
+[10] m_dram_L2_queue                         cap=8    field3   [l2cache.cc:450]
+         v
+[11] L2 fill / bypass   [l2cache.cc:500-518]
+         v
+[12] m_L2_icnt_queue  (reply FIFO)           cap=8    field4   [l2cache.cc:451]
+      counter: *L2_TMA_output_full_cycles*  <-- baseline fwd 45K / bwd 1.39M
+         | rate = gpgpu_l2_reply_drain_per_cycle (cfg=1, ruled out in 4.5)  [gpu-sim.cc:4099]
+         | full: !icnt_has_buffer
+         | counter: *gpu_stall_icnt2sh*  [gpu-sim.cc:4122]  <-- baseline bwd 1.82M
+         v
+[13] REPLY_NET (icnt)   counter: Reply_Network_in_buffer_full (baseline 6.3 = headroom)
+         v
+[14] SM receive   [gpu-sim.cc:4056]
+```
+
+> Numbering note: stages are numbered 1..14 in strict flow order. Only actual
+> queues/buffers/interconnect stages get a number; the xbar's internal full-check and the
+> iSLIP arbiter step are folded onto the arrows between [2] and [3] (they are the SAME
+> xbar_router, not separate buffers).
+
+### Per-stage throughput (how many items move per cycle) — the narrowest stage is the wall
+
+Each stage's rate is given in the unit that stage's own queue/logic actually uses (do NOT convert;
+the mismatch between units is exactly why "one 24KB TMA transfer" hits so many stages differently).
+Unit relationships are explained under the table.
+
+| stage | move unit | default rate | current cfg | knob (source) |
+|---|---|---|---|---|
+| [1] TMA issue | 128B AGU line (=4 sectors) | 2 lines/cyc | 2 | kMaxRequestsPerCycle (hardcoded, tma_unit_sm.h:47) |
+| [2]->[3] iSLIP grant | packet | 1 pkt/(input,dest)/pass x **N passes** | N=4 | -icnt_grant_passes_per_cycle (LEVER 1) |
+| [3]->[4] icnt->L2 pop | packet | 1/sub-part/L2-tick -> **N** | N=4 | -gpgpu_icnt_to_l2_pop_per_cycle (LEVER 2) |
+| [5] L2 cache bank | access | 1 access/cyc (per sub-part, 1 data port) | 1 | -gpgpu_cache:dl2 (port count) |
+| [6]->[7] DRAM arbiter | req | 1 req/cyc (per memory partition) | 1 | hardcoded (l2cache.cc:362 break) |
+| [7] mrqq | req | (depth cap=2, not a rate) | 2 | hardcoded (dram.cc:120) |
+| [8] DRAM banks | column cmd | timing-limited (tRC/tCCD...), not a fixed N | — | DRAM timing (-gpgpu_dram_timing_opt) |
+| [9]->[10] returnq -> dram_L2 | packet | 1/sub-part/DRAM-tick | 1 | hardcoded (l2cache.cc:309-331) |
+| [12]->[13] L2->icnt reply drain | packet | 1/sub-part/ICNT-tick -> N | 1 (ruled out) | -gpgpu_l2_reply_drain_per_cycle |
+
+**Read this as: after the two levers, the request path is 4-wide from [1]..[4], then RE-NARROWS to
+1/cyc at [5] L2 bank, [6] DRAM arbiter and [9] returnq.** Those 1/cyc stages are per-sub-partition,
+and there are 32 sub-partitions in parallel, so aggregate = 32/cyc — currently not the wall
+(DRAM bw_util 7.8%). But if the two levers succeed, `[5]` / `[6]` / `[9]` are the next candidates;
+watch `gpu_stall_dramfull` (=> [4]/[5] region) and `bw_util` (=> [8]) to tell which.
+
+**Unit glossary (what actually flows, and how the units relate):**
+- **sector** = a 32B chunk = the atomic memory access granularity here. One `mem_fetch` (mf) carries
+  one sector. A 128B cache line = **4 sectors** (`SECTOR_CHUNCK_SIZE=4`).
+- **packet** = one `mem_fetch` as it travels the interconnect (icnt in/out buffers, iSLIP grants,
+  icnt->L2 pop, reply drain). So **1 packet = 1 sector mf** on the icnt. This is the dominant unit
+  for stages [2],[3],[4],[9],[12],[13].
+- **128B AGU line** ([1] only) = the TMA mover's issue granularity. Each line expands into **4 sector
+  mfs** (a reduce/RMW into 8: read+write per sector). So `kMaxRequestsPerCycle=2 lines` = **up to 8
+  sector packets/cyc** entering the icnt — but `full()` gates it long before 8 (measured 0.18/cyc).
+- **access** ([5]) = one L2 cache probe. The L2 `push()` sector-splits an incoming mf, but the bank
+  serves **1 access per cycle per sub-partition** (single data port). A miss then emits a fill req.
+- **req** ([6],[7]) = a DRAM request (`dram_req_t`) handed to the memory controller. Multiple sector
+  mfs to the same line can coalesce, but the arbiter still accepts **1 req/cyc per partition**.
+- **column cmd** ([8]) = the actual DRAM burst; throughput here is set by DRAM timing
+  (row/column/bank constraints), reported as `bw_util`, not by a per-cycle integer N.
+
+So the same 24KB TMA load = 768 sectors = 768 packets on the icnt = 192 AGU lines at [1] = (after L2
+coalescing) far fewer reqs at [6]. A stage is the bottleneck when *its own unit's* arrival rate
+exceeds *its own unit's* service rate above.
+
+### Counter -> bottleneck-stage lookup (read this first on any run)
+
+| counter | high => bottleneck at | bwd baseline |
+|---|---|---|
+| `avg_icnt_full_cycles` | [1]->[2] TMA injection blocked on in_buffer full | 4256 (99.9%) |
+| **`Req_Network_in_buffer_full`** | **[2] REQ injection buffer** (current main) | 355 |
+| `Req_Network_out_buffer_full` | [3] xbar output (relocation target if lever 2 fails) | 0.20 |
+| `gpu_stall_dramfull` | [4] L2-input queue (m_icnt_L2_queue) full — NOT DRAM | 1.42M |
+| `L2_total_cache_reservation_fails` | [5] L2 bank admission | 0 |
+| `L2_TMA_output_full_cycles` | [12] reply queue (L2->icnt) full | 1.39M |
+| `gpu_stall_icnt2sh` | [12]->[13] reply injection blocked on icnt full | 1.82M |
+| **`bw_util`** | **[8] real DRAM bandwidth** (high => truly DRAM-bound) | **0.078** |
+| `Reply_Network_in_buffer_full` | [13] reply network | 6.3 |
+
+### Bottleneck-class rule (bw_util is the primary discriminator)
+- `bw_util` HIGH (>~50%) + stall high  => genuinely **DRAM-bandwidth-bound** (not the case here).
+- `bw_util` LOW (7.8%) + stall high     => **queue-serialization-bound** (current case). Then:
+  - `gpu_stall_dramfull` big => [4] L2-input queue or upstream.
+  - `gpu_stall_icnt2sh` big  => [12] reply path.
+  - `idle_bw` big            => requests are not even reaching DRAM (upstream serialization).
+
+### Traps to remember
+- **[7] mrqq is cap=2 hardcoded** ([dram.cc:120]) — if requests reach DRAM but stall here, config
+  cannot fix it; needs a code change.
+- **`gpu_stall_dramfull` is misnamed** — it is L2-input ([4] `m_icnt_L2_queue`, cap=8) backpressure,
+  not DRAM. If it explodes after the two levers, the next knob is `-gpgpu_dram_partition_queues` field1.
+- Stages [2] and [3] are the same xbar_router (in/out), both cap 64, tuned by separate knobs.
+
 
 ## 5. Rollback history & risks (why Phase A failed, must not repeat)
 
