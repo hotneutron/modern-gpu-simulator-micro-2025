@@ -119,6 +119,13 @@ void icnt_reg_options(class OptionParser* opp) {
                          &g_inct_config.verbose, "inct_verbose", "0");
   option_parser_register(opp, "-icnt_grant_cycles", OPT_UINT32,
                          &g_inct_config.grant_cycles, "grant_cycles", "1");
+  option_parser_register(opp, "-icnt_grant_passes_per_cycle", OPT_UINT32,
+                         &g_inct_config.grant_passes_per_cycle,
+                         "Local-xbar arbiter grant passes per cycle: >1 lets one SM "
+                         "eject up to N req/reply packets per cycle, relieving shared "
+                         "REQ-net in_buffer saturation from TMA 768x32B bursts "
+                         "(1=original single-pass behavior)",
+                         "1");
 }
 
 void icnt_wrapper_init() {

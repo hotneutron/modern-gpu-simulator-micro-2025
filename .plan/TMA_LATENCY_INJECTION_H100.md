@@ -483,6 +483,57 @@ traffic in time. Judge by `gpu_sim_cycle` + `wait_barrier`/`tma_flush` SM-idle, 
 `L2_TMA_true_hit_rate` realism check (must stay near HW, not re-inflate). This is the start of the
 actual cycle-reduction phase (tracked as ongoing in FA3_progress.md).
 
+## 4.7 Root cause found = INJECTION path, not reply path (static, no run needed) — 2026-07-09
+
+Instead of burning a 12h reply-path A/B run, the M2/M2.5 baseline logs (`.o14`/`.e14`, bwd K10)
+were analyzed statically. **The reply path is confirmed NOT the lever; the bottleneck is the SM's
+shared REQ-net injection buffer.** Decisive evidence (bwd K10, real-address baseline):
+
+| signal | value | reading |
+|---|---|---|
+| `avg_icnt_full_cycles` / `avg_issue_active_cycles` | 4256 / 4262 = **99.9%** | a TMA transfer spends nearly all its active issue cycles blocked on `m_icnt->full()` |
+| effective inject rate | **0.18 sector mf/cycle** | vs kMaxRequestsPerCycle cap of 8 → cap is NOT the limiter |
+| `Req_Network_in_buffer_full_per_cycle` | **355.4** | REQ (SM->L2 inject) buffer saturated |
+| `Reply_Network_in_buffer_full_per_cycle` | 6.3 | reply side ~empty → reply path is NOT the bottleneck (56x lower) |
+| `Req_Network_out_buffer_full_per_cycle` | 0.20 | out side (sub-partition accept) not full → the in_buffer just **drains too slowly** |
+| `Req_Network_conflicts_per_cycle` | 62.7 | many SMs target the same sub-partition → iSLIP grants 1/dest/cycle |
+| `bw_util` (DRAM) | **0.078** | DRAM is 92% idle → not a DRAM-bandwidth problem |
+| `L2 reservation_fails` | 0 | not an L2 admission problem |
+
+**Structural root:** the built-in local xbar (`-network_mode 2`) runs the iSLIP arbiter **once per
+ICNT tick**, and each pass ejects **<=1 packet per input node** (`input_nodes.erase(node_id)`,
+[local_interconnect.cc:210-247](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/local_interconnect.cc#L210-L247);
+Advance once/cycle, [gpu-sim.cc:4172-4174](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/gpu-sim.cc#L4172-L4174)).
+FA3 emits **768x32B sector mfs per TMA transfer** ([tma_unit_sm.cc](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/tma_unit_sm.cc)) into the SM's **single** shared REQ-net input node (shared with ldst, [sm.cc:1195,1223,1229](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/sm.cc#L1195)). At 1 packet/cycle drain the 512-deep in_buffer saturates and stays full → `full()` blocks every subsequent inject → transfer completion stalls → `wait_barrier` (load) and `tma_flush` (bwd store/reduce).
+
+**Both stall axes are the SAME root.** `tma_flush` (bwd 14.66%, fwd 0%) is store/reduce sector mfs
+going through the **identical single icnt port + same kMaxRequestsPerCycle throttle + same
+`full()` write-side backpressure** ([tma_unit_sm.cc:814,894](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/tma_unit_sm.cc#L814); release is ack-based, not fixed-latency, [sm.cc:2016-2017](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/sm.cc#L2016)). fwd is load-only so its outstanding-store counter stays 0. UBLKRED (reduce) emits 2 mf/sector so it doubles the injection pressure.
+
+**Why the other levers are ruled out (no run needed):**
+- **reply-path (exp1/2/3)** — REQ full 355 vs REPLY full 6.3; `full()` checks only the REQ subnet
+  ([local_interconnect.cc:375-384](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/local_interconnect.cc#L375-L384)), physically separate from REPLY. This is exactly why §4.5's depth/drain A/B moved `output_full` but not cycles, and why `wait_barrier` was pinned.
+- **kMaxRequestsPerCycle=2** — effective inject is 0.18/cycle « cap 8; `full()` gates first. Raising the cap does nothing.
+- **in_buffer size (512)** — deeper buffer only queues longer; the 1-packet/cycle **drain rate** is unchanged, so steady-state throughput is the same.
+
+## 4.8 Fix chosen + IMPLEMENTED: iSLIP grant-passes-per-cycle knob
+
+The only static-sound lever is to raise the **drain rate** of the injection buffer. Implemented as a
+config knob (default 1 = bit-identical):
+
+- **`-icnt_grant_passes_per_cycle N`** ([icnt_wrapper.cc](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/icnt_wrapper.cc), default `"1"`). `xbar_router::Advance()` now runs the iSLIP/RR arbiter up to N full passes per ICNT tick, stopping early when no in_buffer has anything to grant ([local_interconnect.cc Advance](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/local_interconnect.cc#L117-L138)). Each pass still grants <=1 packet/(input,dest) and every packet still passes `Has_Buffer_Out` + `icnt_push`, so the bandwidth accounting stays honest (not a free-memory hack).
+- Applies to both REQ and REPLY xbars (same class); the bottleneck is REQ, REPLY has headroom.
+- H100 config set to **`-icnt_grant_passes_per_cycle 4`** ([gpgpusim.config](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/configs/tested-cfgs/SM90_H100_L2_50MB_80GB/gpgpusim.config#L183)) — 4 sectors/cycle = one 128B line, the natural width for the 4x32B sectorization.
+- Files: `local_interconnect.{h,cc}`, `icnt_wrapper.cc`, `gpgpusim.config`. No tracer/trace change; rebuild required (source change).
+
+**Expected effect (to be measured, this is the first real cycle-reduction run):** `avg_icnt_full_cycles`↓, `Req_Network_in_buffer_full_per_cycle`↓, `wait_barrier`/bwd `tma_flush` SM-idle↓, `gpu_sim_cycle`↓.
+
+**Honest residual risk:** §4.5 warned a reply-drain increase merely relocated the stall to
+`gpu_stall_icnt2sh`. This time `out_buffer_full≈0.20` and REPLY has headroom, so there is no obvious
+next stage to absorb the relocation — but only the run confirms it. Run bwd K10 first (REQ full 355,
+worst case); fwd (REQ full ~45K-equivalent, milder) can share the same run. Keep the
+`L2_TMA_true_hit_rate` realism check unchanged (this knob does not touch addressing).
+
 
 ## 5. Rollback history & risks (why Phase A failed, must not repeat)
 
