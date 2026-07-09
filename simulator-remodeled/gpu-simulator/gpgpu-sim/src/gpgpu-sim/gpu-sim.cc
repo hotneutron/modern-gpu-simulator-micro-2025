@@ -910,6 +910,15 @@ void memory_config::reg_options(class OptionParser *opp) {
                          "check, so icnt reply BW accounting is unchanged.",
                          "1");
 
+  option_parser_register(opp, "-gpgpu_icnt_to_l2_pop_per_cycle", OPT_UINT32,
+                         &gpgpu_icnt_to_l2_pop_per_cycle,
+                         "Opt6: max request mf popped from the icnt (xbar out_buffer) "
+                         "into each L2 sub-partition per L2 tick. 1 = current behavior. "
+                         "Paired with -icnt_grant_passes_per_cycle so the faster icnt "
+                         "injection drain does not just relocate the stall to the "
+                         "icnt->L2 pop; each pop still respects sub_partition full().",
+                         "1");
+
   option_parser_register(opp, "-l2_ideal", OPT_BOOL, &l2_ideal,
                          "Use a ideal L2 cache that always hit", "0");
   option_parser_register(opp, "-gpgpu_cache:dl2", OPT_CSTR,
@@ -2463,6 +2472,21 @@ gpgpu_sim::gpgpu_sim(const gpgpu_sim_config &config, gpgpu_context *ctx)
 
   gpu_stall_dramfull = 0;
   gpu_stall_icnt2sh = 0;
+  gpu_icnt_to_l2_pops_total = 0;
+  gpu_icnt_to_l2_extra_pops = 0;
+  // Opt6 early boot confirmation (once): mirror the icnt grant-passes boot log so a 12h
+  // run can verify the paired icnt->L2 pop knob is actually enabled in the first seconds.
+  {
+    static bool logged_icnt_pop_knob = false;
+    if (!logged_icnt_pop_knob &&
+        m_memory_config->gpgpu_icnt_to_l2_pop_per_cycle > 1) {
+      std::cerr << "[ICNT->L2] gpgpu_icnt_to_l2_pop_per_cycle = "
+                << m_memory_config->gpgpu_icnt_to_l2_pop_per_cycle
+                << " (>1: multi-pop downstream drain enabled, paired with "
+                << "icnt_grant_passes_per_cycle)" << std::endl;
+      logged_icnt_pop_knob = true;
+    }
+  }
   partiton_reqs_in_parallel = 0;
   partiton_reqs_in_parallel_total = 0;
   partiton_reqs_in_parallel_util = 0;
@@ -3361,6 +3385,11 @@ void gpgpu_sim::gpu_print_stat() {
   // performance counter for stalls due to congestion.
   printf("gpu_stall_dramfull = %d\n", gpu_stall_dramfull);
   printf("gpu_stall_icnt2sh    = %d\n", gpu_stall_icnt2sh);
+  // Opt6 icnt->L2 multi-pop: if -gpgpu_icnt_to_l2_pop_per_cycle > 1, extra_pops > 0 proves
+  // the downstream drain actually moved more packets (i.e. the icnt out_buffer was NOT the
+  // limiter). extra_pops ~= 0 means either the knob is off or L2 full() gated it.
+  printf("gpu_icnt_to_l2_pops_total = %llu\n", gpu_icnt_to_l2_pops_total);
+  printf("gpu_icnt_to_l2_extra_pops = %llu\n", gpu_icnt_to_l2_extra_pops);
 
   // printf("partiton_reqs_in_parallel = %lld\n", partiton_reqs_in_parallel);
   // printf("partiton_reqs_in_parallel_total    = %lld\n",
@@ -4139,22 +4168,41 @@ void gpgpu_sim::cycle() {
       // backed up) Note:This needs to be called in DRAM clock domain if there
       // is no L2 cache in the system In the worst case, we may need to push
       // SECTOR_CHUNCK_SIZE requests, so ensure you have enough buffer for them
-      if (m_memory_sub_partition[i]->full(SECTOR_CHUNCK_SIZE)) {
-        gpu_stall_dramfull++;
-      } else {
+      // Opt6: pop up to gpgpu_icnt_to_l2_pop_per_cycle requests from the icnt
+      // out_buffer into this sub-partition per L2 tick, so a faster icnt injection
+      // drain (-icnt_grant_passes_per_cycle) is absorbed here instead of backing up
+      // in the xbar out_buffer. Each pop re-checks full() (push may have filled it)
+      // and stops when the icnt has nothing (mf==NULL). GRID_BARRIER handling and
+      // cache_cycle stay once-per-tick, outside this pop loop.
+      unsigned pops = m_memory_config->gpgpu_icnt_to_l2_pop_per_cycle;
+      if (pops == 0) pops = 1;
+      for (unsigned p = 0; p < pops; ++p) {
+        if (m_memory_sub_partition[i]->full(SECTOR_CHUNCK_SIZE)) {
+          gpu_stall_dramfull++;
+          break;
+        }
         mem_fetch *mf = (mem_fetch *)icnt_pop(m_shader_config->mem2device(i), 0);
-        if(mf) {
-          if(mf->get_inst().op == GRID_BARRIER_OP) {
+        if (mf) {
+          if (mf->get_inst().op == GRID_BARRIER_OP) {
             std::unique_ptr<grid_barrier_notify_info> notifcation_res = register_grid_barrier_arrivement(mf);
             mf = nullptr;
-            if(notifcation_res) {
+            if (notifcation_res) {
               m_grid_barrier_notify_queue.push(std::move(notifcation_res));
             }
-          }else {
+          } else {
             partiton_reqs_in_parallel_per_cycle++;
           }
+          m_memory_sub_partition[i]->push(mf, gpu_sim_cycle + gpu_tot_sim_cycle);
+          gpu_icnt_to_l2_pops_total++;
+          if (p > 0) gpu_icnt_to_l2_extra_pops++;
+        } else {
+          // icnt out_buffer for this sub-partition is empty this tick; nothing
+          // more to pop. Preserve the original behavior of pushing a NULL once
+          // (harmless) only on the first pass so cache_cycle sees a consistent
+          // sub-partition state.
+          if (p == 0) m_memory_sub_partition[i]->push(mf, gpu_sim_cycle + gpu_tot_sim_cycle);
+          break;
         }
-        m_memory_sub_partition[i]->push(mf, gpu_sim_cycle + gpu_tot_sim_cycle);
       }
       m_memory_sub_partition[i]->cache_cycle(gpu_sim_cycle + gpu_tot_sim_cycle);
       if(m_config.g_power_simulation_enabled && (((gpu_tot_sim_cycle + gpu_sim_cycle) + 1) % m_config.gpu_stat_sample_freq == 0)) {

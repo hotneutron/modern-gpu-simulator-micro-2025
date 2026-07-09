@@ -371,6 +371,11 @@ class memory_config {
   // eject faster; each mf still passes icnt_has_buffer/icnt_push, so the icnt
   // reply-bandwidth accounting is untouched (exp1 vs exp3 stay separable).
   unsigned gpgpu_l2_reply_drain_per_cycle;
+  // Opt6: max request mf popped from the icnt xbar out_buffer into each L2 sub-partition
+  // per L2 tick. Default 1 = current behavior. Paired with -icnt_grant_passes_per_cycle
+  // so the faster icnt injection drain is actually absorbed by L2 instead of relocating
+  // the stall to the icnt->L2 pop; each pop still respects sub_partition full().
+  unsigned gpgpu_icnt_to_l2_pop_per_cycle;
   unsigned gpgpu_frfcfs_dram_sched_queue_size;
   unsigned gpgpu_dram_return_queue_size;
   enum dram_ctrl_t scheduler_type;
@@ -1025,6 +1030,10 @@ class gpgpu_sim : public gpgpu_t {
   // performance counter for stalls due to congestion.
   unsigned int gpu_stall_dramfull;
   unsigned int gpu_stall_icnt2sh;
+  // Opt6 icnt->L2 multi-pop instrumentation: total mfs popped from icnt into L2, and how
+  // many of those were extra pops (2nd+ pop in a tick, = throughput the pop knob added).
+  unsigned long long gpu_icnt_to_l2_pops_total;
+  unsigned long long gpu_icnt_to_l2_extra_pops;
   unsigned long long partiton_reqs_in_parallel;
   unsigned long long partiton_reqs_in_parallel_total;
   unsigned long long partiton_reqs_in_parallel_util;

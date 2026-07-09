@@ -533,6 +533,33 @@ config knob (default 1 = bit-identical):
 next stage to absorb the relocation — but only the run confirms it. Run bwd K10 first (REQ full 355,
 worst case); fwd (REQ full ~45K-equivalent, milder) can share the same run. Keep the
 `L2_TMA_true_hit_rate` realism check unchanged (this knob does not touch addressing).
+**§4.9 pre-emptively widens the very stage this risk would relocate to.**
+
+## 4.9 Paired downstream drain: icnt->L2 multi-pop (IMPLEMENTED, same run)
+
+Concern (user): if grant-passes drains the SM's REQ in_buffer 4x faster, the packets just pile in
+the xbar **out_buffer**, because the next stage — popping the out_buffer into each L2 sub-partition —
+was itself only **1 pop / sub-partition / L2-tick** ([gpu-sim.cc L2 clock loop](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/gpu-sim.cc#L4146)). This is exactly the §4.5 "stall relocates one stage downstream" failure mode. So both stages are widened in the same run instead of burning a 12h run to discover the relocation.
+
+Static check of the downstream path (why it was the natural next limiter):
+- `icnt_pop` pulls **1 packet** from the xbar out_buffer per call ([local_interconnect.cc Pop](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/local_interconnect.cc#L92-L102)); it is called **once per sub-partition per L2 tick** in the L2 clock loop ([gpu-sim.cc:4146](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/gpu-sim.cc#L4146)).
+- The gate is `m_memory_sub_partition[i]->full(SECTOR_CHUNCK_SIZE)` → `gpu_stall_dramfull++`; the code comment already notes "in the worst case we may need to push SECTOR_CHUNCK_SIZE requests", so a 4-wide pop matches the intended design.
+- ICNT clock and L2 clock are both 1800MHz (`-gpgpu_clock_domains 1800:1800:1800:8000`), so at 4-in / 1-out the out_buffer would fill at ~3 packets/tick — a real relocation risk.
+
+Fix (config knob, default 1 = bit-identical):
+- **`-gpgpu_icnt_to_l2_pop_per_cycle N`** ([gpu-sim.cc register](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/gpu-sim.cc#L913-L920), member on `memory_config` [gpu-sim.h](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/gpu-sim.h#L374-L378)). The L2-tick loop now pops up to N request mfs per sub-partition, **re-checking `full(SECTOR_CHUNCK_SIZE)` before each pop** and stopping when the out_buffer is empty (mf==NULL). `cache_cycle`, GRID_BARRIER handling and power stats stay **once per tick** (outside the pop loop) so no per-cycle stat is double-counted. Default 1 reproduces the original single-pop flow exactly.
+- H100 config set to **`-gpgpu_icnt_to_l2_pop_per_cycle 4`** ([gpgpusim.config](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/configs/tested-cfgs/SM90_H100_L2_50MB_80GB/gpgpusim.config#L188)), matching the 4x32B sector line and the grant-passes width.
+- Honest: this does NOT create bandwidth — every pop still respects `full()`, so if L2/DRAM cannot accept, `gpu_stall_dramfull` rises instead (visible). It only removes the artificial 1-pop/tick serialization.
+
+Instrumentation added for the 12h run (both levers now fully observable):
+- Boot logs (stderr, once): `[ICNT] grant_passes_per_cycle=4` and `[ICNT->L2] gpgpu_icnt_to_l2_pop_per_cycle=4` — confirm both knobs are live in the first seconds.
+- Lever-1 (grant passes): `Req_Network_avg_passes_per_active_cycle`, `Req_Network_extra_pass_grants_total` (>1 / >0 proves it drained more).
+- Lever-2 (icnt->L2 pop): `gpu_icnt_to_l2_pops_total`, `gpu_icnt_to_l2_extra_pops` (>0 proves the downstream actually moved more, i.e. out_buffer was not the limiter).
+- Relocation detectors: `Req_Network_in_buffer_full` (355 baseline), `Req_Network_out_buffer_full` (0.20 baseline), `gpu_stall_dramfull` (1.42M baseline) — read together they show exactly where the stall ends up.
+
+**Files:** `local_interconnect.{h,cc}`, `icnt_wrapper.cc` (lever 1); `gpu-sim.{cc,h}` (lever 2 + pop counters); `gpgpusim.config` (both knobs=4). No tracer/trace change; rebuild required.
+
+**Judgment rule after the run:** success = `gpu_sim_cycle`↓ with `avg_icnt_full_cycles`↓ and neither `out_buffer_full` nor `gpu_stall_dramfull` exploding. If cycles are flat and `gpu_stall_dramfull` explodes → the limiter moved to the L2 admission / icnt_L2 queue depth (next lever: `-gpgpu_dram_partition_queues` 1st field), and the counters above localize it without another exploratory run.
 
 
 ## 5. Rollback history & risks (why Phase A failed, must not repeat)
