@@ -1,6 +1,7 @@
 # Plan: Fast FA3 Simulation via CTA Subsetting, Validated by Per-PC Stall Fit
 
 **Date:** 2026-06-29, redesigned 2026-07-07, risk-hardened 2026-07-08. **Branch:** `accorde_npu` (~/accorde). **Status:** plan + verification spikes; no simulator code yet.
+_(Renamed from `phased_ncu_gcom_compare_early_term.md` → `CTA_SAMPLING.md` on 2026-07-08: intra-kernel phased run was ruled infeasible (P9); CTA subsetting is the mechanism.)_
 
 ## Progress summary (2026-07-08)
 
