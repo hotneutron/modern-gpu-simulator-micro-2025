@@ -186,6 +186,41 @@ agu_base   = global_base + tile_idx*tile_bytes + agu_index*128
 - Gate behind the existing `-tma_real_base_addr_enable` (M2 is the coord half of the same feature). No separate `-tma_real_coords_enable` flag exists — M2 is always combined with real base.
 - Verification: rerun fwd K5 + bwd K10. Expect `L2_TMA_true_hit_rate` to drop from ~0.99 toward the HW direction (fwd 0.70 / bwd 0.82) as per-CTA tile spread restores cold misses. Judge by direction, not exact match (the wrap + CTA-count cap is an approximation).
 
+### M2/M2.5 measured result (fwd K5 `.o31` / bwd K10 `.o14`, 2026-07-09) — hit rate dropped toward HW
+
+Both kernels ran to completion with `-tma_real_base_addr_enable 1 -tma_operand_addr_tiling_enable 1`
+(CTA-indexed spread build), **clean exit, 0 crash/assert**.
+
+| metric | M1 base-only | **M2/M2.5 (CTA-indexed)** | vs Opt 5 (progression) | HW target |
+|---|---|---|---|---|
+| fwd K5 `L2_TMA_true_hit_rate` | 0.9854 | **0.9461** | — | ~0.70 |
+| bwd K10 `L2_TMA_true_hit_rate` | 0.9785 | **0.8718** | — | ~0.82 |
+| fwd K5 `gpu_sim_cycle` | 142,764 | 145,855 | Opt5 149,727 → **-2.6%** | 67,696 |
+| bwd K10 `gpu_sim_cycle` | 276,109 | 290,572 | Opt5 241,425 → **+20.4%** | 132,901 |
+| UBLKRED real_base coverage | synthetic (M1) | **6/6 sites, 6528/6528 cmds real** | — | — |
+
+> Two baselines are shown deliberately: **M1 base-only** (the same address feature without the
+> tile spread) isolates what CTA-indexing changed, while **Opt 5** is the optimization-progression
+> baseline used in FA3_progress. Against Opt 5, fwd went **down** 2.6% and bwd went **up** 20.4%.
+
+- **bwd 0.8718 ≈ HW 0.82** — essentially on target. **fwd 0.9461** moved the right direction but is
+  still high: with 132 CTAs and 384 tiles, distinct tiles cap at ~132/tensor (confirmed in-run:
+  `first-request` distinct 24 → 132), so the other ~252 tiles' cold misses are still missing. This
+  is the documented CTA-count-cap approximation limit; closing it fully would need real coords
+  (approach B) or a finer spread — parked for now since bwd is already on target and the axis of
+  interest (below) is memory-bound regardless.
+- **Cycle deltas vs Opt 5: fwd -2.6% / bwd +20.4%** (vs the M1 base-only run it is +2.2% / +5.2%,
+  but the progression baseline is Opt 5). The gate is L2-hit realism, not cycle sign: bwd rising is
+  the *expected, correct* "no fake wins" outcome per §5 Risk 4 (fake ~0.98 locality → real DRAM
+  round-trips); fwd's incidental drop is a side-effect of the changed L2/reply pressure, not a
+  claimed win. This M2/M2.5 baseline is now the trustworthy starting point for the actual
+  cycle-reduction work.
+- **TMA Phase3 timing (bwd, per-SM avg):** `avg_drain_cycles ≈ 2,600` vs `avg_emit_span ≈ 1,260` —
+  **drain (memory round-trip) dominates emit (injection) ~2x**, and now on *realistic* traffic
+  (hit 0.87). This re-opens the §4.5 reply-path / drain axis that was previously un-judgeable on
+  fake locality. That, plus `wait_barrier` (~9.5% both) and bwd `tma_flush` (14.66%), is the next
+  lever — see TMA_LATENCY_INJECTION_H100.md.
+
 ### M2.5 — UBLKRED/UBLKCP **real base + mock tiling** (CHOSEN, verified on the local trace)
 
 > **Scope confirmed: BOTH halves ship together as one feature.** (1) **real base** — anchor UBLKRED/UBLKCP at their true GMEM base; (2) **mock tiling** — reuse the M2 visit-counter for the per-transfer tile offset. Neither alone is enough: real base without tiling collapses all transfers onto the tensor's first tile (over-hit); tiling without real base cannot model cross-op L2 residency. Both are gated behind the single new flag `-tma_operand_addr_tiling_enable` (default off).

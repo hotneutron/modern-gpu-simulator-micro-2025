@@ -455,6 +455,34 @@ for re-testing after addresses are realistic. The next experiment is **TMA addre
 Arch TODO-2)**: it is now a prerequisite for interpreting the TMA bottleneck at all, not just a
 later refinement. Re-run this exp1/2/3 A/B after 6B before drawing any reply-path conclusion.
 
+## 4.6 Address realism landed — reply-path re-test is now unblocked (2026-07-09)
+
+The 6B/Arch-TODO-2 prerequisite is **done**: TMA real base + CTA-indexed tile spread (M2/M2.5) is
+implemented and verified (see TMA_BASE_ADDR.md §4.1 / TMA_exact_base_mapping_integration.md). L2
+hit rate is no longer fake — it dropped from ~0.98 toward HW:
+
+| | before (fake) | after (M2/M2.5) | HW |
+|---|---|---|---|
+| fwd K5 `L2_TMA_true_hit_rate` | 0.9854 | **0.9461** | 0.6958 |
+| bwd K10 `L2_TMA_true_hit_rate` | 0.9785 | **0.8718** | 0.8226 |
+
+So the §4.5 caveat ("all four A/B runs ran on fake ~98% locality → reply path cannot be judged") is
+now lifted. New evidence from the M2/M2.5 runs points the same way as §4.5's own prediction:
+
+- **`avg_drain_cycles ≈ 2,600` vs `avg_emit_span ≈ 1,260`** (bwd per-SM, `.e14` TMA Phase3) — the
+  transfer cost is dominated by **drain (waiting for responses)**, ~2x the injection span, and now
+  on *realistic* traffic. 6A (128B emission / injection bandwidth) is still ruled out; the cost is
+  the memory-return path.
+- SM-idle on the realistic baseline: `wait_barrier` ≈ **9.58% (fwd) / 9.53% (bwd)**, bwd
+  `tma_flush` ≈ **14.66%** — the TMA-completion axis is still the #1 recoverable lever.
+
+**Next step:** re-run the exp1/2/3 reply-path A/B matrix (§4.5 "A/B run matrix") on this M2/M2.5
+baseline. The prior result (depth/drain move `output_full` but not cycles, stall relocates to
+`gpu_stall_icnt2sh`) must be re-measured now that misses actually go to DRAM and spread the reply
+traffic in time. Judge by `gpu_sim_cycle` + `wait_barrier`/`tma_flush` SM-idle, and keep the
+`L2_TMA_true_hit_rate` realism check (must stay near HW, not re-inflate). This is the start of the
+actual cycle-reduction phase (tracked as ongoing in FA3_progress.md).
+
 
 ## 5. Rollback history & risks (why Phase A failed, must not repeat)
 

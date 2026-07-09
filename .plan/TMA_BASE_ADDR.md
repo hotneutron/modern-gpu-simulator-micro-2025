@@ -1473,6 +1473,26 @@ Files: `tma_types.h`, `gpu-sim.cc` (loader + `lookup_tma_site_metadata`),
 4. Record cycle deltas + L2 hit rate vs Opt 5 and vs the reply-path 6A results in
    `FA3_progress.md` (this supersedes Arch TODO-2).
 
+### 4.1 RESULT (M2/M2.5 CTA-indexed spread, fwd K5 `.o31` / bwd K10 `.o14`, 2026-07-09)
+
+The real-base + CTA-indexed tile spread ran to completion on both kernels (clean exit, 0
+crash/assert). The L2-hit realism gate (§4.2) **passes in the intended direction**:
+
+| metric | before (M1 base-only) | **after (M2/M2.5)** | HW target | verdict |
+|---|---|---|---|---|
+| fwd K5 `L2_TMA_true_hit_rate` | 0.9854 | **0.9461** | 0.6958 | ↓ toward HW (still high, CTA-cap) |
+| bwd K10 `L2_TMA_true_hit_rate` | 0.9785 | **0.8718** | 0.8226 | ↓ **on target** |
+| fwd K5 `gpu_sim_cycle` | 142,764 | 145,855 | 67,696 | vs Opt 5 (149,727): **-2.6%** — incidental side-effect, not a claimed win |
+| bwd K10 `gpu_sim_cycle` | 276,109 | 290,572 | 132,901 | vs Opt 5 (241,425): **+20.4%** = accuracy (Risk 4) |
+
+- Milestone-1 hotspot is gone and Milestone-2 (coords) is realized as the CTA-indexed
+  approximation (see TMA_exact_base_mapping_integration.md §"M2 chosen approach"). The residual
+  fwd over-hit is the **CTA-count cap** (132 CTAs < 384 tiles → ≤132 distinct tiles/tensor);
+  bwd is already on target so this is not currently blocking.
+- The cycle rise is the expected "no fake wins" accuracy tradeoff, not a regression. This is now
+  the trustworthy baseline for the real cycle-reduction work (reply-path / drain axis re-opened,
+  see TMA_LATENCY_INJECTION_H100.md §4.6).
+
 ## 5. Sequencing
 
 The reply-path A/B matrix runs on a separate server and is **independent of the

@@ -1,6 +1,12 @@
 # Opt candidate — ISSUE_CONTROL latch depth (non-TMA)
 
-> **Status: investigation only (static analysis done, NOT yet gated by measurement).**
+> **Status: PARKED (gate failed on measurement, 2026-07-09).** The SM-level gate below was
+> evaluated on the M2/M2.5 baseline runs and **failed**: `sm_idle_all_blocked_by_tensor` is only
+> **0.67% (fwd K5) / 1.13% (bwd K10)**, while the per-subcore `next_stage_not_available` is
+> 23.23% / 12.88%. This is the exact per-subcore over-count mirage that parked the WGMMA
+> `fu_occupied` opt — increasing the latch depth would improve the per-subcore counter but not
+> move cycles. **Do not implement.** The static analysis below is kept for the record.
+>
 > This is a **non-TMA** cycle-reduction candidate found while the M2/M2.5 TMA address runs
 > were in flight. It is recorded here so it is not re-investigated blindly. **Do not implement
 > before the SM-level gate below passes** — it may be the same per-subcore over-count mirage that
@@ -70,6 +76,20 @@ Decision rule:
 - If `sm_idle_all_blocked_by_tensor` is small (< ~3%): the depth-1 latch is **not** the SM-level
   bottleneck → **park** this candidate (same as WGMMA fu_occupied).
 - If it is meaningful (>= ~3–5%): the latch-depth fix below is worth implementing.
+
+### Gate result (measured on the M2/M2.5 baseline, 2026-07-09) — FAILED → PARK
+
+| metric | fwd K5 (`.o31`) | bwd K10 (`.o14`) | reading |
+|---|---|---|---|
+| `next_stage_not_available` (per-subcore) | **23.23%** | 12.88% | looks big |
+| **`sm_idle_all_blocked_by_tensor` (SM-level)** | **0.67%** | **1.13%** | the truth |
+| `sm_all_subcores_idle` (sum) | 18.06% | 17.61% | — |
+
+The SM-level loss is **0.67% / 1.13% ≪ 3%**, i.e. the per-subcore `next_stage_not_available`
+over-counts the real loss ~20–35x — the depth-1 ISSUE_CONTROL latch is almost never the reason
+the *whole SM* stalls (another subcore is issuing). **Gate failed → parked.** Raising the latch
+depth would move the per-subcore counter but not `gpu_sim_cycle`. This is the identical mirage that
+parked WGMMA `fu_occupied` (0.65% / 1.59% SM-level). Not worth the two-hardcode fix below.
 
 ## 4. Implementation risk (if the gate passes) — infra supports depth>1, but 2 hardcodes break it
 
