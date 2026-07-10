@@ -307,6 +307,24 @@ void functional_unit::cycle() {
     }
   }
 
+  // [throughput metric] Tensor-pipe active-cycle counter (observe-only, timing-neutral).
+  // NCU "Compute (SM) Throughput" is dominated by the tensor/WGMMA pipe for FA3. Existing
+  // counters only track cycles where OTHER warps were blocked BY tensor, which under-counts
+  // when tensor runs alone. Here we count every cycle this tensor FU is actually doing work
+  // (an inst in-flight in its pipeline, in its dispatch reg, or held by the WGMMA
+  // initiation-interval lockout). Guarded to the TENSOR FU by name (created "TENSOR" in
+  // subcore.cc).
+  if (m_name == "TENSOR" && m_sm != NULL) {
+    bool tensor_busy = (m_active_insts_in_pipeline > 0) ||
+                       (!m_dispatch_reg->empty()) ||
+                       (m_dispatch_pending_reserved_cycles > 0);
+    if (tensor_busy) {
+      auto it = m_sm->m_sm_stats.m_stats_map.find("total_num_cycles_tensor_pipe_active");
+      if (it != m_sm->m_sm_stats.m_stats_map.end())
+        it->second->increment_with_integer(1);
+    }
+  }
+
   occupied >>= 1;
 }
 

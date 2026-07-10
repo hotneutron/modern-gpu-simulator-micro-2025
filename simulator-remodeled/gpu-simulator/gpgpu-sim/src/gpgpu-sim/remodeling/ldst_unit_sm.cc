@@ -748,6 +748,13 @@ void ldst_unit_sm::issue(register_set_uniptr &reg_set, unsigned int icnt_id) {
     m_sm->m_sm_stats.m_stats_map["total_conflicts_shared_instructions"]->increment_with_integer(
         inst->get_num_cycles());
     m_sm->m_sm_stats.m_stats_map["total_shared_instructions"]->increment_with_integer(1);
+    // [throughput metric] shared-memory served bytes = active lanes * per-thread data size.
+    // On Hopper L1 data cache + shared memory are the SAME unified L1TEX unit, so NCU
+    // "L1/TEX Cache Throughput" folds shared traffic together with L1D. This counter feeds
+    // the shared component of the L1TEX throughput% metric (L1D bytes already tracked via
+    // core cache stats). Observe-only.
+    m_sm->m_sm_stats.m_stats_map["total_shared_access_bytes"]->increment_with_integer(
+        (unsigned long long)inst->active_count() * inst->data_size);
   }
 
   inst->op_pipe = MEM__OP;

@@ -705,6 +705,268 @@ exceeds *its own unit's* service rate above.
   not DRAM. If it explodes after the two levers, the next knob is `-gpgpu_dram_partition_queues` field1.
 - Stages [2] and [3] are the same xbar_router (in/out), both cap 64, tuned by separate knobs.
 
+## 4.11 HW validation anchors (NCU) — which HW metric each queue-rate maps to, and what the numbers say
+
+Source: `nv_reports/h100/flashattn-fa3-bf16-bwd-causal-b1-s2048-hd64-nh24_full_rpt.csv` (H100 SXM,
+CC9.0). Per-kernel, because fwd (K5, `FlashAttnFwdSm90`) and bwd (K10, `FlashAttnBwdSm90`) behave
+very differently and MUST be judged separately.
+
+### Stage -> HW metric mapping
+| sim stage | sim rate unit | closest HW reality | NCU metric to compare |
+|---|---|---|---|
+| [1] TMA issue | 128B line/cyc | TMA engine issue (no such serial cap in HW) | (no direct NCU metric -> likely a sim artifact) |
+| [2][3] SM<->L2 icnt | packet/cyc | SM->L2 crossbar / NoC BW | L1/TEX Cache Throughput, L2 Cache Throughput |
+| [5] L2 bank | access/cyc | L2 slice throughput | L2 Cache Throughput |
+| [6][7] DRAM arbiter | req/cyc | memory-controller channel | DRAM Throughput |
+| [8] DRAM | column cmd | HBM3 physical BW | **DRAM Throughput (pct of peak)** = primary anchor |
+
+### HW vs sim baseline — FWD (K5)
+| metric | HW (NCU) | sim baseline | note |
+|---|---|---|---|
+| Elapsed Cycles | 67,696 | 145,855 | sim 2.15x over |
+| DRAM Throughput | **12.09%** | ~1.9% (62.8 GB/s / 3.35TB/s); bw_util(active) 2.45% | sim ~6x LOWER |
+| L2 Hit Rate | 69.58% | 94.61% | sim over (fwd CTA-count-cap approximation limit) |
+| L2 Cache Throughput | 22.68% | n/a (no equiv %% metric) | — |
+| L1/TEX Cache Throughput | 31.99% | n/a | — |
+| Compute (SM) Throughput | 43.04% | n/a | — |
+| Memory Throughput | 28.84% | n/a | — |
+
+### HW vs sim baseline — BWD (K10)
+| metric | HW (NCU) | sim baseline | note |
+|---|---|---|---|
+| Elapsed Cycles | 132,901 | 290,572 | sim 2.19x over |
+| DRAM Throughput | **14.85%** | ~4.75% (159.1 GB/s / 3.35TB/s); bw_util(active) 6.21% | sim ~3x LOWER |
+| L2 Hit Rate | 82.26% | 87.18% | close (M2/M2.5 addressing success) |
+| L2 Cache Throughput | 48.52% | n/a | HW L2 quite busy |
+| L1/TEX Cache Throughput | **62.59%** | n/a | **HW's highest pipe = the real hot spot** |
+| Compute (SM) Throughput | 48.45% | n/a | compute also ~half |
+| Memory Throughput | 56.58% | n/a | memory pipe > half busy |
+
+> DRAM %% caveat: HW uses NCU pct-of-peak; sim has no pct-of-peak counter, so sim DRAM is shown two
+> ways — (a) `DRAM_BW_total` GB/s divided by H100 HBM3 peak ~3.35 TB/s, and (b) `bw_util` (fraction of
+> DRAM *active* cycles). Definitions differ, but BOTH agree sim uses far less DRAM than HW. Sim has no
+> NCU-equivalent L2/L1TEX throughput %%, so those axes are n/a (can't be directly compared).
+
+### Findings (what this proves)
+1. **HW is NOT DRAM-bandwidth-bound** (fwd 12% / bwd 15% DRAM). So "DRAM is idle" is TRUE on real HW
+   too — the injection/queue diagnosis is not contradicted by HW.
+2. **Sim uses even LESS DRAM than HW** (fwd ~6x, bwd ~3x lower). This is exactly the fingerprint of
+   requests being stuck in the icnt/L2 queues and not reaching DRAM — matching the [2]/[4] injection
+   bottleneck. So widening the queues (the two levers) should move sim DRAM% UP toward HW, which is an
+   accuracy improvement, not a cheat.
+3. **HW's real hot spot is the on-chip memory path, not DRAM.** bwd: L1/TEX 62.6%, Memory 56.6%,
+   L2 48.5%, Compute 48.5% are all high together (balanced), while DRAM is only 15%. "Memory pipe busy
+   but DRAM idle" == the bottleneck lives in L2 / L1TEX / interconnect — the same region the levers
+   target.
+4. **fwd vs bwd differ.** fwd L2-hit is still over-modeled (0.946 vs HW 0.696, the CTA-cap limit) and
+   fwd DRAM gap is larger (6x); bwd L2-hit is on target (0.872 vs 0.823) and DRAM gap is 3x. Expect a
+   bigger, cleaner lever effect on bwd than fwd.
+
+### Lever judgment thresholds (fill "after-lever" once runs finish)
+The two queue levers are a **timing** change only (see 4.12): they must cut cycles WITHOUT changing
+work. So judge on two separate axes.
+
+| gate | axis | FWD K5 | BWD K10 |
+|---|---|---|---|
+| `gpu_sim_cycle` -> HW | timing (lever's job) | 145,855 -> toward 67,696 | 290,572 -> toward 132,901 |
+| DRAM bytes (must NOT change vs baseline) | work (hit-rate's job) | ~5.09 MB | ~25.68 MB |
+| L2 sectors (must NOT change) | work | 3,356,320 | 11,213,151 |
+| `L2_TMA_true_hit_rate` (must hold) | work | 0.9461 | 0.8718 |
+
+- **Lever success = `gpu_sim_cycle` drops toward HW WHILE DRAM bytes / L2 sectors / hit rate stay put.**
+  A lever that changed the work counts would be a bug, not a win.
+- **Do NOT use DRAM% (bytes/cycle) as a lever gate.** Cutting cycles raises DRAM% mechanically even
+  though bytes are unchanged; that is a side-effect of the timing fix, not an accuracy gain. DRAM% is a
+  final cross-check (4.12 TODO), read only after cycles converge.
+- **The remaining DRAM-work gap (fwd 0.26x, bwd 0.56x) is a hit-rate / addressing problem, not a lever
+  problem** — track it under M2/M2.5, not here.
+- **Relocation (per 4.9):** if cycle is flat, use the 4.10 counter->stage table (`out_buffer_full`,
+  `gpu_stall_dramfull`, `bw_util`) to see where the stall moved.
+
+### After-lever result — BWD K10 (`grant_passes=4`, `icnt_to_l2_pop=4`) — 2026-07-09
+
+This is the first completed behavior run with BOTH queue levers enabled. It confirms the intended
+effect: **work stayed invariant, timing improved, and the bottleneck relocated downstream from
+[2]/[3] to [4]/[5].**
+
+| metric | baseline | after lever | judgment |
+|---|---|---|---|
+| `gpu_sim_cycle` | 290,572 | **262,744** | **-9.6%** -> timing improved |
+| `L2_TMA_true_hit_rate` | 0.8718 | **0.8701** | unchanged -> **work invariant** |
+| `Req_Network_in_buffer_full_per_cycle` | 355.0 | **70.9** | **-80%** -> primary REQ injection bottleneck relieved |
+| `Req_Network_out_buffer_full_per_cycle` | 0.20 | **2.51** | small rise, still low -> no meaningful relocation to [3] |
+| `gpu_stall_dramfull` | 1.42M | **1.35M** | still huge -> downstream backpressure remains |
+| `gpu_stall_icnt2sh` | 1.82M | **0.51M** | **-72%** -> reply-side pressure also dropped |
+| `L2_TMA_output_full_cycles` | 1.39M | **0.47M** | **-66%** -> less reply/output congestion |
+
+**Did the two levers actually fire?** Yes, decisively.
+- `Req_Network_avg_passes_per_active_cycle = 3.74` -> lever 1 reached almost the full configured 4
+  passes/cycle.
+- `Req_Network_extra_pass_grants_total = 8.2M` -> later iSLIP passes granted many additional packets,
+  so lever 1 was not just configured; it was materially used.
+- `gpu_icnt_to_l2_extra_pops = 7.4M / 11.0M total` -> about **67%** of all icnt->L2 pops came from
+  the extra downstream pops, so lever 2 also materially worked.
+
+**Interpretation.**
+1. **The two levers succeeded on their intended axis.** `Req in_buffer_full` collapsed from 355 to 71,
+   cycle count dropped 9.6%, and the key work counters stayed fixed (`L2_TMA_true_hit_rate` unchanged,
+   L2 accesses/read-bytes/write-bytes within ~1%). This is exactly the 4.12 rule: **timing changed,
+   work did not**.
+2. **The user's predicted "relocation" did happen, but NOT to `out_buffer`.** `Req out_buffer_full`
+   rose only from 0.20 to 2.51, still tiny. So [3] is not the new limiter.
+3. **The remaining stall moved to the L2-entry / L2-bank region.** `gpu_stall_dramfull` stayed huge
+   (1.35M) even after the REQ-side lever succeeded. Per the 4.10 stage map, that means the limiter is
+   now around **[4] `m_icnt_L2_queue` backpressure and/or [5] L2 bank/data-port service rate**.
+4. **Reply-path counters improved as a consequence, not as the root cause.** `gpu_stall_icnt2sh` and
+   `L2_TMA_output_full_cycles` both fell sharply because once injection pressure eased, the whole pipe
+   stopped bunching up behind it. This supports the earlier conclusion that reply-path tuning was not
+   the primary first lever.
+
+**Work-axis confirmation (same run).**
+- `L2_total_cache_accesses`: 11,213,151 -> 11,310,291 (**+0.9%**, effectively unchanged)
+- `L2_cache_read_bytes`: 239.3 MB -> 242.3 MB (**+1.3%**, effectively unchanged)
+- `L2_cache_write_bytes`: 119.5 MB -> 119.6 MB (unchanged)
+- `DRAM_BW_total_GBps`: 159.1 -> 176.7 GB/s (**higher only because cycles fell**; do NOT misread this
+  as more DRAM work)
+
+**Immediate conclusion.**
+- The queue levers are a **real partial success**.
+- They remove most of the [2]/[3] artificial injection throttling.
+- They do **not** fully close the cycle gap because the next limiter is now downstream, in **[4]/[5]**.
+
+**Next lever (based on this run).**
+- Do **not** spend another 12h run just to "see if L2 matters" — this run already shows it does.
+- The next experiment should target **L2 service rate**, not reply-path or more REQ-side widening.
+- Most likely candidates:
+  1. **[5] L2 data-port width / service bandwidth** (`-gpgpu_cache:dl2` last field = `m_data_port_width`)
+  2. **[4] L2-input queue capacity** (first field of `-gpgpu_dram_partition_queues`)
+- Important caveat before the L2-port sweep: the current `fill_cycles =
+  atom_sz / m_data_port_width` path uses floor division, so simply increasing `m_data_port_width`
+  above the atom size without a small code fix can accidentally make fill-port cost zero. Treat the
+  next L2-port experiment as **config + correctness guard**, not config-only.
+
+**Throughput metrics note.**
+- The completed `.o15` run above was built **before** the new `Throughput_*` counters were added, so
+  those lines do not appear in this log.
+- Therefore this run is enough to prove **timing/work correctness** of the two queue levers, but a
+  rebuild + rerun is still required to collect the new DRAM/L2/L1TEX/Compute throughput outputs for
+  the final HW-facing comparison.
+
+## 4.12 Cycle-INDEPENDENT "work done" comparison (the trustworthy anchor) — 2026-07-09
+
+Throughput% (bytes/cycle) is a TRAP for validation: sim runs ~2x more cycles, so any bytes/cycle
+metric is auto-halved purely because the denominator (cycles) is larger. That is circular — the
+metric we would use to validate cycles depends on cycles. So compare **absolute work counts**
+(sectors, bytes), which are cycle-independent, FIRST. If work matches HW, the model is right and the
+gap is purely timing.
+
+### Absolute work: HW (NCU raw sums) vs sim baseline
+NCU raw metrics from `ncu --import ...full_rpt.ncu-rep --page raw --metrics lts__t_sectors.sum,
+dram__bytes_read.sum,dram__bytes_write.sum` (main kernels only: FlashAttnFwdSm90 / FlashAttnBwdSm90).
+Sim DRAM bytes = `DRAM_BW_total_GBps * (gpu_sim_cycle / core_clock_1800MHz)` (the only honest sim DRAM
+figure; do NOT use `L2_miss * 128B` — L2 misses are 32B sectors, so that proxy over-counts ~4x and is
+WRONG, see pitfall below).
+
+| kernel | metric | HW (NCU) | sim | sim/HW | reading |
+|---|---|---|---|---|---|
+| FWD K5 | L2 sectors (32B) | 3,833,304 | 3,356,320 | **0.88** | request/addressing model accurate |
+| FWD K5 | DRAM bytes | 19.25 MB | 5.09 MB | **0.26** | sim sends 1/4 of HW to DRAM |
+| BWD K10 | L2 sectors (32B) | 10,111,818 | 11,213,151 | **1.11** | request/addressing model accurate |
+| BWD K10 | DRAM bytes | 45.91 MB | 25.68 MB | **0.56** | sim sends ~half of HW to DRAM |
+
+(sim L2 sectors = `(L2_cache_read_bytes + L2_cache_write_bytes)/32`; L2 accesses raw: fwd 3,356,320 /
+bwd 11,213,151.)
+
+### Findings (this REPLACES the 4.11 throughput-only reading where they conflict)
+1. **L2 work is accurate (0.88x / 1.11x).** The sector volume in/out of L2 matches HW within ~12% for
+   both kernels -> the addressing + request model (M2/M2.5) is correct; the sim is NOT generating the
+   wrong amount of memory traffic at L2.
+2. **DRAM work is set by L2 HIT RATE, not by the queues.** Total DRAM bytes = (L2 misses) x sector
+   size, i.e. it is a pure function of L2 hit rate; a queue only changes *when* those misses reach
+   DRAM, never *how many*. So the fact that sim DRAM bytes are low (fwd 0.26x, bwd 0.56x) is a
+   **hit-rate story, not a queue story**:
+   - bwd L2 hit: sim 0.872 vs HW 0.823 -> sim miss rate 12.8% < HW 17.7% (ratio 0.72). With L2 sectors
+     at 1.11x, expected DRAM ~= 1.11*0.72 = 0.80x; measured 0.56x (the extra gap is sim hit slightly
+     too high + writeback/RMW + BW back-calc error). Direction and cause = hit rate.
+   - Therefore closing the DRAM-work gap is the job of the **addressing model (M2/M2.5 hit rate)**, NOT
+     the queue levers. The fwd hit rate is still over-modeled (0.946 vs HW 0.696), which is exactly why
+     fwd DRAM work is the most off (0.26x).
+3. **The two queue levers change TIMING only, never total work.** Widening icnt/L2 queues cannot add
+   or remove a single DRAM byte. Their only legitimate goal is **fewer cycles for the same work**. A
+   prior draft of this section wrongly claimed the levers "move DRAM bytes up toward HW" — that is
+   impossible and has been removed.
+4. **This resolves the 4.11 apparent paradox.** 4.11 (throughput%) said "sim DRAM% lower than HW"; an
+   early `miss*128` proxy briefly suggested "sim DRAM 3.3x HIGHER". The real absolute bytes
+   (0.26x/0.56x) show sim under-drives DRAM, driven by hit rate. Note `DRAM% = bytes/cycle`, so a lever
+   that cuts cycles will *raise* DRAM% even though total bytes are unchanged — another reason DRAM%
+   alone is not a work metric.
+
+### Two independent validation axes (do not conflate)
+- **Work axis (cycle-independent): L2 sectors, DRAM bytes** -> owned by the **addressing / hit-rate
+  model (M2/M2.5)**. Fix here = better hit rate. Queues are irrelevant to this axis.
+- **Timing axis (cycles): `gpu_sim_cycle`, stall counters** -> owned by the **queue/interconnect
+  levers**. Fix here = fewer cycles for the SAME work. DRAM bytes must NOT change when a lever is
+  applied (if they do, something is wrong).
+
+### Pitfalls proven here (do not repeat)
+- **throughput% is cycle-contaminated** — never use bytes/cycle to judge a model whose cycle count is
+  itself wrong (~2x here). Use absolute sector/byte sums first; only once cycles are close does
+  throughput% become a valid "is each pipe as busy as HW" check.
+- **`L2_miss * 128B` is a wrong DRAM proxy** — L2 misses are 32B sectors, so it over-counts ~4x and
+  flipped the sign of the conclusion. Use `DRAM_BW_GBps * (cycle/clock)` (or a real DRAM byte counter).
+- **Unit discipline:** NCU `lts__t_sectors` = 32B sectors; sim `L2_total_cache_accesses` is an access
+  count (compare via bytes/32, not directly). Always reconcile units before comparing.
+- **Queues do not change work** — total DRAM bytes / L2 misses are fixed by hit rate; a queue lever is
+  only ever a *timing* change. Never justify a queue change by a work/byte metric.
+
+### What this does NOT yet tell us (open)
+- HW's real hot pipe is L1/TEX (62.6% bwd). Sim throughput% counters now exist (see 4.13) but are
+  cycle-contaminated until cycles converge, so the on-chip *utilization* comparison is only trustworthy
+  after the timing gap closes; the *work* comparison (this section) is valid now.
+
+## 4.13 Sim throughput% metrics IMPLEMENTED (final-comparison, read last) — 2026-07-09
+
+NCU-equivalent per-pipe throughput% counters were added to the simulator so the loop can be closed
+once cycles converge. **Each prints both the %% AND the absolute served count** — read the absolute
+count now (cycle-independent, 4.12), read the %% only after cycles are close (%% is bytes/cycle =
+cycle-contaminated, 4.12 pitfall 1).
+
+| metric | sim output key | served (numerator) | peak (denominator) | source |
+|---|---|---|---|---|
+| DRAM | `Throughput_DRAM_pct` / `Throughput_DRAM_served_bytes` | total_accesses * dram_atom_bytes | m_n_mem * dram_atom_bytes * dram_tot_sim_cycle | [mem_latency_stat.cc](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/mem_latency_stat.cc) (after DRAM_BW prints) |
+| L2 | `Throughput_L2_pct` / `Throughput_L2_served_bytes` | total_l2_css.bytes | m_n_mem_sub_partition * 32B * gpu_sim_cycle | [gpu-sim.cc](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/gpu-sim.cc) gpu_print_stat, inside L2 block |
+| L1/TEX | `Throughput_L1TEX_pct` / `Throughput_L1TEX_served_bytes (L1D=.. shared=..)` | core_cache_css.bytes (L1D) + total_shared_access_bytes | num_shader() * 128B * gpu_sim_cycle | gpu-sim.cc gpu_print_stat |
+| Compute (tensor) | `Throughput_ComputeTensor_pct` / `Throughput_ComputeTensor_active_cycles` | total_num_cycles_tensor_pipe_active | num_shader() * gpu_sim_cycle | gpu-sim.cc gpu_print_stat |
+
+New counters added (observe-only, timing-neutral, default present):
+- **`total_num_cycles_tensor_pipe_active`** — incremented in `functional_unit::cycle()` for the TENSOR
+  FU whenever it has work in flight / in dispatch / under WGMMA II-lockout. This is a true busy-cycle
+  count, unlike the existing `*_fu_occupied_tensor` which only counts cycles OTHER warps were blocked
+  by tensor (under-counts when tensor runs alone). Registered in gpu-sim.cc stat init.
+- **`total_shared_access_bytes`** — incremented in `ldst_unit_sm.cc` shared dispatch block as
+  `active_count() * data_size`. On Hopper L1D + shared memory are the SAME unified L1TEX unit, so
+  L1/TEX throughput folds L1D bytes (already tracked via core cache stats) + shared bytes together.
+
+Definitions / caveats:
+- **L1/TEX is unified (L1D + shared + texture).** HW does NOT separate them; NCU L1/TEX throughput is
+  the combined utilization. So sim L1TEX% = (L1D bytes + shared bytes) / peak. Texture is ~0 for FA3.
+  Non-TMA operators DO use L1D/shared, so this metric is necessary (TMA bypasses L1 to L2, counted at
+  L2/DRAM, not here).
+- **Compute% is the TENSOR pipe specifically** (WGMMA), the dominant compute for FA3 — not a general
+  SM issue-slot utilization. Peak = 1 tensor pipe per subcore, denominator uses per-SM cycles.
+- **Peak denominators are model-consistent approximations, not NCU-identical.** They use the sim's own
+  per-cycle service limits (32B/sub-partition, 128B/SM, 1 atom/channel, 1 tensor pipe/subcore), so a
+  sim-vs-sim (baseline vs after-lever) comparison is exact; sim-vs-HW% is directional (compare the
+  absolute served counts for exact HW comparison, 4.12).
+
+**How to use after a run:** (1) confirm absolute served counts vs NCU sums (4.12 anchor). (2) after
+cycles converge, compare the %% to NCU DRAM/L2/L1TEX/Compute throughput to confirm each pipe is as
+busy as HW. Before cycles converge, a lower sim %% is expected purely from the larger cycle
+denominator and is NOT an accuracy signal.
+
+
+
+
 
 ## 5. Rollback history & risks (why Phase A failed, must not repeat)
 

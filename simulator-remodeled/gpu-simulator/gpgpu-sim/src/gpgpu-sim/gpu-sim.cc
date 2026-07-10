@@ -2597,6 +2597,9 @@ void gpgpu_sim::create_gpu_per_sm_stats() {
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_l1d_instructions", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_conflicts_shared_instructions", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_shared_instructions", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  // [throughput metric] shared-memory served bytes (active lanes * data size), for the
+  // shared component of the L1/TEX throughput% (Hopper unified L1D+SMEM). Observe-only.
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_shared_access_bytes", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_shared_mem_accesses", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_ldst_unit_instructions", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_dp_instructions", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
@@ -2730,6 +2733,10 @@ void gpgpu_sim::create_gpu_per_sm_stats() {
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_tensor_fu_occupied_and_wait_barrier_coupled", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
   // (VII) tensor-only RF/latch conflict that extends the tensor re-issue lockout beyond static II.
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_tensor_add_extra_cycle_initiation_interval", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  // [throughput metric] tensor pipe active cycles (busy-cycle count, not a stall count) for
+  // the Compute(tensor) throughput% metric. Incremented in functional_unit::cycle() for the
+  // TENSOR FU when it has work in flight / dispatch / II-lockout. Observe-only, timing-neutral.
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_tensor_pipe_active", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
   // (V) SM-level: cycles where NO subcore issued anything; sub-variant where every non-issuing
   // subcore that had an eligible-but-blocked warp was blocked specifically by the tensor pipe.
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_sm_all_subcores_idle", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
@@ -3645,7 +3652,56 @@ void gpgpu_sim::gpu_print_stat() {
       printf("L2_total_cache_reservation_fail_breakdown:\n");
       l2_stats.print_fail_stats(stdout, "L2_cache_stats_fail_breakdown");
       total_l2_css.print_port_stats(stdout, "L2_cache");
+      // [throughput metric] L2%: served L2 bytes vs peak 32B/sub-partition/cycle.
+      // (Inside the L2 block because total_l2_css is scoped here.)
+      {
+        unsigned long long l2_served_bytes = (unsigned long long)total_l2_css.bytes;
+        double l2_peak_bytes = (double)m_memory_config->m_n_mem_sub_partition * 32.0 *
+                               (double)gpu_sim_cycle;
+        double l2_tp = (l2_peak_bytes > 0.0)
+                           ? 100.0 * (double)l2_served_bytes / l2_peak_bytes
+                           : 0.0;
+        printf("Throughput_L2_pct = %12.4lf\n", l2_tp);
+        printf("Throughput_L2_served_bytes = %llu\n", l2_served_bytes);
+      }
     }
+  }
+
+  // ============================================================================
+  // [throughput metrics] NCU-style pipe utilization = served_work / (peak_per_cycle *
+  // cycles) * 100. Read the ABSOLUTE served counts too (cycle-independent) — throughput%
+  // itself is cycle-contaminated (sim cycles ~2x HW), so compare absolute work first and
+  // only trust the % once cycles converge (see TMA_LATENCY_INJECTION_H100.md sec 4.12).
+  // DRAM% is printed separately in memlatstat_print (served DRAM bytes live there);
+  // L2% is printed inside the L2 block above (total_l2_css scope).
+  {
+    unsigned long long run_cycles = gpu_sim_cycle;  // this-launch cycles
+    unsigned n_sm = m_config.num_shader();
+    // ---- L1/TEX throughput%: L1D bytes + shared bytes (Hopper unified L1TEX) ----
+    unsigned long long l1d_bytes = (unsigned long long)core_cache_css.bytes;
+    unsigned long long shared_bytes =
+        m_gpu_per_sm_stats.m_stats_map.count("total_shared_access_bytes")
+            ? m_gpu_per_sm_stats.m_stats_map["total_shared_access_bytes"]->get_value()
+            : 0ULL;
+    unsigned long long l1tex_served_bytes = l1d_bytes + shared_bytes;
+    double l1tex_peak_bytes = (double)n_sm * 128.0 * (double)run_cycles;
+    double l1tex_tp = (l1tex_peak_bytes > 0.0)
+                          ? 100.0 * (double)l1tex_served_bytes / l1tex_peak_bytes
+                          : 0.0;
+    printf("Throughput_L1TEX_pct = %12.4lf\n", l1tex_tp);
+    printf("Throughput_L1TEX_served_bytes = %llu (L1D=%llu shared=%llu)\n",
+           l1tex_served_bytes, l1d_bytes, shared_bytes);
+    // ---- Compute(tensor) throughput%: tensor active cycles vs (n_sm * cycles) ----
+    unsigned long long tensor_active =
+        m_gpu_per_sm_stats.m_stats_map.count("total_num_cycles_tensor_pipe_active")
+            ? m_gpu_per_sm_stats.m_stats_map["total_num_cycles_tensor_pipe_active"]->get_value()
+            : 0ULL;
+    double tensor_peak = (double)n_sm * (double)run_cycles;  // 1 tensor pipe per subcore; per-SM cycles as denom
+    double tensor_tp = (tensor_peak > 0.0)
+                           ? 100.0 * (double)tensor_active / tensor_peak
+                           : 0.0;
+    printf("Throughput_ComputeTensor_pct = %12.4lf\n", tensor_tp);
+    printf("Throughput_ComputeTensor_active_cycles = %llu\n", tensor_active);
   }
 
   if (m_config.gpgpu_cflog_interval != 0) {
