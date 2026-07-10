@@ -852,6 +852,69 @@ effect: **work stayed invariant, timing improved, and the bottleneck relocated d
   rebuild + rerun is still required to collect the new DRAM/L2/L1TEX/Compute throughput outputs for
   the final HW-facing comparison.
 
+### 4.11.1 Next experiment direction (actionable) — L2 service-rate decision tree
+
+**Decisive finding now fixed in the plan.**
+- The real L2 service-rate knob already exists: `m_data_port_width` (`cache bytes/cycle`), parsed
+  from the **last field** of `-gpgpu_cache:dl2`.
+- Current H100 tested config uses `-gpgpu_cache:dl2 ... ,32:0,32`, so current L2 data-port width is
+  **32B/cycle**.
+
+**Important nuance (why not run config-only sweep immediately).**
+- Existence of the knob does **not** automatically mean "no code work needed":
+  1. Current TMA/L2 path is 32B sector-heavy (`atom_sz = 32B` in sector cache mode), so widening only
+     `m_data_port_width` may yield limited gain by itself.
+  2. `memory_sub_partition::cache_cycle()` still admits one queue-head access attempt per cycle; this
+     can cap realized throughput even if the internal data port is wider.
+  3. Current fill-port model uses floor division (`fill_cycles = atom_sz / m_data_port_width`), which
+     can become zero when `m_data_port_width > atom_sz`; that would create a non-physical "free fill"
+     artifact.
+
+**So the next run must be "config + correctness guard", not blind config-only.**
+
+#### Step A (small implementation guard; timing-model correctness)
+Before any 12h behavior run:
+1. Change fill-port occupancy to ceil division:
+   - from `fill_cycles = atom_sz / port_width`
+   - to `fill_cycles = ceil(atom_sz / port_width)`
+2. Align writeback data-port occupancy with the same ceil rule for consistency:
+   - from `modified_size / port_width`
+   - to `ceil(modified_size / port_width)`
+3. Keep HIT path as-is (already ceil-equivalent).
+
+This prevents accidental 0-cycle occupancy when sweeping `m_data_port_width` to 64/128.
+
+**Status now:** implemented. `gpu-cache.cc` now uses ceil-equivalent occupancy for fill-port and
+writeback data-port accounting, so the next `m_data_port_width=64` run will not get a false zero-cycle
+fill artifact from the old floor-division path.
+
+#### Step B (single decisive run, BWD K10 first)
+Use the same rebuilt binary and run only one controlled A/B on K10:
+- **A (control):** current `-gpgpu_cache:dl2 ... ,32:0,32`
+- **B (test):** `-gpgpu_cache:dl2 ... ,32:0,64`
+
+**Status now:** the tested H100 config has been advanced to the guarded **B** setting (`...,32:0,64`)
+for the next run. The already-recorded baseline/after-lever K10 results serve as the width=32 control.
+
+Read these outputs together:
+- timing: `gpu_sim_cycle`
+- work invariance: `L2_TMA_true_hit_rate`, `L2_total_cache_accesses`, `DRAM served bytes`
+- relocation: `gpu_stall_dramfull`, `L2_TMA_port_busy_cycles`, `L2_TMA_output_full_cycles`
+- HW-facing direction: `Throughput_L2_pct`, `Throughput_DRAM_pct` (plus served-byte counters)
+
+#### Step C (decision gate)
+1. If `gpu_sim_cycle` drops and `L2_TMA_port_busy_cycles` drops while work stays invariant:
+   - `m_data_port_width` is a real remaining limiter -> proceed to optional `64 -> 128` sweep.
+2. If cycle barely changes and `gpu_stall_dramfull` remains dominant:
+   - limiter is likely not width-only; move to explicit [4] admission-rate lever / multi-access path.
+3. Reject any run where work counters drift materially (that indicates model behavior changed, not a
+   pure timing fix).
+
+#### Why this order is optimal
+- Avoids burning multiple 12h runs for exploratory guesses.
+- Uses one guarded A/B to answer the main question decisively.
+- Preserves the 4.12 principle: **work first, timing second, throughput% last**.
+
 ## 4.12 Cycle-INDEPENDENT "work done" comparison (the trustworthy anchor) — 2026-07-09
 
 Throughput% (bytes/cycle) is a TRAP for validation: sim runs ~2x more cycles, so any bytes/cycle
