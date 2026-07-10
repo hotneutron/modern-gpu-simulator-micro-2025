@@ -42,9 +42,10 @@ class tma_unit_sm : public functional_unit_shared_sm_part {
   bool warp_has_outstanding_stores(unsigned int warp_id) const;
 
  private:
-  // Maximum number of bulk requests the TMA engine launches into the shared
-  // interconnect per cycle. Conservative first-model bandwidth bound.
-  static constexpr uint32_t kMaxRequestsPerCycle = 2;
+  // Max 128B AGU lines the mover injects into the shared SM->L2 port per cycle.
+  // Sourced from -gpgpu_tma_max_lines_per_cycle (m_config), HW-calibrated default 1
+  // (= 4 sector/clk = 124 byte/clk/SM). Was a hardcoded 2; see Opt6 4.11.4.
+  uint32_t max_lines_per_cycle() const;
 
   std::queue<TMACommand> m_command_queue;
   std::deque<TMATransferEntry> m_in_flight_transfers;

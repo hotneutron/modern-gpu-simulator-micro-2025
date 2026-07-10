@@ -1968,6 +1968,14 @@ void shader_core_config::reg_options(class OptionParser *opp) {
                          "instead of the synthetic address. Requires "
                          "-tma_real_base_addr_enable. On by default (M4). (default=1)",
                          "1");
+  option_parser_register(opp, "-gpgpu_tma_max_lines_per_cycle", OPT_UINT32,
+                         &gpgpu_tma_max_lines_per_cycle,
+                         "Opt6 4.11.4: max 128B AGU lines the TMA mover injects into the shared "
+                         "SM->L2 port per cycle (each line = 4x 32B sector mfs). HW per-SM "
+                         "injection bandwidth is 124 byte/clk = 4 sector/clk = 1 line/clk "
+                         "(arXiv:2501.12084), so default 1 is HW-calibrated; the old hardcoded "
+                         "value was 2 (2x over-injection). (default=1)",
+                         "1");
   option_parser_register(opp, "-bar_debug_enable", OPT_BOOL,
                          &bar_debug_enable,
                          "Enable BAR.SYNC / BAR.ARV named-barrier debug logging (BARDBG) "
@@ -3397,6 +3405,11 @@ void gpgpu_sim::gpu_print_stat() {
   // limiter). extra_pops ~= 0 means either the knob is off or L2 full() gated it.
   printf("gpu_icnt_to_l2_pops_total = %llu\n", gpu_icnt_to_l2_pops_total);
   printf("gpu_icnt_to_l2_extra_pops = %llu\n", gpu_icnt_to_l2_extra_pops);
+
+  // Opt6 4.11.2: TMA-only per-stage residency (observe-only, timing-neutral).
+  // Splits each TMA sector mf's lifetime by mem_fetch_status so the "unaccounted
+  // queue wait" is attributed to req_side vs reply_side vs a specific stage.
+  mem_fetch::print_tma_status_residency(stdout);
 
   // printf("partiton_reqs_in_parallel = %lld\n", partiton_reqs_in_parallel);
   // printf("partiton_reqs_in_parallel_total    = %lld\n",

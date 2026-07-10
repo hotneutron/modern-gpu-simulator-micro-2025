@@ -191,6 +191,16 @@ class mem_fetch {
   void set_tlb_tag(new_addr_type tlb_tag) { m_tlb_tag = tlb_tag; }
   new_addr_type get_tlb_tag() { return m_tlb_tag; }
 
+  // Opt6 4.11.2 latency-bucket instrumentation (observe-only, timing-neutral).
+  // set_status() accumulates the residency of the PREVIOUS status into a global,
+  // TMA-only per-status cycle table so the ~1330cyc "unaccounted queue wait" in
+  // BWD can be attributed to a specific mem_fetch_status stage without a new run.
+  // Indexed by enum mem_fetch_status (NUM_MEM_REQ_STAT slots). Aggregated across
+  // all sub-partitions/SMs; safe because L2/icnt drain is serial per ICNT tick.
+  static unsigned long long s_tma_status_cycles[NUM_MEM_REQ_STAT];
+  static unsigned long long s_tma_status_visits[NUM_MEM_REQ_STAT];
+  static void print_tma_status_residency(FILE *fp);
+
  private:
   // request source information
   unsigned m_request_uid;

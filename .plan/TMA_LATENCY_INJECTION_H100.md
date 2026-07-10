@@ -968,6 +968,608 @@ Read these outputs together:
 - Uses one guarded A/B to answer the main question decisively.
 - Preserves the 4.12 principle: **work first, timing second, throughput% last**.
 
+#### Step B/C RESULT — width 32->64 REJECTED (BWD K10, `.o16`/`.e16`, 2026-07-10)
+
+The guarded A/B ran. Config reverted to `...,32:0,32`. **The width lever is a null result — Step C
+branch 2 ("cycle barely changes, `gpu_stall_dramfull` remains dominant") is confirmed.** This was
+statically predictable and is now measured.
+
+| metric | width=32 (`.o15`) | **width=64 (`.o16`)** | delta | axis |
+|---|---|---|---|---|
+| `gpu_sim_cycle` | 262,744 | **263,273** | **+0.2%** | timing — no gain (marginally worse) |
+| `L2_TMA_true_hit_rate` | 0.8701 | 0.8700 | ~0 | work invariant ✅ |
+| `L2_total_cache_accesses` | 11,310,291 | 11,295,780 | -0.1% | work invariant ✅ |
+| `L2_cache_read_bytes` | 242.32 MB | 241.86 MB | -0.2% | work invariant ✅ |
+| `L2_cache_write_bytes` | 119.60 MB | 119.60 MB | 0.0% | work invariant ✅ |
+| `L2_TMA_port_busy_cycles` [5] | 660 | **314** | -52% (noise floor) | port was never the limiter |
+| `gpu_stall_dramfull` [4] | 1,353,380 | **1,179,321** | -12.9% | dropped but **cycle did not move** |
+| `L2_TMA_output_full_cycles` [12] | 465,528 | 449,564 | -3.4% | ~flat |
+| `gpu_stall_icnt2sh` [12->13] | 511,707 | 513,932 | +0.4% | flat |
+| `wait_barrier` SM-idle | 9.80% | **9.83%** | pinned | TMA-completion axis unmoved |
+| `tma_flush` SM-idle | 8.88% | 8.28% | -0.6pp | marginal |
+| `Req_Network_in_buffer_full` | 70.94 | 56.23 | -21% | side effect |
+
+**Why width=64 did nothing (static root, confirmed by the numbers):**
+1. **L2 is a 32B-sector cache** (`-gpgpu_cache:dl2 S:...`), so `get_atom_sz()` returns
+   `SECTOR_SIZE = 32B` ([gpu-cache.h:684](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/gpu-cache.h#L684)). The fill/HIT data-port cost is
+   `ceil(atom_sz / port_width)` ([gpu-cache.cc:1150-1185](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/gpu-cache.cc#L1150-L1185)), and
+   `ceil(32/64) == ceil(32/32) == 1`. So the dominant sector traffic sees **byte-identical port
+   occupancy** at 32 and 64. The ceil guard (Step A) worked exactly as intended — it prevented a fake
+   0-cycle fill — but there was no real occupancy to remove.
+2. **The only path width actually changed is 128B full-line writeback** (`ceil(128/32)=4 ->
+   ceil(128/64)=2`). That is real but tiny: it only moved `L2_TMA_port_busy_cycles` 660 -> 314, and
+   `port_busy` was already at the noise floor (0.13% of `output_full`), so it is not on the critical
+   path.
+3. **The 12.9% drop in `gpu_stall_dramfull` with a FLAT cycle count is the decisive signal.** Widening
+   the port let L2 admit slightly faster, which relieved [4] L2-input backpressure — but cycles did not
+   move. That means **[4]/[5] (L2 admission + data port) are NOT the critical-path limiter**; they are
+   downstream symptoms. This run therefore *also* rules out the "next lever = [4] admission-rate"
+   candidate that Step C branch 2 originally proposed, for free.
+
+**What this run proves about the real wall.** `wait_barrier` stayed pinned at ~9.8% across width=32,
+width=64, and all five prior queue/interconnect experiments (depth, drain, grant-passes, icnt->L2 pop,
+port width). A stall that no request-path or L2-service knob can move is **not** a request-path or
+L2-service problem. Per the 4.10 map the only untested region on the critical path is the **reply/return
+segment [9]-[13] on realistic locality**, and specifically the TMA per-transfer `avg_drain_cycles`
+(waiting for the 768 sector responses to come back), which stayed ~2,300-2,570 cyc in every run. See
+4.11.2 for the reframed diagnosis.
+
+#### Step B/C RESULT — width 32->64 REJECTED for FWD K5 too (`.o33`/`.e33`, 2026-07-10)
+
+The matching FWD A/B ran (grant_passes=4, icnt_to_l2_pop=4, width 32->64). **Same null verdict as BWD,
+and even cleaner: FWD `L2_TMA_port_busy_cycles` is 0 at BOTH widths, so the port had literally zero
+occupancy to remove.**
+
+| metric | width=32 (`.o32`) | **width=64 (`.o33`)** | delta | axis |
+|---|---|---|---|---|
+| `gpu_sim_cycle` | 140,138 | **140,213** | **+0.05%** | timing — no gain |
+| `L2_TMA_true_hit_rate` | 0.9455 | 0.9459 | ~0 | work invariant ✅ |
+| `L2_total_cache_accesses` | 3,366,184 | 3,367,644 | +0.04% | work invariant ✅ |
+| `L2_cache_read_bytes` | 103.20 MB | 103.24 MB | +0.04% | work invariant ✅ |
+| `L2_cache_write_bytes` | 4.52 MB | 4.52 MB | 0.0% | work invariant ✅ |
+| `L2_TMA_port_busy_cycles` [5] | **0** | **0** | — | port never occupied (no writeback pressure) |
+| `gpu_stall_dramfull` [4] | 239,240 | 256,095 | +7.0% | rose, cycle flat |
+| `L2_TMA_output_full_cycles` [12] | 73,775 | 67,797 | -8.1% | ~flat |
+| `gpu_stall_icnt2sh` [12->13] | 94,011 | 85,477 | -9.1% | ~flat |
+| `wait_barrier` SM-idle | 9.83% | **9.87%** | pinned | TMA-completion axis unmoved |
+| `tma_flush` SM-idle | 0.00% | 0.00% | — | FWD is load-only (no reduce/store drain) |
+| `Req_Network_in_buffer_full` | 0.52 | 0.52 | flat | already relieved by grant-passes |
+
+**Why FWD is an even stronger null than BWD.** For BWD, width touched the 128B writeback port
+(`port_busy` 660->314); for FWD `port_busy` is **0 at both widths**, because FWD writes almost nothing
+to L2 (`L2_cache_write_bytes` 4.52 MB, load-only kernel). So the L2 data port is provably not on FWD's
+critical path at any width. Width=64 is rejected for both kernels; config reverted to
+`...,32:0,32`.
+
+## 4.11.2 Reframed diagnosis — the wall is TMA-transfer SERIALIZATION, not any single queue (BWD K10, static + `.o15`, 2026-07-10)
+
+Six consecutive knob experiments (depth, reply-drain, grant-passes, icnt->L2 pop, port-width x1) all
+left `gpu_sim_cycle` and `wait_barrier` essentially fixed. Before spending a 7th 12h run, this section
+re-derives the bottleneck from the **existing** `.o15` latency counters (no new run needed) so the next
+experiment targets the actual critical path.
+
+### Evidence 1 — the per-request round-trip is queue-bound, and DRAM is negligible
+From `.o15` (`-gpgpu_memlatency_stat 14`, already in every run):
+
+| counter | value | meaning (stage in 4.10 map) |
+|---|---|---|
+| `averagemflatency` | **1,989** | full mf round-trip: SM inject -> ... -> SM receive |
+| `avg_icnt2mem_latency` | 473 | request path SM-inject -> DRAM-accepted ([2]->[7]) |
+| `avg_mrq_latency` | **8** | time inside the DRAM scheduler ([7] mrqq) |
+| `maxmrqlatency` | 420 | worst DRAM-scheduler wait |
+| `avg_icnt2sh_latency` | 178 | reply path L2-reply-ready -> SM receive ([12]->[14]) |
+| `max_icnt2sh_latency` | 4,485 | worst reply-eject wait |
+| `bw_util` (DRAM) | 0.086 | DRAM 91% idle |
+
+**The DRAM device itself costs ~8 cyc of a ~1,989 cyc round-trip (0.4%).** Even the configured
+`-dram_latency 243` + `-gpgpu_l2_rop_latency 100` = 343 fixed cyc is only ~17% of the round-trip. So
+**~80% of every request's latency is spent queued**, not in ROP/DRAM/reply-eject. This is the
+quantitative proof that the model is **queue-serialization-bound**, exactly as 4.10's bw_util rule
+predicts — and that no single downstream queue is the culprit (each individual segment avg is small:
+req 473, mrq 8, reply 178; they sum to ~659, far below the 1,989 total, so the rest is spent waiting to
+*enter* those segments, i.e. head-of-line blocking upstream).
+
+### Evidence 2 — the real serialization is one TMA transfer = 768 sectors sharing one SM port
+The TMA per-transfer decomposition (`.e15`, SM0) is the decisive lens, not the aggregate queue counters:
+
+| TMA per-transfer field (BWD K10, after both levers) | value |
+|---|---|
+| `avg_issue_active_cycles` | 914 |
+| `avg_icnt_full_cycles` | **893 (97.7% of issue-active)** |
+| `avg_emit_span_cycles` | 449 |
+| `avg_drain_cycles` | **2,570** |
+| `avg_to_first_request_cycles` | 467 |
+| `avg_requests_per_issue_active_cycle` | 0.565 |
+
+Even after grant-passes=4 relieved the REQ in_buffer (355 -> 71), a single transfer still spends 893
+of its 914 issue-active cycles blocked on `m_icnt->full()`, and then waits 2,570 more cyc for its 768
+sector replies to drain back. **`drain (2,570) > emit (449)`** on realistic locality — the transfer is
+completion-latency-bound, and that completion latency is the sum of 768 individual sector round-trips
+each averaging ~1,989 cyc but pipelined through a 1-in / limited-out shared port.
+
+### Evidence 3 — FWD K5 is a DIFFERENT bottleneck (reply-side, small transfers), which is why FWD gained less
+The same latency decomposition on FWD (`.o32`/`.o33`, width=32/64) tells a qualitatively different
+story than BWD, and it explains why grant-passes gave BWD -9.6% but FWD only -3.9%:
+
+| latency counter | FWD K5 (`.o32`) | BWD K10 (`.o15`) | reading |
+|---|---|---|---|
+| `averagemflatency` (round-trip) | **595** | 1,989 | FWD round-trip is 3.3x SHORTER |
+| `avg_icnt2mem_latency` (req side) | 92 | 473 | FWD req path barely queued |
+| `avg_mrq_latency` (DRAM device) | 47 | 8 | both negligible |
+| `avg_icnt2sh_latency` (reply side) | **335 (56% of 595)** | 178 (9% of 1,989) | **FWD is REPLY-dominated; BWD is upstream-queue-dominated** |
+| TMA `avg_icnt_full_cycles` (SM0) | **12.4** | 893 | FWD injection is NOT blocked |
+| TMA `avg_emit_span_cycles` (SM0) | 70 | 449 | FWD emits in ~70 cyc |
+| TMA `avg_drain_cycles` (SM0) | **1,136** | 2,570 | FWD still waits ~1,100 to complete |
+| TMA transfers/SM0 | 42 (688 KB) | 174 (2.88 MB) | **FWD transfers are ~4x smaller** |
+
+**Why FWD and BWD diverge (decisive):**
+1. **FWD injection is already fine.** `avg_icnt_full_cycles=12.4` (vs BWD 893) means the SM shared
+   REQ port is NOT the FWD wall — grant-passes already emptied it (`Req_in_buffer_full=0.52`). So
+   TMA-128B (128B emission), which attacks the injection count, has **little headroom on FWD** — the
+   768->192 reduction cannot help a stage that is only busy 12 cyc/transfer.
+2. **FWD's cost is on the REPLY/return side.** 56% of its (short) round-trip is `icnt2sh`
+   (L2-reply-ready -> SM receive). Yet the reply-path knobs (depth/reply-drain, section 4.5) were also
+   null — because with `averagemflatency=595` and DRAM at 47 cyc, the reply latency is not queue depth,
+   it is the fixed `-gpgpu_l2_rop_latency 100` + reply traversal applied per-sector across many small
+   transfers. This is a **fixed-latency-per-sector x sector-count** cost, not a queue-throughput cost.
+3. **This is consistent with 4.11's earlier reading** ("FWD relocates downstream sooner, smaller net
+   gain") but now quantified: FWD's `wait_barrier` (9.87%) is set by reply-side per-sector latency on
+   many small transfers, while BWD's `wait_barrier` (9.53%) is set by injection-side head-of-line
+   blocking on few large transfers. **Same symptom (`wait_barrier` ~9.8%), two different roots.**
+
+### Why every knob so far was null (unified explanation)
+The knobs each widened **one** segment of a serial pipe whose throughput is set by the SM's **single
+shared icnt port** carrying 768 sectors/transfer:
+- grant-passes / icnt->L2 pop widened [2]->[4] (REQ side) -> `Req_in_buffer_full` fell, but the reply
+  side and the sheer sector *count* were untouched, so `wait_barrier` held.
+- depth / reply-drain / port-width touched [4]/[5]/[12] -> moved their local `*_full` counters but not
+  the round-trip, because the round-trip is dominated by *queuing to enter* the shared port, not by any
+  one queue's service rate.
+- **The invariant across all six runs:** total sectors per transfer = 768, and they share one SM icnt
+  injection node + one reply eject path. That count x sharing is the wall.
+
+### The two candidate levers that actually attack the wall (pick ONE for the next 12h run)
+Both reduce the *number of serialized sector round-trips per transfer*, which is the only thing every
+prior knob failed to change. They are mutually exclusive for a clean A/B.
+
+1. **TMA-128B — coalesce TMA emission to 128B lines (Opt 6A Part 1, previously deferred).** Emit one
+   128B mf per AGU line instead of 4x32B ([tma_unit_sm.cc:614-738](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/tma_unit_sm.cc#L614-L738)). This cuts injected mf
+   count 768 -> 192 *before* the shared port. Caveat from 2-B: `memory_sub_partition::push()` re-splits
+   a 128B parent into 4x32B for the sector-L2 ([l2cache.cc:826-851](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/l2cache.cc#L826-L851)), so this only relieves
+   the **[1]->[4] injection + REQ-net** segment, not L2/DRAM/reply. Given Evidence 1 says the reply
+   side avg is small (178) but the *injection* side dominates (`avg_icnt_full` 893), this is now the
+   best-supported single lever — it directly cuts the 893. Risk: needs the parent/child retire
+   bookkeeping (Risk 2 in section 5); implementation, not config.
+2. **TMA-dedicated-port — give TMA its own icnt injection node / port, separate from ldst.** Today TMA and ldst
+   share one `m_icnt` per SM ([sm.cc:1195,1223,1229](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/sm.cc#L1195)). A bulk 768-sector transfer
+   monopolizes it. A dedicated TMA port removes the head-of-line blocking that Evidence 1 attributes
+   ~80% of round-trip latency to. This is a structural change (more invasive than TMA-128B) and risks
+   giving TMA unrealistic injection bandwidth unless the new port is itself rate-limited.
+
+### Recommendation before the next 12h run
+- **The FWD result changes the plan: there is NO single lever that fixes both kernels.** BWD is
+  injection-bound (TMA-128B helps), FWD is reply/fixed-latency-bound (TMA-128B barely helps). Do not pick
+  one lever and expect both to move.
+- **For BWD: prefer TMA-128B (128B emission).** It reduces the 768-sector count that every prior knob
+  left untouched, directly supported by BWD `avg_icnt_full_cycles=893` (injection-side dominant). This
+  is the original Opt 6A Part-1 plan, gated only by the (now-resolved) address-realism prerequisite.
+- **For FWD: TMA-128B has almost no headroom** (`avg_icnt_full_cycles=12.4`). FWD's cost is reply-side
+  per-sector latency across many small transfers (Evidence 3). The FWD-relevant knob is the fixed
+  `-gpgpu_l2_rop_latency 100` applied per sector, or reducing the per-sector reply *count* (which
+  TMA-128B also does at emission but the L2 re-split at [l2cache.cc:826-851](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/l2cache.cc#L826-L851) undoes for the reply
+  path). Treat FWD as a **separate, later** investigation; do not let it gate the BWD TMA-128B run.
+- **Cheap pre-check first (no 12h run), and it now serves BOTH kernels:** add a per-transfer `lat_mem`
+  histogram split into `req_side` (agu_ready -> DRAM-accept, reuse `icnt2mem`) vs `reply_side`
+  (`icnt2sh`) vs `queue_wait` (remainder). For BWD this attributes the 1,989 - 659 = ~1,330 "unaccounted
+  queue wait" to a specific `mem_fetch_status` bucket ([mem_fetch_status.tup](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/mem_fetch_status.tup)
+  already enumerates every stage; `m_status_change` already timestamps each transition); for FWD it
+  confirms the reply-side dominance before committing to a reply-side fix. Observe-only, timing-neutral.
+  - **Status now: IMPLEMENTED.** `mem_fetch::set_status()` accumulates the residency of the previous
+    status into TMA-only static counters `s_tma_status_cycles[]` / `s_tma_status_visits[]`
+    ([mem_fetch.cc](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/mem_fetch.cc), guarded to `m_is_tma` and monotonic transitions so
+    parent/child splits and re-probes cannot corrupt totals). `print_tma_status_residency()` dumps a
+    per-stage table plus the three plan buckets and is called from `gpu_print_stat()`
+    ([gpu-sim.cc](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/gpu-sim.cc), after `gpu_icnt_to_l2_extra_pops`). Output keys:
+    `TMA_status[<stage>] cycles/visits/avg/pct`, `TMA_status_bucket_req_side_cycles`,
+    `TMA_status_bucket_reply_side_cycles`, `TMA_status_bucket_queue_wait_cycles`. Rebuild required
+    (source change); no tracer/trace change. Read this on the next BWD run to confirm which stage owns
+    the ~1,330 cyc before committing to TMA-128B.
+- **Judgment gate for the BWD TMA-128B run:** success = `avg_icnt_full_cycles`↓ AND `gpu_sim_cycle`↓ AND
+  `wait_barrier`↓, with `L2_TMA_true_hit_rate` and L2 sectors/bytes invariant (4.12 work axis). If BWD
+  cycles stay flat while `avg_icnt_full` drops, the wall has relocated to the reply/return side (i.e.
+  BWD converges to FWD's profile) and TMA-dedicated-port / rop-latency becomes the next candidate for both.
+
+## 4.11.3 TMA-128B design — coalesced 128B-granularity TMA requests + parent/child retire, mirroring the L1->L2 path (2026-07-10)
+
+> **SUPERSEDED by 4.11.4 (2026-07-10).** After a HW primary-source audit (arXiv:2501.12084 Hopper
+> microbenchmarks + NVIDIA Hopper Tuning Guide), BOTH TMA-128B and TMA-dedicated-port were REJECTED as
+> not HW-faithful: (1) real Hopper memory granularity is the 32B sector (a TMA request touches 1-4
+> sectors of a 128B L2 line) — so emitting a 128B TMA request is not what HW does and the current 32B
+> model is correct; (2) there is NO published evidence of a dedicated TMA->L2 port — the TMA bandwidth
+> ceiling equals ordinary global-load bandwidth (~1800 GB/s on H800), i.e. TMA SHARES the SM->L2 path
+> with the LSU, exactly as the sim's single shared `m_icnt` already models. The real artifact is the
+> shared-port INJECTION RATE, not granularity or a missing port. See 4.11.4 for the HW-calibrated fix.
+> This section is kept for the record (the parent/child retire analysis is still correct should a 128B
+> path ever be revisited), but it is NOT the chosen direction.
+
+> **Naming.** "TMA-128B" = emit one 128B-granularity request per AGU line (like the ldst coalescer)
+> instead of 4 separate 32B sector mfs, then let L2 re-split it. The alternative structural fix is
+> "TMA-dedicated-port" (a separate SM->L2 injection node for TMA). These replace the earlier
+> placeholder names; TMA-128B is the recommended first experiment.
+
+Static confirmation of how the normal ldst path and the TMA path differ today, so TMA-128B copies the
+proven L1->L2 mechanism instead of inventing a new one.
+
+### Confirmed today (code-verified)
+1. **Normal ldst->L2 already sends one 128B request.** The coalescer emits a single `mem_access` of
+   `segment_size=128` carrying a 4-sector chunk mask
+   ([abstract_hardware_model.cc:1069-1122](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/abstract_hardware_model.cc#L1069-L1122)); that is ONE icnt packet. L2's
+   `push()` then calls `breakdown_request_to_sector_requests`
+   ([l2cache.cc:759-824](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/l2cache.cc#L759-L824)): a 128B parent (`data_size==MAX_MEMORY_ACCESS_SIZE`) is split
+   into 4x32B children, **each child's `original_mf` = the parent**.
+2. **The 4 children MSHR-merge and are reassembled on the way back.** `send_read_request` uses
+   `m_mshrs.probe(mshr_addr)` so same-line children coalesce ([gpu-cache.cc:1340-1391](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/gpu-cache.cc#L1340-L1391)),
+   and `baseline_cache::fill` decrements `pending_read` on the parent, deleting each child until the
+   last one, then resurfaces the parent ([gpu-cache.cc:1228-1247](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/gpu-cache.cc#L1228-L1247)). This is the
+   parent/child retire bookkeeping TMA-128B must reuse.
+3. **TMA today does the OPPOSITE.** `mover_issue_requests` emits `SECTOR_CHUNCK_SIZE` separate 32B mfs
+   per 128B AGU line, each `data_size=SECTOR_SIZE`, single-bit sector mask, and crucially
+   **`original_mf=nullptr`** ([tma_unit_sm.cc:835-852](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/tma_unit_sm.cc#L835-L852)). So each 32B mf is a distinct icnt
+   packet, and `breakdown_request_to_sector_requests` takes the **`data_size==SECTOR_SIZE &&
+   sector_mask.count()==1` early-return branch** ([l2cache.cc:762-764](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/l2cache.cc#L762-L764)) — i.e. no split, one mf
+   in / one mf out. On return, `SM::accept_ldst_unit_response` routes any `is_tma()` mf to
+   `tma_unit_sm::fill`, which looks the mf up by **exact pointer** in `m_outstanding_requests`
+   ([sm.cc:1515-1524](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/sm.cc#L1515-L1524), [tma_unit_sm.cc:1055-1069](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/tma_unit_sm.cc#L1055-L1069)).
+
+### Answer to "does TMA send duplicate same-addr requests / does MSHR not work?"
+**Not literal duplicates, but redundant fragmentation, and MSHR only helps at DRAM.** The 4 sectors of
+one 128B line have distinct 32B addresses (`agu_base + sector*32`), so they are not identical. But:
+- **They are the same 128B line.** L2 MSHR DOES merge same-line in-flight requests
+  ([gpu-cache.cc:1340-1391](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/gpu-cache.cc#L1340-L1391)), so **DRAM sees no duplication** — consistent with
+  `avg_mrq_latency=8`, DRAM negligible.
+- **MSHR does nothing for the injection cost.** The 4x32B still occupy 4 icnt packets, 4 REQ-net
+  in_buffer slots, and 4 separate L2 admission probes (`m_icnt_L2_queue` head is served one mf/cycle,
+  [l2cache.cc:524-543](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/l2cache.cc#L524-L543)) BEFORE any merge. That 4x inflation on the shared SM port is
+  exactly BWD's `avg_icnt_full_cycles=893`. So the fix is not "add MSHR" (it exists) but "stop
+  fragmenting at emission" — send the 128B parent so only ONE packet crosses the shared port, then let
+  the existing L2 split+MSHR do what it already does for ldst.
+
+### TMA-128B implementation sketch (mirror the ldst path, do NOT invent a new one)
+- **Emit one 128B parent mf per AGU line** in `mover_issue_requests` when a full 128B line is being
+  moved: `data_size=MAX_MEMORY_ACCESS_SIZE`, full 4-sector mask, full 128B byte mask, `original_mf=
+  nullptr` (the parent IS the original). Replace the inner 4x (or 8x for reduce) sector loop with a
+  single alloc+push. Goal counter changes from `kSectorMfGoal = agu_requests*SECTOR_CHUNCK_SIZE*
+  mfs_per_sector` to `kLineMfGoal = agu_requests * mfs_per_line` (`mfs_per_line=1` load/store, `2` for
+  reduce RMW: one 128B read + one 128B write).
+- **Let L2 split it** — no TMA-side change needed: `push()` already routes a 128B parent through
+  `breakdown_request_to_sector_requests` into 4 children with `original_mf=parent`, MSHR-merged, exactly
+  like ldst. This is the key point: the re-split still happens (section 2-B caveat), but only AFTER the
+  shared-port injection, which is the bottleneck.
+- **Retire on the parent, not the child.** Two options:
+  1. **Preferred (reuse existing machinery):** keep `m_outstanding_requests[parent]=uid`; the children
+     are deleted inside `baseline_cache::fill` and only the parent resurfaces
+     ([gpu-cache.cc:1237-1246](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/gpu-cache.cc#L1237-L1246)), so `SM::accept_ldst_unit_response` receives the PARENT and
+     `tma_unit_sm::fill` finds it by pointer unchanged. Must verify the L2 reply path actually returns
+     the parent (not a child) for the L2-bypass and HIT cases too.
+  2. **Fallback (explicit child accounting):** if some path returns children directly, add
+     `m_outstanding_sectors[parent]` initialized to the child count and decrement per returning child,
+     retiring the parent when it hits 0 (Risk 2 in section 5).
+- **Reduce/store (bwd `tma_flush`):** a reduce line is 2 parent mfs (128B read + 128B write). Keep the
+  RMW pairing; do not collapse the write side, or the store-visibility/ack accounting
+  ([sm.cc:2016-2017](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/sm.cc#L2016-L2017)) breaks.
+
+### The exact "fill one sector of a 128B line" mechanism (this is the retire question, resolved)
+The user's question — "when a return ptr comes back it has to fill ONE sector of the 128B, how is that
+done?" — is precisely the parent/child retire, and the sector-cache path ALREADY implements it. Traced
+end to end for a 128B parent:
+
+1. **Split happens in `push`, parent never enters a queue.** `memory_sub_partition::push` calls
+   `breakdown_request_to_sector_requests` ([l2cache.cc:826-851](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/l2cache.cc#L826-L851)). For a 128B parent it takes
+   the `data_size==MAX_MEMORY_ACCESS_SIZE` branch ([l2cache.cc:765-780](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/l2cache.cc#L765-L780)) and makes 4
+   children, each `alloc(..., original_mf=parent)`. Only the **children** are pushed to ROP -> the L2
+   input queue; the **parent is never queued and never probes L2**. (This is also why the parent must
+   NOT be registered in `m_request_tracker`/icnt — it is a pure accounting token.)
+2. **Each child probes L2 independently.** In `cache_cycle`, each child hits `m_L2cache->access()`
+   ([l2cache.cc:548](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/l2cache.cc#L548)). On a MISS, `send_read_request` registers
+   `m_extra_mf_fields[child]` with `pending_read = m_line_sz / SECTOR_SIZE = 4`
+   ([gpu-cache.h:1538-1540](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/gpu-cache.h#L1538-L1540)) — i.e. the count is stored on the mf that carries
+   the line, and same-line siblings MSHR-merge onto it ([gpu-cache.cc:1340-1359](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/gpu-cache.cc#L1340-L1359)).
+3. **"Fill one sector" = `baseline_cache::fill` decrementing `pending_read`.** Each returning 32B child
+   enters `fill`; because `m_mshr_type==SECTOR_ASSOC`, it does
+   `e = m_extra_mf_fields.find(mf->get_original_mf()); e->second.pending_read--;`
+   ([gpu-cache.cc:1230-1246](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/gpu-cache.cc#L1230-L1246)). If `pending_read > 0` it **deletes that child and returns**
+   (`res_deleted`), i.e. that one sector is filled and the line is not yet complete. When the LAST child
+   arrives (`pending_read == 0`) it swaps `mf = mf->get_original_mf()` (the parent), deletes the child,
+   and lets the parent flow out as the single completed reply. **So exactly one mf — the parent —
+   resurfaces per 128B line, after all 4 sectors are filled.**
+4. **Therefore the TMA retire needs NO new per-sector logic on the TMA side.** Because step 3 already
+   collapses 4 children -> 1 parent, the mf that reaches `SM::accept_ldst_unit_response`
+   ([sm.cc:1515-1524](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/sm.cc#L1515-L1524)) is the **parent pointer we registered** in
+   `m_outstanding_requests`. `tma_unit_sm::fill` finds it by pointer and calls `mover_on_response`
+   ONCE for the whole 128B line. This is option-1 above, and it is the same machinery ldst already uses.
+
+**The one thing that MUST be checked before trusting option 1 (else it silently corrupts):**
+`baseline_cache::fill`'s child->parent collapse ONLY runs for a **MISS that went through
+`send_read_request`** (which set `pending_read=4` and `original_mf`). Two other L2 outcomes bypass it:
+- **L2 HIT** ([l2cache.cc:578-595](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/l2cache.cc#L578-L595)): the HIT reply is pushed to `m_L2_icnt_queue` as the
+  **child** mf (it never entered `fill`), so a HIT child returns to the SM, NOT the parent.
+- **L2 disabled / bypass** ([l2cache.cc:620-626](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/l2cache.cc#L620-L626)): the child is pushed straight to the DRAM
+  queue and returns as the child.
+So for TMA, a 128B line that HITs in L2 will return as up to 4 separate child mfs, each with
+`original_mf=parent` but NONE of them the registered parent -> `tma_unit_sm::fill`'s exact-pointer
+lookup would MISS and hit the assert. **This is why option 2 (explicit `m_outstanding_sectors[parent]`)
+is actually required, not optional:** register the parent with an expected child count, and in
+`tma_unit_sm::fill` resolve `parent = mf->get_original_mf() ? mf->get_original_mf() : mf`, decrement the
+parent's outstanding-sector count, and only call `mover_on_response` + free the parent when it reaches
+0. The current sim shows `L2_TMA_true_hit_rate=0.87` (bwd), so ~87% of children take exactly this HIT
+path — option 1 alone would assert almost immediately. Implement option 2.
+
+### Store / reduce ACK path — traced, and why it needs DIFFERENT accounting than reads
+The store/reduce side (bwd `tma_flush`, 14.66% baseline) does NOT go through `baseline_cache::fill`
+(that is the read-fill path), so its 128B->4x32B collapse must be handled explicitly. Traced:
+
+1. **Completion is purely count-based.** `mover_on_response` increments `requests_completed` for every
+   returning mf and retires the transfer when `requests_completed >= sector_mf_goal`
+   ([tma_unit_sm.cc:918-946](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/tma_unit_sm.cc#L918-L946)). For a store, `sector_mf_goal =
+   agu_requests*4*1`; for a reduce, `*2` (read + write per sector). On the last mf it decrements the
+   warp's `m_outstanding_stores_per_warp` ([tma_unit_sm.cc:1033-1046](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/tma_unit_sm.cc#L1033-L1046)), which is what a
+   `UTMACMDFLUSH` warp-stall waits on. So **the store's `wait`/`tma_flush` release is gated by the exact
+   count of returning mfs matching `sector_mf_goal`.** If TMA-128B changes how many mfs come back without
+   changing `sector_mf_goal` to match, the store either never retires (hang) or retires early (wrong).
+2. **A write DOES generate a reply that returns to the SM.** L2 dl2 policy is `...,L:B:m:L:P,...` =
+   WRITE_BACK + write-allocate. A write HIT calls `wr_hit_wb` -> returns HIT with no miss-queue send
+   ([gpu-cache.cc:1425-1441](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/gpu-cache.cc#L1425-L1441)); back in `cache_cycle` the HIT branch has `write_sent==false`,
+   so it does `mf->set_reply(); m_L2_icnt_queue->push(mf)` ([l2cache.cc:578-591](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/l2cache.cc#L578-L591)) — i.e. a
+   WRITE_ACK flows back exactly like a read reply, and `accept_ldst_unit_response` routes it to
+   `tma_unit_sm::fill` because the child inherits `is_tma` ([sm.cc:1515-1524](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/sm.cc#L1515-L1524)).
+3. **BUT the write child->parent is NOT collapsed by anything.** `baseline_cache::fill` (which does the
+   `pending_read` collapse) is only called on the DRAM read-return / L2 fill path, never for a write
+   HIT reply. `breakdown_request_to_sector_requests` sets `original_mf=parent` on write children too
+   ([l2cache.cc:772-777](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/l2cache.cc#L772-L777)), but there is no `pending_write` decrement — so for a 128B write
+   parent, **all 4 write children return independently to `tma_unit_sm::fill`**, each with
+   `original_mf=parent`. This is actually the SAME shape as the read-HIT case in the note above, so
+   **option 2's `m_outstanding_sectors[parent]` accounting handles reads AND writes uniformly**: resolve
+   parent via `get_original_mf()`, decrement, retire at 0.
+
+**Consequence for TMA-128B goal-count:** with option 2, keep the emission-side count in **128B lines**
+but keep the retire-side count in **expected child mfs**. Concretely:
+- Emit `kLineMfGoal = agu_requests * mfs_per_line` parents (`mfs_per_line`=1 load/store, 2 reduce).
+- Set each parent's `m_outstanding_sectors = SECTOR_CHUNCK_SIZE` (4) — the number of children L2 will
+  split it into (and the number of replies that will come back, whether HIT children or one collapsed
+  read parent... see next bullet).
+- **Unify the retire:** in `tma_unit_sm::fill`, always do `parent = mf->get_original_mf() ? ... : mf`
+  then `if (--m_outstanding_sectors[parent] == 0) { mover_on_response(parent-as-one-line); free; }`.
+  For a read MISS the L2 fill path already collapsed 4->1, so only 1 reply arrives — meaning
+  `m_outstanding_sectors` must be set to the ACTUAL number of replies, which DIFFERS between the read-MISS
+  (1, pre-collapsed) and read-HIT/write (4, not collapsed) paths. **This is the real subtlety:** the
+  reply count is not constant. Two clean ways to make it deterministic:
+  - (a) **Count bytes, not mfs.** Set `m_outstanding_bytes[parent]=128` (or 256 for reduce RMW) and
+    decrement by each returning mf's `data_size` (32 for a child, 128 for a collapsed parent). Retire at
+    0. This is robust to whether L2 collapsed or not. **Preferred.**
+    - reduce needs read 128 + write 128 = 256; a returning read-collapsed-parent subtracts 128, four
+      write children subtract 32 each = 128. Sums to 256 regardless of path.
+  - (b) Make `mover_on_response` idempotent per (parent,sector-mask) and retire when the union of
+    returned sector masks covers the line. More state; (a) is simpler and race-free in a serial sim.
+
+**So the store/reduce path is safe for TMA-128B only if the retire switches from "count mfs == fixed
+sector_mf_goal" to "count returned BYTES == transfer bytes".** That is the one non-trivial code change
+option 2 forces, and it must be in before the 12h run or the store side will mis-retire.
+
+### Barrier / correctness accounting under TMA-128B — traced, and why it is SAFE
+The user's concern "read/write ACK both touch barrier-related state — did you check that?" is the real
+risk. Traced all three barrier couplings; **all are byte- or transfer-based, none are per-mf-count**, so
+128B emission does not change them AS LONG AS option-2 byte-retire is used:
+
+1. **Load -> consumer mbarrier (`wait_barrier` release).** `mover_on_response` calls
+   `notify_tma_completion(warp_id, entry.cmd.total_bytes)` exactly ONCE per transfer, only in the
+   `transfer_type==LOAD` branch ([tma_unit_sm.cc:1006-1017](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/tma_unit_sm.cc#L1006-L1017)). `notify_tma_completion` credits
+   the mbarrier in **bytes** (`completed_tx_bytes += applied_bytes`, [sm.cc:1886-1916](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/sm.cc#L1886-L1916)),
+   matched against `expected_tx_bytes` which is set by the SASS `expect-tx` arrive
+   ([sm.cc:1806](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/sm.cc#L1806)). **It is credited with `cmd.total_bytes`, NOT with a per-sector-mf
+   count.** So whether the transfer was 768 mfs or 192 mfs is irrelevant to the mbarrier — the credit
+   is the same total_bytes. The ONLY requirement is that `notify_tma_completion` still fires once, at
+   true completion. With byte-retire, "true completion" = all bytes returned, which is exactly when it
+   should fire. **SAFE.**
+2. **Store/reduce -> `tma_flush` (UTMACMDFLUSH) release.** Gated by `m_outstanding_stores_per_warp`,
+   incremented once per store transfer at enqueue ([tma_unit_sm.cc:633-641](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/tma_unit_sm.cc#L633-L641)) and
+   decremented once per store transfer at completion ([tma_unit_sm.cc:1033-1046](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/tma_unit_sm.cc#L1033-L1046)). This is
+   **per-transfer, not per-mf** — again independent of 768-vs-192. The decrement happens inside the
+   `requests_completed >= goal` block, so it moves to "byte-retire complete" cleanly. **SAFE.**
+3. **TMA store does NOT use the ldst fence accounting at all (the key finding).** `store_ack` /
+   `inc_store_req` / `inc_fence_store` / `dec_fence_store` — the per-mf, per-sector fence counters —
+   are called ONLY from `ldst_unit_sm.cc` and `shader.cc` store sites; **`tma_unit_sm.cc` never calls
+   any of them** (grep-confirmed). And `SM::accept_ldst_unit_response` intercepts any `is_tma()` reply
+   (read OR write ack) and routes it to `tma_unit_sm::fill` BEFORE the ldst `store_ack` path
+   ([sm.cc:1515-1524](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/sm.cc#L1515-L1524)). So a TMA write ack never decrements `pending_stores_*_visible`,
+   never touches `m_stores_outstanding`. That means the `MEMBAR`/fence scope logic
+   (`warp_has_pending_fence_stores`, [sm.cc:2426](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/sm.cc#L2426)) is driven by ordinary LDST stores, not
+   TMA — TMA-128B cannot perturb it because TMA was never in it. **SAFE (and orthogonal).**
+
+**Net barrier conclusion:** every TMA barrier/fence coupling is keyed on **bytes or per-transfer
+counts**, never on the number of sector mfs. TMA-128B changes only the sector-mf count, so with
+byte-based retire (option 2a) all barrier releases are bit-identical in *timing-cause* (they fire when
+the same bytes have returned). The risk is NOT correctness of the barrier math; it is only that a
+mis-implemented retire could fire `notify_tma_completion` / the store decrement at the wrong cycle.
+That is exactly what the byte-retire guarantees, and what the validation counters below will confirm.
+
+### TMA metrics impacted by TMA-128B — which stay valid, which need a definition fix
+The user's second concern. Audited every `m_stat_*` in `mover_issue_requests` / `mover_on_response`
+([tma_unit_sm.cc](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/tma_unit_sm.cc)) and the derived averages in the Phase3 stats line:
+
+| metric | today (32B) | after TMA-128B (128B) | action |
+|---|---|---|---|
+| `bytes_issued` / `bytes_completed` | sum of 32B sectors | **unchanged** if we add `data_size` per parent (128) OR per child; bytes are bytes | keep byte-based increments; DO NOT count `+= SECTOR_SIZE` blindly — use `mf->get_data_size()` |
+| `requests_issued` / `requests_completed` | counts 32B mfs (768) | will count 128B parents (192) | **DEFINITION CHANGES 4x.** Either rename to `sector_mfs` vs `line_mfs`, or keep counting in sectors by adding 4 per parent. Otherwise `avg_requests_per_issue_active_cycle` and BW ratios shift 4x and look like a regression that is really just a unit change. |
+| `avg_icnt_full_cycles` / `avg_emit_span_cycles` | per-transfer, cycle-based | **valid and IS the target** — expected to drop (fewer packets to inject) | keep; this is the success signal |
+| `avg_drain_cycles` | last-issue -> complete | valid; may drop | keep |
+| `icnt_backpressure_events` | per-transfer flag | valid | keep |
+| `BW_*_GBps` | bytes/elapsed | valid (bytes unchanged) | keep |
+| `L2_TMA_true_hit_rate` / `pending_hit_rate` | per-probe at L2 admission | **children still probe L2 individually after split**, so probe count and hit rate are UNCHANGED (the split reconstitutes the same 4 probes) | keep — this is the 4.12 work-invariance check and MUST stay ~0.87 |
+| `L2_TMA_output_full_cycles` / `port_busy` / `res_fail` | per-child at L2 | unchanged population (children identical post-split) | keep |
+| `avg_issue_active_cycles` | cycles the transfer was issuing | drops (1 push/line vs 4) | keep; expected |
+
+**The one metric that will move for a NON-physical reason is `requests_issued/completed`** (sector-mf
+count). To avoid a fake "throughput dropped 4x" reading, either (a) keep incrementing these in
+**sector units** (add `SECTOR_CHUNCK_SIZE` per 128B parent so the count still means "sectors moved"),
+or (b) add explicit `line_mfs_issued` alongside and leave `requests_*` as sectors. Option (a) is less
+disruptive to existing log parsers. Everything cycle- or byte-based is invariant by construction, which
+is the 4.12 discipline: **TMA-128B is a timing change; bytes and L2 probe population must not move.** The
+two validation guards below prove exactly that.
+
+### L2 breakdown asserts — the 128B parent MUST be field-complete or L2 asserts (user's warning, verified)
+The user's warning "L2 copies the parent's internal fields to make the 32B sub-reqs; if TMA doesn't
+pre-fill them like L1 does, the copy fails and asserts" is CORRECT and is the highest-risk part of
+TMA-128B. Traced every field `breakdown_request_to_sector_requests` reads and every downstream assert:
+
+**What `breakdown` copies from the parent** ([l2cache.cc:765-780](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/l2cache.cc#L765-L780), 128B branch). For each
+of the 4 children it calls `m_mf_allocator->alloc(...)` with values derived from the parent:
+- `mf->get_addr() + SECTOR_SIZE*i` — parent addr MUST be 128B-aligned, else children straddle lines.
+- `mf->get_access_type()` — must be a real GLOBAL_ACC_R / GLOBAL_ACC_W (it is, from the mover).
+- `mf->get_access_warp_mask()` — copied as-is.
+- **`mf->get_access_byte_mask() & mask`** — the per-sector 32B slice of the parent's byte mask. **If the
+  parent's byte_mask is not fully set for the 128B, each child gets an empty/partial byte mask**, which
+  later breaks `set_byte_mask` / dirty-mask logic on writes and readability checks on reads.
+- `std::bitset<SECTOR_CHUNCK_SIZE>().set(i)` — child sector mask = exactly 1 bit (breakdown sets this,
+  not the parent — good).
+- `original_mf = mf` (the parent) — this is what the retire relies on.
+
+**The branch-selection trap (most likely silent failure).** `breakdown` chooses the split path by
+`data_size` + `sector_mask.count()`:
+- `data_size==SECTOR_SIZE(32) && sector_mask.count()==1` -> no split (today's TMA path).
+- `data_size==MAX_MEMORY_ACCESS_SIZE(128)` -> 4-way split (the TMA-128B path we WANT).
+- `data_size==64 && (mask.all()||mask.none())` -> const-cache 2-way path.
+- **else -> the final branch, which splits only sectors where `sector_mask.test(i)` is true**
+  ([l2cache.cc:804-820](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/l2cache.cc#L804-L820)). If the TMA 128B parent is built with `data_size=128` but its
+  **sector_mask is empty**, it still enters the 128B branch (that branch ignores sector_mask) and works;
+  BUT if it is built with `data_size=128` and the code path ever compares sector_mask, an empty mask
+  silently yields the wrong sector set. And `if (result.size()==0) assert(0 && "no mf sent")`
+  ([l2cache.cc:822](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/l2cache.cc#L822)) fires if a mis-built parent produces zero children.
+
+**Downstream asserts a mis-built parent would hit:**
+1. **`assert(mf->get_data_size() <= m_config.get_atom_sz())`** at `data_cache::access`
+   ([gpu-cache.cc:2006](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/gpu-cache.cc#L2006)), and the same at `wr_hit`/`rd_hit`/read paths
+   ([gpu-cache.cc:1867/1912/2006](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/gpu-cache.cc#L1867)). atom_sz=32 (sector L2). **A 128B parent that
+   reaches `access()` un-split asserts immediately.** This is why the parent MUST go through `push()`
+   (which splits it) and MUST NOT be pushed directly to the L2 cache. Confirmed: `push` always calls
+   `breakdown` for `m_cache_type==SECTOR` before anything reaches `access`, so as long as the parent is
+   handed to `push` (the normal icnt->L2 path) this is safe. The danger is any TMA shortcut that hands a
+   128B mf straight to L2.
+2. **`assert(sector_mask.count() == 1)`** in `get_sector_index`
+   ([gpu-cache.h:505-511](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/gpu-cache.h#L505-L511)), called from every sector get_status/set_status. Children have
+   exactly 1 sector bit (breakdown sets it), so children are fine. **But the parent must never be probed
+   as a sector** — it has 4 bits set. Again safe iff the parent is only ever a pre-split token.
+3. **`assert(line->get_status(mask) == INVALID)`** in `tag_array::probe`
+   ([gpu-cache.cc:284](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/gpu-cache.cc#L284)) — reached with a child's single-bit mask; fine for children.
+
+**Therefore the parent-build contract for TMA-128B (must match what L1/coalescer produces):**
+- `data_size = MAX_MEMORY_ACCESS_SIZE` (128).
+- `addr` = 128B-aligned line base (`agu_base`, already line-aligned in the mover).
+- **`byte_mask` = all 128 bytes set** (full line). This is the field the user flagged: the mover today
+  sets only 32 bits per sector mf; the 128B parent must set the full 128-bit byte mask so
+  `get_access_byte_mask() & mask` gives each child its correct 32 bytes.
+- **`sector_mask` = all 4 sectors set** (`.set(0..3)`), so the parent is unambiguously the 128B branch
+  and never mistaken for a single-sector or const-64 request.
+- `access_type` = GLOBAL_ACC_R (load / reduce-read) or GLOBAL_ACC_W (store / reduce-write).
+- `original_mf = nullptr` (the parent IS the original; children get `original_mf=parent` from breakdown).
+- warp/sid/tpc = same as today.
+
+This is exactly the shape the ldst coalescer emits for a full-line access
+([abstract_hardware_model.cc:1069-1122](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/abstract_hardware_model.cc#L1069-L1122) builds size=128 with the full chunk set), so TMA-128B's
+parent must be byte-for-byte the same shape. **Add an assert in the mover right after building the
+parent** (`assert(parent->get_data_size()==128 && parent->get_access_byte_mask().count()==128 &&
+parent->get_access_sector_mask().count()==4)`) so a mis-built parent fails loudly at emission, not 5
+stages later inside L2 with an opaque backtrace.
+
+### Two validation guards to ADD as code (the user's request), timing-neutral
+1. **L1->L2 granularity assertion (confirm 128B emission is actually happening).** In
+   `memory_sub_partition::push` ([l2cache.cc:826-851](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/l2cache.cc#L826-L851)), when `mf->is_tma()`, count how
+   many arrive with `data_size==MAX_MEMORY_ACCESS_SIZE` (128B parent, post-TMA-128B) vs
+   `data_size==SECTOR_SIZE` (32B, today). Emit a boot/summary counter
+   `TMA_L2_push_128B_parents` / `TMA_L2_push_32B_sectors` so a run instantly shows whether TMA-128B's
+   emission took effect and how many children the split produced.
+2. **TMA duplicate-request / MSHR-miss detector.** In `send_read_request` when `mf->is_tma()`, on the
+   `!mshr_hit && mshr_avail` branch (a NEW DRAM miss is issued) record `(block_addr)` in a per-kernel
+   `std::unordered_set`; if the same `block_addr` is issued to DRAM again while an earlier one for the
+   same line is still outstanding, increment `TMA_dram_reissue_same_line`. On the `mshr_hit` branch
+   increment `TMA_mshr_merged`. Together they prove whether same-line requests are being merged (healthy)
+   or re-sent to DRAM (the "MSHR not working" hypothesis). Expected today: high `TMA_mshr_merged`, near-zero
+   `TMA_dram_reissue_same_line` (matching `avg_mrq_latency=8`). Observe-only.
+
+Both guards are counters only (no timing change) and can ship in the SAME rebuild as TMA-128B so the
+first TMA-128B run self-validates: 128B parents present, children split as expected, MSHR still merging,
+DRAM byte count unchanged (4.12 work axis).
+
+## 4.11.4 CHOSEN direction — HW-calibrated shared-port injection rate (2026-07-10)
+
+This supersedes 4.11.3. After confirming from HW primary sources that (a) 32B sectors are the real
+granularity and (b) TMA shares the SM->L2 path (no dedicated port), the only HW-faithful lever left is
+to set the shared-port INJECTION RATE to the measured HW per-SM bandwidth, keeping the 32B sector model.
+
+### HW primary-source anchors
+| fact | value | source |
+|---|---|---|
+| Real memory granularity | 32B sector; a request touches 1-4 sectors of a 128B L2 line | H100 course (128B line / 32B sector); arXiv:2501.12084 |
+| TMA has dedicated L2 port? | NO evidence; TMA BW ceiling == ordinary global load (~1800 GB/s H800) => shares SM->L2 path | arXiv:2501.12084 §5.2; NVIDIA Hopper Tuning Guide §1.4.1.2 |
+| Per-SM load bandwidth (LSU/L1 path) | **124 byte/clk/SM** | arXiv:2501.12084 Table 5 (H800) |
+| TMA per-transfer fixed overhead | ~170 cycles (TMA unit + mbarrier sync), ~size-independent for latency | arXiv:2501.12084 §5.1 Fig.2 |
+| TMA single-SM saturates HBM? | NO — needs many CTAs + large (>=8-16KB) transfers | arXiv:2501.12084 §5.2 Fig.3 |
+
+Caveat: the paper's numbers are H800 PCIe (114 SM, HBM2e ~2039 GB/s). H100 SXM5 (132 SM, HBM3
+~3.35 TB/s) scales ~1.6x aggregate, but the PER-SM byte/clk figure (124) is the injection-side quantum
+we need and is architecture-level, so we use it directly.
+
+### The conversion (byte/clk/SM -> sector/clk/SM)
+```
+124 byte/clk/SM  /  32 byte/sector  =  3.875 sector/clk/SM  ~=  4 sector/clk/SM  (= one 128B line/clk)
+```
+So HW injects ~**4 sectors/clk from one SM into the SM->L2 path**. This is the single calibration target.
+
+### Every sim injection stage in sector/clk (code-confirmed) vs HW target
+| stage (sim) | current rate | knob (source) | HW target | verdict |
+|---|---|---|---|---|
+| [1] TMA mover emit | 2 lines/clk = **8 sector/clk** | `kMaxRequestsPerCycle` (hardcoded 2, [tma_unit_sm.h:47](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/tma_unit_sm.h#L47)) | ~4 | **2x too high -> lower to 1 line/clk** |
+| [2]->[3] iSLIP grant | 4 packet/clk | `-icnt_grant_passes_per_cycle` (4) | ~4 | already HW-matched -> keep |
+| [3]->[4] icnt->L2 pop | 4 packet/clk | `-gpgpu_icnt_to_l2_pop_per_cycle` (4) | ~4 | already HW-matched -> keep |
+
+**Key realization:** the after-lever config from 4.11 (grant=4, pop=4) was, by coincidence, already the
+HW-calibrated value (3.875 ~= 4). That is WHY BWD got -9.6% there. The one remaining un-calibrated stage
+is the TMA mover itself: `kMaxRequestsPerCycle=2` lines = 8 sector/clk = **2x the HW per-SM injection
+bandwidth**.
+
+### Why LOWERING kMaxRequestsPerCycle is the correct HW fix (counter-intuitive but measured)
+Measured after-lever K10 (`.o15`): `avg_passes_per_active_cycle=3.74` (grant already drains ~4/clk),
+`conflicts_per_cycle=30.2`, `Req_Network_in_buffer_full=70.9`, `out_buffer_full=2.5`.
+- The drain side (grant) is already at the HW rate (~4/clk) and largely absorbs the 30/clk conflicts.
+- But the mover PRODUCES 8 sector/clk while the path DRAINS 4/clk. Producer(8) > drainer(4) keeps the
+  shared REQ in_buffer artificially full (`in_buffer_full=70.9`). **HW never injects 8 sectors/clk from
+  one SM (it is a 124 byte/clk = 4 sector/clk unit), so the sim's 8/clk is a non-physical over-injection
+  that inflates in_buffer_full and distorts the backpressure signal.**
+- Setting mover = 4 sector/clk (1 line/clk) makes producer == drainer == HW bandwidth. The in_buffer
+  reaches a balanced steady state instead of a fake overflow. This is a *calibration*, not a speedup
+  hack: it aligns the injection quantum with the measured HW per-SM bandwidth.
+
+### Change list
+1. **Make `kMaxRequestsPerCycle` a config knob** (currently hardcoded `2` in
+   [tma_unit_sm.h:47](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/tma_unit_sm.h#L47)). Add `-gpgpu_tma_max_lines_per_cycle` (unit = 128B AGU lines/clk,
+   since the mover's outer loop counts lines and each line = 4 sector mfs). Default **1** (= 4 sector/clk
+   = 124 byte/clk, HW-calibrated). Old behavior = 2.
+2. **grant_passes=4, icnt_to_l2_pop=4: keep** (already HW-matched).
+3. Deferred (separate next step, not this run): model the ~170-cycle TMA fixed overhead explicitly;
+   today it is implicitly (over)approximated by the 768-sector serial injection span.
+
+### Validation gate for the kMaxRequestsPerCycle=1 run (BWD K10 first)
+- Timing: `gpu_sim_cycle` (expect down or flat — this removes an artifact, the win comes from realistic
+  backpressure, so a large drop is NOT expected; a cleaner in_buffer profile is).
+- Injection axis: `Req_Network_in_buffer_full` should DROP markedly (producer==drainer now);
+  `avg_icnt_full_cycles` (TMA) should drop.
+- **Work invariant (4.12):** `L2_TMA_true_hit_rate`, `L2_total_cache_accesses`, L2 read/write bytes,
+  DRAM bytes must NOT change (this is a pure timing/rate change).
+- HW cross-check: `bw_util` (DRAM) currently 8.6% vs HW 14.85% — should move toward HW, not past it.
+- Honest expectation: since grant/pop were already the real drain limit at 4/clk, lowering the mover to
+  4/clk mostly removes the fake `in_buffer_full`; it may not move cycles much by itself. The value is a
+  correct, HW-anchored injection model on which the next lever (170-cyc TMA overhead) can be judged
+  cleanly.
+
 ## 4.12 Cycle-INDEPENDENT "work done" comparison (the trustworthy anchor) — 2026-07-09
 
 Throughput% (bytes/cycle) is a TRAP for validation: sim runs ~2x more cycles, so any bytes/cycle

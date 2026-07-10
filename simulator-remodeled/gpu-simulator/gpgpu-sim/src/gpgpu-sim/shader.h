@@ -2249,6 +2249,14 @@ class shader_core_config : public core_config {
   // UBLKRED/UBLKCP synthetic-address behavior is preserved unless opted in.
   bool tma_operand_addr_tiling_enable;
 
+  // TMA-injection (Opt6 4.11.4): max 128B AGU lines the TMA mover injects into the
+  // shared SM->L2 port per cycle. Each line = SECTOR_CHUNCK_SIZE (4) x 32B sector
+  // mfs, so N lines/cyc = 4N sector/cyc. HW per-SM injection bandwidth is
+  // 124 byte/clk/SM = 3.875 ~= 4 sector/clk = 1 line/clk (arXiv:2501.12084 Table 5),
+  // so the HW-calibrated default is 1. The old hardcoded behavior was 2 (=8 sector/clk,
+  // 2x the HW per-SM bandwidth, which over-injected and inflated Req in_buffer_full).
+  unsigned int gpgpu_tma_max_lines_per_cycle;
+
   // BAR named-barrier (BAR.SYNC / BAR.ARV) debug logging (BARDBG). Independent of
   // sync_debug_enable / tma_debug_enable so the named-barrier decode + release +
   // end-of-kernel summary can be captured without other log noise. Used for the
