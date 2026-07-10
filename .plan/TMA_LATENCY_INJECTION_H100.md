@@ -783,6 +783,59 @@ work. So judge on two separate axes.
 - **Relocation (per 4.9):** if cycle is flat, use the 4.10 counter->stage table (`out_buffer_full`,
   `gpu_stall_dramfull`, `bw_util`) to see where the stall moved.
 
+### After-lever result — FWD K5 (`grant_passes=4`, `icnt_to_l2_pop=4`) — 2026-07-09
+
+This is the matching FWD run for the same two queue levers. The result is weaker than BWD: the levers
+still work, but the net cycle gain is small because FWD's remaining stall relocates downstream much
+earlier.
+
+| metric | baseline | after lever | judgment |
+|---|---|---|---|
+| `gpu_sim_cycle` | 145,855 | **140,138** | **-3.9%** -> small timing improvement |
+| `L2_TMA_true_hit_rate` | 0.9461 | **0.9455** | unchanged -> **work invariant** |
+| `Req_Network_in_buffer_full_per_cycle` | 17.44 | **0.5169** | **-97%** -> REQ injection bottleneck largely removed |
+| `Req_Network_out_buffer_full_per_cycle` | 0.0000 | **0.1561** | still tiny -> [3] out-buffer not the real new limiter |
+| `gpu_stall_dramfull` | 106,285 | **239,240** | **+125%** -> strong relocation to downstream admission/backpressure |
+| `gpu_stall_icnt2sh` | 73,812 | **94,011** | **+27%** -> reply-side pressure increased |
+| `L2_TMA_output_full_cycles` | 44,836 | **73,775** | **+65%** -> reply/output congestion increased |
+| `L2_TMA_port_busy_cycles` | 0 | **0** | no evidence that L2 data-port width is the limiter here |
+
+**Did the two levers actually fire?** Yes.
+- `Req_Network_avg_passes_per_active_cycle = 3.7625` -> lever 1 again ran close to the configured 4
+  passes/cycle.
+- `Req_Network_extra_pass_grants_total = 2.18M` -> later iSLIP passes materially drained extra REQ
+  packets.
+- `gpu_icnt_to_l2_extra_pops = 1.80M / 3.01M total` -> about **60%** of all icnt->L2 pops came from
+  the added downstream pops, so lever 2 also materially fired.
+
+**Interpretation.**
+1. **The levers worked exactly as designed on the injection axis.** `Req in_buffer_full` almost
+   disappeared (17.44 -> 0.52) while `L2_TMA_true_hit_rate` and L2 byte counts stayed effectively
+   unchanged.
+2. **But FWD had much less REQ-side pain to begin with than BWD.** So once the injection queue is
+   relieved, the remaining bottleneck surfaces quickly downstream, and the net cycle gain is only
+   **-3.9%**.
+3. **The new visible stall is NOT [3] out-buffer and NOT [5] L2 data-port width (at least in this
+   run).** `out_buffer_full` stays near zero and `L2_TMA_port_busy_cycles` stays zero. The relocation
+   is instead more consistent with **[4] L2-entry / admission backpressure and [12] reply-path
+   congestion** (`gpu_stall_dramfull`, `output_full`, `gpu_stall_icnt2sh` all rise).
+4. **So FWD and BWD diverge.** BWD got a clearer cycle win from REQ-side drain widening; FWD mostly
+   exposes the next downstream limit sooner.
+
+**Work-axis confirmation (same run).**
+- `L2_total_cache_accesses`: 3,356,320 -> 3,366,184 (**+0.3%**, effectively unchanged)
+- `L2_cache_read_bytes`: 102.88 MB -> 103.20 MB (**+0.3%**, effectively unchanged)
+- `L2_cache_write_bytes`: 4.52 MB -> 4.52 MB (unchanged)
+- `DRAM_BW_total_GBps`: 62.80 -> 65.34 GB/s (**higher only because cycles fell**; not evidence of more
+  DRAM work)
+
+**Practical reading.**
+- FWD K5 confirms the two queue levers are **real and timing-only**, just like BWD.
+- But the gain is small because FWD rapidly exposes **downstream** limits after the REQ queue is fixed.
+- The zero `L2_TMA_port_busy_cycles` is important: for FWD, this run gives **no positive evidence** yet
+  that widening `m_data_port_width` is the main next lever. K10 remains the cleaner proving ground for
+  the ongoing L2-port-width experiment.
+
 ### After-lever result — BWD K10 (`grant_passes=4`, `icnt_to_l2_pop=4`) — 2026-07-09
 
 This is the first completed behavior run with BOTH queue levers enabled. It confirms the intended
