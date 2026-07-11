@@ -63,17 +63,6 @@ struct TMADescriptorConfigMetadata {
   uint32_t element_size = 0;
 };
 
-struct TMADescriptorLookupKey {
-  unsigned int unique_function_id = 0;
-  uint64_t pc = 0;
-  uint32_t handle_hi = 0;
-
-  bool operator<(const TMADescriptorLookupKey &other) const {
-    return std::tie(unique_function_id, pc, handle_hi) <
-           std::tie(other.unique_function_id, other.pc, other.handle_hi);
-  }
-};
-
 struct TMAOperandLookupKey {
   unsigned int unique_function_id = 0;
   uint64_t pc = 0;
@@ -82,14 +71,6 @@ struct TMAOperandLookupKey {
     return std::tie(unique_function_id, pc) <
            std::tie(other.unique_function_id, other.pc);
   }
-};
-
-struct TMADescriptorSiteRecord {
-  std::string config_id;
-  std::string mapping_method;
-  float resolver_confidence = 0.0f;
-  bool config_is_ambiguous = false;
-  bool has_descriptor_metadata = false;
 };
 
 struct TMAOperandSiteRecord {
@@ -113,7 +94,6 @@ struct TMAResolvedSiteMetadata {
   bool descriptor_lookup_hit = false;
   bool operand_lookup_hit = false;
   bool runtime_observed = false;
-  uint32_t handle_hi = 0;
   std::string config_id;
   std::string mapping_method;
   float resolver_confidence = 0.0f;
@@ -125,20 +105,65 @@ struct TMAResolvedSiteMetadata {
   TMADescriptorConfigMetadata descriptor_config;
 };
 
+// Exact per-site descriptor binding recovered offline (build_tma_pc_base_map.py). Keyed
+// by (unique_function_id, pc) — the identity that is still live at build_tma_command,
+// before the mover loses it. Supersedes the handle_hi->config_id heuristic: carries the
+// real GMEM base plus the full descriptor shape so no config_id join is needed.
+struct TMABaseLookupKey {
+  unsigned int unique_function_id = 0;
+  uint64_t pc = 0;
+
+  bool operator<(const TMABaseLookupKey &other) const {
+    return std::tie(unique_function_id, pc) <
+           std::tie(other.unique_function_id, other.pc);
+  }
+};
+
+struct TMABaseRecord {
+  // has_static_base: this site is tensormap-addressed and we recovered the real base
+  // (UTMALDG/UTMASTG/UTMACCTL.PF). operand_addressed: this site is raw-pointer addressed
+  // (UBLKRED/UBLKCP) — no tensormap; the base is the raw kernel-arg GMEM pointer read
+  // offline from the by-value params struct (M2.5). raw_pointer_addressed marks that
+  // operand_addressed case where we DID recover a real base + mock-tiling metadata, so
+  // the simulator applies real base + visit-counter tiling instead of the synthetic
+  // address (size still comes from operand covered_bytes, not a descriptor box).
+  bool has_static_base = false;
+  bool operand_addressed = false;
+  bool raw_pointer_addressed = false;
+  uint64_t global_base = 0;
+  uint32_t tensor_rank = 0;
+  uint32_t tensor_data_type = 0;
+  uint32_t element_size = 0;
+  std::array<uint32_t, 5> global_dim = {0, 0, 0, 0, 0};
+  std::array<uint64_t, 5> global_strides = {0, 0, 0, 0, 0};
+  std::array<uint32_t, 5> box_dim = {0, 0, 0, 0, 0};
+  std::array<uint32_t, 5> element_strides = {0, 0, 0, 0, 0};
+  uint32_t interleave = 0;
+  uint32_t swizzle = 0;
+  uint32_t l2_promotion = 0;
+  uint32_t oob_fill = 0;
+  // M2.5 raw-pointer mock-tiling metadata (only set when raw_pointer_addressed):
+  // tile_bytes = covered_bytes (one transfer's span), num_tiles = region/tile_bytes.
+  // The mover spreads transfers as global_base + (visit%num_tiles)*tile_bytes.
+  uint32_t tile_bytes_operand = 0;
+  uint32_t num_tiles = 0;
+  std::string source;  // "direct" | "chain" | "prefetch" | "pool" | "operand_raw_pointer"
+};
+
 struct TMASidecarMetadataDB {
   std::map<std::string, TMADescriptorConfigMetadata> descriptor_configs;
-  std::map<TMADescriptorLookupKey, TMADescriptorSiteRecord> descriptor_site_records;
   std::map<TMAOperandLookupKey, TMAOperandSiteRecord> operand_site_records;
+  std::map<TMABaseLookupKey, TMABaseRecord> base_records;
 
   void clear() {
     descriptor_configs.clear();
-    descriptor_site_records.clear();
     operand_site_records.clear();
+    base_records.clear();
   }
 
   bool empty() const {
-    return descriptor_configs.empty() && descriptor_site_records.empty() &&
-           operand_site_records.empty();
+    return descriptor_configs.empty() &&
+           operand_site_records.empty() && base_records.empty();
   }
 };
 
@@ -259,6 +284,18 @@ struct TMACommand {
   uint32_t oob_fill = 0;
   uint32_t l2_promotion = 0;
   TMAOperandForm operand_form = TMAOperandForm::GENERIC;
+  // Real GMEM base recovered from the exact (uid,pc) base map. When has_real_base is
+  // true the mover computes addr = global_base + agu_index*128 (HW-faithful, L2 reuse)
+  // instead of the synthetic (transfer_uid<<20)+agu_index*128. Populated in
+  // build_tma_command where (uid,pc) is still known; carried to mover_issue_requests.
+  uint64_t global_base = 0;
+  bool has_real_base = false;
+  // M2 (visit-counter tile spread): per-tensor tile this transfer targets, so the
+  // mover adds tile_idx*tile_bytes to spread transfers across the tensor's tiles
+  // (restores the cold-miss of first-touch that base-only collapses away). Set in
+  // build_tma_command from the per-base visit counter; only meaningful when
+  // has_real_base is true. tile_bytes = Πbox_dim·element_size (one tile's byte span).
+  uint64_t tile_offset_bytes = 0;
 };
 
 struct TMATransferEntry {
@@ -280,7 +317,11 @@ struct TMATransferEntry {
   int cycle_enqueued = -1;
   int cycle_agu_ready = -1;
   int cycle_first_request = -1;
+  int cycle_first_request_issued = -1;
+  int cycle_last_request_issued = -1;
   int cycle_last_completion = -1;
+  uint32_t issue_active_cycles = 0;
+  uint32_t icnt_full_cycles = 0;
   // Debug-only: ensure the first read mf and first write mf of a store/reduce
   // transfer are each logged exactly once (so RMW issue is observable).
   bool logged_first_write = false;

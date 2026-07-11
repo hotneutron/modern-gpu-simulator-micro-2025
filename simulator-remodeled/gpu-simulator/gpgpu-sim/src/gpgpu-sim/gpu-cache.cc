@@ -667,10 +667,22 @@ void mshr_table::display(FILE *fp) const {
  * *****************************************************************/
 cache_stats::cache_stats() {
   m_stats.resize(NUM_MEM_ACCESS_TYPE);
+  m_bytes.resize(NUM_MEM_ACCESS_TYPE);
+  m_read_bytes.resize(NUM_MEM_ACCESS_TYPE);
+  m_write_bytes.resize(NUM_MEM_ACCESS_TYPE);
+  m_tma_bytes.resize(NUM_MEM_ACCESS_TYPE);
+  m_tma_read_bytes.resize(NUM_MEM_ACCESS_TYPE);
+  m_tma_write_bytes.resize(NUM_MEM_ACCESS_TYPE);
   m_stats_pw.resize(NUM_MEM_ACCESS_TYPE);
   m_fail_stats.resize(NUM_MEM_ACCESS_TYPE);
   for (unsigned i = 0; i < NUM_MEM_ACCESS_TYPE; ++i) {
     m_stats[i].resize(NUM_CACHE_REQUEST_STATUS, 0);
+    m_bytes[i].resize(NUM_CACHE_REQUEST_STATUS, 0);
+    m_read_bytes[i].resize(NUM_CACHE_REQUEST_STATUS, 0);
+    m_write_bytes[i].resize(NUM_CACHE_REQUEST_STATUS, 0);
+    m_tma_bytes[i].resize(NUM_CACHE_REQUEST_STATUS, 0);
+    m_tma_read_bytes[i].resize(NUM_CACHE_REQUEST_STATUS, 0);
+    m_tma_write_bytes[i].resize(NUM_CACHE_REQUEST_STATUS, 0);
     m_stats_pw[i].resize(NUM_CACHE_REQUEST_STATUS, 0);
     m_fail_stats[i].resize(NUM_CACHE_RESERVATION_FAIL_STATUS, 0);
   }
@@ -685,6 +697,12 @@ void cache_stats::clear() {
   ///
   for (unsigned i = 0; i < NUM_MEM_ACCESS_TYPE; ++i) {
     std::fill(m_stats[i].begin(), m_stats[i].end(), 0);
+    std::fill(m_bytes[i].begin(), m_bytes[i].end(), 0);
+    std::fill(m_read_bytes[i].begin(), m_read_bytes[i].end(), 0);
+    std::fill(m_write_bytes[i].begin(), m_write_bytes[i].end(), 0);
+    std::fill(m_tma_bytes[i].begin(), m_tma_bytes[i].end(), 0);
+    std::fill(m_tma_read_bytes[i].begin(), m_tma_read_bytes[i].end(), 0);
+    std::fill(m_tma_write_bytes[i].begin(), m_tma_write_bytes[i].end(), 0);
     std::fill(m_stats_pw[i].begin(), m_stats_pw[i].end(), 0);
     std::fill(m_fail_stats[i].begin(), m_fail_stats[i].end(), 0);
   }
@@ -710,6 +728,28 @@ void cache_stats::inc_stats(int access_type, int access_outcome) {
     assert(0 && "Unknown cache access type or access outcome");
 
   m_stats[access_type][access_outcome]++;
+}
+
+void cache_stats::inc_stats_bytes(int access_type, int access_outcome,
+                                  unsigned long long bytes, bool is_write,
+                                  bool is_tma) {
+  if (!check_valid(access_type, access_outcome))
+    assert(0 && "Unknown cache access type or access outcome");
+
+  m_bytes[access_type][access_outcome] += bytes;
+  if (is_write) {
+    m_write_bytes[access_type][access_outcome] += bytes;
+  } else {
+    m_read_bytes[access_type][access_outcome] += bytes;
+  }
+  if (is_tma) {
+    m_tma_bytes[access_type][access_outcome] += bytes;
+    if (is_write) {
+      m_tma_write_bytes[access_type][access_outcome] += bytes;
+    } else {
+      m_tma_read_bytes[access_type][access_outcome] += bytes;
+    }
+  }
 }
 
 void cache_stats::inc_stats_pw(int access_type, int access_outcome) {
@@ -790,6 +830,17 @@ cache_stats cache_stats::operator+(const cache_stats &cs) {
     for (unsigned status = 0; status < NUM_CACHE_REQUEST_STATUS; ++status) {
       ret(type, status, false) =
           m_stats[type][status] + cs(type, status, false);
+      ret.m_bytes[type][status] = m_bytes[type][status] + cs.m_bytes[type][status];
+      ret.m_read_bytes[type][status] =
+          m_read_bytes[type][status] + cs.m_read_bytes[type][status];
+      ret.m_write_bytes[type][status] =
+          m_write_bytes[type][status] + cs.m_write_bytes[type][status];
+      ret.m_tma_bytes[type][status] =
+          m_tma_bytes[type][status] + cs.m_tma_bytes[type][status];
+      ret.m_tma_read_bytes[type][status] =
+          m_tma_read_bytes[type][status] + cs.m_tma_read_bytes[type][status];
+      ret.m_tma_write_bytes[type][status] =
+          m_tma_write_bytes[type][status] + cs.m_tma_write_bytes[type][status];
     }
     for (unsigned status = 0; status < NUM_CACHE_RESERVATION_FAIL_STATUS;
          ++status) {
@@ -813,6 +864,12 @@ cache_stats &cache_stats::operator+=(const cache_stats &cs) {
   for (unsigned type = 0; type < NUM_MEM_ACCESS_TYPE; ++type) {
     for (unsigned status = 0; status < NUM_CACHE_REQUEST_STATUS; ++status) {
       m_stats[type][status] += cs(type, status, false);
+      m_bytes[type][status] += cs.m_bytes[type][status];
+      m_read_bytes[type][status] += cs.m_read_bytes[type][status];
+      m_write_bytes[type][status] += cs.m_write_bytes[type][status];
+      m_tma_bytes[type][status] += cs.m_tma_bytes[type][status];
+      m_tma_read_bytes[type][status] += cs.m_tma_read_bytes[type][status];
+      m_tma_write_bytes[type][status] += cs.m_tma_write_bytes[type][status];
     }
     for (unsigned status = 0; status < NUM_CACHE_REQUEST_STATUS; ++status) {
       m_stats_pw[type][status] += cs(type, status, false);
@@ -876,6 +933,29 @@ void cache_stats::print_stats(FILE *fout, const char *cache_name) const {
   }
 }
 
+void cache_stats::print_byte_stats(FILE *fout, const char *cache_name) const {
+  std::vector<unsigned long long> total_bytes;
+  total_bytes.resize(NUM_MEM_ACCESS_TYPE, 0);
+  std::string m_cache_name = cache_name;
+  for (unsigned type = 0; type < NUM_MEM_ACCESS_TYPE; ++type) {
+    for (unsigned status = 0; status < NUM_CACHE_REQUEST_STATUS; ++status) {
+      fprintf(fout, "\t%s[%s][%s] = %llu\n", m_cache_name.c_str(),
+              mem_access_type_str((enum mem_access_type)type),
+              cache_request_status_str((enum cache_request_status)status),
+              m_bytes[type][status]);
+
+      if (status != RESERVATION_FAIL && status != MSHR_HIT)
+        total_bytes[type] += m_bytes[type][status];
+    }
+  }
+  for (unsigned type = 0; type < NUM_MEM_ACCESS_TYPE; ++type) {
+    if (total_bytes[type] > 0)
+      fprintf(fout, "\t%s[%s][TOTAL_BYTES] = %llu\n", m_cache_name.c_str(),
+              mem_access_type_str((enum mem_access_type)type),
+              total_bytes[type]);
+  }
+}
+
 void cache_stats::print_fail_stats(FILE *fout, const char *cache_name) const {
   std::string m_cache_name = cache_name;
   for (unsigned type = 0; type < NUM_MEM_ACCESS_TYPE; ++type) {
@@ -935,8 +1015,15 @@ void cache_stats::get_sub_stats(struct cache_sub_stats &css) const {
   for (unsigned type = 0; type < NUM_MEM_ACCESS_TYPE; ++type) {
     for (unsigned status = 0; status < NUM_CACHE_REQUEST_STATUS; ++status) {
       if (status == HIT || status == MISS || status == SECTOR_MISS ||
-          status == HIT_RESERVED)
+          status == HIT_RESERVED) {
         t_css.accesses += m_stats[type][status];
+        t_css.bytes += m_bytes[type][status];
+        t_css.read_bytes += m_read_bytes[type][status];
+        t_css.write_bytes += m_write_bytes[type][status];
+        t_css.tma_bytes += m_tma_bytes[type][status];
+        t_css.tma_read_bytes += m_tma_read_bytes[type][status];
+        t_css.tma_write_bytes += m_tma_write_bytes[type][status];
+      }
 
       if (status == MISS || status == SECTOR_MISS)
         t_css.misses += m_stats[type][status];
@@ -944,6 +1031,15 @@ void cache_stats::get_sub_stats(struct cache_sub_stats &css) const {
       if (status == HIT_RESERVED) t_css.pending_hits += m_stats[type][status];
 
       if (status == RESERVATION_FAIL) t_css.res_fails += m_stats[type][status];
+
+      // Granular per-status breakdown (does not alter the legacy fields above).
+      // This is where MISS/SECTOR_MISS are kept separate and MSHR_HIT — which
+      // is otherwise dropped from every legacy field — is finally counted.
+      if (status == HIT) t_css.hits += m_stats[type][status];
+      if (status == MSHR_HIT) t_css.mshr_hits += m_stats[type][status];
+      if (status == MISS) t_css.full_misses += m_stats[type][status];
+      if (status == SECTOR_MISS)
+        t_css.sector_misses += m_stats[type][status];
     }
   }
 
@@ -1795,6 +1891,10 @@ enum cache_request_status read_only_cache::access(
 
   m_stats.inc_stats(mem_type_acc,
                     m_stats.select_stats_status(status, cache_status));
+  m_stats.inc_stats_bytes(mem_type_acc,
+                          m_stats.select_stats_status(status, cache_status),
+                          mf->get_data_size(), mf->get_is_write(),
+                          mf->is_tma());
   m_stats.inc_stats_pw(mem_type_acc,
                        m_stats.select_stats_status(status, cache_status));
   return cache_status;
@@ -1836,6 +1936,10 @@ enum cache_request_status read_only_cache::access(
 
   m_stats.inc_stats(mem_type_acc,
                     m_stats.select_stats_status(status, cache_status));
+  m_stats.inc_stats_bytes(mem_type_acc,
+                          m_stats.select_stats_status(status, cache_status),
+                          mf->get_data_size(), mf->get_is_write(),
+                          mf->is_tma());
   m_stats.inc_stats_pw(mem_type_acc,
                        m_stats.select_stats_status(status, cache_status));
   return cache_status;
@@ -1903,6 +2007,11 @@ enum cache_request_status data_cache::access(new_addr_type addr, mem_fetch *mf,
       process_tag_probe(wr, probe_status, addr, cache_index, mf, time, events);
   m_stats.inc_stats(mf->get_access_type(),
                     m_stats.select_stats_status(probe_status, access_status));
+  m_stats.inc_stats_bytes(mf->get_access_type(),
+                          m_stats.select_stats_status(probe_status,
+                                                      access_status),
+                          mf->get_data_size(), mf->get_is_write(),
+                          mf->is_tma());
   m_stats.inc_stats_pw(mf->get_access_type(), m_stats.select_stats_status(
                                                   probe_status, access_status));
   return access_status;
@@ -1967,6 +2076,10 @@ enum cache_request_status tex_cache::access(new_addr_type addr, mem_fetch *mf,
   }
   m_stats.inc_stats(mf->get_access_type(),
                     m_stats.select_stats_status(status, cache_status));
+  m_stats.inc_stats_bytes(mf->get_access_type(),
+                          m_stats.select_stats_status(status, cache_status),
+                          mf->get_data_size(), mf->get_is_write(),
+                          mf->is_tma());
   m_stats.inc_stats_pw(mf->get_access_type(),
                        m_stats.select_stats_status(status, cache_status));
   return cache_status;

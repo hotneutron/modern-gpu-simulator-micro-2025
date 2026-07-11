@@ -183,10 +183,35 @@ uint64_t total_incremental_flushes = 0;  // stats counter
 uint64_t total_instructions_flushed = 0;  // stats counter
 int enable_tma_desc = 0;
 int aux_htod_dump_max_bytes = 4096;
+/* Phase 0b (TMA_BASE_ADDR.md §2.13): param-base capture for host-side descriptor
+ * deref. tma_param_base_cbank_index is the c[0x0][K] index the entry ULDC.64 loads
+ * param_base from (0x198 in FA3 fwd; auto-detected by extract_tma_descriptor_offsets.py
+ * and passed via TMA_PARAM_BASE_CBANK_INDEX). tma_param_base_region_bytes is how many
+ * bytes of the param block to cuMemcpyDtoH so the offline harness can slice each 128B
+ * descriptor at param_base + tensormap_offset. */
+int tma_param_base_cbank_index = 0x198;
+int tma_param_base_region_bytes = 8192;
+tma_param_base_capture_t *tma_param_base_capture = nullptr;
+/* SPIKE 6 device fact-check (TMA_BASE_ADDR.md §2.18): read 128B at the descriptor VA
+ * of executed UTMALDG/UTMASTG and record qword0 (expected == real base). Gated by
+ * TMA_DESC_FACTCHECK; dumped to tma_desc_factcheck.csv at kernel exit. */
+int tma_desc_factcheck_enable = 0;
+int tma_desc_factcheck_read = 0;
+tma_desc_factcheck_t *tma_desc_factcheck = nullptr;
+std::unordered_set<int> tma_desc_factcheck_header_written;
+std::unordered_set<int> tma_param_base_deref_header_written;
 std::unordered_set<int> tma_desc_runtime_debug_header_written;
 std::unordered_set<int> tma_desc_producer_debug_header_written;
 std::unordered_set<int> tma_memcpy_dump_header_written;
 std::unordered_set<int> tensor_map_encode_dump_header_written;
+/* Path A (TMA_BASE_ADDR.md §2.23): host-side launch-arg dump. At cuLaunchKernel we walk
+ * p->kernelParams (a host void** of per-argument pointers) and record, per argument, its
+ * byte offset within the packed param block and the first 16 qwords read from that host
+ * pointer. A by-value __grid_constant__ CUtensorMap argument yields its 128B descriptor
+ * (qword0 = real base) directly; a pointer argument yields the pointer value (followed
+ * offline). Host memory only — no device load, so this cannot fault like the device
+ * fact-check did. Joined offline to (uid,pc) via the SASS static tensormap_offset. */
+std::unordered_set<int> tma_launch_param_dump_header_written;
 std::unordered_set<int> tma_consumer_opcode_ids;
 std::map<int, std::map<int, uint32_t>> tma_desc_ureg_by_pc;
 std::map<int, std::map<int, uint32_t>> first_dest_ureg_by_pc;
@@ -204,6 +229,21 @@ struct sync_runtime_capture_site_info {
 };
 std::map<int, std::map<int, sync_runtime_capture_site_info>>
     sync_runtime_capture_sites_by_pc;
+// BAR.SYNC / BAR.ARV named-barrier register-operand capture. Mirrors the sync site map:
+// records, per (function_id, pc), which device callback_index carries the runtime value of
+// a register-form barrier id (operand 0) and/or count (operand 1). Immediate operands are
+// not captured here (the decoder reads them statically).
+struct bar_runtime_capture_site_info {
+  bar_runtime_capture_site_info()
+      : enabled(false),
+        id_callback_index(-1),
+        count_callback_index(-1) {}
+  bool enabled;
+  int id_callback_index;
+  int count_callback_index;
+};
+std::map<int, std::map<int, bar_runtime_capture_site_info>>
+    bar_runtime_capture_sites_by_pc;
 uint64_t tma_memcpy_dump_id = 0;
 uint64_t tensor_map_encode_dump_id = 0;
 struct tma_desc_producer_candidate_t {
@@ -372,6 +412,32 @@ static sync_runtime_capture_site_info build_sync_runtime_capture_site_info(
   return info;
 }
 
+static bar_runtime_capture_site_info build_bar_runtime_capture_site_info(
+    const std::string &opcode, int operand_position, int callback_index,
+    InstrType::OperandType operand_type) {
+  bar_runtime_capture_site_info info;
+  // Only BAR.SYNC / BAR.ARV named barriers. (MEMBAR/CGAERRBAR are not BAR.*)
+  if (opcode.rfind("BAR.", 0) != 0 && opcode != "BAR") {
+    return info;
+  }
+  // operand 0 = barrier id, operand 1 = count. Capture only when register-form; the
+  // decoder reads immediate operands statically. A register-form operand emits a
+  // device-side reg-value callback, so its runtime value is recoverable at callback_index.
+  bool is_reg = (operand_type == InstrType::OperandType::REG ||
+                 operand_type == InstrType::OperandType::UREG);
+  if (!is_reg) {
+    return info;
+  }
+  if (operand_position == 0) {
+    info.enabled = true;
+    info.id_callback_index = callback_index;
+  } else if (operand_position == 1) {
+    info.enabled = true;
+    info.count_callback_index = callback_index;
+  }
+  return info;
+}
+
 static int get_first_predicated_lane(uint32_t active_mask, uint32_t predicate_mask) {
   uint32_t relevant = active_mask & predicate_mask;
   if (relevant == 0) {
@@ -504,6 +570,82 @@ static void append_tma_memcpy_dump_event(int device_id, uint64_t stream_key, CUd
       << blob_path << "\n";
 }
 
+/* Path A (TMA_BASE_ADDR.md §2.23): dump the host launch-argument buffer. Called at
+ * cuLaunchKernel (!is_exit). p->kernelParams is a host array of per-argument pointers;
+ * nvbit_get_kernel_argument_sizes gives each argument's byte size, from which we derive
+ * the packed param-block offset (the same static tensormap_offset the SASS def-chain
+ * yields). For each argument we read up to 128B from its host pointer and record the
+ * first 16 qwords. A by-value CUtensorMap arg exposes qword0 = the real base directly.
+ * All reads are host-side, so this never triggers the device illegal-access that killed
+ * the on-device fact-check. */
+static void append_tma_launch_param_dump_event(CUcontext ctx, int device_id,
+                                               int kernel_trace_id,
+                                               unsigned int unique_function_id,
+                                               const cuLaunchKernel_params *p) {
+  if (!enable_tma_desc || p == nullptr || p->kernelParams == nullptr) {
+    return;
+  }
+  std::vector<int> arg_sizes = nvbit_get_kernel_argument_sizes(ctx, p->f);
+  if (arg_sizes.empty()) {
+    return;
+  }
+  create_folder(extrainfo_path.c_str());
+  std::string blob_dir = extrainfo_path + "/launch_param_blobs";
+  create_folder(blob_dir.c_str());
+  std::string csv_path = extrainfo_path + "/tma_launch_param_dump.csv";
+  bool needs_header = tma_launch_param_dump_header_written.empty();
+  std::ofstream csv(csv_path, needs_header ? std::ios::out : std::ios::app);
+  if (!csv.is_open()) {
+    return;
+  }
+  if (needs_header) {
+    tma_launch_param_dump_header_written.insert(device_id);
+    csv << "device_id,kernel_id,unique_function_id,arg_index,param_offset_hex,arg_size,"
+           "arg_ptr_hex,blob_path,qword0_hex,qword1_hex,qword2_hex,qword3_hex\n";
+  }
+  /* CUDA packs each argument at its natural alignment; the param-block offset for a TMA
+   * descriptor is what the SASS c[0x0][K]+UIADD3 chain computes. We approximate the pack
+   * offset by aligning the running cursor to min(size, 8) before placing each argument,
+   * which matches the observed 0x1f0/0x2b0/... spacing for 128B descriptors. */
+  uint64_t offset = 0;
+  for (size_t i = 0; i < arg_sizes.size(); ++i) {
+    int sz = arg_sizes[i];
+    if (sz <= 0) {
+      continue;
+    }
+    uint64_t align = (uint64_t)(sz < 8 ? sz : 8);
+    if (align > 0 && (offset % align) != 0) {
+      offset += align - (offset % align);
+    }
+    const void *arg_ptr = p->kernelParams[i];
+    /* Persistent-kernel params are passed as one big by-value struct (e.g. 2368B) whose
+     * tensor bases sit at various inner offsets, so 128B is not enough. Dump the FULL arg
+     * bytes to a blob and let the offline verifier scan every 8-aligned qword for a base.
+     * (Host memory only — cannot fault the device.) */
+    std::string blob_path = blob_dir + "/k" + std::to_string(kernel_trace_id) +
+                            "_uid" + std::to_string(unique_function_id) + "_arg" +
+                            std::to_string(i) + ".bin";
+    if (arg_ptr != nullptr) {
+      std::ofstream blob(blob_path, std::ios::binary | std::ios::out);
+      if (blob.is_open()) {
+        blob.write(reinterpret_cast<const char *>(arg_ptr), sz);
+      }
+    }
+    const uint64_t *qw = reinterpret_cast<const uint64_t *>(arg_ptr);
+    int nqw = sz / 8;
+    csv << device_id << "," << kernel_trace_id << "," << unique_function_id << ","
+        << i << ",0x" << std::hex << offset << std::dec << "," << sz << ",0x"
+        << std::hex << reinterpret_cast<uintptr_t>(arg_ptr) << std::dec << ","
+        << blob_path;
+    for (int q = 0; q < 4; ++q) {
+      uint64_t v = (arg_ptr != nullptr && q < nqw) ? qw[q] : 0ULL;
+      csv << ",0x" << std::hex << v << std::dec;
+    }
+    csv << "\n";
+    offset += (uint64_t)sz;
+  }
+}
+
 static void append_tensor_map_encode_dump_event(int device_id, const cuTensorMapEncodeTiled_params *p) {
   if (!enable_tma_desc || p == nullptr || p->tensorMap == nullptr) {
     return;
@@ -565,6 +707,111 @@ static void append_tensor_map_encode_dump_event(int device_id, const cuTensorMap
       << uint64_to_hex_string(qwords[7]) << ","
       << blob_path << "\n";
 }
+
+// Phase 0b (TMA_BASE_ADDR.md §2.13, host-deref Gate 0). Called from the
+// cuLaunchKernel EXIT handler, AFTER the kernel has synced and the channel has
+// flushed (so the captured param_base is populated and the param buffer is still
+// alive). Reads the device-global kernel param block at the captured param_base and
+// dumps a raw region blob + a small param-base record. The OFFSET slicing (128B at
+// param_base + tensormap_offset) and encode-blob comparison happen offline in
+// verify_tma_descriptor_deref.py, so the tracer needs no SASS/offset knowledge.
+static void append_tma_param_base_deref_event(int device_id, int kernel_trace_id) {
+  if (!enable_tma_desc || tma_param_base_capture == nullptr) {
+    return;
+  }
+  if (!tma_param_base_capture->valid || tma_param_base_capture->param_base == 0) {
+    // No entry ULDC c[0x0][K] captured this launch (kernel may not use TMA, or K
+    // mismatch). Leave a note once so a wrong TMA_PARAM_BASE_CBANK_INDEX is visible.
+    return;
+  }
+  create_folder(extrainfo_path.c_str());
+  std::string region_dir = extrainfo_path + "/tma_desc_deref_blobs";
+  create_folder(region_dir.c_str());
+
+  unsigned long long param_base = tma_param_base_capture->param_base;
+  unsigned int uid = tma_param_base_capture->unique_function_id;
+  int region_bytes = tma_param_base_region_bytes;
+  if (region_bytes <= 0) {
+    region_bytes = 8192;
+  }
+
+  std::vector<uint8_t> region(region_bytes, 0);
+  CUresult rc = cuMemcpyDtoH(region.data(),
+                             (CUdeviceptr)param_base, (size_t)region_bytes);
+
+  std::string csv_path = extrainfo_path + "/tma_param_base_deref.csv";
+  bool needs_header = tma_param_base_deref_header_written.find(device_id) ==
+                      tma_param_base_deref_header_written.end();
+  std::ofstream csv(csv_path, needs_header ? std::ios::out : std::ios::app);
+  if (csv.is_open()) {
+    if (needs_header) {
+      tma_param_base_deref_header_written.insert(device_id);
+      csv << "device_id,kernel_id,unique_function_id,param_base_hex,cbank_index_hex,"
+             "region_bytes,memcpy_ok,region_blob_path\n";
+    }
+    std::string blob_path = region_dir + "/uid_" + std::to_string(uid) + "_k_" +
+                            std::to_string(kernel_trace_id) + ".bin";
+    if (rc == CUDA_SUCCESS) {
+      std::ofstream blob(blob_path, std::ios::binary | std::ios::out);
+      if (blob.is_open()) {
+        blob.write(reinterpret_cast<const char *>(region.data()), region_bytes);
+      }
+    }
+    std::ostringstream pb_stream;
+    pb_stream << "0x" << std::hex << param_base;
+    std::ostringstream cbank_stream;
+    cbank_stream << "0x" << std::hex << tma_param_base_cbank_index;
+    csv << device_id << "," << kernel_trace_id << "," << uid << ","
+        << pb_stream.str() << "," << cbank_stream.str() << "," << region_bytes
+        << "," << (rc == CUDA_SUCCESS ? 1 : 0) << ","
+        << (rc == CUDA_SUCCESS ? blob_path : std::string("")) << "\n";
+  }
+
+  // Reset for the next launch so each launch re-captures its own param_base.
+  tma_param_base_capture->valid = 0;
+  tma_param_base_capture->param_base = 0;
+  tma_param_base_capture->unique_function_id = 0;
+}
+
+/* SPIKE 6 fact-check (§2.18): dump the device-read 128B descriptor samples (qword0 =
+ * expected real base) collected this launch, then reset the buffer. */
+static void append_tma_desc_factcheck_event(int device_id, int kernel_trace_id) {
+  if (!enable_tma_desc || !tma_desc_factcheck_enable ||
+      tma_desc_factcheck == nullptr) {
+    return;
+  }
+  if (tma_desc_factcheck->count == 0) {
+    return;  // no executed UTMALDG/UTMASTG this launch
+  }
+  create_folder(extrainfo_path.c_str());
+  std::string csv_path = extrainfo_path + "/tma_desc_factcheck.csv";
+  bool needs_header = tma_desc_factcheck_header_written.find(device_id) ==
+                      tma_desc_factcheck_header_written.end();
+  std::ofstream csv(csv_path, needs_header ? std::ios::out : std::ios::app);
+  if (csv.is_open()) {
+    if (needs_header) {
+      tma_desc_factcheck_header_written.insert(device_id);
+      csv << "device_id,kernel_id,unique_function_id,pc_hex,mref_ord,space,read_ok,"
+             "desc_va_hex,qword0_hex,qword1_hex\n";
+    }
+    unsigned int n = tma_desc_factcheck->stored;
+    if (n > TMA_DESC_FACTCHECK_SLOTS) n = TMA_DESC_FACTCHECK_SLOTS;
+    for (unsigned int i = 0; i < n; ++i) {
+      csv << device_id << "," << kernel_trace_id << ","
+          << tma_desc_factcheck->unique_function_id[i] << ",0x" << std::hex
+          << tma_desc_factcheck->pc[i] << std::dec << ","
+          << tma_desc_factcheck->mref_ord[i] << ","
+          << tma_desc_factcheck->space[i] << ","
+          << tma_desc_factcheck->read_ok[i] << ",0x" << std::hex
+          << tma_desc_factcheck->desc_va[i]
+          << ",0x" << tma_desc_factcheck->qword0[i] << ",0x"
+          << tma_desc_factcheck->qword1[i] << std::dec << "\n";
+    }
+  }
+  // Reset for the next launch.
+  memset(tma_desc_factcheck, 0, sizeof(tma_desc_factcheck_t));
+}
+
 
 struct cuMemcpyHtoDAsync_v2_params_proxy {
   CUdeviceptr dstDevice;
@@ -1386,10 +1633,18 @@ void nvbit_at_init() {
   GET_VAR_INT(incremental_flush_threshold, "INCREMENTAL_FLUSH_THRESHOLD", 0,
               "Flush threadblocks to disk when instruction count exceeds this threshold. "
               "0 = disabled (default). Recommended: 50000-100000 for large kernels.");
-  GET_VAR_INT(enable_tma_desc, "ENABLE_TMA_DESC", 0,
+  GET_VAR_INT(enable_tma_desc, "ENABLE_TMA_DESC", 1,
               "Enable TMA descriptor capture, including runtime desc handle debug and tensor-map descriptor dumps.");
   GET_VAR_INT(aux_htod_dump_max_bytes, "AUX_HTOD_DUMP_MAX_BYTES", 4096,
               "Maximum auxiliary HtoD memcpy payload size to dump when ENABLE_TMA_DESC is enabled.");
+  GET_VAR_INT(tma_param_base_cbank_index, "TMA_PARAM_BASE_CBANK_INDEX", 0x198,
+              "Phase 0b: c[0x0][K] index the entry ULDC.64 loads param_base from (host-deref descriptor recovery).");
+  GET_VAR_INT(tma_param_base_region_bytes, "TMA_PARAM_BASE_REGION_BYTES", 8192,
+              "Phase 0b: bytes of the kernel param block to cuMemcpyDtoH for descriptor slicing.");
+  GET_VAR_INT(tma_desc_factcheck_enable, "TMA_DESC_FACTCHECK", 0,
+              "SPIKE 6 (§2.18): at executed UTMALDG/UTMASTG, classify the descriptor VA address space (crash-safe) and dump it to tma_desc_factcheck.csv.");
+  GET_VAR_INT(tma_desc_factcheck_read, "TMA_DESC_FACTCHECK_READ", 0,
+              "SPIKE 6 (§2.18): opt-in — also device-read 128B at the descriptor VA (only when GLOBAL). Off by default because a generic load of a SMEM/raw operand faults.");
   std::string pad(100, '-');
   printf("%s\n", pad.c_str());
 
@@ -1525,6 +1780,7 @@ void instrument_function_if_needed(CUcontext ctx, CUfunction func, int device_id
       uint32_t num_of_injects = 0;
       std::string opcode_str = instr->getOpcode() ? std::string(instr->getOpcode()) : "";
       sync_runtime_capture_site_info sync_site_info;
+      bar_runtime_capture_site_info bar_site_info;
 
       if(inst_parsed->is_tensor_core_op()) {
         inst_parsed->set_tensor_core_instruction_info();
@@ -1547,6 +1803,19 @@ void instrument_function_if_needed(CUcontext ctx, CUfunction func, int device_id
           }
           if (sync_operand_info.semantic_is_zero_literal) {
             sync_site_info.semantic_is_zero_literal = true;
+          }
+        }
+        bar_runtime_capture_site_info bar_operand_info =
+            build_bar_runtime_capture_site_info(opcode_str, i, num_of_injects,
+                                                op->type);
+        if (bar_operand_info.enabled) {
+          bar_site_info.enabled = true;
+          if (bar_operand_info.id_callback_index >= 0) {
+            bar_site_info.id_callback_index = bar_operand_info.id_callback_index;
+          }
+          if (bar_operand_info.count_callback_index >= 0) {
+            bar_site_info.count_callback_index =
+                bar_operand_info.count_callback_index;
           }
         }
         if(is_tma_desc_consumer_instruction && operand_str.find("desc[UR") != std::string::npos) {
@@ -1617,6 +1886,10 @@ void instrument_function_if_needed(CUcontext ctx, CUfunction func, int device_id
       if (sync_site_info.enabled) {
         sync_runtime_capture_sites_by_pc[next_candidate_unique_function_id][vpc] =
             sync_site_info;
+      }
+      if (bar_site_info.enabled) {
+        bar_runtime_capture_sites_by_pc[next_candidate_unique_function_id][vpc] =
+            bar_site_info;
       }
 
       if(num_of_injects == 0) {
@@ -1749,6 +2022,76 @@ void instrument_function_if_needed(CUcontext ctx, CUfunction func, int device_id
           nvbit_add_call_arg_const_val64(instr,
                                         (uint64_t)&reported_dynamic_instr_counter);
           nvbit_add_call_arg_const_val64(instr, (uint64_t)&stop_report[device_id]);
+      }
+
+      /* Phase 0b (TMA_BASE_ADDR.md §2.13): instrument the entry
+       * ULDC.64 URx, c[0x0][K] that loads param_base. K == tma_param_base_cbank_index.
+       * Inject capture_tma_param_base at IPOINT_AFTER so the destination UREG pair
+       * holds the loaded value (param_base). One call per matching site; the device
+       * function keeps only the first write per launch. */
+      if (enable_tma_desc && tma_param_base_capture != nullptr &&
+          opcode_str.rfind("ULDC", 0) == 0) {
+        int dest_ureg = -1;
+        bool matches_param_cbank = false;
+        for (int oi = 0; oi < instr->getNumOperands(); ++oi) {
+          const InstrType::operand_t *op = instr->getOperand(oi);
+          std::string op_text = op->str ? std::string(op->str) : "";
+          if (op->type == InstrType::OperandType::UREG && dest_ureg < 0) {
+            dest_ureg = get_ur_register(op_text);
+          }
+          if (op->type == InstrType::OperandType::CBANK) {
+            /* Match c[0x0][K] by parsing the operand string (avoids depending on
+             * the NVBit cbank struct field name across versions). The second
+             * bracketed value is the constant offset K. */
+            size_t first_lb = op_text.find('[');
+            size_t second_lb = op_text.find('[', first_lb + 1);
+            if (second_lb != std::string::npos) {
+              int parsed_offset = (int)strtol(
+                  op_text.c_str() + second_lb + 1, nullptr, 0);
+              if (parsed_offset == tma_param_base_cbank_index) {
+                matches_param_cbank = true;
+              }
+            }
+          }
+        }
+        if (matches_param_cbank && dest_ureg >= 0) {
+          nvbit_insert_call(instr, "capture_tma_param_base", IPOINT_AFTER);
+          nvbit_add_call_arg_guard_pred_val(instr);
+          nvbit_add_call_arg_const_val32(instr, next_candidate_unique_function_id);
+          nvbit_add_call_arg_ureg_val(instr, dest_ureg);      /* param_base lo */
+          nvbit_add_call_arg_ureg_val(instr, dest_ureg + 1);  /* param_base hi */
+          nvbit_add_call_arg_const_val64(instr, (uint64_t)tma_param_base_capture);
+        }
+      }
+
+      /* SPIKE 6 device fact-check (TMA_BASE_ADDR.md §2.18): at an executed
+       * UTMALDG/UTMASTG, read 128B at the descriptor-carrying memref address (the
+       * generic-SMEM tensormap VA, §2.17f) and record qword0/qword1. Uses the FIRST
+       * memory-ref operand (operand-1 for UTMALDG, the desc-like first pair for
+       * UTMASTG), which is the address UTMACCTL.PF prefetches. Offline we check
+       * qword0 in the 7 encode bases. Gated by TMA_DESC_FACTCHECK. */
+      if (enable_tma_desc && tma_desc_factcheck != nullptr &&
+          (opcode_str.rfind("UTMALDG", 0) == 0 ||
+           opcode_str.rfind("UTMASTG", 0) == 0)) {
+        /* Instrument EVERY memory-ref operand (max 2), each tagged with its 0-based
+         * MREF ordinal. SPIKE 7 showed MREF-0 is a raw-shared cursor (0xe800), so we
+         * must also capture MREF-1 to find which operand is the actual descriptor VA.
+         * The device fn classifies each VA's space and only reads a plausible GLOBAL. */
+        int mref_index = 0;
+        for (int oi = 0; oi < instr->getNumOperands(); ++oi) {
+          if (instr->getOperand(oi)->type != InstrType::OperandType::MREF) {
+            continue;
+          }
+          nvbit_insert_call(instr, "factcheck_tma_descriptor", IPOINT_BEFORE);
+          nvbit_add_call_arg_guard_pred_val(instr);
+          nvbit_add_call_arg_const_val32(instr, next_candidate_unique_function_id);
+          nvbit_add_call_arg_const_val32(instr, (int)instr->getOffset());
+          nvbit_add_call_arg_const_val32(instr, mref_index);
+          nvbit_add_call_arg_mref_addr64(instr, mref_index);
+          nvbit_add_call_arg_const_val32(instr, tma_desc_factcheck_read);
+          nvbit_add_call_arg_const_val64(instr, (uint64_t)tma_desc_factcheck);
+          mref_index++;
+        }
       }
       cnt++;
     }
@@ -2004,6 +2347,12 @@ void nvbit_at_cuda_event(CUcontext ctx, int is_exit, nvbit_api_cuda_t cbid,
         ker->set_id(kernel_id[device_id]);
         ker->set_name(final_kernel_name);
         ker->set_function_unique_id(it_map_unique_function_id->second);
+        /* Path A (§2.23): dump the host launch-arg buffer once per launch (host reads
+         * only, cannot fault). Joined offline to (uid,pc) by the static tensormap_offset. */
+        if (enable_tma_desc) {
+          append_tma_launch_param_dump_event(ctx, device_id, kernel_id[device_id],
+                                             it_map_unique_function_id->second, p);
+        }
         ker->set_size_shared_memory(shmem_static_nbytes + p->sharedMemBytes);
         ker->set_number_of_registers(nregs);
         ker->set_shared_memory_base_address((uint64_t)nvbit_get_shmem_base_addr(ctx));
@@ -2073,6 +2422,16 @@ void nvbit_at_cuda_event(CUcontext ctx, int is_exit, nvbit_api_cuda_t cbid,
        * current kernel */
       while (recv_thread_receiving[ctx]) {
         pthread_yield();
+      }
+
+      /* Phase 0b (TMA_BASE_ADDR.md §2.13): the kernel is fully done and the channel
+       * is drained, so the captured param_base is populated and the kernel param
+       * buffer is still alive. Deref the param region on the app thread here (never
+       * from the recv thread). kernel_id was incremented at launch, so the just-
+       * finished kernel is kernel_id-1. */
+      if (enable_tma_desc && !stop_report[device_id]) {
+        append_tma_param_base_deref_event(device_id, kernel_id[device_id] - 1);
+        append_tma_desc_factcheck_event(device_id, kernel_id[device_id] - 1);
       }
 
       unsigned total_insts_per_kernel =
@@ -2325,6 +2684,40 @@ void *recv_thread_fun(void *args) {
                 sync->set_valid(true);
                 sync->set_has_semantic_raw(true);
                 sync->set_semantic_raw(ma->addrs_or_reg_val_0[first_lane]);
+              }
+            }
+          }
+        }
+        auto bar_function_it =
+            bar_runtime_capture_sites_by_pc.find(ma->unique_function_id);
+        if (bar_function_it != bar_runtime_capture_sites_by_pc.end()) {
+          auto bar_pc_it = bar_function_it->second.find(ma->vpc);
+          if (bar_pc_it != bar_function_it->second.end()) {
+            const bar_runtime_capture_site_info &bar_site = bar_pc_it->second;
+            // Register-form barrier operands take the REGULAR callback path, where the
+            // live register value lands in addrs_or_reg_val_0[lane] with mem_type==NONE.
+            // Pick the first predicated-active lane: if the warp did not actually execute
+            // this BAR (no active+predicated lane), nothing is captured for this instance.
+            int first_lane =
+                get_first_predicated_lane(ma->active_mask, ma->predicate_mask);
+            if (first_lane >= 0 && ma->mem_type == MEM_TYPE::NONE) {
+              if (bar_site.id_callback_index >= 0 &&
+                  callback_index ==
+                      static_cast<unsigned int>(bar_site.id_callback_index)) {
+                dynamic_trace::instruction::bar_runtime_info *bar =
+                    inst->mutable_bar_runtime();
+                bar->set_valid(true);
+                bar->set_has_id(true);
+                bar->set_id(static_cast<uint32_t>(ma->addrs_or_reg_val_0[first_lane]));
+              } else if (bar_site.count_callback_index >= 0 &&
+                         callback_index ==
+                             static_cast<unsigned int>(
+                                 bar_site.count_callback_index)) {
+                dynamic_trace::instruction::bar_runtime_info *bar =
+                    inst->mutable_bar_runtime();
+                bar->set_valid(true);
+                bar->set_has_count(true);
+                bar->set_count(static_cast<uint32_t>(ma->addrs_or_reg_val_0[first_lane]));
               }
             }
           }
@@ -2959,6 +3352,23 @@ void init_context_state(CUcontext ctx) {
       stop_report[i] = false;
       kernel_id.push_back(1);
       current_stream_id.push_back(0);
+    }
+    /* Phase 0b: one managed param-base capture slot (single device assumed here,
+     * matching the rest of the tool's single-stream simplification). */
+    if (enable_tma_desc) {
+      CUDA_SAFECALL(cuMemAllocManaged(
+          reinterpret_cast<CUdeviceptr *>(&tma_param_base_capture),
+          sizeof(tma_param_base_capture_t), CU_MEM_ATTACH_GLOBAL));
+      tma_param_base_capture->param_base = 0;
+      tma_param_base_capture->unique_function_id = 0;
+      tma_param_base_capture->valid = 0;
+    }
+    /* SPIKE 6 fact-check (§2.18): one managed buffer for device-side 128B descriptor reads. */
+    if (enable_tma_desc && tma_desc_factcheck_enable) {
+      CUDA_SAFECALL(cuMemAllocManaged(
+          reinterpret_cast<CUdeviceptr *>(&tma_desc_factcheck),
+          sizeof(tma_desc_factcheck_t), CU_MEM_ATTACH_GLOBAL));
+      memset(tma_desc_factcheck, 0, sizeof(tma_desc_factcheck_t));
     }
   }
   CTXstate* ctx_state = ctx_state_map[ctx];

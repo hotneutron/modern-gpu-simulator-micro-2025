@@ -32,6 +32,7 @@
 #include "sm.h"
 #include "../gpu-cache.h"
 #include "../gpu-sim.h"
+#include <sstream>
 
 void record_instruction_region_late_miss_observation(
     unsigned int sm_id, unsigned int line_size, new_addr_type block_addr,
@@ -206,6 +207,7 @@ bool single_stream_buffer::fill(mem_fetch *mf, unsigned time) {
             get_sm()->m_sm_stats.m_stats_map["total_num_l0i_stream_buffer_prefetch_l1i_miss_fill_matched"]->increment_with_integer(1);
         }
         it->second.is_ready = true;
+        it->second.m_ready_cycle = get_sm()->get_current_gpu_cycle();
         if (it->second.m_has_first_demand) {
             unsigned long long ready_cycle = get_sm()->get_current_gpu_cycle();
             if (ready_cycle > it->second.m_first_demand_cycle) {
@@ -227,11 +229,32 @@ bool single_stream_buffer::fill(mem_fetch *mf, unsigned time) {
             }
         }
     }else {
-        get_sm()->m_sm_stats.m_stats_map["total_num_l0i_stream_buffer_fill_orphaned"]->increment_with_integer(1);
-        if(mf->get_prefetch_l1i_fate() == 2) {
-            get_sm()->m_sm_stats.m_stats_map["total_num_l0i_stream_buffer_prefetch_l1i_miss_fill_orphaned"]->increment_with_integer(1);
+        // No live tracking entry. Distinguish two cases:
+        //  - The entry was dropped by eager-promote (Opt 5) while this prefetch
+        //    response was still in flight: this is expected and benign. The line
+        //    is already (or will be) serviced from the L1I tag array, so just
+        //    consume the fill here without re-driving the cache.
+        //  - Otherwise it is a genuine orphan (unexpected).
+        auto dropped_it = m_eager_promoted_dropped_addrs.find(addr);
+        if(dropped_it != m_eager_promoted_dropped_addrs.end()) {
+            get_sm()->m_sm_stats.m_stats_map["total_num_l0i_stream_buffer_fill_eager_promoted_orphaned"]->increment_with_integer(1);
+            m_eager_promoted_dropped_addrs.erase(dropped_it);
+            if(get_cache()->l1i_pf_debug_take_budget_public()) {
+                std::ostringstream oss;
+                oss << "[L1IPFDBG][sb-promoted-orphan-fill] sm=" << get_sm()->get_sid()
+                    << " sb=" << m_stream_buffer_id
+                    << " addr=0x" << std::hex << addr << std::dec
+                    << " cycle=" << get_sm()->get_current_gpu_cycle() << "\n";
+                fprintf(stderr, "%s", oss.str().c_str());
+            }
+            res = false;  // entry already handled by eager-promote; do not re-drive
+        } else {
+            get_sm()->m_sm_stats.m_stats_map["total_num_l0i_stream_buffer_fill_orphaned"]->increment_with_integer(1);
+            if(mf->get_prefetch_l1i_fate() == 2) {
+                get_sm()->m_sm_stats.m_stats_map["total_num_l0i_stream_buffer_prefetch_l1i_miss_fill_orphaned"]->increment_with_integer(1);
+            }
+            res = true;
         }
-        res = true;
     }
     return res;
 }
@@ -241,7 +264,15 @@ bool single_stream_buffer::send_to_cache() {
     if(!m_queue_ordered_prefetches.empty()) {
         new_addr_type addr = m_queue_ordered_prefetches.front();
         auto it = m_all_prefetches.find(addr);
-        assert(it != m_all_prefetches.end());
+        if(it == m_all_prefetches.end()) {
+            // Queue head has no tracking entry. With eager-promote (Opt 5) the
+            // queue and map are popped/erased together, so this should not happen;
+            // if it ever does, drop the stale queue head instead of asserting
+            // (an assert here aborts the whole run during steady state).
+            get_sm()->m_sm_stats.m_stats_map["total_num_l0i_stream_buffer_send_to_cache_head_missing_entry"]->increment_with_integer(1);
+            m_queue_ordered_prefetches.pop();
+            return can_continue_send_to_cache;
+        }
         if(it->second.is_ready && it->second.is_request_to_cache) {
             get_sm()->m_sm_stats.m_stats_map["total_num_l0i_stream_buffer_send_to_cache_attempts"]->increment_with_integer(1);
             can_continue_send_to_cache = false;
@@ -264,8 +295,81 @@ bool single_stream_buffer::has_ready_requested_head() const {
     }
     new_addr_type addr = m_queue_ordered_prefetches.front();
     auto it = m_all_prefetches.find(addr);
-    assert(it != m_all_prefetches.end());
+    if(it == m_all_prefetches.end()) {
+        // Head was already removed (e.g. by eager-promote). Nothing ready to send.
+        return false;
+    }
     return it->second.is_ready && it->second.is_request_to_cache;
+}
+
+// L1I eager-promote (Option B). Promote the head entry into the L1I tag array if
+// it is ready and has NOT yet been demanded. Guards:
+//  - is_ready == true (data actually returned into the stream buffer)
+//  - is_request_to_cache == false (no demand has claimed it yet; the demand path
+//    owns those, and double-driving would race the L0I response)
+//  - waiting_warp_ids_and_its_addrs empty (Risk B: never strand a waiter)
+//  - fill-port available (Risk: Option B defers rather than dropping)
+// Returns true iff a promote was performed (head popped).
+bool single_stream_buffer::try_eager_promote_head() {
+    if(!m_is_enabled) return false;
+    if(m_queue_ordered_prefetches.empty()) return false;
+    first_level_instruction_cache *cache = get_cache();
+    if(!cache->eager_promote_enabled()) return false;
+
+    new_addr_type addr = m_queue_ordered_prefetches.front();
+    auto it = m_all_prefetches.find(addr);
+    assert(it != m_all_prefetches.end());
+    prefetch_element &elem = it->second;
+
+    if(!elem.is_ready) return false;             // data not back yet
+    if(elem.is_request_to_cache) return false;   // demand owns this; leave it
+    SM *sm = get_sm();
+    if(!elem.waiting_warp_ids_and_its_addrs.empty() ||
+       !elem.waiting_addrs_of_the_block.empty()) {  // Risk B guard
+        sm->m_sm_stats.m_stats_map["total_num_l0i_sb_eager_promote_skipped_has_waiter"]->increment_with_integer(1);
+        return false;
+    }
+    if(cache->is_eager_promote_blocked_by_port()) {  // Option B: defer
+        sm->m_sm_stats.m_stats_map["total_num_l0i_sb_eager_promote_skipped_fill_port_busy"]->increment_with_integer(1);
+        return false;
+    }
+
+    bool promoted = cache->promote_prefetch_to_cache(addr, elem);
+    if(promoted) {
+        m_queue_ordered_prefetches.pop();
+        m_all_prefetches.erase(addr);
+        // The tracking entry is gone, but the original prefetch mem_fetch for this
+        // line may still be in flight in the memory system. Remember the address so
+        // that a later fill() for it is handled as a benign promoted-orphan instead
+        // of falling into the generic orphan path (and so send_to_cache() /
+        // has_ready_requested_head() never assert on a missing entry).
+        m_eager_promoted_dropped_addrs.insert(addr);
+        if(cache->l1i_pf_debug_take_budget_public()) {
+            std::ostringstream oss;
+            oss << "[L1IPFDBG][sb-eager-drop] sm=" << sm->get_sid()
+                << " sb=" << m_stream_buffer_id
+                << " addr=0x" << std::hex << addr << std::dec
+                << " result=promoted"
+                << " cycle=" << sm->get_current_gpu_cycle() << "\n";
+            fprintf(stderr, "%s", oss.str().c_str());
+        }
+    } else {
+        // probe-skip (already cached / misaligned): drop the SB entry too, since
+        // the line is (or will be) serviced by the cache directly.
+        m_queue_ordered_prefetches.pop();
+        m_all_prefetches.erase(addr);
+        m_eager_promoted_dropped_addrs.insert(addr);
+        if(cache->l1i_pf_debug_take_budget_public()) {
+            std::ostringstream oss;
+            oss << "[L1IPFDBG][sb-eager-drop] sm=" << sm->get_sid()
+                << " sb=" << m_stream_buffer_id
+                << " addr=0x" << std::hex << addr << std::dec
+                << " result=probe-skip"
+                << " cycle=" << sm->get_current_gpu_cycle() << "\n";
+            fprintf(stderr, "%s", oss.str().c_str());
+        }
+    }
+    return promoted;
 }
 
 bool single_stream_buffer::classify_waiting_requested_head(new_addr_type addr,
@@ -473,6 +577,17 @@ void multiple_stream_buffers::cycle(bool can_sb_send_to_cache) {
             can_send_to_cache = m_stream_buffers[m_next_sb_send_request]->send_to_cache();
             m_next_sb_send_request = (m_next_sb_send_request + 1) % m_num_stream_buffers;
         }  
+    }
+}
+
+void multiple_stream_buffers::eager_promote_cycle() {
+    if(!m_is_enabled) return;
+    // Best-effort: try to promote one ready/not-demanded head per stream buffer.
+    // single_stream_buffer::try_eager_promote_head() internally gates on the
+    // cache fill port (Option B), so at most one promote actually consumes the
+    // port per cycle; the rest see the port busy and defer.
+    for(unsigned int i = 0; i < m_num_stream_buffers; i++) {
+        m_stream_buffers[i]->try_eager_promote_head();
     }
 }
 

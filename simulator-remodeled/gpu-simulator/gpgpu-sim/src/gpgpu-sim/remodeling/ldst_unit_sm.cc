@@ -301,8 +301,14 @@ mem_stage_stall_type ldst_unit_sm::process_cache_access(
                            ? (mf->get_data_size() / SECTOR_SIZE)
                            : 1;
 
-    for (unsigned i = 0; i < inc_ack; ++i)
+    // Scope-aware fence: this store goes through L1D (not an L1-bypass / .cg
+    // store), so it is CTA-visible once acked. Tag the mem_fetch so store_ack
+    // decrements the right per-warp counter regardless of the ack path.
+    mf->set_fence_visibility_level(mem_fetch::FENCE_VIS_CTA);
+    for (unsigned i = 0; i < inc_ack; ++i) {
       m_core->inc_store_req(inst.warp_id());
+      m_core->inc_fence_store(inst.warp_id(), mem_fetch::FENCE_VIS_CTA, 1);
+    }
   }
   if (status == HIT) {
     assert(!read_sent);
@@ -435,8 +441,11 @@ mem_stage_stall_type ldst_unit_sm::dispatch_to_memory_access_queue_l1Dcache(cach
                 ? (mf->get_data_size() / SECTOR_SIZE)
                 : 1;
 
+        // L1D-path store -> CTA-visible. Tag mem_fetch for the matching dec.
+        mf->set_fence_visibility_level(mem_fetch::FENCE_VIS_CTA);
         for (unsigned i = 0; i < inc_ack; ++i) {
           m_core->inc_store_req(acc->get_inst()->warp_id());
+          m_core->inc_fence_store(acc->get_inst()->warp_id(), mem_fetch::FENCE_VIS_CTA, 1);
         }
         pending_access_logic(acc->get_access_coal_info().m_prts_requesting);
       }
@@ -770,6 +779,13 @@ void ldst_unit_sm::issue(register_set_uniptr &reg_set, unsigned int icnt_id) {
   if(inst->m_is_ldgsts && (inst->m_ldgsts_state == STORE_STAGE)) {
     m_prt->reactivate_entry(inst);
   }else {
+    // Scope-aware fence: a shared store (STS/STSM) is CTA-visible once it retires
+    // from the PRT. Count it here (PRT assign) so it pairs exactly with the dec at
+    // PendingRequestTable::pop_entry (shared && store). Shared stores have no
+    // mem_fetch, so they are tracked directly on the per-warp CTA counter.
+    if(inst->space.is_shared() && inst->is_store()) {
+      m_core->inc_fence_store(inst->warp_id(), mem_fetch::FENCE_VIS_CTA, 1);
+    }
     m_prt->assign_entry(inst);
   }
 }
@@ -1163,9 +1179,15 @@ void ldst_unit_sm::dispatch_access_directly_to_l2() {
       }
       mem_fetch *mf =
           m_mf_allocator->alloc(*(acc->get_inst()), *acc,m_sm->get_current_gpu_cycle());
+      if (acc->get_inst()->is_store()) {
+        // L1-bypass (.cg / gmem_skip) store goes straight to L2 -> GPU-visible.
+        // Tag before push so store_ack (WRITE_ACK) decrements the GPU counter.
+        mf->set_fence_visibility_level(mem_fetch::FENCE_VIS_GPU);
+      }
       m_icnt->push(mf);
       if (acc->get_inst()->is_store()) {
         m_core->inc_store_req(acc->get_inst()->warp_id());
+        m_core->inc_fence_store(acc->get_inst()->warp_id(), mem_fetch::FENCE_VIS_GPU, 1);
         pending_access_logic(acc->get_access_coal_info().m_prts_requesting);
       }
       m_access_queue_to_bypass_to_l2.pop();
@@ -1559,6 +1581,12 @@ std::shared_ptr<warp_inst_t> PendingRequestTable::pop_entry(unsigned int icnt_id
   if(skip_wb || res->is_store()) {
     if(res->space.is_shared()) {
       m_ldst_unit_sm->m_current_num_shared_mem_inst--;
+      // Scope-aware fence: shared store retired -> now CTA-visible. Pairs with the
+      // inc at ldst_unit_sm::issue, which only counts non-ldgsts shared stores
+      // (the assign_entry path), so exclude ldgsts here to keep inc/dec balanced.
+      if(res->is_store() && !is_ldgsts) {
+        m_ldst_unit_sm->get_SM()->dec_fence_store(res->warp_id(), mem_fetch::FENCE_VIS_CTA, 1);
+      }
     }else {
       m_ldst_unit_sm->m_current_num_normal_mem_inst--;
     }

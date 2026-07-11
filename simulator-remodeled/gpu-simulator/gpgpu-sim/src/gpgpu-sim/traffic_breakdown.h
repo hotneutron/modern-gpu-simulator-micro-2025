@@ -12,6 +12,7 @@ class traffic_breakdown {
 
   // print the stats
   void print(FILE* fout);
+  void print_bw(FILE* fout, double elapsed_seconds);
 
   // record the amount and type of traffic introduced by this mem_fetch object
   void record_traffic(class mem_fetch* mf, unsigned int size);

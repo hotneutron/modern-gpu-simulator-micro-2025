@@ -20,6 +20,24 @@ void traffic_breakdown::print(FILE* fout) {
   }
 }
 
+void traffic_breakdown::print_bw(FILE* fout, double elapsed_seconds) {
+  for (traffic_stat_t::const_iterator i_stat = m_stats.begin();
+       i_stat != m_stats.end(); i_stat++) {
+    unsigned long long byte_transferred = 0;
+    for (traffic_class_t::const_iterator i_class = i_stat->second.begin();
+         i_class != i_stat->second.end(); i_class++) {
+      byte_transferred +=
+          (unsigned long long)i_class->first * (unsigned long long)i_class->second;
+    }
+    double bw = elapsed_seconds > 0.0
+                    ? ((double)byte_transferred / elapsed_seconds) /
+                          1000000000.0
+                    : 0.0;
+    fprintf(fout, "traffic_breakdown_%s_BW[%s] = %.4lf GB/Sec\n",
+            m_network_name.c_str(), i_stat->first.c_str(), bw);
+  }
+}
+
 void traffic_breakdown::record_traffic(class mem_fetch* mf, unsigned int size) {
   m_stats[classify_memfetch(mf)][size] += 1;
 }

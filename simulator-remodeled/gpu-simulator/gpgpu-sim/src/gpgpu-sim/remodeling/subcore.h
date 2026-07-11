@@ -91,6 +91,41 @@ class Subcore {
 
   bool is_subcore_with_problems_of_fordward_progress() const;
 
+  // [Step-0 full SM-idle decomposition] reason bits for the per-cycle non-issue mask.
+  enum step0_reason_bit {
+    STEP0_R_NEXT_STAGE          = 1u << 0,  // next_stage_not_available (ISSUE_CONTROL latch full)
+    STEP0_R_ISSUE_PORT_BUSY     = 1u << 1,  // IMAD.WIDE issue-port busy
+    STEP0_R_NO_VALID_FRONTEND   = 1u << 2,  // no_valid_instruction: head waiting on L1I frontend
+    STEP0_R_NO_VALID_SBWAIT     = 1u << 3,  //   ... specifically stream_buffer_wait
+    STEP0_R_NO_VALID_OTHER      = 1u << 4,  // no_valid_instruction: ibuffer empty / decode / other
+    STEP0_R_FU_OCCUPIED         = 1u << 5,  // no_warps_ready: a FU pipe busy
+    STEP0_R_FU_OCCUPIED_TENSOR  = 1u << 6,  //   ... tensor pipe specifically
+    STEP0_R_INST_BARRIER        = 1u << 7,  // BAR.SYNC / ldgdepbar
+    STEP0_R_WAIT_BARRIER        = 1u << 8,  // mbarrier / DEPBAR
+    STEP0_R_TMA_FLUSH           = 1u << 9,  // UTMACMDFLUSH drain
+    STEP0_R_STALL_COUNT         = 1u << 10, // fixed-latency dependency wait
+    STEP0_R_SCOREBOARD          = 1u << 11, // traditional scoreboard collision
+    STEP0_R_L1C                 = 1u << 12, // const cache
+    STEP0_R_RESULT_QUEUE_FULL   = 1u << 13, // RF result-queue full
+    STEP0_R_YIELD               = 1u << 14, // YIELD
+    // sub-reasons of NO_VALID_OTHER (head invalid but NOT waiting on the L1I frontend):
+    STEP0_R_NV_IBUFFER_EMPTY    = 1u << 15, // ibuffer empty (no fetched line to decode yet)
+    STEP0_R_NV_DECODE_PENDING   = 1u << 16, // line fetched, decode in flight
+    STEP0_R_NV_L0I_RESP_READY   = 1u << 17, // L0I response ready but not yet consumed
+    STEP0_R_NV_UNKNOWN          = 1u << 18, // unclassified invalid head
+    // sub-cause of NV_IBUFFER_EMPTY:
+    STEP0_R_NV_IBUF_FETCH_INFLIGHT  = 1u << 19, // fetch for next PC already in flight in L0I
+    STEP0_R_NV_IBUF_FETCH_NOT_ISSUED = 1u << 20, // no fetch issued yet (fetch scheduling behind)
+  };
+
+  // [WGMMA Opt6 Step-0] per-cycle issue outcome exported for SM-level (V) aggregation.
+  bool step0_issued_this_cycle() const { return m_step0_issued_this_cycle; }
+  bool step0_blocked_by_tensor_only_this_cycle() const { return m_step0_blocked_by_tensor_only_this_cycle; }
+  bool step0_blocked_by_frontend_sbwait_this_cycle() const { return m_step0_blocked_by_frontend_sbwait_this_cycle; }
+  // [Step-0 full SM-idle decomposition] per-cycle bitmask of this subcore's non-issue reasons,
+  // so SM::cycle() can attribute true SM-idle cycles to every reason in one run.
+  unsigned int step0_reason_mask_this_cycle() const { return m_step0_reason_mask_this_cycle; }
+
  private:
   int m_num_active_warps_subcore;
   first_level_instruction_cache* m_L0I;
@@ -116,6 +151,12 @@ class Subcore {
   unsigned int m_greedy_pointer_fetch;
 
   bool m_is_next_stage_of_issue_busy;
+
+  // [WGMMA Opt6 Step-0] per-cycle issue outcome (set at the end of Subcore::issue()).
+  bool m_step0_issued_this_cycle = false;
+  bool m_step0_blocked_by_tensor_only_this_cycle = false;
+  bool m_step0_blocked_by_frontend_sbwait_this_cycle = false;
+  unsigned int m_step0_reason_mask_this_cycle = 0;
 
   register_set_uniptr m_ISSUE_CONTROL_latch = register_set_uniptr(1, "ISSUE_CONTROL_latch");
   register_set_uniptr m_CONTROL_ALLOCATE_latch = register_set_uniptr(1, "CONTROL_ALLOCATE_latch");

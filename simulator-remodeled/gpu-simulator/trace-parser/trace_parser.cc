@@ -103,6 +103,11 @@ inst_trace_t::inst_trace_t() {
   sync_barrier_addr = 0;
   sync_has_semantic_raw = false;
   sync_semantic_raw = 0;
+  bar_runtime_valid = false;
+  bar_runtime_has_id = false;
+  bar_runtime_id = 0;
+  bar_runtime_has_count = false;
+  bar_runtime_count = 0;
 }
 
 inst_trace_t::~inst_trace_t() {}
@@ -133,6 +138,11 @@ inst_trace_t::inst_trace_t(const inst_trace_t &b) {
   sync_barrier_addr = b.sync_barrier_addr;
   sync_has_semantic_raw = b.sync_has_semantic_raw;
   sync_semantic_raw = b.sync_semantic_raw;
+  bar_runtime_valid = b.bar_runtime_valid;
+  bar_runtime_has_id = b.bar_runtime_has_id;
+  bar_runtime_id = b.bar_runtime_id;
+  bar_runtime_has_count = b.bar_runtime_has_count;
+  bar_runtime_count = b.bar_runtime_count;
   block_idx_x = b.block_idx_x;
   block_idx_y = b.block_idx_y;
   block_idx_z = b.block_idx_z;
@@ -155,6 +165,11 @@ inst_trace_t::inst_trace_t(address_type pc, unsigned int unique_function_id, boo
   sync_barrier_addr = 0;
   sync_has_semantic_raw = false;
   sync_semantic_raw = 0;
+  bar_runtime_valid = false;
+  bar_runtime_has_id = false;
+  bar_runtime_id = 0;
+  bar_runtime_has_count = false;
+  bar_runtime_count = 0;
 }
 
 bool inst_trace_t::check_opcode_contain(const std::vector<std::string> &opcode,
@@ -304,6 +319,11 @@ bool inst_trace_t::parse_from_pb(dynamic_trace::instruction pb_inst,
       sync_runtime_valid && pb_inst.sync().has_semantic_raw();
   sync_semantic_raw =
       sync_has_semantic_raw ? pb_inst.sync().semantic_raw() : 0;
+  bar_runtime_valid = pb_inst.has_bar_runtime() && pb_inst.bar_runtime().valid();
+  bar_runtime_has_id = bar_runtime_valid && pb_inst.bar_runtime().has_id();
+  bar_runtime_id = bar_runtime_has_id ? pb_inst.bar_runtime().id() : 0;
+  bar_runtime_has_count = bar_runtime_valid && pb_inst.bar_runtime().has_count();
+  bar_runtime_count = bar_runtime_has_count ? pb_inst.bar_runtime().count() : 0;
   unsigned int num_memrefs = pb_inst.addresses_size();
   std::bitset<WARP_SIZE> mask_bits(mask);
   opcode = static_trace_info.get_kernel_by_unique_function_id(m_unique_function_id).get_instruction(m_pc).get_op_code();

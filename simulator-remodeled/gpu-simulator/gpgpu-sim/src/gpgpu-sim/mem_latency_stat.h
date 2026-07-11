@@ -89,6 +89,8 @@ class memory_stats_t {
   unsigned int **totalbankwrites;    // bankwrites[dram chip id][bank id]
   unsigned int **totalbankreads;     // bankreads[dram chip id][bank id]
   unsigned int **totalbankaccesses;  // bankaccesses[dram chip id][bank id]
+  unsigned long long total_tma_dram_reads;
+  unsigned long long total_tma_dram_writes;
   unsigned int
       *num_MCBs_accessed;  // tracks how many memory controllers are accessed
                            // whenever any thread in a warp misses in cache

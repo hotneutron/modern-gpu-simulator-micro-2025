@@ -1,5 +1,122 @@
 # FA3 Kernel 5 (FWD) — Simulator vs. Real H100 Comparison
 
+---
+
+## UPDATE — Opt 5 (L1I eager-promote) simulator result (2026-06)
+
+Sections below were written through the **Opt 2 (BAR fix)** stage. The simulator has since improved
+through Opt 3 (MEMBAR scope fix), Opt 4 (deeper L1I stream buffer, sb=4), and Opt 5 (L1I
+eager-promote). **Real-HW (NCU) numbers are unchanged**; only the simulator side is updated here.
+
+### Simulator cycle progression (FA3 fwd, trace kernel 5, `FlashAttnFwdSm90`) — HW Elapsed = 67,696
+
+| Stage | sim cycles | Sim / HW | Δ vs prev |
+|---|---|---|---|
+| Init (rop=211) | 220,024 | 3.25× | — |
+| Opt 2 (BAR engine fix) | 162,582 | 2.40× | −26% (vs init) |
+| Opt 3 (MEMBAR scope fix) | 158,990 | 2.35× | −2.2% |
+| Opt 4 (prefetch, sb=4) | 155,765 | 2.30× | −2.0% |
+| **Opt 5 (L1I eager-promote)** | **149,727** | **2.21×** | **−3.4%** |
+
+- Opt 5 run: `.../H100_80GB-OnlyKernel5/...warmup_-63a73d452237.o20` (clean exit; Step-0
+  instrumentation counters are timing-neutral, so this is a valid Opt-5 baseline; supersedes the
+  earlier `.o18` 150,755).
+- eager-promote works (`eager_promote_to_cache=662,658`, `demand_hit_later=252,212`,
+  `demand_miss_after_promote=0`, L1I miss rate 0.3574); modest fwd gain (−3.4%).
+
+### Opt 5 issue-stage breakdown (top-level, mutually exclusive)
+
+| Class | Opt 5 % | Note |
+|---|---|---|
+| issuing | 31.19% | |
+| no_warps_ready | 27.32% | dominant stall class |
+| next_stage_not_available | 22.46% | downstream pipe back-pressure |
+| no_valid_instruction (frontend) | 18.11% | |
+| issue_port_busy | 0.92% | |
+
+Inside `no_warps_ready` (overlapping `..._at_least_one_warp_*`, % of all eval cycles):
+`non_tma_axis 24.07%`, `fu_occupied 13.50%`, `tma_axis 12.65%`, `wait_barrier 12.58%`,
+`stall_count 8.48%`, `yield 1.69%`, `inst_barrier 0.07%`.
+
+### Opt 5 / Step-0 SM-idle decomposition (true SM-level, not per-subcore)
+
+A Step-0 instrumentation run decomposed `sm_all_subcores_idle ≈ 18.33%` (cycles where **no**
+subcore on the SM issued) by the dominant blocking reason:
+
+| SM-idle reason | Opt 5 % | note |
+|---|---|---|
+| **no_valid_other** (ibuffer empty / decode / not stream-buffer) | **11.90%** | coarse bucket; follow-up split shows this is almost entirely `nv_ibuffer_empty` = tail-drain / winding-down warp imbalance |
+| **wait_barrier** (mbarrier / DEPBAR) | **9.71%** | #2 |
+| no_valid_frontend (incl. `sbwait` 3.99%) | 4.23% | L1I frontend send-bandwidth idea deferred / parked (only ~4% recoverable at true SM level) |
+| stall_count | 3.76% | |
+| fu_occupied (tensor 0.67%) | 2.10% | WGMMA fix deferred (≤0.7% recoverable) |
+| next_stage | 1.78% | |
+
+> Follow-up split instrumentation resolved the old `no_valid_other` bucket: almost all of it is
+> `nv_ibuffer_empty`, while `nv_ibuf_fetch_inflight = 0` and `nv_ibuf_fetch_not_issued ~= 0`, so the
+> dominant residual is best interpreted as **tail-drain / winding-down warp imbalance**, not an
+> actionable frontend fetch bottleneck. Both the WGMMA idea and the L1I frontend send-bandwidth idea
+> therefore remain **deferred / parked**.
+
+---
+
+## UPDATE — after the OP_BAR named/counted-barrier fix (2026-06)
+
+The numbers in the original sections below ("Simulator" = **220,024 cycles**) were produced
+**before** the named/counted-barrier engine fix. The barrier model was over-serializing the
+warp-specialized FA3 pipeline (`inst_barrier` ≈ 56% of issue-stage stall). After fixing the
+`OP_BAR` decode + the barrier engine (see `.plan/BAR_OP_H100.md`), the same OnlyKernel5 run
+completes cleanly (`*** exit detected ***`, no assert / deadlock) and the accuracy improves
+substantially.
+
+### Before vs. After (FA3 fwd, trace kernel 5, `FlashAttnFwdSm90`)
+
+| Metric | Real H100 (NCU) | Before (sim) | After fix (sim) | Note |
+|---|---|---|---|---|
+| **Elapsed / sim cycles** | 67,696 | **220,024** (3.25×) | **162,582** (2.40×) | **−26% cycles; 3.25× → 2.40×** |
+| gpu_sim_insn | — | 455,639,416 | 455,648,438 | ≈ identical (decode unchanged) |
+| gpu_occupancy | 20.14% | 19.85% | 19.30% | unchanged (resource model intact) |
+| `inst_barrier` stall share | barrier ≈ 10.9% | **56.09%** | **9.09%** | now matches HW barrier share |
+| `wait_barrier` (mbarrier) share | — | 6.64% | 8.07% | similar |
+| **TMA-axis stall share** | ≈ 23.8% | **62.73%** | **17.16%** | inverted attribution removed |
+| non-TMA-axis stall share | ≈ 57.8% | 17.80% | 17.34% | still under-attributed |
+| `issuing` share | 13.9% | 14.56% | 21.17% | closer to HW |
+| `no_valid_instruction` (frontend) | ≈ 4.5% | 9.52% | 39.12% | **new dominant bucket at this stage**; later Step-0 work showed only a small true SM-level frontend share |
+| shared-mem bank conflicts | 281 | 38,016 | 38,016 | untouched (separate model bug) |
+| run termination | — | abort (deadlock / teardown assert) | `*** exit detected ***` (12h38m) | **fixed** |
+
+> Caveat on the percentage rows: the issue-stage normalization denominator
+> (`total_num_cycles_issue_stage_evaluated`) changed between runs (110.4M → 75.9M), so the
+> percentages are **not** on an identical base — read them as a *trend* (barrier share
+> collapsing), not an exact like-for-like delta. The cycle counts (220,024 → 162,582) and the
+> termination status are directly comparable.
+
+### What the fix changed (engine, not decode)
+
+- The `OP_BAR` decode and the blocking-vs-arrive rule were already correct (see
+  `.plan/BAR_OP_H100.md` FINAL rule). The residual failure was a **CTA-teardown leak**:
+  in a warp-specialized kernel the producer/consumer warpgroups exit at different times, and
+  a counted/named barrier whose closing credit would have come from an already-exited warp
+  was never released, tripping `shader.cc:4252 deallocate_barrier` assert.
+- `barrier_set_t::warp_exit` now removes the exiting warp from every per-id participant /
+  arrive-credit / sync-credit set, and a new helper `release_satisfiable_barriers()`
+  generalizes the legacy full-CTA release (`at_barrier == active`) to counted/named barriers
+  so they drain once the remaining active participants have all arrived.
+- BARDBG verification on this run: all 40 CTA teardowns report `leaked_ids=0` (was 6),
+  8 `[BARDBG][exit-release]` events (ids 1,4,5,8,9,10,11), and `0` `exit-clear was_parked=1`
+  (no warp wrongly parked at a blocking SYNC ⇒ decode classification confirmed sound).
+
+### Residual gap (unchanged conclusion, smaller magnitude)
+
+With the spurious barrier serialization removed, the remaining 2.40× over-estimation is no
+longer barrier-dominated. The new largest bucket is the **frontend**
+(`no_valid_instruction = 39.1%`, almost entirely `head_invalid_waiting_frontend` = I-cache
+prefetch / stream-buffer wait), followed by the still-under-modeled non-TMA scheduler axis.
+The TMA-emission-serialization / mbarrier-credit-timing candidates from the analysis below
+remain the next levers; the ROP-latency conclusion is unchanged.
+
+---
+
 ## Target Information
 
 - **Workload**: `flashattn-fa3-bf16-bwd-causal-b1-s2048-hd64-nh24`
@@ -72,30 +189,74 @@
 
 ---
 
-## NCU (Measured) Detailed Metrics
+## NCU ↔ GCOM-sim Metric Mapping
 
-| Metric | Unit | Value |
+How each measured NCU metric maps to a GPGPU-Sim (GCOM, this remodeled sim) counter. "Direct" =
+an emitted sim counter; "Derived" = computed from sim counters (formula given); "No direct sim
+stat" = NCU-only (sim is cycle-based, no NCU-style throughput-% / wall-clock). Sim counter names
+are the exact strings from the Opt 5 run `.o20`.
+
+| NCU metric | GCOM-sim counter / derivation | Mapping note |
 |---|---|---|
-| Elapsed Cycles | cycle | 67,696 |
-| SM Active Cycles | cycle | 61,147 |
-| Duration | µs | 47.55 |
-| SM Frequency | GHz | 1.42 |
-| DRAM Frequency | GHz | 2.62 |
-| Compute (SM) Throughput | % | 43.04 |
-| Memory Throughput | % | 28.84 |
-| Memory Throughput | GB/s | 404.88 |
-| DRAM Throughput | % | 12.09 |
-| L1/TEX Hit Rate | % | 55.60 |
-| L2 Hit Rate | % | 69.58 |
-| Achieved Occupancy | % | 20.14 |
-| Theoretical Occupancy | % | 25.00 |
-| Achieved Active Warps / SM | warp | 12.89 |
-| Executed IPC (active) | inst/cycle | 1.79 |
-| Issued IPC (active) | inst/cycle | 1.80 |
-| Issue Slots Busy | % | 45.03 |
-| Registers / Thread | reg | 128 |
-| Waves / SM | — | 1.00 |
-| Executed Instructions | inst | 14,482,551 |
+| Elapsed Cycles | `gpu_tot_sim_cycle` (= `gpu_sim_cycle`) | Direct; the primary cycle comparison. |
+| SM Active Cycles | — (no separate active/elapsed split) | Sim emits a single cycle count; compare both NCU rows vs `gpu_tot_sim_cycle`. |
+| Duration (µs) | — (no direct sim stat) | Sim is cycle-based, no wall clock. |
+| SM Frequency (GHz) | config `-gpgpu_clock_domains` core clock (1.80) | Configured, not measured; cycle-vs-cycle comparison is clock-independent. |
+| DRAM Frequency (GHz) | config DRAM clock | Configured value. |
+| Compute (SM) Throughput % | — (no direct sim stat) | No NCU-style %-of-peak in sim; closest proxy = issue-stage `issuing` share. |
+| Memory Throughput % / GB/s | — (no direct sim stat) | Proxy = `dram bw_util` / `dram_eff` (both very low in sim). |
+| DRAM Throughput % | Derived proxy: `dram bw_util` (~0.005) | No %-of-peak; DRAM is near-idle in sim too. |
+| L1/TEX Hit Rate % | `1 − L1D_total_cache_miss_rate` | Sim: TMA bypasses L1D, so L1D = 6,144 acc / 100% miss → not comparable. |
+| L2 Hit Rate % | `1 − L2_total_cache_miss_rate` | Direct-derived; sim overestimates (98.96% vs 69.58%). |
+| Achieved Occupancy % | `gpu_occupancy` | Direct (per-SM achieved). |
+| Theoretical Occupancy % | reg/CTA-limited max (1 block/SM ⇒ 25%) | Static; sim matches (CTA=132, SM=132). |
+| Achieved Active Warps / SM | Derived: `gpu_occupancy × 64` (H100 max warps/SM) | No direct counter. |
+| Executed IPC (active) | Derived per-SM: `gpu_sim_insn /(gpu_tot_sim_cycle × n_SM)` | `gpu_ipc` (3043) is **aggregated over all cores** — different definition, not 1:1. |
+| Issued IPC (active) | same as above | sim has no separate executed/issued IPC. |
+| Issue Slots Busy % | issue-stage `issuing` share (Opt 5 = 31.19%) | Closest analog ("fraction of issue cycles that issued"). |
+| Registers / Thread | config / launch reg count (128) | Static; matches. |
+| Waves / SM | `gpu_tot_issued_cta / n_SM` (132/132 = 1.00) | Direct-derived; matches. |
+| Executed Instructions | `gpu_sim_insn` (455,648,438) | **Different granularity**: NCU counts SASS/warp-insts; sim counts thread-insts → not 1:1. |
+
+## NCU (Measured) Detailed Metrics — vs Opt 5 simulator (side by side)
+
+> The "Real H100 (NCU)" column is **unchanged**. The "GCOM Sim (Opt 5)" column is from the
+> clean-exit, timing-neutral run `.../H100_80GB-OnlyKernel5/...warmup_-63a73d452237.o20`
+> (`gpu_tot_sim_cycle = 149,727`). See the mapping table above for how each sim value is obtained;
+> `— (no direct sim stat)` marks NCU-only metrics.
+
+| Metric | Unit | Real H100 (NCU) | GCOM Sim (Opt 5, `.o20`) | Sim/HW or note |
+|---|---|---|---|---|
+| Elapsed Cycles | cycle | 67,696 | 149,727 | **2.21×** (primary) |
+| SM Active Cycles | cycle | 61,147 | — (no split) | compare vs 149,727 → 2.45× |
+| Duration | µs | 47.55 | — | sim is cycle-based |
+| SM Frequency | GHz | 1.42 | 1.80 (config) | configured, not measured |
+| DRAM Frequency | GHz | 2.62 | (config) | configured |
+| Compute (SM) Throughput | % | 43.04 | — (no direct sim stat) | proxy: `issuing` 31.19% |
+| Memory Throughput | % | 28.84 | — (no direct sim stat) | proxy: dram bw_util ~0.005 |
+| Memory Throughput | GB/s | 404.88 | — (no direct sim stat) | — |
+| DRAM Throughput | % | 12.09 | — (no direct sim stat) | dram near-idle in sim too |
+| L1/TEX Hit Rate | % | 55.60 | L1 bypassed (6,144 acc, 100% miss) | not comparable (TMA→L2 direct) |
+| L2 Hit Rate | % | 69.58 | 98.96 (1 − miss 0.0104) | sim **overestimates** |
+| Achieved Occupancy | % | 20.14 | 12.04 (`gpu_occupancy`) | see note ‡ |
+| Theoretical Occupancy | % | 25.00 | 25.00 (reg-limited, 1 blk/SM) | match |
+| Achieved Active Warps / SM | warp | 12.89 | ~7.7 (= 12.04% × 64) | derived; tracks occupancy |
+| Executed IPC (active) | inst/cycle | 1.79 | not 1:1 (see note †) | `gpu_ipc` aggregated = 3043 |
+| Issued IPC (active) | inst/cycle | 1.80 | not 1:1 (see note †) | — |
+| Issue Slots Busy | % | 45.03 | 31.19 (`issuing` share) | sim lower |
+| Registers / Thread | reg | 128 | 128 (config) | match |
+| Waves / SM | — | 1.00 | 1.00 (132 CTA / 132 SM) | match |
+| Executed Instructions | inst | 14,482,551 | `gpu_sim_insn` = 455,648,438 | different granularity (note §) |
+
+> ‡ The `.o20` run reports `gpu_occupancy = 12.04%`. An earlier (Opt 1/2) run reported 19.85%;
+> the difference is a per-run occupancy-accounting artifact, not a model change — the latest Opt 5
+> value (12.04%) is shown here.
+> † NCU IPC is **per-SM** (inst/cycle); sim `gpu_ipc` (3043) is **aggregated over all cores**, a
+> different definition. The comparable per-SM figure must be derived as
+> `gpu_sim_insn /(gpu_tot_sim_cycle × 132)`, but note `gpu_sim_insn` is a thread-instruction count
+> (see §), so even that is not a clean 1:1.
+> § NCU "Executed Instructions" counts SASS/warp-level instructions; sim `gpu_sim_insn` counts
+> thread-level instructions, so the two are on different granularities and are not directly equal.
 
 ---
 
@@ -240,12 +401,13 @@ The re-enabled `no_warps_ready` sub-breakdown in `subcore.cc` produced the follo
 | 5 | WGMMA/tensor latency (`tensor_latency=32`) | HW `gmma` stall only 1.4%, tensor pipe 46% busy is *expected* for fwd | **DO NOT touch** |
 | 6 | shared bank-conflict model | sim 38,016 vs HW 281 — sim grossly over-counts; feeds `mio_throttle`/`short_scoreboard` non-TMA cost | investigate (small absolute vs barrier inflation) |
 
-### Highest-leverage change
-- Since `rop_latency=100` is already in effect and the gap persists, the next target is the
-  **TMA emission serialization (`kMaxRequestsPerCycle`)** and the **mbarrier-credit timing**, which
-  together drive the dominant `inst_barrier`/`wait_barrier` buckets (the 62.7% TMA axis). Use the
-  per-transfer TMA `lat_issue` / `lat_mem` log to decide whether emission serialization or memory
-  round-trip is the larger contributor before changing a knob.
+### Highest-leverage change at that stage
+- At the time of this section, with `rop_latency=100` already in effect and the gap still large,
+  the leading hypothesis was **TMA emission serialization (`kMaxRequestsPerCycle`)** plus
+  **mbarrier-credit timing**, because they appeared to drive the dominant
+  `inst_barrier`/`wait_barrier` buckets (the 62.7% TMA axis). Later work superseded this specific
+  prioritization: the barrier and MEMBAR fixes landed first, and the eventually investigated L1I
+  frontend path was also parked after Step-0 showed it was not a major true-SM bottleneck.
 - Unlike memory-bound kernels, the forward kernel's true bottleneck is the **xu (MUFU) + tensor**
   compute pipes; once the spurious barrier waits are removed, accuracy will hinge on the
   fixed-latency / scheduler (`wait`, `not_selected`, `dispatch`) modeling that the sim currently

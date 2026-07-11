@@ -156,6 +156,15 @@ class SM : public core_t, public shader_core_ctx_wrapper {
 
   void num_cycles_to_stall_SM(unsigned int num_cycles);
 
+  // Map a hardware CTA slot (get_cta_id()) to the linear global block index
+  // (blockIdx.x + gridDim.x*blockIdx.y + ...). Recorded at issue_block2core.
+  // Used by the TMA unit's M2 tile-spread so different CTAs address different
+  // tiles of the same tensor instead of every CTA collapsing to tile 0.
+  unsigned int get_global_cta_id(unsigned int hw_cta_slot) const {
+    if (hw_cta_slot >= MAX_CTA_PER_SHADER) return 0;
+    return m_local_to_global_cta_id[hw_cta_slot];
+  }
+
   void cycle() override;
 
   void consume_pending_wait_barrier_actions(std::stack<Wait_Barrier_Entry_Modifier> &actions);
@@ -264,6 +273,17 @@ class SM : public core_t, public shader_core_ctx_wrapper {
   void inc_store_req(unsigned warp_id) override;
   bool ptx_thread_done(unsigned hw_thread_id) const override;
 
+  // Scope-aware memory-fence store tracking (per warp). These mirror the existing
+  // inc_store_req/store_ack accounting but split it by fence visibility level so a
+  // MEMBAR can drain only the stores visible at its scope. inc happens when a store
+  // is issued (level chosen from is_l1d_bypass / shared), dec when that store is
+  // acked (level read back from the mem_fetch tag, or directly for shared stores).
+  void inc_fence_store(unsigned warp_id, int fence_vis_level, unsigned n = 1);
+  void dec_fence_store(unsigned warp_id, int fence_vis_level, unsigned n = 1);
+  // True while warp_id still has stores not yet visible at the given fence scope
+  // (MEMBAR_SCOPE_CTA / MEMBAR_SCOPE_GPU). Used by warp_waiting_at_mem_barrier.
+  bool warp_has_pending_fence_stores(unsigned warp_id, int membar_scope) const;
+
   // debug:
   void display_simt_state(FILE *fout, int mask) const;
   void display_pipeline(FILE *fout, int print_mem, int mask3bit) const override;
@@ -365,6 +385,13 @@ class SM : public core_t, public shader_core_ctx_wrapper {
   // emit a single enter/release log per stall episode (avoids per-cycle spam).
   std::set<unsigned int> m_warps_waiting_tma_flush;
 
+  // Deadlock watchdog for scope-aware memory fences: cycle at which each warp
+  // first started waiting at its current MEMBAR/FENCE. Used to emit a periodic
+  // "[MEMBARDBG][stuck]" warning if a warp stays blocked far too long (likely a
+  // counter that never drains -> deadlock). Cleared on release.
+  std::map<unsigned int, unsigned long long> m_membar_wait_start_cycle;
+  std::map<unsigned int, unsigned long long> m_membar_last_stuck_warn_cycle;
+
   unsigned int m_num_cycles_to_wait_to_dispatch_another_inst_from_subcore_to_sm_shared_pipeline;
 
   unsigned long long m_last_inst_gpu_sim_cycle;
@@ -409,6 +436,8 @@ class SM : public core_t, public shader_core_ctx_wrapper {
   // Initialized from shader_core_config in SM::SM(); 0 disables logging.
   uint64_t m_sync_debug_print_budget = 0;
   uint64_t m_sync_debug_skip_runtime_budget = 0;
+  // Independent budget for TMA-only stderr logs (TMADBG); 0 disables.
+  uint64_t m_tma_debug_print_budget = 0;
   uint64_t m_sync_debug_sync_insts = 0;
   uint64_t m_sync_debug_exch = 0;
   uint64_t m_sync_debug_arrive = 0;

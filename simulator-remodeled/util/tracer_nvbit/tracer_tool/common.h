@@ -61,3 +61,44 @@ typedef struct {
   uint32_t num_of_injects;
   uint32_t per_operand_type;
 } inst_trace_t;
+
+/* Phase 0b (TMA_BASE_ADDR.md §2.13, host-deref Gate 0):
+ * one managed slot per device that the entry ULDC.64 URx, c[0x0][K] writes its
+ * loaded value (param_base, the device-global pointer to the kernel param block)
+ * into, once per launch. The host reads it after cuLaunchKernel sync and
+ * cuMemcpyDtoH's the param region so the offline harness can slice each 128B
+ * descriptor at param_base + tensormap_offset. */
+typedef struct {
+  unsigned long long param_base;
+  unsigned int unique_function_id;
+  int valid;
+} tma_param_base_capture_t;
+
+/* SPIKE 6 device fact-check (TMA_BASE_ADDR.md §2.18):
+ * at an executed UTMALDG/UTMASTG, read 128B from the descriptor VA (the operand that
+ * holds the generic-SMEM tensormap address, e.g. 0xffffffffc428xxxx) and record the
+ * first two qwords. Offline we check qword0 in {7 encode bases} to confirm the
+ * SMEM-staged descriptor really carries the real base. A tiny fixed ring is enough —
+ * we only need a handful of distinct samples, not every dynamic issue. */
+#define TMA_DESC_FACTCHECK_SLOTS 256
+/* address-space classification of desc_va (isspacep.* is a pure predicate that never
+ * faults, so we can record it for every sample even when the byte read is skipped). */
+enum TMA_DESC_VA_SPACE {
+  TMA_VA_UNKNOWN = 0,  /* generic addr in none of the mapped windows below */
+  TMA_VA_GLOBAL = 1,
+  TMA_VA_SHARED = 2,
+  TMA_VA_CONSTANT = 3,
+  TMA_VA_LOCAL = 4
+};
+typedef struct {
+  unsigned int count;                              /* total attempts (atomic) */
+  unsigned int stored;                             /* slots actually written  */
+  unsigned int unique_function_id[TMA_DESC_FACTCHECK_SLOTS];
+  unsigned int pc[TMA_DESC_FACTCHECK_SLOTS];
+  unsigned int mref_ord[TMA_DESC_FACTCHECK_SLOTS];       /* which memref (0/1) */
+  unsigned int space[TMA_DESC_FACTCHECK_SLOTS];          /* TMA_DESC_VA_SPACE  */
+  unsigned int read_ok[TMA_DESC_FACTCHECK_SLOTS];        /* 1 if q0/q1 valid   */
+  unsigned long long desc_va[TMA_DESC_FACTCHECK_SLOTS];  /* address inspected  */
+  unsigned long long qword0[TMA_DESC_FACTCHECK_SLOTS];   /* expected = base    */
+  unsigned long long qword1[TMA_DESC_FACTCHECK_SLOTS];
+} tma_desc_factcheck_t;

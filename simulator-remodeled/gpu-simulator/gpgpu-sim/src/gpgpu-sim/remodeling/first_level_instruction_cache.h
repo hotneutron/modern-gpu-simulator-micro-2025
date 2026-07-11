@@ -104,6 +104,24 @@ class first_level_instruction_cache : public read_only_cache {
 
   bool fill_from_stream_buffer(new_addr_type prefetch_addr, unsigned time, prefetch_element &pending_information);
 
+  // L1I eager-promote (Option B). Promote a ready, not-yet-demanded prefetch line
+  // into the L1I tag array, WITHOUT creating an L0I response (m_next_response).
+  // Returns true if the line was actually filled into the tag array.
+  // - eager_promote_enabled(): config gate.
+  // - is_eager_promote_blocked_by_port(): true when the fill port is busy this
+  //   cycle (Option B defers, does not drop).
+  // - promote_prefetch_to_cache(): performs the tag-array fill (probe-skip if the
+  //   line is already HIT or MSHR-pending), updates counters/debug logs.
+  bool eager_promote_enabled() const;
+  bool is_eager_promote_blocked_by_port() const;
+  bool promote_prefetch_to_cache(new_addr_type prefetch_addr,
+                                 const prefetch_element &pending_information);
+
+  // Budget-gated debug logging accessor for the stream buffer, which needs to
+  // emit [L1IPFDBG] lines (e.g. promoted-orphan fills) but cannot reach the
+  // private l1i_pf_debug_take_budget(). Returns true if a debug line may print.
+  bool l1i_pf_debug_take_budget_public() { return l1i_pf_debug_take_budget(); }
+
   bool waiting_for_fill(mem_fetch *mf) override;
 
   void printMapKeysMFFields();
@@ -148,4 +166,23 @@ class first_level_instruction_cache : public read_only_cache {
     unsigned int m_num_stream_buffers;
     unsigned int m_size_per_stream_buffer;
     unsigned int m_max_num_prefetches_per_cycle;
+
+    // L1I eager-promote debug logging budget (per cache instance). Decremented
+    // for every [L1IPFDBG] event line emitted; watchdog/summary are independent.
+    unsigned long long m_l1i_pf_debug_budget_left = 0;
+    bool m_l1i_pf_debug_budget_init = false;
+    bool l1i_pf_debug_take_budget();
+
+    // L1I eager-promote: base addresses promoted into L1I without a demand yet,
+    // with the promote cycle. On the next demand that observes the line, used to
+    // detect whether the promote was effective (demand HIT, success) or somehow
+    // MISSed (Risk A). Bounded: entry is consumed on first observing demand.
+    std::map<new_addr_type, unsigned long long> m_eager_promoted_base_addr_cycle;
+
+ public:
+    // Called from access() to account a demand that lands on a line which was
+    // eager-promoted earlier. status_is_hit distinguishes success (HIT) from the
+    // critical Risk-A signal (MISS after promote).
+    void note_demand_on_eager_promoted(new_addr_type base_addr, bool status_is_hit);
+    void record_eager_promoted_base(new_addr_type base_addr, unsigned long long cycle);
 };

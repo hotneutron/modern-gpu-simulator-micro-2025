@@ -1134,6 +1134,28 @@ struct cache_sub_stats {
   unsigned long long misses;
   unsigned long long pending_hits;
   unsigned long long res_fails;
+  // Granular per-status breakdown. The four fields above intentionally keep
+  // their legacy semantics (accesses = HIT+MISS+SECTOR_MISS+HIT_RESERVED;
+  // misses = MISS+SECTOR_MISS; pending_hits = HIT_RESERVED; MSHR_HIT dropped)
+  // so existing miss-rate numbers do not silently move. These extra fields
+  // expose the statuses that were previously merged or lost, for any cache
+  // (L1/L2/L0I/...), so hit rate can be computed without the MISS/SECTOR_MISS
+  // merge and without MSHR_HIT vanishing:
+  //   hits          : HIT             (line resident, data returned now)
+  //   mshr_hits     : MSHR_HIT        (merged onto an outstanding miss; was NOT
+  //                                    counted anywhere before)
+  //   full_misses   : MISS            (whole-line miss -> fill)
+  //   sector_misses : SECTOR_MISS     (sector miss on a resident line)
+  unsigned long long hits;
+  unsigned long long mshr_hits;
+  unsigned long long full_misses;
+  unsigned long long sector_misses;
+  unsigned long long bytes;
+  unsigned long long read_bytes;
+  unsigned long long write_bytes;
+  unsigned long long tma_bytes;
+  unsigned long long tma_read_bytes;
+  unsigned long long tma_write_bytes;
 
   unsigned long long port_available_cycles;
   unsigned long long data_port_busy_cycles;
@@ -1145,6 +1167,16 @@ struct cache_sub_stats {
     misses = 0;
     pending_hits = 0;
     res_fails = 0;
+    hits = 0;
+    mshr_hits = 0;
+    full_misses = 0;
+    sector_misses = 0;
+    bytes = 0;
+    read_bytes = 0;
+    write_bytes = 0;
+    tma_bytes = 0;
+    tma_read_bytes = 0;
+    tma_write_bytes = 0;
     port_available_cycles = 0;
     data_port_busy_cycles = 0;
     fill_port_busy_cycles = 0;
@@ -1157,6 +1189,16 @@ struct cache_sub_stats {
     misses += css.misses;
     pending_hits += css.pending_hits;
     res_fails += css.res_fails;
+    hits += css.hits;
+    mshr_hits += css.mshr_hits;
+    full_misses += css.full_misses;
+    sector_misses += css.sector_misses;
+    bytes += css.bytes;
+    read_bytes += css.read_bytes;
+    write_bytes += css.write_bytes;
+    tma_bytes += css.tma_bytes;
+    tma_read_bytes += css.tma_read_bytes;
+    tma_write_bytes += css.tma_write_bytes;
     port_available_cycles += css.port_available_cycles;
     data_port_busy_cycles += css.data_port_busy_cycles;
     fill_port_busy_cycles += css.fill_port_busy_cycles;
@@ -1172,6 +1214,16 @@ struct cache_sub_stats {
     ret.misses = misses + cs.misses;
     ret.pending_hits = pending_hits + cs.pending_hits;
     ret.res_fails = res_fails + cs.res_fails;
+    ret.hits = hits + cs.hits;
+    ret.mshr_hits = mshr_hits + cs.mshr_hits;
+    ret.full_misses = full_misses + cs.full_misses;
+    ret.sector_misses = sector_misses + cs.sector_misses;
+    ret.bytes = bytes + cs.bytes;
+    ret.read_bytes = read_bytes + cs.read_bytes;
+    ret.write_bytes = write_bytes + cs.write_bytes;
+    ret.tma_bytes = tma_bytes + cs.tma_bytes;
+    ret.tma_read_bytes = tma_read_bytes + cs.tma_read_bytes;
+    ret.tma_write_bytes = tma_write_bytes + cs.tma_write_bytes;
     ret.port_available_cycles =
         port_available_cycles + cs.port_available_cycles;
     ret.data_port_busy_cycles =
@@ -1179,6 +1231,22 @@ struct cache_sub_stats {
     ret.fill_port_busy_cycles =
         fill_port_busy_cycles + cs.fill_port_busy_cycles;
     return ret;
+  }
+
+  // Print the granular per-status breakdown for one cache. prefix is the full
+  // label stem (e.g. "\tL1D_total_cache" or "L2_total_cache"); each line is
+  // "<prefix>_<field> = ...". true_hit_rate uses the legacy `accesses` base
+  // (HIT+MISS+SECTOR_MISS+HIT_RESERVED) so it lines up with the existing
+  // miss_rate denominator; mshr_hits is reported raw since it is outside that
+  // base.
+  void print_hit_breakdown(FILE *fout, const char *prefix) const {
+    fprintf(fout, "%s_hits = %llu\n", prefix, hits);
+    fprintf(fout, "%s_mshr_hits = %llu\n", prefix, mshr_hits);
+    fprintf(fout, "%s_full_misses = %llu\n", prefix, full_misses);
+    fprintf(fout, "%s_sector_misses = %llu\n", prefix, sector_misses);
+    if (accesses > 0)
+      fprintf(fout, "%s_true_hit_rate = %.4lf\n", prefix,
+              (double)hits / (double)accesses);
   }
 
   void print_port_stats(FILE *fout, const char *cache_name) const;
@@ -1252,6 +1320,8 @@ class cache_stats {
   // Clear AerialVision cache stats after each window
   void clear_pw();
   void inc_stats(int access_type, int access_outcome);
+  void inc_stats_bytes(int access_type, int access_outcome,
+                       unsigned long long bytes, bool is_write, bool is_tma);
   // Increment AerialVision cache stats
   void inc_stats_pw(int access_type, int access_outcome);
   void inc_fail_stats(int access_type, int fail_outcome);
@@ -1264,6 +1334,8 @@ class cache_stats {
   cache_stats operator+(const cache_stats &cs);
   cache_stats &operator+=(const cache_stats &cs);
   void print_stats(FILE *fout, const char *cache_name = "Cache_stats") const;
+  void print_byte_stats(FILE *fout,
+                        const char *cache_name = "Cache_byte_stats") const;
   void print_fail_stats(FILE *fout,
                         const char *cache_name = "Cache_fail_stats") const;
 
@@ -1287,6 +1359,12 @@ class cache_stats {
   bool check_fail_valid(int type, int fail) const;
 
   std::vector<std::vector<unsigned long long> > m_stats;
+  std::vector<std::vector<unsigned long long> > m_bytes;
+  std::vector<std::vector<unsigned long long> > m_read_bytes;
+  std::vector<std::vector<unsigned long long> > m_write_bytes;
+  std::vector<std::vector<unsigned long long> > m_tma_bytes;
+  std::vector<std::vector<unsigned long long> > m_tma_read_bytes;
+  std::vector<std::vector<unsigned long long> > m_tma_write_bytes;
   // AerialVision cache stats (per-window)
   std::vector<std::vector<unsigned long long> > m_stats_pw;
   std::vector<std::vector<unsigned long long> > m_fail_stats;

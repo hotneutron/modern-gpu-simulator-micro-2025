@@ -365,6 +365,12 @@ class memory_config {
   char *gpgpu_dram_timing_opt;
   char *gpgpu_L2_queue_config;
   bool l2_ideal;
+  // Opt6 Part-0 exp1: max reply mf drained from each sub-partition's
+  // m_L2_icnt_queue per ICNT tick. Default 1 = current behavior (so exp2's
+  // config-only depth probe is unchanged). N>1 lets a bulk TMA return (768x32B)
+  // eject faster; each mf still passes icnt_has_buffer/icnt_push, so the icnt
+  // reply-bandwidth accounting is untouched (exp1 vs exp3 stay separable).
+  unsigned gpgpu_l2_reply_drain_per_cycle;
   unsigned gpgpu_frfcfs_dram_sched_queue_size;
   unsigned gpgpu_dram_return_queue_size;
   enum dram_ctrl_t scheduler_type;
@@ -490,6 +496,7 @@ class gpgpu_sim_config : public power_config,
   }
   unsigned get_core_freq() const { return core_freq; }
   double get_core_period() const { return core_period; } // MOD. Energy
+  double get_icnt_period() const { return icnt_period; }
   double get_dram_period() const { return dram_period; } // MOD. Enegy
   int get_gpu_stat_sample_freq() const { return gpu_stat_sample_freq;}; // MOD. Energy
   unsigned num_shader() const { return m_shader_config.num_shader(); }
@@ -874,8 +881,9 @@ class gpgpu_sim : public gpgpu_t {
 
   void parse_extra_trace_info(std::string filepath, bool is_extra_trace_enabled); // MOD. Improved tracer
   bool lookup_tma_site_metadata(unsigned int unique_function_id, address_type pc,
-                                uint32_t handle_hi,
                                 TMAResolvedSiteMetadata &metadata) const;
+  bool lookup_tma_base_record(unsigned int unique_function_id, address_type pc,
+                              TMABaseRecord &record) const;
   bool lookup_sync_site_metadata(unsigned int unique_function_id,
                                  address_type pc,
                                  SyncResolvedSiteMetadata &metadata) const;

@@ -312,21 +312,6 @@ bool load_tma_json_document(const std::filesystem::path &path,
   return !doc.HasParseError() && doc.IsObject();
 }
 
-void merge_tma_site_config_id(TMADescriptorSiteRecord &record,
-                              const std::string &config_id) {
-  if (config_id.empty()) {
-    return;
-  }
-  if (record.config_id.empty()) {
-    record.config_id = config_id;
-    return;
-  }
-  if (record.config_id != config_id) {
-    record.config_is_ambiguous = true;
-    record.config_id.clear();
-  }
-}
-
 void load_tma_descriptor_configs(const std::filesystem::path &extra_info_dir,
                                  TMASidecarMetadataDB &db) {
   rapidjson::Document doc;
@@ -389,51 +374,99 @@ void load_tma_descriptor_configs(const std::filesystem::path &extra_info_dir,
   }
 }
 
-void load_tma_descriptor_resolver(const std::filesystem::path &extra_info_dir,
-                                  TMASidecarMetadataDB &db) {
+void load_tma_pc_base_map(const std::filesystem::path &extra_info_dir,
+                          TMASidecarMetadataDB &db) {
   rapidjson::Document doc;
-  if (!load_tma_json_document(extra_info_dir / "tma_descriptor_resolver.json",
-                              doc)) {
+  if (!load_tma_json_document(extra_info_dir / "tma_pc_base_map.json", doc)) {
     return;
   }
-  if (!doc.HasMember("resolver")) {
+  if (!doc.HasMember("map") || !doc["map"].IsObject()) {
     return;
   }
-  const rapidjson::Value &resolver = doc["resolver"];
-  if (!resolver.IsArray()) {
-    return;
-  }
-  for (const auto &entry : resolver.GetArray()) {
-    if (!entry.IsObject() || !entry.HasMember("unique_function_id") ||
-        entry["unique_function_id"].IsNull() ||
-        !entry.HasMember("pc_hex") || !entry["pc_hex"].IsString()) {
+  for (auto it = doc["map"].MemberBegin(); it != doc["map"].MemberEnd(); ++it) {
+    // Key format is "uid:pc_hex" (e.g. "8:0x90a0"). Split on ':'.
+    std::string key = it->name.GetString();
+    std::string::size_type colon = key.find(':');
+    if (colon == std::string::npos) {
       continue;
     }
-    unsigned int unique_function_id =
-        static_cast<unsigned int>(parse_tma_json_uint(
-            entry["unique_function_id"]));
-    uint64_t pc = std::strtoull(entry["pc_hex"].GetString(), nullptr, 0);
-    uint32_t handle_hi = 0;
-    if (entry.HasMember("handle_hi_hex") && entry["handle_hi_hex"].IsString()) {
-      handle_hi = static_cast<uint32_t>(
-          std::strtoul(entry["handle_hi_hex"].GetString(), nullptr, 0));
+    unsigned int unique_function_id = static_cast<unsigned int>(
+        std::strtoul(key.substr(0, colon).c_str(), nullptr, 0));
+    uint64_t pc = std::strtoull(key.substr(colon + 1).c_str(), nullptr, 0);
+    const rapidjson::Value &entry = it->value;
+    if (!entry.IsObject()) {
+      continue;
     }
-    TMADescriptorSiteRecord &record =
-        db.descriptor_site_records[TMADescriptorLookupKey{
-            unique_function_id, pc, handle_hi}];
-    record.has_descriptor_metadata = true;
-    if (entry.HasMember("mapping_method") && entry["mapping_method"].IsString() &&
-        record.mapping_method.empty()) {
-      record.mapping_method = entry["mapping_method"].GetString();
+    TMABaseRecord record;
+    if (entry.HasMember("operand_addressed") &&
+        entry["operand_addressed"].IsBool()) {
+      record.operand_addressed = entry["operand_addressed"].GetBool();
     }
-    if (entry.HasMember("confidence")) {
-      record.resolver_confidence =
-          std::max(record.resolver_confidence,
-                   parse_tma_confidence_score(entry["confidence"]));
+    if (entry.HasMember("base_hex")) {
+      record.global_base = parse_tma_json_uint(entry["base_hex"]);
     }
-    if (entry.HasMember("config_id") && entry["config_id"].IsString()) {
-      merge_tma_site_config_id(record, entry["config_id"].GetString());
+    // A real static base exists iff this site is tensormap-addressed (not operand-
+    // addressed) and carries a nonzero base.
+    record.has_static_base = !record.operand_addressed && record.global_base != 0;
+    // M2.5: UBLKRED/UBLKCP raw-pointer sites are operand_addressed but carry a real
+    // base + mock-tiling metadata (tile_bytes/num_tiles). raw_pointer_addressed tells
+    // the mover to use real base + visit-counter tiling instead of the synthetic addr.
+    if (entry.HasMember("raw_pointer_addressed") &&
+        entry["raw_pointer_addressed"].IsBool()) {
+      record.raw_pointer_addressed = entry["raw_pointer_addressed"].GetBool();
     }
+    if (entry.HasMember("tile_bytes")) {
+      record.tile_bytes_operand =
+          static_cast<uint32_t>(parse_tma_json_uint(entry["tile_bytes"]));
+    }
+    if (entry.HasMember("num_tiles")) {
+      record.num_tiles =
+          static_cast<uint32_t>(parse_tma_json_uint(entry["num_tiles"]));
+    }
+    if (entry.HasMember("tensor_rank")) {
+      record.tensor_rank =
+          static_cast<uint32_t>(parse_tma_json_uint(entry["tensor_rank"]));
+    }
+    if (entry.HasMember("tensor_data_type")) {
+      record.tensor_data_type =
+          static_cast<uint32_t>(parse_tma_json_uint(entry["tensor_data_type"]));
+    }
+    if (entry.HasMember("element_size")) {
+      record.element_size =
+          static_cast<uint32_t>(parse_tma_json_uint(entry["element_size"]));
+    }
+    if (entry.HasMember("global_dim")) {
+      fill_tma_u32_array(entry["global_dim"], record.global_dim);
+    }
+    if (entry.HasMember("global_strides")) {
+      fill_tma_u64_array(entry["global_strides"], record.global_strides);
+    }
+    if (entry.HasMember("box_dim")) {
+      fill_tma_u32_array(entry["box_dim"], record.box_dim);
+    }
+    if (entry.HasMember("element_strides")) {
+      fill_tma_u32_array(entry["element_strides"], record.element_strides);
+    }
+    if (entry.HasMember("interleave")) {
+      record.interleave =
+          static_cast<uint32_t>(parse_tma_json_uint(entry["interleave"]));
+    }
+    if (entry.HasMember("swizzle")) {
+      record.swizzle =
+          static_cast<uint32_t>(parse_tma_json_uint(entry["swizzle"]));
+    }
+    if (entry.HasMember("l2_promotion")) {
+      record.l2_promotion =
+          static_cast<uint32_t>(parse_tma_json_uint(entry["l2_promotion"]));
+    }
+    if (entry.HasMember("oob_fill")) {
+      record.oob_fill =
+          static_cast<uint32_t>(parse_tma_json_uint(entry["oob_fill"]));
+    }
+    if (entry.HasMember("source") && entry["source"].IsString()) {
+      record.source = entry["source"].GetString();
+    }
+    db.base_records[TMABaseLookupKey{unique_function_id, pc}] = record;
   }
 }
 
@@ -627,16 +660,42 @@ void gpgpu_sim::parse_extra_trace_info(std::string filepath, bool is_extra_trace
     std::filesystem::path metadata_path(filepath);
     std::filesystem::path extra_info_dir = metadata_path.parent_path();
     load_tma_descriptor_configs(extra_info_dir, m_tma_sidecar_db);
-    load_tma_descriptor_resolver(extra_info_dir, m_tma_sidecar_db);
+    load_tma_pc_base_map(extra_info_dir, m_tma_sidecar_db);
+    // The exact (uid,pc) base map is the sole descriptor-address source; the legacy
+    // handle_hi descriptor resolver has been removed (M3). config_id / box_dim still
+    // flow through the operand resolver's linked_config_id -> descriptor_configs join.
     load_tma_operand_resolver(extra_info_dir, m_tma_sidecar_db);
     load_sync_operand_resolver(extra_info_dir, m_sync_sidecar_db);
-    if (m_shader_config->sync_debug_enable) {
+    // BASE-MAP LOAD-FAILURE ASSERT (M4): real-base addressing is on by default. An empty
+    // base_records map means tma_pc_base_map.json was missing, unparsable, or had no
+    // descriptor sites. We deliberately FAIL here rather than silently falling back to the
+    // synthetic address: a quiet fallback would run a 12h job on fake locality and produce
+    // misleading results. If a non-FA3 workload legitimately has no TMA descriptors, run it
+    // with -tma_real_base_addr_enable 0.
+    if (m_shader_config->tma_real_base_addr_enable &&
+        m_tma_sidecar_db.base_records.empty()) {
+      std::filesystem::path base_map_path =
+          extra_info_dir / "tma_pc_base_map.json";
+      std::cerr << "[TMA][RealBase][FATAL] -tma_real_base_addr_enable is set but no base "
+                << "records loaded from " << base_map_path.string()
+                << " (exists=" << (std::filesystem::exists(base_map_path) ? 1 : 0)
+                << "). Run build_tma_pc_base_map.py in the trace pipeline first, or pass "
+                << "-tma_real_base_addr_enable 0 for a trace with no TMA descriptors."
+                << std::endl;
+      assert(false &&
+             "tma_real_base_addr_enable set but tma_pc_base_map.json produced no base "
+             "records");
+    }
+    if (m_shader_config->sync_debug_enable ||
+        m_shader_config->tma_real_base_addr_enable) {
       std::cerr << "[TMA][Phase2] loaded descriptor_configs="
                 << m_tma_sidecar_db.descriptor_configs.size()
-                << " descriptor_sites="
-                << m_tma_sidecar_db.descriptor_site_records.size()
                 << " operand_sites="
-                << m_tma_sidecar_db.operand_site_records.size() << std::endl;
+                << m_tma_sidecar_db.operand_site_records.size()
+                << " base_records="
+                << m_tma_sidecar_db.base_records.size() << std::endl;
+    }
+    if (m_shader_config->sync_debug_enable) {
       std::cerr << "[SYNC] loaded operand_sites="
                 << m_sync_sidecar_db.site_records.size() << std::endl;
     }
@@ -646,10 +705,8 @@ void gpgpu_sim::parse_extra_trace_info(std::string filepath, bool is_extra_trace
 
 bool gpgpu_sim::lookup_tma_site_metadata(unsigned int unique_function_id,
                                          address_type pc,
-                                         uint32_t handle_hi,
                                          TMAResolvedSiteMetadata &metadata) const {
   metadata = TMAResolvedSiteMetadata();
-  metadata.handle_hi = handle_hi;
   auto it_operand = m_tma_sidecar_db.operand_site_records.find(
       TMAOperandLookupKey{unique_function_id, pc});
   if (it_operand != m_tma_sidecar_db.operand_site_records.end()) {
@@ -676,28 +733,19 @@ bool gpgpu_sim::lookup_tma_site_metadata(unsigned int unique_function_id,
       }
     }
   }
-  auto it_descriptor = m_tma_sidecar_db.descriptor_site_records.find(
-      TMADescriptorLookupKey{unique_function_id, pc, handle_hi});
-  if (it_descriptor != m_tma_sidecar_db.descriptor_site_records.end()) {
-    const TMADescriptorSiteRecord &record = it_descriptor->second;
-    metadata.valid = true;
-    metadata.descriptor_lookup_hit = true;
-    if (!record.mapping_method.empty()) {
-      metadata.mapping_method = record.mapping_method;
-    }
-    metadata.resolver_confidence =
-        std::max(metadata.resolver_confidence, record.resolver_confidence);
-    if (record.has_descriptor_metadata && !record.config_is_ambiguous &&
-        !record.config_id.empty()) {
-      auto it_cfg = m_tma_sidecar_db.descriptor_configs.find(record.config_id);
-      if (it_cfg != m_tma_sidecar_db.descriptor_configs.end()) {
-        metadata.has_descriptor_metadata = true;
-        metadata.config_id = record.config_id;
-        metadata.descriptor_config = it_cfg->second;
-      }
-    }
-  }
   return metadata.valid;
+}
+
+bool gpgpu_sim::lookup_tma_base_record(unsigned int unique_function_id,
+                                       address_type pc,
+                                       TMABaseRecord &record) const {
+  auto it = m_tma_sidecar_db.base_records.find(
+      TMABaseLookupKey{unique_function_id, static_cast<uint64_t>(pc)});
+  if (it == m_tma_sidecar_db.base_records.end()) {
+    return false;
+  }
+  record = it->second;
+  return true;
 }
 
 bool gpgpu_sim::lookup_sync_site_metadata(unsigned int unique_function_id,
@@ -853,6 +901,14 @@ void memory_config::reg_options(class OptionParser *opp) {
                          "1");
   option_parser_register(opp, "-gpgpu_dram_partition_queues", OPT_CSTR,
                          &gpgpu_L2_queue_config, "i2$:$2d:d2$:$2i", "8:8:8:8");
+
+  option_parser_register(opp, "-gpgpu_l2_reply_drain_per_cycle", OPT_UINT32,
+                         &gpgpu_l2_reply_drain_per_cycle,
+                         "Opt6 exp1: max reply mf drained from each L2 "
+                         "sub-partition's L2->icnt queue per ICNT tick. 1 = "
+                         "current behavior. Each mf still passes icnt buffer "
+                         "check, so icnt reply BW accounting is unchanged.",
+                         "1");
 
   option_parser_register(opp, "-l2_ideal", OPT_BOOL, &l2_ideal,
                          "Use a ideal L2 cache that always hit", "0");
@@ -1831,6 +1887,39 @@ void shader_core_config::reg_options(class OptionParser *opp) {
                          "Maximum number of instruction-region prewarm lines issued per cycle."
                          "(default=1)",
                          "1");
+  option_parser_register(opp, "-is_instruction_prefetch_eager_promote_enabled", OPT_BOOL,
+                         &is_instruction_prefetch_eager_promote_enabled,
+                         "If enabled, a prefetched L1I line is promoted into the L1I tag array "
+                         "as soon as it becomes ready in the stream buffer, without waiting for a "
+                         "demand and without producing an L0I response. Gated by L1I fill-port "
+                         "availability (Option B). See .plan/L1I_prefetch_redesign.md."
+                         "(default = disabled)",
+                         "0");
+  option_parser_register(opp, "-l1i_prefetch_debug_enable", OPT_BOOL,
+                         &l1i_prefetch_debug_enable,
+                         "Enable L1I prefetch eager-promote debug logging ([L1IPFDBG])."
+                         "(default=0)",
+                         "0");
+  option_parser_register(opp, "-l1i_prefetch_debug_budget", OPT_UINT32,
+                         &l1i_prefetch_debug_budget,
+                         "Maximum number of [L1IPFDBG] event lines to print per SM when "
+                         "l1i_prefetch_debug_enable is set. (default=2000000)",
+                         "2000000");
+  option_parser_register(opp, "-wgmma_step0_instrument_enable", OPT_BOOL,
+                         &wgmma_step0_instrument_enable,
+                         "Enable observe-only WGMMA/tensor fu_occupied Step-0 instrumentation "
+                         "(per-pipe fu_occupied split, tensor reissue-lockout, "
+                         "[WGMMADBG-MNK] shape log). No timing change. See "
+                         ".plan/WGMMA_FU_OCCUPIED_H100.md. (default=0)",
+                         "0");
+  option_parser_register(opp, "-l1i_frontend_step0_instrument_enable", OPT_BOOL,
+                         &l1i_frontend_step0_instrument_enable,
+                         "Enable observe-only L1I-frontend Step-0 instrumentation "
+                         "(sm_idle_blocked_by_frontend_sbwait). No timing change. See "
+                         ".plan/L1I_PREFETCH_LOOKAHEAD_H100.md. The full SM-idle reason "
+                         "decomposition (sm_idle_reason_*) is emitted when EITHER this or "
+                         "-wgmma_step0_instrument_enable is set. (default=0)",
+                         "0");
   option_parser_register(opp, "-sync_debug_enable", OPT_BOOL,
                          &sync_debug_enable,
                          "Enable Hopper mbarrier sync debug logging (SYNCDBG)."
@@ -1846,6 +1935,42 @@ void shader_core_config::reg_options(class OptionParser *opp) {
                          "Maximum number of SYNCDBG 'skip sync' lines to print per SM when "
                          "sync_debug_enable is set. (default=1024)",
                          "1024");
+  option_parser_register(opp, "-tma_debug_enable", OPT_BOOL,
+                         &tma_debug_enable,
+                         "Enable TMA-only per-event debug logging (TMADBG) to stderr, "
+                         "independent of sync_debug_enable. (default=0)",
+                         "0");
+  option_parser_register(opp, "-tma_debug_print_budget", OPT_UINT32,
+                         &tma_debug_print_budget,
+                         "Maximum number of TMADBG event lines to print per SM when "
+                         "tma_debug_enable is set. (default=20000000)",
+                         "20000000");
+  option_parser_register(opp, "-tma_real_base_addr_enable", OPT_BOOL,
+                         &tma_real_base_addr_enable,
+                         "Use the exact per-site GMEM base (tma_pc_base_map.json) for TMA "
+                         "transfer addresses instead of the synthetic transfer_uid scheme, "
+                         "so L2 locality matches HW. On by default (M4); auto-disabled if the "
+                         "trace has no base map (non-FA3). (default=1)",
+                         "1");
+  option_parser_register(opp, "-tma_operand_addr_tiling_enable", OPT_BOOL,
+                         &tma_operand_addr_tiling_enable,
+                         "M2.5: give UBLKRED/UBLKCP (raw-pointer, non-tensormap ops) their "
+                         "real GMEM base + visit-counter mock tiling from tma_pc_base_map.json "
+                         "instead of the synthetic address. Requires "
+                         "-tma_real_base_addr_enable. On by default (M4). (default=1)",
+                         "1");
+  option_parser_register(opp, "-bar_debug_enable", OPT_BOOL,
+                         &bar_debug_enable,
+                         "Enable BAR.SYNC / BAR.ARV named-barrier debug logging (BARDBG) "
+                         "to stderr (issue decode + first-seen release + end-of-kernel "
+                         "summary and unreleased-barrier dump). Independent of "
+                         "sync_debug_enable / tma_debug_enable. (default=0)",
+                         "0");
+  option_parser_register(opp, "-bar_debug_issue_budget", OPT_UINT32,
+                         &bar_debug_issue_budget,
+                         "Maximum number of BARDBG per-issue decode lines to print "
+                         "(global) when bar_debug_enable is set. (default=2000000)",
+                         "2000000");
   option_parser_register(opp, "-is_rf_cache_enabled", OPT_BOOL,
                          &is_rf_cache_enabled,
                          "If enabled, Regular register file has the register file feature enabled."
@@ -2511,6 +2636,14 @@ void gpgpu_sim::create_gpu_per_sm_stats() {
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_l0i_stream_buffer_prefetch_issued", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_l0i_stream_buffer_prefetch_blocked_memport_full", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_l0i_stream_buffer_prefetch_blocked_sb_full", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  // L1I eager-promote (Option B) counters. See .plan/L1I_prefetch_redesign.md.
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_l0i_sb_eager_promote_to_cache", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_l0i_sb_eager_promote_skipped_already_cached", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_l0i_sb_eager_promote_skipped_fill_port_busy", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_l0i_sb_eager_promote_skipped_has_waiter", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_l0i_sb_eager_promote_demand_hit_later", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_l0i_sb_eager_promote_demand_miss_after_promote", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_l0i_sb_eager_promote_evicted_before_demand", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_l0i_stream_buffer_prefetch_l1i_accesses", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_l0i_stream_buffer_prefetch_l1i_hits", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_l0i_stream_buffer_prefetch_l1i_misses", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
@@ -2529,7 +2662,9 @@ void gpgpu_sim::create_gpu_per_sm_stats() {
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_l0i_stream_buffer_prefetch_stopped_mshr_hit", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_l0i_stream_buffer_fill_matched", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_l0i_stream_buffer_fill_orphaned", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_l0i_stream_buffer_fill_eager_promoted_orphaned", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_l0i_stream_buffer_send_to_cache_attempts", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_l0i_stream_buffer_send_to_cache_head_missing_entry", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_l0i_stream_buffer_send_to_cache_partial_service", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_l0i_stream_buffer_send_to_cache_full_service", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_l0i_stream_buffer_waiters_served", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
@@ -2559,6 +2694,54 @@ void gpgpu_sim::create_gpu_per_sm_stats() {
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_result_queue_full", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_l1c", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_issue_stage_evaluated", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  // [WGMMA Opt6 Step-0 instrumentation] observe-only counters (no timing change).
+  // (I) split fu_occupied by pipe op.
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_issue_stage_stall_at_least_one_warp_with_fu_occupied_tensor", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_issue_stage_stall_at_least_one_warp_with_fu_occupied_sfu", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_issue_stage_stall_at_least_one_warp_with_fu_occupied_sp_int_dp", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_issue_stage_stall_at_least_one_warp_with_fu_occupied_other", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  // (III) tensor head blocked ONLY by tensor fu (all other issue conditions of that warp true).
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_tensor_reissue_lockout_only", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  // (VI) tensor head blocked by tensor fu AND that same warp would also block on wait_barrier.
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_tensor_fu_occupied_and_wait_barrier_coupled", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  // (VII) tensor-only RF/latch conflict that extends the tensor re-issue lockout beyond static II.
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_tensor_add_extra_cycle_initiation_interval", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  // (V) SM-level: cycles where NO subcore issued anything; sub-variant where every non-issuing
+  // subcore that had an eligible-but-blocked warp was blocked specifically by the tensor pipe.
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_sm_all_subcores_idle", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_sm_idle_all_blocked_by_tensor", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_sm_idle_blocked_by_frontend_sbwait", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  // Full SM-idle decomposition: for each non-issue reason, SM-idle cycles where >=1 subcore had it.
+  {
+    const char *step0_sm_idle_reason_names[] = {
+      "total_num_cycles_sm_idle_reason_next_stage",
+      "total_num_cycles_sm_idle_reason_issue_port_busy",
+      "total_num_cycles_sm_idle_reason_no_valid_frontend",
+      "total_num_cycles_sm_idle_reason_no_valid_sbwait",
+      "total_num_cycles_sm_idle_reason_no_valid_other",
+      "total_num_cycles_sm_idle_reason_nv_ibuffer_empty",
+      "total_num_cycles_sm_idle_reason_nv_ibuf_fetch_inflight",
+      "total_num_cycles_sm_idle_reason_nv_ibuf_fetch_not_issued",
+      "total_num_cycles_sm_idle_reason_nv_decode_pending",
+      "total_num_cycles_sm_idle_reason_nv_l0i_resp_ready",
+      "total_num_cycles_sm_idle_reason_nv_unknown",
+      "total_num_cycles_sm_idle_reason_fu_occupied",
+      "total_num_cycles_sm_idle_reason_fu_occupied_tensor",
+      "total_num_cycles_sm_idle_reason_inst_barrier",
+      "total_num_cycles_sm_idle_reason_wait_barrier",
+      "total_num_cycles_sm_idle_reason_tma_flush",
+      "total_num_cycles_sm_idle_reason_stall_count",
+      "total_num_cycles_sm_idle_reason_scoreboard",
+      "total_num_cycles_sm_idle_reason_l1c",
+      "total_num_cycles_sm_idle_reason_result_queue_full",
+      "total_num_cycles_sm_idle_reason_yield",
+      "total_num_cycles_sm_idle_reason_none",
+    };
+    for (const char *nm : step0_sm_idle_reason_names) {
+      m_gpu_per_sm_stats.add_unsigned_long_long_stat(nm, AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+    }
+  }
+
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_register_file_cache_hits", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_register_file_cache_allocations", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_regular_regfile_reads", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
@@ -3203,11 +3386,11 @@ void gpgpu_sim::gpu_print_stat() {
   // printf("partiton_replys_in_parallel = %lld\n",
   // partiton_replys_in_parallel); printf("partiton_replys_in_parallel_total =
   // %lld\n", partiton_replys_in_parallel_total );
-  printf("L2_BW  = %12.4f GB/Sec\n",
+  printf("ICNT_mem_to_core_reply_BW  = %12.4f GB/Sec\n",
          ((float)(partiton_replys_in_parallel * 32) /
           (gpu_sim_cycle * m_config.icnt_period)) /
              1000000000);
-  printf("L2_BW_total  = %12.4f GB/Sec\n",
+  printf("ICNT_mem_to_core_reply_BW_total  = %12.4f GB/Sec\n",
          ((float)((partiton_replys_in_parallel +
                    partiton_replys_in_parallel_total) *
                   32) /
@@ -3229,12 +3412,22 @@ void gpgpu_sim::gpu_print_stat() {
   for (unsigned i = 0; i < m_config.num_cluster(); i++) {
     m_cluster[i]->get_cache_stats(core_cache_stats);
   }
-  core_cache_stats.compute_total_write_and_read_accesses();
-  double total_cache_accesses = core_cache_stats.get_total_write_and_read_accesses();
-  double l1d_bw = ((total_cache_accesses * 32) / ((gpu_tot_sim_cycle + gpu_sim_cycle) * m_config.core_period)) / 1000000000;
-  printf("L1D_BW_total  = %12.4lf GB/Sec\n", l1d_bw);
+  struct cache_sub_stats core_cache_css;
+  core_cache_css.clear();
+  core_cache_stats.get_sub_stats(core_cache_css);
+  double core_elapsed_seconds =
+      (double)(gpu_tot_sim_cycle + gpu_sim_cycle) * m_config.core_period;
+  double core_ldst_cache_bw =
+      core_elapsed_seconds > 0.0
+          ? ((double)core_cache_css.bytes / core_elapsed_seconds) /
+                1000000000.0
+          : 0.0;
+  printf("Core_ldst_cache_BW_total_GBps = %12.4lf\n", core_ldst_cache_bw);
+  printf("Core_ldst_cache_total_bytes = %llu\n", core_cache_css.bytes);
   printf("\nTotal_core_cache_stats:\n");
   core_cache_stats.print_stats(stdout, "Total_core_cache_stats_breakdown");
+  printf("\nTotal_core_cache_byte_stats:\n");
+  core_cache_stats.print_byte_stats(stdout, "Total_core_cache_bytes_breakdown");
   printf("\nTotal_core_cache_fail_stats:\n");
   core_cache_stats.print_fail_stats(stdout,
                                     "Total_core_cache_fail_stats_breakdown");
@@ -3293,6 +3486,12 @@ void gpgpu_sim::gpu_print_stat() {
     total_l2_css.clear();
 
     printf("\n========= L2 cache stats =========\n");
+    unsigned long long tma_l2_hits_total = 0;
+    unsigned long long tma_l2_pending_hits_total = 0;
+    unsigned long long tma_l2_misses_total = 0;
+    unsigned long long tma_l2_res_fails_total = 0;
+    unsigned long long tma_l2_output_full_cycles_total = 0;
+    unsigned long long tma_l2_port_busy_cycles_total = 0;
     for (unsigned i = 0; i < m_memory_config->m_n_mem_sub_partition; i++) {
       m_memory_sub_partition[i]->accumulate_L2cache_stats(l2_stats);
       m_memory_sub_partition[i]->get_L2cache_sub_stats(l2_css);
@@ -3303,6 +3502,17 @@ void gpgpu_sim::gpu_print_stat() {
               i, l2_css.accesses, l2_css.misses,
               (double)l2_css.misses / (double)l2_css.accesses,
               l2_css.pending_hits, l2_css.res_fails);
+
+      tma_l2_hits_total += m_memory_sub_partition[i]->get_tma_l2_hits();
+      tma_l2_pending_hits_total +=
+          m_memory_sub_partition[i]->get_tma_l2_pending_hits();
+      tma_l2_misses_total += m_memory_sub_partition[i]->get_tma_l2_misses();
+      tma_l2_res_fails_total +=
+          m_memory_sub_partition[i]->get_tma_l2_res_fails();
+      tma_l2_output_full_cycles_total +=
+          m_memory_sub_partition[i]->get_tma_l2_output_full_cycles();
+      tma_l2_port_busy_cycles_total +=
+          m_memory_sub_partition[i]->get_tma_l2_port_busy_cycles();
 
       total_l2_css += l2_css;
     }
@@ -3317,8 +3527,92 @@ void gpgpu_sim::gpu_print_stat() {
       printf("L2_total_cache_pending_hits = %llu\n", total_l2_css.pending_hits);
       printf("L2_total_cache_reservation_fails = %llu\n",
              total_l2_css.res_fails);
+      total_l2_css.print_hit_breakdown(stdout, "L2_total_cache");
+      // Opt6 Part-0: TMA-only L2 admission breakdown. Unlike the aggregate
+      // figures above (which mix TMA with normal LDG/STG), these isolate the
+      // TMA contribution and split true hits from pending (merged-on-miss)
+      // hits. Pending hits are cross-SM reuse of an in-flight line, NOT free
+      // L2 hits, so they are reported separately to avoid the "single synthetic
+      // base => always L2 hit" illusion. res_fails counts re-probe cycles.
+      // Decision gate (vs HW L2 hit rate fwd 69.58% / bwd 82.26%):
+      //   * high res_fail_per_probe + high true hit rate -> synthetic-address
+      //     hotspot (6B address problem; 6A 128B emission cannot fix it)
+      //   * low res_fail_per_probe                       -> admission is not the
+      //     limiter; inspect lat_drain / genuine memory latency before any 6A.
+      {
+        unsigned long long tma_l2_probes = tma_l2_hits_total +
+                                           tma_l2_pending_hits_total +
+                                           tma_l2_misses_total;
+        printf("L2_TMA_hits = %llu\n", tma_l2_hits_total);
+        printf("L2_TMA_pending_hits = %llu\n", tma_l2_pending_hits_total);
+        printf("L2_TMA_misses = %llu\n", tma_l2_misses_total);
+        printf("L2_TMA_reservation_fails = %llu\n", tma_l2_res_fails_total);
+        // Head-of-line backpressure that prevents the TMA admission probe
+        // entirely (so they are NOT part of res_fails). Lets a low res_fail be
+        // distinguished from "head jammed downstream": output_full = L2->ICNT
+        // reply-queue full; port_busy = L2 data port busy. The 4th cause,
+        // dram-queue-full, is the existing global gpu_stall_dramfull.
+        printf("L2_TMA_output_full_cycles = %llu\n",
+               tma_l2_output_full_cycles_total);
+        printf("L2_TMA_port_busy_cycles = %llu\n",
+               tma_l2_port_busy_cycles_total);
+        if (tma_l2_probes > 0) {
+          printf("L2_TMA_true_hit_rate = %.4lf\n",
+                 (double)tma_l2_hits_total / (double)tma_l2_probes);
+          printf("L2_TMA_pending_hit_rate = %.4lf\n",
+                 (double)tma_l2_pending_hits_total / (double)tma_l2_probes);
+          printf("L2_TMA_res_fail_per_probe = %.4lf\n",
+                 (double)tma_l2_res_fails_total / (double)tma_l2_probes);
+        }
+      }
+      double l2_elapsed_seconds =
+          (double)(gpu_tot_sim_cycle + gpu_sim_cycle) * m_config.l2_period;
+      double l2_bw_total =
+          l2_elapsed_seconds > 0.0
+              ? ((double)total_l2_css.bytes / l2_elapsed_seconds) /
+                    1000000000.0
+              : 0.0;
+      double l2_bw_read =
+          l2_elapsed_seconds > 0.0
+              ? ((double)total_l2_css.read_bytes / l2_elapsed_seconds) /
+                    1000000000.0
+              : 0.0;
+      double l2_bw_write =
+          l2_elapsed_seconds > 0.0
+              ? ((double)total_l2_css.write_bytes / l2_elapsed_seconds) /
+                    1000000000.0
+              : 0.0;
+      printf("L2_cache_BW_total_GBps = %12.4lf\n", l2_bw_total);
+      printf("L2_cache_BW_read_GBps = %12.4lf\n", l2_bw_read);
+      printf("L2_cache_BW_write_GBps = %12.4lf\n", l2_bw_write);
+      printf("L2_cache_total_bytes = %llu\n", total_l2_css.bytes);
+      printf("L2_cache_read_bytes = %llu\n", total_l2_css.read_bytes);
+      printf("L2_cache_write_bytes = %llu\n", total_l2_css.write_bytes);
+      if (total_l2_css.tma_bytes > 0) {
+        double l2_tma_bw_total =
+            l2_elapsed_seconds > 0.0
+                ? ((double)total_l2_css.tma_bytes / l2_elapsed_seconds) /
+                      1000000000.0
+                : 0.0;
+        double l2_tma_bw_read =
+            l2_elapsed_seconds > 0.0
+                ? ((double)total_l2_css.tma_read_bytes / l2_elapsed_seconds) /
+                      1000000000.0
+                : 0.0;
+        double l2_tma_bw_write =
+            l2_elapsed_seconds > 0.0
+                ? ((double)total_l2_css.tma_write_bytes / l2_elapsed_seconds) /
+                      1000000000.0
+                : 0.0;
+        printf("L2_TMA_BW_total_GBps = %12.4lf\n", l2_tma_bw_total);
+        printf("L2_TMA_BW_read_GBps = %12.4lf\n", l2_tma_bw_read);
+        printf("L2_TMA_BW_write_GBps = %12.4lf\n", l2_tma_bw_write);
+        printf("L2_TMA_bytes = %llu\n", total_l2_css.tma_bytes);
+      }
       printf("L2_total_cache_breakdown:\n");
       l2_stats.print_stats(stdout, "L2_cache_stats_breakdown");
+      printf("L2_total_cache_byte_breakdown:\n");
+      l2_stats.print_byte_stats(stdout, "L2_cache_bytes_breakdown");
       printf("L2_total_cache_reservation_fail_breakdown:\n");
       l2_stats.print_fail_stats(stdout, "L2_cache_stats_fail_breakdown");
       total_l2_css.print_port_stats(stdout, "L2_cache");
@@ -3767,6 +4061,15 @@ void gpgpu_sim::cycle() {
       }
     }
     for (unsigned i = 0; i < m_memory_config->m_n_mem_sub_partition; i++) {
+      // Opt6 exp1: drain up to N reply mf from this sub-partition per ICNT tick
+      // (default N=1 = original behavior). Each mf still passes the icnt buffer
+      // check + icnt_push, so reply-bandwidth accounting is unchanged; this only
+      // removes the artificial 1-mf-per-cycle ejection cap that serializes a
+      // bulk TMA return (768x32B). Stop early on icnt backpressure or an empty
+      // queue so we neither over-drain nor spin.
+      unsigned drain_budget = m_memory_config->gpgpu_l2_reply_drain_per_cycle;
+      if (drain_budget == 0) drain_budget = 1;
+      for (unsigned d = 0; d < drain_budget; d++) {
       mem_fetch *mf = m_memory_sub_partition[i]->top();
       if (mf) {
         if(m_shader_config->is_const_cache_accessed_blocks_tracking_enabled && (mf->get_access_type() == CONST_ACC_R)) {
@@ -3788,9 +4091,15 @@ void gpgpu_sim::cycle() {
           partiton_replys_in_parallel_per_cycle++;
         } else {
           gpu_stall_icnt2sh++;
+          break;  // icnt backpressure: further drains this cycle would also fail
         }
       } else {
+        // top() returns NULL for an empty queue, or after it cleaned up a WRBK
+        // head (the slot is removed by pop(), which is safe on an empty queue).
+        // Match the original one-drain-then-stop behavior for this case.
         m_memory_sub_partition[i]->pop();
+        break;
+      }
       }
     }
   }

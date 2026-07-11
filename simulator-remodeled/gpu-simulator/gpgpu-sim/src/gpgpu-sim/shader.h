@@ -141,6 +141,14 @@ struct function_call_entry_info {
   active_mask_t active_mask;
 };
 
+// Visibility scope of a memory fence (MEMBAR/FENCE). NONE = not at a fence.
+// CTA = ordering up to shared/L1 (same SM); GPU = ordering up to L2 (all SMs).
+enum membar_scope_t {
+  MEMBAR_SCOPE_NONE = 0,
+  MEMBAR_SCOPE_CTA = 1,
+  MEMBAR_SCOPE_GPU = 2,
+};
+
 class shd_warp_t {
  public:
   shd_warp_t(class shader_core_ctx_wrapper *shader, unsigned warp_size, shader_core_stats *stats) 
@@ -169,6 +177,9 @@ class shd_warp_t {
     n_completed = m_warp_size;
     m_n_atomic = 0;
     m_membar = false;
+    m_membar_scope = MEMBAR_SCOPE_NONE;
+    m_pending_stores_cta_visible = 0;
+    m_pending_stores_gpu_visible = 0;
     m_done_exit = true;
     m_last_fetch = 0;
     m_next = 0;
@@ -281,8 +292,26 @@ class shd_warp_t {
   bool is_atomic_pending() const { return m_n_atomic > 0; }
 
   void set_membar() { m_membar = true; }
-  void clear_membar() { m_membar = false; }
+  void clear_membar() { m_membar = false; m_membar_scope = MEMBAR_SCOPE_NONE; }
   bool get_membar() const { return m_membar; }
+  // Scope-aware fence: remember the fence scope when entering a memory barrier.
+  void set_membar(membar_scope_t scope) { m_membar = true; m_membar_scope = scope; }
+  membar_scope_t get_membar_scope() const { return m_membar_scope; }
+
+  // Per-warp store-visibility counters for scope-aware memory fences.
+  void inc_pending_stores_cta_visible(unsigned n = 1) { m_pending_stores_cta_visible += n; }
+  void dec_pending_stores_cta_visible(unsigned n = 1) {
+    assert(m_pending_stores_cta_visible >= n);
+    m_pending_stores_cta_visible -= n;
+  }
+  unsigned get_pending_stores_cta_visible() const { return m_pending_stores_cta_visible; }
+  void inc_pending_stores_gpu_visible(unsigned n = 1) { m_pending_stores_gpu_visible += n; }
+  void dec_pending_stores_gpu_visible(unsigned n = 1) {
+    assert(m_pending_stores_gpu_visible >= n);
+    m_pending_stores_gpu_visible -= n;
+  }
+  unsigned get_pending_stores_gpu_visible() const { return m_pending_stores_gpu_visible; }
+
   void set_gridbar() { m_gridbar = true; }
   void clear_gridbar() { m_gridbar = false; }
   bool get_gridbar() const { return m_gridbar; }
@@ -440,7 +469,20 @@ class shd_warp_t {
 
   unsigned m_n_atomic;  // number of outstanding atomic operations
   bool m_membar;        // if true, warp is waiting at memory barrier
+  // MEMBAR/FENCE is an ordering fence, not a CTA rendezvous. When the warp is at
+  // a memory fence we remember its scope so the wait condition can drain only the
+  // stores visible at that scope (see warp_waiting_at_mem_barrier).
+  membar_scope_t m_membar_scope;
   bool m_gridbar;      // if true, warp is waiting at grid barrier
+
+  // Per-warp store-visibility tracking for scope-aware memory fences. These are
+  // separate from m_stores_outstanding (which backs stores_done()/exit) and are
+  // counted at sector granularity.
+  //  - cta_visible: shared stores (STS/STSM) + L1-level global stores
+  //  - gpu_visible: L2-level (L1-bypass, .cg) global stores
+  // (TMA stores are tracked separately in tma_unit_sm and folded in by the SM.)
+  unsigned m_pending_stores_cta_visible;
+  unsigned m_pending_stores_gpu_visible;
 
   bool m_done_exit;  // true once thread exit has been registered for threads in
                      // this warp
@@ -1362,12 +1404,24 @@ class barrier_set_t {
   void dump();
 
  private:
+  // Re-evaluate every barrier id for one CTA against its CURRENT active-warp set and
+  // release any whose still-active participants have all arrived. Used when a warp exits
+  // (so a counted/named barrier whose remaining arrivals can never come because the other
+  // participants already exited is not left dangling until CTA teardown).
+  void release_satisfiable_barriers(unsigned cta_id);
+
   unsigned m_max_cta_per_core;
   unsigned m_max_warps_per_core;
   unsigned m_max_barriers_per_cta;
   unsigned m_warp_size;
   cta_to_warp_t m_cta_to_warps;
   bar_id_to_warp_t m_bar_id_to_warps;
+  bar_id_to_warp_t m_bar_id_to_arrive_credited_warps;
+  bar_id_to_warp_t m_bar_id_to_sync_credited_warps;
+  // DIAG (B7): last bar_count requested per (cta,bar_id). Used only for diagnostics at the
+  // teardown leak so the required threshold can be compared against arrived credits. Keyed
+  // by cta_id then bar_id. (unsigned)-1 == full-CTA. Absent == never reached this epoch.
+  std::map<unsigned, std::map<unsigned, unsigned>> m_bar_id_to_count_diag;
   warp_set_t m_warp_active;
   warp_set_t m_warp_at_barrier;
   shader_core_ctx_wrapper *m_shader;
@@ -2155,10 +2209,52 @@ class shader_core_config : public core_config {
   unsigned int instruction_region_prewarm_max_regions;
   unsigned int instruction_region_prewarm_max_lines_per_cycle;
 
+  // L1I prefetch eager-promote: when a prefetched line becomes ready in the
+  // stream buffer, promote it into the L1I tag array immediately (without waiting
+  // for a demand and without producing an L0I response). See
+  // .plan/L1I_prefetch_redesign.md.
+  bool is_instruction_prefetch_eager_promote_enabled;
+  bool l1i_prefetch_debug_enable;
+  unsigned int l1i_prefetch_debug_budget;
+
+  // [WGMMA Opt6 Step-0] Enable the observe-only tensor/fu_occupied instrumentation
+  // (per-pipe fu_occupied split, tensor reissue-lockout, [WGMMADBG-MNK]).
+  // Disabled by default so production runs carry no extra counters/logs.
+  bool wgmma_step0_instrument_enable;
+  // [L1I frontend Step-0] Enable the observe-only frontend SM-idle instrumentation
+  // (sm_idle_blocked_by_frontend_sbwait). Disabled by default.
+  bool l1i_frontend_step0_instrument_enable;
+
   // Hopper mbarrier sync debug logging (SYNCDBG). Disabled by default.
   bool sync_debug_enable;
   unsigned int sync_debug_print_budget;
   unsigned int sync_debug_skip_runtime_budget;
+
+  // TMA-only debug logging (TMADBG). Independent of sync_debug_enable so the TMA
+  // unit's per-event stderr logs (first-request / fill-retire / backpressure /
+  // complete) can be captured without the SYNCDBG / SMDBG noise from all SMs.
+  bool tma_debug_enable;
+  unsigned int tma_debug_print_budget;
+
+  // Use the exact per-site GMEM base recovered offline (tma_pc_base_map.json) for TMA
+  // transfer addresses instead of the synthetic (transfer_uid<<20) scheme. Makes L2
+  // locality HW-faithful (repeated tensor reads hit). Disabled by default so the
+  // synthetic-address behavior is preserved unless explicitly opted in.
+  bool tma_real_base_addr_enable;
+
+  // M2.5: give UBLKRED/UBLKCP (raw-pointer, non-tensormap ops) their real GMEM base
+  // (read offline from the by-value params struct) plus visit-counter mock tiling,
+  // instead of the synthetic (transfer_uid<<20) address. Requires
+  // tma_real_base_addr_enable (the base map must be loaded). Off by default so the
+  // UBLKRED/UBLKCP synthetic-address behavior is preserved unless opted in.
+  bool tma_operand_addr_tiling_enable;
+
+  // BAR named-barrier (BAR.SYNC / BAR.ARV) debug logging (BARDBG). Independent of
+  // sync_debug_enable / tma_debug_enable so the named-barrier decode + release +
+  // end-of-kernel summary can be captured without other log noise. Used for the
+  // long FA3-bwd verification run.
+  bool bar_debug_enable;
+  unsigned int bar_debug_issue_budget;
 
   bool is_rf_cache_enabled;
   int max_operands_regular_register_file; 

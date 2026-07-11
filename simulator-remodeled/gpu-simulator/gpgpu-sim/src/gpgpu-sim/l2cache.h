@@ -209,6 +209,20 @@ class memory_sub_partition {
     m_memcpy_cycle_offset += 1;
   }
 
+  // Opt6 Part-0 TMA L2 diagnosis (timing-neutral observers).
+  unsigned long long get_tma_l2_hits() const { return m_tma_l2_hits; }
+  unsigned long long get_tma_l2_pending_hits() const {
+    return m_tma_l2_pending_hits;
+  }
+  unsigned long long get_tma_l2_misses() const { return m_tma_l2_misses; }
+  unsigned long long get_tma_l2_res_fails() const { return m_tma_l2_res_fails; }
+  unsigned long long get_tma_l2_output_full_cycles() const {
+    return m_tma_l2_output_full_cycles;
+  }
+  unsigned long long get_tma_l2_port_busy_cycles() const {
+    return m_tma_l2_port_busy_cycles;
+  }
+
  private:
   // data
   unsigned m_id;  //< the global sub partition ID
@@ -249,6 +263,42 @@ class memory_sub_partition {
   // is accessed (in both cudamemcpyies and otherwise) this value is added to
   // the gpgpu-sim cycle counters.
   unsigned m_memcpy_cycle_offset;
+
+  // Opt6 Part-0: TMA-only L2 admission outcome counters. The aggregate
+  // L2_total_cache_* stats mix TMA with normal LDG/STG, so they cannot tell
+  // whether the RESERVATION_FAIL re-probe storm (ADDR_MERGE synthetic-address
+  // hotspot) is TMA-driven. These count only is_tma() requests at the admission
+  // probe in cache_cycle(). Pure observers; no timing effect.
+  //  - m_tma_l2_hits        : true HIT (line resident, data returned now)
+  //  - m_tma_l2_pending_hits: HIT_RESERVED / MSHR_HIT (line already in-flight;
+  //                           merged onto an outstanding miss -> no new DRAM
+  //                           traffic). This is the bucket that answers "isn't a
+  //                           single synthetic base always an L2 hit?": cross-SM
+  //                           reuse of one fabricated line shows up here, not as
+  //                           a true hit, and it still costs the miss latency of
+  //                           the first requester.
+  //  - m_tma_l2_misses      : MISS / SECTOR_MISS (goes to DRAM)
+  //  - m_tma_l2_res_fails   : RESERVATION_FAIL re-probe cycles (head-of-line
+  //                           blocking; the hotspot pressure signal)
+  //
+  // The four counters above only advance when access() is actually called,
+  // i.e. when the admission gate (!output_full && port_free) is open. A TMA mf
+  // can also be stuck at the queue head for two *downstream-backpressure*
+  // reasons that prevent access() entirely; without separating them, a low
+  // res_fail could be misread as "admission is not the limiter" when in fact
+  // the head is jammed downstream. These two count those blocked cycles so the
+  // four head-stall causes (dram-queue-full -> gpu_stall_dramfull; output-full;
+  // port-busy; reservation-fail) are fully separable from one TMA run:
+  //  - m_tma_l2_output_full_cycles: head is TMA and m_L2_icnt_queue is full
+  //                                 (L2->ICNT reply queue backpressure)
+  //  - m_tma_l2_port_busy_cycles  : head is TMA, output not full, but the L2
+  //                                 data port is busy this cycle
+  unsigned long long m_tma_l2_hits = 0;
+  unsigned long long m_tma_l2_pending_hits = 0;
+  unsigned long long m_tma_l2_misses = 0;
+  unsigned long long m_tma_l2_res_fails = 0;
+  unsigned long long m_tma_l2_output_full_cycles = 0;
+  unsigned long long m_tma_l2_port_busy_cycles = 0;
 };
 
 class L2interface : public mem_fetch_interface {

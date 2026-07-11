@@ -31,6 +31,8 @@
 #include "stream_buffer.h"
 #include "../shader.h"
 #include "../gpu-sim.h"
+#include <sstream>
+#include <cstdio>
 
 namespace {
 bool is_instruction_stream_early_trigger_threshold_reached(new_addr_type addr,
@@ -225,6 +227,13 @@ cache_request_status first_level_instruction_cache::access(new_addr_type addr, m
             }else {
                 status_origin = status_element::NORMAL_ACCESS;
                 status = read_only_cache::access(addr, mf, time, events);
+                // L1I eager-promote accounting: this demand did not hit the stream
+                // buffer. If the line was eager-promoted earlier, a HIT here means
+                // the promote was effective; a MISS is the critical Risk-A signal.
+                if(eager_promote_enabled() &&
+                   !m_eager_promoted_base_addr_cycle.empty()) {
+                    note_demand_on_eager_promoted(base_addr, status == HIT);
+                }
             }
         }else {
             status_origin = status_element::NORMAL_ACCESS;
@@ -308,6 +317,176 @@ bool first_level_instruction_cache::fill_from_stream_buffer(new_addr_type prefet
     return is_safe_to_erase_entry_in_sb;
 }
 
+bool first_level_instruction_cache::eager_promote_enabled() const {
+    if(!m_is_prefetching_enabled) return false;
+    const shader_core_config *cfg = m_sm->get_config();
+    return cfg != nullptr && cfg->is_instruction_prefetch_eager_promote_enabled;
+}
+
+bool first_level_instruction_cache::is_eager_promote_blocked_by_port() const {
+    // Option B: a promote consumes the fill port. Defer (do not drop) when busy.
+    return !fill_port_free();
+}
+
+bool first_level_instruction_cache::l1i_pf_debug_take_budget() {
+    const shader_core_config *cfg = m_sm->get_config();
+    if(cfg == nullptr || !cfg->l1i_prefetch_debug_enable) return false;
+    if(!m_l1i_pf_debug_budget_init) {
+        m_l1i_pf_debug_budget_left = cfg->l1i_prefetch_debug_budget;
+        m_l1i_pf_debug_budget_init = true;
+    }
+    if(m_l1i_pf_debug_budget_left == 0) return false;
+    m_l1i_pf_debug_budget_left--;
+    return true;
+}
+
+// L1I eager-promote (Option B). Fill a ready, not-yet-demanded prefetch line into
+// the L1I tag array WITHOUT producing an L0I response. Probe-skip if the line is
+// already cached (HIT) or has an in-flight MSHR entry. Returns true iff the
+// tag array was actually filled.
+bool first_level_instruction_cache::promote_prefetch_to_cache(
+    new_addr_type prefetch_addr, const prefetch_element &pending_information) {
+    SM *sm = get_sm();
+    unsigned long long gpu_cycle = sm->get_current_gpu_cycle();
+    new_addr_type base_addr = get_base_line_of_address(prefetch_addr);
+    new_addr_type mshr_addr = m_config.mshr_addr(prefetch_addr);
+
+    // Risk A guard: the demand path probes with mshr_addr(base_addr). The promote
+    // must use the same key, so prefetch_addr must already be line-aligned.
+    if(prefetch_addr != base_addr) {
+        if(l1i_pf_debug_take_budget()) {
+            std::ostringstream oss;
+            oss << "[L1IPFDBG][promote-misaligned] sm=" << sm->get_sid()
+                << " addr=0x" << std::hex << prefetch_addr
+                << " base=0x" << base_addr << std::dec
+                << " cycle=" << gpu_cycle << "\n";
+            fprintf(stderr, "%s", oss.str().c_str());
+        }
+        return false;
+    }
+
+    // Risk C guard: skip if already HIT or MSHR-pending (avoid duplicate fill).
+    // NOTE: use the mask-taking probe overload with an explicit full sector mask.
+    // The mf-taking overload dereferences mf unconditionally, so passing NULL
+    // there would segfault; here we have no real mem_fetch yet.
+    unsigned int useless_idx;
+    mem_access_sector_mask_t probe_mask;
+    probe_mask.set();  // full line (il1 is a non-sector cache)
+    cache_request_status status =
+        m_tag_array->probe(mshr_addr, useless_idx, probe_mask, false /*is_write*/,
+                           false /*probe_mode*/, (mem_fetch *)NULL);
+    bool mshr_hit = get_mshr().probe(mshr_addr);
+    if(status == HIT || status == RESERVATION_FAIL || mshr_hit) {
+        sm->m_sm_stats.m_stats_map["total_num_l0i_sb_eager_promote_skipped_already_cached"]->increment_with_integer(1);
+        if(l1i_pf_debug_take_budget()) {
+            std::ostringstream oss;
+            oss << "[L1IPFDBG][skip-already-cached] sm=" << sm->get_sid()
+                << " addr=0x" << std::hex << prefetch_addr << std::dec
+                << " probe=" << (status == HIT ? "HIT" : (status == RESERVATION_FAIL ? "RESFAIL" : "MSHR"))
+                << " cycle=" << gpu_cycle << "\n";
+            fprintf(stderr, "%s", oss.str().c_str());
+        }
+        return false;
+    }
+
+    // Perform the tag-array fill. Use a synthetic mem_fetch (the prefetch mf was
+    // already deleted in do_prefetch). Consume the fill port (Option B).
+    mem_access_t acc(INST_ACC_R, base_addr, m_config.get_line_sz(), false,
+                     sm->get_gpu()->gpgpu_ctx);
+    mem_fetch *mf_fill = new mem_fetch(acc, NULL, READ_PACKET_SIZE,
+                                       pending_information.sm_warp_id, m_sm_id,
+                                       sm->get_tpc_id(), sm->get_memory_config(),
+                                       gpu_cycle, nullptr, nullptr,
+                                       pending_information.unique_function_id);
+    get_bw_manager().use_fill_port(nullptr);
+    m_tag_array->fill(mshr_addr, gpu_cycle, mf_fill, mf_fill->is_write());
+    delete mf_fill;
+
+    sm->m_sm_stats.m_stats_map["total_num_l0i_sb_eager_promote_to_cache"]->increment_with_integer(1);
+    record_eager_promoted_base(base_addr, gpu_cycle);
+    if(l1i_pf_debug_take_budget()) {
+        unsigned long long lead = (pending_information.m_ready_cycle >= pending_information.m_prefetch_issue_cycle)
+            ? (pending_information.m_ready_cycle - pending_information.m_prefetch_issue_cycle) : 0;
+        std::ostringstream oss;
+        oss << "[L1IPFDBG][eager-promote] sm=" << sm->get_sid()
+            << " addr=0x" << std::hex << prefetch_addr
+            << " base=0x" << base_addr
+            << " mshr=0x" << mshr_addr << std::dec
+            << " issue_cyc=" << pending_information.m_prefetch_issue_cycle
+            << " ready_cyc=" << pending_information.m_ready_cycle
+            << " lead=" << lead
+            << " cycle=" << gpu_cycle << "\n";
+        fprintf(stderr, "%s", oss.str().c_str());
+    }
+    return true;
+}
+
+void first_level_instruction_cache::record_eager_promoted_base(
+    new_addr_type base_addr, unsigned long long cycle) {
+    // Keep the tracking map bounded: only meaningful while debug accounting is of
+    // interest. We still record unconditionally (cheap) so counters are accurate,
+    // but cap the size to avoid unbounded growth on pathological runs.
+    if(m_eager_promoted_base_addr_cycle.size() < 100000) {
+        m_eager_promoted_base_addr_cycle[base_addr] = cycle;
+    }
+}
+
+void first_level_instruction_cache::note_demand_on_eager_promoted(
+    new_addr_type base_addr, bool status_is_hit) {
+    auto it = m_eager_promoted_base_addr_cycle.find(base_addr);
+    if(it == m_eager_promoted_base_addr_cycle.end()) return;
+    SM *sm = get_sm();
+    unsigned long long promote_cyc = it->second;
+    unsigned long long demand_cyc = sm->get_current_gpu_cycle();
+    if(status_is_hit) {
+        sm->m_sm_stats.m_stats_map["total_num_l0i_sb_eager_promote_demand_hit_later"]->increment_with_integer(1);
+        if(l1i_pf_debug_take_budget()) {
+            std::ostringstream oss;
+            oss << "[L1IPFDBG][demand-hit-promoted] sm=" << sm->get_sid()
+                << " addr=0x" << std::hex << base_addr << std::dec
+                << " promote_cyc=" << promote_cyc
+                << " demand_cyc=" << demand_cyc
+                << " gap=" << (demand_cyc >= promote_cyc ? demand_cyc - promote_cyc : 0)
+                << "\n";
+            fprintf(stderr, "%s", oss.str().c_str());
+        }
+    } else {
+        // A demand MISSed on a line we eager-promoted earlier. Distinguish two
+        // very different cases by the promote->miss gap:
+        //  - small gap  => the line was (almost) never in L1I after the promote:
+        //                  a true correctness signal (Risk A, e.g. mshr mismatch).
+        //  - large gap  => the line WAS promoted but got evicted from L1I long
+        //                  before this demand (normal capacity eviction).
+        const unsigned long long kImmediateMissGap = 100;
+        unsigned long long gap = (demand_cyc >= promote_cyc) ? (demand_cyc - promote_cyc) : 0;
+        if(gap < kImmediateMissGap) {
+            // CRITICAL (Risk A): a demand MISSed right after the promote.
+            sm->m_sm_stats.m_stats_map["total_num_l0i_sb_eager_promote_demand_miss_after_promote"]->increment_with_integer(1);
+            // Always print (budget-independent) so this never gets silently dropped.
+            std::ostringstream oss;
+            oss << "[L1IPFDBG][demand-MISS-after-promote] sm=" << sm->get_sid()
+                << " addr=0x" << std::hex << base_addr << std::dec
+                << " promote_cyc=" << promote_cyc
+                << " gap=" << gap
+                << " cycle=" << demand_cyc << "\n";
+            fprintf(stderr, "%s", oss.str().c_str());
+        } else {
+            // Normal capacity eviction before the next demand. Not a bug.
+            sm->m_sm_stats.m_stats_map["total_num_l0i_sb_eager_promote_evicted_before_demand"]->increment_with_integer(1);
+            if(l1i_pf_debug_take_budget()) {
+                std::ostringstream oss;
+                oss << "[L1IPFDBG][evicted-before-demand] sm=" << sm->get_sid()
+                    << " addr=0x" << std::hex << base_addr << std::dec
+                    << " promote_cyc=" << promote_cyc
+                    << " gap=" << gap
+                    << " cycle=" << demand_cyc << "\n";
+                fprintf(stderr, "%s", oss.str().c_str());
+            }
+        }
+    }
+    m_eager_promoted_base_addr_cycle.erase(it);
+}
+
 void first_level_instruction_cache::printMapKeysMFFields() {
   for (const auto &pair : m_extra_mf_fields) {
     std::cout << "Key: " << pair.first << std::endl;
@@ -353,6 +532,13 @@ void first_level_instruction_cache::cycle() {
     }
     if(m_is_prefetching_enabled) {
         m_stream_buffers->cycle(!m_next_response);
+        // L1I eager-promote (Option B): after the demand path has had its chance
+        // at the fill port this cycle, promote any ready/not-demanded prefetch
+        // head straight into the L1I tag array (no L0I response). Gated by config
+        // and by fill-port availability inside try_eager_promote_head().
+        if(eager_promote_enabled()) {
+            m_stream_buffers->eager_promote_cycle();
+        }
     }
 }
 

@@ -164,13 +164,13 @@ void log_tma_phase2_binding_once(const warp_inst_t &inst,
   }
   static std::set<std::tuple<unsigned int, uint64_t, uint32_t>> logged_sites;
   auto key = std::make_tuple(inst.unique_function_id, static_cast<uint64_t>(inst.pc),
-                             inst.tma_handle_hi);
+                             0u);
   if (!logged_sites.insert(key).second) {
     return;
   }
   std::cerr << "[TMA][Phase2] ufid=" << inst.unique_function_id
             << " pc=0x" << std::hex << static_cast<uint64_t>(inst.pc)
-            << " handle_hi=0x" << inst.tma_handle_hi << std::dec
+            << std::dec
             << " family=" << static_cast<int>(cmd.opcode_family)
             << " meta_source=" << static_cast<int>(cmd.meta_source)
             << " config_id=" << cmd.config_id
@@ -179,6 +179,8 @@ void log_tma_phase2_binding_once(const warp_inst_t &inst,
             << " covered_bytes=" << cmd.covered_bytes
             << " operand3_raw=" << cmd.operand3_raw
             << " operand_form=" << static_cast<int>(cmd.operand_form)
+            << " has_real_base=" << (cmd.has_real_base ? 1 : 0)
+            << " global_base=0x" << std::hex << cmd.global_base << std::dec
             << std::endl;
 }
 
@@ -206,9 +208,23 @@ struct TMAPhase2FamilyStats {
   uint64_t operand_only_commands = 0;
   uint64_t mixed_commands = 0;
   uint64_t unresolved_commands = 0;
+  // Real-base coverage (only meaningful when -tma_real_base_addr_enable is on):
+  // real_base_* = a static base was applied; synthetic_* = fell back to the
+  // transfer_uid scheme (operand_addressed sites like UBLKRED/UBLKCP, or flag off).
+  std::set<std::tuple<unsigned int, uint64_t, uint32_t>> real_base_sites;
+  std::set<std::tuple<unsigned int, uint64_t, uint32_t>> synthetic_sites;
+  uint64_t real_base_commands = 0;
+  uint64_t synthetic_commands = 0;
 
   void record(const std::tuple<unsigned int, uint64_t, uint32_t> &key,
-              const TMAResolvedSiteMetadata &metadata) {
+              const TMAResolvedSiteMetadata &metadata, bool has_real_base) {
+    if (has_real_base) {
+      real_base_sites.insert(key);
+      ++real_base_commands;
+    } else {
+      synthetic_sites.insert(key);
+      ++synthetic_commands;
+    }
     if (metadata.descriptor_lookup_hit && metadata.operand_lookup_hit) {
       mixed_sites.insert(key);
       ++mixed_commands;
@@ -261,14 +277,15 @@ struct TMAPhase2BindingStats {
     }
   }
 
-  void record(const warp_inst_t &inst, const TMAResolvedSiteMetadata &metadata) {
+  void record(const warp_inst_t &inst, const TMAResolvedSiteMetadata &metadata,
+              bool has_real_base) {
     auto key = std::make_tuple(inst.unique_function_id,
                                static_cast<uint64_t>(inst.pc),
-                               inst.tma_handle_hi);
-    overall.record(key, metadata);
+                               0u);
+    overall.record(key, metadata, has_real_base);
     TMAPhase2FamilyStats *family_stats = select_family_stats(inst.tma_opcode_family);
     if (family_stats != nullptr) {
-      family_stats->record(key, metadata);
+      family_stats->record(key, metadata, has_real_base);
     }
   }
 
@@ -288,6 +305,14 @@ struct TMAPhase2BindingStats {
               << " operand_only=" << stats.operand_only_commands
               << " mixed=" << stats.mixed_commands
               << " unresolved=" << stats.unresolved_commands << std::endl;
+    // Real-base coverage: how many sites/commands used the exact GMEM base vs the
+    // synthetic fallback. With the flag on, real_base should cover all descriptor
+    // sites; synthetic should be only operand_addressed (UBLKRED/UBLKCP).
+    std::cerr << "[TMA][Phase2][Stats][" << label << "] real_base sites="
+              << stats.real_base_sites.size()
+              << " synthetic_sites=" << stats.synthetic_sites.size()
+              << " | real_base_commands=" << stats.real_base_commands
+              << " synthetic_commands=" << stats.synthetic_commands << std::endl;
   }
 
   ~TMAPhase2BindingStats() {
@@ -368,7 +393,6 @@ TMACommand tma_unit_sm::build_tma_command(const warp_inst_t &inst) const {
   cmd.operand_form = classify_tma_operand_form(cmd.opcode_family);
   cmd.meta_source = TMAMetadataSource::NONE;
   if (m_sm->get_gpu()->lookup_tma_site_metadata(inst.unique_function_id, inst.pc,
-                                                inst.tma_handle_hi,
                                                 metadata)) {
     if (metadata.has_descriptor_metadata) {
       cmd.config_id = metadata.config_id;
@@ -410,6 +434,132 @@ TMACommand tma_unit_sm::build_tma_command(const warp_inst_t &inst) const {
         cmd.mapping_method = metadata.mapping_method;
         cmd.resolver_confidence = metadata.resolver_confidence;
       }
+    }
+  }
+  // Real per-site GMEM base (tma_pc_base_map.json), looked up here because (uid,pc) is
+  // still available — the mover only sees TMATransferEntry and cannot re-derive it.
+  // Gated by -tma_real_base_addr_enable (on by default, M4). Base-map load failure is
+  // already a FATAL assert at load time, so if the flag is on the base map is present.
+  // Only tensormap-addressed sites carry a static
+  // base (UBLKRED/UBLKCP are operand_addressed -> no real base, synthetic retained).
+  if (m_config->tma_real_base_addr_enable) {
+    TMABaseRecord base_record;
+    bool base_hit = m_sm->get_gpu()->lookup_tma_base_record(
+        inst.unique_function_id, inst.pc, base_record);
+    if (base_hit && base_record.has_static_base) {
+      cmd.global_base = base_record.global_base;
+      cmd.has_real_base = true;
+      // SIZE CROSS-CHECK (M1 prerequisite for cutting the config_id path in M3):
+      // the base map carries box_dim/element_size for the exact site, so it must
+      // produce the SAME total_bytes/requests_total as the config_id path already
+      // stored in cmd. A mismatch means the two descriptor sources disagree about
+      // how much data moves -> wrong traffic volume. Fail on the FIRST such command
+      // so a 12h run dies immediately instead of producing bad numbers.
+      TMADescriptorConfigMetadata base_shape;
+      base_shape.box_dim = base_record.box_dim;
+      base_shape.element_size = base_record.element_size;
+      uint32_t base_total_bytes = infer_descriptor_total_bytes(base_shape);
+      uint32_t base_requests_total = infer_descriptor_request_total(base_shape);
+      if (cmd.total_bytes != 0 && base_total_bytes != cmd.total_bytes) {
+        std::cerr << "[TMA][RealBase][FATAL] total_bytes mismatch ufid="
+                  << inst.unique_function_id << " pc=0x" << std::hex
+                  << static_cast<uint64_t>(inst.pc) << std::dec
+                  << " base_map=" << base_total_bytes
+                  << " config_path=" << cmd.total_bytes
+                  << " (base_map box/element_size disagrees with config_id path)"
+                  << std::endl;
+      }
+      assert((cmd.total_bytes == 0 || base_total_bytes == cmd.total_bytes) &&
+             "real-base total_bytes must match config_id path (size cross-check)");
+      if (cmd.requests_total != 0 &&
+          base_requests_total != cmd.requests_total) {
+        std::cerr << "[TMA][RealBase][FATAL] requests_total mismatch ufid="
+                  << inst.unique_function_id << " pc=0x" << std::hex
+                  << static_cast<uint64_t>(inst.pc) << std::dec
+                  << " base_map=" << base_requests_total
+                  << " config_path=" << cmd.requests_total << std::endl;
+      }
+      assert((cmd.requests_total == 0 ||
+              base_requests_total == cmd.requests_total) &&
+             "real-base requests_total must match config_id path (size cross-check)");
+      // M2 (CTA-indexed tile spread): base-only collapses every transfer of a
+      // tensor to global_base+agu_index*128 (one 16KB tile), erasing the cold
+      // miss of the tensor's other tiles. A per-SM visit counter cannot fix this
+      // because FA3 runs 1 CTA/SM and issues only ~24 transfers per tensor per
+      // SM, so every SM's counter stays in [0,24) and all SMs pile onto the same
+      // first tiles (=> ~0.98 L2 hit). Instead seed tile_idx from the linear
+      // GLOBAL CTA index (blockIdx), so different CTAs address different tiles of
+      // the tensor across the whole grid while repeated visits from the SAME CTA
+      // still hit. tile_bytes = one box (=base_total_bytes); tensor_bytes =
+      // Πglobal_dim·element_size; num_tiles = ⌈tensor_bytes/tile_bytes⌉.
+      // Deterministic approximation of the real schedule (coords not in trace).
+      uint64_t tile_bytes = base_total_bytes;  // Πbox_dim · element_size
+      if (tile_bytes > 0) {
+        uint64_t tensor_elems = 1;
+        bool has_extent = false;
+        for (uint32_t d : base_record.global_dim) {
+          if (d == 0) continue;
+          tensor_elems *= d;
+          has_extent = true;
+        }
+        uint64_t tensor_bytes =
+            has_extent ? tensor_elems * base_record.element_size : 0;
+        uint64_t num_tiles =
+            tensor_bytes > 0 ? (tensor_bytes + tile_bytes - 1) / tile_bytes : 1;
+        if (num_tiles == 0) num_tiles = 1;
+        // Global block index for this transfer's CTA (hw slot -> global blockIdx).
+        uint64_t global_cta = m_sm->get_global_cta_id(cmd.cta_id);
+        // Per-(tensor,CTA) visit counter: repeated transfers from the same CTA to
+        // the same tensor advance through neighbouring tiles, but the CTA index
+        // sets a distinct starting tile so grid-wide the tiles are spread.
+        uint64_t &visit =
+            m_tensor_visit_count[base_record.global_base ^ (global_cta << 20)];
+        uint64_t tile_idx = (global_cta + visit) % num_tiles;
+        ++visit;
+        cmd.tile_offset_bytes = tile_idx * tile_bytes;
+      }
+    } else if (base_hit && base_record.raw_pointer_addressed &&
+               m_config->tma_operand_addr_tiling_enable) {
+      // M2.5: UBLKRED/UBLKCP raw-pointer real base + mock tiling. These are NOT
+      // tensormap ops (box_dim is 0, so the descriptor size cross-check above would
+      // FATAL and the tile-spread block would divide by a zero tile) — handle them in
+      // a separate branch. Base is the real dQaccum/scratch GMEM pointer read offline
+      // from the params struct; size stays from operand covered_bytes (already set on
+      // cmd), so we ONLY inject base + tile offset here. Same visit-counter tiling as
+      // the descriptor family, but tile_bytes = covered_bytes (one transfer's span)
+      // and num_tiles comes from the base map (region / tile_bytes).
+      cmd.global_base = base_record.global_base;
+      cmd.has_real_base = true;
+      uint64_t tile_bytes = base_record.tile_bytes_operand;
+      if (tile_bytes == 0) tile_bytes = cmd.covered_bytes;  // fallback to live operand
+      uint64_t num_tiles = base_record.num_tiles;
+      if (num_tiles == 0) num_tiles = 1;
+      if (tile_bytes > 0) {
+        // Same CTA-indexed spread as the descriptor family (M2): seed tile_idx
+        // from the global block index so per-SM transfer scarcity does not pin
+        // every CTA to tile 0. See the M2 comment above.
+        uint64_t global_cta = m_sm->get_global_cta_id(cmd.cta_id);
+        uint64_t &visit =
+            m_tensor_visit_count[base_record.global_base ^ (global_cta << 20)];
+        uint64_t tile_idx = (global_cta + visit) % num_tiles;
+        ++visit;
+        cmd.tile_offset_bytes = tile_idx * tile_bytes;
+      }
+    } else if (tma_family_requires_descriptor(cmd.opcode_family)) {
+      // MISSING-MAP ASSERT: a descriptor-required op (UTMALDG/UTMASTG/UTMAPF/
+      // UTMAREDG) must have an exact base when the flag is on. UBLKRED/UBLKCP are
+      // operand_addressed (no static base) and are excluded by this branch, so they
+      // fall through to the synthetic path without asserting. Fail early so a base-map
+      // coverage gap is caught before a 12h run rather than silently falling back.
+      std::cerr << "[TMA][RealBase][FATAL] descriptor-required site has no static base "
+                << "ufid=" << inst.unique_function_id << " pc=0x" << std::hex
+                << static_cast<uint64_t>(inst.pc) << std::dec
+                << " family=" << tma_phase2_family_label(cmd.opcode_family)
+                << " base_hit=" << (base_hit ? 1 : 0)
+                << " (tma_pc_base_map.json missing this (uid,pc) or operand_addressed)"
+                << std::endl;
+      assert(false &&
+             "descriptor-required TMA site missing real base (base-map coverage gap)");
     }
   }
   assert(metadata.operand_lookup_hit &&
@@ -458,7 +608,7 @@ TMACommand tma_unit_sm::build_tma_command(const warp_inst_t &inst) const {
                infer_request_total_from_covered_bytes(cmd.covered_bytes) &&
            "Phase 2 bulk UBLKCP/UBLKPF should derive requests_total from covered_bytes");
   }
-  get_tma_phase2_binding_stats().record(inst, metadata);
+  get_tma_phase2_binding_stats().record(inst, metadata, cmd.has_real_base);
   log_tma_phase2_binding_once(inst, cmd, m_config->sync_debug_enable);
   return cmd;
 }
@@ -614,6 +764,10 @@ void tma_unit_sm::mover_issue_requests(TMATransferEntry &entry,
   const uint32_t kSectorMfGoal =
       agu_request_goal * SECTOR_CHUNCK_SIZE * mfs_per_sector;
 
+  if (entry.requests_issued < kSectorMfGoal) {
+    ++entry.issue_active_cycles;
+  }
+
   uint32_t agu_requests_this_cycle = 0;
   while (entry.requests_issued < kSectorMfGoal &&
          agu_requests_this_cycle < kMaxRequestsPerCycle) {
@@ -626,13 +780,20 @@ void tma_unit_sm::mover_issue_requests(TMATransferEntry &entry,
     uint32_t sector_unit = entry.requests_issued / mfs_per_sector;
     uint32_t agu_index = sector_unit / SECTOR_CHUNCK_SIZE;
 
-    // Synthetic, deterministic GMEM base address for this 128B AGU request. The
-    // trace does not carry the descriptor base, so we fabricate a per-transfer
-    // address range purely to exercise memory-hierarchy timing. TMA transfers
-    // bypass L1 and go directly to L2/DRAM via the shared interconnect.
+    // GMEM base for this 128B AGU request. When the exact per-site base is available
+    // (build_tma_command set has_real_base from tma_pc_base_map.json), use it plus the
+    // M2 per-transfer tile offset (tile_offset_bytes) so different tiles of the same
+    // tensor land in different L2 lines while same-tile revisits still hit. Without the
+    // tile offset every transfer would collapse to the tensor's first tile (base-only).
+    // Otherwise fall back to the synthetic, deterministic per-transfer range that only
+    // exercises memory-hierarchy timing (the trace lacked the descriptor base).
     new_addr_type agu_base =
-        (static_cast<new_addr_type>(entry.transfer_uid) << 20) +
-        (static_cast<new_addr_type>(agu_index) * MAX_MEMORY_ACCESS_SIZE);
+        entry.cmd.has_real_base
+            ? (static_cast<new_addr_type>(entry.cmd.global_base) +
+               static_cast<new_addr_type>(entry.cmd.tile_offset_bytes) +
+               static_cast<new_addr_type>(agu_index) * MAX_MEMORY_ACCESS_SIZE)
+            : ((static_cast<new_addr_type>(entry.transfer_uid) << 20) +
+               (static_cast<new_addr_type>(agu_index) * MAX_MEMORY_ACCESS_SIZE));
 
     bool icnt_blocked = false;
     // Emit one 128B AGU line worth of sector mfs (mfs_per_sector each), resuming
@@ -652,12 +813,14 @@ void tma_unit_sm::mover_issue_requests(TMATransferEntry &entry,
       // write side of the interconnect.
       if (m_icnt->full(SECTOR_SIZE, /*write=*/this_mf_is_write)) {
         icnt_blocked = true;
+        ++entry.icnt_full_cycles;
         // Interconnect back-pressure: the transfer cannot drain its sector mfs
         // and will resume next cycle. This is a TMA-side stall source (feeds the
         // long_scoreboard axis); log once per transfer to keep it observable
         // without flooding the trace on a sustained stall.
         if (!entry.logged_backpressure) {
           entry.logged_backpressure = true;
+          ++m_stat_icnt_backpressure_events;
           m_sm->debug_log_tma_event(
               "icnt-backpressure uid=" + std::to_string(entry.transfer_uid) +
               " warp=" + std::to_string(entry.cmd.warp_id) +
@@ -687,6 +850,11 @@ void tma_unit_sm::mover_issue_requests(TMATransferEntry &entry,
           /*wid=*/(unsigned)-1, m_sm->get_sid(), m_sm->get_tpc_id(),
           /*original_mf=*/nullptr);
       mf->set_is_tma(true);
+
+      if (entry.cycle_first_request_issued < 0) {
+        entry.cycle_first_request_issued = current_cycle;
+      }
+      entry.cycle_last_request_issued = current_cycle;
 
       if (entry.requests_issued == 0) {
         m_sm->debug_log_tma_event(
@@ -728,6 +896,13 @@ void tma_unit_sm::mover_issue_requests(TMATransferEntry &entry,
       ++entry.requests_issued;
       ++m_stat_requests_issued;
       m_stat_bytes_issued += SECTOR_SIZE;
+      if (is_reduction) {
+        m_stat_reduce_bytes_issued += SECTOR_SIZE;
+      } else if (is_store) {
+        m_stat_store_bytes_issued += SECTOR_SIZE;
+      } else {
+        m_stat_load_bytes_issued += SECTOR_SIZE;
+      }
     }
 
     if (icnt_blocked) {
@@ -744,6 +919,17 @@ void tma_unit_sm::mover_on_response(TMATransferEntry &entry, mem_fetch *mf,
   ++m_stat_requests_completed;
   entry.bytes_completed += mf->get_data_size();
   m_stat_bytes_completed += mf->get_data_size();
+  const bool is_reduction =
+      (entry.cmd.transfer_type == TMATransferType::REDUCTION);
+  const bool is_store =
+      (entry.cmd.direction == TMADirection::SMEM_TO_GMEM) && !is_reduction;
+  if (is_reduction) {
+    m_stat_reduce_bytes_completed += mf->get_data_size();
+  } else if (is_store) {
+    m_stat_store_bytes_completed += mf->get_data_size();
+  } else {
+    m_stat_load_bytes_completed += mf->get_data_size();
+  }
 
   uint32_t agu_request_goal = entry.cmd.requests_total;
   if (agu_request_goal == 0 && entry.cmd.total_bytes > 0) {
@@ -751,8 +937,6 @@ void tma_unit_sm::mover_on_response(TMATransferEntry &entry, mem_fetch *mf,
   }
   // requests are counted in 32B sector mfs (see mover_issue_requests). A
   // reduce-store emits 2 mfs (read + write) per sector, so its goal is 2x.
-  const bool is_reduction =
-      (entry.cmd.transfer_type == TMATransferType::REDUCTION);
   const uint32_t mfs_per_sector = is_reduction ? 2u : 1u;
   uint32_t sector_mf_goal =
       agu_request_goal * SECTOR_CHUNCK_SIZE * mfs_per_sector;
@@ -760,6 +944,30 @@ void tma_unit_sm::mover_on_response(TMATransferEntry &entry, mem_fetch *mf,
     entry.state = TMATransferEntry::State::COMPLETED;
     entry.cycle_last_completion = current_cycle;
     ++m_stat_transfers_completed;
+    int cycle_first_request_issued = entry.cycle_first_request_issued;
+    if (cycle_first_request_issued < 0) {
+      cycle_first_request_issued = entry.cycle_first_request;
+    }
+    int cycle_last_request_issued = entry.cycle_last_request_issued;
+    if (cycle_last_request_issued < 0) {
+      cycle_last_request_issued = cycle_first_request_issued;
+    }
+    int lat_to_first_request = cycle_first_request_issued - entry.cycle_agu_ready;
+    int lat_emit = cycle_last_request_issued - cycle_first_request_issued;
+    int lat_drain = current_cycle - cycle_last_request_issued;
+    if (cycle_first_request_issued >= 0 && cycle_last_request_issued >= 0) {
+      ++m_stat_timed_transfers;
+      m_stat_issue_active_cycles += entry.issue_active_cycles;
+      m_stat_icnt_full_cycles += entry.icnt_full_cycles;
+      m_stat_to_first_request_cycles +=
+          lat_to_first_request > 0 ? lat_to_first_request : 0;
+      m_stat_emit_span_cycles += lat_emit > 0 ? lat_emit : 0;
+      m_stat_drain_cycles += lat_drain > 0 ? lat_drain : 0;
+    }
+    double requests_per_issue_active_cycle =
+        entry.issue_active_cycles
+            ? (double)entry.requests_issued / (double)entry.issue_active_cycles
+            : 0.0;
     m_sm->debug_log_tma_event(
         "complete uid=" + std::to_string(entry.transfer_uid) +
         " warp=" + std::to_string(entry.cmd.warp_id) +
@@ -780,6 +988,13 @@ void tma_unit_sm::mover_on_response(TMATransferEntry &entry, mem_fetch *mf,
         " lat_queue=" + std::to_string(entry.cycle_agu_ready - entry.cycle_enqueued) +
         " lat_issue=" + std::to_string(entry.cycle_first_request - entry.cycle_agu_ready) +
         " lat_mem=" + std::to_string(current_cycle - entry.cycle_first_request) +
+        " lat_to_first_request=" + std::to_string(lat_to_first_request) +
+        " lat_emit=" + std::to_string(lat_emit) +
+        " lat_drain=" + std::to_string(lat_drain) +
+        " issue_active_cycles=" + std::to_string(entry.issue_active_cycles) +
+        " icnt_full_cycles=" + std::to_string(entry.icnt_full_cycles) +
+        " requests_per_issue_active_cycle=" +
+        std::to_string(requests_per_issue_active_cycle) +
         " cycle=" + std::to_string(current_cycle));
     // Only real GMEM->SMEM loads (UTMALDG/UBLKCP) credit the Hopper mbarrier
     // transaction-count (complete_tx). Prefetch (UTMAPF/UBLKPF) also has
@@ -857,6 +1072,57 @@ void tma_unit_sm::debug_dump_tma_counters() const {
   if (m_stat_commands_issued == 0) {
     return;
   }
+  const double elapsed_seconds =
+      (double)m_sm->get_current_gpu_cycle() *
+      m_sm->get_gpu()->get_config().get_core_period();
+  const double issued_bw =
+      elapsed_seconds > 0.0
+          ? ((double)m_stat_bytes_issued / elapsed_seconds) / 1000000000.0
+          : 0.0;
+  const double completed_bw =
+      elapsed_seconds > 0.0
+          ? ((double)m_stat_bytes_completed / elapsed_seconds) / 1000000000.0
+          : 0.0;
+  const double load_issued_bw =
+      elapsed_seconds > 0.0
+          ? ((double)m_stat_load_bytes_issued / elapsed_seconds) /
+                1000000000.0
+          : 0.0;
+  const double store_issued_bw =
+      elapsed_seconds > 0.0
+          ? ((double)m_stat_store_bytes_issued / elapsed_seconds) /
+                1000000000.0
+          : 0.0;
+  const double reduce_issued_bw =
+      elapsed_seconds > 0.0
+          ? ((double)m_stat_reduce_bytes_issued / elapsed_seconds) /
+                1000000000.0
+          : 0.0;
+  const double avg_issue_active_cycles =
+      m_stat_timed_transfers
+          ? (double)m_stat_issue_active_cycles / (double)m_stat_timed_transfers
+          : 0.0;
+  const double avg_icnt_full_cycles =
+      m_stat_timed_transfers
+          ? (double)m_stat_icnt_full_cycles / (double)m_stat_timed_transfers
+          : 0.0;
+  const double avg_to_first_request_cycles =
+      m_stat_timed_transfers
+          ? (double)m_stat_to_first_request_cycles /
+                (double)m_stat_timed_transfers
+          : 0.0;
+  const double avg_emit_span_cycles =
+      m_stat_timed_transfers
+          ? (double)m_stat_emit_span_cycles / (double)m_stat_timed_transfers
+          : 0.0;
+  const double avg_drain_cycles =
+      m_stat_timed_transfers
+          ? (double)m_stat_drain_cycles / (double)m_stat_timed_transfers
+          : 0.0;
+  const double avg_requests_per_issue_active_cycle =
+      m_stat_issue_active_cycles
+          ? (double)m_stat_requests_issued / (double)m_stat_issue_active_cycles
+          : 0.0;
   std::cerr << "[TMA][Phase3][Stats] sm=" << m_sm->get_sid()
             << " commands_issued=" << m_stat_commands_issued
             << " transfers_completed=" << m_stat_transfers_completed
@@ -864,5 +1130,26 @@ void tma_unit_sm::debug_dump_tma_counters() const {
             << " requests_completed=" << m_stat_requests_completed
             << " bytes_issued=" << m_stat_bytes_issued
             << " bytes_completed=" << m_stat_bytes_completed
+            << " load_bytes_issued=" << m_stat_load_bytes_issued
+            << " store_bytes_issued=" << m_stat_store_bytes_issued
+            << " reduce_bytes_issued=" << m_stat_reduce_bytes_issued
+            << " load_bytes_completed=" << m_stat_load_bytes_completed
+            << " store_bytes_completed=" << m_stat_store_bytes_completed
+            << " reduce_bytes_completed=" << m_stat_reduce_bytes_completed
+            << " icnt_backpressure_events=" << m_stat_icnt_backpressure_events
+            << " BW_issued_GBps=" << issued_bw
+            << " BW_completed_GBps=" << completed_bw
+            << " BW_load_issued_GBps=" << load_issued_bw
+            << " BW_store_issued_GBps=" << store_issued_bw
+            << " BW_reduce_issued_GBps=" << reduce_issued_bw
+            << " timed_transfers=" << m_stat_timed_transfers
+            << " avg_issue_active_cycles=" << avg_issue_active_cycles
+            << " avg_icnt_full_cycles=" << avg_icnt_full_cycles
+            << " avg_to_first_request_cycles="
+            << avg_to_first_request_cycles
+            << " avg_emit_span_cycles=" << avg_emit_span_cycles
+            << " avg_drain_cycles=" << avg_drain_cycles
+            << " avg_requests_per_issue_active_cycle="
+            << avg_requests_per_issue_active_cycle
             << " (TMA traffic counted separately from L1/ldst)" << std::endl;
 }
