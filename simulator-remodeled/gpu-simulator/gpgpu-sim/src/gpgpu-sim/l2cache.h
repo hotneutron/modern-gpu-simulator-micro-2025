@@ -309,10 +309,13 @@ class L2interface : public mem_fetch_interface {
     // assume read and write packets all same size
     return m_unit->m_L2_dram_queue->full();
   }
-  virtual void push(mem_fetch *mf) {
-    mf->set_status(IN_PARTITION_L2_TO_DRAM_QUEUE, 0 /*FIXME*/);
-    m_unit->m_L2_dram_queue->push(mf);
-  }
+  // Defined out-of-line in l2cache.cc so it can stamp the real GPU cycle. The
+  // old inline body used a hard-coded 0 for the status-change timestamp (the
+  // original FIXME), which corrupted any per-stage residency measured off
+  // m_status_change: the next transition computed (cycle - 0) = an absolute
+  // timestamp instead of a delta. This is the L2 miss port, so every enabled-L2
+  // miss hit it.
+  virtual void push(mem_fetch *mf);
 
   virtual void flush() {}
 

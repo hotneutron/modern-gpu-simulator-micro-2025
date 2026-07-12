@@ -452,6 +452,15 @@ memory_sub_partition::memory_sub_partition(unsigned sub_partition_id,
   wb_addr = -1;
 }
 
+void L2interface::push(mem_fetch *mf) {
+  // Stamp the actual GPU cycle (the old inline body used a hard-coded 0). This
+  // is the L2 cache miss port: on every enabled-L2 miss the l2_cache drains a
+  // sector request through here into m_L2_dram_queue.
+  mf->set_status(IN_PARTITION_L2_TO_DRAM_QUEUE,
+                 m_unit->m_gpu->gpu_sim_cycle + m_unit->m_gpu->gpu_tot_sim_cycle);
+  m_unit->m_L2_dram_queue->push(mf);
+}
+
 memory_sub_partition::~memory_sub_partition() {
   delete m_icnt_L2_queue;
   delete m_L2_dram_queue;

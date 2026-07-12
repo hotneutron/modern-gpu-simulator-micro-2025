@@ -1109,6 +1109,17 @@ void shader_core_config::reg_options(class OptionParser *opp) {
       &ldst_unit_response_queue_size,
       "number of response packets in ld/st unit ejection buffer", "2");
   option_parser_register(
+      opp, "-gpgpu_cluster_reply_eject_per_cycle", OPT_UINT32,
+      &gpgpu_cluster_reply_eject_per_cycle,
+      "Opt6 4.11.6: max reply mf a cluster ejects from the REPLY icnt into the "
+      "core per ICNT tick (both handoffs in simt_core_cluster::icnt_cycle). "
+      "1 = original 1-packet/tick. HW load-return BW ~4 sector/clk = the same "
+      "per-SM quantum as the injection knobs (grant_passes/icnt_to_l2_pop). "
+      "Ejection-side mirror; removes the per-SM 1/tick reply choke reply_drain "
+      "kept relocating onto. Each mf still passes its buffer-full gate, so mf "
+      "count / byte accounting is unchanged (default=1)",
+      "1");
+  option_parser_register(
       opp, "-gpgpu_shmem_per_block", OPT_UINT32, &gpgpu_shmem_per_block,
       "Size of shared memory per thread block or CTA (default 48kB)", "49152");
   option_parser_register(
@@ -3405,6 +3416,53 @@ void gpgpu_sim::gpu_print_stat() {
   // limiter). extra_pops ~= 0 means either the knob is off or L2 full() gated it.
   printf("gpu_icnt_to_l2_pops_total = %llu\n", gpu_icnt_to_l2_pops_total);
   printf("gpu_icnt_to_l2_extra_pops = %llu\n", gpu_icnt_to_l2_extra_pops);
+
+  // Opt6 4.11.6 reply-eject multi-drain diagnostics (observe-only; defined in
+  // shader.cc icnt_cycle). Only meaningful when -gpgpu_cluster_reply_eject_per_cycle
+  // > 1. These are the "did the lever actually fire?" evidence for a 12h run:
+  //  - *_multi_ticks > 0 proves the per-SM reply eject genuinely moved >1 mf in a
+  //    tick (the 1/tick choke was real and is now relieved). If cycles are still
+  //    flat with large multi_ticks, the wall is downstream (candidate 2 / barrier).
+  //  - *_multi_ticks ~= 0 means this stage was NOT the choke (a valid null, not a
+  //    broken run) -- eject rarely had >1 mf queued, so widening it cannot help.
+  //  - fifo (fifo->core) vs icnt (icnt->fifo) separate the two paired handoffs so
+  //    a residual choke can be pinned to the exact one.
+  {
+    extern unsigned long long g_reply_eject_fifo_active_ticks;
+    extern unsigned long long g_reply_eject_fifo_multi_ticks;
+    extern unsigned long long g_reply_eject_fifo_total;
+    extern unsigned g_reply_eject_fifo_max_burst;
+    extern unsigned long long g_reply_eject_icnt_active_ticks;
+    extern unsigned long long g_reply_eject_icnt_multi_ticks;
+    extern unsigned long long g_reply_eject_icnt_total;
+    extern unsigned g_reply_eject_icnt_max_burst;
+    printf("reply_eject_fifo2core_active_ticks = %llu\n",
+           g_reply_eject_fifo_active_ticks);
+    printf("reply_eject_fifo2core_multi_ticks  = %llu\n",
+           g_reply_eject_fifo_multi_ticks);
+    printf("reply_eject_fifo2core_total_mf     = %llu\n",
+           g_reply_eject_fifo_total);
+    printf("reply_eject_fifo2core_max_burst    = %u\n",
+           g_reply_eject_fifo_max_burst);
+    printf("reply_eject_fifo2core_avg_per_active = %.3f\n",
+           g_reply_eject_fifo_active_ticks
+               ? (double)g_reply_eject_fifo_total /
+                     (double)g_reply_eject_fifo_active_ticks
+               : 0.0);
+    printf("reply_eject_icnt2fifo_active_ticks = %llu\n",
+           g_reply_eject_icnt_active_ticks);
+    printf("reply_eject_icnt2fifo_multi_ticks  = %llu\n",
+           g_reply_eject_icnt_multi_ticks);
+    printf("reply_eject_icnt2fifo_total_mf     = %llu\n",
+           g_reply_eject_icnt_total);
+    printf("reply_eject_icnt2fifo_max_burst    = %u\n",
+           g_reply_eject_icnt_max_burst);
+    printf("reply_eject_icnt2fifo_avg_per_active = %.3f\n",
+           g_reply_eject_icnt_active_ticks
+               ? (double)g_reply_eject_icnt_total /
+                     (double)g_reply_eject_icnt_active_ticks
+               : 0.0);
+  }
 
   // Opt6 4.11.2: TMA-only per-stage residency (observe-only, timing-neutral).
   // Splits each TMA sector mf's lifetime by mem_fetch_status so the "unaccounted

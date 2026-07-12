@@ -1570,6 +1570,227 @@ Measured after-lever K10 (`.o15`): `avg_passes_per_active_cycle=3.74` (grant alr
   correct, HW-anchored injection model on which the next lever (170-cyc TMA overhead) can be judged
   cleanly.
 
+## 4.11.5 Instrumentation bug fix + what actually GATES the queue drain (BWD `.o17` / FWD `.o34`, no re-run — 2026-07-11)
+
+### (a) Latency-bucket instrumentation bug — root cause found and fixed (base-sim bug, not the counter)
+The first `kMaxRequestsPerCycle=1` diagnostic run (BWD `.o17`, FWD `.o34`) produced one physically
+impossible bucket: `TMA_status[IN_PARTITION_L2_TO_DRAM_QUEUE]` avg = **123,432 cyc** (BWD) — larger
+than the whole kernel (261,345 cyc) — while every OTHER stage cross-validated exactly against the
+legacy metrics (`avg_icnt2mem_latency=422` == `ICNT_TO_MEM` 421.7; `avg_icnt2sh_latency=181` ==
+`ICNT_TO_SHADER` 180.3). So the bucket logic was sound; one stage's *timestamp* was poisoned.
+
+**Root cause:** [l2cache.h:313](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/l2cache.h#L313)
+`L2interface::push()` set the status with a hard-coded `0 /*FIXME*/` instead of the real cycle:
+```cpp
+mf->set_status(IN_PARTITION_L2_TO_DRAM_QUEUE, 0 /*FIXME*/);
+```
+This `L2interface` is the l2_cache's **miss port** ([l2cache.cc:439](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/l2cache.cc#L439)),
+so with L2 *enabled* every miss sector passes through it. `m_status_change` became 0, and the NEXT
+transition computed `cycle - 0` = an absolute timestamp (~120k) instead of a delta. `visits=797,967`
+matches the miss count (misses are ~7% of the 10.9M TMA requests), so only this one bucket was
+affected; it was a pre-existing base-simulator bug the authors had flagged `FIXME`, only made visible
+by the new per-stage residency table. (Note: the earlier suspicion of [l2cache.cc:622](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/l2cache.cc#L622)
+was wrong — that is the L2-*disabled* branch, not taken here.)
+
+**Fix:** moved `push()` out-of-line into [l2cache.cc:455](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/l2cache.cc#L455)
+so it can read `m_gpu->gpu_sim_cycle + gpu_tot_sim_cycle` (the header could not — `gpgpu_sim` is
+incomplete there). **Timing-neutral:** `m_status_change` is read only by `mem_fetch::print()` and this
+instrumentation (grep-verified, 8 sites); it never feeds a scheduling/latency decision, so `0 -> real
+cycle` cannot change simulated timing — it only fixes the debug print and the residency accounting.
+
+**Consequence for analysis:** the `.o17`/`.o34` data is fully usable NOW by simply dropping the one
+poisoned bucket and re-normalizing. No re-run is needed to trust the diagnosis below.
+
+### (b) Corrected residency (poisoned bucket excluded) — the two-roots split is confirmed
+| | BWD K10 (`.o17`, 261,345 cyc) | FWD K5 (`.o34`, 140,941 cyc) |
+|---|---|---|
+| valid residency total (excl. L2_TO_DRAM) | 21.98 B | 1.64 B |
+| **ROP_DELAY** | **67.4%**, avg **1356.6** | 23.8%, avg 135.1 |
+| ICNT_TO_MEM (inject) | 20.9%, avg 421.7 | 11.9%, avg 67.6 |
+| **ICNT_TO_SHADER** (reply flight) | 9.0%, avg 180.3 | **58.5%**, avg **332.2** |
+| bucket req_side / reply_side | **89.8% / 10.2%** | 39.8% / **60.2%** |
+
+BWD is request/admission-bound; FWD is reply-bound. The corrupted bucket never mattered to this
+conclusion — it was in the clean stages all along.
+
+### (c) The real question: the queue is not the problem — what GATES its drain?
+Queue depth/drain-rate knobs are all null (§4.5/§4.11.2) because a FIFO's residency is set by its
+*downstream service gate*, not its own size. Tracing each stall counter to the exact code gate:
+
+**BWD — `ROP_DELAY` avg 1357 (fixed part is only `rop_latency=100`, so ~1257 is pure wait).**
+ROP is a fixed-latency queue that pops into `m_icnt_L2_queue` **only when that queue is not full**
+([l2cache.cc:639-640](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/l2cache.cc#L639-L640)).
+`m_icnt_L2_queue` drains into the L2 bank, and the bank admits a new access **only when
+`!output_full && port_free`** ([l2cache.cc:543](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/l2cache.cc#L543)).
+The measured admission-skip cause in `.o17` is decisive:
+- `L2_TMA_output_full_cycles` = **435,481** (reply queue `m_L2_icnt_queue` full)
+- `L2_TMA_port_busy_cycles` = 532 (~0)
+- `L2_TMA_res_fail_per_probe` = 0.0006 (~0)
+
+So the BWD chain is: **`m_L2_icnt_queue` (reply FIFO) full -> L2 bank stops admitting -> `m_icnt_L2_queue`
+fills -> ROP can't pop -> ROP residency balloons to 1357 -> req-side backpressure `in_buffer_full=62`.**
+The gate is the **L2 reply FIFO filling**, which is itself gated one stage further: it drains at 1
+mf/sub-partition/ICNT-tick ([gpu-sim.cc:4168-4192](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/gpu-sim.cc#L4168-L4192)),
+and each drained reply must find room in the REPLY icnt (`icnt_has_buffer`, else `gpu_stall_icnt2sh`,
+BWD = 491,296).
+
+**Why raising `reply_drain` still did nothing (§4.5 C/D, now explained mechanistically, not just empirically):**
+draining `m_L2_icnt_queue` faster just moves the same replies into the REPLY icnt faster, where the
+**per-cluster ejection is 1 mf/ICNT-tick** at the SM ([shader.cc:5396-5413](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/shader.cc#L5396-L5413))
+— so the stall relocates to `gpu_stall_icnt2sh` (§4.5 saw exactly 259K -> 722K). The true serial gate
+is not any single queue's depth or drain knob; it is that **one TMA transfer's sector replies (up to
+768 for a full 24KB tile; ~512 measured per-transfer under FA3 causal masking) must funnel back
+through a per-SM ejection that accepts 1/tick**, the mirror image of the injection wall.
+
+**FWD — `ICNT_TO_SHADER` avg 332 (58.5%).** This interval is bracketed by two status writes: set when
+the reply is pushed into the REPLY icnt ([gpu-sim.cc:4185](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/gpu-sim.cc#L4185))
+and cleared when the SM cluster ejects it ([shader.cc:5426](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/shader.cc#L5426)).
+The built-in local xbar has **no fixed per-hop latency** (only queues + iSLIP arbiter,
+[local_interconnect.cc:88](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/local_interconnect.cc#L88)),
+so 332 cyc is almost entirely **queue-wait for the per-cluster 1-mf/tick ejection**
+([shader.cc:5396-5413](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/shader.cc#L5396-L5413)),
+NOT network flight time. Crucially the REPLY net is NOT congested on average
+(`Reply_Network_in_buffer_full=0.71/cyc`, `out_buffer_full=2.96`, `gpu_stall_icnt2sh` only 0.9% of
+cycles) — so this is a **burst** effect, not steady saturation. Since `n_cores_per_cluster=1`, cluster
+== SM, and **all ~512 sector replies of one TMA transfer return to the single issuing SM**, which
+ejects them one per tick. FWD injects fast (`in_buffer_full=0.057`), so a transfer's replies arrive
+back in a tight burst and pile up at that 1/tick ejection → high per-sector reply wait (332). This is
+the SAME 1/tick ejection choke as BWD's relocation target, hit from the front instead of the back.
+
+**Why BWD's reply wait (180) is LOWER than FWD's (332) despite similar per-transfer size** (~16.5KB,
+~512 sectors both; BWD 174 transfers/SM vs FWD 42): BWD's injection is throttled upstream
+(`in_buffer_full=62`), so its replies dribble back spread-in-time and rarely batch at the ejection.
+FWD's injection is free, so its replies burst. **Same two 1/tick chokes; the binding one differs:
+BWD binds at injection, FWD binds at ejection.** (Earlier drafts mis-stated FWD as having "4x more,
+smaller" transfers — it is fewer, similar-size; corrected here.)
+
+### (d) Root-cause statement (both kernels, one shared structural cause)
+Every prior knob widened ONE segment of a serial pipe whose throughput is actually set at TWO
+per-SM 1/tick choke points that the knobs never touched:
+- **Injection choke:** the SM's single shared REQ icnt node (TMA + LSU) — BWD's wall.
+- **Ejection choke:** the per-cluster reply ejection `icnt_cycle()` at 1 mf/tick — FWD's wall, and BWD's
+  relocation target when the reply FIFO is drained faster.
+The 768-sector-per-transfer count divided by these 1/tick chokes is the serialization. `bw_util`
+(DRAM) = 8.6% and `avg_mrq_latency` = 8 cyc prove the memory *device* is idle; the entire ~2x gap vs
+HW is queue-entry/ejection serialization around a physically-idle DRAM.
+
+### (e) Candidate fixes that attack the GATE (not the queue) — for discussion, mutually composable
+These target the two 1/tick chokes and the fixed per-sector overhead directly. None is a "make memory
+free" hack; each keeps L2/DRAM work invariant (4.12) and must be validated on that axis.
+1. **Multi-eject the per-cluster reply (mirror of grant-passes on the ejection side).** Today
+   `simt_core_cluster::icnt_cycle()` ejects <=1 reply/tick ([shader.cc:5396](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/shader.cc#L5396)).
+   A `-gpgpu_cluster_reply_eject_per_cycle N` (paired with the EXISTING but-null `reply_drain`, so the
+   relocation target is widened at the SAME time — the paired-lever pattern that made grant+pop work in
+   §4.8/§4.9) is the FWD-relevant lever and BWD's relocation guard. HW basis needed: what is the real
+   per-SM reply-acceptance BW (should equal the 124 byte/clk load path, i.e. ~4 sector/clk — same quantum
+   as injection). If so, N=4 is HW-calibrated, not a hack.
+2. **Model the ~170-cyc TMA fixed overhead explicitly and REMOVE the implicit 768-serial-injection
+   overapproximation** (§4.11.4 item 3, deferred). Today the fixed TMA startup is implicitly ~the
+   768-sector emit span; if HW's real per-transfer fixed cost is ~170 cyc (arXiv:2501.12084 §5.1), the
+   sim over-serializes. This is the injection-side analogue and BWD-relevant.
+3. **Pair (1)+(2)+existing grant/pop=4** so injection quantum, ejection quantum, and fixed overhead are
+   all set to the SAME HW per-SM bandwidth (4 sector/clk) + HW fixed latency. This is the only
+   combination that removes BOTH 1/tick chokes without letting the stall relocate, because every stage
+   in the round-trip is then at the identical HW rate.
+
+**Next-step gate (unchanged discipline):** any of the above is a timing change only — require
+`L2_TMA_true_hit_rate`, L2 accesses/bytes, DRAM bytes invariant, and judge by `gpu_sim_cycle` +
+`wait_barrier`/`tma_flush`. Prefer to validate (1)+(3) first (pure rate calibration, lowest risk); (2)
+needs a per-transfer completion-time model and is higher-touch.
+
+### (f) Rejected here: TMA bulk engine
+Replacing the 768 individual sector round-trips with a closed-form `injection + ~170cyc + mem_latency`
+completion time is a **simplification, not a model**: it deletes the very per-sector L2/DRAM traffic
+whose hit-rate realism §4.6 spent effort earning, so `L2_TMA_true_hit_rate` / L2 accesses / DRAM bytes
+would no longer emerge from simulation (4.12 work axis destroyed). Rejected as not HW-faithful; the
+levers in (e) fix the drain gates while keeping every mem_fetch and its statistics intact.
+
+## 4.11.6 IMPLEMENTED — paired reply-path calibration (per-SM reply eject + L2 reply drain), 2026-07-12
+
+Chosen from §4.11.5(e) candidate 1. This is a **timing-only calibration** of the reply path to the HW
+per-SM load-return bandwidth (124 byte/clk ≈ 4 sector/clk, arXiv:2501.12084 Table 5), the exact mirror
+of the §4.11.4 injection calibration. It attacks the two per-SM `1/tick` reply chokes §4.11.5(c)/(d)
+identified as the true drain gate — NOT any queue depth (which §4.5 proved null).
+
+### Why the reply path needs TWO knobs paired (the §4.5-null trap, now avoided)
+The reply path is two `1/tick` handoffs **in series**, each a separate un-knobbed choke:
+```
+L2 bank --[reply_drain]--> REPLY icnt --[grant_passes]--> out_buffer --[reply_eject]--> core
+          (was 1/tick)                   (already 4)                    (was 1/tick)
+   gpu-sim.cc:4179                    local_interconnect               shader.cc icnt_cycle
+```
+§4.5 raised ONLY `reply_drain` (1->4) and got flat cycles + `gpu_stall_icnt2sh` 259K->722K — because
+the stall just relocated onto the still-1/tick per-SM eject (`icnt_cycle`). So the correct fix is to
+open **both ends at once** (the same lesson as the injection side, where grant_passes had to be paired
+with icnt_to_l2_pop in §4.8/§4.9). The middle hop (REPLY xbar `Advance()`) already runs at
+`grant_passes_per_cycle=4` for BOTH subnets ([local_interconnect.cc:399-403](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/local_interconnect.cc#L399-L403)),
+so pairing `reply_drain=4` + `reply_eject=4` leaves no `1/tick` choke on the entire reply path.
+
+### Change list (default-1 knobs; behavior bit-identical when left at 1)
+1. **New knob `-gpgpu_cluster_reply_eject_per_cycle`** (unit = reply mf/ICNT-tick per SM cluster).
+   Member in `shader_core_config` ([shader.h:2038-2046](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/shader.h#L2038-L2046)),
+   registered in `shader_core_config::reg_options` ([gpu-sim.cc:1111-1121](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/gpu-sim.cc#L1111-L1121)),
+   default `1`.
+2. **`simt_core_cluster::icnt_cycle()` rewritten** ([shader.cc:5395-5468](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/shader.cc#L5395-L5468)):
+   both handoffs (ejection-FIFO->core, icnt->ejection-FIFO) are now bounded loops of `N` iterations
+   instead of a single op. Each iteration keeps EVERY original per-mf gate and stat:
+   - fifo->core: still checks `fetch/ldst_unit_response_buffer_full()` per mf; **breaks** (not continue)
+     on a blocked head because the FIFO is in-order (a blocked head blocks all behind it).
+   - icnt->fifo: still checks `n_simt_ejection_buffer_size`, `icnt_pop`, the tpc/type asserts, traffic
+     stats, and `set_status(IN_CLUSTER_TO_SHADER_QUEUE)` per mf; **breaks** on full FIFO or empty icnt.
+   - N=1 reproduces the original 1-op-each-per-tick behavior exactly (verified by inspection).
+   - Added `assert(eject_budget>=1)`, a 0-guard, and a one-time `[REPLY-EJECT]` boot log (mirrors the
+     `[ICNT->L2]` boot log) so the 12h run confirms the knob is live in the first seconds.
+3. **`gpgpusim.config`:** `-gpgpu_cluster_reply_eject_per_cycle 4` ([line 207](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/configs/tested-cfgs/SM90_H100_L2_50MB_80GB/gpgpusim.config#L207))
+   and `-gpgpu_l2_reply_drain_per_cycle 1 -> 4` ([line 165](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/configs/tested-cfgs/SM90_H100_L2_50MB_80GB/gpgpusim.config#L165)).
+   Rebuild required (source change); no tracer/trace change.
+4. **Observe-only "did the lever fire?" counters** ([shader.cc:96-109](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/shader.cc#L96-L109)
+   define, incremented in `icnt_cycle`, dumped in `gpu_print_stat` [gpu-sim.cc:3420-3465](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/gpu-sim.cc#L3420-L3465)).
+   For EACH of the two handoffs (`fifo2core`, `icnt2fifo`) it prints `active_ticks` (ejected >=1),
+   `multi_ticks` (ejected >1 — the proof the widened budget was used), `total_mf`, `max_burst`, and
+   `avg_per_active`. Race-free (the cluster loop is serial), timing-neutral (only reads local counts
+   after the work). **These are what makes a null result interpretable without a re-run:** `multi_ticks
+   ~= 0` ⇒ eject was never the choke (valid null); `multi_ticks` large but cycles flat ⇒ wall moved
+   downstream (candidate 2 / barrier), not "experiment failed".
+
+### Debug-log / early-stop coverage for the 12h run
+- **Boot (stderr, once):** `[REPLY-EJECT] gpgpu_cluster_reply_eject_per_cycle = 4 ...` — confirms the
+  knob parsed and is >1 within seconds; paired `[ICNT->L2]` log already confirms the inject side.
+- **End-of-kernel (stdout):** the 10 `reply_eject_*` counters above + the existing
+  `gpu_stall_icnt2sh`, `L2_TMA_output_full_cycles`, and the (now-fixed) TMA per-stage residency table
+  — together they show whether the eject fired, whether the stall relocated, and where.
+- **Early-stop asserts:** `assert(eject_budget>=1)` (config sanity) plus the retained per-mf
+  `assert(mf->get_tpc()==m_cluster_id)` / `assert(type==READ_REPLY||WRITE_ACK)` inside the widened
+  loop — a mis-routed or corrupted reply trips immediately instead of silently after 11h.
+
+### Why TMA responses benefit (verified, not assumed)
+TMA replies do NOT go through the depth-2 ldst response FIFO: `SM::accept_ldst_unit_response` routes
+`is_tma()` mfs straight to `tma_unit_sm::fill()` ([sm.cc:1515-1524](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/sm.cc#L1515-L1524)),
+which consumes the mf immediately (erase-from-outstanding + `mover_on_response`, no internal per-tick
+cap, [tma_unit_sm.cc:1080-1094](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/tma_unit_sm.cc#L1080-L1094)).
+The only cap on TMA reply intake was the `icnt_cycle` `1/tick` eject — exactly what this removes. The
+cluster ejection buffer is depth 32 (`-gpgpu_n_cluster_ejection_buffer_size 32`), ample for N=4.
+
+### Validation gate for this run (BWD K10 + FWD K5)
+- **Timing:** `gpu_sim_cycle` down (primary). FWD is the strongest expected mover (its dominant stage is
+  `ICNT_TO_SHADER`=332cyc/58%); BWD should drop too if the reply path was its `output_full` relief valve.
+- **Bottleneck shift:** `ICNT_TO_SHADER` residency ↓ (FWD), `L2_TMA_output_full_cycles` ↓ (BWD, since the
+  reply FIFO now drains), `gpu_stall_icnt2sh` should NOT explode the way §4.5's drain-only run did
+  (that is the whole point of pairing — if it still explodes, the middle xbar hop is the residual).
+- **Work invariant (4.12) — MUST hold or the result is void:** `L2_TMA_true_hit_rate` (BWD 0.8691 / FWD
+  0.9461), `L2_total_cache_accesses`, L2 read/write bytes, DRAM bytes all unchanged. This is a pure
+  timing knob; any work-axis movement means a real bug.
+- **`wait_barrier` / `tma_flush`** SM-idle should drop if TMA completion latency actually shortened.
+- **Instrumentation cross-check:** the `L2_TO_DRAM_QUEUE` bucket is now correct (§4.11.5a fix), so the
+  full per-stage residency table is trustworthy this run.
+
+### Residual risk (honest)
+If cycles stay flat, the remaining reply-path serialization is NOT these two chokes — the next suspect
+is the fixed per-sector reply traversal (candidate 2: model the ~170cyc TMA fixed overhead) or a
+genuine `wait_barrier` structural limit unrelated to reply throughput. This run cleanly separates
+"reply throughput choke" (fixed here) from "reply fixed-latency" (untouched), which is why it is worth
+one run even though depth/drain-alone were null.
+
 ## 4.12 Cycle-INDEPENDENT "work done" comparison (the trustworthy anchor) — 2026-07-09
 
 Throughput% (bytes/cycle) is a TRAP for validation: sim runs ~2x more cycles, so any bytes/cycle

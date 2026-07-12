@@ -2035,6 +2035,15 @@ class shader_core_config : public core_config {
   unsigned n_simt_clusters;
   unsigned n_simt_ejection_buffer_size;
   unsigned ldst_unit_response_queue_size;
+  // Opt6 4.11.6: max reply mf a cluster ejects from the REPLY icnt into the core
+  // per ICNT tick (both handoffs in simt_core_cluster::icnt_cycle). Default 1 =
+  // original 1-packet/tick behavior. HW load-return bandwidth is 124 byte/clk =
+  // ~4 sector/clk (arXiv:2501.12084), the SAME per-SM quantum already used on the
+  // injection side (grant_passes/icnt_to_l2_pop=4). This is the ejection-side
+  // mirror; it removes the per-SM 1/tick reply choke that reply_drain (§4.5) kept
+  // relocating onto. Each ejected mf still passes its buffer-full gate, so no mf
+  // count or byte accounting changes (pure timing calibration, 4.12 work axis).
+  unsigned gpgpu_cluster_reply_eject_per_cycle;
 
   int simt_core_sim_order;
 

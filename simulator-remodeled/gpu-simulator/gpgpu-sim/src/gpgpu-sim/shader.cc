@@ -93,6 +93,21 @@ std::string get_instruction_region_prewarm_debug_stats();
 #define MAX(a, b) (((a) > (b)) ? (a) : (b))
 #define MIN(a, b) (((a) < (b)) ? (a) : (b))
 
+// Opt6 4.11.6 observe-only reply-eject diagnostics (definitions; declared extern
+// in gpu-sim.cc for the end-of-kernel dump). Non-atomic on purpose: the
+// simt_core_cluster::icnt_cycle() loop runs serially over clusters in
+// gpgpu_sim::cycle() (plain for, no OpenMP), so these are race-free and add no
+// timing effect. "_multi_ticks" = ticks that ejected >1 mf (the signal that the
+// widened budget was actually used); "_active_ticks" = ticks that ejected >=1.
+unsigned long long g_reply_eject_fifo_active_ticks = 0;
+unsigned long long g_reply_eject_fifo_multi_ticks = 0;
+unsigned long long g_reply_eject_fifo_total = 0;
+unsigned g_reply_eject_fifo_max_burst = 0;
+unsigned long long g_reply_eject_icnt_active_ticks = 0;
+unsigned long long g_reply_eject_icnt_multi_ticks = 0;
+unsigned long long g_reply_eject_icnt_total = 0;
+unsigned g_reply_eject_icnt_max_burst = 0;
+
 mem_fetch *shader_core_mem_fetch_allocator::alloc(
     new_addr_type addr, mem_access_type type, unsigned size, bool wr,
     unsigned long long cycle) const {
@@ -5393,7 +5408,36 @@ void simt_core_cluster::icnt_inject_request_packet(class mem_fetch *mf) {
 }
 
 void simt_core_cluster::icnt_cycle() {
-  if (!m_response_fifo.empty()) {
+  // Opt6 4.11.6: eject up to N reply mf per ICNT tick (default N=1 = original
+  // 1-packet/tick behavior). N=~4 matches the HW per-SM load-return bandwidth
+  // (124 byte/clk = ~4 sector/clk, arXiv:2501.12084), the ejection-side mirror
+  // of the injection knobs (grant_passes/icnt_to_l2_pop=4). Both handoffs
+  // (fifo->core and icnt->fifo) are widened together: widening only one would
+  // re-choke at the other, which is exactly why the L2-side reply_drain (§4.5)
+  // was null (it just relocated the stall onto THIS per-SM 1/tick eject). Each
+  // mf still passes its own buffer-full gate and all per-mf stats fire once, so
+  // this is a pure timing calibration (no mf-count / byte change; 4.12 axis).
+  unsigned eject_budget = m_config->gpgpu_cluster_reply_eject_per_cycle;
+  if (eject_budget == 0) eject_budget = 1;  // 0 defends against a bad config
+  assert(eject_budget >= 1);
+
+  // One-time boot confirmation so a 12h run can verify the knob is live in the
+  // first seconds (mirrors the icnt grant-passes / icnt->L2 pop boot logs).
+  static bool logged_reply_eject_knob = false;
+  if (!logged_reply_eject_knob && eject_budget > 1) {
+    std::cerr << "[REPLY-EJECT] gpgpu_cluster_reply_eject_per_cycle = "
+              << eject_budget
+              << " (>1: multi-eject per-SM reply drain enabled, ejection-side "
+              << "mirror of icnt_grant_passes/icnt_to_l2_pop)" << std::endl;
+    logged_reply_eject_knob = true;
+  }
+
+  // Handoff 1: ejection FIFO -> core (in-order). Stop as soon as the head cannot
+  // be accepted this tick: the FIFO is in-order, so a blocked head blocks all
+  // packets behind it regardless of remaining budget.
+  unsigned fifo_ejected_this_tick = 0;
+  for (unsigned e = 0; e < eject_budget; e++) {
+    if (m_response_fifo.empty()) break;
     mem_fetch *mf = m_response_fifo.front();
     unsigned cid = m_config->sid_to_cid(mf->get_sid());
     if ((mf->get_access_type() == INST_ACC_R) || (mf->get_access_type() == CONST_ACC_R) || (mf->get_access_type() == TLB_MISS_ACC_INST)) {
@@ -5401,6 +5445,9 @@ void simt_core_cluster::icnt_cycle() {
       if (!m_core[cid]->fetch_unit_response_buffer_full()) {
         m_response_fifo.pop_front();
         m_core[cid]->accept_fetch_response(mf);
+        ++fifo_ejected_this_tick;
+      } else {
+        break;  // head blocked downstream; no further eject this tick
       }
     } else {
       // data response
@@ -5408,12 +5455,20 @@ void simt_core_cluster::icnt_cycle() {
         m_response_fifo.pop_front();
         m_memory_stats->memlatstat_read_done(mf);
         m_core[cid]->accept_ldst_unit_response(mf);
+        ++fifo_ejected_this_tick;
+      } else {
+        break;  // head blocked downstream; no further eject this tick
       }
     }
   }
-  if (m_response_fifo.size() < m_config->n_simt_ejection_buffer_size) {
+
+  // Handoff 2: REPLY icnt -> ejection FIFO. Stop when the FIFO is full or the
+  // icnt has nothing more for this cluster this tick.
+  unsigned icnt_popped_this_tick = 0;
+  for (unsigned e = 0; e < eject_budget; e++) {
+    if (m_response_fifo.size() >= m_config->n_simt_ejection_buffer_size) break;
     mem_fetch *mf = (mem_fetch *)::icnt_pop(m_cluster_id, 0);
-    if (!mf) return;
+    if (!mf) break;
     assert(mf->get_tpc() == m_cluster_id);
     assert((mf->get_type() == READ_REPLY) || (mf->get_type() == WRITE_ACK));
 
@@ -5428,6 +5483,30 @@ void simt_core_cluster::icnt_cycle() {
     // m_memory_stats->memlatstat_read_done(mf,m_shader_config->max_warps_per_shader);
     m_response_fifo.push_back(mf);
     m_stats->n_mem_to_simt[m_cluster_id] += mf->get_num_flits(false);
+    ++icnt_popped_this_tick;
+  }
+
+  // Opt6 4.11.6 observe-only diagnostics (timing-neutral; the icnt_cycle loop is
+  // serial over clusters in gpu-sim.cc so plain global increments are race-free).
+  // These answer the ONLY-run-once question "did the lever actually fire?": if
+  // *_multi_* counters are ~0 while the knob is >1, this stage was NOT the choke
+  // (a null result is a real answer, not a broken run); if they are large, the
+  // eject genuinely widened and any flat cycles point downstream instead.
+  if (eject_budget > 1) {
+    if (fifo_ejected_this_tick > 0) {
+      g_reply_eject_fifo_active_ticks++;
+      g_reply_eject_fifo_total += fifo_ejected_this_tick;
+      if (fifo_ejected_this_tick > 1) g_reply_eject_fifo_multi_ticks++;
+      if (fifo_ejected_this_tick > g_reply_eject_fifo_max_burst)
+        g_reply_eject_fifo_max_burst = fifo_ejected_this_tick;
+    }
+    if (icnt_popped_this_tick > 0) {
+      g_reply_eject_icnt_active_ticks++;
+      g_reply_eject_icnt_total += icnt_popped_this_tick;
+      if (icnt_popped_this_tick > 1) g_reply_eject_icnt_multi_ticks++;
+      if (icnt_popped_this_tick > g_reply_eject_icnt_max_burst)
+        g_reply_eject_icnt_max_burst = icnt_popped_this_tick;
+    }
   }
 }
 
