@@ -32,67 +32,68 @@ To keep this file easy to extend, use the following update pattern whenever a ne
 | Opt 3 | MEMBAR Scope-Aware Fix | Scope-aware memory fence (CTA/GPU level) | 158,990 cycles (2.35x vs HW, -2.2% vs Opt 2). Run exits cleanly and `inst_barrier` nearly disappears. | 259,456 cycles (1.95x vs HW, -21.1% vs Opt 2). Run exits cleanly. | Done |
 | Opt 4 | Prefetch (deeper stream buffer) | `-prefetch_per_stream_buffer_size 1 -> 4` (deeper stream buffer, config-only) | 155,765 cycles (2.30x vs HW, -2.0% vs Opt 3) | 241,528 cycles (1.82x vs HW, -6.9% vs Opt 3) | Done |
 | Opt 5 | L1I eager-promote | Promote a ready prefetched line into L1I as soon as it is filled in the stream buffer, without waiting for a demand and without an L0I response (code change, on top of Opt 4 sb=4) | 149,727 cycles (2.21x vs HW, -3.4% vs Opt 4). From the clean-exit Step-0 instrumentation run (fwd `.o20`); Step-0 counters are timing-neutral. | 241,425 cycles (1.82x vs HW, -0.04% vs Opt 4). From the clean-exit Step-0 run (bwd `.o3`); supersedes the earlier 242,270 figure that hit a teardown SIGSEGV. | Done (cycles from clean-exit `.o20`/`.o3`) |
-| Opt 6 (ongoing) | TMA real base + CTA-indexed tile spread (M2/M2.5) | Replace synthetic `(transfer_uid<<20)` address with the real per-site GMEM base + per-CTA tile offset, so L2 locality matches HW | 145,855 cycles (2.15x vs HW, **-2.6% vs Opt 5**). `L2_TMA_true_hit_rate` 0.9854 → **0.9461** (HW 0.6958). fwd `.o31`. Note: this is an **accuracy baseline** run, not a targeted cycle opt — the fwd drop is a side-effect of the changed L2/reply pressure | 290,572 cycles (2.19x vs HW, **+20.4% vs Opt 5** — accuracy tradeoff). `L2_TMA_true_hit_rate` 0.9785 → **0.8718** (HW 0.8226, on target). bwd `.o14` | Ongoing — accuracy baseline re-established; cycle-reduction lever (reply-path/drain) is the next step, no cycle win claimed |
+| Opt 6 | TMA real base + CTA-indexed tile spread (M2/M2.5) | Replace synthetic `(transfer_uid<<20)` address with the real per-site GMEM base + per-CTA tile offset, so L2 locality matches HW | 145,855 cycles (2.15x vs HW, **-2.6% vs Opt 5**). `L2_TMA_true_hit_rate` 0.9854 → **0.9461** (HW 0.6958). fwd `.o31`. This is an **accuracy baseline** (no-fake-wins tradeoff), not a targeted cycle opt — it is the trustworthy baseline that Opt 7 builds on | 290,572 cycles (2.19x vs HW, **+20.4% vs Opt 5** — accuracy tradeoff). `L2_TMA_true_hit_rate` 0.9785 → **0.8718** (HW 0.8226, on target). bwd `.o14` | Done (accuracy prerequisite; enabled Opt 7) |
+| Opt 7 | TMA queue/interconnect calibration (inject + reply) | HW-calibrated per-SM 4 sector/clk drain on both inject and reply paths: `-icnt_grant_passes_per_cycle 4` + `-gpgpu_icnt_to_l2_pop_per_cycle 4` (inject) + `-gpgpu_l2_reply_drain_per_cycle 4` + `-gpgpu_cluster_reply_eject_per_cycle 4` (reply), paired so no 1/tick choke remains. Timing-only (work invariant). | 138,021 cycles (2.04x vs HW, **-5.4% vs Opt 6**). fwd `.o35`. `L2_TMA_true_hit_rate` 0.9456 (unchanged → work invariant). | 250,026 cycles (1.88x vs HW, **-13.9% vs Opt 6**). bwd `.o18`. `L2_TMA_true_hit_rate` 0.8688 (unchanged). `gpu_stall_icnt2sh` 1.82M→5.8K, `L2_TMA_output_full` 1.39M→441. | Done. TMA queue tuning now **exhausted** — every queue stage at noise floor; next wall is `ROP_DELAY` (fixed-latency), see Ongoing. |
 
 ### Simulator Cycle Breakdown
 
 #### FA3 fwd - top-level simulator breakdown
 
-| Class | Init | Opt 1 (`rop=100`) | Opt 2 (BAR impl) | Opt 3 (MEMBAR) | Opt 4 (prefetch, sb=4) | Opt 5 (eager-promote) | Opt 6 (ongoing, TMA real base) | Note |
-|---|---|---|---|---|---|---|---|---|
-| `sim_cycle` | — | 220,024 | 162,582 | 158,990 | 155,765 | 149,727 | 145,855 | Opt 4 = `.o16` (sb=4 only); Opt 5 = `.o20` (sb=4 + eager-promote, clean-exit Step-0 run). Opt 6 = `.o31` (real base + CTA-indexed tile spread; hit rate 0.9461, accuracy baseline, not a cycle win). |
-| `no_warps_ready` | — | 64.02% | 23.83% | 20.98% | 26.81% | 27.32% | 27.93% | Now the dominant class; frontend is no longer #1. |
-| `issuing` | — | 14.56% | 21.17% | 24.05% | 31.18% | 31.19% | 32.30% | Roughly flat vs Opt 5. |
-| `next_stage_not_available` | — | 11.40% | 15.25% | 17.26% | 22.45% | 22.46% | 23.23% | Downstream pipes; per-subcore (SM-level tensor-block only 0.67%, see Deferred). |
-| `no_valid_instruction` | — | 9.52% | 39.12% | 37.01% | 18.63% | 18.11% | 15.59% | Frontend drops a bit further. |
-| `issue_port_busy` | — | 0.50% | 0.63% | 0.71% | 0.92% | 0.92% | 0.95% | Present in `.o31`. |
-| `sum` | — | 100.00% | 100.00% | 100.00% | 100.00% | 100.00% | 100.00% | |
+| Class | Init | Opt 1 (`rop=100`) | Opt 2 (BAR impl) | Opt 3 (MEMBAR) | Opt 4 (prefetch, sb=4) | Opt 5 (eager-promote) | Opt 6 (TMA real base) | Opt 7 (queue calib) | Note |
+|---|---|---|---|---|---|---|---|---|---|
+| `sim_cycle` | — | 220,024 | 162,582 | 158,990 | 155,765 | 149,727 | 145,855 | 138,021 | Opt 6 = `.o31` (realistic-address baseline). Opt 7 = `.o35` (all queue levers; -5.4% vs Opt 6, work invariant). |
+| `no_warps_ready` | — | 64.02% | 23.83% | 20.98% | 26.81% | 27.32% | 27.93% | 29.51% | Now the dominant class; frontend is no longer #1. |
+| `issuing` | — | 14.56% | 21.17% | 24.05% | 31.18% | 31.19% | 32.30% | 34.75% | Rises: fewer stalls, more issue slots used. |
+| `next_stage_not_available` | — | 11.40% | 15.25% | 17.26% | 22.45% | 22.46% | 23.23% | 24.90% | Downstream pipes; per-subcore (SM-level tensor-block only 0.67%, see Deferred). |
+| `no_valid_instruction` | — | 9.52% | 39.12% | 37.01% | 18.63% | 18.11% | 15.59% | 9.81% | Frontend drops further. |
+| `issue_port_busy` | — | 0.50% | 0.63% | 0.71% | 0.92% | 0.92% | 0.95% | 1.02% | Present in `.o35`. |
+| `sum` | — | 100.00% | 100.00% | 100.00% | 100.00% | 100.00% | 100.00% | 100.00% | |
 
 #### FA3 fwd - inner stall / wait breakdown
 
-| Wait reason | Init | Opt 1 (`rop=100`) | Opt 2 (BAR impl) | Opt 3 (MEMBAR) | Opt 4 (prefetch, sb=4) | Opt 5 (eager-promote) | Opt 6 (ongoing, TMA real base) | Note |
-|---|---|---|---|---|---|---|---|---|
-| `inst_barrier` | — | 56.09% | 9.09% | 0.05% | 0.07% | 0.07% | 0.07% | Negligible. |
-| `wait_barrier` | — | 6.64% | 8.07% | 9.01% | 11.98% | 12.58% | 12.66% | mbarrier-style wait. |
-| `tma_axis` | — | 62.73% | 17.16% | 9.06% | 12.05% | 12.65% | 12.73% | Grouped TMA-side stall share. See note [1] below. |
-| `non_tma_axis` | — | 17.80% | 17.34% | 19.07% | 24.10% | 24.07% | 24.90% | Execution/resource-side waits. |
-| `fu_occupied` | — | 11.83% | 9.91% | 10.91% | 13.53% | 13.50% | 13.99% | Present in `.o31`. |
-| `stall_count` | — | 5.00% | 5.97% | 6.56% | 8.47% | 8.48% | 8.75% | Present in `.o31`. |
-| `tma_flush` | — | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | Present in `.o31`. |
-| `yield` | — | 0.92% | 1.21% | 1.30% | 1.69% | 1.69% | 1.74% | Present in `.o31`. |
-| `result_queue_full` | — | 0.05% | 0.25% | 0.29% | 0.40% | 0.40% | 0.41% | Present in `.o31`. |
-| `l1c` | — | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | Present in `.o31`. |
-| `scoreboard (memory)` | — | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | Present in `.o31`. |
+| Wait reason | Init | Opt 1 (`rop=100`) | Opt 2 (BAR impl) | Opt 3 (MEMBAR) | Opt 4 (prefetch, sb=4) | Opt 5 (eager-promote) | Opt 6 (TMA real base) | Opt 7 (queue calib) | Note |
+|---|---|---|---|---|---|---|---|---|---|
+| `inst_barrier` | — | 56.09% | 9.09% | 0.05% | 0.07% | 0.07% | 0.07% | 0.08% | Negligible. |
+| `wait_barrier` | — | 6.64% | 8.07% | 9.01% | 11.98% | 12.58% | 12.66% | 13.18% | mbarrier-style wait. |
+| `tma_axis` | — | 62.73% | 17.16% | 9.06% | 12.05% | 12.65% | 12.73% | 13.25% | Grouped TMA-side stall share. See note [1] below. |
+| `non_tma_axis` | — | 17.80% | 17.34% | 19.07% | 24.10% | 24.07% | 24.90% | 26.59% | Execution/resource-side waits. |
+| `fu_occupied` | — | 11.83% | 9.91% | 10.91% | 13.53% | 13.50% | 13.99% | 14.98% | Present in `.o35`. |
+| `stall_count` | — | 5.00% | 5.97% | 6.56% | 8.47% | 8.48% | 8.75% | 9.31% | Present in `.o35`. |
+| `tma_flush` | — | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | fwd is load-only. |
+| `yield` | — | 0.92% | 1.21% | 1.30% | 1.69% | 1.69% | 1.74% | 1.83% | Present in `.o35`. |
+| `result_queue_full` | — | 0.05% | 0.25% | 0.29% | 0.40% | 0.40% | 0.41% | 0.45% | Present in `.o35`. |
+| `l1c` | — | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | 0.03% | Present in `.o35`. |
+| `scoreboard (memory)` | — | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | Present in `.o35`. |
 
 > **[1] On the Opt 1 `tma_axis = 62.73%`.** This is a correctly-recorded value, not an input error. `tma_axis` is the grouped sum `wait_barrier + inst_barrier + tma_flush`, and the **same formula is applied in every column** (e.g. Opt 1: 6.64+56.09+0.00=62.73; Opt 2: 8.07+9.09+0.00=17.16) — it is not split differently between columns. Opt 1 only looks large because the pre-BAR-fix `inst_barrier` (56.09%) is folded in; that is not a real TMA cost. It collapses to 17.16% in Opt 2 purely because `inst_barrier` itself drops (56.09% -> 9.09%) after the BAR implementation. The HW TMA axis is ~23.8%, so the Opt 1 value is an over-attribution driven by the unfixed barrier model.
 
 #### FA3 bwd - top-level simulator breakdown
 
-| Class | Init | Opt 1 (`rop=100`) | Opt 2 (BAR impl) | Opt 3 (MEMBAR) | Opt 4 (prefetch, sb=4) | Opt 5 (eager-promote) | Opt 6 (ongoing, TMA real base) | Note |
-|---|---|---|---|---|---|---|---|---|
-| `sim_cycle` | 376,735 | 361,760 | 328,643 | 259,456 | 241,528 | 241,425 | 290,572 | Opt 4 = `.o1`; Opt 5 = `.o3`. Opt 6 = `.o14` (real base + CTA-indexed tile spread; hit rate 0.8718 ≈ HW 0.8226; cycle rise is the accuracy tradeoff, not a regression). |
-| `no_warps_ready` | 66.40% | 66.64% | 58.27% | 29.80% | 36.56% | 36.45% | 41.51% | Rises as real DRAM traffic replaces fake L2 hits. |
-| `issuing` | 12.12% | 12.71% | 14.06% | 20.93% | 26.18% | 25.70% | 17.76% | Drops: warps wait longer on real TMA completion. |
-| `next_stage_not_available` | 10.17% | 10.69% | 11.41% | 15.11% | 18.96% | 18.52% | 12.88% | per-subcore (SM-level tensor-block only 1.13%, see Deferred). |
-| `no_valid_instruction` | 10.37% | 8.96% | 15.02% | 33.59% | 17.59% | 18.63% | 27.37% | Rises with longer memory latency (more L0I-miss frontend pressure). |
-| `issue_port_busy` | 0.95% | 1.01% | 1.24% | 0.57% | 0.71% | 0.70% | 0.48% | |
-| `sum` | 100.00% | 100.00% | 100.00% | 100.00% | 100.00% | 100.00% | 100.00% | Init columns sum to ~100% after rounding. |
+| Class | Init | Opt 1 (`rop=100`) | Opt 2 (BAR impl) | Opt 3 (MEMBAR) | Opt 4 (prefetch, sb=4) | Opt 5 (eager-promote) | Opt 6 (TMA real base) | Opt 7 (queue calib) | Note |
+|---|---|---|---|---|---|---|---|---|---|
+| `sim_cycle` | 376,735 | 361,760 | 328,643 | 259,456 | 241,528 | 241,425 | 290,572 | 250,026 | Opt 6 = `.o14` (realistic-address baseline; hit rate 0.8718 ≈ HW 0.8226). Opt 7 = `.o18` (all queue levers; -13.9% vs Opt 6, work invariant). |
+| `no_warps_ready` | 66.40% | 66.64% | 58.27% | 29.80% | 36.56% | 36.45% | 41.51% | 34.00% | Falls back as the TMA-completion stall drains. |
+| `issuing` | 12.12% | 12.71% | 14.06% | 20.93% | 26.18% | 25.70% | 17.76% | 21.94% | Rises: warps wait less on TMA completion. |
+| `next_stage_not_available` | 10.17% | 10.69% | 11.41% | 15.11% | 18.96% | 18.52% | 12.88% | 15.83% | per-subcore (SM-level tensor-block only 1.13%, see Deferred). |
+| `no_valid_instruction` | 10.37% | 8.96% | 15.02% | 33.59% | 17.59% | 18.63% | 27.37% | 27.63% | Frontend tail (`nv_ibuffer_empty`) now co-dominant with the TMA axis. |
+| `issue_port_busy` | 0.95% | 1.01% | 1.24% | 0.57% | 0.71% | 0.70% | 0.48% | 0.59% | |
+| `sum` | 100.00% | 100.00% | 100.00% | 100.00% | 100.00% | 100.00% | 100.00% | 100.00% | Init columns sum to ~100% after rounding. |
 
 #### FA3 bwd - inner stall / wait breakdown
 
-| Wait reason | Init | Opt 1 (`rop=100`) | Opt 2 (BAR impl) | Opt 3 (MEMBAR) | Opt 4 (prefetch, sb=4) | Opt 5 (eager-promote) | Opt 6 (ongoing, TMA real base) | Note |
-|---|---|---|---|---|---|---|---|---|
-| `inst_barrier` | — | 58.47% / 87.70% of `no_warps_ready` | 44.78% / 76.84% of `no_warps_ready` | 1.01% / 3.40% of `no_warps_ready` | 1.30% / 3.57% of `no_warps_ready` | 1.26% | 0.89% | Remains low after the MEMBAR fix. |
-| `tma_axis` | — | 67.28% / 90.90% of `no_warps_ready` | 58.09% | 17.13% / 57.49% of `no_warps_ready` | 21.96% / 60.06% of `no_warps_ready` | 22.17% | 31.91% | Rises sharply: real TMA completion latency now dominates. |
-| `non_tma_axis` | — | 16.40% / 24.50% of `no_warps_ready` | 18.08% | 21.99% / 73.79% of `no_warps_ready` | 27.15% / 74.25% of `no_warps_ready` | 26.66% | 18.94% | |
-| `fu_occupied` | — | 11.55% / 17.30% of `no_warps_ready` | 12.63% | 14.67% / 49.21% of `no_warps_ready` | 18.09% / 49.47% of `no_warps_ready` | 17.75% | 12.58% | function-unit busy |
-| `wait_barrier` | — | 7.98% / 12.00% of `no_warps_ready` | 8.62% | 11.76% / 39.46% of `no_warps_ready` | 14.66% / 40.12% of `no_warps_ready` | 14.71% | 11.80% | `DEPBAR` (SB phase wait = TMA mbarrier) |
-| `stall_count` | — | 4.11% / 6.20% of `no_warps_ready` | 4.63% | 6.18% / 20.73% of `no_warps_ready` | 7.55% / 20.65% of `no_warps_ready` | 7.40% | 5.30% | explicit stall cycles |
-| `tma_flush` | — | 0.83% / 1.20% of `no_warps_ready` | 4.69% | 4.36% / 14.62% of `no_warps_ready` | 5.99% / 16.38% of `no_warps_ready` | 6.20% | 19.22% | `UTMACMDFLUSH`; jumps up — real store-drain cost now visible. |
-| `yield` | — | 0.68% / 1.00% of `no_warps_ready` | 0.76% | 1.02% / 3.41% of `no_warps_ready` | 1.26% / 3.45% of `no_warps_ready` | 1.23% | 0.87% | `YIELD` |
-| `result_queue_full` | — | 0.03% / — | 0.03% | 0.09% / 0.30% of `no_warps_ready` | 0.12% / 0.33% of `no_warps_ready` | 0.12% | 0.08% | fixed-latency result queue |
-| `l1c` | — | 0.03% / — | 0.03% | 0.04% / 0.14% of `no_warps_ready` | 0.13% / 0.36% of `no_warps_ready` | 0.16% | 0.11% | L1 constant |
-| `scoreboard (memory)` | — | 0.00% / 0.00% of `no_warps_ready` | 0.00% | 0.00% / 0.00% of `no_warps_ready` | 0.00% / 0.00% of `no_warps_ready` | 0.00% | 0.00% | traditional scoreboard (unused here) |
+| Wait reason | Init | Opt 1 (`rop=100`) | Opt 2 (BAR impl) | Opt 3 (MEMBAR) | Opt 4 (prefetch, sb=4) | Opt 5 (eager-promote) | Opt 6 (TMA real base) | Opt 7 (queue calib) | Note |
+|---|---|---|---|---|---|---|---|---|---|
+| `inst_barrier` | — | 58.47% / 87.70% of `no_warps_ready` | 44.78% / 76.84% of `no_warps_ready` | 1.01% / 3.40% of `no_warps_ready` | 1.30% / 3.57% of `no_warps_ready` | 1.26% | 0.89% | 1.09% | Remains low after the MEMBAR fix. |
+| `tma_axis` | — | 67.28% / 90.90% of `no_warps_ready` | 58.09% | 17.13% / 57.49% of `no_warps_ready` | 21.96% / 60.06% of `no_warps_ready` | 22.17% | 31.91% | 21.60% | Falls back sharply as the queue levers drain TMA completion latency. |
+| `non_tma_axis` | — | 16.40% / 24.50% of `no_warps_ready` | 18.08% | 21.99% / 73.79% of `no_warps_ready` | 27.15% / 74.25% of `no_warps_ready` | 26.66% | 18.94% | 22.79% | |
+| `fu_occupied` | — | 11.55% / 17.30% of `no_warps_ready` | 12.63% | 14.67% / 49.21% of `no_warps_ready` | 18.09% / 49.47% of `no_warps_ready` | 17.75% | 12.58% | 15.18% | function-unit busy |
+| `wait_barrier` | — | 7.98% / 12.00% of `no_warps_ready` | 8.62% | 11.76% / 39.46% of `no_warps_ready` | 14.66% / 40.12% of `no_warps_ready` | 14.71% | 11.80% | 12.09% | `DEPBAR` (SB phase wait = TMA mbarrier) |
+| `stall_count` | — | 4.11% / 6.20% of `no_warps_ready` | 4.63% | 6.18% / 20.73% of `no_warps_ready` | 7.55% / 20.65% of `no_warps_ready` | 7.40% | 5.30% | 6.33% | explicit stall cycles |
+| `tma_flush` | — | 0.83% / 1.20% of `no_warps_ready` | 4.69% | 4.36% / 14.62% of `no_warps_ready` | 5.99% / 16.38% of `no_warps_ready` | 6.20% | 19.22% | 8.42% | `UTMACMDFLUSH` store-drain; drops sharply after the reply-path levers (`.o18` SM-idle `tma_flush` 14.66%→6.84%). |
+| `yield` | — | 0.68% / 1.00% of `no_warps_ready` | 0.76% | 1.02% / 3.41% of `no_warps_ready` | 1.26% / 3.45% of `no_warps_ready` | 1.23% | 0.87% | 1.06% | `YIELD` |
+| `result_queue_full` | — | 0.03% / — | 0.03% | 0.09% / 0.30% of `no_warps_ready` | 0.12% / 0.33% of `no_warps_ready` | 0.12% | 0.08% | 0.10% | fixed-latency result queue |
+| `l1c` | — | 0.03% / — | 0.03% | 0.04% / 0.14% of `no_warps_ready` | 0.13% / 0.36% of `no_warps_ready` | 0.16% | 0.11% | 0.13% | L1 constant |
+| `scoreboard (memory)` | — | 0.00% / 0.00% of `no_warps_ready` | 0.00% | 0.00% / 0.00% of `no_warps_ready` | 0.00% / 0.00% of `no_warps_ready` | 0.00% | 0.00% | 0.00% | traditional scoreboard (unused here) |
 
 > **[2] On the bwd Opt 1 `tma_axis` / `non_tma_axis`.** These were not emitted as single grouped counters in the Opt 1 run (`.o307`), so the cells are **computed** from the per-reason rows in the same column (the later runs emit them directly):
 > - `tma_axis` = `wait_barrier + inst_barrier + tma_flush` = 7.98+58.47+0.83 = **67.28%** (of `no_warps_ready`: 12.00+87.70+1.20 = 90.90%).
@@ -102,39 +103,29 @@ To keep this file easy to extend, use the following update pattern whenever a ne
 >
 > **[4] On the bwd Opt 5 column (`.o3`, clean-exit Step-0 run).** The run is sb=4 + eager-promote. It **exits cleanly** (`exit code 0`, no teardown SIGSEGV — the earlier `.o320` run's destructor heap-corruption crash is gone), so the cycle (241,425) and breakdown are fully trustworthy and this supersedes the preliminary 242,270. eager-promote counters: `eager_promote_to_cache=994,032`, `demand_hit_later=366,329`, `skipped_fill_port_busy=31,254`, `skipped_has_waiter=0`, `demand_miss_after_promote=0` (the prior `.o320` showed 2,224 here — the teardown fix also cleared the promote-then-miss artifact); L1I miss rate 0.1977. Step-0 instrumentation counters are timing-neutral, so this is a valid Opt-5 baseline.
 
-### Ongoing (real cycle-optimization phase — started 2026-07-09)
+### Ongoing (next cycle-reduction levers — after Opt 7)
 
-The accuracy prerequisite is done and the actual cycle-reduction work is now beginning. These items
-are **in progress**, not yet a completed Opt row — no cycle claim is made in the Optimization
-Progress table until an item lands a verified improvement.
+Opt 6 (address realism) and Opt 7 (TMA queue/interconnect calibration) are **Done**. With Opt 7 the
+TMA queue/interconnect axis is **exhausted** — every REQ/reply queue and interconnect stage is at the
+noise floor (`Req_Network_in_buffer_full` 355→7, `L2_TMA_output_full_cycles` 1.39M→441,
+`gpu_stall_icnt2sh` 1.82M→5.8K, `Reply_Network_in_buffer_full` 6.3→0.02 on bwd `.o18`). Further
+depth/drain/eject/width knobs move local `*_full` counters but **not `gpu_sim_cycle`**. The remaining
+sim-vs-HW gap (fwd 2.04x / bwd 1.88x) is owned by the two items below. No cycle claim is made until an
+item lands a verified improvement.
 
-#### Opt 6 (ongoing) - TMA real base address + CTA-indexed tile spread (M2/M2.5)
+#### Ongoing item 1 — TMA fixed-overhead / ROP per-sector serialization (the primary remaining cycle lever)
 
-> Detailed design & spike history: [TMA_exact_base_mapping_integration.md](file:///home/jihyun/modern-gpu-simulator-micro-2025/.plan/TMA_exact_base_mapping_integration.md) (milestones M0-M4, per-opcode handling), [TMA_BASE_ADDR.md](file:///home/jihyun/modern-gpu-simulator-micro-2025/.plan/TMA_BASE_ADDR.md) (base-recovery spikes SPIKE 1-10, §4.1 result), [TMA_ISA.md](file:///home/jihyun/modern-gpu-simulator-micro-2025/.plan/TMA_ISA.md) (per-opcode base/size), [TMA_LATENCY_INJECTION_H100.md](file:///home/jihyun/modern-gpu-simulator-micro-2025/.plan/TMA_LATENCY_INJECTION_H100.md) (§4.6 reply-path re-open).
+> Full diagnosis: [TMA_LATENCY_INJECTION_H100.md](file:///home/jihyun/modern-gpu-simulator-micro-2025/.plan/TMA_LATENCY_INJECTION_H100.md) §4.11.7 (post-Opt-7 stage residency) + §4.11.5(e) candidate 2 + §6 remaining items.
 
-##### Why this optimization
+- **Evidence (bwd `.o18`).** After Opt 7, **90.0% of a TMA request's round-trip is `IN_PARTITION_ROP_DELAY`** (avg **1,483** cyc), while inject is 7.1%, reply flight 1.5%, and the DRAM device itself is idle (`bw_util ≈ 0.033`, `avg_mrq_latency = 10`, `IN_PARTITION_DRAM = 0.57`). The configured ROP fixed part is only `-gpgpu_l2_rop_latency 100`, so ~1,383 cyc (93% of ROP) is **queue-wait to leave ROP**, not modeled latency.
+- **Root cause.** The sim pays a fixed ROP cost **per 32B sector × 768 sectors/transfer**, serialized into a single L2-input admission (`m_icnt_L2_queue`, surfacing as `gpu_stall_dramfull=137,131`). HW instead pays a ~170-cyc fixed overhead **once per transfer** (arXiv:2501.12084 §5.1). This per-sector×768 serialization is the residual wall now that every queue is drained.
+- **Direction.** Model the per-transfer TMA fixed overhead explicitly / remove the implicit per-sector ROP serialization. It is a **timing-only** change: keep `L2_TMA_true_hit_rate`, L2 accesses/bytes, and DRAM bytes invariant (the §4.12 work axis). **Rejected alternative:** the closed-form "TMA bulk engine" (deletes the per-sector L2/DRAM traffic whose hit-rate realism Opt 6 earned).
 
-- The TMA unit fabricated a synthetic GMEM base per transfer (`agu_base = (transfer_uid << 20) + agu_index*128`). Because `transfer_uid` is unique per transfer, repeated reads of the *same* tensor never reused an L2 line → the model could not observe real address behavior (this was the former Arch **TODO-2**).
-- Consequence: `L2_TMA_true_hit_rate` was fake-inflated (fwd 0.9854 / bwd 0.9785 in the M1 base-only run) vs HW (fwd 0.6958 / bwd 0.8226). Every prior TMA-latency / reply-path experiment (`TMA_LATENCY_INJECTION` §4.5) ran on this fake ~0.98 locality, so its "no cycle lever" conclusion was **un-judgeable** — the reply traffic was artificially dense. Realistic addresses are therefore a *prerequisite* for interpreting the TMA bottleneck at all, not just a fidelity nicety.
+#### Ongoing item 2 — frontend tail / fwd L2-hit over-model (accuracy-side, largely unrecoverable)
 
-##### How to implement (DONE — code landed, gated by config flags)
-
-- **Real base (M1):** recover each descriptor op's exact GMEM base offline into `tma_pc_base_map.json` (23/23 descriptor sites, `pool=0`, via direct SMEM-window offset + UTMACCTL.PF prefetch chain). Load it in `gpu-sim.cc`, look it up in `build_tma_command` by `(uid,pc)`, carry `global_base` + box/element_size on `TMACommand`, and drive the mover from the real base. Gated by `-tma_real_base_addr_enable`.
-- **CTA-indexed tile spread (M2):** base-only collapses all of a tensor's tiles to one address (over-hit). The first fix (per-SM visit counter) was measured to **fail** — FA3 runs 1 CTA/SM with only ~24 transfers/tensor/SM, so every SM restarted at tile 0 (fwd stayed 0.9854, distinct tiles ~24). Fixed by seeding `tile_idx = (global_blockIdx + visit) % num_tiles` from `SM::get_global_cta_id()` (added getter exposing the existing local→global CTA map), so distinct CTAs hit distinct tiles grid-wide while same-CTA revisits still hit.
-- **M2.5 (UBLKRED/UBLKCP):** these are raw-pointer ops (not tensormaps); their real base is read offline from the by-value param struct (`launch_param_blobs/*.bin`) and given the same CTA-indexed tiling with `tile_bytes=covered_bytes`. Gated by `-tma_operand_addr_tiling_enable`.
-- Files: `sm.h`/`sm.cc` (getter), `tma_unit_sm.{h,cc}` (lookup + mover + tile spread), `tma_types.h`, `gpu-sim.cc` (loader + flags). Commits `6893954` (code) + `0ddaec9` (docs).
-
-##### Result (measured — fwd K5 `.o31` / bwd K10 `.o14`, clean exit, 0 crash)
-
-- `L2_TMA_true_hit_rate`: fwd **0.9854 → 0.9461**, bwd **0.9785 → 0.8718** (HW 0.6958 / 0.8226). **bwd is essentially on target**; fwd moved the right direction but is still high due to the **CTA-count cap** (132 CTAs < 384 tiles → ≤132 distinct tiles/tensor; confirmed in-run `first-request` distinct 24 → 132). Closing the fwd gap fully needs real coords (approach B) and is parked since bwd is on target.
-- UBLKRED real-base coverage: **6/6 sites, 6528/6528 commands** (was synthetic in M1).
-- Cycles vs Opt 5: fwd 149,727 → **145,855 (-2.6%)**, bwd 241,425 → **290,572 (+20.4%)**. These are **not a targeted cycle optimization** — this run only makes the address model realistic. The bwd rise is the expected "no fake wins" accuracy tradeoff (fake ~0.98 locality → real DRAM traffic); the fwd drop is an incidental side-effect of the changed L2/reply pressure, not a claimed win. Either way this is now the trustworthy baseline for the cycle-reduction levers below.
-  - (For reference, the M1 base-only run was fwd 142,764 / bwd 276,109; but the Opt-progression baseline is Opt 5.)
-- The row/columns for Opt 6 in the tables above/below are marked **(ongoing)**: they record the current realistic baseline, not a cycle improvement.
-
-##### Next lever (from this baseline): TMA-completion / reply-path
-
-- With addresses realistic, the reply-path A/B (previously exhausted on fake locality, no cycle lever) can be re-judged. Evidence: TMA `avg_drain_cycles ≈ 2,600` vs `avg_emit_span ≈ 1,260` (bwd) → memory-return **drain dominates injection ~2x**; SM-idle `wait_barrier` ≈ 9.58% (fwd) / 9.53% (bwd), bwd `tma_flush` ≈ 14.66% remain the #1 recoverable axis. Plan: re-run the exp1/2/3 reply-path A/B matrix on this baseline — see [TMA_LATENCY_INJECTION_H100.md](file:///home/jihyun/modern-gpu-simulator-micro-2025/.plan/TMA_LATENCY_INJECTION_H100.md) §4.6.
+- **Frontend tail.** With the TMA axis drained, `no_valid_instruction` / `nv_ibuffer_empty` (~6–9%) is now co-dominant on bwd, but it is HW's own **straggler-tail imbalance** (Waves-Per-SM cross-validated: fwd 1.00 wave, bwd 2.91 non-integer waves; HW SM-idle 9.7% / 11.1% ≈ sim `nv_ibuffer_empty` 12.2% / 10.1%). It is **not** recoverable by a frontend-fetch fix — see the detailed evidence in **Deferred Opts → L1I frontend `stream_buffer_wait`**.
+- **fwd L2-hit over-model.** fwd `L2_TMA_true_hit_rate` is still **0.9456 vs HW 0.6958**, due to the **CTA-count cap** (132 CTAs < 384 tiles → ≤132 distinct tiles/tensor). Closing it needs real tile `coords` (Opt-6 approach B) — an **addressing** fix, not a timing one; parked because bwd hit rate is already on target (0.8688 vs HW 0.8226). This is why fwd's DRAM-work ratio is the most off (§4.12: fwd 0.26x vs bwd 0.56x).
+- Both are **fidelity items**, not the primary cycle lever; tracked here so they are not mistaken for queue work.
 
 ### Deferred Opts
 
@@ -188,6 +179,16 @@ FA3 fwd
   - Event / debug run: `H100_80GB-OnlyKernel5/flashattn-fa3-bf16-bwd-causal-b1-s2048-hd64-nh24-flashattn_fa3_bf16_bwd_causal_b1_s2048_hd64_nh24___warmup_-63a73d452237.e20`
   - Note: `sb=4` + `-is_instruction_prefetch_eager_promote_enabled 1`; clean-exit Step-0 instrumentation run (Step-0 counters are timing-neutral). `eager_promote_to_cache=662,658`, `demand_hit_later=252,212`, `demand_miss_after_promote=0` (no Risk A). L1I miss rate 0.3574. Supersedes the earlier `.o18` (150,755).
 
+- Opt 6 (TMA real base + CTA-indexed tile spread)
+  - Stats run: `H100_80GB-OnlyKernel5/flashattn-fa3-bf16-bwd-causal-b1-s2048-hd64-nh24-flashattn_fa3_bf16_bwd_causal_b1_s2048_hd64_nh24___warmup_-63a73d452237.o31`
+  - Event / debug run: `H100_80GB-OnlyKernel5/flashattn-fa3-bf16-bwd-causal-b1-s2048-hd64-nh24-flashattn_fa3_bf16_bwd_causal_b1_s2048_hd64_nh24___warmup_-63a73d452237.e31`
+  - Note: real-base + CTA-indexed tile spread (M2/M2.5); clean exit. Final cycle = `145,855`. `L2_TMA_true_hit_rate=0.9461` (accuracy baseline, not a cycle win).
+
+- Opt 7 (TMA queue/interconnect calibration)
+  - Stats run: `H100_80GB-OnlyKernel5/flashattn-fa3-bf16-bwd-causal-b1-s2048-hd64-nh24-flashattn_fa3_bf16_bwd_causal_b1_s2048_hd64_nh24___warmup_-63a73d452237.o35`
+  - Event / debug run: `H100_80GB-OnlyKernel5/flashattn-fa3-bf16-bwd-causal-b1-s2048-hd64-nh24-flashattn_fa3_bf16_bwd_causal_b1_s2048_hd64_nh24___warmup_-63a73d452237.e35`
+  - Note: `grant_passes=4` + `icnt_to_l2_pop=4` + `reply_drain=4` + `cluster_reply_eject=4` (all boot logs confirmed live). Final cycle = `138,021` (-5.4% vs Opt 6). `L2_TMA_true_hit_rate=0.9456` (unchanged → work invariant). ROP_DELAY dominates residual round-trip (61% / avg 135; req_side 95.3%).
+
 FA3 bwd
 
 - Init
@@ -219,6 +220,16 @@ FA3 bwd
   - Stats run: `H100_80GB-OnlyKernel10/flashattn-fa3-bf16-bwd-causal-b1-s2048-hd64-nh24-flashattn_fa3_bf16_bwd_causal_b1_s2048_hd64_nh24___warmup_-63a73d452237.o3`
   - Event / debug run: `H100_80GB-OnlyKernel10/flashattn-fa3-bf16-bwd-causal-b1-s2048-hd64-nh24-flashattn_fa3_bf16_bwd_causal_b1_s2048_hd64_nh24___warmup_-63a73d452237.e3`
   - Note: `sb=4` + `-is_instruction_prefetch_eager_promote_enabled 1`; **clean-exit** Step-0 instrumentation run (`exit 0`, the teardown SIGSEGV is fixed; Step-0 counters are timing-neutral). Final cycle = `241,425` (-0.04% vs Opt 4 `.o1`). `eager_promote_to_cache=994,032`, `demand_hit_later=366,329`, `skipped_fill_port_busy=31,254`, `skipped_has_waiter=0`, `demand_miss_after_promote=0`; L1I miss rate 0.1977. Supersedes the earlier `.o320` (242,270, teardown SIGSEGV).
+
+- Opt 6 (TMA real base + CTA-indexed tile spread)
+  - Stats run: `H100_80GB-OnlyKernel10/flashattn-fa3-bf16-bwd-causal-b1-s2048-hd64-nh24-flashattn_fa3_bf16_bwd_causal_b1_s2048_hd64_nh24___warmup_-63a73d452237.o14`
+  - Event / debug run: `H100_80GB-OnlyKernel10/flashattn-fa3-bf16-bwd-causal-b1-s2048-hd64-nh24-flashattn_fa3_bf16_bwd_causal_b1_s2048_hd64_nh24___warmup_-63a73d452237.e14`
+  - Note: real-base + CTA-indexed tile spread (M2/M2.5); clean exit. Final cycle = `290,572`. `L2_TMA_true_hit_rate=0.8718` (≈ HW 0.8226, on target). Cycle rise vs Opt 5 is the "no fake wins" accuracy tradeoff, not a regression.
+
+- Opt 7 (TMA queue/interconnect calibration)
+  - Stats run: `H100_80GB-OnlyKernel10/flashattn-fa3-bf16-bwd-causal-b1-s2048-hd64-nh24-flashattn_fa3_bf16_bwd_causal_b1_s2048_hd64_nh24___warmup_-63a73d452237.o18`
+  - Event / debug run: `H100_80GB-OnlyKernel10/flashattn-fa3-bf16-bwd-causal-b1-s2048-hd64-nh24-flashattn_fa3_bf16_bwd_causal_b1_s2048_hd64_nh24___warmup_-63a73d452237.e18`
+  - Note: `grant_passes=4` + `icnt_to_l2_pop=4` + `reply_drain=4` + `cluster_reply_eject=4` (all boot logs confirmed live). Final cycle = `250,026` (-13.9% vs Opt 6). `L2_TMA_true_hit_rate=0.8688` (unchanged → work invariant). `gpu_stall_icnt2sh` 1.82M→5,792, `L2_TMA_output_full_cycles` →441. Post-run: ROP_DELAY = 90% of TMA round-trip (avg 1,483), queue axis exhausted.
 
 ## 2. Optimization Details
 
@@ -460,6 +471,55 @@ HITs in L1I.
 - Fix direction: classify by promote->miss gap (or check eviction explicitly), so
   a small-gap immediate miss is the only true Risk-A signal and large-gap evictions
   go to a separate `eager_promote_evicted_before_demand` bucket.
+
+### Opt 6 - TMA real base address + CTA-indexed tile spread (M2/M2.5)
+
+> Detailed design & spike history: [TMA_exact_base_mapping_integration.md](file:///home/jihyun/modern-gpu-simulator-micro-2025/.plan/TMA_exact_base_mapping_integration.md) (milestones M0-M4, per-opcode handling), [TMA_BASE_ADDR.md](file:///home/jihyun/modern-gpu-simulator-micro-2025/.plan/TMA_BASE_ADDR.md) (base-recovery spikes SPIKE 1-10, §4.1 result), [TMA_ISA.md](file:///home/jihyun/modern-gpu-simulator-micro-2025/.plan/TMA_ISA.md) (per-opcode base/size).
+
+#### Why this optimization
+
+- The TMA unit fabricated a synthetic GMEM base per transfer (`agu_base = (transfer_uid << 20) + agu_index*128`). Because `transfer_uid` is unique per transfer, repeated reads of the *same* tensor never reused an L2 line → the model could not observe real address behavior (this was the former Arch **TODO-2**).
+- Consequence: `L2_TMA_true_hit_rate` was fake-inflated (fwd 0.9854 / bwd 0.9785 in the M1 base-only run) vs HW (fwd 0.6958 / bwd 0.8226). Every prior TMA-latency / reply-path experiment ran on this fake ~0.98 locality, so its "no cycle lever" conclusion was **un-judgeable** — the reply traffic was artificially dense. Realistic addresses are therefore a *prerequisite* for interpreting the TMA bottleneck at all (i.e. the prerequisite for Opt 7), not just a fidelity nicety.
+
+#### How to implement
+
+- **Real base (M1):** recover each descriptor op's exact GMEM base offline into `tma_pc_base_map.json` (23/23 descriptor sites, `pool=0`, via direct SMEM-window offset + UTMACCTL.PF prefetch chain). Load it in `gpu-sim.cc`, look it up in `build_tma_command` by `(uid,pc)`, carry `global_base` + box/element_size on `TMACommand`, and drive the mover from the real base. Gated by `-tma_real_base_addr_enable`.
+- **CTA-indexed tile spread (M2):** base-only collapses all of a tensor's tiles to one address (over-hit). The first fix (per-SM visit counter) **failed** — FA3 runs 1 CTA/SM with only ~24 transfers/tensor/SM, so every SM restarted at tile 0 (fwd stayed 0.9854). Fixed by seeding `tile_idx = (global_blockIdx + visit) % num_tiles` from `SM::get_global_cta_id()` (getter exposing the existing local→global CTA map), so distinct CTAs hit distinct tiles grid-wide while same-CTA revisits still hit.
+- **M2.5 (UBLKRED/UBLKCP):** raw-pointer ops (not tensormaps); their real base is read offline from the by-value param struct (`launch_param_blobs/*.bin`) and given the same CTA-indexed tiling with `tile_bytes=covered_bytes`. Gated by `-tma_operand_addr_tiling_enable`.
+- Files: `sm.h`/`sm.cc` (getter), `tma_unit_sm.{h,cc}` (lookup + mover + tile spread), `tma_types.h`, `gpu-sim.cc` (loader + flags). Commits `6893954` (code) + `0ddaec9` (docs).
+
+#### Result
+
+- `L2_TMA_true_hit_rate`: fwd **0.9854 → 0.9461**, bwd **0.9785 → 0.8718** (HW 0.6958 / 0.8226). **bwd is essentially on target**; fwd is still high due to the **CTA-count cap** (132 CTAs < 384 tiles → ≤132 distinct tiles/tensor). Closing the fwd gap needs real coords (approach B) and is parked (Ongoing item 2) since bwd is on target.
+- UBLKRED real-base coverage: **6/6 sites, 6528/6528 commands** (was synthetic in M1).
+- Cycles vs Opt 5: fwd 149,727 → **145,855 (-2.6%)**, bwd 241,425 → **290,572 (+20.4%)**. This is an **accuracy** change, not a targeted cycle opt — the bwd rise is the expected "no fake wins" tradeoff (fake ~0.98 locality → real DRAM traffic). This is now the trustworthy baseline Opt 7 builds on.
+  - (For reference the M1 base-only run was fwd 142,764 / bwd 276,109; the Opt-progression baseline is Opt 5.)
+
+### Opt 7 - TMA queue/interconnect calibration (inject + reply paths)
+
+> Full derivation & experiment history: [TMA_LATENCY_INJECTION_H100.md](file:///home/jihyun/modern-gpu-simulator-micro-2025/.plan/TMA_LATENCY_INJECTION_H100.md) §4 (this Opt consolidates every measured experiment there: §4.5 reply-depth/drain, §4.8/§4.9 injection grant-passes + icnt→L2 pop, §4.11 port-width A/B, §4.11.6 paired reply-eject/drain, §4.11.7 post-run diagnosis, §6 summary).
+
+#### Why this optimization
+
+- On the realistic-address Opt-6 baseline, the #1 recoverable SM-idle was the TMA-completion axis (`wait_barrier` ≈ 9.5%, bwd `tma_flush` ≈ 14.66%). Static + measured analysis traced this to a chain of **1-item-per-cycle chokes** around a physically-idle DRAM (`bw_util` ≈ 8%): the SM's single shared REQ icnt injection node, the icnt→L2 pop, the L2→icnt reply drain, and the per-SM reply eject each moved only 1 sector-mf/tick, while one 24KB TMA transfer emits 768×32B sectors. That count ÷ the 1/tick chokes was the serialization.
+- HW anchor (arXiv:2501.12084): the per-SM SM→L2 load bandwidth is **124 byte/clk ≈ 4 sector/clk = one 128B line/clk**, and TMA **shares** that path (no dedicated port). So the calibration target for every injection/reply stage is ~4 sector/clk — not "free memory".
+
+#### How to implement
+
+All knobs are config-gated and default to 1 (bit-identical). The H100 config sets them to 4:
+- **Injection:** `-icnt_grant_passes_per_cycle 4` (xbar iSLIP runs up to N grant passes/tick) paired with `-gpgpu_icnt_to_l2_pop_per_cycle 4` (downstream icnt→L2 pop) — must be paired or the stall relocates to the out_buffer.
+- **Reply:** `-gpgpu_l2_reply_drain_per_cycle 4` (L2→icnt reply FIFO drain) paired with the new `-gpgpu_cluster_reply_eject_per_cycle 4` (per-SM `simt_core_cluster::icnt_cycle` eject). §4.5 proved reply_drain alone is null (the stall relocated to the still-1/tick eject); pairing both ends removes the last reply choke.
+- Every drained packet still passes `Has_Buffer_Out`/`icnt_push`/`full()`, so bandwidth accounting stays honest. Plus two timing-neutral correctness fixes: ceil-division fill/writeback port occupancy (prevents a fake 0-cycle fill when sweeping port width) and the `IN_PARTITION_L2_TO_DRAM_QUEUE` status-timestamp bug (§4.11.5a).
+- L2 data-port width 32→64 was tested and **rejected** (null for both kernels); config left at 32B.
+- Files: `local_interconnect.{h,cc}`, `icnt_wrapper.cc`, `gpu-sim.{cc,h}`, `shader.{h,cc}`, `gpu-cache.cc`, `l2cache.{h,cc}`, `gpgpusim.config`.
+
+#### Result
+
+- Cycles vs Opt 6: fwd 145,855 → **138,021 (-5.4%)** (`.o35`, 2.04x vs HW), bwd 290,572 → **250,026 (-13.9%)** (`.o18`, 1.88x vs HW). BWD gains more because its reply FIFO was a genuine relief valve; FWD's residual is reply-side fixed-latency across small transfers, which a throughput knob cannot touch.
+- **Work invariant (the win is timing-only, not fake locality):** `L2_TMA_true_hit_rate` fwd 0.9456 / bwd 0.8688 (unchanged vs Opt 6); L2 accesses/read/write bytes within ~1%.
+- Bottleneck relieved: bwd `Req_Network_in_buffer_full` 355→7, `L2_TMA_output_full_cycles` 1.39M→441, `gpu_stall_icnt2sh` 1.82M→5,792, `Reply_Network_in_buffer_full` 6.3→0.02. `tma_flush` SM-idle 14.66%→6.84%.
+- **The levers actually fired:** bwd `reply_eject_multi_ticks=2.89M` (avg 2.17/tick, max_burst 4); `Req_Network_extra_pass_grants_total` large; ~67% of icnt→L2 pops came from the added downstream pops.
+- **Conclusion — TMA queue/interconnect tuning is exhausted.** Post-run stage residency (bwd `.o18`) shows **90% of a TMA request's round-trip is now `ROP_DELAY`** (avg 1,483 cyc), a fixed-latency per-sector serialization, not any queue. Every queue stage is at the noise floor. The next cycle lever is the TMA fixed-overhead model (Ongoing item 1), not more queue widening.
 
 ## 3. Arch TODO
 

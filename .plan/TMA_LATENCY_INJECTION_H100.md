@@ -1791,6 +1791,90 @@ genuine `wait_barrier` structural limit unrelated to reply throughput. This run 
 "reply throughput choke" (fixed here) from "reply fixed-latency" (untouched), which is why it is worth
 one run even though depth/drain-alone were null.
 
+### RESULT — paired reply-path calibration MEASURED (FWD K5 `.o35`/`.e35`, BWD K10 `.o18`/`.e18`, 2026-07-12/13)
+
+Both kernels ran clean. Both knobs confirmed live in the boot log (`[REPLY-EJECT] ...=4`, plus the
+prior `[ICNT] grant_passes=4` and `[ICNT->L2] pop=4`). Both levers materially fired: BWD
+`reply_eject_*_multi_ticks=2.89M` (`avg_per_active=2.17`, `max_burst=4`); FWD
+`multi_ticks=809K` (`avg_per_active=2.43`, `max_burst=4`). **The run is a real partial success:
+timing improved, work stayed invariant, and it did NOT relocate the stall the way the §4.5
+drain-only run did.**
+
+Baselines: prior after-lever (grant/pop=4 only) FWD `.o32`=140,138 / BWD `.o15`=262,744; realistic-
+address baseline (no queue levers, M2/M2.5) FWD `.o31`=145,855 / BWD `.o14`=290,572; HW 67,696 / 132,901.
+
+| metric | FWD K5 (`.o35`) | BWD K10 (`.o18`) | judgment |
+|---|---|---|---|
+| `gpu_sim_cycle` | **138,021** | **250,026** | timing improved |
+| vs prior after-lever (grant/pop=4) | 140,138 → **−1.5%** | 262,744 → **−4.8%** | reply calibration adds a real cut |
+| vs realistic baseline (no queue levers) | 145,855 → **−5.4%** | 290,572 → **−13.9%** | cumulative queue-lever effect |
+| vs HW | **2.04x** | **1.88x** | still ~2x |
+| `L2_TMA_true_hit_rate` | 0.9456 (was 0.9455) | 0.8688 (was 0.8701) | **work invariant ✅** |
+| `L2_total_cache_accesses` | 3,457,208 (~flat) | 11,269,403 (~flat) | **work invariant ✅** |
+| `L2_cache_read/write_bytes` | 106.1 / 4.52 MB | 241.0 / 119.6 MB | **work invariant ✅** |
+| `L2_TMA_output_full_cycles` [12] | 0 | **441** (was 465,528) | reply FIFO no longer fills |
+| `gpu_stall_icnt2sh` [12→13] | 0 | **5,792** (was 511,707) | did NOT explode (pairing worked) |
+| `Reply_Network_in_buffer_full` | 0.00 | **0.02** | reply net empty |
+| `wait_barrier` SM-idle | 9.81% | **9.16%** | down |
+| `tma_flush` SM-idle | 0.00% (load-only) | **6.84%** (was 14.66%) | down sharply |
+
+**Why the pairing worked (vs §4.5 drain-only null):** §4.5 raised only `reply_drain` and the stall
+relocated to the still-1/tick per-SM eject (`gpu_stall_icnt2sh` 259K→722K). This run opens BOTH ends
+(`reply_drain=4` + `reply_eject=4`), so there is no 1/tick choke left on the reply path — hence
+`gpu_stall_icnt2sh` FELL (511K→5.8K on BWD) instead of exploding. This is the same paired-lever
+lesson as the injection side (§4.8/§4.9 grant_passes + icnt_to_l2_pop).
+
+**FWD moved less (−1.5%) than BWD (−4.8%), as predicted:** FWD's residual cost is reply-side
+fixed-latency across small transfers (§4.11.5c), which a throughput knob cannot touch; BWD's reply
+FIFO was a genuine relief valve.
+
+## 4.11.7 POST-RUN diagnosis — TMA queue tuning is EXHAUSTED; the new wall is ROP_DELAY (a fixed-latency stage, not a queue) — 2026-07-13
+
+With the reply path drained, the §4.10 stage map was re-read on the new `.o18` (BWD K10) counters.
+**Every queue/interconnect stage is now at the noise floor. There is no queue left to widen.**
+
+| stage (§4.10) | counter | pre-levers baseline | **now (`.o18`)** | status |
+|---|---|---|---|---|
+| [2] REQ inject buffer | `Req_Network_in_buffer_full` | 355 | **7.15** | drained |
+| [3] REQ out buffer | `Req_Network_out_buffer_full` | 0.20 | **0.26** | never a limiter |
+| [5] L2 bank data port | `L2_TMA_port_busy_cycles` | 660 | **750** | noise floor |
+| [5] L2 admission | `L2_TMA_res_fail_per_probe` | 0 | **0.0015** | ~0 |
+| [12] L2→icnt reply FIFO | `L2_TMA_output_full_cycles` | 1.39M | **441** | drained |
+| [12]→[13] reply inject | `gpu_stall_icnt2sh` | 1.82M | **5,792** | drained |
+| [13] reply network | `Reply_Network_in_buffer_full` | 6.3 | **0.02** | empty |
+
+The only counter still large is `gpu_stall_dramfull = 137,131` (stage [4] L2-input queue) — but per the
+per-stage residency below it is a *symptom* of ROP holding requests, not an independent depth limit
+(and §4.5/§4.11 already proved widening it is null).
+
+### Where the cycles actually go now — the TMA round-trip is dominated by ROP_DELAY
+Corrected per-stage residency of every TMA request (`.o18`, `averagemflatency = 1,649`; the
+`L2_TO_DRAM_QUEUE` poisoned-bucket bug from §4.11.5a is fixed here, so the table is trustworthy):
+
+| stage | avg cyc | % of TMA round-trip |
+|---|---|---|
+| **`IN_PARTITION_ROP_DELAY`** | **1,483** | **90.0%** |
+| `IN_ICNT_TO_MEM` (inject) | 117 | 7.1% |
+| `IN_PARTITION_DRAM_LATENCY_QUEUE` | 247 (×0.07 miss) | 1.1% |
+| `IN_ICNT_TO_SHADER` (reply flight) | 24 | 1.5% |
+| DRAM device / MC / fill / L2 queues | ≈ 0–11 each | < 0.3% |
+| bucket req_side / reply_side | **98.45% / 1.55%** | — |
+
+DRAM is idle (`bw_util ≈ 0.033`, `avg_mrq_latency = 10`, `IN_PARTITION_DRAM = 0.57 cyc`), so the
+memory *device* is not the wall — **90% of a TMA request's life is spent parked in ROP_DELAY.**
+
+**What ROP_DELAY is (and why it is the next lever):** the ROP avg is **1,483** but the *configured*
+fixed part is only `-gpgpu_l2_rop_latency 100`. So ~1,383 cyc (93%) is **queue-wait to leave ROP**,
+not modeled ROP latency. ROP pops into `m_icnt_L2_queue` only when that queue has room; the chain is
+now `ROP holds → m_icnt_L2_queue can't accept → gpu_stall_dramfull → ROP residency balloons to 1,483`.
+This is no longer a depth/drain problem (all drained). It is the §4.11.5(e) **candidate 2**: the sim
+pays a fixed ROP cost **per 32B sector × 768 sectors/transfer, serialized into single L2-input
+admission**, whereas HW pays a ~170-cyc fixed overhead **once per transfer** (arXiv:2501.12084 §5.1).
+That per-sector × 768 fixed cost funneled through one admission point is the residual 1,383 cyc.
+
+FWD `.o35` shows the same shape (ROP_DELAY 61% / 135 avg, req_side 95.3%), just milder because FWD
+transfers are smaller and its residual is reply-side fixed-latency.
+
 ## 4.12 Cycle-INDEPENDENT "work done" comparison (the trustworthy anchor) — 2026-07-09
 
 Throughput% (bytes/cycle) is a TRAP for validation: sim runs ~2x more cycles, so any bytes/cycle
@@ -1928,3 +2012,53 @@ denominator and is NOT an accuracy signal.
   experiment.
 - **Out of scope:** real GMEM base recovery (trace-gen / NVBit descriptor-cache limitation, Arch
   TODO-2). Tracked separately; this plan deliberately uses a hotspot-free synthetic address only.
+
+## 6. Opt 7 — final summary (TMA queue/interconnect calibration) and remaining items
+
+Everything in this document below §4 (the injection + reply queue/interconnect calibration) is
+consolidated as **Opt 7** in `FA3_progress.md`. It is built on top of **Opt 6** (TMA real base +
+CTA-indexed tile spread, M2/M2.5 — the address-realism prerequisite, now finalized separately).
+
+### What Opt 7 is (the shipped config + code)
+All knobs default to 1 (bit-identical); the H100 config enables them:
+- `-icnt_grant_passes_per_cycle 4` (§4.8, injection xbar drain, HW-calibrated to ~4 sector/clk).
+- `-gpgpu_icnt_to_l2_pop_per_cycle 4` (§4.9, paired downstream icnt→L2 pop).
+- `-gpgpu_l2_reply_drain_per_cycle 4` (§4.11.6, reply FIFO drain — now paired, was null when alone in §4.5).
+- `-gpgpu_cluster_reply_eject_per_cycle 4` (§4.11.6, per-SM reply eject — the missing pair for reply_drain).
+- Ceil-division fill/writeback port occupancy guard (§4.11.1 Step A) + the §4.11.5a `L2_TO_DRAM_QUEUE`
+  status-timestamp bug fix (both timing-neutral correctness fixes).
+- L2 data-port width sweep 32→64 was tested and **rejected** (§4.11-Step B/C, null for both kernels);
+  config left at 32B.
+
+### Measured result (on the Opt 6 realistic-address baseline)
+| | FWD K5 | BWD K10 | HW |
+|---|---|---|---|
+| Opt 6 baseline (no queue levers) | 145,855 | 290,572 | — |
+| **Opt 7 (all queue levers)** | **138,021** (`.o35`) | **250,026** (`.o18`) | 67,696 / 132,901 |
+| Opt 7 vs Opt 6 | **−5.4%** | **−13.9%** | — |
+| vs HW | 2.04x | 1.88x | 1.0x |
+
+Work axis invariant (the win is timing-only, not fake locality): `L2_TMA_true_hit_rate` 0.9456 / 0.8688,
+L2 accesses/bytes unchanged vs baseline. See §4.11.6 RESULT for the full table.
+
+### Conclusion — TMA queue/interconnect tuning is EXHAUSTED (§4.11.7)
+After Opt 7 every REQ/reply queue and interconnect stage is at the noise floor
+(`Req_in_buffer_full` 355→7, `L2_TMA_output_full` 1.39M→441, `gpu_stall_icnt2sh` 1.82M→5.8K,
+`Reply_in_buffer_full` 6.3→0.02). Further depth/drain/eject/width knobs will move local `*_full`
+counters but **not `gpu_sim_cycle`** — the exact null pattern this document documented six times.
+
+### Remaining items to reach HW cycles (NOT queue-related — tracked as Ongoing in FA3_progress.md)
+1. **TMA fixed-overhead / ROP per-sector serialization (§4.11.5e candidate 2 + §4.11.7).** 90% of a
+   TMA request's round-trip is now `ROP_DELAY` (avg 1,483 cyc, of which ~1,383 is queue-wait, not the
+   configured 100). Root: the sim pays a fixed ROP cost **per 32B sector × 768 sectors/transfer**,
+   serialized into a single L2-input admission, while HW pays a ~170-cyc fixed overhead **once per
+   transfer** (arXiv:2501.12084 §5.1). This is the largest remaining bucket and the most HW-faithful
+   next lever. It is a *timing* change; keep `L2_TMA_true_hit_rate`, L2 accesses/bytes, DRAM bytes
+   invariant (§4.12 work axis). Rejected alternative: the "TMA bulk engine" closed-form model (§4.11f)
+   deletes the per-sector L2/DRAM traffic whose hit-rate realism Opt 6 earned.
+2. **Frontend tail / fwd L2-hit over-model (accuracy-side, largely unrecoverable).** With the TMA axis
+   drained, `nv_ibuffer_empty`/`no_valid_frontend` (~6–9%) is co-dominant but is HW's own straggler-tail
+   imbalance (Waves-Per-SM cross-validated, see FA3_progress Deferred Opts) — not recoverable by a
+   frontend-fetch fix. Separately, the fwd L2 hit rate is still over-modeled (0.9456 vs HW 0.6958) due
+   to the CTA-count cap; closing it needs real tile `coords` (Opt-6 approach B), an *addressing* fix,
+   not a timing one. These are fidelity items, not the primary cycle lever.
