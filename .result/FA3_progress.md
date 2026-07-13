@@ -113,13 +113,16 @@ depth/drain/eject/width knobs move local `*_full` counters but **not `gpu_sim_cy
 sim-vs-HW gap (fwd 2.04x / bwd 1.88x) is owned by the two items below. No cycle claim is made until an
 item lands a verified improvement.
 
-#### Ongoing item 1 — TMA fixed-overhead / ROP per-sector serialization (the primary remaining cycle lever)
+#### Ongoing item 1 — Opt 8: L2 admission-rate under-modeling (the primary remaining cycle lever)
 
-> Full diagnosis: [TMA_LATENCY_INJECTION_H100.md](file:///home/jihyun/modern-gpu-simulator-micro-2025/.plan/TMA_LATENCY_INJECTION_H100.md) §4.11.7 (post-Opt-7 stage residency) + §4.11.5(e) candidate 2 + §6 remaining items.
+> Dedicated plan: [L2_ADMISSION_WIDTH_H100.md](file:///home/jihyun/modern-gpu-simulator-micro-2025/.plan/L2_ADMISSION_WIDTH_H100.md) (HW anchor, 2-probe/cycle safety trace, impl + verification). Upstream diagnosis: [TMA_LATENCY_INJECTION_H100.md](file:///home/jihyun/modern-gpu-simulator-micro-2025/.plan/TMA_LATENCY_INJECTION_H100.md) §4.11.7.
 
 - **Evidence (bwd `.o18`).** After Opt 7, **90.0% of a TMA request's round-trip is `IN_PARTITION_ROP_DELAY`** (avg **1,483** cyc), while inject is 7.1%, reply flight 1.5%, and the DRAM device itself is idle (`bw_util ≈ 0.033`, `avg_mrq_latency = 10`, `IN_PARTITION_DRAM = 0.57`). The configured ROP fixed part is only `-gpgpu_l2_rop_latency 100`, so ~1,383 cyc (93% of ROP) is **queue-wait to leave ROP**, not modeled latency.
-- **Root cause.** The sim pays a fixed ROP cost **per 32B sector × 768 sectors/transfer**, serialized into a single L2-input admission (`m_icnt_L2_queue`, surfacing as `gpu_stall_dramfull=137,131`). HW instead pays a ~170-cyc fixed overhead **once per transfer** (arXiv:2501.12084 §5.1). This per-sector×768 serialization is the residual wall now that every queue is drained.
-- **Direction.** Model the per-transfer TMA fixed overhead explicitly / remove the implicit per-sector ROP serialization. It is a **timing-only** change: keep `L2_TMA_true_hit_rate`, L2 accesses/bytes, and DRAM bytes invariant (the §4.12 work axis). **Rejected alternative:** the closed-form "TMA bulk engine" (deletes the per-sector L2/DRAM traffic whose hit-rate realism Opt 6 earned).
+- **Root cause.** One 24KB TMA transfer = 768×32B sectors, tiled onto a few sub-partitions, each draining at the L2-admission cap of **1 sector (32B)/cycle** (`gpu_stall_dramfull=137,131` = L2-input queue full). HW pipelines it as a bulk line stream.
+- **HW-anchored fix (verified 2026-07-13).** A real H100 L2 slice returns **64B/cycle = 2×32B sectors** (32B is the access granularity; 100-class HBM doubled per-slice width from V100's 32B to 64B — Cornell CVW GPU-memory + NVIDIA dev-forum L2-throughput thread). So the sim under-models L2 admission by **2x**. Fix = admit **2 sectors/cycle/sub-partition** (each still through the real `access()`+MSHR+`data_port`, so work stays invariant), mirroring the Opt-7 inject/reply calibration. Target is **2** (L2-slice quantum), NOT 4 (SM→L2 injection quantum). **`m_data_port_width` is NOT this knob** (proven null — only meters occupancy of an already-admitted sector, `ceil(32/32)=1`).
+- **Safety traced (before implementing):** `access()` is re-entrant within a cycle; MSHR (192 entries) and miss-queue are capacity- not rate-bounded; the only real relocation risk is the 1/tick miss-queue→DRAM drain, but with ~87% L2 hits and DRAM idle it should be minor. Full trace in the dedicated plan §4.
+- **Measure before/after (next run):** the coarse `partiton_level_parallism` counter (already printed) shows only **~44 of 80** sub-partitions active/cycle chip-wide on bwd `.o18`, but that is inject-side and kernel-averaged — it hides temporal burst concentration. A new **per-sub-partition L2-admission histogram** (§8 of the plan) is to be added so the next run directly confirms whether the ROP wall is a few hot slices (spread problem) vs a genuine per-slice throughput limit (Opt 8 lever), and later proves the 1→2 budget is actually used.
+- **Alternative (more invasive, deferred):** model a per-transfer ~170-cyc TMA fixed overhead instead of 768 serialized sector round-trips — attacks the same wall from the fixed-latency side but risks deleting the per-sector L2/DRAM traffic whose hit-rate realism Opt 6 earned. Do Opt 8 (admission width) first.
 
 #### Ongoing item 2 — frontend tail / fwd L2-hit over-model (accuracy-side, largely unrecoverable)
 
@@ -542,6 +545,15 @@ knobs.
 - **TODO**: implement TMA-side shared-memory swizzle (apply the descriptor `swizzle` mode when
   computing the SMEM destination layout) so the TMA store path and the downstream LDSM/LDS
   consumers see the correct (swizzled) shared addresses.
+- **Clarification — swizzle is an SMEM-bank concern, NOT the "spread across L2 slices" mechanism.**
+  A common conflation: "swizzle spreads the transfer across all L2 sub-partitions to reach peak
+  bandwidth." That peak-bandwidth spreading is done by the **L2 partition indexing / address hashing**
+  (GMEM line → L2 slice), which the sim **already implements** (`addrdec.cc` + `hashing.cc`, IPoly,
+  `-gpgpu_memory_partition_indexing 2`). TMA descriptor swizzle instead rearranges bytes **within one
+  CTA's shared memory** to avoid the 32-bank SMEM conflict on the GMEM→SMEM write and the LDSM/LDS
+  reads — it does not change which L2 slice a line lands on. The two are orthogonal (different memory
+  layers). Whether TMA bursts actually exploit the L2 slice spread is a separate, measurable question —
+  see [L2_ADMISSION_WIDTH_H100.md](file:///home/jihyun/modern-gpu-simulator-micro-2025/.plan/L2_ADMISSION_WIDTH_H100.md) §8 (per-slice admission histogram) / §9.
 
 > Note: the former **TODO-2 (real TMA base address)** has been implemented — real per-site GMEM
 > base + CTA-indexed tile spread (M2/M2.5). It is no longer a TODO; see the Ongoing section above

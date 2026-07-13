@@ -1,4 +1,4 @@
-# Opt 6 — TMA transfer latency / injection over-modeling
+# Opt 7 — TMA transfer latency / injection over-modeling
 
 > **Current decision.** This plan still uses the evidence from the address-hotspot / sector-merge
 > and injection-bandwidth analyses, but implementation must be split into separately-gated
@@ -1874,6 +1874,15 @@ That per-sector × 768 fixed cost funneled through one admission point is the re
 
 FWD `.o35` shows the same shape (ROP_DELAY 61% / 135 avg, req_side 95.3%), just milder because FWD
 transfers are smaller and its residual is reply-side fixed-latency.
+
+### The fix for this ROP wall is split into its own plan (Opt 8)
+
+The residual `ROP_DELAY` wall is the L2 **admission** stage: `cache_cycle` admits only **1 sector
+(32B) per sub-partition per L2-tick**, while a real H100 L2 slice returns **64B/cycle (2×32B
+sectors)**. That HW anchor, the full re-entrancy/MSHR/data-port safety trace for admitting 2
+probes/cycle, and the implementation/verification plan now live in a dedicated doc:
+[L2_ADMISSION_WIDTH_H100.md](file:///home/jihyun/modern-gpu-simulator-micro-2025/.plan/L2_ADMISSION_WIDTH_H100.md) (Opt 8). `m_data_port_width` is NOT that knob (proven null in
+§4.11 Step B/C). See that doc for details; this section only established *that* ROP_DELAY is the wall.
 
 ## 4.12 Cycle-INDEPENDENT "work done" comparison (the trustworthy anchor) — 2026-07-09
 
