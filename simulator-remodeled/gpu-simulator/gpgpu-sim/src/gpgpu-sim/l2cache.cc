@@ -530,7 +530,21 @@ void memory_sub_partition::cache_cycle(unsigned cycle) {
   if (!m_config->m_L2_config.disabled()) m_L2cache->cycle();
 
   // new L2 texture accesses and/or non-texture accesses
-  if (!m_L2_dram_queue->full() && !m_icnt_L2_queue->empty()) {
+  //
+  // Opt8: admit up to N sectors per sub-partition per L2 tick (default N=1 =
+  // original behavior). N=2 matches the HW H100 L2 slice throughput of 64B/cycle
+  // (2x32B sectors). The data port is modeled N*32B-wide: it is gated ONCE via
+  // data_port_free() below (checked inside the first probe's branch as today), and
+  // the whole batch shares that single tick's port occupancy, so the 1/tick
+  // replenish is not oversubscribed. Each probe still runs the real access()+MSHR,
+  // so L2 hit-rate / DRAM work is invariant (timing-only rate calibration). Loop
+  // stops early on: empty input queue, output_full, port busy, or RESERVATION_FAIL
+  // (head unchanged, retried next tick).
+  unsigned admit_budget = m_config->gpgpu_l2_admit_sectors_per_cycle;
+  if (admit_budget == 0) admit_budget = 1;
+  unsigned admitted_this_tick = 0;
+  for (unsigned ap = 0; ap < admit_budget; ++ap) {
+    if (m_L2_dram_queue->full() || m_icnt_L2_queue->empty()) break;
     mem_fetch *mf = m_icnt_L2_queue->top();
     if (!m_config->m_L2_config.disabled() &&
         ((m_config->m_L2_texure_only && mf->istexture()) ||
@@ -543,13 +557,25 @@ void memory_sub_partition::cache_cycle(unsigned cycle) {
       // skip to its downstream cause so a low res_fail is not misread as "no
       // admission pressure". output_full is checked first because that gate is
       // evaluated first below; port-busy is the remaining skip cause.
-      if (mf->is_tma() && (output_full || !port_free)) {
+      // Opt8: only attribute on the FIRST probe of the tick (ap==0) so the extra
+      // probes do not double-count the same-cycle backpressure signal.
+      if (ap == 0 && mf->is_tma() && (output_full || !port_free)) {
         if (output_full)
           ++m_tma_l2_output_full_cycles;
         else
           ++m_tma_l2_port_busy_cycles;
       }
-      if (!output_full && port_free) {
+      // Opt8: model the N-wide data port. access() below charges the data port
+      // once per probe (ceil(32/port_width)=1), so within a single tick the 2nd..Nth
+      // probe would otherwise see the port busy from the 1st probe. We therefore
+      // gate the port only on the FIRST probe (ap==0); probes ap>0 skip the port
+      // re-check because the batch is charged as one N*32B-wide access, and the
+      // (N-1) extra data-port replenish AFTER this loop cancels the extra per-probe
+      // occupancy so the NEXT tick starts with a free port (no saturation, no
+      // 1/tick throttle). output_full is still re-checked every probe. N=1 =
+      // original single-probe behavior exactly.
+      bool port_ok = (ap == 0) ? port_free : true;
+      if (!output_full && port_ok) {
         std::list<cache_event> events;
         if(m_gpu->getShaderCoreConfig()->is_global_memory_accesses_blocks_tracking_enabled && (mf->get_access_type() != CONST_ACC_R)) {
           m_gpu->get_shader_stats()->all_global_memory_accessed_blocks.insert(m_L2cache->get_config().block_addr(mf->get_addr()));
@@ -602,6 +628,7 @@ void memory_sub_partition::cache_cycle(unsigned cycle) {
             assert(write_sent);
             m_icnt_L2_queue->pop();
           }
+          ++admitted_this_tick;
         } else if (status != RESERVATION_FAIL) {
           if (mf->is_write() &&
               (m_config->m_L2_config.m_write_alloc_policy == FETCH_ON_WRITE ||
@@ -620,11 +647,17 @@ void memory_sub_partition::cache_cycle(unsigned cycle) {
           }
           // L2 cache accepted request
           m_icnt_L2_queue->pop();
+          ++admitted_this_tick;
         } else {
           assert(!write_sent);
           assert(!read_sent);
           // L2 cache lock-up: will try again next cycle
+          break;  // Opt8: head is RESERVATION_FAIL, no point probing more this tick
         }
+      } else {
+        // Opt8: output full (or port busy on first probe) -> cannot admit more
+        // this tick.
+        break;
       }
     } else {
       // L2 is disabled or non-texture access to texture-only L2
@@ -632,7 +665,23 @@ void memory_sub_partition::cache_cycle(unsigned cycle) {
                      m_gpu->gpu_sim_cycle + m_gpu->gpu_tot_sim_cycle);
       m_L2_dram_queue->push(mf);
       m_icnt_L2_queue->pop();
+      ++admitted_this_tick;
     }
+  }
+  // Opt8 instrumentation (timing-neutral): per-sub-partition admission parallelism.
+  if (admitted_this_tick > 0) {
+    m_l2_admissions += admitted_this_tick;
+    ++m_l2_active_cycles;
+    if (admitted_this_tick > 1) ++m_l2_multi_admit_cycles;
+  }
+  // Opt8: model the N-wide data port. baseline_cache::cycle() (called above) does
+  // the base 1/tick data-port replenish; when the slice admits up to N sectors/tick
+  // we must replenish (N-1) extra so the accumulated per-probe occupancy does not
+  // saturate the port and throttle the NEXT tick back to 1 admission. Only when
+  // the knob is >1 (default 1 = bit-identical). Guarded to L2-enabled (cycle() and
+  // the bandwidth model only run then).
+  if (admit_budget > 1 && !m_config->m_L2_config.disabled()) {
+    m_L2cache->replenish_data_port_extra(admit_budget - 1);
   }
 
   // ROP delay queue

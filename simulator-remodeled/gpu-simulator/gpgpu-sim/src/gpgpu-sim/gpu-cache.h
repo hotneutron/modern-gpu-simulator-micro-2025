@@ -1488,6 +1488,11 @@ class baseline_cache : public cache_t {
   bool fill_port_free() const {
     return m_bandwidth_management.fill_port_free();
   }
+  // Opt8: extra data-port replenish for an N-wide L2 slice (see
+  // bandwidth_management::replenish_data_port_extra).
+  void replenish_data_port_extra(unsigned reps) {
+    m_bandwidth_management.replenish_data_port_extra(reps);
+  }
 
   // This is a gapping hole we are poking in the system to quickly handle
   // filling the cache on cudamemcopies. We don't care about anything other than
@@ -1588,6 +1593,16 @@ class baseline_cache : public cache_t {
 
     /// called every cache cycle to free up the ports
     void replenish_port_bandwidth();
+
+    /// Opt8: extra data-port replenish so an N-wide L2 slice (N admissions/tick)
+    /// does not saturate the 1/tick replenish. Called (N-1) extra times/tick by
+    /// l2_cache when -gpgpu_l2_admit_sectors_per_cycle>1, modeling an N*32B-wide
+    /// data port. Only touches the DATA port (fill port is unchanged).
+    void replenish_data_port_extra(unsigned reps) {
+      for (unsigned i = 0; i < reps; ++i) {
+        if (m_data_port_occupied_cycles > 0) m_data_port_occupied_cycles -= 1;
+      }
+    }
 
     /// query for data port availability
     bool data_port_free() const;

@@ -376,6 +376,15 @@ class memory_config {
   // so the faster icnt injection drain is actually absorbed by L2 instead of relocating
   // the stall to the icnt->L2 pop; each pop still respects sub_partition full().
   unsigned gpgpu_icnt_to_l2_pop_per_cycle;
+  // Opt8: max L2 admissions (cache_cycle probes that are pop()ed, i.e. not
+  // RESERVATION_FAIL) per sub-partition per L2 tick. Default 1 = current behavior
+  // (1 sector/32B per slice/cycle). N=2 matches the HW H100 L2 slice throughput of
+  // 64B/cycle (2x32B sectors). The whole N-probe batch is gated ONCE on
+  // data_port_free()+output_full at loop top (i.e. the data port is modeled 64B-wide
+  // for N=2), so it does NOT saturate the 1/tick port replenish. Each probe still
+  // goes through the real access()+MSHR+data_port, so L2 hit-rate / DRAM work is
+  // invariant (timing-only rate calibration). See L2_ADMISSION_WIDTH_H100.md.
+  unsigned gpgpu_l2_admit_sectors_per_cycle;
   unsigned gpgpu_frfcfs_dram_sched_queue_size;
   unsigned gpgpu_dram_return_queue_size;
   enum dram_ctrl_t scheduler_type;

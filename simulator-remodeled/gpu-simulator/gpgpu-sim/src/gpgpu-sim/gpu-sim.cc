@@ -919,6 +919,17 @@ void memory_config::reg_options(class OptionParser *opp) {
                          "icnt->L2 pop; each pop still respects sub_partition full().",
                          "1");
 
+  option_parser_register(opp, "-gpgpu_l2_admit_sectors_per_cycle", OPT_UINT32,
+                         &gpgpu_l2_admit_sectors_per_cycle,
+                         "Opt8: max L2 admissions per sub-partition per L2 tick "
+                         "(cache_cycle probes that are accepted, i.e. not "
+                         "RESERVATION_FAIL). 1 = current behavior (1 sector/32B per "
+                         "slice/cycle). 2 = HW H100 L2 slice throughput (64B/cycle = "
+                         "2x32B). Batch gated once on data_port_free/output_full at "
+                         "loop top (port modeled N*32B-wide), each probe still runs the "
+                         "real access()+MSHR so L2 hit-rate/DRAM work is invariant.",
+                         "1");
+
   option_parser_register(opp, "-l2_ideal", OPT_BOOL, &l2_ideal,
                          "Use a ideal L2 cache that always hit", "0");
   option_parser_register(opp, "-gpgpu_cache:dl2", OPT_CSTR,
@@ -2506,6 +2517,18 @@ gpgpu_sim::gpgpu_sim(const gpgpu_sim_config &config, gpgpu_context *ctx)
       logged_icnt_pop_knob = true;
     }
   }
+  // Opt8 early boot confirmation (once): confirm the L2 admission-width knob is live.
+  {
+    static bool logged_l2_admit_knob = false;
+    if (!logged_l2_admit_knob &&
+        m_memory_config->gpgpu_l2_admit_sectors_per_cycle > 1) {
+      std::cerr << "[L2-ADMIT] gpgpu_l2_admit_sectors_per_cycle = "
+                << m_memory_config->gpgpu_l2_admit_sectors_per_cycle
+                << " (>1: multi-sector L2 admission enabled; 2 = HW 64B/cycle slice)"
+                << std::endl;
+      logged_l2_admit_knob = true;
+    }
+  }
   partiton_reqs_in_parallel = 0;
   partiton_reqs_in_parallel_total = 0;
   partiton_reqs_in_parallel_util = 0;
@@ -3671,6 +3694,53 @@ void gpgpu_sim::gpu_print_stat() {
           printf("L2_TMA_res_fail_per_probe = %.4lf\n",
                  (double)tma_l2_res_fails_total / (double)tma_l2_probes);
         }
+      }
+      // Opt8: per-sub-partition L2-admission parallelism (timing-neutral). Reveals
+      // whether the ROP wall is a few HOT slices (spread problem) or a genuine
+      // per-slice throughput limit (the Opt8 1->2 admission lever). See
+      // L2_ADMISSION_WIDTH_H100.md section 8.
+      //   admit_per_active = admissions / active_cycles: the realized admission rate
+      //     on busy slices (pinned ~1.0 with knob=1; rises toward N with knob=N if
+      //     the slice was actually backlogged -> proves the widened budget was used).
+      //   util p50/p95/max across slices = active-cycle fraction (hot-slice tail).
+      //   multi_admit_cycles = ticks a slice admitted >1 (0 when knob=1).
+      {
+        unsigned nsp = m_memory_config->m_n_mem_sub_partition;
+        std::vector<double> util(nsp, 0.0);
+        std::vector<unsigned long long> adm(nsp, 0);
+        unsigned long long adm_total = 0, active_total = 0, multi_total = 0;
+        for (unsigned i = 0; i < nsp; i++) {
+          unsigned long long a = m_memory_sub_partition[i]->get_l2_admissions();
+          unsigned long long ac = m_memory_sub_partition[i]->get_l2_active_cycles();
+          unsigned long long mc =
+              m_memory_sub_partition[i]->get_l2_multi_admit_cycles();
+          adm[i] = a;
+          adm_total += a;
+          active_total += ac;
+          multi_total += mc;
+          util[i] = (gpu_sim_cycle > 0) ? (double)ac / (double)gpu_sim_cycle : 0.0;
+        }
+        std::sort(util.begin(), util.end());
+        std::sort(adm.begin(), adm.end());
+        auto pct = [nsp](std::vector<double> &v, double p) {
+          if (nsp == 0) return 0.0;
+          unsigned idx = (unsigned)(p * (nsp - 1));
+          return v[idx];
+        };
+        printf("L2_admit_total = %llu\n", adm_total);
+        printf("L2_admit_active_cycles_total = %llu\n", active_total);
+        printf("L2_admit_multi_cycles_total = %llu\n", multi_total);
+        if (active_total > 0)
+          printf("L2_admit_per_active_cycle = %.4lf\n",
+                 (double)adm_total / (double)active_total);
+        printf("L2_slice_util_p50 = %.4lf\n", pct(util, 0.50));
+        printf("L2_slice_util_p95 = %.4lf\n", pct(util, 0.95));
+        printf("L2_slice_util_max = %.4lf\n", nsp ? util[nsp - 1] : 0.0);
+        printf("L2_slice_admissions_p50 = %llu\n",
+               nsp ? adm[(nsp - 1) / 2] : 0);
+        printf("L2_slice_admissions_p95 = %llu\n",
+               nsp ? adm[(unsigned)(0.95 * (nsp - 1))] : 0);
+        printf("L2_slice_admissions_max = %llu\n", nsp ? adm[nsp - 1] : 0);
       }
       double l2_elapsed_seconds =
           (double)(gpu_tot_sim_cycle + gpu_sim_cycle) * m_config.l2_period;

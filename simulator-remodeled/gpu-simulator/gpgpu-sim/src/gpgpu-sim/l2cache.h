@@ -299,6 +299,26 @@ class memory_sub_partition {
   unsigned long long m_tma_l2_res_fails = 0;
   unsigned long long m_tma_l2_output_full_cycles = 0;
   unsigned long long m_tma_l2_port_busy_cycles = 0;
+  // Opt8 admission-parallelism instrumentation (timing-neutral). Per-sub-partition
+  // so gpu_print_stat can build the across-slice histogram that reveals whether the
+  // ROP wall is a few hot slices (spread problem) or a genuine per-slice throughput
+  // limit (the Opt8 lever). See L2_ADMISSION_WIDTH_H100.md section 8.
+  //  - m_l2_admissions      : total accepted probes (== this slice's L2 accesses)
+  //  - m_l2_active_cycles   : L2 ticks where this slice accepted >=1 probe
+  //  - m_l2_multi_admit_cycles: L2 ticks where this slice accepted >1 (proves the
+  //                            widened budget was actually used; 0 when knob==1)
+  unsigned long long m_l2_admissions = 0;
+  unsigned long long m_l2_active_cycles = 0;
+  unsigned long long m_l2_multi_admit_cycles = 0;
+
+ public:
+  unsigned long long get_l2_admissions() const { return m_l2_admissions; }
+  unsigned long long get_l2_active_cycles() const { return m_l2_active_cycles; }
+  unsigned long long get_l2_multi_admit_cycles() const {
+    return m_l2_multi_admit_cycles;
+  }
+
+ private:
 };
 
 class L2interface : public mem_fetch_interface {
