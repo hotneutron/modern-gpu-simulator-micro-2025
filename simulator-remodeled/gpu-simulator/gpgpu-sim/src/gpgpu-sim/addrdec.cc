@@ -45,6 +45,7 @@ static void addrdec_getmasklimit(new_addr_type mask, unsigned char *high,
 linear_to_raw_address_translation::linear_to_raw_address_translation() {
   addrdec_option = NULL;
   ADDR_CHIP_S = 10;
+  l2_slice_balanced_hash = 0;  // Opt8/Opt9 default off (set by config option)
   memset(addrdec_mklow, 0, N_ADDRDEC);
   memset(addrdec_mkhigh, 64, N_ADDRDEC);
   addrdec_mask[0] = 0x0000000000001C00;
@@ -72,6 +73,12 @@ void linear_to_raw_address_translation::addrdec_setoption(option_parser_t opp) {
       opp, "-gpgpu_memory_partition_indexing", OPT_UINT32,
       &memory_partition_indexing,
       "0 = no indexing, 1 = bitwise xoring, 2 = IPoly, 3 = custom indexing",
+      "0");
+  option_parser_register(
+      opp, "-gpgpu_l2_slice_balanced_hash", OPT_UINT32, &l2_slice_balanced_hash,
+      "Opt8/Opt9: 1 = use a balanced avalanche hash for the L2 sub-partition "
+      "index on the non-power-of-two (gap) IPoly path, removing the `% n_slices` "
+      "pigeonhole 2:1 bias (e.g. 40ch x2 = 80 slices). 0 = original ipoly%N.",
       "0");
 }
 
@@ -146,13 +153,24 @@ void linear_to_raw_address_translation::addrdec_tlx(new_addr_type addr,
       unsigned sub_partition_addr_mask = m_n_sub_partition_in_channel - 1;
       unsigned sub_partition = tlx->chip * m_n_sub_partition_in_channel +
                                (tlx->bk & sub_partition_addr_mask);
-      sub_partition = ipoly_hash_function(
-          rest_of_addr_high_bits, sub_partition,
-          nextPowerOf2_m_n_channel * m_n_sub_partition_in_channel);
+      unsigned n_slices_total = m_n_channel * m_n_sub_partition_in_channel;
+      if (gap && l2_slice_balanced_hash) {
+        // Opt8/Opt9: non-power-of-two slice count -> the default
+        // `ipoly(...,nextPow2*sub) % n_slices` double-counts the low slices
+        // (128->80 pigeonhole => 2:1 bias). Use the balanced avalanche hash so
+        // all n_slices are equally likely for every power-of-two stride. Feed it
+        // the IPoly index too, so IPoly's stride structure is folded in. Result
+        // is in [0, n_slices) directly, so no biased modulo fold is needed.
+        sub_partition = balanced_subpartition_hash(rest_of_addr_high_bits,
+                                                   sub_partition, n_slices_total);
+      } else {
+        sub_partition = ipoly_hash_function(
+            rest_of_addr_high_bits, sub_partition,
+            nextPowerOf2_m_n_channel * m_n_sub_partition_in_channel);
 
-      if (gap)  // if it is not 2^n partitions, then take modular
-        sub_partition =
-            sub_partition % (m_n_channel * m_n_sub_partition_in_channel);
+        if (gap)  // if it is not 2^n partitions, then take modular
+          sub_partition = sub_partition % n_slices_total;
+      }
 
       tlx->chip = sub_partition / m_n_sub_partition_in_channel;
       tlx->sub_partition = sub_partition;
@@ -458,6 +476,22 @@ void linear_to_raw_address_translation::init(
     }
   }
   printf("sub_partition_id_mask = %016llx\n", sub_partition_id_mask);
+
+  // Opt8/Opt9 boot confirmation (once): show whether the balanced sub-partition
+  // hash is active and whether this config even hits the biased `gap` fold path.
+  if (l2_slice_balanced_hash && gap && memory_partition_indexing == IPOLY) {
+    fprintf(stderr,
+            "[L2-SLICE-HASH] balanced sub-partition hash ENABLED "
+            "(n_channel=%u non-2^n, n_slices=%u; replaces the biased ipoly%%%u "
+            "fold)\n",
+            m_n_channel, m_n_channel * m_n_sub_partition_in_channel,
+            m_n_channel * m_n_sub_partition_in_channel);
+  } else if (l2_slice_balanced_hash) {
+    fprintf(stderr,
+            "[L2-SLICE-HASH] balanced hash requested but NOT applied "
+            "(gap=%d, indexing=%d) -> no bias to fix on this config\n",
+            gap ? 1 : 0, (int)memory_partition_indexing);
+  }
 
   if (run_test) {
     sweep_test();

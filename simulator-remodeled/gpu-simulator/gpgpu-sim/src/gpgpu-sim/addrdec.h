@@ -76,6 +76,11 @@ class linear_to_raw_address_translation {
   const char *addrdec_option;
   int gpgpu_mem_address_mask;
   partition_index_function memory_partition_indexing;
+  // Opt8/Opt9: when >0, replace the biased `ipoly(...) % n_slices` fold (used on
+  // the non-power-of-two `gap` path, e.g. 40 channels x2 = 80 slices) with the
+  // balanced avalanche hash so all L2 slices are equally likely. Default 0 = the
+  // original IPoly%N behavior (bit-identical). See L2_SLICE_PARALLELISM_H100.md 8.4.
+  unsigned l2_slice_balanced_hash;
   bool run_test;
 
   int ADDR_CHIP_S;

@@ -383,7 +383,7 @@ class memory_config {
   // data_port_free()+output_full at loop top (i.e. the data port is modeled 64B-wide
   // for N=2), so it does NOT saturate the 1/tick port replenish. Each probe still
   // goes through the real access()+MSHR+data_port, so L2 hit-rate / DRAM work is
-  // invariant (timing-only rate calibration). See L2_ADMISSION_WIDTH_H100.md.
+  // invariant (timing-only rate calibration). See L2_SLICE_PARALLELISM_H100.md.
   unsigned gpgpu_l2_admit_sectors_per_cycle;
   unsigned gpgpu_frfcfs_dram_sched_queue_size;
   unsigned gpgpu_dram_return_queue_size;

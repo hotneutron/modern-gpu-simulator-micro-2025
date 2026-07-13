@@ -302,7 +302,7 @@ class memory_sub_partition {
   // Opt8 admission-parallelism instrumentation (timing-neutral). Per-sub-partition
   // so gpu_print_stat can build the across-slice histogram that reveals whether the
   // ROP wall is a few hot slices (spread problem) or a genuine per-slice throughput
-  // limit (the Opt8 lever). See L2_ADMISSION_WIDTH_H100.md section 8.
+  // limit (the Opt8 lever). See L2_SLICE_PARALLELISM_H100.md section 8.
   //  - m_l2_admissions      : total accepted probes (== this slice's L2 accesses)
   //  - m_l2_active_cycles   : L2 ticks where this slice accepted >=1 probe
   //  - m_l2_multi_admit_cycles: L2 ticks where this slice accepted >1 (proves the

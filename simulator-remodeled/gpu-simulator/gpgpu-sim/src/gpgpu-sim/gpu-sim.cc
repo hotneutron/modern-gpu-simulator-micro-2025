@@ -3698,7 +3698,7 @@ void gpgpu_sim::gpu_print_stat() {
       // Opt8: per-sub-partition L2-admission parallelism (timing-neutral). Reveals
       // whether the ROP wall is a few HOT slices (spread problem) or a genuine
       // per-slice throughput limit (the Opt8 1->2 admission lever). See
-      // L2_ADMISSION_WIDTH_H100.md section 8.
+      // L2_SLICE_PARALLELISM_H100.md section 8.
       //   admit_per_active = admissions / active_cycles: the realized admission rate
       //     on busy slices (pinned ~1.0 with knob=1; rises toward N with knob=N if
       //     the slice was actually backlogged -> proves the widened budget was used).

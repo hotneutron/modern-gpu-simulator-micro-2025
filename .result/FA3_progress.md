@@ -115,7 +115,7 @@ item lands a verified improvement.
 
 #### Ongoing item 1 — Opt 8: L2 admission-rate under-modeling (the primary remaining cycle lever)
 
-> Dedicated plan: [L2_ADMISSION_WIDTH_H100.md](file:///home/jihyun/modern-gpu-simulator-micro-2025/.plan/L2_ADMISSION_WIDTH_H100.md) (HW anchor, 2-probe/cycle safety trace, impl + verification). Upstream diagnosis: [TMA_LATENCY_INJECTION_H100.md](file:///home/jihyun/modern-gpu-simulator-micro-2025/.plan/TMA_LATENCY_INJECTION_H100.md) §4.11.7.
+> Dedicated plan: [L2_SLICE_PARALLELISM_H100.md](file:///home/jihyun/modern-gpu-simulator-micro-2025/.plan/L2_SLICE_PARALLELISM_H100.md) (HW anchor, 2-probe/cycle safety trace, impl + verification). Upstream diagnosis: [TMA_LATENCY_INJECTION_H100.md](file:///home/jihyun/modern-gpu-simulator-micro-2025/.plan/TMA_LATENCY_INJECTION_H100.md) §4.11.7.
 
 - **Evidence (bwd `.o18`).** After Opt 7, **90.0% of a TMA request's round-trip is `IN_PARTITION_ROP_DELAY`** (avg **1,483** cyc), while inject is 7.1%, reply flight 1.5%, and the DRAM device itself is idle (`bw_util ≈ 0.033`, `avg_mrq_latency = 10`, `IN_PARTITION_DRAM = 0.57`). The configured ROP fixed part is only `-gpgpu_l2_rop_latency 100`, so ~1,383 cyc (93% of ROP) is **queue-wait to leave ROP**, not modeled latency.
 - **Root cause.** One 24KB TMA transfer = 768×32B sectors, tiled onto a few sub-partitions, each draining at the L2-admission cap of **1 sector (32B)/cycle** (`gpu_stall_dramfull=137,131` = L2-input queue full). HW pipelines it as a bulk line stream.
@@ -553,7 +553,7 @@ knobs.
   CTA's shared memory** to avoid the 32-bank SMEM conflict on the GMEM→SMEM write and the LDSM/LDS
   reads — it does not change which L2 slice a line lands on. The two are orthogonal (different memory
   layers). Whether TMA bursts actually exploit the L2 slice spread is a separate, measurable question —
-  see [L2_ADMISSION_WIDTH_H100.md](file:///home/jihyun/modern-gpu-simulator-micro-2025/.plan/L2_ADMISSION_WIDTH_H100.md) §8 (per-slice admission histogram) / §9.
+  see [L2_SLICE_PARALLELISM_H100.md](file:///home/jihyun/modern-gpu-simulator-micro-2025/.plan/L2_SLICE_PARALLELISM_H100.md) §8 (per-slice admission histogram) / §9.
 
 > Note: the former **TODO-2 (real TMA base address)** has been implemented — real per-site GMEM
 > base + CTA-indexed tile spread (M2/M2.5). It is no longer a TODO; see the Ongoing section above

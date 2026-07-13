@@ -1,16 +1,27 @@
-# Opt 8 — L2 admission-rate under-modeling (1 sector/cycle vs HW 64B/cycle slice)
+# Opt 8 — L2 slice parallelism: admission-rate (throughput) + balanced sub-partition hashing (placement)
 
+> **Scope.** This plan is a single optimization (**Opt 8**) with TWO orthogonal parts on the L2
+> sub-partition (=slice), both born from the post-Opt-7 diagnosis that the residual wall is
+> `ROP_DELAY` (90% of a TMA request's round-trip):
+> - **Part 1 — admission-rate (throughput / "how fast each slice drains"):** the sim admits only
+>   **1 sector (32B) per slice per L2-tick** while a real H100 L2 slice returns **64B/cycle (2×32B)**.
+>   §3–§9.
+> - **Part 2 — balanced sub-partition hashing (placement / "which slice a sector goes to"):** the
+>   40-channel (non-2^n) config makes IPoly hash into 128 then fold with `% 80`, double-counting slices
+>   0..47 ⇒ up to **2:1 spatial load imbalance** across slices. §10–§11.
+>
+> The two parts are **complementary, not alternatives**: Part 1 makes each slice faster; Part 2 makes
+> the load even across slices. Both are **timing-only** and must keep the §4.12 work axis invariant
+> (`L2_TMA_true_hit_rate`, L2 accesses/bytes, DRAM bytes). Both are default-off (bit-identical); the
+> H100 config enables both, and they are validated in the same 12h run.
+>
 > **Origin.** Split out from [TMA_LATENCY_INJECTION_H100.md](file:///home/jihyun/modern-gpu-simulator-micro-2025/.plan/TMA_LATENCY_INJECTION_H100.md).
 > Opt 7 (that doc) drained every TMA REQ/reply queue and interconnect stage to the noise floor. The
 > post-Opt-7 diagnosis (§4.11.7 there) found the residual wall is **`ROP_DELAY` = 90% of a TMA
-> request's round-trip (avg 1,483 cyc)**, and traced it to the L2 **admission** stage, which admits
-> only **1 sector (32B) per sub-partition per L2-tick** while real H100 L2 slices return **64B/cycle
-> (2×32B sectors)**. This doc is the dedicated plan for that fix (the "Ongoing item 1 / candidate:
-> widen L2 admission" from FA3_progress.md).
->
-> This is a **timing-only rate calibration**, the L2-service analogue of Opt 7's HW-calibrated
-> inject/reply drains. It must keep the §4.12 work axis invariant (`L2_TMA_true_hit_rate`, L2
-> accesses/bytes, DRAM bytes).
+> request's round-trip (avg 1,483 cyc)**, and traced it to the L2 **admission** stage (Part 1). The
+> placement-imbalance root (Part 2) was found later while auditing why sim L2 slices are under-utilized
+> vs HW (§7.2, §9). (Formerly named `L2_ADMISSION_WIDTH_H100.md`, renamed once the placement part was
+> folded in.)
 
 ## 1. Symptom (measured, post-Opt-7)
 
@@ -52,7 +63,7 @@ current 1-sector (32B)/cycle admission and a full 128B line/cycle.
 (124 B/clk, Opt 7 §4.11.4) because it aggregates a whole SM's LSU+TMA. The L2 *slice* is 2 sector/clk
 (64 B/clk) because it is one slice. **This Opt's target is 2, not 4.**
 
-## 2.5 Background — HW memory hierarchy (partition / slice / bank / port)
+## 3. Background — HW memory hierarchy (partition / slice / bank / port)
 
 To see why this Opt fixes the **per-slice throughput** rather than the **number of slices**, you need
 the real HW hierarchy. This describes **how the HW actually behaves**, not the sim code.
@@ -118,12 +129,12 @@ slice only (banks/ports are abstracted). So the HW fact "64 B/cycle per slice" i
 as the **per-slice admission count (1→2)** — this Opt. The problem is not too few banks; it is that the
 per-slice rate is modeled at half.
 
-## 3. Current code — where the 1-sector/cycle cap lives
+## 4. Current code — where the 1-sector/cycle cap lives
 
 The cap is NOT `m_data_port_width` (already proven null in Opt 7 §4.11 Step B/C). It is the
 single-`top()`-per-tick admission loop.
 
-### 3.1 The admission loop ([l2cache.cc:532-636](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/l2cache.cc#L532-L636), inside `memory_sub_partition::cache_cycle`)
+### 4.1 The admission loop ([l2cache.cc:532-636](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/l2cache.cc#L532-L636), inside `memory_sub_partition::cache_cycle`)
 Called **once per sub-partition per L2-tick** ([gpu-sim.cc:4334](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/gpu-sim.cc#L4334)). Per call it does exactly ONE admission:
 
 ```
@@ -140,16 +151,16 @@ if (!m_L2_dram_queue->full() && !m_icnt_L2_queue->empty()) {
 }
 ```
 
-### 3.2 Why `m_data_port_width` does NOT fix it
+### 4.2 Why `m_data_port_width` does NOT fix it
 `use_data_port` charges `ceil(data_size / port_width)` occupancy cycles ([gpu-cache.cc:1144-1176](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/gpu-cache.cc#L1144-L1176)); with `data_size=32, width=32` (and even width=64) that is `ceil(32/32)=ceil(32/64)=1`. It only meters the *occupancy of an already-admitted sector*; it does **not** increase the *number of admissions per cycle*. That number is fixed at 1 by the single `top()`/`pop()` above.
 
-## 4. Trace — is admitting 2 probes/cycle SAFE? (done, before implementing)
+## 5. Trace — is admitting 2 probes/cycle SAFE? (done, before implementing)
 
 Traced every piece of state a second `access()` in the same `cache_cycle` would touch. **Conclusion:
 safe, provided each of the 2 probes independently re-checks the same gates the single probe checks
 today, and the once-per-tick port-replenish is respected.** Details:
 
-### 4.1 `data_cache::access()` is re-entrant within a cycle — with ONE gate to respect
+### 5.1 `data_cache::access()` is re-entrant within a cycle — with ONE gate to respect
 [gpu-cache.cc:2003-2024](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/gpu-cache.cc#L2003-L2024) → `process_tag_probe` → `m_rd_hit`/`m_rd_miss`/`m_wr_*`. It carries no
 "already-ran-this-cycle" flag. The only intra-cycle side effect that couples two calls is the **data
 port**:
@@ -157,12 +168,12 @@ port**:
 - `data_port_free()` is `true` iff `m_data_port_occupied_cycles == 0` ([gpu-cache.cc:1202-1204](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/gpu-cache.cc#L1202-L1204)).
 - **Implication:** after the FIRST HIT admission this cycle, `data_port_occupied_cycles` becomes 1, so
   `data_port_free()` would return **false** for the second probe → the naive 2-probe loop that
-  re-checks `port_free` would admit only 1. **This is the design decision (see §5):** to model a 64B
+  re-checks `port_free` would admit only 1. **This is the design decision (see §6):** to model a 64B
   slice we must let the port carry **2 sectors' worth of occupancy per cycle** (i.e. treat the port as
-  64B-wide), not gate the 2nd probe on the 1st probe's 32B occupancy. Options in §5.
+  64B-wide), not gate the 2nd probe on the 1st probe's 32B occupancy. Options in §6.
 - `assert(mf->get_data_size() <= m_config.get_atom_sz())` ([gpu-cache.cc:2006](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/gpu-cache.cc#L2006)) — atom_sz=32, and TMA children are 32B, so each probe satisfies it. **No new assert risk** as long as we still admit one 32B sector *per probe* (we do — 2 probes × 32B, not 1 probe × 64B).
 
-### 4.2 MSHR accepts 2 adds/cycle — it is capacity-bounded, not rate-bounded
+### 5.2 MSHR accepts 2 adds/cycle — it is capacity-bounded, not rate-bounded
 `send_read_request` ([gpu-cache.cc:1333-1392](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/gpu-cache.cc#L1333-L1392)):
 - `mshr_hit = m_mshrs.probe(addr)`, `mshr_avail = !m_mshrs.full(addr)`, then `m_mshrs.add(...)`. These
   are **capacity** checks (per-entry merge count + total entries), **not** a per-cycle "1 add" limit.
@@ -173,22 +184,22 @@ port**:
   `MSHR_ENTRY_FAIL`/`RESERVATION_FAIL` (the 2nd probe just fails gracefully and stays at head next
   cycle) — no assert.
 
-### 4.3 miss_queue accepts 2 pushes/cycle — but drains at 1/tick (the real relocation risk)
+### 5.3 miss_queue accepts 2 pushes/cycle — but drains at 1/tick (the real relocation risk)
 - The miss path pushes to `m_miss_queue` gated by `m_miss_queue.size() < m_config.m_miss_queue_size`
   ([gpu-cache.cc:1362-1363](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/gpu-cache.cc#L1362-L1363)). `m_miss_queue_size = 32` (dl2 field 4 of `...,32:0,32`). Two pushes in one cycle is fine (capacity check re-evaluated each push).
 - **BUT `baseline_cache::cycle()` drains only ONE mf from `m_miss_queue` to the DRAM port per tick**
   ([gpu-cache.cc:1213-1219](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/gpu-cache.cc#L1213-L1219)). So if both probes MISS, we admit 2 misses/cycle but only send 1 to DRAM/cycle → `m_miss_queue` fills, `access()` starts returning `RESERVATION_FAIL` (or the miss-queue-full guard blocks), and the stall relocates to the miss-queue.
-- **Mitigation:** this is the exact §4.9-style paired-lever situation. However, note bwd `.o18` has
+- **Mitigation:** this is the exact Opt-7 §4.9-style paired-lever situation. However, note bwd `.o18` has
   ~87% L2 HIT rate (`L2_TMA_true_hit_rate=0.8688`) — **most admissions are HITs, which do NOT touch
   `m_miss_queue`** (a HIT pushes straight to the reply queue). So the 1/tick miss-queue drain is only a
   concern for the ~13% miss fraction, and DRAM is 97% idle anyway. Expect the relocation to be small,
-  but **the miss-queue drain rate is the first thing to watch** in the run (see §6 gate). If it
+  but **the miss-queue drain rate is the first thing to watch** in the run (see §7 gate). If it
   relocates, pair with a 2/tick `baseline_cache::cycle()` miss drain.
 
-### 4.4 Port replenish stays once per tick (must NOT be doubled)
-`baseline_cache::cycle()` calls `replenish_port_bandwidth()` once ([gpu-cache.cc:1223](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/gpu-cache.cc#L1223)), decrementing `m_data_port_occupied_cycles` by 1/tick. If we widen the port to 64B (§5 option A) so 2 sectors = 1 occupancy-unit, the replenish stays correct. If instead we let 2 separate 32B probes each add 1 occupancy (total 2/tick) but only replenish 1/tick, the port would monotonically saturate — a bug. **So §5 option A (treat the L2 data port as 64B-wide) is the clean design; a naive "loop twice + keep 32B occupancy" is not.**
+### 5.4 Port replenish stays once per tick (must NOT be doubled)
+`baseline_cache::cycle()` calls `replenish_port_bandwidth()` once ([gpu-cache.cc:1223](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/gpu-cache.cc#L1223)), decrementing `m_data_port_occupied_cycles` by 1/tick. If we widen the port to 64B (§6 option A) so 2 sectors = 1 occupancy-unit, the replenish stays correct. If instead we let 2 separate 32B probes each add 1 occupancy (total 2/tick) but only replenish 1/tick, the port would monotonically saturate — a bug. **So §6 option A (treat the L2 data port as 64B-wide) is the clean design; a naive "loop twice + keep 32B occupancy" is not.**
 
-### 4.5 Reply/output side already widened by Opt 7
+### 5.5 Reply/output side already widened by Opt 7
 Each HIT admission pushes to `m_L2_icnt_queue` (reply FIFO). Opt 7 already set `reply_drain=4` +
 `cluster_reply_eject=4`, so the reply side can absorb 2 HIT replies/cycle from this partition. The gate
 `output_full = m_L2_icnt_queue->full()` is re-checked per probe (both probes must check it). No new risk.
@@ -198,14 +209,14 @@ Each HIT admission pushes to `m_L2_icnt_queue` (reply FIFO). Opt 7 already set `
 1. Loop the admission up to N=2 times, **re-checking `output_full` per probe** and stopping when the
    L2-input queue is empty or a probe RESERVATION_FAILs.
 2. Model the L2 data port as **64B-wide** (occupancy semantics), NOT as two independent 32B charges
-   against a 32B port — otherwise §4.4 saturation bug.
+   against a 32B port — otherwise §5.4 saturation bug.
 3. Keep `baseline_cache::cycle()` (miss-queue drain + port replenish) **once per tick**; only the
    admission loop repeats.
-4. Watch the miss-queue relocation (§4.3); pair a 2/tick miss drain only if the run shows it.
+4. Watch the miss-queue relocation (§5.3); pair a 2/tick miss drain only if the run shows it.
 
 No `assert` in `access()`/MSHR/tag-array is violated by a 2nd 32B probe in the same cycle.
 
-## 5. Implementation options
+## 6. Implementation options (Part 1 — admission rate)
 
 ### Option A (recommended) — config knob `-gpgpu_l2_admit_sectors_per_cycle N`, port modeled 64B-wide
 - New `memory_config` member, default **1** (bit-identical). H100 config sets **2** (= 64B/cycle slice).
@@ -215,9 +226,9 @@ No `assert` in `access()`/MSHR/tag-array is violated by a 2nd 32B probe in the s
 - Port width: either bump the effective data-port occupancy accounting so N sectors = 1 occupancy unit
   (cleanest: gate the whole loop on a single `data_port_free()` at the top, and charge the port once for
   the batch), OR keep per-probe `use_data_port` but widen `m_data_port_width` to `N*32` **and** confirm
-  `replenish` still matches. Option A's single-gate-at-top form avoids the §4.4 pitfall entirely.
+  `replenish` still matches. Option A's single-gate-at-top form avoids the §5.4 pitfall entirely.
 - Everything else (`access()`, MSHR, tag array, reply push, miss push) is unchanged per-probe, so
-  hit-rate/DRAM work is invariant by construction (§6 work axis).
+  hit-rate/DRAM work is invariant by construction (§7 work axis).
 
 ### Option B (rejected for now) — full 128B line admission
 Admitting a whole 128B line (4 sectors) per cycle overshoots HW (64B/cycle) by 2x and would be a
@@ -231,7 +242,7 @@ captures the throughput at the HW quantum, so C is deferred unless A relocates u
 (`cache_cycle` admission loop), `gpu-cache.{cc,h}` (port-width/occupancy alignment if needed),
 `gpgpusim.config` (knob=2). No tracer/trace change; rebuild required.
 
-## 6. Verification plan
+## 7. Verification plan
 
 Run bwd K10 first (worst ROP_DELAY), fwd K5 for the milder case.
 
@@ -243,7 +254,7 @@ Run bwd K10 first (worst ROP_DELAY), fwd K5 for the milder case.
   `L2_total_cache_accesses`, L2 read/write bytes, DRAM bytes all unchanged. A rate knob cannot change
   work.
 - **Relocation detectors:** `gpu_stall_dramfull` (L2-input queue) should ↓; watch the **miss-queue**
-  (§4.3) — if cycles stay flat and misses pile up, pair a 2/tick `baseline_cache::cycle()` miss drain.
+  (§5.3) — if cycles stay flat and misses pile up, pair a 2/tick `baseline_cache::cycle()` miss drain.
   Check `bw_util` moves toward HW (bwd HW DRAM 14.85%) but does not exceed it.
 - **Boot log:** `[L2-ADMIT] gpgpu_l2_admit_sectors_per_cycle = 2 ...` to confirm the knob is live in the
   first seconds.
@@ -252,7 +263,7 @@ Run bwd K10 first (worst ROP_DELAY), fwd K5 for the milder case.
   re-bunches at the next stage, cycles may move less than the ROP% suggests — the per-stage residency
   table localizes where it went.
 
-### 6.1 HW (NCU) metrics to compare — which ones this Opt should move, and how (verified 2026-07-13)
+### 7.1 HW (NCU) metrics to compare — which ones this Opt should move, and how (verified 2026-07-13)
 
 Pulled from `nv_reports/h100/flashattn-fa3-bf16-bwd-causal-b1-s2048-hd64-nh24_full_rpt.ncu-rep` (bwd
 main kernel = FlashAttnBwdSm90, the ID-9 instance). NCU commands run inside `docker exec gpu-sim bash`,
@@ -278,7 +289,7 @@ right BEFORE this Opt. NCU values are the main-kernel GPU-Speed-Of-Light + Memor
 | axis | HW (NCU) | sim now (`.o35`, Opt7) | sim/HW | Opt 8 expectation |
 |---|---|---|---|---|
 | **timing** — Elapsed Cycles | **67,696** | 138,021 | 2.04x | ↓ toward HW |
-| **L2 busy %** (direct target) | **L2 Cache Throughput 22.68%** | `Throughput_L2_pct` 31.31 (cycle-contaminated) | n/a | slice util ↑; use §8 proxy |
+| **L2 busy %** (direct target) | **L2 Cache Throughput 22.68%** | `Throughput_L2_pct` 31.31 (cycle-contaminated) | n/a | slice util ↑; use §9 proxy |
 | Memory Throughput % | 28.84% | — | — | ↑ |
 | DRAM Throughput % | 12.09% | `Throughput_DRAM_pct` 0.65 / `bw_util` 0.017 | ~0.05x | ↑ toward HW, must NOT exceed |
 | L1/TEX Cache Throughput % | 31.99% | `Throughput_L1TEX_pct` 1.83 | — | not this Opt's lever |
@@ -290,7 +301,7 @@ right BEFORE this Opt. NCU values are the main-kernel GPU-Speed-Of-Light + Memor
 | axis | HW (NCU) | sim now (`.o18`, Opt7) | sim/HW | Opt 8 expectation |
 |---|---|---|---|---|
 | **timing** — Elapsed Cycles | **132,901** | 250,026 | 1.88x | ↓ toward HW |
-| **L2 busy %** (direct target) | **L2 Cache Throughput 48.52%** | `Throughput_L2_pct` 56.34 (cycle-contaminated) | n/a | slice util ↑; use §8 proxy |
+| **L2 busy %** (direct target) | **L2 Cache Throughput 48.52%** | `Throughput_L2_pct` 56.34 (cycle-contaminated) | n/a | slice util ↑; use §9 proxy |
 | Memory Throughput % | 56.58% | — | — | ↑ |
 | DRAM Throughput % | 14.85% | `Throughput_DRAM_pct` 1.82 / `bw_util` 0.045 | ~0.12x | ↑ toward HW, must NOT exceed |
 | L1/TEX Cache Throughput % | 62.59% (HW's hottest pipe) | `Throughput_L1TEX_pct` 6.74 | — | not this Opt's lever |
@@ -302,7 +313,43 @@ right BEFORE this Opt. NCU values are the main-kernel GPU-Speed-Of-Light + Memor
 and HW L2 is already quite busy (48.5%), so widening admission should move sim L2 utilization toward HW
 with less confound. fwd's L2 hit rate is still over-modeled (0.95 vs 0.70, the CTA-count cap = Ongoing
 item 2), so its DRAM-work gap (0.05x) is a hit-rate story, not an admission story; expect a smaller,
-noisier Opt-8 effect on fwd.
+noisier Part-1 effect on fwd.
+
+### 7.2 Per-slice (sub-partition) utilization + bank-conflict: what HW exposes (verified 2026-07-13)
+
+Checked whether NCU has a per-L2-slice utilization metric and an L2 bank-conflict metric — because
+those are the direct HW counterparts of §9's per-slice admission histogram and of the "bank" abstraction.
+
+**(a) L2 bank conflict — NCU has NONE for L2.** The only bank-conflict metrics are
+`l1tex__data_bank_conflicts_pipe_lsu_mem_shared*` — all **shared-memory** only (bwd: total 45,471 =
+ld 24 + st 35,493). There is **no `lts__*bank_conflict` metric**: L2-slice-internal banks are HW-hashed
+and not user-controllable, so NVIDIA does not expose L2 bank conflicts (consistent with §3: the sim
+also does not model L2 banks). The shared-mem bank conflict is a TODO-1 (SMEM swizzle) axis, orthogonal
+to this Opt.
+
+**(b) Per-slice L2 utilization — NCU HAS it: `lts__cycles_active.{avg,max,min}`** (`lts` = L2 slice), and
+this is the direct HW anchor for §9's `L2_slice_util_*`. Measured (bwd K10 main kernel):
+
+| NCU per-slice metric | avg | max | min | max/min spread |
+|---|---|---|---|---|
+| `lts__cycles_active` (slice busy cycles) | 143,159 | 145,071 | 141,035 | **2.9%** |
+| `lts__t_sectors` (sectors per slice) | 126,398 | 129,937 | 123,519 | **5.2%** |
+
+**Decisive reading — HW L2 slices are almost perfectly EVEN (≤5% spread across slices).** So on HW the
+L2 is NOT "a few hot slices + the rest idle"; the traffic is fully spread and every slice is ~equally,
+near-fully busy. Contrast with the sim baseline `partiton_level_parallism = 44 / 80` (~55% of slices
+active per cycle, §9.1) — the sim is LESS spread / lower per-slice occupancy than HW.
+
+**This is exactly the fork §9.3 was built to resolve, now with the HW answer in hand:**
+- If, after Part 1, sim `L2_slice_util_p50/p95/max` become **even and high like HW** (`lts__cycles_active`
+  avg≈max), the per-slice-throughput model was the gap → Part 1 is HW-faithful and the right lever.
+- If sim `L2_slice_util` stays **skewed (hot p95/max ≫ p50)** while HW is even, then part of the wall is
+  a **spread / address→slice mapping** problem — which Part 2 (§10/§11) fixes, NOT throughput — Part 1
+  alone won't fully close it. `lts__cycles_active.{avg,max,min}` is the HW yardstick for that judgment.
+
+**Add these to the NCU pull command** (`--page raw --metrics ...`):
+`lts__cycles_active.avg,lts__cycles_active.max,lts__cycles_active.min,lts__t_sectors.avg,lts__t_sectors.max,lts__t_sectors.min`
+(fwd K5 equivalents to be read the same way when judging fwd).
 
 **How to read it after the run (two independent axes, do not conflate — §4.12):**
 1. **Work axis first (cycle-independent):** confirm sim `L2_total_cache_accesses` and
@@ -316,7 +363,7 @@ noisier Opt-8 effect on fwd.
 
 **Caveat — no sim metric is byte-for-byte identical to NCU `L2 Cache Throughput %`.** NCU's is a
 pct-of-peak-sustained; the sim has no such counter. So the primary sim gate stays `gpu_sim_cycle` +
-`ROP_DELAY` + the §8 per-slice admission histogram; the NCU `L2 Cache Throughput` / `DRAM Throughput` /
+`ROP_DELAY` + the §9 per-slice admission histogram; the NCU `L2 Cache Throughput` / `DRAM Throughput` /
 `Memory Throughput` are directional HW anchors (sim should move toward them, and the fact that HW L2 is
 48.5%/22.7% busy while the model serializes admission is the independent evidence that widening it is
 HW-faithful).
@@ -333,7 +380,7 @@ dram__bytes.sum,sm__throughput.avg.pct_of_peak_sustained_elapsed
 #            Compute 48.45% / L2 Hit 82.26% / L2 sectors 10,111,818
 ```
 
-## 7. Relationship to the other remaining item
+## 8. Relationship to the other remaining item (fixed-overhead alternative)
 
 This Opt (L2 admission width) attacks the **throughput/serialization** half of ROP_DELAY. The other
 FA3_progress "Ongoing item 1" framing — modeling a per-transfer ~170-cyc TMA fixed overhead instead of
@@ -343,12 +390,12 @@ earns the realistic hit rate). **Do this Opt (Option A) first** — it is the di
 work-invariant rate calibration and is the clean continuation of Opt 7. Escalate to the fixed-overhead
 model only if admission-width relocates the stall without closing the cycle gap.
 
-## 8. Instrumentation — measure per-sub-partition admission parallelism BEFORE/AFTER (add to next run)
+## 9. Instrumentation — measure per-sub-partition admission parallelism BEFORE/AFTER (add to next run)
 
 The core hypothesis (§1) is that the ROP wall is a **burst concentrated on a few sub-partitions**, not
 a chip-wide bandwidth limit. That must be *measured*, not assumed. Two levels of instrumentation:
 
-### 8.1 Already-present coarse counter (re-confirm; no build needed)
+### 9.1 Already-present coarse counter (re-confirm; no build needed)
 `partiton_level_parallism` is **already printed** ([gpu-sim.cc:3475-3492](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/gpu-sim.cc#L3475-L3492)) and shows the
 chip-wide average. Measured on the Opt-7 baseline (bwd K10 `.o18`):
 - `partiton_level_parallism = 44.04` — avg **~44 of 80** sub-partitions receive a request per cycle.
@@ -360,7 +407,7 @@ sub-partition ([gpu-sim.cc:4320](file:///home/jihyun/modern-gpu-simulator-micro-
 concentration (a hot sub-partition serializing its backlog while others idle). Useful as a sanity
 number, insufficient as the gate.
 
-### 8.2 New counter to ADD (build required) — true per-sub-partition admission distribution
+### 9.2 New counter to ADD (build required) — true per-sub-partition admission distribution
 Add a **per-sub-partition L2-admission histogram** so the next run directly shows the burst
 concentration and how much headroom the 1→2 widening actually uses.
 
@@ -370,7 +417,7 @@ concentration and how much headroom the 1→2 widening actually uses.
 - **Counters (per sub-partition `i`):**
   - `m_l2_admissions[i]` — total admissions (should equal that slice's share of `L2_total_cache_accesses`).
   - `m_l2_active_cycles[i]` — cycles this slice admitted ≥1 (for per-slice utilization).
-  - After Opt 8 lands: `m_l2_admit2_cycles[i]` — cycles this slice admitted **2** (proves the widened
+  - After Part 1 lands: `m_l2_admit2_cycles[i]` — cycles this slice admitted **2** (proves the widened
     budget was actually used, mirror of Opt 7's `*_multi_ticks`).
 - **Dump (in `gpu_print_stat`):**
   - `L2_admit_per_active_cycle` = Σ`m_l2_admissions` / Σ`m_l2_active_cycles` — the real admission rate
@@ -382,21 +429,140 @@ concentration and how much headroom the 1→2 widening actually uses.
 - **Timing-neutral:** observe-only counters, incremented on the existing admission path, no scheduling
   effect. Race-free (the sub-partition loop is serial).
 
-### 8.3 What the numbers decide
+### 9.3 What the numbers decide
 - **Baseline run (Opt 7 binary + these counters):** if the hot slices show `admit_per_active ≈ 1.0`
   pinned AND `admit_p95/max` ≫ median utilization, the burst-serialization hypothesis is confirmed and
-  Opt 8 (1→2) is the right lever.
-- **After Opt 8:** `m_l2_admit2_cycles` > 0 on the hot slices proves the widened budget was used;
+  Part 1 (1→2) is the right lever.
+- **After Part 1:** `m_l2_admit2_cycles` > 0 on the hot slices proves the widened budget was used;
   `admit_per_active` should rise toward ~2 on those slices, `gpu_stall_dramfull` and `ROP_DELAY` should
-  fall, with the §6 work axis unchanged.
+  fall, with the §7 work axis unchanged.
 - If the hot slices already sit at `admit_per_active ≈ 1.0` but the p95 across slices is *low* (traffic
-  actually spread), then Opt 8 helps little and the real issue is the **address→slice mapping** (see
-  §9) — i.e. the burst is not being spread across slices in the first place.
+  actually spread), then Part 1 helps little and the real issue is the **address→slice mapping** (see
+  §10/§11) — i.e. the burst is not being spread across slices in the first place.
 
 **Files:** `l2cache.{h,cc}` (per-sub-partition counters + accessors), `gpu-sim.cc` (aggregate + print).
 No tracer/trace change; rebuild required.
 
-## 9. Relationship to TMA swizzle (FA3_progress TODO-1) — related GOAL, different LAYER
+## 10. Part 2 — CONFIRMED spatial root cause: the `% 80` partition-index modulo bias (static, 2026-07-13)
+
+> **User's hunch (correct):** "changing the L2 slice return to 64B/cycle won't fix the sub-partition
+> imbalance — it only changes how much a slice returns, not WHERE the sectors go inside L2." Confirmed
+> by static analysis: Part 1 (throughput) and the imbalance (placement) are **orthogonal**, and there is
+> a **structural placement bias in the address→slice mapping** that Part 1 cannot touch. Part 2 fixes it.
+
+### The mechanism (code-proven, not a guess)
+The H100 config has `-gpgpu_n_mem 40` × `n_sub_partition_per_mchannel 2` = **80 sub-partitions**, but 40
+is **not** a power of two → `gap = true`. The IPoly path in
+[addrdec.cc:144-161](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/addrdec.cc#L144-L161) does:
+```
+sub_partition = ipoly_hash_function(high_bits, sub_partition, nextPow2(40)*2 = 128);  // 0..127
+if (gap) sub_partition = sub_partition % (40*2 = 80);                                  // 0..79
+```
+`ipoly_hash_function` only supports power-of-two `bank_set_num` (16/32/64/128/…), so it is called with
+**128** and then folded to 80 by `% 80`. Boot log confirms the live config: `IPoly`, `sub partition = 80`,
+`gap` path taken.
+
+### The bias, quantified (assuming the hash is perfectly uniform over 0..127)
+```
+128 hash values % 80:
+  sub-partitions  0..47  (48 slices) ← hit by TWO hash values (N and N+80) → ~2x traffic  (HOT)
+  sub-partitions 48..79  (32 slices) ← hit by ONE hash value               → ~1x traffic  (COLD)
+=> up to 2:1 spatial load imbalance from the modulo ALONE, independent of the address pattern.
+```
+This is a **pure simulator artifact of the 40-channel (non-2^n) config** — real H100 partition counts
+are chosen hash-friendly, which is exactly why NCU shows the HW L2 slices even to ≤5% (§7.2) while the
+sim baseline runs at `partiton_level_parallism = 44/80 (~55%)`: the ~32 cold slices are structurally
+under-fed.
+
+### Why Part 1 (admission rate) cannot fix this (the user's point, formalized)
+Part 1 raises each slice's **service rate** (1→2 sector/cycle). It does **not** change **which** slice a
+sector maps to. If slices 0..47 receive ~2x the sectors, making every slice 2x faster leaves the *ratio*
+unchanged — the hot half still finishes its double load in the same relative time as the cold half
+finishes its single load, so the per-slice utilization histogram stays skewed. Part 1 lowers the absolute
+ROP wait (fewer serialized cycles per slice) but does not flatten the slice distribution.
+
+### The TMA address does NOT rescue it either
+A TMA transfer's sectors are `global_base + tile_offset + agu_index*128 + sector*32`
+([tma_unit_sm.cc:815-860](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/tma_unit_sm.cc#L815-L860)) — a run of consecutive 128B lines. IPoly spreads consecutive
+lines across the 128-wide hash space well, but the **final `% 80` fold re-concentrates them 2:1 onto the
+low 48 slices** regardless of how good the hash is. So the placement bias is downstream of both the hash
+and the TMA address; neither the address model nor Part 1 removes it.
+
+### Fix direction (Part 2 — address→slice mapping)
+Remove the `% 80` fold-bias so all 80 slices are equally likely. Options, cheapest first:
+1. **Config probe (no code):** does the sim accept an 8th/16th memory config that is a power of two, or a
+   different `-gpgpu_memory_partition_indexing`? If `n_mem` could be 32 or 64 the `gap` path disappears
+   and IPoly is bijective. But changing `n_mem` changes L2 size/DRAM channels → NOT work-invariant, so
+   this is a modeling change, not a free knob. **Rejected** (changes model params / HW spec).
+2. **Bias-free hash (code, CHOSEN + IMPLEMENTED):** see §11.
+3. **Validate against §7.2 HW anchor:** after the fix, sim `L2_slice_util p50≈p95≈max` (even, like HW's
+   `lts__cycles_active` avg≈max) and `partiton_level_parallism` should rise from ~44 toward ~80.
+
+### Decision order (do NOT skip the measurement)
+The §9.2 histogram from the *current* run is still the arbiter of **how much** of the ROP wall is
+placement (this §10 bias) vs throughput (Part 1's target):
+- If cycles drop a lot and `L2_slice_util` flattens → throughput dominated, bias is secondary.
+- If cycles barely move and `L2_slice_util` stays skewed with hot∈{0..47} → **this %80 bias is the
+  real wall**, and Part 2 (bias-free hash) is the fix. The static proof above says the bias is *present*;
+  the run says how *binding* it is. **Part 1 and Part 2 are complementary, not alternatives.**
+
+## 11. Part 2 fix — balanced avalanche sub-partition hash (IMPLEMENTED, 2026-07-13)
+
+Per the decision to run Part 1 (admission rate) + Part 2 (this placement fix) together (one 12h run),
+the `% 80` bias fix is implemented.
+
+### Why not the "obvious" fixes (both empirically rejected)
+- **Any deterministic 128→80 fold is 2:1** (pigeonhole: 128 hash values into 80 slices ⇒ 48 slices get
+  2, 32 get 1). `h % 80` and `h*80>>7` both measured min/max = 1/2. So keeping the IPoly-128 space and
+  folding cannot be uniform.
+- **Plain multiplicative hash `(x*C) % 80` collapses on strided traffic.** Measured: consecutive
+  addresses uniform (cv 0.005) but **stride-128 puts everything on ~5 slices** (`gcd(128,80)=16`,
+  cv 3.87). GPU traffic is heavily strided, which is the whole reason IPoly exists — so a naive
+  multiplicative hash is worse than the bias.
+
+### The chosen hash — avalanche (bit-mix) then modulo
+`balanced_subpartition_hash(high_bits, ipoly_index, n_slices)`
+([hashing.cc](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/hashing.cc), [hashing.h](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/hashing.h)): combine the address high bits with the IPoly index
+(`x = high_bits ^ (index<<40)`), run a **SplitMix64 finalizer** (two multiply+xorshift rounds =
+full avalanche), then `% n_slices`. The avalanche decorrelates any power-of-two stride from the
+modulus, so `% 80` becomes uniform **for every 2^k stride**. Measured (python model, 400k refs):
+
+| stream | `% 80` (current) | balanced hash |
+|---|---|---|
+| consecutive | cv 0.005 (2:1) | cv 0.003 |
+| stride-128 | 2:1 bias | **cv 0.001** |
+| stride-1024 | 2:1 bias | **cv 0.001** |
+| stride-4096 | 2:1 bias | **cv 0.001** |
+
+Properties that make it safe:
+- **Deterministic + address-stable:** pure function of `(high_bits, index, n_slices)` → same line always
+  maps to the same slice (L2 caching / MSHR / reuse unaffected).
+- **Work-invariant:** it only changes **which** slice `tlx->sub_partition` is; it does NOT touch
+  `partition_address()` (which strips the chip/sub bits to form the in-partition address — verified
+  independent of the slice choice), so L2 hit rate / access counts / DRAM bytes are unchanged.
+- **Only on the biased path:** applied ONLY when `gap && memory_partition_indexing==IPOLY`; power-of-two
+  configs (no gap) are untouched. Default off.
+
+### Change list
+- `hashing.{h,cc}` — `balanced_subpartition_hash()`.
+- `addrdec.{h,cc}` — member `l2_slice_balanced_hash` (ctor-init 0), option
+  `-gpgpu_l2_slice_balanced_hash`, IPoly-gap branch calls the balanced hash instead of `ipoly%N`, and a
+  `[L2-SLICE-HASH]` boot log (once) confirming it is live and that the config actually hits the `gap` path.
+- `gpgpusim.config` — `-gpgpu_l2_slice_balanced_hash 1` (default 0 = original ipoly%N, bit-identical).
+
+### Validation gate (same run as Part 1)
+- **Boot log:** `[L2-SLICE-HASH] balanced sub-partition hash ENABLED (n_channel=40 non-2^n, n_slices=80 …)`.
+- **Imbalance fixed (the target):** `L2_slice_util_p50 ≈ p95 ≈ max` (was skewed), `partiton_level_parallism`
+  ↑ from ~44 toward ~80, `L2_slice_admissions_p50 ≈ max`. Compare to HW `lts__cycles_active` avg≈max (§7.2).
+- **Work-invariant (MUST hold — else a bug):** `L2_TMA_true_hit_rate` (bwd 0.8688 / fwd 0.9456),
+  `L2_total_cache_accesses`, L2 bytes, DRAM bytes all unchanged. A placement change cannot alter work.
+  ⚠ **Caveat:** re-hashing which line → which slice *can* subtly change L2 set-mapping and thus hit rate
+  by a tiny amount if slice==set-selecting bits overlap; watch hit rate closely — a >1% move means the
+  hash is perturbing set selection, not just slice selection, and must be revisited.
+- **Timing:** `gpu_sim_cycle` ↓ (together with Part 1); this is the combined injection-throughput +
+  placement-balance run.
+
+## 12. Relationship to TMA swizzle (FA3_progress TODO-1) — related GOAL, different LAYER
 
 The user's intuition — "swizzle spreads the transfer across all L2 sub-partitions to approach peak
 bandwidth" — points at a real and correct HW effect, but it is important **not** to attach it to the
@@ -413,34 +579,38 @@ governed by the **L2 partition indexing (address hashing)**, which the sim **alr
 what TODO-1 (SMEM swizzle) controls. SMEM swizzle only rearranges bytes *within one CTA's shared
 memory* to dodge the 32-bank SMEM conflict; it does not change which L2 slice a GMEM line lands on.
 
-**So how does this interact with Opt 8 (the L2-admission wall)?** Two separate questions, and §8.2's
+**So how does this interact with Part 1 (the L2-admission wall)?** Two separate questions, and §9.2's
 histogram answers the crucial one:
 1. **Are TMA transfers actually spread across L2 slices, or concentrated?** If the M2/M2.5 CTA-indexed
    tiling + IPoly hashing already spreads them well (median slice utilization ≈ p95), then the ROP wall
-   is a genuine **per-slice throughput** limit → Opt 8 (1→2 admission) is the fix, and it moves sim
+   is a genuine **per-slice throughput** limit → Part 1 (1→2 admission) is the fix, and it moves sim
    toward HW peak-bandwidth behavior *by making each slice as fast as HW*, not by re-spreading.
 2. **If instead the histogram shows a few hot slices (concentration)**, then part of the wall is a
-   *spread* problem, and the lever is the **address→slice mapping** for TMA tiles (an L2-indexing /
-   addressing question, tracked under M2/M2.5 addressing), **not** SMEM swizzle (TODO-1) and not the
-   admission width. Opt 8 and better spreading would then be complementary.
+   *spread* problem, and the lever is the **address→slice mapping** for TMA tiles — which is exactly
+   **Part 2** (§10/§11), **not** SMEM swizzle (TODO-1) and not the admission width. Part 1 and Part 2
+   are complementary.
 
 **Bottom line for the docs:** TODO-1 (SMEM swizzle) is a **shared-memory bank-conflict** fidelity item,
 orthogonal to the L2-admission cycle wall. The "spread across L2 to hit peak BW" idea belongs to the
-**already-implemented L2 partition indexing**; whether TMA bursts exploit it is exactly what §8.2's
-per-slice admission histogram will reveal. Do §8.2 (measure) before assuming either Opt 8 (throughput)
-or an addressing/spread fix is the lever.
+**L2 partition indexing** (Part 2 fixes its `% 80` bias); whether TMA bursts exploit it is exactly what
+§9.2's per-slice admission histogram will reveal.
 
-## 10. Implementation status + risk review (IMPLEMENTED, pre-build) — 2026-07-13
+## 13. Implementation status + risk review (IMPLEMENTED, pre-build) — 2026-07-13
 
-Option A + §8 instrumentation are coded (build pending on the user). Files changed:
+Part 1 (admission) + Part 2 (balanced hash) + §9 instrumentation are coded (build pending on the user).
+Files changed:
 - `gpu-sim.h` — `memory_config::gpgpu_l2_admit_sectors_per_cycle` (default 1).
 - `gpu-sim.cc` — knob registration (`-gpgpu_l2_admit_sectors_per_cycle`, default "1"); `[L2-ADMIT]`
-  boot log (once, when >1); §8 per-slice admission histogram print in `gpu_print_stat`.
+  boot log (once, when >1); §9 per-slice admission histogram print in `gpu_print_stat`.
 - `l2cache.{h,cc}` — the N-probe admission loop in `cache_cycle` + per-sub-partition counters
   (`m_l2_admissions/active_cycles/multi_admit_cycles`) + accessors.
 - `gpu-cache.h` — `bandwidth_management::replenish_data_port_extra(reps)` + `baseline_cache`
   pass-through (the N-wide data-port model).
-- `gpgpusim.config` — `-gpgpu_l2_admit_sectors_per_cycle 2`.
+- `hashing.{h,cc}` — `balanced_subpartition_hash()` (Part 2).
+- `addrdec.{h,cc}` — `l2_slice_balanced_hash` member + `-gpgpu_l2_slice_balanced_hash` option +
+  IPoly-gap branch + `[L2-SLICE-HASH]` boot log (Part 2).
+- `gpgpusim.config` — `-gpgpu_l2_admit_sectors_per_cycle 2` (Part 1) + `-gpgpu_l2_slice_balanced_hash 1`
+  (Part 2).
 
 ### The one subtle correctness point (got it right, documented so it is not "fixed" back)
 The data port must be gated **only on the first probe** (`port_ok = (ap==0) ? port_free : true`) AND the
@@ -457,12 +627,12 @@ loop must be followed by `(N-1)` extra data-port replenishes. These two are a **
 ### Risks considered (and why each is OK)
 1. **Work-axis drift (would be a bug).** Each probe still runs the real `access()`+MSHR+tag-array, so
    hit/miss/sector counts are identical to N=1; only *how many per tick* changes. Gate: `L2_TMA_true_hit_rate`
-   / `L2_total_cache_accesses` must be unchanged (§6.1 axis-1). If they move → real bug, reject.
+   / `L2_total_cache_accesses` must be unchanged (§7.1 axis-1). If they move → real bug, reject.
 2. **Miss-queue relocation (real, expected small).** The loop can admit up to N misses/tick, but
    `baseline_cache::cycle()` still drains only 1 miss/tick to DRAM. With ~87% L2 hits and DRAM 97% idle
    this should be minor; if `gpu_stall_dramfull` explodes and cycles stay flat, pair a 2/tick miss drain
-   (§4.3). This is the honest §4.9-style relocation risk, and the §8 counters + stage residency localize
-   it without a second exploratory run.
+   (§5.3). This is the honest Opt-7 §4.9-style relocation risk, and the §9 counters + stage residency
+   localize it without a second exploratory run.
 3. **RESERVATION_FAIL head-of-line.** On a RESERVATION_FAIL the loop `break`s (head unchanged, retried
    next tick) — identical to N=1 semantics, no busy-spin.
 4. **L2-disabled / texture path.** Counted as an admission (it pops) but the extra replenish is guarded
@@ -479,7 +649,7 @@ loop must be followed by `(N-1)` extra data-port replenishes. These two are a **
 - **End-of-kernel, relocation localizers (already present):** `gpu_stall_dramfull`,
   `L2_TMA_output_full_cycles`, the TMA per-stage residency table (`IN_PARTITION_ROP_DELAY` avg), `bw_util`
   — together they show whether the stall moved and where.
-- **Slice-concentration (new §8):** `L2_slice_util_p50/p95/max`, `L2_slice_admissions_p50/p95/max` — the
+- **Slice-concentration (new §9):** `L2_slice_util_p50/p95/max`, `L2_slice_admissions_p50/p95/max` — the
   burst-vs-spread evidence.
 - **Assessment: coverage is sufficient** for a single decisive run. The only thing NOT logged is a
   per-cycle time series (deliberately — it would flood a 12h run); the aggregate histogram is enough to
