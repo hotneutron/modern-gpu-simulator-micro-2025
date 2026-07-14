@@ -127,6 +127,56 @@ is owned by the items below. No cycle claim is made until an item lands a verifi
 - **fwd L2-hit over-model.** fwd `L2_TMA_true_hit_rate` is still **0.9456 vs HW 0.6958**, due to the **CTA-count cap** (132 CTAs < 384 tiles → ≤132 distinct tiles/tensor). Closing it needs real tile `coords` (Opt-6 approach B) — an **addressing** fix, not a timing one; parked because bwd hit rate is already on target (0.8688 vs HW 0.8226). This is why fwd's DRAM-work ratio is the most off (§4.12: fwd 0.26x vs bwd 0.56x).
 - Both are **fidelity items**, not the primary cycle lever; tracked here so they are not mistaken for queue work.
 
+#### Ongoing item 3 — fwd 2.02× is a REAL structural gap: sim issues at HALF HW's rate (2026-07-14)
+
+> Metrics prerequisite: [METRICS_Add_Fix.md](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/.plan/METRICS_Add_Fix.md) §2 (NCU stall-taxonomy alignment) — build the
+> counters that quantify suspects #1/#2 BEFORE touching any timing model. Upstream worklist:
+> [CTA_SAMPLING.md](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/.plan/CTA_SAMPLING.md) §7.1 (P11/R12).
+
+**This supersedes the earlier "fwd faithful-floor" read.** A deeper diagnostic showed fwd is **not** at
+a faithful floor — the 2.02× (137,053 vs HW 67,696) is a single, real architectural gap, not diffuse
+noise. The work is identical (same warp-instruction stream), so **cycle-gap = issue-rate-gap exactly**:
+
+| | issued warp-inst / cycle / SM | active warps | 
+|---|---|---|
+| HW | **1.63** (IPC 1.79, 3.28 warps/sched) | 3.28 / scheduler |
+| sim `.o37` | **0.79** | ~3.2 / subcore |
+| ratio | **2.07× = the entire cycle gap** | ≈ equal |
+
+**The decisive inference: with the SAME warp count, HW extracts 2× the issue throughput → HW overlaps
+work the sim serializes.** This is not occupancy (matches: sim 19.85% vs HW 20.14%), not memory (at
+floor, ROP 126≈100), not per-instruction latency depth (warp-cyc/issue 9.1 vs 7.16 = only 1.28×). Two
+structural suspects, both confirmed present in source:
+
+- **Suspect #1 — WGMMA is modeled SYNCHRONOUSLY, not async.** `TENSOR_CORE_OP` flows through the same
+  fixed-latency FU path as an ordinary FMA ([subcore.cc:288-327](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/subcore.cc#L288-L327): `reserve_latency()` +
+  scoreboard-held), so back-to-back WGMMAs serialize at `-tensor_latency 32` / init-interval 64 and the
+  **consumer warpgroup cannot overlap softmax `exp` with tensor work**. HW `wgmma.mma_async` issues in
+  the background; the warp only blocks at `wgmma.wait_group`. This is fwd's most likely primary lever —
+  fwd is tensor(46%)+xu/MUFU(47.75%) heavy, exactly the profile that suffers when tensor is synchronous.
+  **Contrast (important asymmetry): TMA IS already async in the sim** — issuing `UTMALDG` frees the
+  producer warp, the transfer runs in the background, completion arrives via
+  [sm.cc:1519](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/sm.cc#L1519) (`m_tma_unit_shared_of_sm->fill(mf)`), and only the consumer waits at the mbarrier.
+  So the async treatment TMA got was **never applied to WGMMA**.
+  - **Note — this is why the earlier WGMMA park was for the WRONG reason.** [WGMMA_FU_OCCUPIED_H100.md](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/.plan/WGMMA_FU_OCCUPIED_H100.md)
+    parked on `sm_idle_all_blocked_by_tensor` ≈ 0.65% (fully-idle SM cycles). That counter does NOT
+    capture the throughput loss from the consumer being unable to overlap — the 2× issue-rate deficit
+    is the real signature and it points here. The async-WGMMA model is a different (harder) change than
+    the II-lowering that was parked.
+- **Suspect #2 — single-issue per scheduler (no dual-issue).** The subcore issues at most ONE
+  instruction then `break`s the warp loop ([subcore.cc:635-638](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/subcore.cc#L635-L638)); no co-issue to independent
+  pipes, even though `-gpgpu_dual_issue_diff_exec_units 1` is parsed. HW Hopper schedulers can dual-issue
+  (e.g. MUFU + FMA same cycle). If HW dual-issues even ~30% of active cycles, that is a large chunk of
+  the 2×.
+
+**Ruled out** (to prevent re-chasing): clock 1800 vs 1420 MHz (comparison is cycle-vs-cycle,
+frequency-independent); occupancy (matches HW); memory path (at floor both sides); SFU under-cost
+(TODO-2 — real bug but pushes cycles UP, cannot explain sim being 2× slower).
+
+**Plan:** do the [METRICS_Add_Fix.md](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/.plan/METRICS_Add_Fix.md) §2 taxonomy alignment first (observe-only, bit-identical),
+read `warpgroup_arrive` (#1) vs `not_selected`/`dispatch_stall` (#2) on the existing runs to size which
+suspect dominates, THEN design the async-WGMMA or dual-issue timing model with an NCU-anchored target.
+
 ### Deferred Opts
 
 Optimizations that were investigated and consciously **parked** because, although they fix a real
@@ -587,6 +637,53 @@ knobs.
   layers). Whether TMA bursts actually exploit the L2 slice spread is a separate, measurable question —
   see [L2_SLICE_PARALLELISM_H100.md](file:///home/jihyun/modern-gpu-simulator-micro-2025/.plan/L2_SLICE_PARALLELISM_H100.md) §8 (per-slice admission histogram) / §9.
 
-> Note: the former **TODO-2 (real TMA base address)** has been implemented — real per-site GMEM
+> Note: the *original* TODO-2 (real TMA base address) has been implemented — real per-site GMEM
 > base + CTA-indexed tile spread (M2/M2.5). It is no longer a TODO; see the Ongoing section above
 > and [TMA_exact_base_mapping_integration.md](file:///home/jihyun/modern-gpu-simulator-micro-2025/.plan/TMA_exact_base_mapping_integration.md).
+> The TODO-2 slot below is a **new, unrelated** item (SFU/MUFU latency).
+
+### TODO-2: SFU/MUFU (transcendental) latency is under-modeled in trace-driven mode
+
+- **Status**: not fixed. The softmax `exp` (SASS `MUFU.EX2`) decodes correctly to `OP_MUFU` /
+  `SFU_OP` ([hopper_opcode.h:30](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/ISA_Def/hopper_opcode.h#L30)) and routes to a **real, dedicated per-subcore SFU
+  functional unit** ([functional_unit.h:190](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/functional_unit.h#L190); routed at
+  [subcore.cc:1092-1093](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/subcore.cc#L1092-L1093)) — so the pipe **is** modeled. The gap is the **latency/throughput**
+  it is given.
+- **The bug (config gap, not code).** In trace-driven mode the per-op timing comes from
+  `-trace_opcode_latency_initiation_sfu` ([trace_driven.cc:711-715](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/trace-driven/trace_driven.cc#L711-L715), consumed for
+  `SFU_OP` at [trace_driven.cc:812-814](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/trace-driven/trace_driven.cc#L812-L814)). The H100 config
+  (`SM90_H100_L2_50MB_80GB/gpgpusim.config`) sets only `-ptx_opcode_latency_sfu 21` /
+  `-ptx_opcode_initiation_sfu 8` (lines 89-90), which feed the **PTX functional-sim path**
+  (`cuda-sim.cc`), NOT the trace-driven timing. It never sets `-trace_opcode_latency_initiation_sfu`,
+  so trace mode falls back to the default **`"4,1"`** → **latency = 4 cyc, initiation interval = 1**,
+  *identical to an FP add* (`-trace_opcode_latency_initiation_sp` also defaults to `"4,1"`,
+  [trace_driven.cc:701-705](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/trace-driven/trace_driven.cc#L701-L705); config does not override it either). This is why the Opt-8 fwd run
+  reports `fu_occupied_sfu = 0.00%` — with 4 SFU units (one per subcore) each accepting one MUFU/cycle
+  at 4-cyc latency, the transcendental pipe **never bottlenecks**.
+- **Why it matters (fidelity).** On real H100, MUFU/transcendental runs at roughly **¼ the FMA rate**,
+  and for FA3 **fwd** the xu/MUFU pipe is the **single busiest pipe on HW** — `SM Busy = 47.75%`
+  (NCU, kernel 5), driven by the softmax `exp`. See [FA3_kernel_5_fwd.md](file:///home/jihyun/modern-gpu-simulator-micro-2025/.result/FA3_kernel_5_fwd.md) HW pipe table
+  (`sm__inst_executed_pipe_xu = 47.75%`). Modeling `exp` at FP-add cost under-represents fwd's
+  dominant compute cost.
+- **⚠ Direction warning — this is a FIDELITY fix, NOT a cycle-reduction lever (it makes the sim
+  SLOWER).** fwd currently over-estimates at **2.02×** HW (137,053 vs 67,696). Because the sim already
+  under-costs its busiest pipe yet is still 2× too slow, giving SFU a realistic (higher) latency/II
+  will push fwd cycles **UP**, widening the raw ratio. It must therefore be landed as an accuracy
+  item, and only alongside re-checking the residual axes — the under-costed SFU is currently a
+  **compensating error** that partially masks an over-estimation elsewhere (exposed
+  warp-not-ready / mbarrier-wait under the 1-CTA/SM occupancy). Do **not** treat closing it as a win
+  on the sim-vs-HW cycle ratio.
+- **TODO (fix, when accuracy work is prioritized)**:
+  1. Add `-trace_opcode_latency_initiation_sfu <lat>,<ii>` to the H100 config. Start from the PTX-path
+     values already present (`21,8`) as the HW-plausible anchor (MUFU ~¼ FMA throughput ⇒ II≈4-8),
+     then calibrate `lat`/`ii` against the NCU xu-pipe utilization (target: sim SFU-pipe occupancy
+     approaches HW `pipe_xu` 47.75% for fwd) rather than guessing.
+  2. Re-verify the pipe actually saturates: `fu_occupied_sfu` should become **> 0** once the II is
+     realistic (that counter is the built-in proof the SFU pipe now bottlenecks —
+     [subcore.cc:647](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/subcore.cc#L647), gated on `-wgmma_step0_instrument_enable`).
+  3. Because it raises cycles, land it together with a re-measurement of the compensated axis
+     (`wait_barrier` / warp-not-ready), and keep the work axis (instruction counts, hit rate)
+     invariant — this is a pure per-op *timing* change.
+  4. **Bit-identity safety**: gate via config only (no code change needed for the minimal fix); with
+     the option absent the default `"4,1"` reproduces today's behavior exactly, so existing 12h runs
+     stay bit-identical until the config is deliberately changed.
