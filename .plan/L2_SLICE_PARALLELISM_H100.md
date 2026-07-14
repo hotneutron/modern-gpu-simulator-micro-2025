@@ -655,3 +655,70 @@ loop must be followed by `(N-1)` extra data-port replenishes. These two are a **
   per-cycle time series (deliberately — it would flood a 12h run); the aggregate histogram is enough to
   decide. No early-stop assert was added because the loop reuses existing gated ops (no new invariant that
   could silently corrupt); the `replenish_data_port_extra` guard prevents port underflow.
+
+## 14. RESULT — MEASURED (FWD K5 `.o37`, BWD K10 `.o20`, 2026-07-14)
+
+Both parts confirmed live in the boot log (`[L2-ADMIT]=2`, `[L2-SLICE-HASH] balanced ... ENABLED`, plus
+the 3 Opt-7 knobs). **Verdict: BWD is a clear win (−6.1% vs Opt 7); FWD barely moves (−0.7%), as
+predicted; both parts fired and the placement bias is fully removed; work axis invariant.**
+
+| metric | FWD K5 (`.o37`) | BWD K10 (`.o20`) | judgment |
+|---|---|---|---|
+| `gpu_sim_cycle` | **137,053** (Opt7 138,021, −0.7%) | **234,665** (Opt7 250,026, **−6.1%**) | BWD wins |
+| vs HW | 2.02x (67,696) | **1.77x** (132,901) | BWD 1.88x→1.77x |
+| `L2_TMA_true_hit_rate` | 0.9453 (was 0.9456) | 0.8688 (was 0.8688) | **work invariant ✅** |
+| `L2_total_cache_accesses` | 3,429,628 (−0.8%) | 11,294,547 (+0.2%) | invariant ✅ |
+| **`ROP_DELAY` avg** | 135→**126** (≈fixed 100) | **1,483→558 (−62%)** | the target moved |
+| `averagemflatency` | 222→**194** | 1,649→**692 (−58%)** | round-trip halved (bwd) |
+| `gpu_stall_dramfull` | 116K→105K | **137K→0** | L2-input backpressure gone (bwd) |
+| `gpu_stall_icnt2sh` | 0 | 5,792→**0** | reply choke gone |
+| `L2_TMA_output_full_cycles` | 0 | 441→**0** | reply FIFO never full |
+
+### Part 2 (placement) — the decisive success: imbalance FULLY removed
+The `% 80` 2:1 bias is gone; per-slice utilization is now flat, matching HW's ≤5% spread (§7.2):
+
+| | FWD | BWD | HW anchor (§7.2, `lts__cycles_active`) |
+|---|---|---|---|
+| `L2_slice_util` p50 / p95 / max | 0.314 / 0.348 / 0.366 | 0.601 / 0.630 / 0.651 | avg≈max (≤3% spread) |
+| `L2_slice_admissions` p50 / max | 43,156 / 50,228 (16% spread) | 141,045 / 152,830 (8% spread) | ≤5% |
+
+`admit_per_active_cycle ≈ 1.00` (FWD 1.004, BWD 1.000) — because with the bias gone there is no
+per-slice backlog to burst-admit, so the 2nd probe rarely fires (`L2_admit_multi_cycles` FWD 12,622 /
+BWD 846). **This is the key finding: Part 2 (placement) did the heavy lifting on BWD, not Part 1
+(throughput).** Once traffic is even across 80 slices, each slice's 1/tick was already enough and the
+ROP backlog drained — hence `dramfull`/`icnt2sh`/`output_full` all hit 0.
+
+> Note on `partiton_level_parallism`: FWD 44→22, BWD ~44→47. The FWD drop is expected — with the bias
+> removed and the burst de-concentrated, fewer slices need to be simultaneously active per cycle to
+> carry the same (now-even) work; it is NOT a regression (util is flat and cycles improved).
+
+### FWD — why it barely moved (root cause, confirmed)
+FWD's TMA path was **already at the floor** before this Opt: `ROP_DELAY` avg 126 ≈ the configured
+`rop_latency=100` (only ~26 cyc of residual queue-wait). So there was almost nothing for admission/
+placement to remove. FWD's real remaining cost is NOT the TMA queue at all:
+- **`nv_ibuffer_empty = 12.52%`** (frontend tail / straggler drain) — HW's own imbalance, **unrecoverable**
+  (Deferred Opts, Waves-Per-SM cross-validated).
+- **`wait_barrier` 9.65%** + **`non_tma_axis` 26.9%** (`fu_occupied` 15.1%) — execution/WGMMA side.
+- **fwd L2 hit rate over-modeled 0.945 vs HW 0.696** (CTA-cap, Ongoing item 2) → its DRAM work is
+  unrealistically low (`bw_util` 0.027 vs HW 12%), so the memory axis is already "too easy" in sim; no
+  memory-side lever can help fwd until the hit rate is fixed (an addressing, not timing, problem).
+
+**Conclusion for FWD: this Opt is correctly a no-op — the TMA memory path is not fwd's bottleneck.**
+
+### BWD — what remains (the next wall)
+BWD improved a lot but is still 1.77x. Residual breakdown (`.o20`):
+- **`ROP_DELAY` still 558 (80.65% of the TMA round-trip)**, of which ~458 is queue-wait beyond the fixed
+  100. But now `dramfull=0`, `port_busy≈0` (846), `res_fail=0` — **the L2 admission is NOT the gate
+  anymore**. The residual ROP wait is inherited from the **injection side**: `Req_Network_in_buffer_full
+  = 5.67/cyc` (Opt7 7.15) is still high, i.e. the 768-sector burst is still **temporally concentrated**
+  at inject even though it is now spatially even across slices. Placement fixed *where*; it did not fix
+  *when* (the burst still arrives bunched in time).
+- **`tma_flush` 6.39%** (store/reduce drain) and **`wait_barrier` 8.63%** remain the top TMA-axis SM-idle.
+- DRAM still idle (`bw_util` 0.078 vs HW 14.85%, `avg_mrq_latency=3`) — memory device is not the wall.
+
+**Next lever for BWD (beyond this Opt):** the residual is the **per-transfer fixed-overhead /
+temporal-burst serialization** — the §8 "fixed-overhead alternative" (model a ~170-cyc per-transfer
+cost instead of 768 serialized per-sector round-trips). That attacks the *timing of the burst* (the
+`Req_in_buffer_full=5.67` + ROP 558), which neither admission width nor placement touches. This is the
+honest next step; it is more invasive (needs a per-transfer completion model) and is tracked as the
+remaining item in FA3_progress.
