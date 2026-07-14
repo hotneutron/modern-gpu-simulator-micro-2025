@@ -507,22 +507,63 @@ void memory_sub_partition::cache_cycle(unsigned cycle) {
   }
 
   // DRAM to L2 (texture) and icnt (not texture)
-  if (!m_dram_L2_queue->empty()) {
-    mem_fetch *mf = m_dram_L2_queue->top();
-    if (!m_config->m_L2_config.disabled() && m_L2cache->waiting_for_fill(mf)) {
-      if (m_L2cache->fill_port_free()) {
+  //
+  // Opt9 Gate B: drain up to M returned lines from m_dram_L2_queue per L2-tick
+  // (default 1 = original single-if behavior). N=2 matches HW 64B/cycle/slice. Two
+  // sub-paths: (a) L2-fill (waiting_for_fill) consumes the FILL port, so like Opt8's
+  // data port we gate fill_port_free() only on the FIRST fill of the tick and
+  // replenish (fills-1) extra after the loop (fill port modeled M*32B-wide); (b) the
+  // reply push to m_L2_icnt_queue touches no port, only its full() gate. Stops early
+  // on: empty dram_L2 queue, fill-port busy (1st fill), or reply-queue full.
+  {
+    unsigned dram_reply_budget = m_config->gpgpu_l2_dram_reply_drain_per_cycle;
+    if (dram_reply_budget == 0) dram_reply_budget = 1;
+    unsigned fills_this_tick = 0;
+    unsigned drained_this_tick = 0;  // Opt9 Gate B lever-fired counter (fill+reply)
+    for (unsigned d = 0; d < dram_reply_budget; ++d) {
+      if (m_dram_L2_queue->empty()) break;
+      mem_fetch *mf = m_dram_L2_queue->top();
+      if (!m_config->m_L2_config.disabled() && m_L2cache->waiting_for_fill(mf)) {
+        // Fill path: gate the fill port only on the first fill of the tick; the
+        // batch shares one tick's fill-port occupancy (extra replenish below).
+        bool fill_ok = (fills_this_tick == 0) ? m_L2cache->fill_port_free() : true;
+        if (!fill_ok) break;
         mf->set_status(IN_PARTITION_L2_FILL_QUEUE,
                        m_gpu->gpu_sim_cycle + m_gpu->gpu_tot_sim_cycle);
         m_L2cache->fill(mf, m_gpu->gpu_sim_cycle + m_gpu->gpu_tot_sim_cycle +
                                 m_memcpy_cycle_offset);
         m_dram_L2_queue->pop();
+        ++fills_this_tick;
+        ++drained_this_tick;
+      } else if (!m_L2_icnt_queue->full()) {
+        if (mf->is_write() && mf->get_type() == WRITE_ACK)
+          mf->set_status(IN_PARTITION_L2_TO_ICNT_QUEUE,
+                         m_gpu->gpu_sim_cycle + m_gpu->gpu_tot_sim_cycle);
+        m_L2_icnt_queue->push(mf);
+        m_dram_L2_queue->pop();
+        ++drained_this_tick;
+      } else {
+        break;  // reply queue full this tick
       }
-    } else if (!m_L2_icnt_queue->full()) {
-      if (mf->is_write() && mf->get_type() == WRITE_ACK)
-        mf->set_status(IN_PARTITION_L2_TO_ICNT_QUEUE,
-                       m_gpu->gpu_sim_cycle + m_gpu->gpu_tot_sim_cycle);
-      m_L2_icnt_queue->push(mf);
-      m_dram_L2_queue->pop();
+    }
+    // Opt9 Gate B lever-fired instrumentation (timing-neutral).
+    if (drained_this_tick > 0) {
+      m_l2_dram_reply_drained += drained_this_tick;
+      if (drained_this_tick > 1) ++m_l2_dram_reply_multi_cycles;
+    }
+    // Opt9 Gate B: model the M-wide fill port. baseline_cache::cycle() (in the
+    // L2cache->cycle() below) does the base 1/tick fill-port replenish; add
+    // (fills-1) extra so the accumulated per-fill occupancy does not saturate and
+    // throttle the NEXT tick. Only when the knob is >1 and >1 fill happened.
+    // Note: fills_this_tick counts fill() CALLS; a SECTOR_ASSOC fill that early-
+    // returns while waiting for sibling sectors does NOT consume the fill port
+    // (use_fill_port is only reached on the normal completion path). So this may
+    // over-replenish, but replenish_fill_port_extra has an `if(occupied>0)` guard
+    // -> it can only bring occupancy down to 0, never negative: safe (conservative,
+    // never saturates and never underflows).
+    if (dram_reply_budget > 1 && fills_this_tick > 1 &&
+        !m_config->m_L2_config.disabled()) {
+      m_L2cache->replenish_fill_port_extra(fills_this_tick - 1);
     }
   }
 
@@ -685,13 +726,34 @@ void memory_sub_partition::cache_cycle(unsigned cycle) {
   }
 
   // ROP delay queue
-  if (!m_rop.empty() && (cycle >= m_rop.front().ready_cycle) &&
-      !m_icnt_L2_queue->full()) {
-    mem_fetch *mf = m_rop.front().req;
-    m_rop.pop();
-    m_icnt_L2_queue->push(mf);
-    mf->set_status(IN_PARTITION_ICNT_TO_L2_QUEUE,
-                   m_gpu->gpu_sim_cycle + m_gpu->gpu_tot_sim_cycle);
+  //
+  // Opt9 Gate A: drain up to N sectors from the ROP delay queue into
+  // m_icnt_L2_queue per L2-tick (default 1 = original single-if behavior). N=2
+  // matches HW 64B/cycle/slice. The fixed rop_latency (front.ready_cycle) is
+  // UNCHANGED; only the drain throughput widens (timing-only, work invariant). The
+  // ROP queue is FIFO/age-ordered, so once the head is not yet ready (cycle <
+  // ready_cycle) no later entry can be ready either -> break. m_icnt_L2_queue->full()
+  // is re-checked every pop (push can fill it). This stage touches no port.
+  {
+    unsigned rop_budget = m_config->gpgpu_l2_rop_drain_per_cycle;
+    if (rop_budget == 0) rop_budget = 1;
+    unsigned rop_drained_this_tick = 0;  // Opt9 Gate A lever-fired counter
+    for (unsigned d = 0; d < rop_budget; ++d) {
+      if (m_rop.empty() || cycle < m_rop.front().ready_cycle ||
+          m_icnt_L2_queue->full())
+        break;
+      mem_fetch *mf = m_rop.front().req;
+      m_rop.pop();
+      m_icnt_L2_queue->push(mf);
+      mf->set_status(IN_PARTITION_ICNT_TO_L2_QUEUE,
+                     m_gpu->gpu_sim_cycle + m_gpu->gpu_tot_sim_cycle);
+      ++rop_drained_this_tick;
+    }
+    // Opt9 Gate A lever-fired instrumentation (timing-neutral).
+    if (rop_drained_this_tick > 0) {
+      m_l2_rop_drained += rop_drained_this_tick;
+      if (rop_drained_this_tick > 1) ++m_l2_rop_multi_cycles;
+    }
   }
 }
 

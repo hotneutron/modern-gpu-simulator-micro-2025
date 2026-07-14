@@ -1493,6 +1493,11 @@ class baseline_cache : public cache_t {
   void replenish_data_port_extra(unsigned reps) {
     m_bandwidth_management.replenish_data_port_extra(reps);
   }
+  // Opt9 Gate B: extra fill-port replenish for an M-wide DRAM->L2 reply drain
+  // (see bandwidth_management::replenish_fill_port_extra).
+  void replenish_fill_port_extra(unsigned reps) {
+    m_bandwidth_management.replenish_fill_port_extra(reps);
+  }
 
   // This is a gapping hole we are poking in the system to quickly handle
   // filling the cache on cudamemcopies. We don't care about anything other than
@@ -1601,6 +1606,17 @@ class baseline_cache : public cache_t {
     void replenish_data_port_extra(unsigned reps) {
       for (unsigned i = 0; i < reps; ++i) {
         if (m_data_port_occupied_cycles > 0) m_data_port_occupied_cycles -= 1;
+      }
+    }
+
+    /// Opt9 Gate B: extra FILL-port replenish, the fill-side mirror of
+    /// replenish_data_port_extra. When -gpgpu_l2_dram_reply_drain_per_cycle=M>1
+    /// fills M returned lines/tick, each use_fill_port() adds 1 occupancy but the
+    /// base replenish only removes 1/tick; this adds (M-1) extra so the fill port
+    /// is modeled M*32B-wide and does not saturate. Only touches the FILL port.
+    void replenish_fill_port_extra(unsigned reps) {
+      for (unsigned i = 0; i < reps; ++i) {
+        if (m_fill_port_occupied_cycles > 0) m_fill_port_occupied_cycles -= 1;
       }
     }
 

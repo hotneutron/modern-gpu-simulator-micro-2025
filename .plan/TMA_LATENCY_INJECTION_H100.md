@@ -1881,8 +1881,100 @@ The residual `ROP_DELAY` wall is the L2 **admission** stage: `cache_cycle` admit
 (32B) per sub-partition per L2-tick**, while a real H100 L2 slice returns **64B/cycle (2×32B
 sectors)**. That HW anchor, the full re-entrancy/MSHR/data-port safety trace for admitting 2
 probes/cycle, and the implementation/verification plan now live in a dedicated doc:
-[L2_SLICE_PARALLELISM_H100.md](file:///home/jihyun/modern-gpu-simulator-micro-2025/.plan/L2_SLICE_PARALLELISM_H100.md) (Opt 8+9). `m_data_port_width` is NOT that knob (proven null in
+[L2_SLICE_PARALLELISM_H100.md](file:///home/jihyun/modern-gpu-simulator-micro-2025/.plan/L2_SLICE_PARALLELISM_H100.md) (Opt 8). `m_data_port_width` is NOT that knob (proven null in
 §4.11 Step B/C). See that doc for details; this section only established *that* ROP_DELAY is the wall.
+The post-Opt-8 re-diagnosis (why ROP_DELAY is still 558 after Opt 8) is §4.11.8 below.
+
+## 4.11.8 POST-Opt-8 re-diagnosis — the residual ROP_DELAY is the ROP-drain 1/tick gate (Opt 9 candidate) — 2026-07-14
+
+Opt 8 (L2 slice admission 1→2 + balanced slice hash) cut bwd `ROP_DELAY` 1,483→**558** (-62%) and drove
+`gpu_stall_dramfull`/`icnt2sh`/`output_full` to 0, but `ROP_DELAY` is still **80.65%** of the TMA
+round-trip (bwd `.o20`, 1.77x vs HW). This section traces where that residual 558 actually comes from,
+after ruling out injection and iSLIP as the wall.
+
+### Ruled out: injection rate (measured, not assumed)
+Computed the sim's aggregate injection vs HW (§4.11.4 anchor: HW per-SM TMA = 124 B/clk = 3.875
+sector/clk):
+- sim `Req_Network_injected_packets_per_cycle = 46.95` (bwd `.o20`) = **1,502 B/clk = 2.70 TB/s** at the
+  1.8 GHz ICNT clock = **81% of the HBM3 ceiling (3.35 TB/s)**. Equivalent to ~12 of 132 SMs bursting
+  each cycle — i.e. only ~12 SMs actually inject TMA at any instant (the rest are computing / waiting).
+- `Req_Network_avg_passes_per_active_cycle = 4.02` (grant runs the full 4 passes), `extra_pass_grants
+  = 8.21M` — the iSLIP grant is already at its max width (= HW 4 sector/clk). Raising it further would
+  exceed the HBM ceiling = a fake win.
+- **Verdict: injection is NOT rate-bound.** It is already near the HBM ceiling; `Req_in_buffer_full=5.67`
+  is a transient iSLIP dest-conflict when the ~12 bursting SMs momentarily target the same
+  sub-partition, NOT a sustained rate shortfall. (And HW *does* have a memory-partition crossbar — H100
+  Course: `SM→L1D/coalescer→L2→memory partition/crossbar→MC→HBM` — so removing/replacing iSLIP would be
+  HW-INaccurate. The iSLIP crossbar stays.)
+
+### The actual residual: the ROP delay queue drains 1 sector / sub-partition / tick
+Traced `memory_sub_partition::push` and the ROP pop:
+- On arrival, `push()` ([l2cache.cc:884-908](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/l2cache.cc#L884-L908)) breaks the request into sector mfs and pushes **each sector**
+  into the ROP delay queue `m_rop` with `ready_cycle = arrival + rop_latency(100)`, stamping
+  `IN_PARTITION_ROP_DELAY` at that moment.
+- The ROP pop ([l2cache.cc:688-695](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/l2cache.cc#L688-L695)) is a **single `if` (NOT a loop)**: at most **1 sector per
+  sub-partition per L2-tick** moves `m_rop → m_icnt_L2_queue`, gated on `cycle >= front.ready_cycle`
+  AND `!m_icnt_L2_queue->full()` (queue cap is 64 per `-gpgpu_dram_partition_queues 64:64:64:64`, so
+  the full-gate is NOT the limiter; the **1/tick pop is**).
+- So a burst of sectors landing on one sub-partition sits in `m_rop`: the head waits the fixed 100, but
+  each subsequent sector waits `100 + (its FIFO position)`. Averaged over the 768-sector burst that is
+  exactly the observed **avg 558** — 100 fixed + ~458 of 1/tick drain-queue wait.
+
+### Why Opt 8 did NOT remove it (it widened the wrong stage)
+Opt 8 Part 1 widened the **L2-bank admission** inside `cache_cycle` (`access()`, stage [5]) to 2/cyc.
+But the ROP→`m_icnt_L2_queue` drain (the stage BEFORE the L2 bank, feeding stage [4]→[5]) is still
+**1/tick**. A sector must pass the 1/tick ROP gate *before* it can even reach the (now 2-wide) L2 bank,
+so the L2-bank widening is starved — consistent with the measured `L2_admit_per_active_cycle≈1.00` and
+`L2_admit_multi_cycles≈846` (the 2nd admission probe almost never fires, because ROP only feeds 1/tick).
+This is a stage the §4.10 pipeline map did not call out as a rate (it listed ROP as a fixed-latency
+delay, not noticing its drain is 1/tick).
+
+### A symmetric second gate: the REPLY-side `dram_L2 → L2_icnt` drain is ALSO 1 sector/tick
+Re-tracing the full flow found the SAME 1-sector/tick pattern on the reply side, and confirmed the
+whole path is **32B-sector-granular**, never 128B-line:
+- Request: TMA emits 32B **sector** mfs ([tma_unit_sm.cc:872](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/tma_unit_sm.cc#L872)); on arrival `push()` re-splits into sectors
+  ([l2cache.cc:862-878](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/l2cache.cc#L862-L878)); DRAM carries the same 32B mf (`nbytes=mf->get_data_size()`, [dram.cc:259](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/dram.cc#L259))
+  and returns the same mf object.
+- Reply: `cache_cycle`'s "DRAM to L2 ... icnt" block ([l2cache.cc:509-527](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/l2cache.cc#L509-L527)) is a **single `if` (NOT a loop)**
+  that moves at most **1 sector / sub-partition / L2-tick** from `m_dram_L2_queue → m_L2_icnt_queue`.
+  So a DRAM-miss line returns to the SM one 32B sector at a time — HW returns 64B/cycle (2 sectors) per
+  slice (same anchor as Opt 8 §2). This is the reply-side mirror of the ROP gate.
+- **Current impact is small but non-zero:** bwd is ~87% L2-hit, and L2 HITs reply directly from
+  `cache_cycle` admission (`m_L2_icnt_queue->push`, [l2cache.cc:587-604](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/l2cache.cc#L587-L604)) — they never touch this
+  reply gate. Only the ~13% DRAM-miss returns pass here (`IN_PARTITION_DRAM_TO_L2_QUEUE≈0.04`,
+  `IN_ICNT_TO_SHADER=12`), so it is not the current wall. But it is (a) HW-inaccurate (1 sector vs 64B),
+  and (b) the natural **relocation target** once the request-side ROP gate is widened. So Opt 9 fixes
+  both, with **separate knobs** (they are different code sites / directions — must not share one knob).
+
+### Opt 9 scope = TWO independent 1-sector/tick gates, each its own knob (promoted only if a run shows a cycle gain)
+Both are the same anti-pattern (a single per-tick `if` draining a sector queue), on opposite directions
+of the L2 sub-partition. Widen each to **N sectors / sub-partition / L2-tick** with its own config knob
+(default 1 = bit-identical). The fixed latencies (`rop_latency=100`) are **kept unchanged** — only the
+throughput gate widens, so it is timing-only and HW-faithful (HW does not serialize L2 in/out at 1
+sector/tick; it moves 64B/cycle per slice).
+
+- **Gate A — REQUEST: ROP → `m_icnt_L2_queue`** (the dominant one, ROP_DELAY 558).
+  - Change the single `if` at [l2cache.cc:688-695](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/l2cache.cc#L688-L695) into a bounded loop (up to N), each iteration
+    re-checking `!m_rop.empty()`, `cycle >= front.ready_cycle`, `!m_icnt_L2_queue->full()`.
+  - Knob: **`-gpgpu_l2_rop_drain_per_cycle N`** (default 1). Natural N=2 (HW 64B/slice) or 4 (icnt-pop width).
+- **Gate B — REPLY: `m_dram_L2_queue` → `m_L2_icnt_queue`** (relocation guard + HW consistency).
+  - Change the single `if` at [l2cache.cc:509-527](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/l2cache.cc#L509-L527) into a bounded loop (up to M), each iteration
+    re-checking `!m_dram_L2_queue->empty()` and the fill/`!m_L2_icnt_queue->full()` branch (the L2-fill
+    `waiting_for_fill`+`fill_port_free()` sub-branch stays per-probe as today).
+  - Knob: **`-gpgpu_l2_dram_reply_drain_per_cycle M`** (default 1). **Separate from Gate A** (different
+    site/direction). Natural M=2 (HW 64B/slice).
+- **Work-invariant by construction (both):** only *how many already-arrived sectors* move per tick
+  changes; not which sectors, addresses, hit/miss, or DRAM traffic. Gate after the run:
+  `L2_TMA_true_hit_rate`, `L2_total_cache_accesses`, DRAM bytes MUST be unchanged.
+- **Expected effect (to be measured):** Gate A → `ROP_DELAY` avg ↓ toward fixed 100, `L2_admit_multi_cycles`↑,
+  `L2_admit_per_active_cycle`→~2 (the Opt-8 2-wide admission finally gets fed), bwd `gpu_sim_cycle`↓.
+  Gate B → reply-side residency (`IN_ICNT_TO_SHADER`, `DRAM_TO_L2_QUEUE`) stays low even after A opens
+  the request side (prevents the §4.5-style relocation). **Promotion condition: Opt 9 exists only if the
+  run shows a real cycle gain with the work axis invariant.** Relocation to watch: after A, stall could
+  move to `m_icnt_L2_queue` fill or L2 admission (`gpu_stall_dramfull`) — the §9 per-slice `L2_admit_*`
+  counters localize it.
+- **Files (when implemented):** `l2cache.cc` (both pop loops), `gpu-sim.{cc,h}` (2 knobs + boot logs),
+  `gpgpusim.config` (both knobs). No tracer/trace change; rebuild required.
 
 ## 4.12 Cycle-INDEPENDENT "work done" comparison (the trustworthy anchor) — 2026-07-09
 

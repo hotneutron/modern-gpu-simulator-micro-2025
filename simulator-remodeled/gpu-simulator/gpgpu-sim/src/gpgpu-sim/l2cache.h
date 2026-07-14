@@ -310,12 +310,31 @@ class memory_sub_partition {
   unsigned long long m_l2_admissions = 0;
   unsigned long long m_l2_active_cycles = 0;
   unsigned long long m_l2_multi_admit_cycles = 0;
+  // Opt9 drain-lever instrumentation (timing-neutral, per-sub-partition). Prove
+  // each drain lever actually fired (>1 moved in a tick) — the direct analogue of
+  // m_l2_multi_admit_cycles for Opt8. 0 when the knob is 1.
+  //  Gate A (ROP -> m_icnt_L2_queue):
+  unsigned long long m_l2_rop_drained = 0;         // total sectors ROP->icnt_L2
+  unsigned long long m_l2_rop_multi_cycles = 0;    // ticks that drained >1
+  //  Gate B (m_dram_L2_queue -> L2 fill | L2_icnt):
+  unsigned long long m_l2_dram_reply_drained = 0;  // total returns drained
+  unsigned long long m_l2_dram_reply_multi_cycles = 0;  // ticks that drained >1
 
  public:
   unsigned long long get_l2_admissions() const { return m_l2_admissions; }
   unsigned long long get_l2_active_cycles() const { return m_l2_active_cycles; }
   unsigned long long get_l2_multi_admit_cycles() const {
     return m_l2_multi_admit_cycles;
+  }
+  unsigned long long get_l2_rop_drained() const { return m_l2_rop_drained; }
+  unsigned long long get_l2_rop_multi_cycles() const {
+    return m_l2_rop_multi_cycles;
+  }
+  unsigned long long get_l2_dram_reply_drained() const {
+    return m_l2_dram_reply_drained;
+  }
+  unsigned long long get_l2_dram_reply_multi_cycles() const {
+    return m_l2_dram_reply_multi_cycles;
   }
 
  private:

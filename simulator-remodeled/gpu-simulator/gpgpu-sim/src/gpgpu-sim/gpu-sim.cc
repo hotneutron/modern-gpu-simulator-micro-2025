@@ -930,6 +930,24 @@ void memory_config::reg_options(class OptionParser *opp) {
                          "real access()+MSHR so L2 hit-rate/DRAM work is invariant.",
                          "1");
 
+  option_parser_register(opp, "-gpgpu_l2_rop_drain_per_cycle", OPT_UINT32,
+                         &gpgpu_l2_rop_drain_per_cycle,
+                         "Opt9 Gate A: max sectors drained from the ROP delay queue "
+                         "into m_icnt_L2_queue per sub-partition per L2 tick. 1 = "
+                         "current behavior (1/tick serialization). 2 = HW 64B/cycle "
+                         "per slice. Fixed rop_latency is unchanged; only the drain "
+                         "throughput widens (timing-only, work invariant).",
+                         "1");
+
+  option_parser_register(opp, "-gpgpu_l2_dram_reply_drain_per_cycle", OPT_UINT32,
+                         &gpgpu_l2_dram_reply_drain_per_cycle,
+                         "Opt9 Gate B: max returned lines drained from m_dram_L2_queue "
+                         "into the L2 fill or the L2->icnt reply queue per sub-partition "
+                         "per L2 tick. 1 = current behavior. 2 = HW 64B/cycle per slice. "
+                         "The fill port is modeled M-wide (extra fill-port replenish) so "
+                         "it does not saturate. Timing-only, work invariant.",
+                         "1");
+
   option_parser_register(opp, "-l2_ideal", OPT_BOOL, &l2_ideal,
                          "Use a ideal L2 cache that always hit", "0");
   option_parser_register(opp, "-gpgpu_cache:dl2", OPT_CSTR,
@@ -2529,6 +2547,21 @@ gpgpu_sim::gpgpu_sim(const gpgpu_sim_config &config, gpgpu_context *ctx)
       logged_l2_admit_knob = true;
     }
   }
+  // Opt9 early boot confirmation (once): confirm the two L2 drain knobs are live.
+  {
+    static bool logged_l2_drain_knobs = false;
+    if (!logged_l2_drain_knobs &&
+        (m_memory_config->gpgpu_l2_rop_drain_per_cycle > 1 ||
+         m_memory_config->gpgpu_l2_dram_reply_drain_per_cycle > 1)) {
+      std::cerr << "[L2-ROP-DRAIN] gpgpu_l2_rop_drain_per_cycle = "
+                << m_memory_config->gpgpu_l2_rop_drain_per_cycle
+                << " ; [L2-DRAM-REPLY-DRAIN] gpgpu_l2_dram_reply_drain_per_cycle = "
+                << m_memory_config->gpgpu_l2_dram_reply_drain_per_cycle
+                << " (>1: multi-sector ROP/reply drain enabled; 2 = HW 64B/cycle slice)"
+                << std::endl;
+      logged_l2_drain_knobs = true;
+    }
+  }
   partiton_reqs_in_parallel = 0;
   partiton_reqs_in_parallel_total = 0;
   partiton_reqs_in_parallel_util = 0;
@@ -3741,6 +3774,27 @@ void gpgpu_sim::gpu_print_stat() {
         printf("L2_slice_admissions_p95 = %llu\n",
                nsp ? adm[(unsigned)(0.95 * (nsp - 1))] : 0);
         printf("L2_slice_admissions_max = %llu\n", nsp ? adm[nsp - 1] : 0);
+      }
+      // Opt9: per-sub-partition drain-lever firing (timing-neutral). Proves the two
+      // 1->N drain gates actually moved >1/tick (the direct analogue of Opt8's
+      // L2_admit_multi_cycles). If *_multi_cycles_total == 0 while the knob is >1,
+      // the widened drain was never used (valid null). See TMA_LATENCY_INJECTION_H100
+      // .md 4.11.8.
+      {
+        unsigned nsp = m_memory_config->m_n_mem_sub_partition;
+        unsigned long long rop_drained = 0, rop_multi = 0;
+        unsigned long long reply_drained = 0, reply_multi = 0;
+        for (unsigned i = 0; i < nsp; i++) {
+          rop_drained += m_memory_sub_partition[i]->get_l2_rop_drained();
+          rop_multi += m_memory_sub_partition[i]->get_l2_rop_multi_cycles();
+          reply_drained += m_memory_sub_partition[i]->get_l2_dram_reply_drained();
+          reply_multi +=
+              m_memory_sub_partition[i]->get_l2_dram_reply_multi_cycles();
+        }
+        printf("L2_rop_drained_total = %llu\n", rop_drained);
+        printf("L2_rop_multi_cycles_total = %llu\n", rop_multi);
+        printf("L2_dram_reply_drained_total = %llu\n", reply_drained);
+        printf("L2_dram_reply_multi_cycles_total = %llu\n", reply_multi);
       }
       double l2_elapsed_seconds =
           (double)(gpu_tot_sim_cycle + gpu_sim_cycle) * m_config.l2_period;

@@ -385,6 +385,16 @@ class memory_config {
   // goes through the real access()+MSHR+data_port, so L2 hit-rate / DRAM work is
   // invariant (timing-only rate calibration). See L2_SLICE_PARALLELISM_H100.md.
   unsigned gpgpu_l2_admit_sectors_per_cycle;
+  // Opt9 Gate A: max sectors moved ROP->m_icnt_L2_queue per sub-partition per
+  // L2-tick (the ROP delay-queue drain). Default 1 = current behavior. The fixed
+  // rop_latency is UNCHANGED; only the drain throughput widens. N=2 = HW 64B/cycle
+  // per slice. Timing-only; work invariant. See TMA_LATENCY_INJECTION_H100.md 4.11.8.
+  unsigned gpgpu_l2_rop_drain_per_cycle;
+  // Opt9 Gate B: max returned lines moved m_dram_L2_queue->{L2 fill | L2_icnt} per
+  // sub-partition per L2-tick (the DRAM->L2 reply drain). Default 1 = current
+  // behavior. The FILL port is modeled M-wide via replenish_fill_port_extra so it
+  // does not saturate. N=2 = HW 64B/cycle per slice. Timing-only; work invariant.
+  unsigned gpgpu_l2_dram_reply_drain_per_cycle;
   unsigned gpgpu_frfcfs_dram_sched_queue_size;
   unsigned gpgpu_dram_return_queue_size;
   enum dram_ctrl_t scheduler_type;
