@@ -724,15 +724,16 @@ void Subcore::issue(SM *shared_sm) {
             }
             if(!are_wait_barriers_ready) {
               is_any_waiting_in_wait_barrier = true;
-              // [NCU stall-taxonomy] split the WGMMA warpgroup wait (WARPGROUP.ARRIVE / .DEPBAR.LE)
-              // out of the generic mbarrier wait_barrier to match NCU `warpgroup_arrive`. The blocking
-              // head opcode string carries "WARPGROUP" for these ops (OP_WARPGROUP).
-              if(pI->get_extra_trace_instruction_info().get_op_code().find("WARPGROUP") != std::string::npos) {
-                is_any_waiting_in_warpgroup_arrive = true;
-              }
             }
             if(!are_traditional_scoreaboards_ready) {
               is_any_waiting_in_scoreboard = true;
+              // [NCU stall-taxonomy] split NCU `warpgroup_arrive` out of scoreboard stalls: the warp
+              // is RAW-blocked on a register that is a pending dst of an in-flight tensor (WGMMA) op.
+              // This is where a consumer waiting on a warpgroup-MMA result actually stalls (WGMMA is a
+              // tensor-FU op, so it surfaces as a scoreboard RAW, NOT an mbarrier wait). Read-only.
+              if(shared_sm->get_scoreboard()->checkTensorCollision_remodeling(sm_warp_id, pI)) {
+                is_any_waiting_in_warpgroup_arrive = true;
+              }
             }
             if(!is_write_available_result_queue_for_fixed_latency_available) {
               is_any_waiting_in_result_queue_full = true;

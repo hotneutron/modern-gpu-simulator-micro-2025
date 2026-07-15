@@ -77,6 +77,10 @@ class Scoreboard {
 
   bool checkCollision(unsigned wid, const inst_t *inst) const;
   bool checkCollision_remodeling(unsigned wid, const warp_inst_t *inst) const;
+  // [NCU stall-taxonomy] like checkCollision_remodeling, but the collision set is restricted to
+  // registers pending from an in-flight tensor (WGMMA) op — i.e. a RAW on a warpgroup-MMA result.
+  // Lets the issue stage split NCU `warpgroup_arrive` out of generic scoreboard stalls.
+  bool checkTensorCollision_remodeling(unsigned wid, const warp_inst_t *inst) const;
   bool pendingWrites(unsigned wid) const;
   void printContents() const;
   const bool islongop(unsigned warp_id, unsigned regnum);
@@ -94,6 +98,10 @@ class Scoreboard {
   std::vector<std::set<unsigned> > reg_table;
   // Register that depend on a long operation (global, local or tex memory)
   std::vector<std::set<unsigned> > longopregs;
+  // [NCU stall-taxonomy] Registers that are pending dsts of an in-flight tensor (WGMMA) op.
+  // Parallel to longopregs; lets the issue stage attribute a scoreboard stall to NCU
+  // `warpgroup_arrive` (waiting on a warpgroup MMA result) vs a plain RAW.
+  std::vector<std::set<unsigned> > tensoropregs;
 
   class gpgpu_t *m_gpu;
 };

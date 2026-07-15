@@ -69,6 +69,7 @@ Scoreboard::Scoreboard(unsigned sid, unsigned n_warps, class gpgpu_t* gpu, bool 
   // Initialize size of table
   reg_table.resize(n_warps);
   longopregs.resize(n_warps);
+  tensoropregs.resize(n_warps);  // [NCU stall-taxonomy] parallel to longopregs
 
   m_gpu = gpu;
 }
@@ -169,6 +170,11 @@ void Scoreboard::reserveRegisters_remodeling(const class warp_inst_t* inst) {
                          inst->warp_id(), final_reg_id);
           longopregs[inst->warp_id()].insert(final_reg_id);
         }
+        // [NCU stall-taxonomy] mark tensor (WGMMA) dsts so a later scoreboard stall on this reg
+        // can be attributed to NCU `warpgroup_arrive` (waiting on a warpgroup-MMA result).
+        if (inst->is_tensor_core_op()) {
+          tensoropregs[inst->warp_id()].insert(final_reg_id);
+        }
       }
     }
   }
@@ -197,6 +203,7 @@ void Scoreboard::releaseRegisters_remodeling(const class warp_inst_t* inst) {
                        inst->warp_id(), final_reg_id);
         releaseRegister(inst->warp_id(), final_reg_id);
         longopregs[inst->warp_id()].erase(final_reg_id);
+        tensoropregs[inst->warp_id()].erase(final_reg_id);  // [NCU stall-taxonomy]
       }
     }
   }
@@ -209,6 +216,7 @@ void Scoreboard::releaseRegisters(const class warp_inst_t* inst) {
                      inst->warp_id(), inst->out[r]);
       releaseRegister(inst->warp_id(), inst->out[r]);
       longopregs[inst->warp_id()].erase(inst->out[r]);
+      tensoropregs[inst->warp_id()].erase(inst->out[r]);  // [NCU stall-taxonomy]
     }
   }
 }
@@ -273,4 +281,29 @@ bool Scoreboard::checkCollision(unsigned wid, const class inst_t* inst) const {
 
 bool Scoreboard::pendingWrites(unsigned wid) const {
   return !reg_table[wid].empty();
+}
+
+// [NCU stall-taxonomy] Same operand-gathering as checkCollision_remodeling, but intersect against
+// tensoropregs (pending WGMMA dsts) instead of reg_table. True => the warp's head instruction has a
+// RAW on an in-flight warpgroup-MMA result => attribute the scoreboard stall to NCU `warpgroup_arrive`.
+bool Scoreboard::checkTensorCollision_remodeling(unsigned wid, const class warp_inst_t* inst) const {
+  std::set<int> inst_regs;
+
+  for(unsigned int i = 0; i < inst->get_extra_trace_instruction_info().get_num_operands(); i++) {
+    traced_operand& op = inst->get_extra_trace_instruction_info().get_operand(i);
+    TraceEnhancedOperandType op_type = get_reg_type_eval(op);
+    if(op.get_has_reg() && !check_is_reserved_regs_remodeling(op.get_operand_reg_number(), op_type, m_is_trace_mode)) {
+      for(unsigned int j = 0; j < get_number_of_uses_per_operand(inst->get_extra_trace_instruction_info(), op.get_operand_reg_number(), i, op_type); j++) {
+        unsigned int final_reg_id = translate_reg_to_global_id(op.get_operand_reg_number(), op_type) + j;
+        inst_regs.insert(final_reg_id);
+      }
+    }
+  }
+
+  std::set<int>::const_iterator it2;
+  for (it2 = inst_regs.begin(); it2 != inst_regs.end(); it2++)
+    if (tensoropregs[wid].find((unsigned)*it2) != tensoropregs[wid].end()) {
+      return true;
+    }
+  return false;
 }

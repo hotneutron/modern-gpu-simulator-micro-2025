@@ -1590,7 +1590,12 @@ void shader_core_stats::print_remodeling_stats(FILE *fout) {
   {
     unsigned long long ncu_selected      = m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_cycles_issue_stage_selected"]->get_value();
     unsigned long long ncu_not_selected  = m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_cycles_issue_stage_not_selected"]->get_value();
-    unsigned long long ncu_dispatch      = m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_cycles_issue_stage_stall_dispatch"]->get_value();
+    // dispatch_stall == issue-port busy (the winner could not be dispatched because its target
+    // pipe's issue port was occupied). NOT result_queue_full (that is mio_throttle). See
+    // .plan/NCU_STALL_TAXONOMY_METRICS_IMPL.md Finding #2 (bug-2 fix). The per-warp
+    // total_num_cycles_issue_stage_stall_dispatch counter (result_queue axis) is kept but no longer
+    // aliased to NCU dispatch_stall to avoid duplicating mio_throttle.
+    unsigned long long ncu_dispatch      = total_num_cycles_issue_stage_stall_issue_port_busy;
     unsigned long long ncu_wg_arrive     = m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_warpgroup_arrive"]->get_value();
     unsigned long long warps_eligible    = m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_warps_eligible_accumulator"]->get_value();
     unsigned long long fu_occ_sfu        = m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_cycles_issue_stage_stall_at_least_one_warp_with_fu_occupied_sfu"]->get_value();

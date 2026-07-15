@@ -180,6 +180,77 @@ frequency-independent); occupancy (matches HW); memory path (at floor both sides
 read `warpgroup_arrive` (#1) vs `not_selected`/`dispatch_stall` (#2) on the existing runs to size which
 suspect dominates, THEN design the async-WGMMA or dual-issue timing model with an NCU-anchored target.
 
+#### Measured result — NCU stall taxonomy: FWD K5 (Opt9+Metrics `.o39`, 2026-07-15)
+
+> Implementation, counter definitions, and the two mapping-bug fixes live in
+> [NCU_STALL_TAXONOMY_METRICS_IMPL.md](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/.plan/NCU_STALL_TAXONOMY_METRICS_IMPL.md). This section records **results only**.
+> HW = NCU `nv_reports/…full_rpt.csv`, FWD = `FlashAttnFwdSm` grid 132.
+
+**Bit-identity gate PASSED.** `.o38` (Opt9) and `.o39` (Opt9+Metrics) both = `gpu_sim_cycle 135,999`,
+**identical** — the always-on metrics changed no timing.
+
+**Scheduler scalars — sim vs HW (the head-to-head that matters).** These NCU metrics ARE in the HW
+export, so this is a direct comparison:
+
+| scheduler scalar | sim `.o39` (FWD) | HW NCU (FWD) | read |
+|---|---:|---:|---|
+| Issue Slots Busy | 34.96% | **45.03%** | sim issues on fewer cycles → the 2× cycle gap. |
+| Issued Warp / scheduler | 0.35 | **0.46** | same shape, sim lower. |
+| Eligible Warps / scheduler | 0.53 | **0.83** | HW keeps more warps eligible. |
+| No Eligible | 65.04% | **54.26%** | sim more often has nothing to issue. |
+| Active Warps / scheduler | ~3.2 | **3.28** | occupancy matches (not a warp-count problem). |
+| Warp Cyc / Issued Inst | ~9.1 | **7.16** | sim's per-issue stall depth ~1.28× HW. |
+
+**Sim stall taxonomy (full stack).** Denominator = `evaluated` 45,945,472; per-reason boolean-OR so
+reasons overlap. HW per-reason column is **N/A** — this NCU export contains Scheduler/Warp-State
+*scalars* but not the per-reason Warp-State breakdown (needs a `.ncu-rep` Warp-State detail export;
+tracked as a follow-up):
+
+| NCU reason | sim `.o39` (FWD) | HW NCU (FWD) | reads as |
+|---|---:|---:|---|
+| `selected` | 34.96% | 45.03%¹ | issued winner (== `issuing`; ¹ = HW Issue Slots Busy). |
+| **`not_selected`** | **17.90%** | N/A | ⭐ eligible-but-not-picked — the suspect-#2 signature, large. |
+| `long_scoreboard` (wait_barrier+tma_flush) | 12.74% | N/A | mbarrier / global-load dependency. |
+| `math_pipe_throttle` (sfu+sp_int_dp) | 11.05% | N/A | math exec pipe busy (FMA/ALU; `sfu`=0 until TODO-2, cost sits in `sp_int_dp`). |
+| `no_instructions` | 9.72% | N/A | frontend/L0I tail (fwd is frontend-tail bound). |
+| `wait` | 9.42% | N/A | fixed-latency dependency. |
+| `mma` (fu_occupied_tensor) | **5.65%** | N/A | ⭐ WGMMA tensor-pipe busy — suspect-#1 FU-busy signal. |
+| `sleeping` (yield fold) | 1.85% | N/A | — |
+| `dispatch_stall` | (re-measure)² | N/A | ² was mis-mapped in `.o39`; fixed, re-measure next run. |
+| `warpgroup_arrive` | (re-measure)² | N/A | ² was 0 in `.o39` (wrong mapping); fixed, re-measure next run. |
+| `barrier` | 0.08% | N/A | CTA barrier (tiny in fwd). |
+| `imc_miss`/`short_scoreboard` (l1c) | 0.0017% | N/A | const-cache ≈ 0. |
+
+Self-consistent: `selected` 16.06M + `not_selected` 8.22M = eligible 24.29M.
+
+**Finding (the payoff): suspect #2 is confirmed and large.** `not_selected = 17.90%` (sim) + the HW
+scalar gap (HW eligible 0.83 vs issued 0.46 ⇒ HW leaves ~0.37 eligible-unissued warps/sched/cycle, and
+sim leaves 0.53−0.35≈0.18) shows a real dual-issue opportunity. Combined with `mma`=5.65% (suspect #1),
+**the next timing lever is dual-issue**, async-WGMMA secondary.
+
+> ²`warpgroup_arrive`/`dispatch_stall` in `.o39` used the pre-fix mappings and are **not** trustworthy;
+> the corrected values will appear in the next post-`make clean` run (which must also re-confirm the
+> FWD bit-identity gate = 135,999).
+
+#### Measured result — NCU stall taxonomy: BWD K10 (Opt9+Metrics, run in progress)
+
+> HW = NCU `FlashAttnBwdSm` grid 384. Sim column filled when the bwd Opt9+Metrics run lands.
+
+**Scheduler scalars — sim vs HW:**
+
+| scheduler scalar | sim (BWD) | HW NCU (BWD) |
+|---|---:|---:|
+| Issue Slots Busy | _pending_ | **32.07%** |
+| Issued Warp / scheduler | _pending_ | **0.33** |
+| Eligible Warps / scheduler | _pending_ | **0.46** |
+| No Eligible | _pending_ | **67.17%** |
+| Active Warps / scheduler | _pending_ | **2.47** |
+| Warp Cyc / Issued Inst | _pending_ | **7.53** |
+
+**Sim stall taxonomy (BWD):** _pending run._ (bwd is expected to show a larger `long_scoreboard` /
+`warpgroup_arrive` share than fwd — the bwd NCU spike in CTA_SAMPLING §7.1 had `long_scoreboard` 21.9%,
+`barrier` 17.2%, `warpgroup_arrive` 5.7%.)
+
 ### Deferred Opts
 
 Optimizations that were investigated and consciously **parked** because, although they fix a real

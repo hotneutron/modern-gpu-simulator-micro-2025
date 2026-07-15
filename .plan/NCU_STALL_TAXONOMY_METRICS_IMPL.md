@@ -276,3 +276,85 @@ run `make clean` first** (project rule for header edits). Build required either 
   fabricate the fold. Decide whether to add global-load RAW tracking as a follow-up.
 - **R4 — null-key crash** if a counter is incremented but not registered in `gpu-sim.cc`. Mitigated by
   the 3-site checklist; grep every new key string appears in all three files before building.
+
+---
+
+## Post-implementation — measured findings + mapping-bug fixes (2026-07-15)
+
+First measured run (FWD K5 `.o39`, on top of Opt9) confirmed the build and **passed the bit-identity
+gate** (`.o38` == `.o39` == `gpu_sim_cycle 135,999`). Results (scalars + stack) are recorded in
+[FA3_progress.md](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/.result/FA3_progress.md) "Measured result — FWD K5". The run also exposed **two mapping bugs** in the
+first-cut counters. Both are **metrics-only** (no timing-model change; bit-identity preserved).
+
+### Bug 1 — `warpgroup_arrive` was in the wrong bucket AND matched the wrong string
+
+**Symptom:** `.o39` reported `warpgroup_arrive = 0.00%`.
+
+**Root cause (two errors):**
+1. Wrong bucket: the split was placed inside the **`wait_barrier`** (mbarrier) stall. But WGMMA is a
+   tensor-**FU** op — a consumer waiting on a WGMMA result stalls on a **scoreboard RAW**, not an
+   mbarrier wait. So the split could never fire from `wait_barrier`.
+2. Wrong string: it matched the literal `"WARPGROUP"` in the head opcode, whereas the tracer names
+   tensor ops `WGMMA`/`HGMMA`/… (`is_warpgroup_tensor_opcode`, [traced_instruction.cc:54-61](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/util/traces_enhanced/src/traced_instruction.cc#L54-L61)).
+
+**Fix (scoreboard-based — the correct design).** Track which pending destination registers belong to an
+in-flight tensor op, then attribute a scoreboard stall to `warpgroup_arrive` when the stalling warp's
+head instruction has a RAW against one of those registers:
+
+| site | change |
+|---|---|
+| [scoreboard.h](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/scoreboard.h) | add `std::vector<std::set<unsigned>> tensoropregs;` (parallel to `longopregs`) + declare `checkTensorCollision_remodeling()`. **Header edit ⇒ `make clean` required.** |
+| [scoreboard.cc](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/scoreboard.cc) | `tensoropregs.resize(n_warps)` in ctor; on reserve, `if (inst->is_tensor_core_op()) tensoropregs[wid].insert(reg)` ([:180-182](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/scoreboard.cc#L180-L182)); erase symmetrically in both `releaseRegisters_remodeling` and `releaseRegisters`; new `checkTensorCollision_remodeling()` = same operand-gather as `checkCollision_remodeling` but intersect against `tensoropregs` ([:294-314](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/scoreboard.cc#L294-L314)). |
+| [subcore.cc](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/subcore.cc) | move the split into the `!are_traditional_scoreaboards_ready` branch; set `warpgroup_arrive` when `get_scoreboard()->checkTensorCollision_remodeling(sm_warp_id, pI)` ([:728-737](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/subcore.cc#L728-L737)). Remove the old `"WARPGROUP"` string match. |
+
+Detection uses `inst->is_tensor_core_op()` (== `op == TENSOR_CORE_OP`, [abstract_hardware_model.h:1193](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/abstract_hardware_model.h#L1193)),
+which the parser already sets — more robust than opcode-string matching. `warpgroup_arrive` is now a
+real suspect-#1 signal, **orthogonal to `mma`** (`fu_occupied_tensor`, FU-busy): `mma` = tensor pipe is
+busy; `warpgroup_arrive` = a consumer is RAW-blocked on a not-yet-retired WGMMA result. Together they
+bound the async-WGMMA opportunity.
+
+**Bit-identity note.** `tensoropregs` is written only in reserve/release and read only by the new
+observe-only `checkTensorCollision_remodeling` (never gates issue). So it is timing-neutral — but the
+next post-`make clean` run must re-confirm FWD = 135,999 (and bwd = its Opt9 value) since a header
+changed.
+
+### Bug 2 — `dispatch_stall` duplicated `mio_throttle`
+
+**Symptom:** `.o39` had `dispatch_stall == mio_throttle == 211,152` (identical).
+
+**Root cause:** both were mapped to `waiting_result_queue_full`. The real issue-port backpressure signal
+`stall_issue_port_busy` (472,562) was left unused.
+
+**Fix:** in [shader.cc](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/shader.cc#L1598) map `dispatch_stall` ← `total_num_cycles_issue_stage_stall_issue_port_busy`;
+`mio_throttle` keeps `result_queue_full`. The per-warp `..._stall_dispatch` counter (result-queue axis)
+is retained but no longer aliased to NCU `dispatch_stall`.
+
+### Resolved — `math_pipe_throttle` mapping is correct as-is (`sfu + sp_int_dp`)
+
+Re-examined after `.o39` showed `sfu = 0`, `sp_int_dp = 11.05%`. **Decision: keep the mapping
+(`math_pipe_throttle` ← `fu_occupied_sfu + fu_occupied_sp_int_dp`); no code change.** Rationale:
+
+- NCU `math_pipe_throttle` = "a **math execution pipe** (FMA / ALU / FP64 / XU-transcendental) was busy
+  so the warp could not issue." It is deliberately distinct from `mma` (tensor pipe) and `tex_throttle`.
+- The sim's pipe classification ([subcore.cc:685-690](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/subcore.cc#L685-L690)) is exactly this partition:
+  `sp_int_dp` = `SP_OP/HALF_OP/INTP_OP/DP_OP/UNIFORM_OP` (the FMA/ALU/FP64 math pipes),
+  `sfu` = `SFU_OP` (the XU/MUFU transcendental pipe). Their sum **is** NCU's math-pipe set.
+  `tensor` → `mma` (excluded, correct) and `other` (LDST etc., 0.86%) → not a math pipe (excluded,
+  correct). So `sfu + sp_int_dp` is the accurate mapping; the earlier "generic ALU may not belong"
+  worry was wrong — FMA/ALU *is* the math pipe NCU counts.
+- **Why `sfu = 0` (not a mapping bug):** transcendental cost is not being routed to the SFU pipe because
+  the config sets `-ptx_opcode_latency_sfu` but not `-trace_opcode_latency_initiation_sfu`, so in trace
+  mode `exp`/MUFU falls back to the FP-add pipe and lands in `sp_int_dp`. That is the separate **TODO-2**
+  (SFU under-cost) tracked in `.result/FA3_progress.md`; it is a *timing* fix (would break bit-identity)
+  and is out of scope for the observe-only taxonomy. The current mapping still totals the math-pipe
+  stall correctly (it is just all attributed to `sp_int_dp` until TODO-2 is done, at which point part of
+  it shifts into `sfu` — the **sum stays the NCU `math_pipe_throttle` value** either way).
+
+Net: the NCU-named line `math_pipe_throttle = sfu + sp_int_dp` is correct and stays. No `make clean`.
+
+### Follow-up — HW per-reason export
+
+The NCU CSV export (`nv_reports/…full_rpt.csv`) contains Scheduler/Warp-State **scalars** (Issue Slots
+Busy, Eligible/Issued/No-Eligible Warps Per Scheduler, Warp Cyc/Issued Inst) but **not** the per-reason
+Warp-State stall breakdown. To fill the HW per-reason column in the FA3_progress tables, re-export the
+`.ncu-rep` with the Warp State Statistics detail (the `smsp__average_warps_issue_stalled_*` group).
