@@ -184,7 +184,7 @@ suspect dominates, THEN design the async-WGMMA or dual-issue timing model with a
 
 > Implementation, counter definitions, and the two mapping-bug fixes live in
 > [NCU_STALL_TAXONOMY_METRICS_IMPL.md](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/.plan/NCU_STALL_TAXONOMY_METRICS_IMPL.md). This section records **results only**.
-> HW = NCU `nv_reports/…full_rpt.csv`, FWD = `FlashAttnFwdSm` grid 132.
+> HW source = NCU report `/home/jihyun/modern-gpu-simulator-micro-2025/nv_reports/h100/flashattn-fa3-bf16-bwd-causal-b1-s2048-hd64-nh24_full_rpt.ncu-rep`, kernel 5 (`FlashAttnFwdSm90`, grid 132). Scheduler scalars come from the CSV export; per-reason HW shares come from the `.ncu-rep` Warp-State / ground-truth extraction.
 
 **Bit-identity gate PASSED.** `.o38` (Opt9) and `.o39` (Opt9+Metrics) both = `gpu_sim_cycle 135,999`,
 **identical** — the always-on metrics changed no timing.
@@ -192,34 +192,38 @@ suspect dominates, THEN design the async-WGMMA or dual-issue timing model with a
 **Scheduler scalars — sim vs HW (the head-to-head that matters).** These NCU metrics ARE in the HW
 export, so this is a direct comparison:
 
-| scheduler scalar | sim `.o39` (FWD) | HW NCU (FWD) | read |
-|---|---:|---:|---|
-| Issue Slots Busy | 34.96% | **45.03%** | sim issues on fewer cycles → the 2× cycle gap. |
-| Issued Warp / scheduler | 0.35 | **0.46** | same shape, sim lower. |
-| Eligible Warps / scheduler | 0.53 | **0.83** | HW keeps more warps eligible. |
-| No Eligible | 65.04% | **54.26%** | sim more often has nothing to issue. |
-| Active Warps / scheduler | ~3.2 | **3.28** | occupancy matches (not a warp-count problem). |
-| Warp Cyc / Issued Inst | ~9.1 | **7.16** | sim's per-issue stall depth ~1.28× HW. |
+| scheduler scalar | sim `.o39` (FWD) | HW NCU (FWD) | HW NCU metric (verbatim source) | read |
+|---|---:|---:|---|---|
+| Issue Slots Busy | 34.96% | **45.74%** | `smsp__issue_active.avg.pct_of_peak_sustained_active` | sim issues on fewer cycles → the 2× cycle gap. |
+| Issued Warp / scheduler | 0.35 | **0.46** | `smsp__issue_active.avg.per_cycle_active` | same shape, sim lower. |
+| Eligible Warps / scheduler | 0.53 | **0.83** | `smsp__warps_eligible.avg.per_cycle_active` | HW keeps more warps eligible. |
+| No Eligible | 65.04% | **54.26%** | derived (`1 − issue_active pct`-class) | sim more often has nothing to issue. |
+| Active Warps / scheduler | ~3.2 | **3.28** | `smsp__warps_active.avg.per_cycle_active` | occupancy matches (not a warp-count problem). |
+| Warp Cyc / Issued Inst | ~9.1 | **7.16** | `smsp__average_warp_latency_per_inst_issued.ratio` | sim's per-issue stall depth ~1.28× HW. |
+| Elapsed / SM-Active / SMSP-Active cyc | — | **67,838 / 61,147 / 60,209** | `sm__cycles_elapsed.avg` / `sm__cycles_active.avg` / `smsp__cycles_active.avg` | HW cycle anchors. |
 
 **Sim stall taxonomy (full stack).** Denominator = `evaluated` 45,945,472; per-reason boolean-OR so
-reasons overlap. HW per-reason column is **N/A** — this NCU export contains Scheduler/Warp-State
-*scalars* but not the per-reason Warp-State breakdown (needs a `.ncu-rep` Warp-State detail export;
-tracked as a follow-up):
+reasons overlap. HW per-reason shares below are from the same `.ncu-rep` (kernel 5 Warp-State
+ground-truth extraction):
 
-| NCU reason | sim `.o39` (FWD) | HW NCU (FWD) | reads as |
-|---|---:|---:|---|
-| `selected` | 34.96% | 45.03%¹ | issued winner (== `issuing`; ¹ = HW Issue Slots Busy). |
-| **`not_selected`** | **17.90%** | N/A | ⭐ eligible-but-not-picked — the suspect-#2 signature, large. |
-| `long_scoreboard` (wait_barrier+tma_flush) | 12.74% | N/A | mbarrier / global-load dependency. |
-| `math_pipe_throttle` (sfu+sp_int_dp) | 11.05% | N/A | math exec pipe busy (FMA/ALU; `sfu`=0 until TODO-2, cost sits in `sp_int_dp`). |
-| `no_instructions` | 9.72% | N/A | frontend/L0I tail (fwd is frontend-tail bound). |
-| `wait` | 9.42% | N/A | fixed-latency dependency. |
-| `mma` (fu_occupied_tensor) | **5.65%** | N/A | ⭐ WGMMA tensor-pipe busy — suspect-#1 FU-busy signal. |
-| `sleeping` (yield fold) | 1.85% | N/A | — |
-| `dispatch_stall` | (re-measure)² | N/A | ² was mis-mapped in `.o39`; fixed, re-measure next run. |
-| `warpgroup_arrive` | (re-measure)² | N/A | ² was 0 in `.o39` (wrong mapping); fixed, re-measure next run. |
-| `barrier` | 0.08% | N/A | CTA barrier (tiny in fwd). |
-| `imc_miss`/`short_scoreboard` (l1c) | 0.0017% | N/A | const-cache ≈ 0. |
+| NCU reason | sim `.o39` (FWD) | HW NCU (FWD) | HW cyc/inst (verbatim) | HW NCU metric (`smsp__average_warps_issue_stalled_*_per_issue_active.ratio`) | reads as |
+|---|---:|---:|---:|---|---|
+| `selected` | 34.96% | 45.03%¹ | 0.9995 | `..._selected_...` | issued winner (== `issuing`; ¹ = HW Issue Slots Busy). |
+| **`not_selected`** | **17.90%** | **11.4%** | 0.8204 | `..._not_selected_...` | ⭐ eligible-but-not-picked — the suspect-#2 signature, large. |
+| `long_scoreboard` (wait_barrier+tma_flush) | 12.74% | **9.8%** | 0.7003 | `..._long_scoreboard_...` | mbarrier / global-load dependency. |
+| `math_pipe_throttle` (sfu+sp_int_dp) | 11.05% | **3.2%** | 0.2288 | `..._math_pipe_throttle_...` | math exec pipe busy (FMA/ALU; `sfu`=0 until TODO-2, cost sits in `sp_int_dp`). |
+| `mio_throttle` | — | **6.4%** | 0.4565 | `..._mio_throttle_...` | MIO (SFU/shared/LSU) input-throttle; not folded into `math_pipe_throttle` on HW. |
+| `no_instructions` | 9.72% | **2.4%** | 0.1691 | `..._no_instruction_...` | frontend/L0I tail (fwd is frontend-tail bound). |
+| `wait` | 9.42% | **19.0%** | 1.3629 | `..._wait_...` | fixed-latency dependency. |
+| `mma` (fu_occupied_tensor) | **5.65%** | **1.4%** | 0.0969 | `..._gmma_...` | ⭐ WGMMA tensor-pipe busy — suspect-#1 FU-busy signal. |
+| `sleeping` (yield fold) | 1.85% | **3.1%** | 0.2232 | `..._sleeping_...` | — |
+| `dispatch_stall` | (re-measure)² | **11.0%** | 0.7874 | `..._dispatch_stall_...` | ² sim `.o39` mapping was wrong; HW already shows this is large. |
+| `warpgroup_arrive` | (re-measure)² | **1.7%**³ | 65 samples | `smsp__pcsamp_warps_issue_stalled_warpgroup_arrive` (³ PC-sampling family, not the `average_..._per_issue_active` one) | ² sim `.o39` mapping was wrong; ³ WGMMA `wgmma.wait_group` producer-arrive wait — small on fwd. |
+| `barrier` | 0.08% | **10.9%** | 0.7817 | `..._barrier_...` | CTA / named barrier side. |
+| `imc_miss`/`short_scoreboard` (l1c) | 0.0017% | **2.2% / 4.6%** | 0.1563 / 0.3298 | `..._imc_miss_...` / `..._short_scoreboard_...` | HW exposes both `imc_miss` and `short_scoreboard`; sim's current `l1c` line is only the const-cache sliver. |
+| `branch_resolving` | — | **0.9%** | 0.0612 | `..._branch_resolving_...` | branch-target resolve wait. |
+| `misc` / `drain` | — | **0.0% / 0.0%** | 0.0018 / 0.0007 | `..._misc_...` / `..._drain_...` | negligible. |
+| `membar` / `lg_throttle` / `tex_throttle` | — | **0.0%** | 0.0000 | `..._membar_/_lg_throttle_/_tex_throttle_...` | zero on this kernel. |
 
 Self-consistent: `selected` 16.06M + `not_selected` 8.22M = eligible 24.29M.
 
@@ -231,25 +235,62 @@ sim leaves 0.53−0.35≈0.18) shows a real dual-issue opportunity. Combined wit
 > ²`warpgroup_arrive`/`dispatch_stall` in `.o39` used the pre-fix mappings and are **not** trustworthy;
 > the corrected values will appear in the next post-`make clean` run (which must also re-confirm the
 > FWD bit-identity gate = 135,999).
+>
+> ³**On `warpgroup_arrive` (why it was earlier marked `—`).** It **does** exist in HW, but only in the
+> **PC-sampling** metric family (`smsp__pcsamp_warps_issue_stalled_warpgroup_arrive`), NOT in the
+> `smsp__average_warps_issue_stalled_*_per_issue_active.ratio` family the rest of this table's HW
+> `cyc/inst` column is read from — that average family simply has no `warpgroup_arrive` member. So its
+> HW share (1.7% fwd) is a **sample-count %** of the pcsamp total (65 / 3,925), on a slightly different
+> normalization than the cyc/inst rows (the two agree to ~0.5pp: e.g. pcsamp `wait` 19.5% vs
+> average-family 19.0%). It captures the WGMMA producer waiting at `wgmma.wait_group`.
 
 #### Measured result — NCU stall taxonomy: BWD K10 (Opt9+Metrics, run in progress)
 
-> HW = NCU `FlashAttnBwdSm` grid 384. Sim column filled when the bwd Opt9+Metrics run lands.
+> HW source = NCU report `/home/jihyun/modern-gpu-simulator-micro-2025/nv_reports/h100/flashattn-fa3-bf16-bwd-causal-b1-s2048-hd64-nh24_full_rpt.ncu-rep`, kernel 10 (`FlashAttnBwdSm90`, grid 384). Sim column filled when the bwd Opt9+Metrics run lands.
 
 **Scheduler scalars — sim vs HW:**
 
-| scheduler scalar | sim (BWD) | HW NCU (BWD) |
-|---|---:|---:|
-| Issue Slots Busy | _pending_ | **32.07%** |
-| Issued Warp / scheduler | _pending_ | **0.33** |
-| Eligible Warps / scheduler | _pending_ | **0.46** |
-| No Eligible | _pending_ | **67.17%** |
-| Active Warps / scheduler | _pending_ | **2.47** |
-| Warp Cyc / Issued Inst | _pending_ | **7.53** |
+| scheduler scalar | sim (BWD) | HW NCU (BWD) | HW NCU metric (verbatim source) |
+|---|---:|---:|---|
+| Issue Slots Busy | _pending_ | **32.83%** | `smsp__issue_active.avg.pct_of_peak_sustained_active` |
+| Issued Warp / scheduler | _pending_ | **0.33** | `smsp__issue_active.avg.per_cycle_active` |
+| Eligible Warps / scheduler | _pending_ | **0.46** | `smsp__warps_eligible.avg.per_cycle_active` |
+| No Eligible | _pending_ | **67.17%** | derived (`1 − issue_active pct`-class) |
+| Active Warps / scheduler | _pending_ | **2.47** | `smsp__warps_active.avg.per_cycle_active` |
+| Warp Cyc / Issued Inst | _pending_ | **7.53** | `smsp__average_warp_latency_per_inst_issued.ratio` |
+| Elapsed / SM-Active / SMSP-Active cyc | _pending_ | **130,641 / 118,089 / 115,328** | `sm__cycles_elapsed.avg` / `sm__cycles_active.avg` / `smsp__cycles_active.avg` |
 
-**Sim stall taxonomy (BWD):** _pending run._ (bwd is expected to show a larger `long_scoreboard` /
-`warpgroup_arrive` share than fwd — the bwd NCU spike in CTA_SAMPLING §7.1 had `long_scoreboard` 21.9%,
-`barrier` 17.2%, `warpgroup_arrive` 5.7%.)
+**Stall taxonomy — sim pending, HW already extracted from the `.ncu-rep`:**
+
+| NCU reason | sim (BWD) | HW NCU (BWD) | HW cyc/inst (verbatim) | HW NCU metric (`smsp__average_warps_issue_stalled_*_per_issue_active.ratio`) | reads as |
+|---|---:|---:|---:|---|---|
+| `selected` | _pending_ | 32.07%¹ | 1.0000 | `..._selected_...` | issued winner (¹ = HW Issue Slots Busy). |
+| `not_selected` | _pending_ | **5.4%** | 0.4051 | `..._not_selected_...` | eligible-but-not-picked. |
+| `long_scoreboard` | _pending_ | **19.8%** | 1.4915 | `..._long_scoreboard_...` | TMA / global-memory data-arrival latency. |
+| `math_pipe_throttle` | _pending_ | **1.2%** | 0.0917 | `..._math_pipe_throttle_...` | non-tensor math-pipe busy. |
+| `mio_throttle` | _pending_ | **6.3%** | 0.4744 | `..._mio_throttle_...` | MIO (SFU/shared/LSU) input-throttle. |
+| `no_instructions` | _pending_ | **1.6%** | 0.1150 | `..._no_instruction_...` | frontend / ibuffer empty. |
+| `wait` | _pending_ | **10.4%** | 0.7839 | `..._wait_...` | fixed-latency dependency. |
+| `mma` | _pending_ | **5.3%** | 0.3981 | `..._gmma_...` | WGMMA tensor-pipe wait. |
+| `sleeping` | _pending_ | **4.4%** | 0.3284 | `..._sleeping_...` | warp-specialization producer idle. |
+| `dispatch_stall` | _pending_ | **4.5%** | 0.3376 | `..._dispatch_stall_...` | dispatch-side contention. |
+| `warpgroup_arrive` | _pending_ | **5.7%**³ | 436 samples | `smsp__pcsamp_warps_issue_stalled_warpgroup_arrive` (³ PC-sampling family, not the `average_..._per_issue_active` one) | ³ WGMMA `wgmma.wait_group` producer-arrive wait — **6th-largest bwd stall**, notable. |
+| `barrier` | _pending_ | **17.4%** | 1.3131 | `..._barrier_...` | mbarrier / named-barrier sync. |
+| `imc_miss`/`short_scoreboard` (l1c) | _pending_ | **1.3% / 8.5%** | 0.0944 / 0.6429 | `..._imc_miss_...` / `..._short_scoreboard_...` | HW exposes both `imc_miss` and `short_scoreboard`; sim fill waits when the run lands. |
+| `branch_resolving` | _pending_ | **0.8%** | 0.0602 | `..._branch_resolving_...` | branch-target resolve wait. |
+| `misc` / `drain` | _pending_ | **0.0% / 0.0%** | 0.0019 / 0.0014 | `..._misc_...` / `..._drain_...` | negligible. |
+| `membar` / `lg_throttle` / `tex_throttle` | _pending_ | **0.0%** | 0.0000 | `..._membar_/_lg_throttle_/_tex_throttle_...` | zero on this kernel. |
+
+The bwd sim run is still pending, but the HW column above is now grounded in the same kernel-10
+`.ncu-rep` (grid `(384, 1, 1)` = `FlashAttnBwdSm90`, re-extracted 2026-07-15 via
+`ncu --import <rpt> --page raw --csv`). The per-reason HW `% of warp cyc` = `cyc/inst ÷ 7.54`, where
+7.54 = Σ(all reasons) ≈ Warp-Cyc-per-Issued-Inst (7.53) and `selected` ≈ 1.0 is the issued winner.
+
+> ³**On `warpgroup_arrive`.** Same caveat as fwd: it lives **only** in the PC-sampling family
+> (`smsp__pcsamp_warps_issue_stalled_warpgroup_arrive`), not the `average_..._per_issue_active.ratio`
+> family the other rows use, so its 5.7% is a **sample-count %** of the pcsamp total (436 / 7,613).
+> Unlike fwd it is **large on bwd** (6th place, > `not_selected` / `dispatch_stall`) — the WGMMA
+> producer often waits at `wgmma.wait_group`, consistent with bwd's heavier tensor pipeline.
 
 ### Deferred Opts
 
