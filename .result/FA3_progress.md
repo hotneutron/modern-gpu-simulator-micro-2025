@@ -35,66 +35,67 @@ To keep this file easy to extend, use the following update pattern whenever a ne
 | Opt 6 | TMA real base + CTA-indexed tile spread (M2/M2.5) | Replace synthetic `(transfer_uid<<20)` address with the real per-site GMEM base + per-CTA tile offset, so L2 locality matches HW | 145,855 cycles (2.15x vs HW, **-2.6% vs Opt 5**). `L2_TMA_true_hit_rate` 0.9854 → **0.9461** (HW 0.6958). fwd `.o31`. This is an **accuracy baseline** (no-fake-wins tradeoff), not a targeted cycle opt — it is the trustworthy baseline that Opt 7 builds on | 290,572 cycles (2.19x vs HW, **+20.4% vs Opt 5** — accuracy tradeoff). `L2_TMA_true_hit_rate` 0.9785 → **0.8718** (HW 0.8226, on target). bwd `.o14` | Done (accuracy prerequisite; enabled Opt 7) |
 | Opt 7 | TMA queue/interconnect calibration (inject + reply) | HW-calibrated per-SM 4 sector/clk drain on both inject and reply paths: `-icnt_grant_passes_per_cycle 4` + `-gpgpu_icnt_to_l2_pop_per_cycle 4` (inject) + `-gpgpu_l2_reply_drain_per_cycle 4` + `-gpgpu_cluster_reply_eject_per_cycle 4` (reply), paired so no 1/tick choke remains. Timing-only (work invariant). | 138,021 cycles (2.04x vs HW, **-5.4% vs Opt 6**). fwd `.o35`. `L2_TMA_true_hit_rate` 0.9456 (unchanged → work invariant). | 250,026 cycles (1.88x vs HW, **-13.9% vs Opt 6**). bwd `.o18`. `L2_TMA_true_hit_rate` 0.8688 (unchanged). `gpu_stall_icnt2sh` 1.82M→5.8K, `L2_TMA_output_full` 1.39M→441. | Done. TMA queue tuning now **exhausted** — every queue stage at noise floor; next wall is `ROP_DELAY` (fixed-latency), see Ongoing. |
 | Opt 8 | L2 slice parallelism (admission-rate + balanced slice hash) | Part 1: `-gpgpu_l2_admit_sectors_per_cycle 2` (HW 64B/cycle/slice). Part 2: `-gpgpu_l2_slice_balanced_hash 1` (SplitMix64 hash removes the `ipoly%80` 2:1 spatial imbalance from the 40-channel non-2^n config). Timing-only (work invariant). | 137,053 cycles (2.02x vs HW, **-0.7% vs Opt 7**). fwd `.o37`. `L2_TMA_true_hit_rate` 0.9453 (unchanged). Correctly a near no-op — fwd's TMA path was already at floor (ROP_DELAY 126≈fixed 100); its bottleneck is frontend tail + hit-rate over-model, not the TMA queue. | 234,665 cycles (**1.77x** vs HW, **-6.1% vs Opt 7**). bwd `.o20`. `L2_TMA_true_hit_rate` 0.8688 (unchanged). **Part 2 did the heavy lifting**: slice imbalance removed (util p50≈max), ROP_DELAY 1,483→558 (-62%), `gpu_stall_dramfull` 137K→0. | Done. Placement bias fixed; residual bwd wall is per-transfer temporal-burst / fixed-overhead (see Ongoing). |
+| Opt 9 | L2 sub-partition drain widening (ROP-drain + DRAM-reply-drain) | Two symmetric 1-sector/tick L2 gates, each its own knob: `-gpgpu_l2_rop_drain_per_cycle 2` (Gate A, REQUEST: ROP delay-queue→m_icnt_L2_queue) + `-gpgpu_l2_dram_reply_drain_per_cycle 2` (Gate B, REPLY: m_dram_L2_queue→L2 fill/L2_icnt; fill port modeled M-wide). Fixed latencies unchanged; timing-only (work invariant). | 135,999 cycles (2.01x vs HW, **-0.8% vs Opt 8**). fwd `.o38`. `L2_TMA_true_hit_rate` 0.9455 (unchanged). Small (fwd still frontend-tail bound). | 215,895 cycles (**1.62x** vs HW, **-8.0% vs Opt 8**). bwd `.o21`. `L2_TMA_true_hit_rate` 0.8682 (unchanged). **Unlocked Opt 8**: `L2_admit_per_active_cycle` 1.00→**1.93** (the 2-wide bank was starved by the 1/tick ROP feed); ROP_DELAY 558→**164** (-71%), `averagemflatency` 692→369. | Done. Opt 8+9 were a matched pair. Residual now spread across ROP(45%)+inject(37%)+reply(12.5%); no single 1/tick gate dominates. |
 
 ### Simulator Cycle Breakdown
 
 #### FA3 fwd - top-level simulator breakdown
 
-| Class | Init | Opt 1 (`rop=100`) | Opt 2 (BAR impl) | Opt 3 (MEMBAR) | Opt 4 (prefetch, sb=4) | Opt 5 (eager-promote) | Opt 6 (TMA real base) | Opt 7 (queue calib) | Opt 8 (slice parallelism) | Note |
-|---|---|---|---|---|---|---|---|---|---|---|
-| `sim_cycle` | — | 220,024 | 162,582 | 158,990 | 155,765 | 149,727 | 145,855 | 138,021 | 137,053 | Opt 7 = `.o35`. Opt 8 = `.o37` (admission=2 + balanced slice hash; -0.7% vs Opt 7, near no-op — fwd TMA path already at floor). |
-| `no_warps_ready` | — | 64.02% | 23.83% | 20.98% | 26.81% | 27.32% | 27.93% | 29.51% | 29.14% | Roughly flat vs Opt 7 (fwd unaffected). |
-| `issuing` | — | 14.56% | 21.17% | 24.05% | 31.18% | 31.19% | 32.30% | 34.75% | 34.77% | Flat. |
-| `next_stage_not_available` | — | 11.40% | 15.25% | 17.26% | 22.45% | 22.46% | 23.23% | 24.90% | 24.96% | Flat. |
-| `no_valid_instruction` | — | 9.52% | 39.12% | 37.01% | 18.63% | 18.11% | 15.59% | 9.81% | 10.10% | Frontend tail (`nv_ibuffer_empty` 12.5%) is fwd's real residual, not the TMA queue. |
-| `issue_port_busy` | — | 0.50% | 0.63% | 0.71% | 0.92% | 0.92% | 0.95% | 1.02% | 1.02% | |
-| `sum` | — | 100.00% | 100.00% | 100.00% | 100.00% | 100.00% | 100.00% | 100.00% | 100.00% | |
+| Class | Init | Opt 1 (`rop=100`) | Opt 2 (BAR impl) | Opt 3 (MEMBAR) | Opt 4 (prefetch, sb=4) | Opt 5 (eager-promote) | Opt 6 (TMA real base) | Opt 7 (queue calib) | Opt 8 (slice parallelism) | Opt 9 (drain widening) | Note |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| `sim_cycle` | — | 220,024 | 162,582 | 158,990 | 155,765 | 149,727 | 145,855 | 138,021 | 137,053 | 135,999 | Opt 8 = `.o37`. Opt 9 = `.o38` (ROP+reply drain 1→2; -0.8% vs Opt 8, still frontend-tail bound). |
+| `no_warps_ready` | — | 64.02% | 23.83% | 20.98% | 26.81% | 27.32% | 27.93% | 29.51% | 29.14% | 29.22% | Flat (fwd unaffected). |
+| `issuing` | — | 14.56% | 21.17% | 24.05% | 31.18% | 31.19% | 32.30% | 34.75% | 34.77% | 34.96% | Flat. |
+| `next_stage_not_available` | — | 11.40% | 15.25% | 17.26% | 22.45% | 22.46% | 23.23% | 24.90% | 24.96% | 25.07% | Flat. |
+| `no_valid_instruction` | — | 9.52% | 39.12% | 37.01% | 18.63% | 18.11% | 15.59% | 9.81% | 10.10% | 9.72% | Frontend tail (`nv_ibuffer_empty` ~12%) is fwd's real residual. |
+| `issue_port_busy` | — | 0.50% | 0.63% | 0.71% | 0.92% | 0.92% | 0.95% | 1.02% | 1.02% | 1.03% | |
+| `sum` | — | 100.00% | 100.00% | 100.00% | 100.00% | 100.00% | 100.00% | 100.00% | 100.00% | 100.00% | |
 
 #### FA3 fwd - inner stall / wait breakdown
 
-| Wait reason | Init | Opt 1 (`rop=100`) | Opt 2 (BAR impl) | Opt 3 (MEMBAR) | Opt 4 (prefetch, sb=4) | Opt 5 (eager-promote) | Opt 6 (TMA real base) | Opt 7 (queue calib) | Opt 8 (slice parallelism) | Note |
-|---|---|---|---|---|---|---|---|---|---|---|
-| `inst_barrier` | — | 56.09% | 9.09% | 0.05% | 0.07% | 0.07% | 0.07% | 0.08% | 0.08% | Negligible. |
-| `wait_barrier` | — | 6.64% | 8.07% | 9.01% | 11.98% | 12.58% | 12.66% | 13.18% | 12.69% | mbarrier-style wait. |
-| `tma_axis` | — | 62.73% | 17.16% | 9.06% | 12.05% | 12.65% | 12.73% | 13.25% | 12.77% | Grouped TMA-side stall share. See note [1] below. |
-| `non_tma_axis` | — | 17.80% | 17.34% | 19.07% | 24.10% | 24.07% | 24.90% | 26.59% | 26.93% | Execution/resource-side waits (fwd's residual). |
-| `fu_occupied` | — | 11.83% | 9.91% | 10.91% | 13.53% | 13.50% | 13.99% | 14.98% | 15.13% | Present in `.o37`. |
-| `stall_count` | — | 5.00% | 5.97% | 6.56% | 8.47% | 8.48% | 8.75% | 9.31% | 9.45% | Present in `.o37`. |
-| `tma_flush` | — | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | fwd is load-only. |
-| `yield` | — | 0.92% | 1.21% | 1.30% | 1.69% | 1.69% | 1.74% | 1.83% | 1.89% | Present in `.o37`. |
-| `result_queue_full` | — | 0.05% | 0.25% | 0.29% | 0.40% | 0.40% | 0.41% | 0.45% | 0.45% | Present in `.o37`. |
-| `l1c` | — | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | 0.03% | 0.02% | Present in `.o37`. |
-| `scoreboard (memory)` | — | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | Present in `.o37`. |
+| Wait reason | Init | Opt 1 (`rop=100`) | Opt 2 (BAR impl) | Opt 3 (MEMBAR) | Opt 4 (prefetch, sb=4) | Opt 5 (eager-promote) | Opt 6 (TMA real base) | Opt 7 (queue calib) | Opt 8 (slice parallelism) | Opt 9 (drain widening) | Note |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| `inst_barrier` | — | 56.09% | 9.09% | 0.05% | 0.07% | 0.07% | 0.07% | 0.08% | 0.08% | 0.08% | Negligible. |
+| `wait_barrier` | — | 6.64% | 8.07% | 9.01% | 11.98% | 12.58% | 12.66% | 13.18% | 12.69% | 12.74% | mbarrier-style wait. |
+| `tma_axis` | — | 62.73% | 17.16% | 9.06% | 12.05% | 12.65% | 12.73% | 13.25% | 12.77% | 12.82% | Grouped TMA-side stall share. See note [1] below. |
+| `non_tma_axis` | — | 17.80% | 17.34% | 19.07% | 24.10% | 24.07% | 24.90% | 26.59% | 26.93% | 26.84% | Execution/resource-side waits (fwd's residual). |
+| `fu_occupied` | — | 11.83% | 9.91% | 10.91% | 13.53% | 13.50% | 13.99% | 14.98% | 15.13% | 15.10% | Present in `.o38`. |
+| `stall_count` | — | 5.00% | 5.97% | 6.56% | 8.47% | 8.48% | 8.75% | 9.31% | 9.45% | 9.42% | Present in `.o38`. |
+| `tma_flush` | — | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | fwd is load-only. |
+| `yield` | — | 0.92% | 1.21% | 1.30% | 1.69% | 1.69% | 1.74% | 1.83% | 1.89% | 1.85% | Present in `.o38`. |
+| `result_queue_full` | — | 0.05% | 0.25% | 0.29% | 0.40% | 0.40% | 0.41% | 0.45% | 0.45% | 0.46% | Present in `.o38`. |
+| `l1c` | — | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | 0.03% | 0.02% | 0.00% | Present in `.o38`. |
+| `scoreboard (memory)` | — | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | Present in `.o38`. |
 
 > **[1] On the Opt 1 `tma_axis = 62.73%`.** This is a correctly-recorded value, not an input error. `tma_axis` is the grouped sum `wait_barrier + inst_barrier + tma_flush`, and the **same formula is applied in every column** (e.g. Opt 1: 6.64+56.09+0.00=62.73; Opt 2: 8.07+9.09+0.00=17.16) — it is not split differently between columns. Opt 1 only looks large because the pre-BAR-fix `inst_barrier` (56.09%) is folded in; that is not a real TMA cost. It collapses to 17.16% in Opt 2 purely because `inst_barrier` itself drops (56.09% -> 9.09%) after the BAR implementation. The HW TMA axis is ~23.8%, so the Opt 1 value is an over-attribution driven by the unfixed barrier model.
 
 #### FA3 bwd - top-level simulator breakdown
 
-| Class | Init | Opt 1 (`rop=100`) | Opt 2 (BAR impl) | Opt 3 (MEMBAR) | Opt 4 (prefetch, sb=4) | Opt 5 (eager-promote) | Opt 6 (TMA real base) | Opt 7 (queue calib) | Opt 8 (slice parallelism) | Note |
-|---|---|---|---|---|---|---|---|---|---|---|
-| `sim_cycle` | 376,735 | 361,760 | 328,643 | 259,456 | 241,528 | 241,425 | 290,572 | 250,026 | 234,665 | Opt 7 = `.o18`. Opt 8 = `.o20` (admission=2 + balanced slice hash; **-6.1% vs Opt 7**, work invariant; `dramfull` 137K→0). |
-| `no_warps_ready` | 66.40% | 66.64% | 58.27% | 29.80% | 36.56% | 36.45% | 41.51% | 34.00% | 34.35% | TMA-completion stall further drained (ROP_DELAY 1,483→558). |
-| `issuing` | 12.12% | 12.71% | 14.06% | 20.93% | 26.18% | 25.70% | 17.76% | 21.94% | 23.63% | Rises as warps wait less on TMA completion. |
-| `next_stage_not_available` | 10.17% | 10.69% | 11.41% | 15.11% | 18.96% | 18.52% | 12.88% | 15.83% | 17.11% | per-subcore. |
-| `no_valid_instruction` | 10.37% | 8.96% | 15.02% | 33.59% | 17.59% | 18.63% | 27.37% | 27.63% | 24.28% | Frontend tail co-dominant with the (now-smaller) TMA axis. |
-| `issue_port_busy` | 0.95% | 1.01% | 1.24% | 0.57% | 0.71% | 0.70% | 0.48% | 0.59% | 0.64% | |
-| `sum` | 100.00% | 100.00% | 100.00% | 100.00% | 100.00% | 100.00% | 100.00% | 100.00% | 100.00% | Init columns sum to ~100% after rounding. |
+| Class | Init | Opt 1 (`rop=100`) | Opt 2 (BAR impl) | Opt 3 (MEMBAR) | Opt 4 (prefetch, sb=4) | Opt 5 (eager-promote) | Opt 6 (TMA real base) | Opt 7 (queue calib) | Opt 8 (slice parallelism) | Opt 9 (drain widening) | Note |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| `sim_cycle` | 376,735 | 361,760 | 328,643 | 259,456 | 241,528 | 241,425 | 290,572 | 250,026 | 234,665 | 215,895 | Opt 8 = `.o20`. Opt 9 = `.o21` (ROP+reply drain 1→2; **-8.0% vs Opt 8**; unlocked Opt 8's 2-wide admission, ROP_DELAY 558→164). |
+| `no_warps_ready` | 66.40% | 66.64% | 58.27% | 29.80% | 36.56% | 36.45% | 41.51% | 34.00% | 34.35% | 36.49% | TMA-completion stall keeps draining. |
+| `issuing` | 12.12% | 12.71% | 14.06% | 20.93% | 26.18% | 25.70% | 17.76% | 21.94% | 23.63% | 29.49% | Rises strongly: warps wait far less on TMA completion. |
+| `next_stage_not_available` | 10.17% | 10.69% | 11.41% | 15.11% | 18.96% | 18.52% | 12.88% | 15.83% | 17.11% | 21.35% | per-subcore. |
+| `no_valid_instruction` | 10.37% | 8.96% | 15.02% | 33.59% | 17.59% | 18.63% | 27.37% | 27.63% | 24.28% | 11.87% | Frontend tail; drops as TMA axis shrinks. |
+| `issue_port_busy` | 0.95% | 1.01% | 1.24% | 0.57% | 0.71% | 0.70% | 0.48% | 0.59% | 0.64% | 0.80% | |
+| `sum` | 100.00% | 100.00% | 100.00% | 100.00% | 100.00% | 100.00% | 100.00% | 100.00% | 100.00% | 100.00% | Init columns sum to ~100% after rounding. |
 
 #### FA3 bwd - inner stall / wait breakdown
 
-| Wait reason | Init | Opt 1 (`rop=100`) | Opt 2 (BAR impl) | Opt 3 (MEMBAR) | Opt 4 (prefetch, sb=4) | Opt 5 (eager-promote) | Opt 6 (TMA real base) | Opt 7 (queue calib) | Opt 8 (slice parallelism) | Note |
-|---|---|---|---|---|---|---|---|---|---|---|
-| `inst_barrier` | — | 58.47% / 87.70% of `no_warps_ready` | 44.78% / 76.84% of `no_warps_ready` | 1.01% / 3.40% of `no_warps_ready` | 1.30% / 3.57% of `no_warps_ready` | 1.26% | 0.89% | 1.09% | 1.09% | Remains low after the MEMBAR fix. |
-| `tma_axis` | — | 67.28% / 90.90% of `no_warps_ready` | 58.09% | 17.13% / 57.49% of `no_warps_ready` | 21.96% / 60.06% of `no_warps_ready` | 22.17% | 31.91% | 21.60% | 21.02% | Slightly down; residual is injection temporal-burst, not L2 admission. |
-| `non_tma_axis` | — | 16.40% / 24.50% of `no_warps_ready` | 18.08% | 21.99% / 73.79% of `no_warps_ready` | 27.15% / 74.25% of `no_warps_ready` | 26.66% | 18.94% | 22.79% | 24.37% | |
-| `fu_occupied` | — | 11.55% / 17.30% of `no_warps_ready` | 12.63% | 14.67% / 49.21% of `no_warps_ready` | 18.09% / 49.47% of `no_warps_ready` | 17.75% | 12.58% | 15.18% | 16.25% | function-unit busy |
-| `wait_barrier` | — | 7.98% / 12.00% of `no_warps_ready` | 8.62% | 11.76% / 39.46% of `no_warps_ready` | 14.66% / 40.12% of `no_warps_ready` | 14.71% | 11.80% | 12.09% | 11.82% | `DEPBAR` (SB phase wait = TMA mbarrier) |
-| `stall_count` | — | 4.11% / 6.20% of `no_warps_ready` | 4.63% | 6.18% / 20.73% of `no_warps_ready` | 7.55% / 20.65% of `no_warps_ready` | 7.40% | 5.30% | 6.33% | 6.74% | explicit stall cycles |
-| `tma_flush` | — | 0.83% / 1.20% of `no_warps_ready` | 4.69% | 4.36% / 14.62% of `no_warps_ready` | 5.99% / 16.38% of `no_warps_ready` | 6.20% | 19.22% | 8.42% | 8.11% | `UTMACMDFLUSH` store-drain; stays down after the reply-path levers. |
-| `yield` | — | 0.68% / 1.00% of `no_warps_ready` | 0.76% | 1.02% / 3.41% of `no_warps_ready` | 1.26% / 3.45% of `no_warps_ready` | 1.23% | 0.87% | 1.06% | 1.13% | `YIELD` |
-| `result_queue_full` | — | 0.03% / — | 0.03% | 0.09% / 0.30% of `no_warps_ready` | 0.12% / 0.33% of `no_warps_ready` | 0.12% | 0.08% | 0.10% | 0.11% | fixed-latency result queue |
-| `l1c` | — | 0.03% / — | 0.03% | 0.04% / 0.14% of `no_warps_ready` | 0.13% / 0.36% of `no_warps_ready` | 0.16% | 0.11% | 0.13% | 0.14% | L1 constant |
-| `scoreboard (memory)` | — | 0.00% / 0.00% of `no_warps_ready` | 0.00% | 0.00% / 0.00% of `no_warps_ready` | 0.00% / 0.00% of `no_warps_ready` | 0.00% | 0.00% | 0.00% | 0.00% | traditional scoreboard (unused here) |
+| Wait reason | Init | Opt 1 (`rop=100`) | Opt 2 (BAR impl) | Opt 3 (MEMBAR) | Opt 4 (prefetch, sb=4) | Opt 5 (eager-promote) | Opt 6 (TMA real base) | Opt 7 (queue calib) | Opt 8 (slice parallelism) | Opt 9 (drain widening) | Note |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| `inst_barrier` | — | 58.47% / 87.70% of `no_warps_ready` | 44.78% / 76.84% of `no_warps_ready` | 1.01% / 3.40% of `no_warps_ready` | 1.30% / 3.57% of `no_warps_ready` | 1.26% | 0.89% | 1.09% | 1.09% | 1.34% | Remains low after the MEMBAR fix. |
+| `tma_axis` | — | 67.28% / 90.90% of `no_warps_ready` | 58.09% | 17.13% / 57.49% of `no_warps_ready` | 21.96% / 60.06% of `no_warps_ready` | 22.17% | 31.91% | 21.60% | 21.02% | 19.74% | Down again as ROP_DELAY collapses (558→164). |
+| `non_tma_axis` | — | 16.40% / 24.50% of `no_warps_ready` | 18.08% | 21.99% / 73.79% of `no_warps_ready` | 27.15% / 74.25% of `no_warps_ready` | 26.66% | 18.94% | 22.79% | 24.37% | 30.17% | Execution-side now the larger share as TMA drains. |
+| `fu_occupied` | — | 11.55% / 17.30% of `no_warps_ready` | 12.63% | 14.67% / 49.21% of `no_warps_ready` | 18.09% / 49.47% of `no_warps_ready` | 17.75% | 12.58% | 15.18% | 16.25% | 20.21% | function-unit busy |
+| `wait_barrier` | — | 7.98% / 12.00% of `no_warps_ready` | 8.62% | 11.76% / 39.46% of `no_warps_ready` | 14.66% / 40.12% of `no_warps_ready` | 14.71% | 11.80% | 12.09% | 11.82% | 13.82% | `DEPBAR` (SB phase wait = TMA mbarrier) |
+| `stall_count` | — | 4.11% / 6.20% of `no_warps_ready` | 4.63% | 6.18% / 20.73% of `no_warps_ready` | 7.55% / 20.65% of `no_warps_ready` | 7.40% | 5.30% | 6.33% | 6.74% | 8.31% | explicit stall cycles |
+| `tma_flush` | — | 0.83% / 1.20% of `no_warps_ready` | 4.69% | 4.36% / 14.62% of `no_warps_ready` | 5.99% / 16.38% of `no_warps_ready` | 6.20% | 19.22% | 8.42% | 8.11% | 4.58% | `UTMACMDFLUSH` store-drain; keeps dropping. |
+| `yield` | — | 0.68% / 1.00% of `no_warps_ready` | 0.76% | 1.02% / 3.41% of `no_warps_ready` | 1.26% / 3.45% of `no_warps_ready` | 1.23% | 0.87% | 1.06% | 1.13% | 1.39% | `YIELD` |
+| `result_queue_full` | — | 0.03% / — | 0.03% | 0.09% / 0.30% of `no_warps_ready` | 0.12% / 0.33% of `no_warps_ready` | 0.12% | 0.08% | 0.10% | 0.11% | 0.14% | fixed-latency result queue |
+| `l1c` | — | 0.03% / — | 0.03% | 0.04% / 0.14% of `no_warps_ready` | 0.13% / 0.36% of `no_warps_ready` | 0.16% | 0.11% | 0.13% | 0.14% | 0.12% | L1 constant |
+| `scoreboard (memory)` | — | 0.00% / 0.00% of `no_warps_ready` | 0.00% | 0.00% / 0.00% of `no_warps_ready` | 0.00% / 0.00% of `no_warps_ready` | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | traditional scoreboard (unused here) |
 
 > **[2] On the bwd Opt 1 `tma_axis` / `non_tma_axis`.** These were not emitted as single grouped counters in the Opt 1 run (`.o307`), so the cells are **computed** from the per-reason rows in the same column (the later runs emit them directly):
 > - `tma_axis` = `wait_barrier + inst_barrier + tma_flush` = 7.98+58.47+0.83 = **67.28%** (of `no_warps_ready`: 12.00+87.70+1.20 = 90.90%).
@@ -104,22 +105,24 @@ To keep this file easy to extend, use the following update pattern whenever a ne
 >
 > **[4] On the bwd Opt 5 column (`.o3`, clean-exit Step-0 run).** The run is sb=4 + eager-promote. It **exits cleanly** (`exit code 0`, no teardown SIGSEGV — the earlier `.o320` run's destructor heap-corruption crash is gone), so the cycle (241,425) and breakdown are fully trustworthy and this supersedes the preliminary 242,270. eager-promote counters: `eager_promote_to_cache=994,032`, `demand_hit_later=366,329`, `skipped_fill_port_busy=31,254`, `skipped_has_waiter=0`, `demand_miss_after_promote=0` (the prior `.o320` showed 2,224 here — the teardown fix also cleared the promote-then-miss artifact); L1I miss rate 0.1977. Step-0 instrumentation counters are timing-neutral, so this is a valid Opt-5 baseline.
 
-### Ongoing (next cycle-reduction levers — after Opt 8)
+### Ongoing (next cycle-reduction levers — after Opt 9)
 
-Opt 6 (address realism), Opt 7 (queue/interconnect calibration) and Opt 8 (L2 slice parallelism:
-admission-rate + balanced slice hash) are **Done**. After Opt 8 the entire TMA memory path — inject,
-L2 admission, reply, AND slice placement — is HW-calibrated (bwd `gpu_stall_dramfull`/`icnt2sh`/
-`output_full` all 0; per-slice util flat like HW). The remaining sim-vs-HW gap (fwd 2.02x / bwd 1.77x)
-is owned by the items below. No cycle claim is made until an item lands a verified improvement.
+Opt 6 (address realism), Opt 7 (queue calibration), Opt 8 (L2 slice parallelism) and Opt 9 (L2
+sub-partition drain widening) are **Done**. After Opt 9 the whole TMA memory path — inject, ROP-drain,
+L2 admission, slice placement, and DRAM-reply — is HW-calibrated, and no single 1/tick gate dominates
+(bwd ROP_DELAY 80.65% → 44.67%; round-trip spread across ROP 44.7% + inject 36.7% + reply 12.5%).
+Cumulative: **bwd 250,026 → 215,895 (-13.7% since Opt 7, 1.88x → 1.62x); fwd 138,021 → 135,999**. The
+remaining sim-vs-HW gap (fwd 2.01x / bwd 1.62x) is owned by the items below. No cycle claim is made
+until an item lands a verified improvement.
 
-#### Ongoing item 1 — bwd residual: per-transfer temporal-burst / fixed-overhead (the next cycle lever)
+#### Ongoing item 1 — bwd residual: injection dest-conflict + execution-side (no free lever left)
 
-> Dedicated plan: [L2_SLICE_PARALLELISM_H100.md](file:///home/jihyun/modern-gpu-simulator-micro-2025/.plan/L2_SLICE_PARALLELISM_H100.md) §8 (fixed-overhead alternative) + §14 (measured residual). Upstream diagnosis: [TMA_LATENCY_INJECTION_H100.md](file:///home/jihyun/modern-gpu-simulator-micro-2025/.plan/TMA_LATENCY_INJECTION_H100.md) §4.11.7.
+> Upstream diagnosis: [TMA_LATENCY_INJECTION_H100.md](file:///home/jihyun/modern-gpu-simulator-micro-2025/.plan/TMA_LATENCY_INJECTION_H100.md) §4.11.8 (Opt-9 measured result + injection-not-rate-bound proof).
 
-- **Where bwd stands (measured `.o20`, 1.77x vs HW).** Opt 8 cut `ROP_DELAY` 1,483→**558** (-62%) and drove L2-input backpressure to 0. But `ROP_DELAY` is still **80.65%** of the TMA round-trip (avg 558, of which ~458 is queue-wait beyond the fixed 100).
-- **Root cause (why ROP is still 558 with dramfull=0).** L2 admission is no longer the gate (`dramfull=0`, `port_busy≈0`, `res_fail=0`). The residual is on the **injection side**: `Req_Network_in_buffer_full = 5.67/cyc` (Opt7 7.15) is still high — the 768-sector transfer is now **spatially even across slices** (Opt 8 Part 2) but still **temporally bunched** at inject. Placement fixed *where* the sectors go; it did not fix *when* they arrive.
-- **Direction.** Model the **per-transfer ~170-cyc fixed overhead** (arXiv:2501.12084 §5.1) instead of 768 serialized per-sector round-trips, so the burst is not emitted as 768 back-to-back sector injections. It is a **timing-only** change but more invasive (needs a per-transfer completion model) and must keep `L2_TMA_true_hit_rate` / L2 accesses / DRAM bytes invariant (the per-sector L2/DRAM traffic that earns the realistic hit rate must NOT be deleted — §8 rejected the closed-form "bulk engine" for this reason).
-- **DRAM still idle** (`bw_util` 0.078 vs HW 14.85%, `avg_mrq_latency=3`) — the memory device is not the wall; this is purely a request-timing serialization.
+- **Where bwd stands (measured `.o21`, 1.62x vs HW).** Opt 9 unlocked Opt 8 (admit_per_active 1.00→1.93) and cut `ROP_DELAY` 558→**164** (-71%). The round-trip is now balanced: ROP 44.7% + `IN_ICNT_TO_MEM` (inject) 36.7% + `IN_ICNT_TO_SHADER` (reply) 12.5%.
+- **Injection is NOT rate-bound (measured, §4.11.8).** sim injects 2.70 TB/s = **81% of the HBM3 ceiling**; iSLIP grant runs at full width (`avg_passes=4.0`). The residual `Req_Network_in_buffer_full=11.8` is transient iSLIP **dest-conflict** (a few bursting SMs targeting the same sub-partition), not a rate shortfall — and HW *has* a memory-partition crossbar, so this is HW-faithful. Raising injection further would exceed the HBM ceiling (a fake win). **No free memory-side lever remains.**
+- **Execution side is now the larger share:** bwd `non_tma_axis` 24.4% → **30.2%** (`fu_occupied` 20.2%, WGMMA/tensor side) + `no_warps_ready` 36.5%. This is compute/dependency, not the TMA queue.
+- **DRAM still idle** (`bw_util` 0.085 vs HW 14.85%) — memory device is not the wall.
 
 #### Ongoing item 2 — frontend tail / fwd L2-hit over-model (accuracy-side, largely unrecoverable)
 
@@ -244,6 +247,11 @@ FA3 fwd
   - Event / debug run: `H100_80GB-OnlyKernel5/flashattn-fa3-bf16-bwd-causal-b1-s2048-hd64-nh24-flashattn_fa3_bf16_bwd_causal_b1_s2048_hd64_nh24___warmup_-63a73d452237.e37`
   - Note: `admit_sectors_per_cycle=2` + `l2_slice_balanced_hash=1` (both `[L2-ADMIT]`/`[L2-SLICE-HASH]` boot logs confirmed live, on top of the 4 Opt-7 knobs). Final cycle = `137,053` (-0.7% vs Opt 7). `L2_TMA_true_hit_rate=0.9453` (unchanged). Near no-op: ROP_DELAY already at floor (avg 135→126 ≈ fixed 100); fwd's residual is frontend tail (`nv_ibuffer_empty` 12.5%), not the TMA queue. Slice util flat (p50 0.314 / max 0.366).
 
+- Opt 9 (L2 sub-partition drain widening: ROP-drain + DRAM-reply-drain)
+  - Stats run: `H100_80GB-OnlyKernel5/flashattn-fa3-bf16-bwd-causal-b1-s2048-hd64-nh24-flashattn_fa3_bf16_bwd_causal_b1_s2048_hd64_nh24___warmup_-63a73d452237.o38`
+  - Event / debug run: `H100_80GB-OnlyKernel5/flashattn-fa3-bf16-bwd-causal-b1-s2048-hd64-nh24-flashattn_fa3_bf16_bwd_causal_b1_s2048_hd64_nh24___warmup_-63a73d452237.e38`
+  - Note: `l2_rop_drain_per_cycle=2` + `l2_dram_reply_drain_per_cycle=2` (both `[L2-ROP-DRAIN]`/`[L2-DRAM-REPLY-DRAIN]` boot logs confirmed live, on top of the Opt-7/8 knobs). Final cycle = `135,999` (-0.8% vs Opt 8). `L2_TMA_true_hit_rate=0.9455` (unchanged). Small (fwd still frontend-tail bound). `L2_rop_multi_cycles_total=1.55M` (Gate A fired), `L2_admit_per_active_cycle` 1.00→1.82.
+
 FA3 bwd
 
 - Init
@@ -289,7 +297,12 @@ FA3 bwd
 - Opt 8 (L2 slice parallelism: admission-rate + balanced slice hash)
   - Stats run: `H100_80GB-OnlyKernel10/flashattn-fa3-bf16-bwd-causal-b1-s2048-hd64-nh24-flashattn_fa3_bf16_bwd_causal_b1_s2048_hd64_nh24___warmup_-63a73d452237.o20`
   - Event / debug run: `H100_80GB-OnlyKernel10/flashattn-fa3-bf16-bwd-causal-b1-s2048-hd64-nh24-flashattn_fa3_bf16_bwd_causal_b1_s2048_hd64_nh24___warmup_-63a73d452237.e20`
-  - Note: `admit_sectors_per_cycle=2` + `l2_slice_balanced_hash=1` (both boot logs confirmed live, on top of the 4 Opt-7 knobs). Final cycle = `234,665` (**-6.1% vs Opt 7**, 1.77x vs HW). `L2_TMA_true_hit_rate=0.8688` (unchanged → work invariant). **ROP_DELAY 1,483→558 (-62%)**, `gpu_stall_dramfull` 137K→**0**, `gpu_stall_icnt2sh`→0, `L2_TMA_output_full_cycles`→0. Slice imbalance removed: util p50 0.601 / p95 0.630 / max 0.651 (flat, matches HW ≤5%). Residual = injection temporal-burst (`Req_Network_in_buffer_full=5.67`).
+  - Note: `admit_sectors_per_cycle=2` + `l2_slice_balanced_hash=1` (both boot logs confirmed live, on top of the 4 Opt-7 knobs). Final cycle = `234,665` (**-6.1% vs Opt 7**, 1.77x vs HW). `L2_TMA_true_hit_rate=0.8688` (unchanged → work invariant). **ROP_DELAY 1,483→558 (-62%)**, `gpu_stall_dramfull` 137K→**0**, `gpu_stall_icnt2sh`→0, `L2_TMA_output_full_cycles`→0. Slice imbalance removed: util p50 0.601 / p95 0.630 / max 0.651 (flat, matches HW ≤5%). Residual = ROP-drain 1/tick feed (`ROP_DELAY` still 80% — fixed by Opt 9).
+
+- Opt 9 (L2 sub-partition drain widening: ROP-drain + DRAM-reply-drain)
+  - Stats run: `H100_80GB-OnlyKernel10/flashattn-fa3-bf16-bwd-causal-b1-s2048-hd64-nh24-flashattn_fa3_bf16_bwd_causal_b1_s2048_hd64_nh24___warmup_-63a73d452237.o21`
+  - Event / debug run: `H100_80GB-OnlyKernel10/flashattn-fa3-bf16-bwd-causal-b1-s2048-hd64-nh24-flashattn_fa3_bf16_bwd_causal_b1_s2048_hd64_nh24___warmup_-63a73d452237.e21`
+  - Note: `l2_rop_drain_per_cycle=2` + `l2_dram_reply_drain_per_cycle=2` (both boot logs confirmed live, on top of the Opt-7/8 knobs). Final cycle = `215,895` (**-8.0% vs Opt 8**, **1.62x vs HW**). `L2_TMA_true_hit_rate=0.8682` (unchanged → work invariant). **Unlocked Opt 8**: `L2_admit_per_active_cycle` 1.00→**1.93**, `L2_admit_multi_cycles` 846→5.50M, `L2_rop_multi_cycles_total=5.50M` (Gate A fired). **ROP_DELAY 558→164 (-71%)**, `averagemflatency` 692→369. Relocation (expected, net-positive): `gpu_stall_dramfull` 0→46,758, `Req_Network_in_buffer_full` 5.67→11.8; ROP now 44.7% (was 80.65%), round-trip spread ROP+inject+reply.
 
 ## 2. Optimization Details
 
@@ -604,7 +617,32 @@ All knobs are config-gated and default to 1 (bit-identical). The H100 config set
 - **Work invariant:** `L2_TMA_true_hit_rate` fwd 0.9453 / bwd 0.8688 (unchanged); L2 accesses/bytes ±1%. hit rate did NOT move → the balanced hash only re-picks slices, it does not perturb L2 set selection.
 - **Part 2 did the heavy lifting on bwd:** slice imbalance removed — `L2_slice_util` p50≈p95≈max (bwd 0.601/0.630/0.651; fwd 0.314/0.348/0.366), matching HW's ≤5% spread. bwd **ROP_DELAY 1,483→558 (-62%)**, `averagemflatency` 1,649→692, `gpu_stall_dramfull` 137K→**0**, `gpu_stall_icnt2sh`→0, `L2_TMA_output_full`→0. `admit_per_active_cycle≈1.00` (with the bias gone there is no per-slice backlog, so Part 1's 2nd probe rarely fires — the win is placement, not raw throughput).
 - **fwd is correctly a near no-op:** its TMA path was already at the floor (ROP_DELAY 135→126 ≈ fixed 100). fwd's real residual is the frontend tail (`nv_ibuffer_empty` 12.5%, HW's own straggler imbalance) + hit-rate over-model (0.945 vs HW 0.696, CTA-cap) — neither is a TMA-queue problem, so no memory-side lever can help fwd (see Ongoing item 2).
-- **bwd residual (next wall):** ROP_DELAY still 558 (80.65%), but L2 admission is no longer the gate (`dramfull=0`). The residual is **injection temporal-burst** — `Req_Network_in_buffer_full=5.67/cyc` — the 768-sector transfer is now spatially even but still temporally bunched. Next lever = per-transfer fixed-overhead model (Ongoing item 1).
+- **bwd residual (found + fixed by Opt 9):** after Opt 8, ROP_DELAY was still 558 (80.65%) with `dramfull=0`. Re-diagnosis showed the L2 bank admission was 2-wide but **starved by the 1/tick ROP-drain feed** (`admit_per_active`=1.00). That 1/tick gate (and its reply-side mirror) is Opt 9.
+
+### Opt 9 - L2 sub-partition drain widening (ROP-drain + DRAM-reply-drain)
+
+> Dedicated diagnosis + plan: [TMA_LATENCY_INJECTION_H100.md](file:///home/jihyun/modern-gpu-simulator-micro-2025/.plan/TMA_LATENCY_INJECTION_H100.md) §4.11.8 (two 1-sector/tick gates, injection-not-the-wall proof, measured result).
+
+#### Why this optimization
+
+- After Opt 8, bwd ROP_DELAY was still 558 (80% of the TMA round-trip) with DRAM idle, injection already at 81% of the HBM ceiling, and iSLIP grant at full width — so injection was ruled out as the wall (measured, not assumed). Tracing `memory_sub_partition::cache_cycle` found **two symmetric 1-sector/tick gates** inside the L2 sub-partition that Opt 8 did not touch:
+  - **Gate A (REQUEST):** ROP delay-queue → `m_icnt_L2_queue` was a single `if` (1 sector/tick). This is what starved Opt 8's 2-wide bank admission (`admit_per_active` pinned at 1.00).
+  - **Gate B (REPLY):** `m_dram_L2_queue` → {L2 fill | L2_icnt} was a single `if` (1 return/tick), the reply-side mirror. Everything on the path is 32B-sector-granular; HW returns 64B/cycle (2 sectors) per slice.
+
+#### How to implement
+
+- **Gate A** (`-gpgpu_l2_rop_drain_per_cycle N`, H100=2, default 1): the single `if` → bounded loop (up to N), each iteration re-checking `!m_rop.empty()`, `cycle >= front.ready_cycle` (FIFO age-order → break when head not ready), `!m_icnt_L2_queue->full()`. No port. Fixed `rop_latency` unchanged.
+- **Gate B** (`-gpgpu_l2_dram_reply_drain_per_cycle M`, H100=2, default 1, **separate knob** — different site/direction): loop up to M. The fill path consumes the FILL port, so like Opt 8's data port, `fill_port_free()` is gated only on the first fill of the tick and `replenish_fill_port_extra(fills-1)` is called after the loop (fill port modeled M*32B-wide). The reply-push path touches no port.
+- Both timing-only (fixed latencies unchanged, only throughput widens), work-invariant, default-off (bit-identical). Lever-fired counters `L2_rop_*` / `L2_dram_reply_*` + `[L2-ROP-DRAIN]`/`[L2-DRAM-REPLY-DRAIN]` boot logs.
+- Files: `l2cache.{cc,h}` (both loops + counters), `gpu-cache.h` (`replenish_fill_port_extra`), `gpu-sim.{cc,h}` (2 knobs + boot logs + stat prints), `gpgpusim.config`.
+
+#### Result
+
+- Cycles vs Opt 8: fwd 137,053 → **135,999 (-0.8%)** (`.o38`, 2.01x vs HW), bwd 234,665 → **215,895 (-8.0%)** (`.o21`, **1.62x** vs HW).
+- **Work invariant:** `L2_TMA_true_hit_rate` fwd 0.9455 / bwd 0.8682 (unchanged); L2 accesses ±1%.
+- **Opt 8 + Opt 9 were a matched pair (the key finding):** Opt 9 opened the ROP feed to 2/tick, and Opt 8's previously-starved 2-wide bank finally fired — bwd `L2_admit_per_active_cycle` **1.00 → 1.93**, `L2_admit_multi_cycles` 846 → **5.50M**, `L2_rop_multi_cycles_total` = 5.50M (Gate A directly proven). bwd **ROP_DELAY 558 → 164 (-71%)**, `averagemflatency` 692 → 369. Gate B fired small (`L2_dram_reply_multi_cycles` 18K, only the ~13% DRAM-miss returns).
+- **Relocation (expected, net-positive):** draining ROP faster lets injection push harder → bwd `gpu_stall_dramfull` 0 → 46,758, `Req_Network_in_buffer_full` 5.67 → 11.8. But cycles fell 8% and `partiton_level_parallism` rose 47→51, so the gain dwarfs the relocation. ROP_DELAY is no longer dominant (80.65% → 44.67%); the round-trip is now spread across ROP (44.7%) + inject (36.7%) + reply (12.5%) — no single 1/tick gate remains.
+- **fwd unchanged story:** still frontend-tail bound; the memory levers are exhausted for fwd until the hit-rate over-model (Ongoing item 2) is fixed.
 
 ## 3. Arch TODO
 

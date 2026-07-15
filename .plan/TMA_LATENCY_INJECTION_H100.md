@@ -1976,6 +1976,42 @@ sector/tick; it moves 64B/cycle per slice).
 - **Files (when implemented):** `l2cache.cc` (both pop loops), `gpu-sim.{cc,h}` (2 knobs + boot logs),
   `gpgpusim.config` (both knobs). No tracer/trace change; rebuild required.
 
+### RESULT — MEASURED, Opt 9 PROMOTED (FWD `.o38`, BWD `.o21`, 2026-07-14)
+Both drain knobs live in the boot log (`[L2-ROP-DRAIN]=2 ; [L2-DRAM-REPLY-DRAIN]=2`). **Verdict: real
+cycle gain with the work axis invariant → Opt 9 is promoted.**
+
+| metric | FWD K5 | BWD K10 | note |
+|---|---|---|---|
+| `gpu_sim_cycle` | 137,053 → **135,999** (−0.8%) | 234,665 → **215,895** (**−8.0%**) | vs Opt 8 |
+| vs HW | 2.02x → 2.01x | 1.77x → **1.62x** | HW 67,696 / 132,901 |
+| **`ROP_DELAY` avg** | 126 → **111** | **558 → 164 (−71%)** | the target |
+| `averagemflatency` | 194 → 190 | 692 → **369 (−47%)** | round-trip |
+| `L2_admit_per_active_cycle` | 1.00 → **1.82** | 1.00 → **1.93** | Opt-8 admission FINALLY fed |
+| `L2_rop_multi_cycles_total` | 1.55M | **5.50M** | Gate A fired (direct proof) |
+| `L2_dram_reply_multi_cycles_total` | 6,684 | 18,258 | Gate B fired (small, as predicted) |
+| `L2_TMA_true_hit_rate` | 0.9455 (was .9453) | 0.8682 (was .8688) | **work invariant ✅** |
+| `L2_total_cache_accesses` | 3,402,748 | 11,428,384 | ±1% ✅ |
+
+**The key finding — Opt 8 and Opt 9 were a matched pair.** Opt 8 widened the L2-bank admission to 2/cyc,
+but the 1/tick ROP drain (Gate A) starved it, so on Opt 8 `L2_admit_per_active_cycle` was pinned at
+**1.00** (the 2nd admission probe never fired, `L2_admit_multi_cycles`≈846). Opt 9 opens the ROP feed to
+2/tick; `admit_per_active` jumps to **1.93** and `L2_admit_multi_cycles` explodes to **5.50M** — Opt 8's
+2-wide bank is finally exercised. The true wall was the *combined* "ROP-drain → admission" 1/tick
+serialization; neither knob alone was enough.
+
+**Where BWD stands now (`.o21`, 1.62x):** ROP_DELAY dropped from dominant (80.65%) to **44.67%**, and the
+TMA round-trip is now spread across three stages: ROP 44.7% + `IN_ICNT_TO_MEM` (inject) 36.7% +
+`IN_ICNT_TO_SHADER` (reply) 12.5%. No single 1/tick gate dominates anymore.
+
+**Relocation observed (expected, net-positive):** `Req_Network_in_buffer_full` 5.67 → **11.8** and
+`gpu_stall_dramfull` 0 → 46,758 (bwd) — draining ROP faster lets injection push harder, so the stall
+partially relocates upstream (inject in_buffer) and to the L2-admission front. But cycles still fell 8%
+and `partiton_level_parallism` rose 47→51, so the relocation is dwarfed by the gain. `bw_util` 0.078 →
+0.085 (toward HW 14.85%); slice util stays flat (p50 0.343 ≈ max 0.370, still even like HW). This is the
+honest §4.5-style relocation, now bounded and observable — the next lever would be the inject in_buffer /
+iSLIP dest-conflict side, but that is at the HBM-ceiling limit (§4.11.8 "Ruled out: injection rate") so
+there is little headroom there without a fake win.
+
 ## 4.12 Cycle-INDEPENDENT "work done" comparison (the trustworthy anchor) — 2026-07-09
 
 Throughput% (bytes/cycle) is a TRAP for validation: sim runs ~2x more cycles, so any bytes/cycle
