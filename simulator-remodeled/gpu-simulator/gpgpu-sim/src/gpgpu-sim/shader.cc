@@ -1581,6 +1581,74 @@ void shader_core_stats::print_remodeling_stats(FILE *fout) {
   fprintf(fout, "avg_cycles_ibuffer_entry_response_ready_to_decode = %.4Lf\n", avg_cycles_ibuffer_entry_response_ready_to_decode);
   fprintf(fout, "total_percentage_cycles_issue_stage_stall_no_warps_ready = %.4Lf\n", total_percentage_cycles_issue_stage_stall_no_warps_ready);
 
+  // ================= NCU-aligned stall taxonomy (full 20-reason stack) =================
+  // See .plan/NCU_STALL_TAXONOMY_METRICS_IMPL.md (Phase 1b). Every NCU stall reason is emitted as
+  // ncu_stall_<reason> (count) + _pct so the sim stack lines up 1:1 with the NCU stall page.
+  // NEW counters (Phase 1/2), MAP lines (existing counters re-named), folds, and residual 0-lines.
+  // NOTE: per-reason flags are a per-cycle boolean-OR (>=1 warp), so reasons OVERLAP and can sum to
+  // >100% — the same way NCU's own smsp__pcsamp reasons overlap. Compare shape-vs-shape (§Phase 1b).
+  {
+    unsigned long long ncu_selected      = m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_cycles_issue_stage_selected"]->get_value();
+    unsigned long long ncu_not_selected  = m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_cycles_issue_stage_not_selected"]->get_value();
+    unsigned long long ncu_dispatch      = m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_cycles_issue_stage_stall_dispatch"]->get_value();
+    unsigned long long ncu_wg_arrive     = m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_warpgroup_arrive"]->get_value();
+    unsigned long long warps_eligible    = m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_warps_eligible_accumulator"]->get_value();
+    unsigned long long fu_occ_sfu        = m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_cycles_issue_stage_stall_at_least_one_warp_with_fu_occupied_sfu"]->get_value();
+    unsigned long long fu_occ_sp_int_dp  = m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_cycles_issue_stage_stall_at_least_one_warp_with_fu_occupied_sp_int_dp"]->get_value();
+    unsigned long long fu_occ_tensor     = m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_cycles_issue_stage_stall_at_least_one_warp_with_fu_occupied_tensor"]->get_value();
+
+    long double denom = total_num_cycles_issue_stage_evaluated ? (long double) total_num_cycles_issue_stage_evaluated : 1;
+    // wait_barrier still includes the WGMMA-group wait split-out (warpgroup_arrive) as a subset;
+    // NCU `barrier` == inst_barrier, NCU `long_scoreboard` == wait_barrier + tma_flush (+global RAW,
+    // see R3 gap note), NCU `short_scoreboard` == scoreboard + l1c.
+    unsigned long long ncu_long_sb  = total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_wait_barrier
+                                    + total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_tma_flush;
+    unsigned long long ncu_short_sb = total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_scoreboard
+                                    + total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_l1c;
+    unsigned long long ncu_math_pipe = fu_occ_sfu + fu_occ_sp_int_dp;
+    unsigned long long ncu_no_instructions = total_num_cycles_issue_stage_stall_no_valid_instruction;
+
+    #define NCU_LINE(name, cnt) do { \
+      fprintf(fout, "ncu_stall_" name " = %llu\n", (unsigned long long)(cnt)); \
+      fprintf(fout, "ncu_stall_" name "_pct = %.4Lf\n", ((long double)(cnt) / denom) * 100); \
+    } while (0)
+
+    // --- reasons present in the sim (measured) ---
+    NCU_LINE("selected",           ncu_selected);                                                              // NEW (denominator)
+    NCU_LINE("not_selected",       ncu_not_selected);                                                          // NEW (Phase 2)
+    NCU_LINE("dispatch_stall",     ncu_dispatch);                                                              // NEW
+    NCU_LINE("warpgroup_arrive",   ncu_wg_arrive);                                                             // NEW (subset of wait_barrier)
+    NCU_LINE("long_scoreboard",    ncu_long_sb);                                                               // fold
+    NCU_LINE("short_scoreboard",   ncu_short_sb);                                                              // fold
+    NCU_LINE("barrier",            total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_inst_barrier); // MAP
+    NCU_LINE("wait",               total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_stall_count);   // MAP
+    NCU_LINE("mio_throttle",       total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_result_queue_full); // MAP
+    NCU_LINE("math_pipe_throttle", ncu_math_pipe);                                                             // MAP
+    NCU_LINE("mma",                fu_occ_tensor);                                                             // MAP (tensor pipe busy)
+    NCU_LINE("no_instructions",    ncu_no_instructions);                                                        // MAP (frontend sub-tree)
+    NCU_LINE("imc_miss",           total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_l1c);           // MAP (const-cache)
+    NCU_LINE("sleeping",           total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_yield);         // fold-into-yield (trace-mode limit)
+    // --- residual / negligible in FA3: emitted as explicit 0-lines so the stack is provably complete ---
+    NCU_LINE("branch_resolving",   0ull);  // no branch unit in trace-driven sim (R-note)
+    NCU_LINE("membar",             0ull);  // scope-only membar handled in sm.cc
+    NCU_LINE("drain",              0ull);  // negligible in FA3
+    NCU_LINE("lg_throttle",        0ull);  // negligible in FA3
+    NCU_LINE("tex_throttle",       0ull);  // no texture in FA3
+    NCU_LINE("misc",               0ull);  // catch-all
+    #undef NCU_LINE
+
+    // --- NCU scheduler scalars (per-SMSP == per-subcore here) ---
+    long double issued_warp_per_scheduler = denom ? ((long double) ncu_selected / denom) : 0;
+    long double eligible_warps_per_scheduler = denom ? ((long double) warps_eligible / denom) : 0;
+    long double issue_slots_busy_pct = denom ? (((long double) ncu_selected / denom) * 100) : 0;
+    long double no_eligible_pct = 100.0L - issue_slots_busy_pct;
+    fprintf(fout, "ncu_issued_warp_per_scheduler = %.4Lf\n", issued_warp_per_scheduler);
+    fprintf(fout, "ncu_eligible_warps_per_scheduler = %.4Lf\n", eligible_warps_per_scheduler);
+    fprintf(fout, "ncu_issue_slots_busy_pct = %.4Lf\n", issue_slots_busy_pct);
+    fprintf(fout, "ncu_no_eligible_pct = %.4Lf\n", no_eligible_pct);
+    fprintf(fout, "ncu_one_or_more_eligible_pct = %.4Lf\n", issue_slots_busy_pct);
+  }
+
   fprintf(fout, "total_num_constant_cache_different_blocks = %zu\n", all_const_cache_accessed_blocks.size());
   fprintf(fout, "total_num_global_memory_blocks = %zu\n", all_global_memory_accessed_blocks.size());
   fprintf(fout, "total_num_different_virtual_pages = %zu\n", all_virtual_pages_accessed.size());

@@ -115,12 +115,12 @@ forced 100% partition (R5 coarse-axis fallback if a strict partition is later re
 
 ---
 
-## Phase 2 — tail-only read-only completion of the SAME loop (`not_selected` + `eligible_warps_per_scheduler`, sizes #2)
+## Phase 2 — restructure the SAME loop to count `not_selected` + `eligible_warps_per_scheduler` (sizes #2)
 
-> **User decision (2026-07-14): NOT a separate every-cycle full-warp scan** — that re-evaluates warps
-> the primary loop already covered and is wasteful on the 12h run. Instead, **continue the existing
-> primary loop past the winner in read-only mode** (do not add a second full pass). We DO need the exact
-> `not_selected` count (goal = match NCU), so we keep counting exactly, just without the redundant scan.
+> **User decisions (2026-07-14):** (1) NOT a separate every-cycle full-warp scan (wasteful); (2) exact
+> `not_selected` count (goal = match NCU); (3) **restructure the primary loop rather than clone a mirror
+> predicate** — reuse the original eligibility logic verbatim so the count cannot drift, gating only the
+> side-effecting calls on the post-stop tail.
 
 **Why the loop must be *extended*, not *re-run*.** The primary loop has **TWO** early exits, not one:
 - the `break` at [subcore.cc:638](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/subcore.cc#L638) — the winner issued;
@@ -142,93 +142,90 @@ draft: the tail trigger is **"the loop exited early"** (both breaks), NOT "a war
 **natural-end** cycle (no break — every warp examined and none issued) the loop already walked all warps,
 so `not_selected`/`eligible` there is free. Only when a break fires do we need the read-only tail.
 
-**The hard constraint (always-on ⇒ must be truly side-effect-free).** The primary eligibility predicate
-calls 3 **mutating** functions that must NOT be re-invoked:
+**The hard constraint (always-on ⇒ must be truly side-effect-free).** The per-warp evaluation block
+([subcore.cc:549-707](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/subcore.cc#L549-L707)) calls 3 side-effecting functions. On the tail (warps after the stop, which today
+are never reached) NONE must run. **Final decision (verified against source): the tail skips all three
+and computes `not_selected` from only the read-only sub-conditions** — which is exactly correct because
+each skipped condition maps to a *different* NCU reason, not `not_selected`:
 
-| mutator in predicate | why it mutates | read-only substitute |
+| function skipped on tail | why it mutates | why skipping is correct for `not_selected` |
 |---|---|---|
-| `c_warp->waiting()` ([shader.cc:4853](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/shader.cc#L4853)) | clears membar state, erases watchdog maps, may invalidate L1 | `SM::warp_waiting_at_barrier(warp_id)` (const, [sm.cc:1547](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/sm.cc#L1547)) + read-only membar-pending-stores query (`warp_has_pending_fence_stores` / const `get_membar()`) |
-| `are_l1c_operands_ready()` ([subcore.cc:953](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/subcore.cc#L953)) | issues a real L0-const-cache `access()` | **omit** from the eligibility mirror (const-cache readiness is a greedy-switch tolerance nuance, [subcore.cc:613-622](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/subcore.cc#L613-L622), not part of `are_switch_warp_conditions_ready`). Document that `not_selected` excludes it. |
-| `warp_waiting_at_tma_flush()` ([sm.cc:2011](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/sm.cc#L2011)) | insert/erases a log-tracking set (not timing, but non-const) | `warp_has_outstanding_stores()` (read-only; the value it derives from) |
+| `are_l1c_operands_ready()` ([subcore.cc:584](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/subcore.cc#L584), def [:953-975](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/subcore.cc#L953-L975)) | real L0-const-cache `access()` | `is_l1c_ready` is NOT in `are_switch_warp_conditions_ready` ([:606-609](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/subcore.cc#L606-L609)); const-cache wait = NCU `short_scoreboard`/`imc_miss`. |
+| `c_warp->waiting()` ([subcore.cc:573](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/subcore.cc#L573)) | its `warp_waiting_at_mem_barrier` sub-check drains membar state | a warp parked here is waiting on a CTA-barrier / grid-barrier / membar = NCU `barrier`/`membar`, **not** `not_selected`. In FA3 the consumer/producer sync is the mbarrier `wait_barrier` (kept read-only), and `barrier`/`membar` are separate reasons, so excluding it does not steal from `not_selected`. |
+| `warp_waiting_at_tma_flush()` ([sm.cc:2011-2015](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/sm.cc#L2011-L2015)) | inserts a debug-log set (only when opcode==UTMACMDFLUSH; else early-returns false with NO side effect) | UTMACMDFLUSH store-drain = NCU `tma_flush` (drain axis), not `not_selected`. fwd is load-only (tma_flush≈0). |
 
-All other predicate calls are read-only (scoreboard `checkCollision_remodeling` const, `is_stall_counter_0`,
-`is_wait_barriers_ready_entry_point`, `is_yield_ready`, `is_waiting_ldgdepbar`, `can_issue`,
-`is_fixed_latency_unit`, RF-queue-space, `IBuffer::is_next_valid`/`next_inst` — no pop).
+So the tail's eligibility test uses ONLY the read-only conditions already computed in the block:
+`is_not_yield && is_stall_counter_0 && are_wait_barriers_ready && is_fu_available &&
+is_not_warp_waiting_ldgdepbar && are_traditional_scoreaboards_ready &&
+is_write_available_result_queue_for_fixed_latency_available`. Every one of these is a read-only call
+(scoreboard `checkCollision_remodeling` const, `is_stall_counter_0`, `is_wait_barriers_ready_entry_point`,
+`is_yield_ready`, `is_waiting_ldgdepbar`, `can_issue`, RF-queue-space, `next_inst` — no pop). **No header
+change, no `make clean` needed.**
 
-**Design — replace BOTH breaks with a read-only tail continuation (single pass, exact count):**
+> **Accuracy note (R2, refined):** the tail eligibility drops `!c_warp->waiting()` from the predicate,
+> so it does **not** exclude warps parked at a CTA/grid barrier or membar. In FA3 those are ~0 on the
+> consumer path (sync is via mbarrier `wait_barrier`, which IS checked), so `not_selected` is exact for
+> FA3. For a kernel with heavy `__syncthreads`, tail `not_selected` could be slightly over-counted; a
+> read-only 3-of-4 `waiting()` (SM getters) would close it but needs a header helper — deferred.
 
-Do NOT add a second loop. Keep the primary loop as-is up to and including the stopping warp (full
-predicate, side effects intact — unchanged behavior). At **each** point where it would `break`, instead
-set `tail_readonly = true` and `continue`; the SAME loop then finishes the remaining warps with the
-read-only mirror only.
+**Design — restructure the SAME loop (no mirror function, no second scan): skip only the mutators +
+`issue_warp` on the tail.**
+
+Per the user decision (accuracy + no drift), do NOT clone the predicate into a mirror. Instead keep the
+one evaluation block and gate the 3 side-effecting calls behind a `tail_readonly` flag. This reuses the
+original eligibility logic verbatim, so `not_selected` cannot drift from the real predicate.
 
 ```
-// subcore.cc — read-only eligibility mirror (no mutating calls).
-// Mirrors are_switch_warp_conditions_ready (subcore.cc:606-609) using ONLY read-only
-// calls + the 3 substitutes above; excludes is_l1c_ready by design (documented).
-bool Subcore::is_warp_eligible_readonly(SM* sm, shd_warp_t* w,
-                                        warp_inst_t* pI, unsigned subcore_wid) const;
+// Add two locals at the top of Subcore::issue():
+bool tail_readonly = false;      // set once the loop would have broken (either exit)
+unsigned n_not_selected = 0;
+unsigned n_eligible = 0;
 
-// Inside the EXISTING primary loop (order_greedy_then_highest_id):
+// Inside the block (subcore.cc:549-707), gate the 2 mutators on !tail_readonly:
+//   is_l1c_ready            = tail_readonly ? true /*unused*/ : are_l1c_operands_ready(sm, pI);
+//   is_not_warp_in_prog_bar = tail_readonly
+//                               ? !(functional_done() || warp_waiting_at_barrier()
+//                                                     || warp_waiting_grid_barrier())   // read-only 3-of-4
+//                               : !c_warp->waiting();
+//   is_not_warp_tma_flush   = tail_readonly ? !warp_has_outstanding_stores(sm_warp_id)
+//                                           : !warp_waiting_at_tma_flush(sm_warp_id, pI);
 //
-// exit 1 — winner issued (subcore.cc:638):
-//   if (is_inst_ready_to_issue) {
-//       issue_warp(...); is_issued_inst = true; m_greedy_pointer_issue = subcore_warp_id;
-//       tail_readonly = true; continue;          // was: break;
-//   }
+// Then, at each former break, DO NOT break — flip to read-only and keep looping:
 //
-// exit 2 — greedy warp const-cache-blocked (subcore.cc:703):
-//   } else {                                     // greedy warp, !is_l1c_ready, cannot yield
-//       tail_readonly = true; continue;          // was: break;  (is_issued_inst stays false)
-//   }
+//   exit 1 (subcore.cc:625-638, winner): after issue_warp(...) / is_issued_inst=true /
+//           m_greedy_pointer_issue=subcore_warp_id  ->  tail_readonly = true; continue;
 //
-// At loop TOP, when tail_readonly is set, skip the full predicate and use the mirror:
-//   if (tail_readonly) {
-//       if (!c_warp || c_warp->done_exit() || !ibuffer_is_next_valid) continue;
-//       warp_inst_t* pI = next_inst();           // read-only, no pop
-//       if (is_warp_eligible_readonly(shared_sm, c_warp, pI, subcore_warp_id)) {
-//           ++n_eligible_tail;
-//           not_selected++;                       // every eligible tail warp is by definition not-selected
-//       }
-//       continue;                                 // NEVER call issue_warp / mutating predicate again
+//   exit 2 (subcore.cc:702-704, greedy const-cache): the `else{break;}` becomes
+//           tail_readonly = true; continue;   // is_issued_inst stays false
+//
+// Count not_selected ONLY while tail_readonly is already set (i.e. warps strictly AFTER the stop):
+//   if (tail_readonly && are_switch_warp_conditions_ready) {   // l1c excluded by definition
+//       ++n_not_selected; ++n_eligible;
 //   }
+// (eligible warps encountered BEFORE the stop are counted inline in the normal path.)
 ```
 
-**Correctness notes (address the re-review findings):**
-- **Both exits handled.** `tail_readonly` is the single trigger for "loop exited early", covering the
-  `:638` (issued) and `:703` (greedy const-cache) breaks. The natural-end case never sets it and is
-  counted inline as today.
-- **The `:703` greedy warp is NOT counted as `not_selected`.** It is the *stopping* warp, evaluated by
-  the full path, and it is blocked on `is_l1c_ready` — which the mirror deliberately excludes. NCU
-  classifies this as `short_scoreboard`/`imc_miss`, not `not_selected`. Because the tail only counts
-  warps *after* the stop, the greedy warp is correctly excluded. (The mirror is used ONLY on the tail,
-  never re-applied to the stopping warp.)
-- **Winner exclusion.** On exit 1 we `continue` *past* the winner before flipping to read-only, so the
-  winner is never re-counted; it is `selected`.
+**Why this is exact and matches NCU:**
+- `not_selected` = `are_switch_warp_conditions_ready` true on a warp strictly after the stop. That
+  predicate excludes `is_l1c_ready` — matching NCU, which files const-cache waits under
+  `short_scoreboard`/`imc_miss`, not `not_selected`. **No approximation for FA3.**
+- The winner is excluded because we set `tail_readonly` and `continue` *past* it before counting.
+- The `:703` greedy warp is excluded because it is the *stopping* warp (evaluated by the full path), and
+  the tail counts only warps after it.
 
-- **Natural-end cycles (no break):** `tail_readonly` never set → loop runs exactly as today over all
-  warps; count `eligible`/`not_selected` inline from values it already computes. **Zero added scan.**
-- **Early-exit cycles (either break):** heavy path runs only up to the stopping warp (as today); the tail
-  runs the cheap read-only mirror. Cost = O(#warps after the stop), not O(all warps). FA3 fwd has ~3–4
-  active warps/subcore, so the tail is on average under half.
-- **Exact count preserved (NCU-matching):** every eligible warp after the stop is, by the zone argument
-  above, exactly a `not_selected` warp — so the sum is the true NCU `not_selected`, not an
-  approximation. `eligible_warps_per_scheduler` accumulates (eligible warps examined by the heavy path,
-  incl. the winner) + `n_eligible_tail` per cycle.
-- **Bit-identity (the paramount always-on constraint):** the heavy path up to the stop is byte-for-byte
-  unchanged (`issue_warp` called at most once, same const-cache probes at [subcore.cc:503](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/subcore.cc#L503) / `are_l1c_operands_ready` fire on exactly the same warps as today, because those warps are still
-  visited by the heavy path before either break). The tail warps were **never** visited today (the break
-  skipped them), so running them read-only adds **no** new mutating call — provided the mirror truly
-  avoids the 3 mutators (§ table above) AND the const-cache probes at [:503](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/subcore.cc#L503)/[:480](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/subcore.cc#L480). Verify via the cycle-equality gate below.
+**Bit-identity (the paramount always-on constraint):**
+- Warps **up to and including the stop** run the byte-for-byte original path (`tail_readonly` still
+  false): same `are_l1c_operands_ready` / `waiting()` / `warp_waiting_at_tma_flush` calls on exactly the
+  same warps as today, `issue_warp` called at most once.
+- Warps **after the stop** were **never visited today** (the break skipped them). Running them with the
+  3 mutators gated off adds **zero** new mutating call. Verify via the cycle-equality gate below.
 
-- **Maintenance coupling (documented risk):** the mirror duplicates the predicate. If the primary
-  predicate changes, the mirror must change too. Accepted because touching the hot-path predicate risks
-  bit-identity; a future cleanup can extract a shared read-only core. Add a code comment linking the two
-  sites ([subcore.cc:606-609](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/subcore.cc#L606-L609) ↔ the mirror).
+- **Maintenance note:** no predicate duplication (the whole point of restructuring vs a mirror). The only
+  divergence is the 3 gated calls, each documented inline with a comment pointing at this plan.
 
-**Perf note:** this is NOT a per-cycle full re-scan. Natural-end cycles add nothing (the loop already
-visits all warps); early-exit cycles add only the read-only tail after the stop. Net overhead is far
-below the rejected full-scan design and is safe to ship always-on.
+**Perf note:** NOT a per-cycle full re-scan. Natural-end cycles are unchanged (loop already visits all
+warps). Early-exit cycles add only the read-only tail after the stop (FA3 fwd ~3–4 active warps/subcore,
+tail is on average under half). Safe to ship always-on.
 
 ---
 
@@ -237,13 +234,13 @@ below the rejected full-scan design and is safe to ship always-on.
 | File | Change |
 |---|---|
 | [gpu-sim.cc](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/gpu-sim.cc) `create_gpu_per_sm_stats()` (~2639-2804) | Register all new keys: `..._selected`, `..._stall_dispatch`, `..._stall_warpgroup_arrive`, `..._not_selected`, `total_num_warps_eligible_accumulator`. |
-| [subcore.cc](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/subcore.cc) | (a) emit `selected` in the issued branch; (b) `dispatch` split; (c) `warpgroup_arrive` opcode-string split at the wait_barrier stall; (d) new `is_warp_eligible_readonly()` helper; (e) replace **both** breaks ([:638](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/subcore.cc#L638) winner, [:703](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/subcore.cc#L703) greedy-l1c) with a `tail_readonly` continuation so the SAME loop finishes the post-stop tail read-only (no second full-warp scan). |
-| [subcore.h](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/subcore.h) | declare `is_warp_eligible_readonly()`. |
+| [subcore.cc](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/subcore.cc) `Subcore::issue()` | (a) emit `selected` in the issued branch; (b) `dispatch` split; (c) `warpgroup_arrive` opcode-string split at the wait_barrier stall; (d) **restructure the loop**: add `tail_readonly` local, gate the 2 mutators (`are_l1c_operands_ready` skip, `waiting()`→read-only 3-of-4) + `warp_waiting_at_tma_flush`→`warp_has_outstanding_stores` on the tail, replace **both** breaks ([:638](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/subcore.cc#L638) winner, [:703](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/subcore.cc#L703) greedy-l1c) with `tail_readonly=true; continue;`, count `not_selected`/`eligible` (no mirror function). |
+| [subcore.h](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/subcore.h) | **No change needed** for `not_selected` (all logic is inside `issue()`, no new method). Edit only if a small read-only helper for the tma-flush/waiting read-only checks is factored out; otherwise leave untouched (then no `make clean` required). |
 | [shader.cc](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/shader.cc) `print_remodeling_stats()` (~1230-1582) | Emit the **full 20-reason NCU-named stall stack** (Phase 1b table) as `ncu_stall_<reason>` + pct: new counters, MAP print-lines for existing counters (`barrier`/`wait`/`math_pipe_throttle`/`no_instructions`/`imc_miss`), the `long_scoreboard`/`short_scoreboard` folds, and explicit 0-lines for residual/negligible reasons. Plus NCU scalars (`issued_warp_per_scheduler`, `eligible_warps_per_scheduler`, `issue_slots_busy_pct`, `no_eligible_pct`). |
 
-No config, no tracer, no header (`mem_fetch.h`/`shader.h`) struct-size change beyond the `subcore.h`
-method decl. Build required. **Because `subcore.h` is edited, run `make clean` before building** (project
-rule for header edits).
+No config, no tracer change. If `subcore.h` is **not** edited (default — all logic in `issue()`), only
+`.cc` files change and a normal incremental build suffices. **If any header (`subcore.h`) is touched,
+run `make clean` first** (project rule for header edits). Build required either way.
 
 ## Verification
 
@@ -266,12 +263,15 @@ rule for header edits).
 
 ## Risks
 
-- **R1 — read-only tail leaks a side effect** (breaks bit-identity; always-on has no off-switch). The
-  post-winner tail must call ONLY the read-only mirror + the 3 substitutes — never `waiting()`,
-  `are_l1c_operands_ready()`, `warp_waiting_at_tma_flush()`, or `issue_warp()`. Mitigated by the
-  substitute table above + verification step 1 (cycle equality). This is the single highest-risk item.
-- **R2 — predicate duplication drift** (mirror vs primary). Mitigated by a cross-referencing comment;
-  future cleanup extracts a shared read-only core.
+- **R1 — tail leaks a side effect** (breaks bit-identity; always-on has no off-switch). When
+  `tail_readonly` is set, the block must NOT call `issue_warp()`, `are_l1c_operands_ready()`,
+  `c_warp->waiting()` (use the read-only 3-of-4), or `warp_waiting_at_tma_flush()` (use
+  `warp_has_outstanding_stores`). Mitigated by the mutator table above + verification step 1 (cycle
+  equality). Single highest-risk item.
+- **R2 — membar-warp misclassification** (accuracy edge, not bit-identity). The tail drops
+  `warp_waiting_at_mem_barrier` from `waiting()`, so a warp blocked *only* on a memory fence would be
+  counted as `not_selected` instead of NCU `membar`. In FA3 `membar` ≈ 0% (scope-only), so the error is
+  negligible; documented so it is revisited if a future kernel has non-trivial membar.
 - **R3 — `long_scoreboard` global-load RAW may be uncounted** today. If so, report the gap; do not
   fabricate the fold. Decide whether to add global-load RAW tracking as a follow-up.
 - **R4 — null-key crash** if a counter is incremented but not registered in `gpu-sim.cc`. Mitigated by

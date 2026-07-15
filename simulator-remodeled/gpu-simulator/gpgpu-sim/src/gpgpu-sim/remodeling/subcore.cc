@@ -429,6 +429,17 @@ void Subcore::issue(SM *shared_sm) {
   bool is_any_waiting_in_scoreboard = false;     // traditional scoreboard collision (non-TMA)
   bool is_any_waiting_in_result_queue_full = false; // RF result-queue full (non-TMA)
   bool is_any_waiting_l1c = false;               // const cache -> NCU "short_scoreboard" (non-TMA)
+  // [NCU stall-taxonomy] warpgroup-arrive wait (WGMMA WARPGROUP.ARRIVE / .DEPBAR) split out of
+  // the wait_barrier bucket to match NCU `warpgroup_arrive`. See .plan/NCU_STALL_TAXONOMY_METRICS_IMPL.md.
+  bool is_any_waiting_in_warpgroup_arrive = false;
+  // [NCU stall-taxonomy] dispatch/issue-port + RF-result-queue backpressure (NCU `dispatch_stall`),
+  // re-derived into the per-warp axis (a warp was otherwise-ready but its result queue was full).
+  bool is_any_waiting_in_dispatch = false;
+  // [NCU stall-taxonomy] not_selected + eligible accounting (Phase 2): once the loop would have
+  // broken, keep iterating in read-only mode over the post-stop tail; count eligible-but-not-picked.
+  bool tail_readonly = false;
+  unsigned long long n_not_selected_this_cycle = 0;
+  unsigned long long n_eligible_this_cycle = 0;
 
   modify_warp_state();
   if(m_num_pending_cycles_with_issue_port_busy > 0) {
@@ -450,6 +461,15 @@ void Subcore::issue(SM *shared_sm) {
       assert(c_warp_id == subcore_warp_id);
       bool is_valid_inst_in_the_warp =
           c_warp->get_IBuffer_remodeled()->is_next_valid();
+
+      // [NCU stall-taxonomy] Phase 2 tail: once the loop has already stopped this cycle, a warp with
+      // NO valid head instruction cannot be `not_selected` (it is a frontend/no_valid case), so skip
+      // it without running the frontend-classification path (which today never executes after the
+      // break, and would otherwise perturb the no_valid_instruction sub-counters). Valid-head tail
+      // warps fall through to the read-only eligibility check inside the valid block below.
+      if (tail_readonly && !is_valid_inst_in_the_warp) {
+        continue;
+      }
 
       if (!is_valid_inst_in_the_warp) {
         IBuffer_Remodeled *ibuffer = c_warp->get_IBuffer_remodeled();
@@ -570,18 +590,23 @@ void Subcore::issue(SM *shared_sm) {
         }
 
         bool is_not_warp_waiting_ldgdepbar = !is_waiting_ldgdepbar(pI, subcore_warp_id);
-        bool is_not_warp_waiting_in_programmer_barrier = !c_warp->waiting();
+        // [NCU stall-taxonomy] On the read-only tail (already stopped this cycle) do NOT call the
+        // side-effecting waiting()/warp_waiting_at_tma_flush(): they map to NCU barrier/membar/tma_flush,
+        // NOT not_selected, and re-invoking them would perturb membar/log state (bit-identity).
+        // See .plan/NCU_STALL_TAXONOMY_METRICS_IMPL.md Phase 2.
+        bool is_not_warp_waiting_in_programmer_barrier =
+            tail_readonly ? true : !c_warp->waiting();
         // UTMACMDFLUSH (cp.async.bulk.wait_group 0) stalls its warp until all of
         // that warp's outstanding store-class TMA transfers drain (warp-local).
         bool is_not_warp_waiting_tma_flush =
-            !shared_sm->warp_waiting_at_tma_flush(sm_warp_id, pI);
+            tail_readonly ? true : !shared_sm->warp_waiting_at_tma_flush(sm_warp_id, pI);
         functional_unit* fu = get_fu(pI);
         bool is_fu_available = true;;
         bool is_fixed_latency_inst = fu->is_fixed_latency_unit();
         if(is_fixed_latency_inst) {
           is_fu_available = fu->can_issue(pI);
         }
-        bool is_l1c_ready = are_l1c_operands_ready(shared_sm, pI);
+        bool is_l1c_ready = tail_readonly ? true : are_l1c_operands_ready(shared_sm, pI);
         bool is_write_available_result_queue_for_fixed_latency_available = true;
         bool has_dst_regs = false;
         TraceEnhancedOperandType dst_type = TraceEnhancedOperandType::NONE;
@@ -622,7 +647,19 @@ void Subcore::issue(SM *shared_sm) {
         }
 
         bool is_inst_ready_to_issue = are_switch_warp_conditions_ready && is_l1c_ready;
+        // [NCU stall-taxonomy] Phase 2: on the read-only tail (a warp strictly AFTER the cycle's
+        // stop) never issue. Count it as not_selected iff it satisfies the read-only eligibility
+        // (are_switch_warp_conditions_ready; l1c excluded by design — see plan). No side effects.
+        if (tail_readonly) {
+          if (are_switch_warp_conditions_ready) {
+            ++n_eligible_this_cycle;
+            ++n_not_selected_this_cycle;
+          }
+          continue;
+        }
         if (is_inst_ready_to_issue) {
+          // This warp is eligible AND selected (the winner). Counts toward eligible, not not_selected.
+          ++n_eligible_this_cycle;
           const active_mask_t &active_mask =
               shared_sm->get_active_mask(sm_warp_id, pI);
           assert(c_warp->inst_in_pipeline());
@@ -635,7 +672,10 @@ void Subcore::issue(SM *shared_sm) {
           is_issued_inst = true;
           m_greedy_pointer_issue = subcore_warp_id;
           m_num_pending_cycles_constant_cache_misses_before_switch_to_other_warp = m_config->num_const_cache_cycle_misses_before_switch_to_other_warp;
-          break;
+          // [NCU stall-taxonomy] was: break; — now keep iterating the SAME loop in read-only mode
+          // over the post-winner tail to count not_selected. No further issue_warp / side effects.
+          tail_readonly = true;
+          continue;
         }else {
           if(!are_switch_warp_conditions_ready) {
             if(!is_fu_available) {
@@ -684,12 +724,21 @@ void Subcore::issue(SM *shared_sm) {
             }
             if(!are_wait_barriers_ready) {
               is_any_waiting_in_wait_barrier = true;
+              // [NCU stall-taxonomy] split the WGMMA warpgroup wait (WARPGROUP.ARRIVE / .DEPBAR.LE)
+              // out of the generic mbarrier wait_barrier to match NCU `warpgroup_arrive`. The blocking
+              // head opcode string carries "WARPGROUP" for these ops (OP_WARPGROUP).
+              if(pI->get_extra_trace_instruction_info().get_op_code().find("WARPGROUP") != std::string::npos) {
+                is_any_waiting_in_warpgroup_arrive = true;
+              }
             }
             if(!are_traditional_scoreaboards_ready) {
               is_any_waiting_in_scoreboard = true;
             }
             if(!is_write_available_result_queue_for_fixed_latency_available) {
               is_any_waiting_in_result_queue_full = true;
+              // [NCU stall-taxonomy] result-queue backpressure at the dispatch/RF-write port maps to
+              // NCU `dispatch_stall` (re-derived into the per-warp axis).
+              is_any_waiting_in_dispatch = true;
             }
             if(!is_l1c_ready) {
               is_any_waiting_l1c = true;
@@ -700,7 +749,11 @@ void Subcore::issue(SM *shared_sm) {
                 is_any_waiting_l1c = true;
               }
             }else {
-              break;
+              // [NCU stall-taxonomy] was: break; — the greedy warp is blocked only on the const cache
+              // and cannot yield. It is the stop point (l1c wait = NCU short_scoreboard/imc_miss, NOT
+              // not_selected). Keep iterating read-only over the tail instead of breaking.
+              tail_readonly = true;
+              continue;
             }
           }
         
@@ -712,8 +765,15 @@ void Subcore::issue(SM *shared_sm) {
   }
 
   // Stats
+  // [NCU stall-taxonomy] Phase 2 accumulators — emitted every cycle regardless of the branch below.
+  // n_eligible = warps that satisfied read-only eligibility this cycle (winner + tail); n_not_selected
+  // = eligible tail warps that were not the winner. See .plan/NCU_STALL_TAXONOMY_METRICS_IMPL.md.
+  shared_sm->m_sm_stats.m_stats_map["total_num_warps_eligible_accumulator"]->increment_with_integer(n_eligible_this_cycle);
+  shared_sm->m_sm_stats.m_stats_map["total_num_cycles_issue_stage_not_selected"]->increment_with_integer(n_not_selected_this_cycle);
   if(is_issued_inst) {
     shared_sm->m_sm_stats.m_stats_map["total_num_cycles_issue_stage_issuing"]->increment_with_integer(1);
+    // [NCU stall-taxonomy] `selected` == the issued winner (NCU per-issue denominator).
+    shared_sm->m_sm_stats.m_stats_map["total_num_cycles_issue_stage_selected"]->increment_with_integer(1);
   }else if(!is_next_stage_availabe){
     shared_sm->m_sm_stats.m_stats_map["total_num_cycles_issue_stage_stall_next_stage_not_available"]->increment_with_integer(1);
   }else if(is_issue_port_busy) { // IMAD.WIDE scenario
@@ -748,6 +808,10 @@ void Subcore::issue(SM *shared_sm) {
     shared_sm->m_sm_stats.m_stats_map["total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_scoreboard"]->increment_with_integer(is_any_waiting_in_scoreboard);
     shared_sm->m_sm_stats.m_stats_map["total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_result_queue_full"]->increment_with_integer(is_any_waiting_in_result_queue_full);
     shared_sm->m_sm_stats.m_stats_map["total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_l1c"]->increment_with_integer(is_any_waiting_l1c);
+    // [NCU stall-taxonomy] warpgroup_arrive (WGMMA-group wait split out of wait_barrier) +
+    // dispatch (RF result-queue / issue-port backpressure re-derived into the per-warp axis).
+    shared_sm->m_sm_stats.m_stats_map["total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_warpgroup_arrive"]->increment_with_integer(is_any_waiting_in_warpgroup_arrive);
+    shared_sm->m_sm_stats.m_stats_map["total_num_cycles_issue_stage_stall_dispatch"]->increment_with_integer(is_any_waiting_in_dispatch);
     // [WGMMA Opt6 Step-0] (I)/(III)/(VI) per-pipe + tensor-specific stall attribution.
     shared_sm->m_sm_stats.m_stats_map["total_num_cycles_issue_stage_stall_at_least_one_warp_with_fu_occupied_tensor"]->increment_with_integer(is_any_fu_occupied_tensor);
     shared_sm->m_sm_stats.m_stats_map["total_num_cycles_issue_stage_stall_at_least_one_warp_with_fu_occupied_sfu"]->increment_with_integer(is_any_fu_occupied_sfu);

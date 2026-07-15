@@ -2796,6 +2796,17 @@ void gpgpu_sim::create_gpu_per_sm_stats() {
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_result_queue_full", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_l1c", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_issue_stage_evaluated", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  // [NCU stall-taxonomy alignment] observe-only counters (no timing change). See
+  // .plan/NCU_STALL_TAXONOMY_METRICS_IMPL.md. selected = issued winner (per-issue denominator);
+  // dispatch = issue-port/RF-queue backpressure re-derived into the per-warp axis;
+  // warpgroup_arrive = WGMMA-group wait split out of wait_barrier;
+  // not_selected = eligible-but-not-picked (Gap C, counted on the post-stop read-only tail);
+  // warps_eligible_accumulator = per-cycle sum of eligible warps (for eligible_warps_per_scheduler).
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_issue_stage_selected", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_issue_stage_stall_dispatch", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_warpgroup_arrive", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_issue_stage_not_selected", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_warps_eligible_accumulator", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
   // [WGMMA Opt6 Step-0 instrumentation] observe-only counters (no timing change).
   // (I) split fu_occupied by pipe op.
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_issue_stage_stall_at_least_one_warp_with_fu_occupied_tensor", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
