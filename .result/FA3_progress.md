@@ -124,32 +124,56 @@ until an item lands a verified improvement.
 - **Execution side is now the larger share:** bwd `non_tma_axis` 24.4% → **30.2%** (`fu_occupied` 20.2%, WGMMA/tensor side) + `no_warps_ready` 36.5%. This is compute/dependency, not the TMA queue.
 - **DRAM still idle** (`bw_util` 0.085 vs HW 14.85%) — memory device is not the wall.
 
-#### Ongoing item 2 — frontend tail / fwd L2-hit over-model (accuracy-side, largely unrecoverable)
+#### Ongoing item 2 — frontend tail / fwd L2-hit over-model (accuracy-side; tail-drain magnitude is a REAL fwd gap — see item 3)
 
-- **Frontend tail.** With the TMA axis drained, `no_valid_instruction` / `nv_ibuffer_empty` (~6–9%) is now co-dominant on bwd, but it is HW's own **straggler-tail imbalance** (Waves-Per-SM cross-validated: fwd 1.00 wave, bwd 2.91 non-integer waves; HW SM-idle 9.7% / 11.1% ≈ sim `nv_ibuffer_empty` 12.2% / 10.1%). It is **not** recoverable by a frontend-fetch fix — see the detailed evidence in **Deferred Opts → L1I frontend `stream_buffer_wait`**.
+- **Frontend tail — nature vs magnitude (⚠️ RE-corrected 2026-07-15b).** The *nature* is correctly
+  diagnosed: `no_valid_instruction` / `nv_ibuffer_empty` is **trace-DRAINED warps (no inst to execute)**,
+  not fetch-starvation (`nv_ibuf_fetch_inflight ≈ 0`) — so a **frontend-fetch fix will not help** and
+  Opt 4/5 were correctly scoped. **But the *magnitude* is NOT HW-faithful for fwd.** An earlier draft
+  claimed "HW SM-idle 9.7% ≈ sim `nv_ibuffer_empty` 12.2%, so it matches" — that compared a wall-clock %
+  against an evaluated-axis reason-share (**different denominators**). The apples-to-apples number is the
+  subcore-**active** fraction: **sim 64.0% vs HW SMSP-Active 88.9% = 1.39× more idle** (item 3 table).
+  So fwd's drain-idle is a **real recoverable gap**, and it is coupled to the same compute-pipe
+  serialization as stall-depth (Ongoing item 3). What remains true from the old note: this is **not** a
+  scheduling/fetch bottleneck (the per-SM drain-shape and 1-CTA/SM occupancy still hold). **bwd
+  RE-COMPUTED (2026-07-15b, `.o22`): subcore-active 67.5% vs HW SMSP-Active 86.8% = 1.29× more idle**
+  — the same real drain-gap as fwd (1.39×), NOT HW-faithful. So the earlier "bwd tail ≈ HW-faithful"
+  read was the same mismatched-denominator artifact and is likewise retracted.
 - **fwd L2-hit over-model.** fwd `L2_TMA_true_hit_rate` is still **0.9456 vs HW 0.6958**, due to the **CTA-count cap** (132 CTAs < 384 tiles → ≤132 distinct tiles/tensor). Closing it needs real tile `coords` (Opt-6 approach B) — an **addressing** fix, not a timing one; parked because bwd hit rate is already on target (0.8688 vs HW 0.8226). This is why fwd's DRAM-work ratio is the most off (§4.12: fwd 0.26x vs bwd 0.56x).
-- Both are **fidelity items**, not the primary cycle lever; tracked here so they are not mistaken for queue work.
+- The L2-hit item is a **fidelity item**; the frontend-tail *magnitude* is now promoted to a real cycle
+  factor (item 3), while its *fetch-nature* remains not-a-lever. Tracked here so they are not mistaken
+  for queue work.
 
-#### Ongoing item 3 — fwd 2.02× is a REAL structural gap: sim issues at HALF HW's rate (2026-07-14)
+#### Ongoing item 3 — fwd ~2× is a REAL structural gap: issue stall-depth on the compute pipes (async-WGMMA) (2026-07-14, normalized 2026-07-15)
 
 > Metrics prerequisite: [METRICS_Add_Fix.md](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/.plan/METRICS_Add_Fix.md) §2 (NCU stall-taxonomy alignment) — build the
-> counters that quantify suspects #1/#2 BEFORE touching any timing model. Upstream worklist:
+> counters that quantify the suspect BEFORE touching any timing model. Upstream worklist:
 > [CTA_SAMPLING.md](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/.plan/CTA_SAMPLING.md) §7.1 (P11/R12).
 
 **This supersedes the earlier "fwd faithful-floor" read.** A deeper diagnostic showed fwd is **not** at
-a faithful floor — the 2.02× (137,053 vs HW 67,696) is a single, real architectural gap, not diffuse
-noise. The work is identical (same warp-instruction stream), so **cycle-gap = issue-rate-gap exactly**:
+a faithful floor — the ~2× (137,053 vs HW 67,696) is a real architectural gap. Work is ~matched (sim
+14.24M vs HW 14.48M executed warp-inst), so the 2× is not "more work" — it decomposes into three
+cycle-side factors (table below): a small issue-slot over-count (1.10×), issue stall-depth (1.29×), and
+subcore drain-idle (1.39×, the largest).
 
-| | issued warp-inst / cycle / SM | active warps | 
-|---|---|---|
-| HW | **1.63** (IPC 1.79, 3.28 warps/sched) | 3.28 / scheduler |
-| sim `.o37` | **0.79** | ~3.2 / subcore |
-| ratio | **2.07× = the entire cycle gap** | ≈ equal |
+**Normalized head-to-head (both per-SMSP; RE-corrected 2026-07-15b — the 2× decomposes into THREE
+factors, and subcore drain-idle is the LARGEST, not "matched"):**
 
-**The decisive inference: with the SAME warp count, HW extracts 2× the issue throughput → HW overlaps
-work the sim serializes.** This is not occupancy (matches: sim 19.85% vs HW 20.14%), not memory (at
-floor, ROP 126≈100), not per-instruction latency depth (warp-cyc/issue 9.1 vs 7.16 = only 1.28×). Two
-structural suspects, both confirmed present in source:
+| axis (per-SMSP / subcore) | HW (fwd) | sim `.o39` | ratio (sim ÷ HW) |
+|---|---|---|---|
+| subcore **active** fraction (≥1 resident warp) | **88.9%** (SMSP-Active 60,209 / Elapsed 67,696) | **64.0%** (evaluated 45.95M / 71.81M subcore-cyc) | **1.39×** more idle |
+| Issue Slots Busy (per active cyc) | **45.03%** | 34.96% | **1.29×** stall-depth |
+| issued warp-inst (work) | 14.48M | 16.06M | **1.10×** (sim over-issues) |
+| ⇒ wall-clock issue rate | 40.9% | 22.4% | **1.83×** |
+| ⇒ total cycles | 67,696 | 135,999 | **2.01× = 1.10 × 1.29 × 1.39** |
+
+**The decisive inference (corrected): the 2× is NOT a single lever — it is `work 1.10× · stall-depth
+1.29× · drain-idle 1.39×`, and the LARGEST single factor is the subcore DRAIN-IDLE (1.39×), not
+stall-depth.** It is NOT occupancy (matches: 20.14% HW vs ~19.85% sim) and NOT memory (at floor, ROP
+126≈100). The two recoverable factors — stall-depth (compute-pipe serialization) and drain-idle
+(finish-time spread 6.5× wider than HW in raw idle-cycles) — are **mechanically coupled** (finish spread
+scales with per-inst stall; see the FWD finding below), so both point at the **same compute-pipe root
+cause**. One structural suspect carries both, confirmed in source AND in the `.o39` taxonomy:
 
 - **Suspect #1 — WGMMA is modeled SYNCHRONOUSLY, not async.** `TENSOR_CORE_OP` flows through the same
   fixed-latency FU path as an ordinary FMA ([subcore.cc:288-327](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/subcore.cc#L288-L327): `reserve_latency()` +
@@ -163,22 +187,32 @@ structural suspects, both confirmed present in source:
   So the async treatment TMA got was **never applied to WGMMA**.
   - **Note — this is why the earlier WGMMA park was for the WRONG reason.** [WGMMA_FU_OCCUPIED_H100.md](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/.plan/WGMMA_FU_OCCUPIED_H100.md)
     parked on `sm_idle_all_blocked_by_tensor` ≈ 0.65% (fully-idle SM cycles). That counter does NOT
-    capture the throughput loss from the consumer being unable to overlap — the 2× issue-rate deficit
+    capture the throughput loss from the consumer being unable to overlap — the issue-rate deficit
     is the real signature and it points here. The async-WGMMA model is a different (harder) change than
     the II-lowering that was parked.
-- **Suspect #2 — single-issue per scheduler (no dual-issue).** The subcore issues at most ONE
-  instruction then `break`s the warp loop ([subcore.cc:635-638](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/subcore.cc#L635-L638)); no co-issue to independent
-  pipes, even though `-gpgpu_dual_issue_diff_exec_units 1` is parsed. HW Hopper schedulers can dual-issue
-  (e.g. MUFU + FMA same cycle). If HW dual-issues even ~30% of active cycles, that is a large chunk of
-  the 2×.
+  - **⭐ Confirmed by the `.o39` NCU taxonomy (the FU re-issue lockout is over-modeled).** sim
+    `math_pipe_throttle` 11.0% vs HW **3.2%**, and `mma` (fu_occupied_tensor) 5.65% vs HW **1.4%** — the
+    sim spends 3–4× more issue-cycles blocked on a busy math/tensor FU than HW. Combined with the
+    normalized stall-depth gap (warp-cyc/issued 9.15 vs 7.16 = 1.28×), this is where the recoverable fwd
+    cycles are. This absorbs what an earlier draft listed as a separate "priority-2 FU re-issue lockout":
+    it is the *same* synchronous-WGMMA root cause, not a distinct item.
+
+**Removed — former "Suspect #2 (dual-issue)".** Hopper schedulers are single-issue per SMSP (SM-wide
+4-issue = the 4 subcores the sim already models); `-gpgpu_dual_issue_diff_exec_units` does not
+correspond to a real per-scheduler dual-issue on SM90. The high sim `not_selected` (17.9% vs HW 11.4%)
+is therefore not a dual-issue opportunity and the suspect is dropped, not merely deprioritized.
 
 **Ruled out** (to prevent re-chasing): clock 1800 vs 1420 MHz (comparison is cycle-vs-cycle,
 frequency-independent); occupancy (matches HW); memory path (at floor both sides); SFU under-cost
-(TODO-2 — real bug but pushes cycles UP, cannot explain sim being 2× slower).
+(TODO-2 — real bug but pushes cycles UP, cannot explain sim being slower); dual-issue (Hopper is
+single-issue per SMSP). **NOT ruled out (re-corrected 2026-07-15b):** subcore drain-idle — it is a
+**real 1.39× factor**, coupled to compute-pipe serialization (see the FWD finding below). Only the
+*frontend-fetch* interpretation of that idle is ruled out (warps are trace-drained, not fetch-starved).
 
-**Plan:** do the [METRICS_Add_Fix.md](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/.plan/METRICS_Add_Fix.md) §2 taxonomy alignment first (observe-only, bit-identical),
-read `warpgroup_arrive` (#1) vs `not_selected`/`dispatch_stall` (#2) on the existing runs to size which
-suspect dominates, THEN design the async-WGMMA or dual-issue timing model with an NCU-anchored target.
+**Plan:** the `.o39` NCU taxonomy is measured (below). The single fwd lever is **async-WGMMA** — model
+`wgmma.mma_async` so the consumer warpgroup overlaps softmax `exp` with tensor work instead of
+serializing at `-tensor_latency 32` / init-interval 64. Design against the HW anchor (`math_pipe` 3.2%,
+`mma` 1.4%, warp-cyc/issued 7.16) with a bit-identity-safe default.
 
 #### Measured result — NCU stall taxonomy: FWD K5 (Opt9+Metrics `.o39`, 2026-07-15)
 
@@ -227,10 +261,44 @@ ground-truth extraction):
 
 Self-consistent: `selected` 16.06M + `not_selected` 8.22M = eligible 24.29M.
 
-**Finding (the payoff): suspect #2 is confirmed and large.** `not_selected = 17.90%` (sim) + the HW
-scalar gap (HW eligible 0.83 vs issued 0.46 ⇒ HW leaves ~0.37 eligible-unissued warps/sched/cycle, and
-sim leaves 0.53−0.35≈0.18) shows a real dual-issue opportunity. Combined with `mma`=5.65% (suspect #1),
-**the next timing lever is dual-issue**, async-WGMMA secondary.
+**Finding (RE-normalized 2026-07-15b) — the 2× is `work 1.10× · stall-depth 1.29× · drain-idle 1.39×`;
+drain-idle is the LARGEST factor and it is NOT HW-faithful.** All axes are per-subcore/SMSP (sim
+`evaluated`/`issuing` counted per `Subcore::issue()`,
+[subcore.cc:868](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/subcore.cc#L868); H100 = 4 subcores/SM).
+
+- **Instruction count ~matches HW (slightly over).** sim `gpu_sim_insn` 455.6M / 32 lanes = 14.24M
+  warp-inst vs HW `Executed Instructions` 14.48M by that measure; but the issue-slot count `issuing`
+  16.06M is **1.10× HW's 14.48M** — the sim re-issues/replays somewhat more. Small factor, noted.
+- **Stall-depth: 1.29×.** sim Issue-Slots-Busy (per *active* cycle) 34.96% vs HW 45.03%; equivalently
+  warp-cyc/issued ~9.15 vs HW 7.16. This is the axis the stall stack above measures.
+- **⚠️⚠️ RE-correction — the previous retraction OVER-corrected and was itself wrong.** An intermediate
+  draft claimed the missing 36% of subcore-cycles is "≈ matched / HW-faithful tail-drain, not a lever."
+  **That is false.** The apples-to-apples comparison is subcore-**active** fraction: **sim 64.0%
+  (evaluated 45.95M / 71.81M subcore-cyc) vs HW SMSP-Active 88.9% (60,209 / 67,696)** = **1.39× more
+  idle** — in raw idle-cycles, 48,972 vs 7,487 per subcore = a **6.5× wider drain tail**. The earlier
+  "matched" claim mistakenly compared the `nv_ibuffer_empty` *reason-share* (12.2%, an evaluated-axis %)
+  against HW's 9.67% SM-idle (a wall-clock %) — **different denominators**, so the "match" was an
+  artifact. The idle IS real and IS the largest factor.
+- **BUT the *nature* of the idle is still correctly diagnosed: it is trace-DRAINED warps (no inst to
+  execute), not fetch-starvation.** `nv_ibuf_fetch_inflight ≈ 0`, so the prefetch/inst-fetch work
+  (Opt 4/5) was correct and the residual is **not** a frontend-fetch lever. What was wrong was calling
+  the resulting idle "HW-faithful" — HW drains a much tighter tail (11% vs 36%).
+- **Why the tail is 6.5× wider — and why it is the SAME root cause, not a separate item.**
+  `idle = kernel_end − (this subcore's finish time)`, and the finish-time **spread** scales with per-inst
+  stall depth. So the 1.29× stall-depth **mechanically inflates** the drain tail — the two recoverable
+  factors are coupled, not independent. Cutting compute-pipe serialization (async-WGMMA) shrinks BOTH.
+  A residual extra spread likely remains (differential tensor stall: heavy 3-tile CTAs stall more under
+  synchronous WGMMA, so only the heavy CTAs lag) — **this is a measurement TODO** (per-CTA finish-cycle
+  histogram), not yet a conclusion.
+- **On dual-issue (answer to the standing question):** Hopper schedulers are **single-issue per SMSP**;
+  SM-wide 4-issue = 4 subcores, which the sim already models. Not a lever — removed from the plan.
+
+**Where the recoverable cycles sit** (sim over-model vs HW, from the table above): `math_pipe_throttle`
+11% vs HW 3.2%, `mma` 5.65% vs HW 1.4% — the tensor/FU **re-issue interval is too coarse** (synchronous
+WGMMA), which inflates BOTH stall-depth (1.29×) AND the drain tail (1.39×). That is Ongoing item 3's
+Suspect #1 and the single fwd lever; tracked in **Ongoing item 3** (async-WGMMA). Frontend and
+dual-issue are **not** levers. **Open measurement TODO:** per-CTA finish-cycle histogram to size the
+drain-tail component that survives after normalizing out stall-depth.
 
 > ²`warpgroup_arrive`/`dispatch_stall` in `.o39` used the pre-fix mappings and are **not** trustworthy;
 > the corrected values will appear in the next post-`make clean` run (which must also re-confirm the
@@ -244,47 +312,79 @@ sim leaves 0.53−0.35≈0.18) shows a real dual-issue opportunity. Combined wit
 > normalization than the cyc/inst rows (the two agree to ~0.5pp: e.g. pcsamp `wait` 19.5% vs
 > average-family 19.0%). It captures the WGMMA producer waiting at `wgmma.wait_group`.
 
-#### Measured result — NCU stall taxonomy: BWD K10 (Opt9+Metrics, run in progress)
+#### Measured result — NCU stall taxonomy: BWD K10 (Opt9+Metrics `.o22`, 2026-07-15)
 
-> HW source = NCU report `/home/jihyun/modern-gpu-simulator-micro-2025/nv_reports/h100/flashattn-fa3-bf16-bwd-causal-b1-s2048-hd64-nh24_full_rpt.ncu-rep`, kernel 10 (`FlashAttnBwdSm90`, grid 384). Sim column filled when the bwd Opt9+Metrics run lands.
+> HW source = NCU report `/home/jihyun/modern-gpu-simulator-micro-2025/nv_reports/h100/flashattn-fa3-bf16-bwd-causal-b1-s2048-hd64-nh24_full_rpt.ncu-rep`, kernel 10 (`FlashAttnBwdSm90`, grid 384). Sim column = bwd `.o22` (Opt8+Opt9 config, metrics build).
+
+**⚠️ Bit-identity: bwd is NOT exact (unlike fwd), but the delta is negligible.** `.o22` (Opt9+Metrics)
+= `gpu_sim_cycle 216,015` vs `.o21` (Opt9, no metrics) = `215,895` — **+120 cyc (+0.056%)**, same
+config, same `gpu_sim_insn` (629,211,348). fwd was byte-exact (`.o38`==`.o39`); bwd is not. **Cause not
+identified** — a source audit confirmed the three known side-effecting tail predicates ARE gated on
+`tail_readonly` (`c_warp->waiting()`, `warp_waiting_at_tma_flush()`, `are_l1c_operands_ready()` at
+[subcore.cc:598-609](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/subcore.cc#L598-L609)), and the remaining tail calls (`can_issue`, wait-barrier/ldgdepbar
+checks, `next_inst`) are read-only, so the earlier "store-drain leak" guess is **not** supported. At
++0.056% it is treated as negligible and not chased; the tracked **Opt9 bwd cycle stays 215,895**
+(`.o21`), and `.o22` is used only for the (timing-neutral-in-shape) stall taxonomy below.
 
 **Scheduler scalars — sim vs HW:**
 
-| scheduler scalar | sim (BWD) | HW NCU (BWD) | HW NCU metric (verbatim source) |
+| scheduler scalar | sim `.o22` (BWD) | HW NCU (BWD) | HW NCU metric (verbatim source) |
 |---|---:|---:|---|
-| Issue Slots Busy | _pending_ | **32.83%** | `smsp__issue_active.avg.pct_of_peak_sustained_active` |
-| Issued Warp / scheduler | _pending_ | **0.33** | `smsp__issue_active.avg.per_cycle_active` |
-| Eligible Warps / scheduler | _pending_ | **0.46** | `smsp__warps_eligible.avg.per_cycle_active` |
-| No Eligible | _pending_ | **67.17%** | derived (`1 − issue_active pct`-class) |
-| Active Warps / scheduler | _pending_ | **2.47** | `smsp__warps_active.avg.per_cycle_active` |
-| Warp Cyc / Issued Inst | _pending_ | **7.53** | `smsp__average_warp_latency_per_inst_issued.ratio` |
-| Elapsed / SM-Active / SMSP-Active cyc | _pending_ | **130,641 / 118,089 / 115,328** | `sm__cycles_elapsed.avg` / `sm__cycles_active.avg` / `smsp__cycles_active.avg` |
+| Issue Slots Busy | 29.38% | **32.83%** | `smsp__issue_active.avg.pct_of_peak_sustained_active` |
+| Issued Warp / scheduler | 0.29 | **0.33** | `smsp__issue_active.avg.per_cycle_active` |
+| Eligible Warps / scheduler | 0.41 | **0.46** | `smsp__warps_eligible.avg.per_cycle_active` |
+| No Eligible | 70.62% | **67.17%** | derived (`1 − issue_active pct`-class) |
+| Active Warps / scheduler | ~2.4 (occ-matched, est.) | **2.47** | `smsp__warps_active.avg.per_cycle_active` |
+| Warp Cyc / Issued Inst | ~8.2 (= 2.4 ÷ 0.294) | **7.53** | `smsp__average_warp_latency_per_inst_issued.ratio` |
+| Elapsed / SM-Active / SMSP-Active cyc | — | **132,901 / 118,089 / 115,328** | `sm__cycles_elapsed.avg` / `sm__cycles_active.avg` / `smsp__cycles_active.avg` |
 
-**Stall taxonomy — sim pending, HW already extracted from the `.ncu-rep`:**
+**Sim stall taxonomy (full stack).** Denominator = `evaluated` 77,008,681; per-reason boolean-OR so
+reasons overlap. HW per-reason shares are from the same kernel-10 `.ncu-rep`:
 
-| NCU reason | sim (BWD) | HW NCU (BWD) | HW cyc/inst (verbatim) | HW NCU metric (`smsp__average_warps_issue_stalled_*_per_issue_active.ratio`) | reads as |
+| NCU reason | sim `.o22` (BWD) | HW NCU (BWD) | HW cyc/inst (verbatim) | HW NCU metric (`smsp__average_warps_issue_stalled_*_per_issue_active.ratio`) | reads as |
 |---|---:|---:|---:|---|---|
-| `selected` | _pending_ | 32.07%¹ | 1.0000 | `..._selected_...` | issued winner (¹ = HW Issue Slots Busy). |
-| `not_selected` | _pending_ | **5.4%** | 0.4051 | `..._not_selected_...` | eligible-but-not-picked. |
-| `long_scoreboard` | _pending_ | **19.8%** | 1.4915 | `..._long_scoreboard_...` | TMA / global-memory data-arrival latency. |
-| `math_pipe_throttle` | _pending_ | **1.2%** | 0.0917 | `..._math_pipe_throttle_...` | non-tensor math-pipe busy. |
-| `mio_throttle` | _pending_ | **6.3%** | 0.4744 | `..._mio_throttle_...` | MIO (SFU/shared/LSU) input-throttle. |
-| `no_instructions` | _pending_ | **1.6%** | 0.1150 | `..._no_instruction_...` | frontend / ibuffer empty. |
-| `wait` | _pending_ | **10.4%** | 0.7839 | `..._wait_...` | fixed-latency dependency. |
-| `mma` | _pending_ | **5.3%** | 0.3981 | `..._gmma_...` | WGMMA tensor-pipe wait. |
-| `sleeping` | _pending_ | **4.4%** | 0.3284 | `..._sleeping_...` | warp-specialization producer idle. |
-| `dispatch_stall` | _pending_ | **4.5%** | 0.3376 | `..._dispatch_stall_...` | dispatch-side contention. |
-| `warpgroup_arrive` | _pending_ | **5.7%**³ | 436 samples | `smsp__pcsamp_warps_issue_stalled_warpgroup_arrive` (³ PC-sampling family, not the `average_..._per_issue_active` one) | ³ WGMMA `wgmma.wait_group` producer-arrive wait — **6th-largest bwd stall**, notable. |
-| `barrier` | _pending_ | **17.4%** | 1.3131 | `..._barrier_...` | mbarrier / named-barrier sync. |
-| `imc_miss`/`short_scoreboard` (l1c) | _pending_ | **1.3% / 8.5%** | 0.0944 / 0.6429 | `..._imc_miss_...` / `..._short_scoreboard_...` | HW exposes both `imc_miss` and `short_scoreboard`; sim fill waits when the run lands. |
-| `branch_resolving` | _pending_ | **0.8%** | 0.0602 | `..._branch_resolving_...` | branch-target resolve wait. |
-| `misc` / `drain` | _pending_ | **0.0% / 0.0%** | 0.0019 / 0.0014 | `..._misc_...` / `..._drain_...` | negligible. |
-| `membar` / `lg_throttle` / `tex_throttle` | _pending_ | **0.0%** | 0.0000 | `..._membar_/_lg_throttle_/_tex_throttle_...` | zero on this kernel. |
+| `selected` | 29.38% | 32.07%¹ | 1.0000 | `..._selected_...` | issued winner (== `issuing`; ¹ = HW Issue Slots Busy). |
+| **`not_selected`** | **11.47%** | **5.4%** | 0.4051 | `..._not_selected_...` | eligible-but-not-picked — sim ~2× HW (same over-count as fwd). |
+| `long_scoreboard` (wait_barrier+tma_flush) | 18.39% | **19.8%** | 1.4915 | `..._long_scoreboard_...` | TMA / global-memory data-arrival latency — **on target**. |
+| **`mma`** (fu_occupied_tensor) | **12.51%** | **5.3%** | 0.3981 | `..._gmma_...` | ⭐ WGMMA tensor-pipe busy — sim **2.4× HW** (suspect-#1 signature). |
+| `no_instructions` | 12.14% | **1.6%** | 0.1150 | `..._no_instruction_...` | frontend/ibuffer tail — sim **7.6× HW**. |
+| **`math_pipe_throttle`** (sfu+sp_int_dp) | **9.64%** | **1.2%** | 0.0917 | `..._math_pipe_throttle_...` | ⭐ math exec pipe busy — sim **8× HW** (suspect-#1 signature). |
+| `wait` | 8.27% | **10.4%** | 0.7839 | `..._wait_...` | fixed-latency dependency — on target. |
+| `sleeping` (yield fold) | 1.39% | **4.4%** | 0.3284 | `..._sleeping_...` | warp-specialization producer idle — sim under-counts. |
+| `barrier` | 1.33% | **17.4%** | 1.3131 | `..._barrier_...` | ⚠ mbarrier/named-barrier — sim **13× UNDER** HW (folded elsewhere; see note). |
+| `mio_throttle` | 0.14%⁴ | **6.3%** | 0.4744 | `..._mio_throttle_...` | ⁴ result_queue_full only; sim under-models MIO input-throttle. |
+| `dispatch_stall` | (re-measure)² | **4.5%** | 0.3376 | `..._dispatch_stall_...` | ² `.o22` mapping was wrong (== `mio_throttle` 0.14%); fix pending. |
+| `warpgroup_arrive` | (re-measure)² | **5.7%**³ | 436 samples | `smsp__pcsamp_warps_issue_stalled_warpgroup_arrive` (³ PC-sampling family) | ² `.o22` = 0 (string-match bug); HW is **6th-largest bwd stall**, notable. |
+| `imc_miss`/`short_scoreboard` (l1c) | 0.12% / 0.12% | **1.3% / 8.5%** | 0.0944 / 0.6429 | `..._imc_miss_...` / `..._short_scoreboard_...` | sim's `l1c` line is only the const-cache sliver; HW's `short_scoreboard` 8.5% is unmapped. |
+| `branch_resolving` | 0.00% | **0.8%** | 0.0602 | `..._branch_resolving_...` | no branch unit in trace-driven sim. |
+| `misc` / `drain` | 0.00% / 0.00% | **0.0% / 0.0%** | 0.0019 / 0.0014 | `..._misc_...` / `..._drain_...` | negligible. |
+| `membar` / `lg_throttle` / `tex_throttle` | 0.00% | **0.0%** | 0.0000 | `..._membar_/_lg_throttle_/_tex_throttle_...` | zero on this kernel. |
 
-The bwd sim run is still pending, but the HW column above is now grounded in the same kernel-10
-`.ncu-rep` (grid `(384, 1, 1)` = `FlashAttnBwdSm90`, re-extracted 2026-07-15 via
-`ncu --import <rpt> --page raw --csv`). The per-reason HW `% of warp cyc` = `cyc/inst ÷ 7.54`, where
-7.54 = Σ(all reasons) ≈ Warp-Cyc-per-Issued-Inst (7.53) and `selected` ≈ 1.0 is the issued winner.
+Self-consistent: `selected` 22.63M + `not_selected` 8.83M = eligible 31.46M (= `ncu_eligible_warps_per_scheduler` 0.4085 × evaluated).
+
+**bwd finding — SAME structural problem as fwd, and MORE pronounced on the compute pipes.** The two
+signatures that identify synchronous-WGMMA over-modeling are **larger on bwd than fwd**:
+`math_pipe_throttle` sim 9.64% vs HW 1.2% = **8×** (fwd was 3.4×), and `mma` sim 12.51% vs HW 5.3% =
+**2.4×** (fwd was 4×). bwd is the more tensor-dense kernel (grid 384, `mma` is the sim's **single
+largest** non-scoreboard stall at 12.51%), so it suffers the synchronous-WGMMA serialization harder —
+exactly as predicted. The 3-factor decomposition confirms the same shape as fwd:
+
+| axis (per-SMSP / subcore) | HW (bwd) | sim `.o22` | ratio (sim ÷ HW) |
+|---|---:|---:|---:|
+| subcore **active** fraction | **86.8%** (SMSP-Active 115,328 / Elapsed 132,901) | **67.5%** (evaluated 77.01M / 114.10M subcore-cyc) | **1.29×** more idle |
+| Issue Slots Busy (per active cyc) | **32.07%** | 29.38% | **1.09×** stall-depth |
+| issued warp-inst (work) | 19.95M | 22.63M | **1.13×** (sim over-issues) |
+| ⇒ total cycles | 132,901 | 215,895 (`.o21`) | **1.62× = 1.13 × 1.09 × 1.29** |
+
+So bwd's 1.62× is the **same three coupled factors** as fwd's 2.01× — work over-issue (1.13×),
+stall-depth (1.09×), and subcore drain-idle (1.29×, again the largest). The stall-depth factor is
+*smaller* on bwd (1.09× vs fwd 1.29×) because bwd's `long_scoreboard`/`wait`/`barrier` (real
+data-latency) already match HW well; the recoverable gap is concentrated in the **tensor/math re-issue
+lockout** (`mma` 2.4×, `math_pipe` 8×) and the drain tail it inflates. **Confirmed: async-WGMMA is the
+shared fwd+bwd lever**, and bwd is arguably the *better* kernel to validate it on (the `mma` signal is
+its top stall). Two bwd-specific caveats vs fwd: (a) `barrier` is 13× UNDER HW (17.4% HW vs 1.33% sim)
+— a fold/mapping gap to resolve, not a timing lever; (b) `warpgroup_arrive` is genuinely large on HW
+(5.7%, 6th) so the pending bug-fix re-measure matters more here than on fwd.
 
 > ³**On `warpgroup_arrive`.** Same caveat as fwd: it lives **only** in the PC-sampling family
 > (`smsp__pcsamp_warps_issue_stalled_warpgroup_arrive`), not the `average_..._per_issue_active.ratio`

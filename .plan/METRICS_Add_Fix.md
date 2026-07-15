@@ -331,9 +331,13 @@ Implementation details:
 >   HW `wgmma.mma_async` issues in the background and the warp only blocks at `wgmma.wait_group`. This
 >   over-serializes the consumer warpgroup (blocks softmax/`exp` overlap with tensor work). Contrast:
 >   TMA IS already async ([sm.cc:1519](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/sm.cc#L1519) async completion → only the consumer waits at the mbarrier).
-> - **Suspect #2 — single-issue per scheduler.** The subcore issues at most one instruction then
->   `break`s the warp loop ([subcore.cc:635-638](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/subcore.cc#L635-L638)); no dual-issue to independent pipes, despite
->   `-gpgpu_dual_issue_diff_exec_units 1` being parsed. HW Hopper schedulers can co-issue.
+> - **Suspect #2 — single-issue per scheduler. ⚠️ DROPPED (2026-07-15).** The subcore issues at most one
+>   instruction then `break`s the warp loop ([subcore.cc:635-638](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/subcore.cc#L635-L638)). This was investigated as
+>   a possible dual-issue gap, but Hopper is **single-issue per SMSP** (SM-wide 4-issue = the 4 subcores
+>   the sim already models); `-gpgpu_dual_issue_diff_exec_units` does not correspond to a real
+>   per-scheduler dual-issue on SM90. So the high sim `not_selected` is **not** a lever. The
+>   `not_selected`/`dispatch_stall` counters remain valid NCU-alignment metrics; only the dual-issue
+>   conclusion is retracted. The sole remaining fwd lever is Suspect #1 (async-WGMMA).
 
 ### 2.1 Where the current taxonomy lives (baseline)
 
@@ -360,8 +364,8 @@ needed for pure observers.
 | # | New/'fixed counter | NCU reason it aligns to (k5 fwd / k10 bwd share) | How to implement (source site + predicate) |
 |---|---|---|---|
 | 1 | **`selected`** (define as denominator, not a stall) | `selected` (13.9% / 13.1%) | Already exists as `is_issued_inst` ([subcore.cc:635](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/subcore.cc#L635)). Emit an explicit `total_num_cycles_issue_stage_selected` and document that NCU shares use `selected` as the per-issue denominator. No behavior change. |
-| 2 | **`not_selected`** (NEW — Gap C) | `not_selected` (11.4% / —) | The hard one. Today classification only runs in the no-issue branch. Add an **every-cycle, per-warp pass** (CTA_SAMPLING §8 "Change B′"): for each warp that was *eligible* (`are_switch_warp_conditions_ready` true, [subcore.cc:606-609](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/subcore.cc#L606-L609)) but was NOT the one that issued (not `m_greedy_pointer_issue`), increment `not_selected`. Must run even on cycles where `is_issued_inst` is true — decouple it from the issue-loop `break` at [subcore.cc:638](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/subcore.cc#L638). **This counter also directly sizes suspect #2** (a high `not_selected` with ready warps = issue-width starvation). |
-| 3 | **`dispatch_stall`** (NEW — suspect #2) | `dispatch_stall` (11.0% / 4.5%) | Sim has `issue_port_busy` cycles ([subcore.cc:719-720](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/subcore.cc#L719-L720)) driven by `set_num_pending_cycles_with_issue_port_busy` ([subcore.cc:629](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/subcore.cc#L629)) but it is OUTSIDE the per-warp taxonomy. Re-derive it into the per-warp axis: count cycles where a warp is ready but blocked by dispatch-port/dual-issue contention (the `is_write_available_result_queue_for_fixed_latency_available` false case + the port-busy pending countdown). Emit `total_num_cycles_issue_stage_stall_dispatch`. |
+| 2 | **`not_selected`** (NEW — Gap C) | `not_selected` (11.4% / —) | The hard one. Today classification only runs in the no-issue branch. Add an **every-cycle, per-warp pass** (CTA_SAMPLING §8 "Change B′"): for each warp that was *eligible* (`are_switch_warp_conditions_ready` true, [subcore.cc:606-609](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/subcore.cc#L606-L609)) but was NOT the one that issued (not `m_greedy_pointer_issue`), increment `not_selected`. Must run even on cycles where `is_issued_inst` is true — decouple it from the issue-loop `break` at [subcore.cc:638](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/subcore.cc#L638). **NCU-alignment metric** (the former "suspect #2 / dual-issue" read is dropped — Hopper is single-issue per SMSP). |
+| 3 | **`dispatch_stall`** (NEW) | `dispatch_stall` (11.0% / 4.5%) | Sim has `issue_port_busy` cycles ([subcore.cc:719-720](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/subcore.cc#L719-L720)) driven by `set_num_pending_cycles_with_issue_port_busy` ([subcore.cc:629](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/subcore.cc#L629)) but it is OUTSIDE the per-warp taxonomy. Re-derive it into the per-warp axis: count cycles where a warp is ready but blocked by dispatch-port contention (the `is_write_available_result_queue_for_fixed_latency_available` false case + the port-busy pending countdown). Emit `total_num_cycles_issue_stage_stall_dispatch`. |
 | 4 | **`warpgroup_arrive`** (NEW — suspect #1) | `warpgroup_arrive` (— / 5.7%) | Currently blended into `wait_barrier`/`inst_barrier`. Separate the WGMMA-arrival wait (`WARPGROUP.ARRIVE` / `WARPGROUP.DEPBAR.LE`) from the mbarrier `wait_barrier`. The coupling is already partly detected — `is_any_tensor_fu_occupied_and_wait_barrier` ([subcore.cc:667-668](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/subcore.cc#L667-L668)). Add a dedicated `total_num_cycles_issue_stage_stall_warpgroup_arrive` keyed on the WGMMA-family opcode at the wait. **This is the counter that sizes how much of the stall is tensor-ordering (suspect #1).** |
 | 5 | **`sleeping`** (NEW) | `sleeping` (3.1% / 3.1%) | Distinct from `waiting_yield` (YIELD only). Add a NANOSLEEP/warp-sleep predicate → `total_num_cycles_issue_stage_stall_sleeping`. Low priority (small share) but needed for a clean full-taxonomy sum. |
 | 6 | **`long_scoreboard` fold** (FIX Gap B) | `long_scoreboard` (9.8% / 21.9%) | Define the many→one fold: NCU `long_scoreboard` = sim `wait_barrier` (mbarrier/TMA arrival) + `tma_flush` + global-load RAW. **Verify** the sim actually counts global-load (non-const) RAW — today `waiting_scoreboard` is *traditional* RAW only ([subcore.cc:562-563](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/subcore.cc#L562-L563)). Emit a grouped `long_scoreboard` line = the defined sum. |
@@ -397,10 +401,12 @@ These are the scalars that make the 2× issue-rate deficit legible against HW di
 ### 2.5 What the aligned taxonomy will decide
 
 Once emitted, read on the existing fwd `.o37` / bwd `.o20` runs:
-- If **`warpgroup_arrive` + tensor-coupled `wait_barrier`** is a large share → **suspect #1 (async
-  WGMMA)** is the primary lever; design the async-WGMMA timing model next.
-- If **`not_selected` + `dispatch_stall`** is large with ready warps present → **suspect #2
-  (single-issue)** is the primary lever; design dual-issue next.
+- **`warpgroup_arrive` + tensor-coupled `wait_barrier` + `math_pipe_throttle`/`mma`** sizes **suspect #1
+  (async WGMMA)** — the sole remaining lever. Design the async-WGMMA timing model next, anchored to HW
+  (`math_pipe` 3.2%, `mma` 1.4%, warp-cyc/issued 7.16).
+- **`not_selected` + `dispatch_stall`** are kept as NCU-alignment metrics only. **Suspect #2 (dual-issue)
+  is dropped** — Hopper is single-issue per SMSP (SM-wide 4-issue = the 4 subcores already modeled), so
+  a high `not_selected` is not a dual-issue opportunity. See `.result/FA3_progress.md` Ongoing item 3.
 - Either way, we then have an NCU-anchored before/after target instead of inferring from cycle deltas.
 
 ### 2.6 How these counters are implemented (build plan)

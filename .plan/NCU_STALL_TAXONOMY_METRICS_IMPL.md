@@ -14,6 +14,12 @@ Two structural suspects (tracked in `.result/FA3_progress.md` Ongoing item 3):
 - **Suspect #1 — WGMMA modeled synchronously**, not async (`TENSOR_CORE_OP` uses the fixed-latency FU
   reserve path, [subcore.cc:288-327](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/subcore.cc#L288-L327); contrast TMA which IS async, [sm.cc:1519](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/sm.cc#L1519)).
 - **Suspect #2 — single-issue per scheduler** (loop `break`s after one issue, [subcore.cc:635-638](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/subcore.cc#L635-L638)).
+  **⚠️ RESOLVED — DROPPED (2026-07-15).** After the taxonomy shipped, this was confirmed **not** a lever:
+  Hopper is single-issue per SMSP (SM-wide 4-issue = the 4 subcores the sim already models), so the high
+  sim `not_selected` (17.9% vs HW 11.4%) is not a dual-issue opportunity. The sole remaining fwd lever is
+  Suspect #1 (async-WGMMA). The `not_selected`/`dispatch_stall` counters remain valid NCU-alignment
+  metrics; only the "dual-issue timing model" conclusion is retracted. See `.result/FA3_progress.md`
+  Ongoing item 3.
 
 **The reason we cannot size these today is that the sim's stall taxonomy has no counter for either** —
 NCU exposes `warpgroup_arrive` (→ #1) and `dispatch_stall`/`not_selected` (→ #2), but the sim folds
@@ -23,7 +29,8 @@ dominates before touching any timing model.
 
 **Intended outcome:** an NCU-shaped per-reason stall breakdown emitted on the existing fwd `.o37` / bwd
 `.o20` runs, decomposing the 2× issue-rate deficit into `warpgroup_arrive` (suspect #1) vs
-`not_selected`+`dispatch_stall` (suspect #2), with a hard bit-identity guarantee.
+`not_selected`+`dispatch_stall` (former suspect #2, since **dropped** — see the resolution above; these
+two remain as NCU-alignment metrics only), with a hard bit-identity guarantee.
 
 **Decisions (user):** implement **both phases together**; counters are **always-on** (no config gate).
 Since always-on removes any off-switch, **side-effect-freedom of the every-cycle pass is the paramount
@@ -257,9 +264,13 @@ run `make clean` first** (project rule for header edits). Build required either 
 4. **Full-coverage check (Phase 1b).** Confirm the emitted `ncu_stall_*` stack has **all 20 NCU reasons**
    present (including explicit 0-lines for `branch_resolving`/`membar`/`tex_throttle`) — no NCU reason
    should be missing from the sim output. This is the "compare every stall reason with HW" deliverable.
-5. **The payoff read.** On the new `.o` files, compare `warpgroup_arrive` + tensor-coupled `wait_barrier`
-   (→ suspect #1) vs `not_selected` + `dispatch_stall` (→ suspect #2). The larger bucket names the next
-   timing lever (async-WGMMA model vs dual-issue), now with an NCU-anchored before/after target.
+5. **The payoff read.** On the new `.o` files, size **suspect #1 (async-WGMMA)** from its NCU-anchored
+   signature — `math_pipe_throttle` (sim 11.0% vs HW 3.2%), `mma`/fu_occupied_tensor (sim 5.65% vs HW
+   1.4%), `warpgroup_arrive`, and tensor-coupled `wait_barrier` — against the warp-cyc/issued anchor
+   (HW 7.16 vs sim ~9.15 = 1.28×). Suspect #2 (dual-issue) is **dropped** (Hopper is single-issue per
+   SMSP), so the high `not_selected` (17.9% vs HW 11.4%) and `dispatch_stall` are kept only as
+   NCU-alignment metrics, not as a lever. This gives the async-WGMMA model an NCU-anchored before/after
+   target.
 
 ## Risks
 
