@@ -103,6 +103,25 @@ consumer via an event instead of fixed latency. This is the "correct" async mode
 and risks perturbing the scoreboard/writeback path. **Defer** unless A cannot hit the HW anchors — A
 already removes the exact serialization the measurement implicated.
 
+### Strategy decision (user, 2026-07-16): A first, then B if A works
+
+The user's goal is a **correct architecture design**, not just a quick experiment. The agreed sequence is:
+
+1. **Implement Design A now** (config-gated producer-II divisor) — DONE (see §7 Status). It is the minimal,
+   bit-identity-safe change that directly targets the *only* measured tensor stall (producer re-issue
+   lockout, bwd r=0.99).
+2. **Run N=4 and check against the HW anchors** (§6). Design A is the measurement gate that tells us
+   whether the producer-side fix alone is sufficient.
+3. **If Design A is effective** (bwd `mma` moves toward HW 5.3%, `math_pipe` toward 1.2%, cycles drop
+   toward the anchor) → **proceed to implement Design B** as the proper full-async architecture
+   (background completion + event-driven consumer release), using A's result to size the remaining gap.
+4. If Design A under-delivers, re-examine before committing to B (the confound in
+   [CTA_FINISH_TENSOR_CORRELATION.md](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/.plan/CTA_FINISH_TENSOR_CORRELATION.md) §Results must be cleared by the post-fix `[CTAFIN]` re-run
+   that N=4 also produces).
+
+So B is **not** cancelled — it is the intended end state for the correct async model. A is the safe,
+measured first step that both delivers a cycle result and de-risks B.
+
 ## 4. Why Design A is the right first step
 
 - **Surgical:** one knob, one formula site, one gate. No pipeline-structure rewrite.
@@ -159,5 +178,22 @@ already removes the exact serialization the measurement implicated.
 - [x] Root cause mapped (synchronous II=32 producer lockout; consumer folds into fixed latency).
 - [x] Design chosen: Design A (config-gated II divisor), default-off bit-identity-safe. **N=4 selected.**
 - [x] Insertion sites verified; per-shape N=4 effect computed (II 32→8, target/completion unchanged).
-- [ ] Implement the 5-step checklist (NEXT session — not yet done per user).
-- [ ] Run N=4; verify against HW anchors; record in FA3_progress.md.
+- [x] Strategy agreed with user (2026-07-16): implement A now → if effective, implement Design B as the
+      correct full-async architecture (§3 "Strategy decision").
+- [x] Implement the 5-step checklist (2026-07-16). Verified against current source
+      (`/home/jihyun/...` tree; the doc's `/Users/bytedance/...` line numbers are stale but the sites
+      matched by symbol):
+  - `int wgmma_async_issue_interval_divisor;` added to `shader_core_config` next to
+    `tensor_rate_per_cycle` ([shader.h](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/shader.h)).
+  - `-wgmma_async_issue_interval_divisor` (OPT_INT32, default 1) registered in
+    `shader_core_config::reg_options` next to `-tensor_rate_per_cycle`
+    ([gpu-sim.cc](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/gpu-sim.cc)).
+  - II/latency split applied in `generate_tensor_core_latencies()` after the `is_sparse` halving and
+    before the `is_16816_fp32` extra, using `std::max(1u, (number_of_cycles/2)/N)` for N>1 and the
+    EXACT current value for N==1 ([abstract_hardware_model.cc](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/abstract_hardware_model.cc)).
+  - `[WGMMADBG-MNK]` log extended with `async_div=%d` so the applied divisor is verifiable.
+  - `-wgmma_async_issue_interval_divisor 4` set in
+    [gpgpusim.config](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/configs/tested-cfgs/SM90_H100_L2_50MB_80GB/gpgpusim.config).
+  - **Header changed (shader.h) → `make clean` required before rebuild.**
+- [ ] Run N=4; verify against HW anchors (§6); record in FA3_progress.md.
+- [ ] If effective → implement Design B (true background completion).

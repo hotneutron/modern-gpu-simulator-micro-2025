@@ -1677,6 +1677,15 @@ void shader_core_config::reg_options(class OptionParser *opp) {
                          &tensor_rate_per_cycle, "Rate of processing of the tensor cores per cycle."
                          "Configure to any positive number (default=2048)",
                          "2048");
+  option_parser_register(opp, "-wgmma_async_issue_interval_divisor", OPT_INT32,
+                         &wgmma_async_issue_interval_divisor,
+                         "ASYNC_WGMMA Design A: divisor N for the WGMMA producer re-issue "
+                         "interval. Default 1 = bit-identical synchronous model "
+                         "(II = number_of_cycles/2). N>1 shrinks the producer re-issue II by "
+                         "N while holding the consumer completion time (issue->result) and "
+                         "total tensor-pipe occupancy constant, modeling async wgmma.mma_async "
+                         "issue de-serialization. See .plan/ASYNC_WGMMA.md. (default=1)",
+                         "1");
   option_parser_register(opp, "-branch_latency", OPT_INT32,
                          &branch_latency, "Latency of the branch instructions."
                          "Configure to any positive number (default=1)",
