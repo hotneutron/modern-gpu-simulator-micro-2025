@@ -575,6 +575,20 @@ void SM::cycle() {
     }
     if (!any_subcore_issued) {
       m_sm_stats.m_stats_map["total_num_cycles_sm_all_subcores_idle"]->increment_with_integer(1);
+      // [CTA stall breakdown] Per-CTA drain-idle: attribute every true SM-idle cycle (no
+      // subcore issued) to each resident CTA slot, and separately its ibuffer-empty subset
+      // (trace-drained head). This is the drain-idle that dominates fwd's finish variance
+      // (1.39x); correlating it per-CTA with tensor_ops tells fwd tensor-vs-nontensor apart.
+      // Gated separately so it can be toggled without the tensor counters.
+      if (m_config->cta_stall_breakdown_instrument_enable) {
+        bool idle_ibuffer_empty = (sm_idle_reason_or & Subcore::STEP0_R_NV_IBUFFER_EMPTY) != 0;
+        for (unsigned s = 0; s < MAX_CTA_PER_SHADER; s++) {
+          if (m_cta_status[s] > 0) {
+            m_sm_idle_cyc_by_cta_slot[s]++;
+            if (idle_ibuffer_empty) m_sm_idle_ibuffer_empty_cyc_by_cta_slot[s]++;
+          }
+        }
+      }
       // WGMMA-specific: SM-idle cycles with >=1 subcore blocked only by the tensor lockout.
       if (m_config->wgmma_step0_instrument_enable && any_subcore_tensor_only_block) {
         m_sm_stats.m_stats_map["total_num_cycles_sm_idle_all_blocked_by_tensor"]->increment_with_integer(1);
@@ -947,6 +961,8 @@ void SM::init_warps(unsigned cta_id, unsigned start_thread, unsigned end_thread,
     m_tensor_ops_by_cta_slot[cta_id] = 0;
     m_sm_idle_tensor_cyc_by_cta_slot[cta_id] = 0;
     m_fu_occupied_tensor_cyc_by_cta_slot[cta_id] = 0;
+    m_sm_idle_cyc_by_cta_slot[cta_id] = 0;
+    m_sm_idle_ibuffer_empty_cyc_by_cta_slot[cta_id] = 0;
   }
   if (m_config->model == POST_DOMINATOR) {
     unsigned start_warp = start_thread / m_config->warp_size;
@@ -1352,15 +1368,25 @@ void SM::register_cta_thread_exit(unsigned cta_num, kernel_info_t *kernel) {
       unsigned long long start_cyc = m_cta_slot_start_cycle[cta_num];
       printf("[CTAFIN] sm=%u cta_slot=%u global_cta=%u start_cyc=%llu "
              "finish_cyc=%llu elapsed_cyc=%llu tensor_ops=%llu sm_idle_tensor_cyc=%llu "
-             "fu_occupied_tensor_cyc=%llu\n",
+             "fu_occupied_tensor_cyc=%llu",
              m_sm_id, cta_num, global_cta_id, start_cyc, finish_cyc,
              finish_cyc - start_cyc, m_tensor_ops_by_cta_slot[cta_num],
              m_sm_idle_tensor_cyc_by_cta_slot[cta_num],
              m_fu_occupied_tensor_cyc_by_cta_slot[cta_num]);
+      // [CTA stall breakdown] append the non-tensor drain-idle columns on the SAME line
+      // (only when enabled) so the [CTAFIN] parser sees one record per CTA.
+      if (m_config->cta_stall_breakdown_instrument_enable) {
+        printf(" sm_idle_cyc=%llu sm_idle_ibuffer_empty_cyc=%llu",
+               m_sm_idle_cyc_by_cta_slot[cta_num],
+               m_sm_idle_ibuffer_empty_cyc_by_cta_slot[cta_num]);
+      }
+      printf("\n");
       m_tensor_ops_by_cta_slot[cta_num] = 0;
       m_cta_slot_start_cycle[cta_num] = 0;
       m_sm_idle_tensor_cyc_by_cta_slot[cta_num] = 0;
       m_fu_occupied_tensor_cyc_by_cta_slot[cta_num] = 0;
+      m_sm_idle_cyc_by_cta_slot[cta_num] = 0;
+      m_sm_idle_ibuffer_empty_cyc_by_cta_slot[cta_num] = 0;
     }
 
     // Increment the completed CTAs

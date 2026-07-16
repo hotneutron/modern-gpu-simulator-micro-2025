@@ -115,6 +115,27 @@ Cumulative: **bwd 250,026 → 215,895 (-13.7% since Opt 7, 1.88x → 1.62x); fwd
 remaining sim-vs-HW gap (fwd 2.01x / bwd 1.62x) is owned by the items below. No cycle claim is made
 until an item lands a verified improvement.
 
+#### Ongoing item 4 — ⭐ NEW (2026-07-16): no warpgroup execution model → WGMMA executed 4× redundantly (PARKED)
+
+> Full analysis + fix sketch: [WARP_GROUP_H100.md](file:///home/jihyun/modern-gpu-simulator-micro-2025/.plan/WARP_GROUP_H100.md). Discovered while designing async-WGMMA.
+
+- **Finding.** The simulator has **no warpgroup (nor thread-block-cluster) execution unit** — only
+  warps. Real Hopper `wgmma.mma_async` is a warpgroup (4-warp) instruction run **once** on the SM
+  tensor core (NCU counts one `gmma`). The sim parses the trace per warp, and since the NVBit trace
+  records the HGMMA in all 4 warps of the warpgroup, the sim issues **4 independent TENSOR_CORE_OP**,
+  one per warp, onto the 4 subcores' tensor pipes ([subcore.cc:1155-1156](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/subcore.cc#L1155-L1156), warp→subcore
+  `%num_subcores` at [sm.cc:1195](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/sm.cc#L1195)), each computing the **full** tile — so the warpgroup tile
+  is executed **4× redundantly**.
+- **Why it matters.** This is the more plausible root cause of the sim's excess tensor stall (`mma`
+  bwd 12.5% vs HW 5.3% = 2.4×) than the old "II too big" premise — which was **falsified** (§ below /
+  ASYNC_WGMMA.md §9.3: sim II=32 is actually < HW II≈72). The per-tensor-pipe *rate* is ~correct (sim
+  4096 vs HW peak 3781 FLOP/cyc/SM), so it is the 4× instruction **count** flooding all 4 subcores.
+- **Status: PARKED.** Separate from async (async does NOT fix the 4×). HW anchor: NCU gmma ≈ 835,500
+  (kernel 9). **Confirmation pending:** a clean post-`tensor_ops`-fix run to check `Σ[CTAFIN]
+  tensor_ops ≈ 4× HW gmma` (the fix landed in `ee96251` but the only post-fix run crashed on the
+  Design-A assert). Fix options W1 (leader-only) / W2 (quarter-tile) sketched in WARP_GROUP_H100.md;
+  main risk is DEPBAR/scoreboard reconciliation across the 4 warps.
+
 #### Ongoing item 1 — bwd residual: injection dest-conflict + execution-side (no free lever left)
 
 > Upstream diagnosis: [TMA_LATENCY_INJECTION_H100.md](file:///home/jihyun/modern-gpu-simulator-micro-2025/.plan/TMA_LATENCY_INJECTION_H100.md) §4.11.8 (Opt-9 measured result + injection-not-rate-bound proof).
@@ -145,6 +166,16 @@ until an item lands a verified improvement.
   for queue work.
 
 #### Ongoing item 3 — fwd ~2× is a REAL structural gap: issue stall-depth on the compute pipes (async-WGMMA) (2026-07-14, normalized 2026-07-15)
+
+> **⚠️ UPDATE 2026-07-16 — the "async-WGMMA" framing of this item is RETIRED.** A deep source audit +
+> HW-throughput back-calc ([ASYNC_WGMMA.md](file:///home/jihyun/modern-gpu-simulator-micro-2025/.plan/ASYNC_WGMMA.md) §9, §11) showed: (a) the sim is **already**
+> effectively async (producer runs ahead during the WGMMA latency; consumer waits only on the real
+> `gsb0`/DEPBAR dependency), and (b) the "II too big" premise is **false** — sim II=32 < HW II≈72. So
+> "model WGMMA as async" is NOT the fwd lever; latency/II are config-tunable, not a code gap. The excess
+> tensor stall (`mma` 2.4×, `math_pipe`) is now attributed to **Ongoing item 4 (no warpgroup model →
+> WGMMA executed 4× redundantly)**, the current active tensor lever. The stall-depth/drain-idle
+> *measurements* below remain valid; only their "async" root-cause label is replaced by item 4. Design A
+> (II divisor) was implemented then **reverted** (structurally infeasible; ASYNC_WGMMA.md §8).
 
 > Metrics prerequisite: [METRICS_Add_Fix.md](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/.plan/METRICS_Add_Fix.md) §2 (NCU stall-taxonomy alignment) — build the
 > counters that quantify the suspect BEFORE touching any timing model. Upstream worklist:

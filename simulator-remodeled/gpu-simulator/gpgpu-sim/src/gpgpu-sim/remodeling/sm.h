@@ -509,6 +509,14 @@ class SM : public core_t, public shader_core_ctx_wrapper {
   // side warpgroup_arrive (WGMMA result waits fold into wait_barrier), so this is THE tensor-
   // attributable per-CTA stall. Exact for 1-CTA/SM (fwd); upper bound for bwd.
   unsigned long long m_fu_occupied_tensor_cyc_by_cta_slot[MAX_CTA_PER_SHADER] = {0};
+  // [CTA stall breakdown] Per-CTA-slot NON-tensor drain-idle counters, for correlating
+  // fwd CTA finish-cycle variance with non-tensor causes. Gated by
+  // -cta_stall_breakdown_instrument_enable. `m_sm_idle_cyc_by_cta_slot` counts every
+  // true SM-idle cycle (no subcore issued) resident to this CTA = the drain-idle that
+  // dominates fwd (1.39x). `m_sm_idle_ibuffer_empty_cyc_by_cta_slot` is the subset where
+  // the idle head warp had an empty ibuffer (trace-drained), the suspected fwd cause.
+  unsigned long long m_sm_idle_cyc_by_cta_slot[MAX_CTA_PER_SHADER] = {0};
+  unsigned long long m_sm_idle_ibuffer_empty_cyc_by_cta_slot[MAX_CTA_PER_SHADER] = {0};
  public:
   // Increment the tensor-op count for the CTA slot that owns hardware warp wid.
   void inc_tensor_ops_for_warp(unsigned wid) {

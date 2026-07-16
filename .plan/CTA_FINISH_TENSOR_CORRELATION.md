@@ -208,3 +208,32 @@ Result = **related** (bwd tail is tensor-coupled), so per the naming rule the as
 documented in a single design doc **`.plan/ASYNC_WGMMA.md`** (created next). The fwd-specific weak
 coupling is noted there as "not the fwd lever" rather than spun into a separate CTA_IMBALANCE doc —
 fwd's residual is the aggregate stall-depth item already tracked in `FA3_progress.md` Ongoing item 3.
+
+## UPDATE (2026-07-16) — async closed; direction changed to warpgroup-4×; new per-CTA columns
+
+The async-WGMMA design that this correlation was meant to feed has been **closed without a code lever**
+(see [ASYNC_WGMMA.md](file:///home/jihyun/modern-gpu-simulator-micro-2025/.plan/ASYNC_WGMMA.md) TL;DR + §11): the sim is already effectively async and the latency/II
+magnitude is a config knob, not code. The bwd r=0.99 producer-lockout correlation is now re-interpreted
+as a **symptom of the warpgroup-4× over-execution** ([WARP_GROUP_H100.md](file:///home/jihyun/modern-gpu-simulator-micro-2025/.plan/WARP_GROUP_H100.md)): 4 warps each
+running the full tile floods all 4 subcore tensor pipes, which is exactly what inflates
+`sm_idle_tensor_cyc` / `fu_occupied_tensor_cyc` on the tensor-dense (slow) CTAs.
+
+**The `[CTAFIN]` line has evolved (matches current source):**
+- `warpgroup_arrive_cyc` (dead in trace mode) was replaced by **`fu_occupied_tensor_cyc`** (= NCU `mma`),
+  gated by `-wgmma_step0_instrument_enable`.
+- **NEW** `sm_idle_cyc` + `sm_idle_ibuffer_empty_cyc` columns appended, gated by the new
+  `-cta_stall_breakdown_instrument_enable` (2026-07-16), to resolve **Open item 2 (fwd finish-cycle
+  variance)** — i.e. whether fwd's slow CTAs are drain-idle/frontend-bound rather than tensor-bound
+  (fwd r was only 0.38, so a non-tensor cause is expected).
+
+Current full line:
+```
+[CTAFIN] sm=.. cta_slot=.. global_cta=.. start_cyc=.. finish_cyc=.. elapsed_cyc=.. tensor_ops=.. sm_idle_tensor_cyc=.. fu_occupied_tensor_cyc=.. sm_idle_cyc=.. sm_idle_ibuffer_empty_cyc=..
+```
+
+**Next run does double duty (one 12h run, both open items):**
+1. **Open item 1 (warpgroup-4×):** `Σ tensor_ops` vs HW gmma ≈ 835,500 → expect ≈ 4× if confirmed.
+2. **Open item 2 (fwd variance):** correlate fwd per-CTA `elapsed_cyc` with `sm_idle_cyc` /
+   `sm_idle_ibuffer_empty_cyc` (non-tensor) vs `fu_occupied_tensor_cyc` (tensor) to name the cause.
+3. **bwd confound clear-up:** density-normalized `sm_idle_tensor_cyc / tensor_ops` and
+   `fu_occupied_tensor_cyc` now that `tensor_ops` is non-zero (post-fix build).

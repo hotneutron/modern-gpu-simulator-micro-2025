@@ -2233,6 +2233,13 @@ class shader_core_config : public core_config {
   // [L1I frontend Step-0] Enable the observe-only frontend SM-idle instrumentation
   // (sm_idle_blocked_by_frontend_sbwait). Disabled by default.
   bool l1i_frontend_step0_instrument_enable;
+  // [CTA stall breakdown] Enable observe-only per-CTA-slot NON-tensor stall counters
+  // added to the [CTAFIN] line (drain-idle + its ibuffer-empty component). Lets fwd's
+  // CTA finish-cycle variance be correlated with non-tensor causes in one run. Emitted
+  // only when this AND -wgmma_step0_instrument_enable (which prints [CTAFIN]) are set.
+  // Increment path is cheap; disabled by default. See .plan/WARP_GROUP_H100.md /
+  // .plan/CTA_FINISH_TENSOR_CORRELATION.md.
+  bool cta_stall_breakdown_instrument_enable;
 
   // Hopper mbarrier sync debug logging (SYNCDBG). Disabled by default.
   bool sync_debug_enable;

@@ -1969,6 +1969,15 @@ void shader_core_config::reg_options(class OptionParser *opp) {
                          "decomposition (sm_idle_reason_*) is emitted when EITHER this or "
                          "-wgmma_step0_instrument_enable is set. (default=0)",
                          "0");
+  option_parser_register(opp, "-cta_stall_breakdown_instrument_enable", OPT_BOOL,
+                         &cta_stall_breakdown_instrument_enable,
+                         "Enable observe-only per-CTA-slot NON-tensor stall counters in the "
+                         "[CTAFIN] line (drain-idle sm_idle_cyc + its ibuffer-empty component). "
+                         "Correlates fwd CTA finish-cycle variance with non-tensor causes. "
+                         "No timing change; emitted only when -wgmma_step0_instrument_enable "
+                         "(which prints [CTAFIN]) is also set. See .plan/WARP_GROUP_H100.md. "
+                         "(default=0)",
+                         "0");
   option_parser_register(opp, "-sync_debug_enable", OPT_BOOL,
                          &sync_debug_enable,
                          "Enable Hopper mbarrier sync debug logging (SYNCDBG)."
