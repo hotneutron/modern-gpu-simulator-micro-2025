@@ -826,6 +826,9 @@ void Subcore::issue(SM *shared_sm) {
   // tensor pipe this cycle? Used to count true SM-wide idle cycles vs tensor-only idle.
   m_step0_issued_this_cycle = is_issued_inst;
   m_step0_blocked_by_tensor_only_this_cycle = is_any_tensor_reissue_lockout_only;
+  // [CTA-imbalance diag] consumer-side tensor stall: >=1 warp blocked on a WGMMA result
+  // (scoreboard RAW on a pending tensor dst). Exported for per-CTA attribution in SM::cycle.
+  m_step0_blocked_by_warpgroup_arrive_this_cycle = is_any_waiting_in_warpgroup_arrive;
   // [Frontend Step-0] also export whether this subcore had >=1 warp blocked on the L1I
   // stream-buffer frontend this cycle, for the SM-level frontend-idle measurement.
   m_step0_blocked_by_frontend_sbwait_this_cycle = is_any_invalid_head_waiting_frontend_in_l0i_response_queue_stream_buffer_wait;

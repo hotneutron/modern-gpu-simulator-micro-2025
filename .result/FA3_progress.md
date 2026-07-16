@@ -283,19 +283,24 @@ drain-idle is the LARGEST factor and it is NOT HW-faithful.** All axes are per-s
   execute), not fetch-starvation.** `nv_ibuf_fetch_inflight ≈ 0`, so the prefetch/inst-fetch work
   (Opt 4/5) was correct and the residual is **not** a frontend-fetch lever. What was wrong was calling
   the resulting idle "HW-faithful" — HW drains a much tighter tail (11% vs 36%).
-- **Why the tail is 6.5× wider — and why it is the SAME root cause, not a separate item.**
-  `idle = kernel_end − (this subcore's finish time)`, and the finish-time **spread** scales with per-inst
-  stall depth. So the 1.29× stall-depth **mechanically inflates** the drain tail — the two recoverable
-  factors are coupled, not independent. Cutting compute-pipe serialization (async-WGMMA) shrinks BOTH.
-  A residual extra spread likely remains (differential tensor stall: heavy 3-tile CTAs stall more under
-  synchronous WGMMA, so only the heavy CTAs lag) — **this is a measurement TODO** (per-CTA finish-cycle
-  histogram), not yet a conclusion.
+- **Is the tail CAUSED by synchronous-WGMMA? — HYPOTHESIS, being measured (do not assume coupled).**
+  `stall-depth` and `drain-idle` live on **disjoint** cycle populations (warps-present vs. SM-empty), so
+  they are **not** automatically coupled. A *uniform* WGMMA slowdown scales every CTA's finish time
+  equally and leaves the idle **fraction** unchanged — it would fix stall-depth but **not** the tail.
+  async-WGMMA fixes the tail **only if** the cost is **differential** (tensor-heavy CTAs slowed more,
+  widening the finish spread). fwd's `DynamicPersistentTileScheduler` + causal-mask triangular work makes
+  that plausible but **unproven**. An earlier draft here asserted the two are "mechanically coupled" —
+  **that overstated it and is retracted.** The decisive test — per-CTA `finish_cyc` vs per-CTA
+  `tensor_ops` correlation — is now instrumented and pending a run; see
+  [CTA_FINISH_TENSOR_CORRELATION.md](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/.plan/CTA_FINISH_TENSOR_CORRELATION.md). Result decides whether this is one lever
+  (async-WGMMA) or two (async-WGMMA + a separate CTA-imbalance/scheduler lever).
 - **On dual-issue (answer to the standing question):** Hopper schedulers are **single-issue per SMSP**;
   SM-wide 4-issue = 4 subcores, which the sim already models. Not a lever — removed from the plan.
 
 **Where the recoverable cycles sit** (sim over-model vs HW, from the table above): `math_pipe_throttle`
 11% vs HW 3.2%, `mma` 5.65% vs HW 1.4% — the tensor/FU **re-issue interval is too coarse** (synchronous
-WGMMA), which inflates BOTH stall-depth (1.29×) AND the drain tail (1.39×). That is Ongoing item 3's
+WGMMA). This is confirmed to drive **stall-depth** (1.29×); whether it *also* drives the **drain tail**
+(1.39×) is the pending correlation test ([CTA_FINISH_TENSOR_CORRELATION.md](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/.plan/CTA_FINISH_TENSOR_CORRELATION.md)). That is Ongoing item 3's
 Suspect #1 and the single fwd lever; tracked in **Ongoing item 3** (async-WGMMA). Frontend and
 dual-issue are **not** levers. **Open measurement TODO:** per-CTA finish-cycle histogram to size the
 drain-tail component that survives after normalizing out stall-depth.

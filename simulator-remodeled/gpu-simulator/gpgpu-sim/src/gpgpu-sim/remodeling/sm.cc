@@ -554,18 +554,35 @@ void SM::cycle() {
     bool any_subcore_issued = false;
     bool any_subcore_tensor_only_block = false;
     bool any_subcore_frontend_block = false;
+    bool any_subcore_warpgroup_arrive_block = false;
     unsigned int sm_idle_reason_or = 0;  // OR of all subcores' non-issue reason masks
     for (auto subcore : m_subcores) {
       if (subcore->step0_issued_this_cycle()) any_subcore_issued = true;
       if (subcore->step0_blocked_by_tensor_only_this_cycle()) any_subcore_tensor_only_block = true;
       if (subcore->step0_blocked_by_frontend_sbwait_this_cycle()) any_subcore_frontend_block = true;
+      if (subcore->step0_blocked_by_warpgroup_arrive_this_cycle()) any_subcore_warpgroup_arrive_block = true;
       sm_idle_reason_or |= subcore->step0_reason_mask_this_cycle();
+    }
+    // [CTA-imbalance diag] consumer-side WGMMA-result wait, counted EVERY cycle (not just
+    // SM-idle) and attributed to each resident CTA slot. This is the async-WGMMA overlap
+    // target: a consumer warp stalled on a wgmma.wait_group would run if the tensor result
+    // were available in the background. Exact for 1-CTA/SM (fwd); upper bound for bwd.
+    if (m_config->wgmma_step0_instrument_enable && any_subcore_warpgroup_arrive_block) {
+      for (unsigned s = 0; s < MAX_CTA_PER_SHADER; s++) {
+        if (m_cta_status[s] > 0) m_warpgroup_arrive_cyc_by_cta_slot[s]++;
+      }
     }
     if (!any_subcore_issued) {
       m_sm_stats.m_stats_map["total_num_cycles_sm_all_subcores_idle"]->increment_with_integer(1);
       // WGMMA-specific: SM-idle cycles with >=1 subcore blocked only by the tensor lockout.
       if (m_config->wgmma_step0_instrument_enable && any_subcore_tensor_only_block) {
         m_sm_stats.m_stats_map["total_num_cycles_sm_idle_all_blocked_by_tensor"]->increment_with_integer(1);
+        // [CTA-imbalance diag] attribute this tensor-caused idle cycle to every
+        // CTA slot resident this cycle (exact for 1-CTA/SM fwd; upper bound for
+        // multi-CTA bwd). Correlates per-CTA tensor-idle with density in [CTAFIN].
+        for (unsigned s = 0; s < MAX_CTA_PER_SHADER; s++) {
+          if (m_cta_status[s] > 0) m_sm_idle_tensor_cyc_by_cta_slot[s]++;
+        }
       }
       // Frontend-specific: SM-idle cycles with >=1 subcore blocked on the L1I stream-buffer frontend.
       if (m_config->l1i_frontend_step0_instrument_enable && any_subcore_frontend_block) {
@@ -921,6 +938,15 @@ void SM::init_warps(unsigned cta_id, unsigned start_thread, unsigned end_thread,
                     unsigned ctaid, int cta_size, kernel_info_t &kernel) {
   address_type start_pc = next_pc(start_thread);
   unsigned kernel_id = kernel.get_uid();
+  // [CTA-imbalance diag] Stamp this CTA slot's launch cycle and clear its
+  // tensor-op counter so [CTAFIN] can report per-CTA elapsed cycles + density.
+  // Observe-only; no timing effect.
+  if (cta_id < MAX_CTA_PER_SHADER) {
+    m_cta_slot_start_cycle[cta_id] = (unsigned long long)m_gpu->gpu_sim_cycle;
+    m_tensor_ops_by_cta_slot[cta_id] = 0;
+    m_sm_idle_tensor_cyc_by_cta_slot[cta_id] = 0;
+    m_warpgroup_arrive_cyc_by_cta_slot[cta_id] = 0;
+  }
   if (m_config->model == POST_DOMINATOR) {
     unsigned start_warp = start_thread / m_config->warp_size;
     unsigned warp_per_cta = cta_size / m_config->warp_size;
@@ -1314,6 +1340,27 @@ void SM::register_cta_thread_exit(unsigned cta_num, kernel_info_t *kernel) {
     // Record first completed CTA for ground truth validation
     unsigned global_cta_id = m_local_to_global_cta_id[cta_num];
     m_gpu->record_first_completed_cta(global_cta_id, m_sm_id);
+
+    // [CTA-imbalance diag] Emit this CTA's finish cycle, elapsed cycles, and raw
+    // tensor-op (WGMMA) count so tail-drain can be correlated with tensor density
+    // AND per-CTA duration. Keyed by hardware CTA slot so multi-wave SMs (bwd)
+    // report each CTA separately; the slot counters are reset for reuse by the
+    // next CTA scheduled into this slot. Observe-only, gated.
+    if (m_config->wgmma_step0_instrument_enable) {
+      unsigned long long finish_cyc = (unsigned long long)m_gpu->gpu_sim_cycle;
+      unsigned long long start_cyc = m_cta_slot_start_cycle[cta_num];
+      printf("[CTAFIN] sm=%u cta_slot=%u global_cta=%u start_cyc=%llu "
+             "finish_cyc=%llu elapsed_cyc=%llu tensor_ops=%llu sm_idle_tensor_cyc=%llu "
+             "warpgroup_arrive_cyc=%llu\n",
+             m_sm_id, cta_num, global_cta_id, start_cyc, finish_cyc,
+             finish_cyc - start_cyc, m_tensor_ops_by_cta_slot[cta_num],
+             m_sm_idle_tensor_cyc_by_cta_slot[cta_num],
+             m_warpgroup_arrive_cyc_by_cta_slot[cta_num]);
+      m_tensor_ops_by_cta_slot[cta_num] = 0;
+      m_cta_slot_start_cycle[cta_num] = 0;
+      m_sm_idle_tensor_cyc_by_cta_slot[cta_num] = 0;
+      m_warpgroup_arrive_cyc_by_cta_slot[cta_num] = 0;
+    }
 
     // Increment the completed CTAs
     m_sm_stats.m_stats_map["ctas_completed"]->increment_with_integer(1);

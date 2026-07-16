@@ -486,4 +486,32 @@ class SM : public core_t, public shader_core_ctx_wrapper {
 
   // Power
   PowerscalingCoefficients *m_scaling_coeffs;
+
+  // [CTA-imbalance diag] Per-CTA-slot raw count of TENSOR_CORE (WGMMA) ops.
+  // Indexed by hardware CTA slot (get_cta_id, 0..MAX_CTA_PER_SHADER-1) so a SM
+  // that runs multiple CTAs sequentially (bwd: Waves/SM=2.91) counts each CTA
+  // separately — a SM-wide scalar would wrongly fold earlier CTAs into later
+  // ones. Also stamps each slot's launch cycle so both tensor density AND
+  // elapsed cycles can be correlated with the finish cycle. Observe-only;
+  // increment is always-on, emission is gated by -wgmma_step0_instrument_enable.
+  unsigned long long m_tensor_ops_by_cta_slot[MAX_CTA_PER_SHADER] = {0};
+  unsigned long long m_cta_slot_start_cycle[MAX_CTA_PER_SHADER] = {0};
+  // SM-idle cycles (no subcore issued) with >=1 subcore blocked only by the tensor
+  // re-issue lockout, attributed to the CTA slot(s) resident this cycle. For 1-CTA/SM
+  // (fwd) this exactly attributes the tensor-caused drain to that CTA; for multi-CTA
+  // SMs it credits every resident slot (read as an upper bound there). Lets [CTAFIN]
+  // correlate a CTA's tensor-caused idle with its tensor density in ONE line.
+  unsigned long long m_sm_idle_tensor_cyc_by_cta_slot[MAX_CTA_PER_SHADER] = {0};
+  // Cycles with >=1 subcore blocked on a WGMMA RESULT (warpgroup_arrive = consumer-side
+  // scoreboard RAW), attributed to each resident CTA slot. Counted every cycle (not only
+  // SM-idle), since a consumer can wait while another subcore still issues. Distinguishes
+  // the consumer-side tensor stall (which async-WGMMA overlap targets) from the
+  // producer-side re-issue lockout above. Exact for 1-CTA/SM (fwd); upper bound for bwd.
+  unsigned long long m_warpgroup_arrive_cyc_by_cta_slot[MAX_CTA_PER_SHADER] = {0};
+ public:
+  // Increment the tensor-op count for the CTA slot that owns hardware warp wid.
+  void inc_tensor_ops_for_warp(unsigned wid) {
+    unsigned cta_slot = m_physical_warp[wid]->get_cta_id();
+    if (cta_slot < MAX_CTA_PER_SHADER) m_tensor_ops_by_cta_slot[cta_slot]++;
+  }
 };
