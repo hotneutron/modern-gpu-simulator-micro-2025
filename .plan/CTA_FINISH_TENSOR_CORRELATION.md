@@ -160,6 +160,51 @@ summed should be in the same ballpark as the SM-global `warpgroup_arrive` stall 
 ## Status
 
 - [x] Instrumentation implemented (sm.h / functional_unit.cc / sm.cc), observe-only + gated.
-- [ ] `make clean` + rebuild on remote.
-- [ ] fwd K5 + bwd K10 re-run with the flag.
-- [ ] Correlation computed; decision-rule doc(s) created.
+- [x] `make clean` + rebuild on remote.
+- [x] fwd K5 (`.o40`) + bwd K10 (`.o23`) run with the flag (12h). 132 / 384 `[CTAFIN]` lines — full.
+- [x] Correlation computed (below).
+
+## Results (2026-07-16, fwd `.o40` / bwd `.o23`)
+
+**Two instrumentation bugs found + fixed in the run (columns were 0):**
+1. `tensor_ops=0` — the guard keyed off `m_type_of_pipeline == TENSOR_CORE__OP`, but the tensor pipeline
+   is built as `SPECIALIZED__OP` ([subcore.cc:1469](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/subcore.cc#L1469)), so the branch never ran. Fixed to key off the
+   instruction op (`ready_reg->is_tensor_core_op()`).
+2. `warpgroup_arrive_cyc=0` — gated on the traditional-scoreboard path, but FA3 runs in **trace mode**
+   with `use_traditional_scoreboarding == false` ([subcore.cc:572](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/subcore.cc#L572)), so `checkTensorCollision_remodeling`
+   is never reached and the SM-global `ncu_stall_warpgroup_arrive` is itself 0. **This model has no
+   separate consumer-side warpgroup_arrive stall** — WGMMA is a fixed-latency `SPECIALIZED` FU op and the
+   consumer's RAW wait folds into `wait_barrier`/scoreboard latency. Replaced the dead column with the
+   working **producer/FU-busy** signal `fu_occupied_tensor_cyc` (== NCU `mma`).
+
+**The one column valid on THIS run is `sm_idle_tensor_cyc` (producer re-issue lockout, SM-idle).**
+`tensor_ops` and `fu_occupied_tensor_cyc` need the post-fix rebuild. Correlation of the valid column
+against per-CTA duration:
+
+| kernel | n | elapsed spread | r(sm_idle_tensor_cyc, elapsed_cyc) | slow-decile vs fast-decile idle |
+|---|---:|---:|---:|---:|
+| **FWD** (`.o40`) | 132 | 16,551 (12.2% of kernel) | **+0.38** (weak) | 2655 vs 2396 (≈flat) |
+| **BWD** (`.o23`) | 384 | 125,504 (58.4% of kernel) | **+0.99** (near-perfect) | **6479 vs 556 (11.6×)** |
+
+**Verdict — bwd's CTA-imbalance is strongly tensor-coupled; fwd's is not.**
+- **bwd**: the CTAs that take longest are exactly the tensor-stalled CTAs (r=0.99, slow decile 11.6× the
+  fast decile's tensor idle). bwd is the tensor-dense kernel (`mma` is its top sim stall at 12.5%), so
+  async-WGMMA is the tail lever here. **This is the primary optimization target.**
+- **fwd**: weak (r=0.38); tensor idle is nearly flat across CTAs (1998–3017) and the elapsed spread is
+  small (12%). fwd's residual is NOT dominated by per-CTA tensor imbalance — consistent with fwd being
+  1-CTA/SM with an already-tight tail. (fwd still has the aggregate stall-depth gap from Ongoing item 3,
+  but it is not a *per-CTA-imbalance* effect.)
+
+**Caveat (why the post-fix rebuild still matters):** the bwd r=0.99 is on the producer re-issue-lockout
+column alone. To rule out the trivial confound "a longer-running CTA accumulates more of *every* stall,"
+the re-run must check the density-normalized signal (`sm_idle_tensor_cyc / tensor_ops`, and
+`fu_occupied_tensor_cyc`) — if the tensor stall PER tensor-op is also higher on the slow CTAs, the
+causation is confirmed, not just co-scaling. Design (below in ASYNC_WGMMA) proceeds against bwd on this
+strong-but-single-column evidence; the post-fix run is the confirmation gate.
+
+## Decision (naming rule applied)
+
+Result = **related** (bwd tail is tensor-coupled), so per the naming rule the async-WGMMA lever is
+documented in a single design doc **`.plan/ASYNC_WGMMA.md`** (created next). The fwd-specific weak
+coupling is noted there as "not the fwd lever" rather than spun into a separate CTA_IMBALANCE doc —
+fwd's residual is the aggregate stall-depth item already tracked in `FA3_progress.md` Ongoing item 3.
