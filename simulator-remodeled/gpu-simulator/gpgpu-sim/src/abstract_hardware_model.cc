@@ -437,15 +437,6 @@ void warp_inst_t::generate_tensor_core_latencies(gpgpu_sim *gpu) {
     number_of_cycles = number_of_cycles / 2;
   } 
   initiation_interval = number_of_cycles / 2;
-  // ASYNC_WGMMA Design A: shrink the producer re-issue interval by N while holding
-  // the consumer completion time (issue->result == number_of_cycles) and the total
-  // tensor-pipe occupancy (bitset target = read + latency + II) constant. N==1 keeps
-  // the EXACT synchronous value (bit-identical). See .plan/ASYNC_WGMMA.md.
-  int wgmma_async_div = shader_config.wgmma_async_issue_interval_divisor;
-  if (wgmma_async_div > 1) {
-    initiation_interval =
-        std::max(1u, (number_of_cycles / 2) / (unsigned)wgmma_async_div);
-  }
   latency = number_of_cycles - initiation_interval;
   if(get_extra_trace_instruction_info().get_tensor_core_instruction_info().is_16816_fp32_1688_fp32) {
     initiation_interval += gpu->get_config().get_gpgpu_sim_config().tensor_extra_latency_16816_fp32_1688_fp32;
@@ -464,9 +455,9 @@ void warp_inst_t::generate_tensor_core_latencies(gpgpu_sim *gpu) {
         ( ti.is_sparse ? 1ull : 0ull );
     if(s_seen_wgmma_shapes.insert(key).second) {
       std::fprintf(stderr,
-        "[WGMMADBG-MNK] m=%u n=%u k=%u bits=%u sparse=%d number_of_cycles=%u async_div=%d II=%u latency=%u\n",
+        "[WGMMADBG-MNK] m=%u n=%u k=%u bits=%u sparse=%d number_of_cycles=%u II=%u latency=%u\n",
         ti.size_m, ti.size_n, ti.size_k, ti.operand_bit_size, (int)ti.is_sparse,
-        number_of_cycles, wgmma_async_div, initiation_interval, latency);
+        number_of_cycles, initiation_interval, latency);
     }
   }
 }

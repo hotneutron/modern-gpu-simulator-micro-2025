@@ -2139,12 +2139,6 @@ class shader_core_config : public core_config {
   int tensor_latency;
   int tensor_extra_latency_16816_fp32_1688_fp32;
   int tensor_rate_per_cycle;
-  // ASYNC_WGMMA Design A: producer re-issue interval divisor. Default 1 =
-  // bit-identical to the synchronous model (II = number_of_cycles/2). When N>1
-  // the producer re-issue II is shrunk by N while the consumer completion time
-  // (issue->result) and total tensor-pipe occupancy are held constant, modeling
-  // async wgmma.mma_async issue de-serialization. See .plan/ASYNC_WGMMA.md.
-  int wgmma_async_issue_interval_divisor;
   int branch_latency;
   int half_latency;
   int uniform_latency;
