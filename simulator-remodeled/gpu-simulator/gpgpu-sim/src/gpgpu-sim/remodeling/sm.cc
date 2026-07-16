@@ -554,22 +554,23 @@ void SM::cycle() {
     bool any_subcore_issued = false;
     bool any_subcore_tensor_only_block = false;
     bool any_subcore_frontend_block = false;
-    bool any_subcore_warpgroup_arrive_block = false;
+    bool any_subcore_fu_occupied_tensor_block = false;
     unsigned int sm_idle_reason_or = 0;  // OR of all subcores' non-issue reason masks
     for (auto subcore : m_subcores) {
       if (subcore->step0_issued_this_cycle()) any_subcore_issued = true;
       if (subcore->step0_blocked_by_tensor_only_this_cycle()) any_subcore_tensor_only_block = true;
       if (subcore->step0_blocked_by_frontend_sbwait_this_cycle()) any_subcore_frontend_block = true;
-      if (subcore->step0_blocked_by_warpgroup_arrive_this_cycle()) any_subcore_warpgroup_arrive_block = true;
+      if (subcore->step0_blocked_by_fu_occupied_tensor_this_cycle()) any_subcore_fu_occupied_tensor_block = true;
       sm_idle_reason_or |= subcore->step0_reason_mask_this_cycle();
     }
-    // [CTA-imbalance diag] consumer-side WGMMA-result wait, counted EVERY cycle (not just
-    // SM-idle) and attributed to each resident CTA slot. This is the async-WGMMA overlap
-    // target: a consumer warp stalled on a wgmma.wait_group would run if the tensor result
-    // were available in the background. Exact for 1-CTA/SM (fwd); upper bound for bwd.
-    if (m_config->wgmma_step0_instrument_enable && any_subcore_warpgroup_arrive_block) {
+    // [CTA-imbalance diag] tensor-FU-busy stall (NCU `mma`), counted EVERY cycle (not just
+    // SM-idle: another subcore may still issue while this WGMMA waits on the tensor FU) and
+    // attributed to each resident CTA slot. This is the tensor-attributable stall the trace
+    // model exposes (there is no separate consumer-side warpgroup_arrive). Exact for 1-CTA/SM
+    // (fwd); upper bound for bwd.
+    if (m_config->wgmma_step0_instrument_enable && any_subcore_fu_occupied_tensor_block) {
       for (unsigned s = 0; s < MAX_CTA_PER_SHADER; s++) {
-        if (m_cta_status[s] > 0) m_warpgroup_arrive_cyc_by_cta_slot[s]++;
+        if (m_cta_status[s] > 0) m_fu_occupied_tensor_cyc_by_cta_slot[s]++;
       }
     }
     if (!any_subcore_issued) {
@@ -945,7 +946,7 @@ void SM::init_warps(unsigned cta_id, unsigned start_thread, unsigned end_thread,
     m_cta_slot_start_cycle[cta_id] = (unsigned long long)m_gpu->gpu_sim_cycle;
     m_tensor_ops_by_cta_slot[cta_id] = 0;
     m_sm_idle_tensor_cyc_by_cta_slot[cta_id] = 0;
-    m_warpgroup_arrive_cyc_by_cta_slot[cta_id] = 0;
+    m_fu_occupied_tensor_cyc_by_cta_slot[cta_id] = 0;
   }
   if (m_config->model == POST_DOMINATOR) {
     unsigned start_warp = start_thread / m_config->warp_size;
@@ -1351,15 +1352,15 @@ void SM::register_cta_thread_exit(unsigned cta_num, kernel_info_t *kernel) {
       unsigned long long start_cyc = m_cta_slot_start_cycle[cta_num];
       printf("[CTAFIN] sm=%u cta_slot=%u global_cta=%u start_cyc=%llu "
              "finish_cyc=%llu elapsed_cyc=%llu tensor_ops=%llu sm_idle_tensor_cyc=%llu "
-             "warpgroup_arrive_cyc=%llu\n",
+             "fu_occupied_tensor_cyc=%llu\n",
              m_sm_id, cta_num, global_cta_id, start_cyc, finish_cyc,
              finish_cyc - start_cyc, m_tensor_ops_by_cta_slot[cta_num],
              m_sm_idle_tensor_cyc_by_cta_slot[cta_num],
-             m_warpgroup_arrive_cyc_by_cta_slot[cta_num]);
+             m_fu_occupied_tensor_cyc_by_cta_slot[cta_num]);
       m_tensor_ops_by_cta_slot[cta_num] = 0;
       m_cta_slot_start_cycle[cta_num] = 0;
       m_sm_idle_tensor_cyc_by_cta_slot[cta_num] = 0;
-      m_warpgroup_arrive_cyc_by_cta_slot[cta_num] = 0;
+      m_fu_occupied_tensor_cyc_by_cta_slot[cta_num] = 0;
     }
 
     // Increment the completed CTAs

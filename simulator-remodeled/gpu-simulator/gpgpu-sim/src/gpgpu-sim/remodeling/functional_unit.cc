@@ -164,16 +164,19 @@ void functional_unit::issue(register_set_uniptr &source_reg) {
       case SFU__OP:
       case TENSOR_CORE__OP:
         m_sm->incsfu_stat(m_sm->get_config()->warp_size, ready_reg->latency);
-        // [CTA-imbalance diag] raw per-CTA-slot WGMMA/tensor op count (observe-only,
-        // always-on; printed only under -wgmma_step0_instrument_enable). Keyed by the
-        // issuing warp's CTA slot so multi-wave SMs (bwd) count each CTA separately.
-        if (m_type_of_pipeline == TENSOR_CORE__OP) {
-          m_sm->inc_tensor_ops_for_warp(ready_reg->warp_id());
-        }
         break;
       default:
         assert(0);
         break;
+    }
+    // [CTA-imbalance diag] raw per-CTA-slot WGMMA/tensor op count (observe-only,
+    // always-on; printed only under -wgmma_step0_instrument_enable). Keyed by the
+    // issuing warp's CTA slot so multi-wave SMs (bwd) count each CTA separately.
+    // NOTE: the tensor pipeline is created with m_type_of_pipeline == SPECIALIZED__OP
+    // (see subcore.cc), NOT TENSOR_CORE__OP, so we must key off the INSTRUCTION op
+    // (is_tensor_core_op) here — the pipeline type does not identify a WGMMA.
+    if (ready_reg->is_tensor_core_op()) {
+      m_sm->inc_tensor_ops_for_warp(ready_reg->warp_id());
     }
 
     m_sm->incexecstat(ready_reg);

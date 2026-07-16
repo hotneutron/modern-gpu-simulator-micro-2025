@@ -502,12 +502,13 @@ class SM : public core_t, public shader_core_ctx_wrapper {
   // SMs it credits every resident slot (read as an upper bound there). Lets [CTAFIN]
   // correlate a CTA's tensor-caused idle with its tensor density in ONE line.
   unsigned long long m_sm_idle_tensor_cyc_by_cta_slot[MAX_CTA_PER_SHADER] = {0};
-  // Cycles with >=1 subcore blocked on a WGMMA RESULT (warpgroup_arrive = consumer-side
-  // scoreboard RAW), attributed to each resident CTA slot. Counted every cycle (not only
-  // SM-idle), since a consumer can wait while another subcore still issues. Distinguishes
-  // the consumer-side tensor stall (which async-WGMMA overlap targets) from the
-  // producer-side re-issue lockout above. Exact for 1-CTA/SM (fwd); upper bound for bwd.
-  unsigned long long m_warpgroup_arrive_cyc_by_cta_slot[MAX_CTA_PER_SHADER] = {0};
+  // Cycles with >=1 subcore whose head WGMMA was blocked because the tensor FU is busy
+  // (NCU `mma`, the producer/FU-busy tensor stall), attributed to each resident CTA slot.
+  // Counted every cycle (not only SM-idle), since a WGMMA can wait on the tensor FU while
+  // another subcore still issues. In this trace-driven model there is no separate consumer-
+  // side warpgroup_arrive (WGMMA result waits fold into wait_barrier), so this is THE tensor-
+  // attributable per-CTA stall. Exact for 1-CTA/SM (fwd); upper bound for bwd.
+  unsigned long long m_fu_occupied_tensor_cyc_by_cta_slot[MAX_CTA_PER_SHADER] = {0};
  public:
   // Increment the tensor-op count for the CTA slot that owns hardware warp wid.
   void inc_tensor_ops_for_warp(unsigned wid) {

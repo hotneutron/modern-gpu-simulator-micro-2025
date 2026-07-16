@@ -122,11 +122,12 @@ class Subcore {
   bool step0_issued_this_cycle() const { return m_step0_issued_this_cycle; }
   bool step0_blocked_by_tensor_only_this_cycle() const { return m_step0_blocked_by_tensor_only_this_cycle; }
   bool step0_blocked_by_frontend_sbwait_this_cycle() const { return m_step0_blocked_by_frontend_sbwait_this_cycle; }
-  // [CTA-imbalance diag] this cycle, >=1 warp in this subcore was blocked on a WGMMA
-  // result (warpgroup_arrive = scoreboard RAW on a pending tensor dst). The consumer-side
-  // tensor stall, distinct from the producer-side re-issue lockout. Exported so SM::cycle
-  // can attribute it per-CTA-slot.
-  bool step0_blocked_by_warpgroup_arrive_this_cycle() const { return m_step0_blocked_by_warpgroup_arrive_this_cycle; }
+  // [CTA-imbalance diag] this cycle, >=1 warp's head was a WGMMA blocked because the tensor FU
+  // is busy (== NCU `mma`, the producer/FU-busy tensor stall). Trace-driven WGMMA is a
+  // fixed-latency SPECIALIZED FU op with no separate consumer-side scoreboard "warpgroup_arrive"
+  // (that folds into wait_barrier), so this FU-busy signal is the tensor-attributable stall the
+  // model exposes. Exported so SM::cycle can attribute it per-CTA-slot.
+  bool step0_blocked_by_fu_occupied_tensor_this_cycle() const { return m_step0_blocked_by_fu_occupied_tensor_this_cycle; }
   // [Step-0 full SM-idle decomposition] per-cycle bitmask of this subcore's non-issue reasons,
   // so SM::cycle() can attribute true SM-idle cycles to every reason in one run.
   unsigned int step0_reason_mask_this_cycle() const { return m_step0_reason_mask_this_cycle; }
@@ -161,7 +162,7 @@ class Subcore {
   bool m_step0_issued_this_cycle = false;
   bool m_step0_blocked_by_tensor_only_this_cycle = false;
   bool m_step0_blocked_by_frontend_sbwait_this_cycle = false;
-  bool m_step0_blocked_by_warpgroup_arrive_this_cycle = false;
+  bool m_step0_blocked_by_fu_occupied_tensor_this_cycle = false;
   unsigned int m_step0_reason_mask_this_cycle = 0;
 
   register_set_uniptr m_ISSUE_CONTROL_latch = register_set_uniptr(1, "ISSUE_CONTROL_latch");
