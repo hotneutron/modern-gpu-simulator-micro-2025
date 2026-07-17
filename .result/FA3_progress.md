@@ -115,7 +115,40 @@ Cumulative: **bwd 250,026 → 215,895 (-13.7% since Opt 7, 1.88x → 1.62x); fwd
 remaining sim-vs-HW gap (fwd 2.01x / bwd 1.62x) is owned by the items below. No cycle claim is made
 until an item lands a verified improvement.
 
+#### ⭐ Measured per-CTA breakdown run (2026-07-17, fwd `.o42` / bwd `.o25`) — decisive results
+
+Timing-neutral (bwd 215,537 ≈ .o21 215,895; fwd 136,293 ≈ .o38 135,999). Per-CTA `[CTAFIN]` with the
+new `-cta_stall_breakdown_instrument_enable` columns (sm_idle_cyc / sm_idle_ibuffer_empty_cyc). Full
+tables in [CTA_FINISH_TENSOR_CORRELATION.md](file:///home/jihyun/modern-gpu-simulator-micro-2025/.plan/CTA_FINISH_TENSOR_CORRELATION.md) RESULTS.
+
+1. **Warpgroup-4× REFUTED.** sim `Σ tensor_ops` = **835,584** vs HW gmma **835,506** = **1.0001×**
+   (both per-warp). No tensor over-execution → Ongoing item 4 CLOSED; the gap is not tensor work.
+2. **fwd (K5): drain-idle bound, NOT tensor, tight spread.** Per-CTA elapsed spread only **12.5%**
+   (slow÷fast 1.10×, everything flat ~1.1×). Absolute breakdown: **drain-idle sm_idle_cyc = 46.9% of
+   elapsed**, of which **ibuffer-empty (trace-drained) = 34.0%**; `sm_idle_tensor_cyc` only 2.0%,
+   `fu_occupied_tensor` 13.4%. → fwd's residual is the **drain tail** (trace-exhausted warps), confirming
+   the "drain-idle 1.39×" factor (Ongoing item 3) and the trace-drained *nature* (not fetch-starved,
+   item 2). No per-CTA imbalance lever for fwd.
+3. **bwd (K10): large REAL work imbalance, faithfully reproduced.** elapsed spread **92.2%**; slow-decile
+   does **11.4×** the tensor_ops of the fast-decile and ALL stalls co-scale (r(elapsed,tensor_ops)=**+0.99**,
+   r(sm_idle)=+0.99). This is causal-mask triangular load imbalance — a scheduler/tile-assignment
+   property the sim reproduces correctly, not a modeling bug. The bwd r=0.99 "tensor coupling" is
+   confirmed as density co-scaling, not an artifactual per-op over-cost (confound cleared).
+
+**Consequence:** both tensor-side hypotheses (async-WGMMA lever, warpgroup-4×) are now closed by
+measurement. The live recoverable gap is **fwd drain-idle** (item 2/3) and any bwd load-balance modeling;
+neither is a tensor-pipe fix.
+
 #### Ongoing item 4 — ⭐ NEW (2026-07-16): no warpgroup execution model → WGMMA executed 4× redundantly (PARKED)
+
+> **⛔ CLOSED (2026-07-17, MEASURED `.o25`) — the 4× hypothesis is REFUTED.** The confirmation run
+> measured sim `Σ[CTAFIN] tensor_ops = 835,584` vs HW NCU gmma ≈ **835,506** → **1.0001×** (per CTA
+> 2,176 == 2,176). The sim executes the **same** tensor-instruction count as HW, not 4×. WGMMA is
+> collective in FLOP terms but both NCU and the sim count `gmma` **per-warp** (all 4 warps issue the
+> HGMMA and each is counted), so sim == HW. **No warpgroup over-execution, no lever here.** Full detail:
+> [WARP_GROUP_H100.md](file:///home/jihyun/modern-gpu-simulator-micro-2025/.plan/WARP_GROUP_H100.md) (verdict box) and [CTA_FINISH_TENSOR_CORRELATION.md](file:///home/jihyun/modern-gpu-simulator-micro-2025/.plan/CTA_FINISH_TENSOR_CORRELATION.md)
+> RESULTS. The excess `mma`-share vs HW is a per-op latency/II (config) matter, not a work over-count.
+> **Net: the fwd/bwd gap is NOT tensor over-execution.** Measured re-scoping below (item 2/3).
 
 > Full analysis + fix sketch: [WARP_GROUP_H100.md](file:///home/jihyun/modern-gpu-simulator-micro-2025/.plan/WARP_GROUP_H100.md). Discovered while designing async-WGMMA.
 

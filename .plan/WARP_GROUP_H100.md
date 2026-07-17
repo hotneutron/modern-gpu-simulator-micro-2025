@@ -1,9 +1,23 @@
 # WARP_GROUP_H100 — the simulator has no warpgroup execution model (WGMMA is executed 4× redundantly)
 
-> **Status: PARKED (documented, not yet implemented).** Discovered 2026-07-16 while designing
-> async-WGMMA ([ASYNC_WGMMA.md](file:///home/jihyun/modern-gpu-simulator-micro-2025/.plan/ASYNC_WGMMA.md)). This is a **separate** problem from async — async does NOT
-> fix it. Tracked as an Ongoing item in
-> [FA3_progress.md](file:///home/jihyun/modern-gpu-simulator-micro-2025/.result/FA3_progress.md).
+> ## ⛔ VERDICT (2026-07-17, MEASURED `.o25`/`.o42`): the "4× over-execution" hypothesis is REFUTED.
+>
+> The confirmation run measured **sim `Σ tensor_ops` = 835,584** vs **HW NCU gmma ≈ 835,506** →
+> **ratio 1.0001 (per CTA: 2,176 vs 2,176)**. The sim executes **exactly the same number of tensor
+> instructions as HW**, NOT 4×. Resolution of the earlier confusion:
+> - WGMMA is *collective* in **FLOP** terms (one tile / warpgroup), BUT the **instruction count** that
+>   both NCU (`sm__inst_executed_pipe_tensor_op_gmma`) and the sim report is **per-warp** — all 4 warps
+>   of the warpgroup each issue the HGMMA and each is counted. sim (per-warp) == HW (per-warp). No 4×.
+> - So there is **no tensor-work over-count** and **no warpgroup lever here**. `mma` FU-occupancy is
+>   HW-faithful in *count*; the sim/HW `mma`-share gap is a per-op **latency/II** (config) matter, which
+>   ASYNC_WGMMA.md already showed is config-tunable, not a code bug.
+> - **This item is CLOSED (no action).** The remaining fwd/bwd gap is NOT tensor over-execution. See the
+>   measured breakdown recorded in FA3_progress.md (Ongoing item 4 → closed; the live gap is fwd
+>   drain-idle, Ongoing item 2/3). The analysis below is retained for history but its premise (4×) is
+>   wrong.
+
+> **Status: ~~PARKED~~ CLOSED — hypothesis refuted by measurement (see verdict above).** Originally
+> discovered 2026-07-16 while designing async-WGMMA ([ASYNC_WGMMA.md](file:///home/jihyun/modern-gpu-simulator-micro-2025/.plan/ASYNC_WGMMA.md)).
 
 ## 1. The finding
 

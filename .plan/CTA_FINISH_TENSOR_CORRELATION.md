@@ -237,3 +237,52 @@ Current full line:
    `sm_idle_ibuffer_empty_cyc` (non-tensor) vs `fu_occupied_tensor_cyc` (tensor) to name the cause.
 3. **bwd confound clear-up:** density-normalized `sm_idle_tensor_cyc / tensor_ops` and
    `fu_occupied_tensor_cyc` now that `tensor_ops` is non-zero (post-fix build).
+
+## RESULTS (2026-07-17, MEASURED — fwd `.o42` / bwd `.o25`, both clean-exit)
+
+Timing-neutral gate held: bwd `gpu_sim_cycle=215,537` (vs `.o21` 215,895, −0.17%), fwd `136,293`
+(vs `.o38` 135,999, +0.2%) — the new counters did not perturb timing. 384 / 132 `[CTAFIN]` lines full.
+
+### Headline: warpgroup-4× REFUTED
+`Σ tensor_ops` bwd = **835,584** vs HW gmma **835,506** → **1.0001×** (per CTA 2,176 == 2,176). The sim
+executes the SAME tensor-instruction count as HW (both per-warp). No 4×. → WARP_GROUP_H100.md CLOSED.
+
+### bwd (K10) — strongly tensor-coupled (as before), imbalance is REAL and large
+| axis | r(elapsed) | slow-decile ÷ fast-decile |
+|---|---:|---:|
+| tensor_ops | **+0.99** | **11.4×** |
+| fu_occupied_tensor_cyc (mma) | +0.97 | 11.1× |
+| sm_idle_tensor_cyc | +0.99 | 10.5× |
+| sm_idle_cyc (drain) | +0.99 | 9.7× |
+| sm_idle_ibuffer_empty_cyc | +0.84 | 6.2× |
+
+elapsed spread = **92.2%** (10,626 → 136,028). The slow CTAs are the tensor-dense CTAs *and* every
+stall scales together — a genuine per-CTA **work imbalance** (causal-mask triangular load: some CTAs do
+11× the tensor ops of others). This is a **scheduler/tile-assignment (load-balance)** phenomenon, not a
+tensor-model bug: the sim faithfully reproduces that tensor-heavy CTAs take longer. The confound is now
+resolved — since tensor_ops itself is 11.4× and fu_occupied scales with it, the stall is proportional to
+real work, i.e. co-scaling with density, not an artifactual per-op over-cost.
+
+### fwd (K5) — NOT tensor-bound; drain-idle dominated, tight spread
+| axis | r(elapsed) | slow÷fast | mean as % elapsed |
+|---|---:|---:|---:|
+| sm_idle_cyc (drain) | +0.74 | 1.09× | **46.9%** |
+| sm_idle_ibuffer_empty_cyc | +0.66 | 1.12× | **34.0%** |
+| tensor_ops | +0.75 | 1.14× | — |
+| fu_occupied_tensor_cyc (mma) | +0.55 | 1.15× | 13.4% |
+| sm_idle_tensor_cyc | +0.34 | 1.13× | 2.0% |
+
+elapsed spread = only **12.5%** (117,923 → 134,791). fwd is 1-CTA/SM with a **tight** finish tail — the
+per-CTA variance is small and everything is mildly correlated (all ~1.1×), so there is **no dominant
+per-CTA imbalance lever**. What dominates fwd in absolute terms is **drain-idle 46.9% of elapsed**, of
+which **ibuffer-empty (trace-drained) is 34%** — confirming fwd's residual is the drain tail (SM sits
+idle with trace-exhausted warps), NOT tensor and NOT a per-CTA imbalance. `sm_idle_tensor_cyc` is only
+2.0%. This matches the earlier r=0.38 tensor read and the "drain-idle 1.39×" factor.
+
+### Verdict on the two open items
+- **Open item 1 (warpgroup-4×): CLOSED — refuted.** sim == HW tensor count.
+- **Open item 2 (fwd variance): ANSWERED — fwd is drain-idle bound (46.9%, ibuffer-empty 34%), not
+  tensor, with a tight 12.5% spread.** No per-CTA imbalance lever for fwd; the lever (if any) is the
+  aggregate drain-tail, whose *nature* is trace-drained warps (not fetch-starved, prior finding holds).
+- **bwd:** large real imbalance (92% spread) that tracks tensor density — a load-balance property the
+  sim reproduces faithfully; not a modeling error to "fix".
