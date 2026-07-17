@@ -1978,6 +1978,14 @@ void shader_core_config::reg_options(class OptionParser *opp) {
                          "(which prints [CTAFIN]) is also set. See .plan/WARP_GROUP_H100.md. "
                          "(default=0)",
                          "0");
+  option_parser_register(opp, "-sync_wait_hist_instrument_enable", OPT_BOOL,
+                         &sync_wait_hist_instrument_enable,
+                         "Enable observe-only mbarrier wait-duration histogram (first-miss to pass "
+                         "cycle, bucketed). Uses dedicated arrays only (never the issue-path "
+                         "m_pending_sync_waits), so timing is unchanged. Independent gate for "
+                         "bit-identity bisection. See .plan FWD_DRAIN_IDLE_MBARRIER_CEILING. "
+                         "(default=0)",
+                         "0");
   option_parser_register(opp, "-sync_debug_enable", OPT_BOOL,
                          &sync_debug_enable,
                          "Enable Hopper mbarrier sync debug logging (SYNCDBG)."
@@ -2836,6 +2844,18 @@ void gpgpu_sim::create_gpu_per_sm_stats() {
   // subcore that had an eligible-but-blocked warp was blocked specifically by the tensor pipe.
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_sm_all_subcores_idle", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_sm_idle_all_blocked_by_tensor", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  // [FWD drain-idle 축1] mutually-exclusive SM-idle partition (sum == sm_all_subcores_idle) + the
+  // independent wait_barrier ceiling (cross-checks partition only_wait_barrier). Observe-only.
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_sm_idle_all_blocked_by_wait_barrier", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_sm_idle_partition_drained", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_sm_idle_partition_only_wait_barrier", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_sm_idle_partition_only_tensor", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_sm_idle_partition_only_stall_count", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_sm_idle_partition_only_fu_nontensor", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_sm_idle_partition_only_next_stage", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_sm_idle_partition_only_l1c", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_sm_idle_partition_only_other", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_sm_idle_partition_multi", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_sm_idle_blocked_by_frontend_sbwait", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
   // Full SM-idle decomposition: for each non-issue reason, SM-idle cycles where >=1 subcore had it.
   {

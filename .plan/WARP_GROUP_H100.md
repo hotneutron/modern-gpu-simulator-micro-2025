@@ -15,6 +15,36 @@
 >   measured breakdown recorded in FA3_progress.md (Ongoing item 4 → closed; the live gap is fwd
 >   drain-idle, Ongoing item 2/3). The analysis below is retained for history but its premise (4×) is
 >   wrong.
+>
+> ## ⛔ W2 (quarter-tile) VERDICT (2026-07-17, MEASURED HW `sm__pipe_tensor_cycles_active`): also REFUTED.
+>
+> The count-identity above (sim gmma == HW gmma) proves the instruction *count* is faithful, but it does
+> NOT by itself prove the per-op tensor-pipe **occupancy** (cycles) is faithful — that was the open W2
+> question ("does the sim charge each of the 4 warps the FULL tile, giving 4× pipe-busy-cycles?"). It is
+> now measured and **refuted**:
+> - **HW NCU `sm__pipe_tensor_cycles_active.pct_of_peak_sustained_active`: fwd 46.13%, bwd 53.61%**
+>   (kernels 4 / 9 of this trace, grid 132 / 384; `ncu --page raw --import full_rpt.ncu-rep`).
+>   ⚠️ This supersedes the `15.33%` in FA3_kernel_10_bwd.md (a mislabeled normalization); **53.6% is
+>   authoritative** (== the `sm__pipe_tensor_cycles_active=53.6%` already noted in that file's §"Pre-run"
+>   raw-report row).
+> - **Sim tensor-pipe occupancy (active-normalized, apples-to-apples): fwd ≈ 48.5% (1.05×), bwd
+>   ≤ 69.6% upper-bound (≤1.30×)** — computed from `Σ[CTAFIN] tensor_ops` × 64 cyc / (528 pipes ×
+>   active-cycles). The bwd figure is an **upper bound** (it over-charges the 32-cyc `m64n64k16` shapes to
+>   64); the true value is lower. **Neither is 4× HW.** If the sim over-occupied the tensor pipe 4×, its
+>   utilization could not land ≤ HW.
+> - **Why it is already faithful (the mechanism the count-verdict missed): 4× work × 4× per-pipe rate
+>   CANCELS.** `-tensor_rate_per_cycle 32768` (bits/cyc) = 2048 MAC/cyc = the **whole-SM** tensor peak
+>   (≈949 TFLOPS bf16, matches H100). One `HGMMA m64n128k16` = 131,072 MAC. The sim charges each warp the
+>   FULL tile at the whole-SM rate → 131072/2048 = **64 cyc/pipe**; HW splits M=64 across 4 SMSP tensor
+>   cores (¼ tile each) at the per-SMSP rate (512 MAC/cyc) → 32768/512 = **64 cyc/pipe**. **Identical
+>   pipe-busy time.** The sim's 4× MAC over-count is exactly cancelled by its 4×-too-large per-pipe rate.
+> - **W2 would BACKFIRE.** Quarter-tile done naively (¼ work, unchanged rate) → 16 cyc/op → sim 4×
+>   *too fast* on tensor, breaking a currently-correct timing. Quarter-tile done correctly (¼ work + ¼
+>   rate) → 64 cyc/op → no change. **No win in either direction.** W1 (leader-only) has the same problem
+>   (it removes 3 pipes that are individually correct). **Both W1 and W2 are CLOSED (no action).**
+> - **The only residual tensor fidelity gap is in FLOP-*accounting* (power/throughput-%), not timing** —
+>   the sim's `pct_of_peak_sustained` (a FLOP-efficiency metric) would read 4× high, which matters for a
+>   power model but is a separate, non-cycle concern. The cycle-time model is correct.
 
 > **Status: ~~PARKED~~ CLOSED — hypothesis refuted by measurement (see verdict above).** Originally
 > discovered 2026-07-16 while designing async-WGMMA ([ASYNC_WGMMA.md](file:///home/jihyun/modern-gpu-simulator-micro-2025/.plan/ASYNC_WGMMA.md)).

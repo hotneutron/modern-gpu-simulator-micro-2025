@@ -517,10 +517,33 @@ class SM : public core_t, public shader_core_ctx_wrapper {
   // the idle head warp had an empty ibuffer (trace-drained), the suspected fwd cause.
   unsigned long long m_sm_idle_cyc_by_cta_slot[MAX_CTA_PER_SHADER] = {0};
   unsigned long long m_sm_idle_ibuffer_empty_cyc_by_cta_slot[MAX_CTA_PER_SHADER] = {0};
+  // [FWD drain-idle 축1] per-CTA mutually-exclusive partition signals: recoverable mbarrier-only
+  // idle vs floor (all-drained) idle. Gated by wgmma_step0_instrument_enable; reset at launch/exit.
+  unsigned long long m_wait_barrier_only_cyc_by_cta_slot[MAX_CTA_PER_SHADER] = {0};
+  unsigned long long m_drained_cyc_by_cta_slot[MAX_CTA_PER_SHADER] = {0};
+  // [FWD drain-idle 축2] producer/consumer role split. sticky per-warp booleans (set on first
+  // TMA/arrive_expect_tx = producer, first WGMMA = consumer), and per-warp last trace-drain cycle
+  // (0 = not yet drained). At CTA exit the [CTAFIN] line derives per-role max drain from these.
+  bool m_warp_is_producer[MAX_WARP_PER_SHADER] = {false};
+  bool m_warp_is_consumer[MAX_WARP_PER_SHADER] = {false};
+  unsigned long long m_warp_drain_cycle[MAX_WARP_PER_SHADER] = {0};
+  // [FWD drain-idle 축4] per-CTA mbarrier test counts (per-SM SYNCDBG re-attributed per CTA slot).
+  unsigned long long m_wait_pending_by_cta_slot[MAX_CTA_PER_SHADER] = {0};
+  unsigned long long m_wait_released_by_cta_slot[MAX_CTA_PER_SHADER] = {0};
+  // [FWD drain-idle 축3] mbarrier wait-duration histogram (observe-only; does NOT touch
+  // m_pending_sync_waits, which feeds the issue-path warp_waiting_at_barrier). first-miss cycle +
+  // barrier addr per warp; on the pass (next hit) we bucket (now - first_miss). Gated by
+  // sync_wait_hist_instrument_enable. Buckets: {0, 1-16, 17-64, 65-256, 257-1024, 1024+}.
+  address_type m_sync_first_miss_barrier[MAX_WARP_PER_SHADER] = {0};
+  unsigned long long m_sync_first_miss_cycle[MAX_WARP_PER_SHADER] = {0};
+  unsigned long long m_sync_wait_cycle_hist[6] = {0};
  public:
   // Increment the tensor-op count for the CTA slot that owns hardware warp wid.
   void inc_tensor_ops_for_warp(unsigned wid) {
     unsigned cta_slot = m_physical_warp[wid]->get_cta_id();
     if (cta_slot < MAX_CTA_PER_SHADER) m_tensor_ops_by_cta_slot[cta_slot]++;
   }
+  // [FWD drain-idle 축2] sticky role marks (observe-only; set on first occurrence).
+  void mark_producer_warp(unsigned wid) { if (wid < MAX_WARP_PER_SHADER) m_warp_is_producer[wid] = true; }
+  void mark_consumer_warp(unsigned wid) { if (wid < MAX_WARP_PER_SHADER) m_warp_is_consumer[wid] = true; }
 };

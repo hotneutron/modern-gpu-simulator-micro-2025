@@ -458,6 +458,18 @@ void SM::debug_dump_sync_counters() const {
             << " tma_completions=" << m_sync_debug_tma_completions
             << " missing_runtime=" << m_sync_debug_missing_runtime
             << std::endl;
+  // [FWD drain-idle 축3] mbarrier wait-duration histogram (per SM). Emitted only when the
+  // dedicated gate is on; buckets = {0, 1-16, 17-64, 65-256, 257-1024, 1024+}. Observe-only.
+  if (m_config->sync_wait_hist_instrument_enable) {
+    std::cerr << "[SYNCWAITHIST][SM" << m_sm_id << "]"
+              << " b0_eq0=" << m_sync_wait_cycle_hist[0]
+              << " b1_1_16=" << m_sync_wait_cycle_hist[1]
+              << " b2_17_64=" << m_sync_wait_cycle_hist[2]
+              << " b3_65_256=" << m_sync_wait_cycle_hist[3]
+              << " b4_257_1024=" << m_sync_wait_cycle_hist[4]
+              << " b5_1024plus=" << m_sync_wait_cycle_hist[5]
+              << std::endl;
+  }
 }
 
 void SM::create_gpu_per_sm_stats(Element_stats &all_stats) {
@@ -556,12 +568,36 @@ void SM::cycle() {
     bool any_subcore_frontend_block = false;
     bool any_subcore_fu_occupied_tensor_block = false;
     unsigned int sm_idle_reason_or = 0;  // OR of all subcores' non-issue reason masks
+    // [FWD drain-idle 축1] SM-level mutually-exclusive sole-block: pick the highest recover-value
+    // reason across the 4 subcores (only meaningful on SM-idle cycles). DRAINED is the floor and
+    // only wins if NO subcore had a recoverable (ONLY_*/MULTI) reason.
+    int sm_best_sole_rank = -1;                 // -1 = nothing recoverable seen
+    Subcore::Step0SoleBlock sm_best_sole = Subcore::SB_DRAINED;
+    bool any_subcore_non_drained_block = false; // >=1 subcore had a valid head that failed to issue
     for (auto subcore : m_subcores) {
       if (subcore->step0_issued_this_cycle()) any_subcore_issued = true;
       if (subcore->step0_blocked_by_tensor_only_this_cycle()) any_subcore_tensor_only_block = true;
       if (subcore->step0_blocked_by_frontend_sbwait_this_cycle()) any_subcore_frontend_block = true;
       if (subcore->step0_blocked_by_fu_occupied_tensor_this_cycle()) any_subcore_fu_occupied_tensor_block = true;
       sm_idle_reason_or |= subcore->step0_reason_mask_this_cycle();
+      // rank map (mirror of subcore.cc): WAIT_BARRIER>TENSOR>STALL_COUNT>FU_NONTENSOR>NEXT_STAGE>L1C>OTHER>MULTI
+      Subcore::Step0SoleBlock sb = subcore->step0_sole_block_this_cycle();
+      int rank = -1;
+      switch (sb) {
+        case Subcore::SB_ONLY_WAIT_BARRIER: rank = 7; break;
+        case Subcore::SB_ONLY_TENSOR:       rank = 6; break;
+        case Subcore::SB_ONLY_STALL_COUNT:  rank = 5; break;
+        case Subcore::SB_ONLY_FU_NONTENSOR: rank = 4; break;
+        case Subcore::SB_ONLY_NEXT_STAGE:   rank = 3; break;
+        case Subcore::SB_ONLY_L1C:          rank = 2; break;
+        case Subcore::SB_ONLY_OTHER:        rank = 1; break;
+        case Subcore::SB_MULTI:             rank = 0; break;
+        default:                            rank = -1; break;  // SB_ISSUED / SB_DRAINED
+      }
+      if (rank >= 0) {
+        any_subcore_non_drained_block = true;
+        if (rank > sm_best_sole_rank) { sm_best_sole_rank = rank; sm_best_sole = sb; }
+      }
     }
     // [CTA-imbalance diag] tensor-FU-busy stall (NCU `mma`), counted EVERY cycle (not just
     // SM-idle: another subcore may still issue while this WGMMA waits on the tensor FU) and
@@ -602,6 +638,45 @@ void SM::cycle() {
       // Frontend-specific: SM-idle cycles with >=1 subcore blocked on the L1I stream-buffer frontend.
       if (m_config->l1i_frontend_step0_instrument_enable && any_subcore_frontend_block) {
         m_sm_stats.m_stats_map["total_num_cycles_sm_idle_blocked_by_frontend_sbwait"]->increment_with_integer(1);
+      }
+      // [FWD drain-idle 축1] mutually-exclusive SM-idle partition: attribute THIS idle cycle to
+      // exactly one reason (highest recover-value across subcores; DRAINED floor if none). These
+      // counters sum EXACTLY to sm_all_subcores_idle (unlike the overlapping sm_idle_reason_* below).
+      // Also attribute the two recoverable-vs-floor signals per-CTA-slot for [CTAFIN].
+      if (m_config->wgmma_step0_instrument_enable) {
+        Subcore::Step0SoleBlock part =
+            any_subcore_non_drained_block ? sm_best_sole : Subcore::SB_DRAINED;
+        const char *pkey = nullptr;
+        switch (part) {
+          case Subcore::SB_DRAINED:           pkey = "total_num_cycles_sm_idle_partition_drained"; break;
+          case Subcore::SB_ONLY_WAIT_BARRIER: pkey = "total_num_cycles_sm_idle_partition_only_wait_barrier"; break;
+          case Subcore::SB_ONLY_TENSOR:       pkey = "total_num_cycles_sm_idle_partition_only_tensor"; break;
+          case Subcore::SB_ONLY_STALL_COUNT:  pkey = "total_num_cycles_sm_idle_partition_only_stall_count"; break;
+          case Subcore::SB_ONLY_FU_NONTENSOR: pkey = "total_num_cycles_sm_idle_partition_only_fu_nontensor"; break;
+          case Subcore::SB_ONLY_NEXT_STAGE:   pkey = "total_num_cycles_sm_idle_partition_only_next_stage"; break;
+          case Subcore::SB_ONLY_L1C:          pkey = "total_num_cycles_sm_idle_partition_only_l1c"; break;
+          case Subcore::SB_ONLY_OTHER:        pkey = "total_num_cycles_sm_idle_partition_only_other"; break;
+          default:                            pkey = "total_num_cycles_sm_idle_partition_multi"; break;
+        }
+        m_sm_stats.m_stats_map[pkey]->increment_with_integer(1);
+        // Independent ceiling (mirrors sm_idle_all_blocked_by_tensor): >=1 subcore blocked ONLY by
+        // wait_barrier. Used to cross-check the partition's only_wait_barrier column.
+        bool any_wb_only = false;
+        for (auto subcore : m_subcores)
+          if (subcore->step0_sole_block_this_cycle() == Subcore::SB_ONLY_WAIT_BARRIER) any_wb_only = true;
+        if (any_wb_only)
+          m_sm_stats.m_stats_map["total_num_cycles_sm_idle_all_blocked_by_wait_barrier"]->increment_with_integer(1);
+        // Per-CTA: recoverable (only_wait_barrier) and floor (drained) attributed to resident slots.
+        bool part_is_wb   = (part == Subcore::SB_ONLY_WAIT_BARRIER);
+        bool part_is_drain = (part == Subcore::SB_DRAINED);
+        if (part_is_wb || part_is_drain) {
+          for (unsigned s = 0; s < MAX_CTA_PER_SHADER; s++) {
+            if (m_cta_status[s] > 0) {
+              if (part_is_wb)    m_wait_barrier_only_cyc_by_cta_slot[s]++;
+              if (part_is_drain) m_drained_cyc_by_cta_slot[s]++;
+            }
+          }
+        }
       }
       // FULL SM-idle decomposition: for each reason, count SM-idle cycles where >=1 subcore
       // was blocked for that reason. Reasons overlap (sum can exceed sm_all_subcores_idle),
@@ -902,6 +977,13 @@ void SM::func_exec_inst(warp_inst_t &inst) {
     if (m_trace_warp->trace_done() && m_trace_warp->functional_done()) {
       m_trace_warp->get_IBuffer_remodeled()->flush(true);
       m_barriers.warp_exit(inst.warp_id());
+      // [FWD drain-idle 축2] stamp the cycle this warp's trace drained (first time only).
+      if (m_config->wgmma_step0_instrument_enable) {
+        unsigned wid = inst.warp_id();
+        if (wid < MAX_WARP_PER_SHADER && m_warp_drain_cycle[wid] == 0) {
+          m_warp_drain_cycle[wid] = get_current_gpu_cycle();
+        }
+      }
     }
   } else {
     execute_warp_inst_t(inst);
@@ -963,6 +1045,11 @@ void SM::init_warps(unsigned cta_id, unsigned start_thread, unsigned end_thread,
     m_fu_occupied_tensor_cyc_by_cta_slot[cta_id] = 0;
     m_sm_idle_cyc_by_cta_slot[cta_id] = 0;
     m_sm_idle_ibuffer_empty_cyc_by_cta_slot[cta_id] = 0;
+    // [FWD drain-idle 축1·2·4] reset this CTA slot's new per-CTA counters at launch.
+    m_wait_barrier_only_cyc_by_cta_slot[cta_id] = 0;
+    m_drained_cyc_by_cta_slot[cta_id] = 0;
+    m_wait_pending_by_cta_slot[cta_id] = 0;
+    m_wait_released_by_cta_slot[cta_id] = 0;
   }
   if (m_config->model == POST_DOMINATOR) {
     unsigned start_warp = start_thread / m_config->warp_size;
@@ -985,7 +1072,15 @@ void SM::init_warps(unsigned cta_id, unsigned start_thread, unsigned end_thread,
         }
       }
       m_simt_stack[i]->launch(start_pc, active_threads);
-
+      // [FWD drain-idle 축2·3] reset this warp's per-warp observe-only state at (re)launch so a
+      // reused hardware warp slot (multi-wave SMs) does not inherit a prior CTA's role/drain/miss.
+      if (i < MAX_WARP_PER_SHADER) {
+        m_warp_is_producer[i] = false;
+        m_warp_is_consumer[i] = false;
+        m_warp_drain_cycle[i] = 0;
+        m_sync_first_miss_barrier[i] = 0;
+        m_sync_first_miss_cycle[i] = 0;
+      }
       if (m_gpu->resume_option == 1 && kernel_id == m_gpu->resume_kernel &&
           ctaid >= m_gpu->resume_CTA && ctaid < m_gpu->checkpoint_CTA_t) {
         char fname[2048];
@@ -1379,6 +1474,27 @@ void SM::register_cta_thread_exit(unsigned cta_num, kernel_info_t *kernel) {
         printf(" sm_idle_cyc=%llu sm_idle_ibuffer_empty_cyc=%llu",
                m_sm_idle_cyc_by_cta_slot[cta_num],
                m_sm_idle_ibuffer_empty_cyc_by_cta_slot[cta_num]);
+        // [FWD drain-idle 축1] mutually-exclusive recoverable(mbarrier-only) vs floor(drained) idle.
+        // [FWD drain-idle 축4] per-CTA mbarrier test counts.
+        printf(" sm_idle_wait_barrier_only_cyc=%llu sm_idle_drained_cyc=%llu "
+               "wait_pending=%llu wait_released=%llu",
+               m_wait_barrier_only_cyc_by_cta_slot[cta_num],
+               m_drained_cyc_by_cta_slot[cta_num],
+               m_wait_pending_by_cta_slot[cta_num],
+               m_wait_released_by_cta_slot[cta_num]);
+        // [FWD drain-idle 축2] producer vs consumer last trace-drain cycle for this CTA: scan the
+        // warps that belong to this CTA slot and take the max drain cycle per role (0 = none).
+        unsigned long long prod_drain = 0, cons_drain = 0;
+        for (unsigned w = 0; w < MAX_WARP_PER_SHADER; w++) {
+          if (m_physical_warp[w] == NULL) continue;
+          if (m_physical_warp[w]->get_cta_id() != cta_num) continue;
+          if (m_warp_is_producer[w] && m_warp_drain_cycle[w] > prod_drain)
+            prod_drain = m_warp_drain_cycle[w];
+          if (m_warp_is_consumer[w] && m_warp_drain_cycle[w] > cons_drain)
+            cons_drain = m_warp_drain_cycle[w];
+        }
+        printf(" producer_last_drain_cyc=%llu consumer_last_drain_cyc=%llu",
+               prod_drain, cons_drain);
       }
       printf("\n");
       m_tensor_ops_by_cta_slot[cta_num] = 0;
@@ -1387,6 +1503,11 @@ void SM::register_cta_thread_exit(unsigned cta_num, kernel_info_t *kernel) {
       m_fu_occupied_tensor_cyc_by_cta_slot[cta_num] = 0;
       m_sm_idle_cyc_by_cta_slot[cta_num] = 0;
       m_sm_idle_ibuffer_empty_cyc_by_cta_slot[cta_num] = 0;
+      // [FWD drain-idle 축1·2·4] reset the new per-CTA counters for slot reuse.
+      m_wait_barrier_only_cyc_by_cta_slot[cta_num] = 0;
+      m_drained_cyc_by_cta_slot[cta_num] = 0;
+      m_wait_pending_by_cta_slot[cta_num] = 0;
+      m_wait_released_by_cta_slot[cta_num] = 0;
     }
 
     // Increment the completed CTAs
@@ -1735,10 +1856,27 @@ void SM::handle_sync_instruction(warp_inst_t &inst, unsigned int warp_id) {
               HopperMBarrierPendingWait{true, is_trywait, key,
                                         inst.sync_semantic_raw})) {
         m_sync_debug_wait_released++;
-        // Include decoded parity + barrier phase so a post-fix run can confirm
-        // that waits now hit at BOTH phases (the old bit-0 decode only ever hit
-        // at phase=0). parity = (wait_state >> 31) & 1; satisfied when
-        // phase != parity.
+        // [FWD drain-idle 축4] per-CTA mbarrier test count (released = immediate hit).
+        if (m_config->cta_stall_breakdown_instrument_enable &&
+            key.cta_id < MAX_CTA_PER_SHADER) {
+          m_wait_released_by_cta_slot[key.cta_id]++;
+        }
+        // [FWD drain-idle 축3] observe-only: if this warp had an outstanding first-miss on THIS
+        // barrier, the wait is now satisfied → bucket (now - first_miss_cycle) and clear. Dedicated
+        // array only; never touches m_pending_sync_waits / issue path. Gated, default-off.
+        if (m_config->sync_wait_hist_instrument_enable && warp_id < MAX_WARP_PER_SHADER &&
+            m_sync_first_miss_barrier[warp_id] == key.barrier_addr) {
+          unsigned long long delta =
+              get_current_gpu_cycle() - m_sync_first_miss_cycle[warp_id];
+          unsigned b = (delta == 0)      ? 0
+                     : (delta <= 16)     ? 1
+                     : (delta <= 64)     ? 2
+                     : (delta <= 256)    ? 3
+                     : (delta <= 1024)   ? 4
+                                         : 5;
+          m_sync_wait_cycle_hist[b]++;
+          m_sync_first_miss_barrier[warp_id] = 0;
+        }
         std::string hit_phase_state = " phase=<unseen> parity=" +
             std::to_string(decode_sync_wait_phase(inst.sync_semantic_raw));
         auto hit = m_hopper_mbarriers.find(key);
@@ -1757,6 +1895,20 @@ void SM::handle_sync_instruction(warp_inst_t &inst, unsigned int warp_id) {
         // PHASECHK / TRYWAIT are modeled as nonblocking predicate tests.
         // The traced control flow performs any retry or fallback sequencing.
         m_sync_debug_wait_pending++;
+        // [FWD drain-idle 축4] per-CTA mbarrier test count (pending = found not-ready).
+        if (m_config->cta_stall_breakdown_instrument_enable &&
+            key.cta_id < MAX_CTA_PER_SHADER) {
+          m_wait_pending_by_cta_slot[key.cta_id]++;
+        }
+        // [FWD drain-idle 축3] observe-only: record the FIRST miss cycle for this warp on this
+        // barrier (spin retries keep the earliest). Uses a DEDICATED array (never m_pending_sync_waits,
+        // which feeds the issue-path warp_waiting_at_barrier). Gated so default runs are unchanged.
+        if (m_config->sync_wait_hist_instrument_enable && warp_id < MAX_WARP_PER_SHADER) {
+          if (m_sync_first_miss_barrier[warp_id] != key.barrier_addr) {
+            m_sync_first_miss_barrier[warp_id] = key.barrier_addr;
+            m_sync_first_miss_cycle[warp_id] = get_current_gpu_cycle();
+          }
+        }
         m_pending_sync_waits[warp_id] = HopperMBarrierPendingWait();
         // Deadlock diagnosis: dump the current barrier counters so a barrier
         // that never becomes ready (arrive_count < expected, or tx bytes short)
@@ -1875,6 +2027,9 @@ void SM::handle_sync_instruction(warp_inst_t &inst, unsigned int warp_id) {
           inst.sync_has_semantic_raw && inst.sync_semantic_raw != 0;
       if (is_expect_tx) {
         m_sync_debug_arrive_expect_tx++;
+        // [FWD drain-idle 축2] a warp that issues arrive+expect-tx announces an incoming TMA
+        // transfer → it is a data-producer warp (sticky).
+        mark_producer_warp(warp_id);
         barrier.arrive_count += active_threads;
         uint32_t tx_bytes = static_cast<uint32_t>(inst.sync_semantic_raw);
         barrier.expected_tx_bytes += tx_bytes;

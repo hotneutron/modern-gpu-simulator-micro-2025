@@ -118,10 +118,29 @@ class Subcore {
     STEP0_R_NV_IBUF_FETCH_NOT_ISSUED = 1u << 20, // no fetch issued yet (fetch scheduling behind)
   };
 
+  // [FWD drain-idle 축1] mutually-exclusive "sole block reason" for a subcore this cycle.
+  // Unlike STEP0_R_* (a boolean-OR bitmask that overlaps), exactly one of these is chosen so the
+  // SM-level partition sums to sm_all_subcores_idle. Priority order (recover-value) is applied at
+  // the SM level when multiple resident warps disagree. See FWD_DRAIN_IDLE_MBARRIER_CEILING.md 축1.
+  enum Step0SoleBlock {
+    SB_ISSUED = 0,          // this subcore issued this cycle
+    SB_DRAINED,             // no warp had a valid head (all trace-drained) = floor
+    SB_ONLY_WAIT_BARRIER,   // sole unmet = are_wait_barriers_ready (async mbarrier)
+    SB_ONLY_TENSOR,         // sole unmet = tensor FU re-issue lockout
+    SB_ONLY_STALL_COUNT,    // sole unmet = fixed-latency dependency (NCU wait)
+    SB_ONLY_FU_NONTENSOR,   // sole unmet = non-tensor FU busy
+    SB_ONLY_NEXT_STAGE,     // sole unmet = next-stage back-pressure (result-queue full)
+    SB_ONLY_L1C,            // sole unmet = const-cache
+    SB_ONLY_OTHER,          // sole unmet = yield / programmer-barrier / ldgdepbar / tma_flush / scoreboard
+    SB_MULTI,               // >=2 conditions unmet (no single-lever recovery)
+  };
+
   // [WGMMA Opt6 Step-0] per-cycle issue outcome exported for SM-level (V) aggregation.
   bool step0_issued_this_cycle() const { return m_step0_issued_this_cycle; }
   bool step0_blocked_by_tensor_only_this_cycle() const { return m_step0_blocked_by_tensor_only_this_cycle; }
   bool step0_blocked_by_frontend_sbwait_this_cycle() const { return m_step0_blocked_by_frontend_sbwait_this_cycle; }
+  // [FWD drain-idle 축1] this subcore's mutually-exclusive sole-block reason this cycle.
+  Step0SoleBlock step0_sole_block_this_cycle() const { return m_step0_sole_block_this_cycle; }
   // [CTA-imbalance diag] this cycle, >=1 warp's head was a WGMMA blocked because the tensor FU
   // is busy (== NCU `mma`, the producer/FU-busy tensor stall). Trace-driven WGMMA is a
   // fixed-latency SPECIALIZED FU op with no separate consumer-side scoreboard "warpgroup_arrive"
@@ -163,6 +182,8 @@ class Subcore {
   bool m_step0_blocked_by_tensor_only_this_cycle = false;
   bool m_step0_blocked_by_frontend_sbwait_this_cycle = false;
   bool m_step0_blocked_by_fu_occupied_tensor_this_cycle = false;
+  // [FWD drain-idle 축1] this subcore's mutually-exclusive sole-block reason this cycle.
+  Step0SoleBlock m_step0_sole_block_this_cycle = SB_ISSUED;
   unsigned int m_step0_reason_mask_this_cycle = 0;
 
   register_set_uniptr m_ISSUE_CONTROL_latch = register_set_uniptr(1, "ISSUE_CONTROL_latch");

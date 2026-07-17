@@ -177,6 +177,8 @@ void functional_unit::issue(register_set_uniptr &source_reg) {
     // (is_tensor_core_op) here — the pipeline type does not identify a WGMMA.
     if (ready_reg->is_tensor_core_op()) {
       m_sm->inc_tensor_ops_for_warp(ready_reg->warp_id());
+      // [FWD drain-idle 축2] a warp that issues a WGMMA is a compute/consumer warp (sticky).
+      m_sm->mark_consumer_warp(ready_reg->warp_id());
     }
 
     m_sm->incexecstat(ready_reg);

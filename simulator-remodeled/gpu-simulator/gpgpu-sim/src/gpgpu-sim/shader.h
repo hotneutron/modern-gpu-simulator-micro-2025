@@ -2241,6 +2241,11 @@ class shader_core_config : public core_config {
   // .plan/CTA_FINISH_TENSOR_CORRELATION.md.
   bool cta_stall_breakdown_instrument_enable;
 
+  // [FWD drain-idle 축3] mbarrier wait-duration histogram (observe-only; dedicated arrays, does NOT
+  // touch the issue-path m_pending_sync_waits). Independent gate so a bit-identity failure can be
+  // bisected against 축1·2·4 (which share -wgmma_step0_instrument_enable). Default 0.
+  bool sync_wait_hist_instrument_enable;
+
   // Hopper mbarrier sync debug logging (SYNCDBG). Disabled by default.
   bool sync_debug_enable;
   unsigned int sync_debug_print_budget;

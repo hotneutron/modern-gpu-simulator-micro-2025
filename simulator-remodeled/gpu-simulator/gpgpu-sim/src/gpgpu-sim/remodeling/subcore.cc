@@ -440,6 +440,14 @@ void Subcore::issue(SM *shared_sm) {
   bool tail_readonly = false;
   unsigned long long n_not_selected_this_cycle = 0;
   unsigned long long n_eligible_this_cycle = 0;
+  // [FWD drain-idle 축1] mutually-exclusive sole-block accounting for this subcore this cycle.
+  // We scan valid-head warps that failed to issue; for each we count how many issue conditions are
+  // unmet. If exactly one is unmet it yields an ONLY_* reason, else SB_MULTI. Across warps we keep
+  // the highest recover-value reason (WAIT_BARRIER>TENSOR>STALL_COUNT>FU_NONTENSOR>NEXT_STAGE>L1C>
+  // OTHER>MULTI). If NO warp had a valid head at all -> SB_DRAINED (floor). Gated by wgmma step0.
+  bool any_valid_head_this_cycle = false;
+  int best_sole_block_rank = -1;         // higher rank wins; -1 = none seen
+  Step0SoleBlock best_sole_block = SB_MULTI;
 
   modify_warp_state();
   if(m_num_pending_cycles_with_issue_port_busy > 0) {
@@ -657,6 +665,47 @@ void Subcore::issue(SM *shared_sm) {
           }
           continue;
         }
+        // [FWD drain-idle 축1] observe-only sole-block classification for this valid-head warp.
+        // Reached only for warps WITH a valid head (invalid heads `continue` above), so mark that
+        // this subcore had >=1 valid head this cycle (=> NOT drained). Count unmet issue conditions;
+        // exactly-one => the matching ONLY_* reason, >=2 => SB_MULTI. Keep the highest recover-value
+        // reason across warps. Pure read (no side effects); gated by wgmma step0.
+        if (m_config->wgmma_step0_instrument_enable) {
+          any_valid_head_this_cycle = true;
+          if (!is_inst_ready_to_issue) {
+            bool head_is_tensor = (pI->op == TENSOR_CORE_OP);
+            // condition -> (met?, sole-reason-if-this-is-the-only-unmet, rank)
+            struct { bool met; Step0SoleBlock reason; int rank; } conds[] = {
+              { are_wait_barriers_ready,
+                SB_ONLY_WAIT_BARRIER, 7 },
+              { !( !is_fu_available && head_is_tensor ),
+                SB_ONLY_TENSOR, 6 },
+              { is_stall_counter_0,
+                SB_ONLY_STALL_COUNT, 5 },
+              { !( !is_fu_available && !head_is_tensor ),
+                SB_ONLY_FU_NONTENSOR, 4 },
+              { is_write_available_result_queue_for_fixed_latency_available,
+                SB_ONLY_NEXT_STAGE, 3 },
+              { is_l1c_ready,
+                SB_ONLY_L1C, 2 },
+              { is_not_yield && is_not_warp_waiting_in_programmer_barrier &&
+                is_not_warp_waiting_ldgdepbar && is_not_warp_waiting_tma_flush &&
+                are_traditional_scoreaboards_ready,
+                SB_ONLY_OTHER, 1 },
+            };
+            int unmet = 0; Step0SoleBlock sole = SB_MULTI; int sole_rank = 0;
+            for (auto &c : conds) {
+              if (!c.met) { unmet++; sole = c.reason; sole_rank = c.rank; }
+            }
+            Step0SoleBlock warp_reason; int warp_rank;
+            if (unmet == 1) { warp_reason = sole; warp_rank = sole_rank; }
+            else            { warp_reason = SB_MULTI; warp_rank = 0; }
+            if (warp_rank > best_sole_block_rank) {
+              best_sole_block_rank = warp_rank;
+              best_sole_block = warp_reason;
+            }
+          }
+        }
         if (is_inst_ready_to_issue) {
           // This warp is eligible AND selected (the winner). Counts toward eligible, not not_selected.
           ++n_eligible_this_cycle;
@@ -826,6 +875,12 @@ void Subcore::issue(SM *shared_sm) {
   // tensor pipe this cycle? Used to count true SM-wide idle cycles vs tensor-only idle.
   m_step0_issued_this_cycle = is_issued_inst;
   m_step0_blocked_by_tensor_only_this_cycle = is_any_tensor_reissue_lockout_only;
+  // [FWD drain-idle 축1] finalize this subcore's mutually-exclusive sole-block reason:
+  // issued -> SB_ISSUED; else no valid head all cycle -> SB_DRAINED (floor); else the highest
+  // recover-value ONLY_*/MULTI reason seen among valid-head warps. Observe-only.
+  if (is_issued_inst)                 m_step0_sole_block_this_cycle = SB_ISSUED;
+  else if (!any_valid_head_this_cycle) m_step0_sole_block_this_cycle = SB_DRAINED;
+  else                                 m_step0_sole_block_this_cycle = best_sole_block;
   // [CTA-imbalance diag] tensor-FU-busy stall: >=1 warp's head is a WGMMA blocked because the
   // tensor FU is still busy (== NCU `mma`). In this trace-driven model WGMMA is a fixed-latency
   // SPECIALIZED FU op and there is NO separate consumer-side "warpgroup_arrive" scoreboard wait
