@@ -1986,6 +1986,15 @@ void shader_core_config::reg_options(class OptionParser *opp) {
                          "bit-identity bisection. See .plan FWD_DRAIN_IDLE_MBARRIER_CEILING. "
                          "(default=0)",
                          "0");
+  option_parser_register(opp, "-spin_instrument_enable", OPT_BOOL,
+                         &spin_instrument_enable,
+                         "Enable observe-only NANOSLEEP/PHASECHK spin-loop issue-slot counters "
+                         "(spin ops issued, spin winning an issue slot, and spin displacing a "
+                         "co-eligible warp). Tests whether widening NANOSLEEP latency frees issue "
+                         "slots for the consumer (eligible-warp fidelity). No timing change. "
+                         "Independent gate for bit-identity bisection. See .plan "
+                         "FWD_DRAIN_IDLE_MBARRIER_CEILING. (default=0)",
+                         "0");
   option_parser_register(opp, "-sync_debug_enable", OPT_BOOL,
                          &sync_debug_enable,
                          "Enable Hopper mbarrier sync debug logging (SYNCDBG)."
@@ -2824,6 +2833,13 @@ void gpgpu_sim::create_gpu_per_sm_stats() {
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_warpgroup_arrive", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_issue_stage_not_selected", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_warps_eligible_accumulator", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  // [NANOSLEEP spin lever] observe-only spin issue-slot counters (gated by -spin_instrument_enable).
+  // spin_ops_issued        = cycles whose issued winner was a PHASECHK/TRYWAIT/NANOSLEEP spin op.
+  // spin_won_over_eligible = of those, the cycles where >=1 OTHER warp was also eligible (spin
+  //                          displaced a co-eligible warp = the issue-slot-theft signal).
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_spin_ops_issued", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_spin_won_over_eligible", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_spin_phasechk_issued", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
   // [WGMMA Opt6 Step-0 instrumentation] observe-only counters (no timing change).
   // (I) split fu_occupied by pipe op.
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_issue_stage_stall_at_least_one_warp_with_fu_occupied_tensor", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);

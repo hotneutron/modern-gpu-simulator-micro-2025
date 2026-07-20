@@ -387,6 +387,9 @@ void Subcore::issue(SM *shared_sm) {
   bool is_valid_inst =
       false;  // there was one warp with a valid instruction to issue
   bool is_issued_inst = false;  // Achieved to issue an instruction?
+  // [NANOSLEEP spin lever] set true iff the issued winner this cycle was a producer mbarrier spin
+  // poll (PHASECHK/TRYWAIT). Finalized against n_eligible_this_cycle in the stats block. Observe-only.
+  bool issued_spin_op_this_cycle = false;
   bool is_issue_port_busy = true;
   bool is_next_stage_availabe = true;
   bool is_any_invalid_head_decode_pending = false;
@@ -719,6 +722,12 @@ void Subcore::issue(SM *shared_sm) {
           }
           issue_warp(shared_sm, m_ISSUE_CONTROL_latch, pI, active_mask, sm_warp_id, fu, is_fixed_latency_inst, use_traditional_scoreboarding, has_dst_regs, dst_type);
           is_issued_inst = true;
+          // [NANOSLEEP spin lever] record whether the winning op is a producer mbarrier spin poll
+          // (PHASECHK/TRYWAIT). Used with n_eligible_this_cycle (finalized on the tail) to detect
+          // spin displacing a co-eligible warp. Observe-only; gated at the stats site.
+          issued_spin_op_this_cycle =
+              (pI->sync_kind == SyncInstructionKind::PHASECHK ||
+               pI->sync_kind == SyncInstructionKind::TRYWAIT);
           m_greedy_pointer_issue = subcore_warp_id;
           m_num_pending_cycles_constant_cache_misses_before_switch_to_other_warp = m_config->num_const_cache_cycle_misses_before_switch_to_other_warp;
           // [NCU stall-taxonomy] was: break; — now keep iterating the SAME loop in read-only mode
@@ -820,6 +829,16 @@ void Subcore::issue(SM *shared_sm) {
   // = eligible tail warps that were not the winner. See .plan/NCU_STALL_TAXONOMY_METRICS_IMPL.md.
   shared_sm->m_sm_stats.m_stats_map["total_num_warps_eligible_accumulator"]->increment_with_integer(n_eligible_this_cycle);
   shared_sm->m_sm_stats.m_stats_map["total_num_cycles_issue_stage_not_selected"]->increment_with_integer(n_not_selected_this_cycle);
+  // [NANOSLEEP spin lever] observe-only: count cycles where the winner was a producer mbarrier spin
+  // poll, and (of those) cycles where >=1 other warp was eligible but not selected (n_not_selected>0)
+  // = spin displaced a co-eligible warp. Gated so default runs stay bit-identical.
+  if (m_config->spin_instrument_enable && is_issued_inst && issued_spin_op_this_cycle) {
+    shared_sm->m_sm_stats.m_stats_map["total_num_cycles_spin_ops_issued"]->increment_with_integer(1);
+    shared_sm->m_sm_stats.m_stats_map["total_num_spin_phasechk_issued"]->increment_with_integer(1);
+    if (n_not_selected_this_cycle > 0) {
+      shared_sm->m_sm_stats.m_stats_map["total_num_cycles_spin_won_over_eligible"]->increment_with_integer(1);
+    }
+  }
   if(is_issued_inst) {
     shared_sm->m_sm_stats.m_stats_map["total_num_cycles_issue_stage_issuing"]->increment_with_integer(1);
     // [NCU stall-taxonomy] `selected` == the issued winner (NCU per-issue denominator).

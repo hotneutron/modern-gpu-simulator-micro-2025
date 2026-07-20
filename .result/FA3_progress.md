@@ -177,6 +177,70 @@ fetch-starvation.
 > fetch-nature). The entire tensor/work axis is HW-faithful **in timing**. The single remaining
 > recoverable gap is the fwd **subcore drain-idle**.
 
+##### ⭐ UPDATE (2026-07-20) — root cause narrowed to the producer mbarrier spin-loop (NANOSLEEP), NOT a memory floor
+
+Two decisive measurements this session **overturned the earlier "faithful floor" reading** of the
+drain-idle and localized it to a concrete, config/code-fixable modeling gap.
+
+**1. FWD_DRAIN_IDLE 4-axis run (fwd `OnlyKernel5/.o43` = 135,452 cyc; bwd `OnlyKernel10/.o26` = 216,527
+cyc; both clean exit).** ⚠️ NOT bit-identical to the tracked baselines (fwd .o42 136,293 / bwd .o25
+215,537) — the 4-axis instrument shifted timing ~0.4%, so these cycles are for shape only, not a new
+tracked baseline. Findings:
+- **mbarrier wait-duration histogram (축3):** both kernels are dominated by the **long (1024+ cyc)**
+  bucket with ~zero short waits (fwd `b5_1024plus=1,769`, b1-b3≈0; bwd `b5=4,233`, b1-b3≈0).
+- **per-CTA (축1/2/4):** fwd `sm_idle` = 46.9% of elapsed (wait_barrier_only 53% of idle, drained/floor
+  17%, r(wait_barrier_only,elapsed)=+0.68). bwd `sm_idle` = 49.1%, everything r≈0.99 (faithful
+  load-imbalance, confirmed not a lever).
+- **role drain (축2):** consumer(WGMMA) drains at **59.5%** of elapsed; producer(TMA) lives to **100%**
+  → a **40.5% producer-only tail** carries ~40pp of the 47% idle.
+
+**2. HW trace cross-check (the decisive step).** Parsed the HW dynamic trace directly
+(`hw_run/.../traces/threadblocks/.../kernel_5`, 132 CTAs = sim's 132):
+- CTA has **16 warps**: warp 0 (producer) = **14,082 insts**; warps 4-15 (consumer) = ~8,600 each; warps
+  1-3 ≈ 55 (setup). Producer having MORE insts than consumer is **trace-inherent** → "consumer drains
+  first" is NOT a sim artifact.
+- **warp 0's 14,082 insts are ~89% a spin-loop:** `PHASECHK.TRYWAIT` 3,117 + `NANOSLEEP.SYNCS` 3,075 +
+  `PHASECHK` 3,075 + `BRA` 3,226. Consumer warp 4 is all real compute (`MUFU.EX2` 1,184, `FFMA/FADD`,
+  `HGMMA`), no spin. So the producer-only tail is the producer **polling the mbarrier**, not doing work.
+- Compared against the sim's own TMA timing: consumer mbarrier waits are **1024+ cyc** but a TMA tile
+  actually **arrives in ~335 cyc** (`lat_total` p50; `lat_emit` fixed 127), and per-SM TMA inter-transfer
+  gap is **2,596 cyc** with **max 3 concurrent in-flight** — i.e. the wait is long because the *producer
+  under-pipelines / spins*, not because memory is slow.
+
+**Root cause (source-confirmed).** `NANOSLEEP` decodes to `MISCELLANEOUS_NO_QUEUE_OP`; the H100 config
+never set `-trace_opcode_latency_initiation_miscellaneous_no_queue`, so it fell back to the default
+**`1,1` (1-cycle)**. HW's nanosleep backoff is tens–hundreds of cyc. And `PHASECHK/TRYWAIT` are modeled
+**non-blocking** ([sm.cc:1895](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/sm.cc#L1895)) — the warp is not parked; the traced spin
+loop is replayed at full issue rate. So the producer's spin ops are issued every cycle
+([subcore.cc:709-727](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/subcore.cc#L709-L727)), consuming issue slots (single-issue/subcore, GTO) and
+displacing the consumer → **eligible-warp 0.53 vs HW 0.83** (matched occupancy). This is the drain-idle
+mechanism — a spin-loop latency modeling gap, **not** a memory-latency floor and **not** the (closed)
+tensor axis.
+
+**Hypothesis to test:** widening NANOSLEEP latency → producer spins less often → consumer reclaims issue
+slots → eligible↑ / drain-idle↓ / cycle↓. ⚠️ Like TODO-2 (SFU), this is a **fidelity** change that may
+move cycles up OR down; not assumed a win.
+
+##### Planned experiment (instrumented; NOT yet run) — NANOSLEEP spin lever
+
+- **Code (added 2026-07-20, gated `-spin_instrument_enable`, default 0, timing-neutral):** three
+  observe-only counters at the issue winner site
+  ([subcore.cc:826-841](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/subcore.cc#L826-L841)): `total_num_cycles_spin_ops_issued`
+  (winner was PHASECHK/TRYWAIT spin), `total_num_cycles_spin_won_over_eligible` (of those, ≥1 other warp
+  was eligible-but-not-selected = spin stole a slot), `total_num_spin_phasechk_issued`. Files:
+  `shader.h`, `gpu-sim.cc` (option + stat register), `subcore.cc`. **Headers changed → `make clean`.**
+- **Config (H100):** new `-spin_instrument_enable 1` and a **dedicated NANOSLEEP-only** latency knob
+  `-trace_opcode_latency_initiation_nanosleep 1,1` (baseline) added to
+  `SM90_H100_L2_50MB_80GB/gpgpusim.config`. NANOSLEEP was **split out of the shared MISC_NO_QUEUE knob
+  in code** (`trace_driven.{h,cc}`: opcode-aware `set_latency(category, opcode, ...)` overriding only
+  `category==MISCELLANEOUS_NO_QUEUE_OP && opcode==OP_NANOSLEEP`), so raising it perturbs **only**
+  NANOSLEEP — no MISC_NO_QUEUE contamination. Default `1,1` is bit-identical. Experiment = A(`1,1`) vs
+  B(e.g. `64,1`), kernel 5.
+- **Judgment:** B cycle↓ & eligible↑ & `spin_won_over_eligible` shrinks A→B ⇒ **lever confirmed**
+  (spin displaced the consumer). Cycle≈flat & `spin_won_over_eligible` already small ⇒ fidelity-only,
+  no slot contention, close the axis. Cycle↑ ⇒ backoff over-delays a real dependency, re-examine.
+
+
 **What it is (measured, fwd `.o39` / `.o42`).** The fwd 2.01× (135,999 vs HW 67,696) decomposes into
 three per-SMSP factors; two are closed as non-levers, and the **largest** is the live one:
 

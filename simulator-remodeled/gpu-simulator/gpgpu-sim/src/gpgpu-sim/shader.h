@@ -2246,6 +2246,14 @@ class shader_core_config : public core_config {
   // bisected against 축1·2·4 (which share -wgmma_step0_instrument_enable). Default 0.
   bool sync_wait_hist_instrument_enable;
 
+  // [NANOSLEEP spin lever] Observe-only counters that measure how often the producer's mbarrier
+  // spin-loop (PHASECHK/TRYWAIT/NANOSLEEP) wins an issue slot and, in doing so, displaces another
+  // warp that was eligible the same cycle. Used to test whether widening NANOSLEEP latency (config)
+  // frees issue slots for the consumer (eligible-warp fidelity vs HW 0.83). Pure read of existing
+  // per-cycle state; no timing change. Independent gate for bit-identity bisection. Default 0.
+  // See .plan/FWD_DRAIN_IDLE_MBARRIER_CEILING.md.
+  bool spin_instrument_enable;
+
   // Hopper mbarrier sync debug logging (SYNCDBG). Disabled by default.
   bool sync_debug_enable;
   unsigned int sync_debug_print_budget;
