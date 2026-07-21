@@ -133,6 +133,66 @@ you specifically want the tail breakdown — and even then prefer a shrunk confi
 12 h run.
 
 
+## 2.6 MEASURED RESULTS (kernel-5, `-gpgpu_section_timing_enable 1`, trace_enabled 0)
+
+Run with the section timers on (Docker `.o48`, 500-cycle windows). **The early windows are
+DRAM-warmup-biased; the steady state is what matters.**
+
+Early (warmup — do NOT conclude from these):
+
+| cycle | CORE (par) | DRAM (par) | icnt_load | icnt_reply | L2 | booksim | SERIAL |
+|---|---|---|---|---|---|---|---|
+| 3000 | 21.6% | 77.5% | 0.2% | 0.2% | 0.4% | 0.1% | 0.9% |
+| 5000 | 44.8% | 54.7% | 0.2% | 0.1% | 0.2% | 0.0% | 0.5% |
+| 6500 | 57.4% | 39.4% | 0.3% | 0.4% | 2.3% | 0.2% | 3.2% |
+| 9000 | 70.1% | 29.0% | 0.2% | 0.2% | 0.4% | 0.2% | 1.0% |
+
+Steady state (cycle ~20k+, this is the real breakdown):
+
+| cycle | CORE (par) | DRAM (par) | icnt_load | icnt_reply | L2 | booksim | SERIAL |
+|---|---|---|---|---|---|---|---|
+| 20000 | 90.8% | 9.1% | 0.0% | 0.0% | 0.0% | 0.0% | 0.1% |
+| 22000 | 90.3% | 9.6% | 0.0% | 0.0% | 0.1% | 0.0% | 0.1% |
+| 23000 | 92.7% | 7.0% | 0.0% | 0.0% | 0.1% | 0.0% | 0.3% |
+| 24500 | 92.3% | 7.6% | 0.0% | 0.0% | 0.1% | 0.0% | 0.1% |
+
+### Findings (steady state — these are the conclusions)
+
+1. **CORE is ~92% of wall-clock.** The parallel `core_cycle` compute loop over 132 clusters
+   is the overwhelming cost. This IS the thing to optimize.
+
+2. **DRAM is only ~8% in steady state — NOT the bottleneck.** The early 40-77% DRAM share
+   was a **warmup artifact** (little CORE work yet to amortize against + initial DRAM burst).
+   It monotonically fell to ~8% by cycle 20k and stayed there. The earlier "DRAM fork/join
+   is the main cost" hypothesis is **refuted** — do not spend effort there.
+
+3. **Serial sections (icnt_load/icnt_reply/L2/booksim) are ~0.1%.** Parallelizing the L2
+   loop or simplifying booksim would buy essentially nothing. **Dropped.**
+
+4. Wall-clock is slow in absolute terms (~9 min to reach cycle ~9k; ~1 h to ~24.5k), which
+   is consistent with a full run being many hours — and confirms the cost is CORE, so any
+   real speedup must come from the CORE parallel path.
+
+### Revised optimization priority (evidence-based, steady state)
+
+Because ~92% is the CORE `#pragma omp parallel for`, the levers are all about CORE parallel
+efficiency, not the memory/serial sections:
+
+1. **Thread count vs physical cores.** `OMP_NUM_THREADS` is unset under `--launcher local`
+   -> 192 threads on 96 physical cores (2:1 HT oversubscription). Measure 96 vs 192 on the
+   same window; if 96 is not slower, cap threads (cheaper team spawns, less HT contention).
+   Zero model change.
+2. **Remove per-tick fork/join on the CORE loop.** The CORE `parallel for` opens/closes a
+   thread team every core tick (hundreds of thousands of times). Hoist to a persistent
+   parallel region (`#pragma omp parallel` outside the cycle loop + `#pragma omp for`
+   inside) so the team is reused. Source change + rebuild; timing-neutral.
+3. **Tune the custom OMP scheduler** (`gpu-sim.cc` static<->dynamic, chunk=1). With 132
+   clusters and near-uniform load in FA3 fwd, a larger static chunk may beat chunk=1.
+4. **(deprioritized)** DRAM fork/join, L2-loop parallelization, booksim simplification —
+   proven <10% / <1% and not worth it.
+
+
+
 ## 3. Profiling plan (measure before changing model code)
 
 ### 3.0 How long do I actually have to run? (do NOT run the full 12 h)
