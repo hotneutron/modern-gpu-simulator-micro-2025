@@ -221,24 +221,124 @@ tensor axis.
 slots → eligible↑ / drain-idle↓ / cycle↓. ⚠️ Like TODO-2 (SFU), this is a **fidelity** change that may
 move cycles up OR down; not assumed a win.
 
-##### Planned experiment (instrumented; NOT yet run) — NANOSLEEP spin lever
+##### Experiment RESULT (2026-07-20) — NANOSLEEP spin lever REFUTED (non-lever, closed)
 
-- **Code (added 2026-07-20, gated `-spin_instrument_enable`, default 0, timing-neutral):** three
+Ran A(`nanosleep 1,1`, baseline) vs **B(`nanosleep 64,1`)** on both kernels (dedicated NANOSLEEP knob;
+`-miscellaneous_no_queue_latency` raised to 64 to size the MISC_NO_QUEUE FU pipeline depth, else the
+fixed-latency FU asserts `start_stage < m_pipeline_depth` — same pipe-stage-index ceiling as async-WGMMA).
+Both B runs exit cleanly (fwd `.o45`, bwd `.o28`).
+
+| | baseline A (NANO=1) | experiment B (NANO=64) | Δ |
+|---|---:|---:|---|
+| fwd `gpu_sim_cycle` | 135,999 | **137,207** | **+0.9%** (worse) |
+| bwd `gpu_sim_cycle` | 215,895 | **217,423** | **+0.7%** (worse) |
+| fwd `ncu_eligible_warps_per_scheduler` | 0.53 | **0.5263** | ~flat |
+| bwd `ncu_eligible_warps_per_scheduler` | 0.41 | **0.4072** | ~flat |
+| fwd `issuing%` | 34.96 | 34.84 | ~flat |
+
+**Verdict — the "spin steals issue slots" hypothesis (scenario A) is REFUTED; it is scenario B
+(fidelity-only, no slot contention).** Widening the producer's mbarrier-spin backoff did **not** raise
+eligible-warp and **slightly raised** cycles. Reason: at **1 CTA/SM, ~20% occupancy**, when the producer
+stops spinning there is **no other warp to fill the freed slot** — the consumer warps are already parked
+on the mbarrier (non-eligible) waiting for TMA data. So the producer spin was **filling slots that would
+otherwise be idle anyway**, not displacing the consumer; removing it just turns spin-cycles into
+idle-cycles (and the NANOSLEEP delay pushes the next producer TMA slightly later, hence the small cycle
+rise). This means the drain-idle is **structural low-occupancy idle** (no eligible warp exists), not an
+issue-slot-scheduling artifact.
+
+**Consequence:** NANOSLEEP latency is **not a cycle lever** and not even a correct-direction fidelity
+knob (raising it worsens the ratio). Config restored to baseline (`nanosleep 1,1`,
+`miscellaneous_no_queue_latency 1`). The producer-spin axis is **closed**. The residual fwd drain-idle
+(sim eligible 0.53 vs HW 0.83 at matched occupancy) is owned by the deeper question of *why HW keeps more
+warps eligible under the same 1-CTA/SM ~20%-occupancy warp-specialized structure* — a producer/consumer
+overlap property not reachable by per-op latency tuning. (Instrumentation note: the three
+`total_num_cycles_spin_*` counters register but are not auto-printed in the stat dump — they need an
+explicit read in `shader.cc` if a future run wants the exact spin-slot counts; the cycle/eligible verdict
+above does not depend on them.)
+
+
+
+##### Implementation reference (instrumentation + knob, retained for re-runs)
+
+- **Code (2026-07-20, gated `-spin_instrument_enable`, default 0, timing-neutral):** three
   observe-only counters at the issue winner site
   ([subcore.cc:826-841](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/subcore.cc#L826-L841)): `total_num_cycles_spin_ops_issued`
   (winner was PHASECHK/TRYWAIT spin), `total_num_cycles_spin_won_over_eligible` (of those, ≥1 other warp
   was eligible-but-not-selected = spin stole a slot), `total_num_spin_phasechk_issued`. Files:
   `shader.h`, `gpu-sim.cc` (option + stat register), `subcore.cc`. **Headers changed → `make clean`.**
-- **Config (H100):** new `-spin_instrument_enable 1` and a **dedicated NANOSLEEP-only** latency knob
-  `-trace_opcode_latency_initiation_nanosleep 1,1` (baseline) added to
-  `SM90_H100_L2_50MB_80GB/gpgpusim.config`. NANOSLEEP was **split out of the shared MISC_NO_QUEUE knob
-  in code** (`trace_driven.{h,cc}`: opcode-aware `set_latency(category, opcode, ...)` overriding only
-  `category==MISCELLANEOUS_NO_QUEUE_OP && opcode==OP_NANOSLEEP`), so raising it perturbs **only**
-  NANOSLEEP — no MISC_NO_QUEUE contamination. Default `1,1` is bit-identical. Experiment = A(`1,1`) vs
-  B(e.g. `64,1`), kernel 5.
-- **Judgment:** B cycle↓ & eligible↑ & `spin_won_over_eligible` shrinks A→B ⇒ **lever confirmed**
-  (spin displaced the consumer). Cycle≈flat & `spin_won_over_eligible` already small ⇒ fidelity-only,
-  no slot contention, close the axis. Cycle↑ ⇒ backoff over-delays a real dependency, re-examine.
+- **Config (H100):** `-spin_instrument_enable` and a **dedicated NANOSLEEP-only** latency knob
+  `-trace_opcode_latency_initiation_nanosleep` in `SM90_H100_L2_50MB_80GB/gpgpusim.config`. NANOSLEEP was
+  **split out of the shared MISC_NO_QUEUE knob in code** (`trace_driven.{h,cc}`: opcode-aware
+  `set_latency(category, opcode, ...)` overriding only `MISCELLANEOUS_NO_QUEUE_OP && OP_NANOSLEEP`), so
+  raising it perturbs **only** NANOSLEEP. ⚠️ To re-run with latency L>1, also set
+  `-miscellaneous_no_queue_latency >= L` (it sizes the FU pipeline depth). Both restored to baseline
+  (`1,1` / `1`) after the experiment; default is bit-identical.
+
+##### Investigation note (2026-07-20) — fwd eligible-warp gap → `wait`/`stall_count` under-model (SUSPECT, not confirmed)
+
+Traced the fwd eligible-warp deficit (sim 0.53 vs HW 0.83 at matched occupancy ~3.2 warps/sched) via the
+NCU warp-state taxonomy (HW from `...full_rpt.ncu-rep` kernel 5, sim from `.o45`, normalized to
+per-issue-active). The paradox: **sim is MORE idle yet records FEWER stalls** because the stall *mix* is
+displaced —
+- sim OVER: `math_pipe_throttle` 1.38×, `no_instruction` 1.67×, `gmma` 1.66× (long/terminal stalls)
+- sim UNDER (≪1): **`wait` 0.20×** (HW's #1 stall, ratio 1.363), `barrier` 0.00×, `dispatch_stall` 0.04×,
+  `mio_throttle` 0.03×, `short_scoreboard` 0.00×, `sleeping`/`imc_miss`/`branch_resolving` ~0.
+
+HW fills warp-latency with **many short stalls that keep the warp resident/eligible**; sim lacks them, so
+its warps swing to the extremes (long `long_scoreboard` block or trace `drain`) and fall out of eligible.
+The largest single gap is **`wait` (fixed-latency dependency)**: sim `ncu_stall_wait` = `stall_count`
+counter, set from the SASS control-word stall field (raw 0-15, [control_bits.cc:35](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/util/traces_enhanced/src/control_bits.cc#L35);
+[sm.cc:918-927](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/sm.cc#L918-L927)) and decremented by
+**`m_stall_counter >>= 1`** (exponential, [warp_dependency_state.cc:92](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/warp_dependency_state.cc#L92)) — so a raw
+stall of 5 lasts ~3 cyc, 13 lasts ~4 cyc (FA3 fwd: 24% of insts have stall≥3, so they under-stall).
+
+**⚠️ NOT confirmed a bug — likely an intentional compressed-approximation.** Counter-evidence found on
+re-check (do NOT re-chase as a plain bug): (1) `>>=1` is the codebase's shift-register convention (the FU
+`occupied` bitset uses `.set(N)` + `>>=1` for an exact N-cycle model); (2) `m_yield` uses the same shift
+but is set to `2`(=`1<<1`) → exactly 1 cyc, i.e. these counters are designed as bit-position-encoded +
+shift; (3) `-num_stall_cycles_wait_after_bits_stall_0_and_yield 46` → after `>>=1` becomes ~6 cyc, which
+looks like a **calibrated** magic number that presumes the log compression (so raw `stall_count` fed
+straight in may be the intended "compress static stall to effective stall" model, avoiding double-count
+with FU latency). Git history is a single "Uploaded" import — no origin intent recoverable. Only real
+discrepancy: the option's doc says "Number of cycles" but the impl log-compresses it.
+
+**Verdict:** a genuine SUSPECT for the eligible gap, but static analysis cannot decide bug-vs-intent. The
+decisive test (`>>=1` → linear `--`, A/B) is **global** (all kernels/all stalls) and would require
+re-calibrating dependent magic numbers (e.g. the `46`), so it is high-risk and deferred, not a quick win.
+Recorded as an open modeling question, not a lever.
+
+##### BWD cycle-lever scan (2026-07-20, `.o28`) — no large single lever; same CTA-internal shape as fwd
+
+Scanned bwd (1.62×, 215,895 vs HW 132,901 ≈ 83K excess cyc) for a **cycle** lever (not a ratio), i.e.
+where absolute cycles are actually burned. Findings (`.o28`, gpu_sim_cycle 217,423):
+- **SM-all-idle = 16.83%** (~36K cyc). Decomposed by SM-level recoverable ceilings:
+  `sm_idle_all_blocked_by_tensor` **1.75%**, `sm_idle_blocked_by_frontend_sbwait` **3.80%** — both small
+  (per-subcore `tensor_reissue_lockout_only` is 11.77%, but SM-wide only 1.75% because another subcore
+  is almost always issuing → tensor/frontend are NOT the cycle lever, consistent with the closed axes).
+  The rest of SM-idle is `nv_ibuffer_empty`(drain) 10.24% + `wait_barrier`(mbarrier) 10.12% (OR-overlap).
+- **Occupancy is structural, matches HW.** Boot log: `CTA/core = 1, limited by: shmem regs` (233 KB
+  shmem/block → 1 CTA/SM). HW is the same (H100 ~227 KB SM shmem). Wave structure from `[CTAFIN]`: first
+  wave = 132 CTAs @ cyc 1,501 (1/SM); remaining 252 launch **one-at-a-time** (88,620→tail) as each SM's
+  CTA finishes. So bwd is 1-CTA/SM just like fwd — the low occupancy is NOT a sim artifact.
+- **CTA elapsed spread 92.6%** (10,186–137,800; r(tensor_ops,elapsed)=+0.99) = causal-mask triangular
+  imbalance, faithfully reproduced (HW has it too). 97/384 CTAs finish in the last 10% (long tail).
+
+**bwd warp-state vs HW (NCU kernel-11 raw, per issue_active) — SAME displacement as fwd:** sim UNDER on
+the short execution stalls — `barrier` 0.03×, `short_scoreboard` 0.01×, `mio_throttle` 0.01×,
+`dispatch_stall` 0.08×, `wait` 0.36×, `sleeping` 0.14× — and OVER on `no_instruction` 3.61× and
+`math_pipe_throttle` 3.58×. Same pattern as fwd but more pronounced: HW keeps warps resident with many
+short stalls; sim lacks them so warps swing to `drain`/`math_pipe`.
+
+**Verdict (cycle goal):** bwd has **no large single cycle lever left** — every big candidate is either
+closed (tensor SM-wide 1.75%, memory path Opt6-9), structural (1-CTA/SM occupancy = HW-matched),
+or faithful (causal tail). The residual 1.62× is the **CTA-internal warp-progress gap** (sim runs each
+CTA longer than HW), which decomposes into the same short-stall-under / drain-over displacement as fwd
+(the `>>=1` stall_count SUSPECT above is one contributor, but global-risk). ⚠️ The short-stall
+under-modeling (`short_scoreboard`/`mio_throttle`/`barrier`) is a **symptom-or-cause ambiguity**: their
+low % may partly be a denominator effect (sim burns cycles elsewhere), so they are not yet actionable as
+levers until the CTA-internal progress model is understood. No cycle claim made.
+
+
 
 
 **What it is (measured, fwd `.o39` / `.o42`).** The fwd 2.01× (135,999 vs HW 67,696) decomposes into
