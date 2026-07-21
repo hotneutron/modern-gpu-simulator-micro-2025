@@ -1995,6 +1995,16 @@ void shader_core_config::reg_options(class OptionParser *opp) {
                          "Independent gate for bit-identity bisection. See .plan "
                          "FWD_DRAIN_IDLE_MBARRIER_CEILING. (default=0)",
                          "0");
+  option_parser_register(opp, "-headofline_instrument_enable", OPT_BOOL,
+                         &headofline_instrument_enable,
+                         "Enable observe-only head-of-line counters: on next_stage_not_available "
+                         "cycles (ISSUE_CONTROL latch full, warp-scan skipped), re-scan the subcore's "
+                         "warps read-only and count how many were warp-side-ready (valid head + "
+                         "wait_barrier/stall_count/yield/scoreboard/prog-barrier/ldgdepbar/tma_flush "
+                         "satisfied; FU-side excluded). Sizes the recoverable head-of-line fraction. "
+                         "No timing change. Independent gate. See .plan CONSUMER_COMPUTE_BOUND. "
+                         "(default=0)",
+                         "0");
   option_parser_register(opp, "-sync_debug_enable", OPT_BOOL,
                          &sync_debug_enable,
                          "Enable Hopper mbarrier sync debug logging (SYNCDBG)."
@@ -2840,6 +2850,29 @@ void gpgpu_sim::create_gpu_per_sm_stats() {
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_spin_ops_issued", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_spin_won_over_eligible", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_spin_phasechk_issued", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  // [Head-of-line lever] observe-only counters (gated by -headofline_instrument_enable).
+  // scanned          = next_stage_not_available cycles we re-scanned (denominator).
+  // with_ready_warp  = of those, cycles where >=1 warp was warp-side-ready (== true head-of-line: a
+  //                    warp could have issued if the latch were free) -> the RECOVERABLE fraction.
+  // ready_warps_sum  = sum of ready warps over those cycles (avg recoverable warps per HoL cycle).
+  // blocked_by_{tensor,mem,other} = FU class of the instruction occupying the full ISSUE_CONTROL latch
+  //                    (what is holding the head of line).
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_next_stage_scanned", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_next_stage_with_ready_warp", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_ready_warps_during_next_stage", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_next_stage_blocked_by_tensor", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_next_stage_blocked_by_mem", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_next_stage_blocked_by_other", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  // [Head-of-line lever] why the OTHER warps were not warp-side-ready during next_stage cycles (summed
+  // over warps × cycles). If `with_ready_warp` is low, this says whether the whole warpgroup is stuck on
+  // the SAME dependency (lockstep — e.g. all on wait_barrier/scoreboard waiting on the same WGMMA), which
+  // would mean the limit is over-serialization / lack of warp-stagger, NOT a plain latch-depth fix.
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_next_stage_notready_wait_barrier", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_next_stage_notready_scoreboard", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_next_stage_notready_stall_count", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_next_stage_notready_yield", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_next_stage_notready_ldgdepbar", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_next_stage_valid_head_warps", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
   // [WGMMA Opt6 Step-0 instrumentation] observe-only counters (no timing change).
   // (I) split fu_occupied by pipe op.
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_issue_stage_stall_at_least_one_warp_with_fu_occupied_tensor", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
