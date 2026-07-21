@@ -59,6 +59,80 @@ any model code.
   `clock_gettime`), so section-level timing must be added if we want the most trustworthy
   serial-vs-parallel split (Step D).
 
+## 2.5 Environment reality: perf is NOT usable here -> Step D is the method
+
+The runs happen inside a Docker container (`docker exec -it gpu-sim bash`). Verified facts:
+
+- **No `perf` inside the container**; installing it would not help because the container is
+  **not privileged** (`Privileged=false`, no `cap_add`), so `perf_event_open` is blocked by
+  the default Docker seccomp profile.
+- **Host `perf` is also broken**: `/usr/bin/perf` is a wrapper that execs
+  `perf_5.10.135.bsk`, which is **not present** (kernel/tools version mismatch).
+- `perf_event_paranoid = 2` on both host and container, which would further restrict
+  kernel-event sampling even if a binary existed.
+- `gprof` exists but is a poor fit: it needs a full `-pg` rebuild and does **not** profile
+  OpenMP worker threads well (it mostly captures the main thread), so for a multi-threaded
+  simulator it would under-count exactly the parallel CORE loop we care about. It also
+  reports per-function CPU time, not the serial-vs-parallel **wall-clock** split we need.
+
+**Decision:** Steps A/B/C (perf-based) are **not feasible** in this environment. We adopt
+**Step D (in-code section timers)** as the primary method. This is actually the *more
+trustworthy* measurement for the specific question ("what fraction of wall-clock is serial
+vs parallel, head vs tail"), and it works with zero external tooling.
+
+### 2.5.1 Implemented: `-gpgpu_section_timing_enable` (DONE)
+
+Added timing-neutral wall-clock section timers to `gpgpu_sim::cycle()`:
+
+- New config flag **`-gpgpu_section_timing_enable`** (default `0` = off; a normal run pays
+  nothing). Registered in `gpgpu_sim_config::reg_options`. Added to the H100 config
+  `configs/tested-cfgs/SM90_H100_L2_50MB_80GB/gpgpusim.config` (set to `0`).
+- Six `std::chrono::steady_clock` accumulators (nanoseconds) wrap the five clock-domain
+  sections of `cycle()` via `SECT_TIC()`/`SECT_TOC()` macros:
+  - `icnt_load` (CORE-clock icnt_cycle loop) — **serial**
+  - `icnt_reply` (ICNT reply-drain loop) — **serial**
+  - `DRAM` (`#pragma omp parallel for`) — **parallel**
+  - `L2` (sub-partition cache_cycle loop) — **serial**
+  - `booksim` (`icnt_transfer`) — **serial**
+  - `CORE` (`#pragma omp parallel for` compute loop) — **parallel**
+- Output (to stdout, `steady_clock`, monotonic — never affects sim cycles):
+  - `[SECTTIME-WINDOW] ...` every `gpu_stat_sample_freq` cycles (= first field of
+    `-gpgpu_runtime_stat`; in the H100 config that is **500**), with the window accumulators
+    reset after each print -> gives the **head-vs-tail** trajectory.
+  - `[SECTTIME-TOTAL] ...` once at kernel end (from `gpu_print_stat`) -> whole-run split.
+  - Each line reports per-section % plus the rolled-up **PARALLEL%** (CORE+DRAM) vs
+    **SERIAL%** (icnt_load+icnt_reply+L2+booksim).
+- Files changed: `gpu-simulator/gpgpu-sim/src/gpgpu-sim/gpu-sim.h`,
+  `gpu-simulator/gpgpu-sim/src/gpgpu-sim/gpu-sim.cc`, and the H100 `gpgpusim.config`.
+
+**How to use:** set `-gpgpu_section_timing_enable 1` in the config (or as a CLI arg) and run.
+Then read the `[SECTTIME-*]` lines from stdout. Nothing else changes.
+
+**Validation still required (timing-neutral):** run once with the flag `1` and once with `0`
+on the same short window and confirm `gpu_sim_cycle` / `gpu_tot_sim_cycle` are identical.
+
+### 2.5.2 Do I have to run this to the end (12 h)?
+
+**No — for the FIRST look, a few minutes is enough; a full run is only needed to capture the
+TAIL.** The `[SECTTIME-WINDOW]` lines print every 500 cycles from the very start, so:
+
+- **First few minutes (early windows):** already answers the main question — is the run
+  dominated by the parallel CORE section, or by the serial icnt/L2/booksim sections? If the
+  early windows already show a large SERIAL%, we have our target without waiting.
+- **The TAIL (only reason to go longer):** the "utilization drops later" effect appears near
+  kernel end (few CTAs left, CORE loop starves, serial sections dominate). To see that you
+  need to reach the end — but you do **not** need to launch a *new* 12 h run for it:
+  - Cheapest: let the **next full run you were going to do anyway** carry the flag; the
+    periodic windows record head->tail for free, and `[SECTTIME-TOTAL]` closes it out.
+  - Faster proxy: run a **shrunk config** (e.g. shorter sequence length) that finishes in
+    minutes; the tail *shape* (parallel starvation as CTAs drain) reproduces structurally.
+
+Practical answer: **do a short run first (a few minutes) and read the early
+`[SECTTIME-WINDOW]` lines.** Only run to completion if the early windows are inconclusive or
+you specifically want the tail breakdown — and even then prefer a shrunk config over a fresh
+12 h run.
+
+
 ## 3. Profiling plan (measure before changing model code)
 
 ### 3.0 How long do I actually have to run? (do NOT run the full 12 h)

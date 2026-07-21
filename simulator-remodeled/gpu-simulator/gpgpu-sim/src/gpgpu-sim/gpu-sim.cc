@@ -71,6 +71,7 @@
 #include "shader_trace.h"
 
 #include <time.h>
+#include <chrono>
 #include "addrdec.h"
 #include "delayqueue.h"
 #include "dram.h"
@@ -2262,6 +2263,13 @@ void gpgpu_sim_config::reg_options(option_parser_t opp) {
                          "Minimum number of seconds between simulation "
                          "liveness messages (0 = always print)",
                          "1");
+  option_parser_register(opp, "-gpgpu_section_timing_enable", OPT_BOOL,
+                         &gpgpu_section_timing_enable,
+                         "Profile simulator wall-clock per clock-domain section "
+                         "of gpgpu_sim::cycle() (CORE/DRAM/L2/ICNT/booksim). "
+                         "Timing-neutral: does not change any simulated cycle. "
+                         "(1=on, 0=off default)",
+                         "0");
   option_parser_register(opp, "-gpgpu_compute_capability_major", OPT_UINT32,
                          &gpgpu_compute_capability_major,
                          "Major compute capability version number", "7");
@@ -2558,6 +2566,14 @@ gpgpu_sim::gpgpu_sim(const gpgpu_sim_config &config, gpgpu_context *ctx)
   gpu_stall_icnt2sh = 0;
   gpu_icnt_to_l2_pops_total = 0;
   gpu_icnt_to_l2_extra_pops = 0;
+
+  // Wall-clock section-timing accumulators (profiling only; timing-neutral).
+  m_sect_ns_icnt_cycle_win = m_sect_ns_icnt_cycle_tot = 0;
+  m_sect_ns_icnt_reply_win = m_sect_ns_icnt_reply_tot = 0;
+  m_sect_ns_dram_win = m_sect_ns_dram_tot = 0;
+  m_sect_ns_l2_win = m_sect_ns_l2_tot = 0;
+  m_sect_ns_icnt_xfer_win = m_sect_ns_icnt_xfer_tot = 0;
+  m_sect_ns_core_win = m_sect_ns_core_tot = 0;
   // Opt6 early boot confirmation (once): mirror the icnt grant-passes boot log so a 12h
   // run can verify the paired icnt->L2 pop knob is actually enabled in the first seconds.
   {
@@ -3523,6 +3539,8 @@ void gpgpu_sim::clear_executed_kernel_info() {
 void gpgpu_sim::gpu_print_stat() {
   FILE *statfout = stdout;
 
+  if (m_config.gpgpu_section_timing_enable) print_section_timing(true);
+
   std::string kernel_info_str = executed_kernel_info_string();
   gather_gpu_per_sm_stats();
   reset_cycless_access_history();
@@ -4387,9 +4405,60 @@ void gpgpu_sim::decrease_num_threads_kernel(unsigned kernel_id, unsigned num_thr
 }
 
 
+// Print the per-section wall-clock breakdown accumulated by the SECT_TIC/SECT_TOC
+// timers in gpgpu_sim::cycle(). final_dump=false prints the window (since the last
+// print) and resets the _win accumulators, giving a head-vs-tail view across the run;
+// final_dump=true prints the whole-run totals. Profiling only; timing-neutral.
+void gpgpu_sim::print_section_timing(bool final_dump) {
+  auto pct = [](unsigned long long part, unsigned long long whole) -> double {
+    return whole ? (100.0 * (double)part / (double)whole) : 0.0;
+  };
+  unsigned long long icnt_cycle = final_dump ? m_sect_ns_icnt_cycle_tot : m_sect_ns_icnt_cycle_win;
+  unsigned long long icnt_reply = final_dump ? m_sect_ns_icnt_reply_tot : m_sect_ns_icnt_reply_win;
+  unsigned long long dram       = final_dump ? m_sect_ns_dram_tot       : m_sect_ns_dram_win;
+  unsigned long long l2         = final_dump ? m_sect_ns_l2_tot         : m_sect_ns_l2_win;
+  unsigned long long icnt_xfer  = final_dump ? m_sect_ns_icnt_xfer_tot  : m_sect_ns_icnt_xfer_win;
+  unsigned long long core       = final_dump ? m_sect_ns_core_tot       : m_sect_ns_core_win;
+  unsigned long long total = icnt_cycle + icnt_reply + dram + l2 + icnt_xfer + core;
+  // Parallel = OpenMP sections (CORE compute loop + DRAM loop). Serial = everything
+  // else (icnt_cycle load, ICNT reply drain, L2 sub-partition loop, booksim transfer).
+  unsigned long long parallel = core + dram;
+  unsigned long long serial = icnt_cycle + icnt_reply + l2 + icnt_xfer;
+
+  const char *tag = final_dump ? "SECTTIME-TOTAL" : "SECTTIME-WINDOW";
+  printf("[%s] cycle=%llu total_ms=%.1f | "
+         "CORE(par)=%.1f%% DRAM(par)=%.1f%% | "
+         "icnt_load(ser)=%.1f%% icnt_reply(ser)=%.1f%% L2(ser)=%.1f%% booksim(ser)=%.1f%% | "
+         "PARALLEL=%.1f%% SERIAL=%.1f%%\n",
+         tag, (unsigned long long)(gpu_tot_sim_cycle + gpu_sim_cycle),
+         (double)total / 1e6,
+         pct(core, total), pct(dram, total),
+         pct(icnt_cycle, total), pct(icnt_reply, total), pct(l2, total), pct(icnt_xfer, total),
+         pct(parallel, total), pct(serial, total));
+  fflush(stdout);
+
+  if (!final_dump) {
+    // reset window accumulators so the next print reflects only that window
+    m_sect_ns_icnt_cycle_win = m_sect_ns_icnt_reply_win = m_sect_ns_dram_win = 0;
+    m_sect_ns_l2_win = m_sect_ns_icnt_xfer_win = m_sect_ns_core_win = 0;
+  }
+}
+
 void gpgpu_sim::cycle() {
   m_active_sms_this_cycle = 0;
   m_current_cycle_clock_mask = next_clock_domain();
+  // Wall-clock section timing (profiling only; timing-neutral). When disabled,
+  // the accumulator adds are skipped entirely via the guard flag so a normal run
+  // pays nothing. Uses steady_clock (monotonic) so it never affects sim cycles.
+  const bool st_on = m_config.gpgpu_section_timing_enable;
+  std::chrono::steady_clock::time_point st_t0;
+#define SECT_TIC() do { if (st_on) st_t0 = std::chrono::steady_clock::now(); } while (0)
+#define SECT_TOC(acc) do { if (st_on) { \
+    auto st_dt = std::chrono::duration_cast<std::chrono::nanoseconds>( \
+        std::chrono::steady_clock::now() - st_t0).count(); \
+    m_##acc##_win += st_dt; m_##acc##_tot += st_dt; } } while (0)
+
+  SECT_TIC();
   if (m_current_cycle_clock_mask & CORE) {
     // shader core loading (pop from ICNT into core) follows CORE clock
     for (unsigned i = 0; i < m_shader_config->n_simt_clusters; i++) {
@@ -4397,7 +4466,9 @@ void gpgpu_sim::cycle() {
     }
     m_power_stats->pwr_mem_stat->core_cache_stats[CURRENT_STAT_IDX].clear();
   }
+  SECT_TOC(sect_ns_icnt_cycle);
   unsigned partiton_replys_in_parallel_per_cycle = 0;
+  SECT_TIC();
   if (m_current_cycle_clock_mask & ICNT) {
     // pop from grid barrier notify queue
     if(!m_grid_barrier_notify_queue.empty()) {
@@ -4473,7 +4544,9 @@ void gpgpu_sim::cycle() {
     }
   }
   partiton_replys_in_parallel += partiton_replys_in_parallel_per_cycle;
+  SECT_TOC(sect_ns_icnt_reply);
 
+  SECT_TIC();
   if (m_current_cycle_clock_mask & DRAM) {
     #pragma omp parallel for
     for (unsigned i = 0; i < m_memory_config->m_n_mem; i++) {
@@ -4498,9 +4571,11 @@ void gpgpu_sim::cycle() {
     }
     dram_sim_cycle++;
   }
+  SECT_TOC(sect_ns_dram);
 
   // L2 operations follow L2 clock domain
   unsigned partiton_reqs_in_parallel_per_cycle = 0;
+  SECT_TIC();
   if (m_current_cycle_clock_mask & L2) {
     m_power_stats->pwr_mem_stat->l2_cache_stats[CURRENT_STAT_IDX].clear();
     for (unsigned i = 0; i < m_memory_config->m_n_mem_sub_partition; i++) {
@@ -4556,11 +4631,15 @@ void gpgpu_sim::cycle() {
     partiton_reqs_in_parallel_util += partiton_reqs_in_parallel_per_cycle;
     gpu_sim_cycle_parition_util++;
   }
+  SECT_TOC(sect_ns_l2);
 
+  SECT_TIC();
   if (m_current_cycle_clock_mask & ICNT) {
     icnt_transfer(0);
   }
+  SECT_TOC(sect_ns_icnt_xfer);
 
+  SECT_TIC();
   if (m_current_cycle_clock_mask & CORE) {
     // L1 cache + shader core pipeline stages
     #pragma omp parallel for schedule(runtime) reduction(+:m_active_sms_this_cycle)
@@ -4675,6 +4754,7 @@ void gpgpu_sim::cycle() {
       }
 
       if (!(gpu_sim_cycle % m_config.gpu_stat_sample_freq)) {
+        if (st_on) print_section_timing(false);
         time_t days, hrs, minutes, sec;
         time_t curr_time;
         time(&curr_time);
@@ -4741,6 +4821,9 @@ void gpgpu_sim::cycle() {
         gpgpu_ctx->device_runtime->launch_one_device_kernel();
       #endif
   }
+  SECT_TOC(sect_ns_core);
+#undef SECT_TIC
+#undef SECT_TOC
 }
 
 void shader_core_ctx::dump_warp_state(FILE *fout) const {
