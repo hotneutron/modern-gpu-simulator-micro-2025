@@ -2254,6 +2254,18 @@ class shader_core_config : public core_config {
   // See .plan/FWD_DRAIN_IDLE_MBARRIER_CEILING.md.
   bool spin_instrument_enable;
 
+  // [Head-of-line lever] Observe-only counters for the issue-pipeline head-of-line blocking test.
+  // On cycles where the subcore issues nothing because the 1-deep ISSUE_CONTROL latch is full
+  // (next_stage_not_available), the normal warp-scan loop is skipped, so we cannot tell whether a
+  // *different* warp was actually ready. This gate enables a pure read-only re-scan of the subcore's
+  // warps on those cycles, counting how many had a valid head AND satisfied the warp-side issue
+  // conditions (wait_barrier / stall_count / yield / scoreboard / programmer-barrier / ldgdepbar /
+  // tma_flush — FU-side conditions excluded, since a full latch blocks FU entry regardless). This
+  // sizes the RECOVERABLE fraction of next_stage (true head-of-line vs. no-other-warp-ready).
+  // No timing change (read-only, no side-effecting waiting()/tma_flush calls). Default 0.
+  // See .plan/CONSUMER_COMPUTE_BOUND.md.
+  bool headofline_instrument_enable;
+
   // Hopper mbarrier sync debug logging (SYNCDBG). Disabled by default.
   bool sync_debug_enable;
   unsigned int sync_debug_print_budget;

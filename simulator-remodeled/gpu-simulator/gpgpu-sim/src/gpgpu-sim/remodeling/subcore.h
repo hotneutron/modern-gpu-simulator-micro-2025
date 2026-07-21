@@ -243,6 +243,13 @@ class Subcore {
   void issue(SM *shared_sm);
   void decode(SM *shared_sm);
   void fetch(SM *shared_sm);
+
+  // [Head-of-line lever] Pure read-only re-scan used only on next_stage_not_available cycles
+  // (ISSUE_CONTROL latch full). Counts how many of this subcore's warps had a valid head AND passed
+  // the warp-side issue conditions (FU-side excluded, since the full latch blocks FU entry anyway),
+  // and classifies the FU of the instruction occupying the latch. No side effects, no timing change;
+  // called only under -headofline_instrument_enable. See .plan/CONSUMER_COMPUTE_BOUND.md.
+  void scan_head_of_line_when_blocked(SM *shared_sm);
   
   void set_num_pending_cycles_with_issue_port_busy(const warp_inst_t *pI);
   void generate_fixed_latency_constant_accesses(warp_inst_t *pI);

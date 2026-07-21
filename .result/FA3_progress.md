@@ -338,6 +338,66 @@ under-modeling (`short_scoreboard`/`mio_throttle`/`barrier`) is a **symptom-or-c
 low % may partly be a denominator effect (sim burns cycles elsewhere), so they are not yet actionable as
 levers until the CTA-internal progress model is understood. No cycle claim made.
 
+##### ⭐ CONSUMER-COMPUTE-BOUND (2026-07-20, `.o45` TMA timeline) — the CTA-internal gap is the consumer's per-tile compute
+
+Full analysis: [CONSUMER_COMPUTE_BOUND.md](file:///home/jihyun/modern-gpu-simulator-micro-2025/.plan/CONSUMER_COMPUTE_BOUND.md). A per-CTA TMA-timeline decomposition of the SM0
+log finally localized where the fwd 2× cycles are burned — and it is **not** memory/producer/frontend/
+occupancy, it is the **consumer warpgroup's per-tile WGMMA+softmax compute**.
+
+- **Warp structure (HW trace kernel_5 CTA0, 16 warps):** 1 producer (warp 0, 14,082 insts, **~66% spin**
+  PHASECHK/NANOSLEEP, only 44 real TMA) + 12 consumers (warps 4-15, ~8,600 insts each, 216 HGMMA + many
+  MUFU.EX2, ~no spin) + 3 setup. Producer is NOT the bottleneck — it mostly spins waiting on consumers.
+- **TMA timeline (SM0, 40 load tiles):** per-tile arrival latency mean **402 cyc** (memory is fast);
+  tiles arrive in pairs then a **7-16K cyc void**; **large voids (>2000) sum to 99,687 cyc = 93% of the
+  TMA span** = producer waiting on the consumer to compute+free the double-buffer. Avg void 6,645 cyc ≈
+  consumer processing ~2 tiles ⇒ **~3,300 cyc/tile** in sim.
+- **It is consumer *compute*, not idle:** SM-all-idle only 17.2% (issuing 34.8%, fu_occupied 15.2%) — the
+  voids are consumers busy on WGMMA/math, showing up as **stall-depth** (`math_pipe` 11% vs HW 3.2% =3.4×,
+  `mma` 5.65% vs HW 1.4% =4×), not SM-idle. Reconciles with "tensor SM-wide-blocked 1.75%".
+- **Quantified target:** sim ~3,300 cyc/tile vs HW ~1,700 (67,696/40, double-buffered) ≈ **1.9×** — i.e.
+  ~the whole 2× gap.
+
+⚠️ **CORRECTED (2026-07-20b, pipe-level split) — it is NOT "compute 1.9× too slow"; it is compute-SPARSE
+vs HW compute-DENSE.** HW NCU pipe-active vs sim per-pipe fu_occupied (kernel 5):
+  - HW **tensor 46.1%** (~705 cyc/tile) + **MUFU/xu 47.75%** (~729 cyc/tile, HW's #1 pipe) → SM **90%
+    active**, ~1,434 of ~1,700 cyc/tile is real tensor+MUFU work (compute-dense, tightly packed).
+  - sim **tensor fu_occupied only 13.4%** (~426 cyc/tile, LESS than HW) + **SFU/MUFU = 0.00%** (SFU
+    modeled at 4-cyc FP-add, TODO-2) → SM **64% active**; per-tile ~3,300 cyc is only ~426 cyc compute +
+    ~87% stall/idle. **sim runs the compute faster but cannot overlap/pack it.**
+  - So the fwd 2× is an **overlap/packing + missing-MUFU-cost** problem, NOT over-costed compute. This is
+    why async-WGMMA ("II too big") and NANOSLEEP were correctly refuted. **Sharp implication:** TODO-2
+    (realistic SFU/MUFU latency) is the only way to reproduce HW's #1 pipe (xu 47.75%); whether it
+    *reduces* the cycle ratio depends on whether the added MUFU work **overlaps** WGMMA (like HW) or
+    serializes — the new key open question. See [CONSUMER_COMPUTE_BOUND.md](file:///home/jihyun/modern-gpu-simulator-micro-2025/.plan/CONSUMER_COMPUTE_BOUND.md) "Pipe-level breakdown".
+
+
+**Status: re-opens the tensor/math re-issue axis with a concrete quantified target.** ⚠️ Overlaps the
+deferred async-WGMMA (closed on "II not too big") and TODO-2 (SFU under-modeled → fixing makes sim
+*slower*). The open question is **which part of the ~3,300 cyc/tile is over-costed** (WGMMA issue
+serialization vs MUFU/SFU latency vs the math pipe). Next: measure HW per-tile compute directly + split
+the sim per-tile compute by pipe. No cycle claim until measured; SFU direction caveat applies.
+
+##### ⭐⭐ ROOT CAUSE (2026-07-20c) — issue-pipeline head-of-line blocking (sim can't warp-switch under FU backpressure)
+
+Decomposing WHY sim is compute-sparse (SM-active 64% vs HW 90%): sim per-SMSP cycle budget is issuing
+34.8%, **`next_stage_not_available` 24.96%** (11.5M cyc, 2nd-largest), fu_occupied 15.2%, wait_barrier
+12.9%, stall_count 9.4%. The `next_stage` term is the mechanical root:
+- **Source (confirmed):** fixed-latency issue pipe = `issue → ISSUE_CONTROL(1-deep) → CONTROL_ALLOCATE
+  (1-deep) → read_stage(6-deep WGMMA) → TENSOR FU(lat 32)`. `Subcore::issue()` runs the warp-scan loop
+  **only if `m_ISSUE_CONTROL_latch.has_free()`** ([subcore.cc:458](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/subcore.cc#L458)); else the
+  whole subcore issues nothing and **does not even look at other warps** ([subcore.cc:822](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/subcore.cc#L822)).
+  = **per-subcore head-of-line blocking.** (Not tensor-II: `tensor_add_extra_cycle_II`=14,763 = 0.1%.)
+- **HW warp-switches instead:** NCU `warps_active=3.28`, **`not_selected=0.82`** (0.82 spare eligible
+  warps every issue-active cycle); `dispatch_stall=0.787` is **per-warp** (scheduler picks another warp),
+  so SMSP stays busy → SM-active 90%. sim's stall is **per-subcore** → 64%.
+- **So the fwd 2× "compute-sparse" is a scheduler/pipeline-structure gap, not compute cost:** sim's
+  1-deep issue latches propagate WGMMA read/FU backpressure into a full-subcore stall and cannot switch
+  to a ready warp the way HW does.
+- **⚠️ unconfirmed (needs run):** whether a *different* warp was actually eligible during those 11.5M
+  `next_stage` cycles (recoverable head-of-line) or none was ready (not recoverable) — the loop is
+  skipped so the stat can't tell. Decisive test = gated read-only eligible-scan in the `else` branch;
+  secondary = widen ISSUE_CONTROL/CONTROL_ALLOCATE to 2-deep. Full analysis in [CONSUMER_COMPUTE_BOUND.md](file:///home/jihyun/modern-gpu-simulator-micro-2025/.plan/CONSUMER_COMPUTE_BOUND.md).
+
 
 
 

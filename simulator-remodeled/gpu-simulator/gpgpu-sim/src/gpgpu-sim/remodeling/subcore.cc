@@ -383,6 +383,81 @@ void Subcore::control_stage(SM *shared_sm) {
   }
 }
 
+// [Head-of-line lever] Read-only re-scan on a next_stage_not_available cycle (ISSUE_CONTROL latch
+// full, so Subcore::issue() skipped its warp-scan). Counts warps that COULD have issued if the latch
+// were free — i.e. valid head + warp-side conditions satisfied (FU-side excluded, since a full latch
+// blocks FU entry regardless). Also classifies the FU of the instruction holding the latch. Pure read,
+// no side effects (never calls the side-effecting waiting()/warp_waiting_at_tma_flush()); gated by
+// -headofline_instrument_enable so default runs stay bit-identical. See .plan/CONSUMER_COMPUTE_BOUND.md.
+void Subcore::scan_head_of_line_when_blocked(SM *shared_sm) {
+  // Classify what is holding the head of line (the instruction occupying ISSUE_CONTROL).
+  if (m_ISSUE_CONTROL_latch.has_ready()) {
+    warp_inst_t *held = m_ISSUE_CONTROL_latch.get_ready();
+    const char *key;
+    if (held->op == TENSOR_CORE_OP)                 key = "total_num_next_stage_blocked_by_tensor";
+    else if (held->is_load() || held->is_store())   key = "total_num_next_stage_blocked_by_mem";
+    else                                            key = "total_num_next_stage_blocked_by_other";
+    shared_sm->m_sm_stats.m_stats_map[key]->increment_with_integer(1);
+  }
+
+  unsigned long long n_ready = 0;
+  for (auto *c_warp : m_warps_of_subcore) {
+    if (c_warp == NULL || c_warp->done_exit()) continue;
+    if (!c_warp->get_IBuffer_remodeled()->is_next_valid()) continue;  // no valid head
+    unsigned int sm_warp_id = c_warp->get_warp_id();
+    unsigned int subcore_warp_id =
+        translate_warp_id_of_sm_to_subcore(sm_warp_id, shared_sm->get_num_subcores());
+    warp_inst_t *pI = c_warp->get_IBuffer_remodeled()->next_inst();
+    if (pI == nullptr) continue;
+    shared_sm->m_sm_stats.m_stats_map["total_num_next_stage_valid_head_warps"]->increment_with_integer(1);
+
+    bool use_traditional_scoreboarding =
+        !c_warp->get_kernel_info()->is_captured_from_binary ||
+        m_config->is_remodeling_scoreboarding_enabled || !m_config->is_trace_mode;
+    bool are_traditional_scoreaboards_ready = true;
+    bool is_stall_counter_0 = true;
+    bool are_wait_barriers_ready = true;
+    bool is_not_yield = true;
+    if (use_traditional_scoreboarding) {
+      are_traditional_scoreaboards_ready =
+          !(shared_sm->get_scoreboard()->checkCollision_remodeling(sm_warp_id, pI) ||
+            shared_sm->get_scoreboard_WAR()->checkCollision_remodeling(sm_warp_id, pI));
+    } else {
+      is_stall_counter_0 = c_warp->get_dependency_state()->is_stall_counter_0();
+      are_wait_barriers_ready = is_wait_barriers_ready_entry_point(pI, subcore_warp_id);
+      is_not_yield = c_warp->get_dependency_state()->is_yield_ready();
+    }
+    bool is_not_warp_waiting_ldgdepbar = !is_waiting_ldgdepbar(pI, subcore_warp_id);
+    // Warp-side ready = every issue condition EXCEPT the FU-side ones (fu_available, result-queue,
+    // l1c) and the side-effecting programmer-barrier/tma_flush (skipped like the read-only tail).
+    bool warp_side_ready = are_traditional_scoreaboards_ready && is_stall_counter_0 &&
+                           are_wait_barriers_ready && is_not_yield && is_not_warp_waiting_ldgdepbar;
+    if (warp_side_ready) {
+      n_ready++;
+    } else {
+      // [Head-of-line lever] why this warp was NOT ready (non-exclusive: a warp can miss several).
+      // If `with_ready_warp` is low, the dominant reason here tells us whether the whole warpgroup is
+      // stuck lockstep on the same dependency (over-serialization) vs. genuinely diverse waits.
+      if (!are_wait_barriers_ready)
+        shared_sm->m_sm_stats.m_stats_map["total_num_next_stage_notready_wait_barrier"]->increment_with_integer(1);
+      if (!are_traditional_scoreaboards_ready)
+        shared_sm->m_sm_stats.m_stats_map["total_num_next_stage_notready_scoreboard"]->increment_with_integer(1);
+      if (!is_stall_counter_0)
+        shared_sm->m_sm_stats.m_stats_map["total_num_next_stage_notready_stall_count"]->increment_with_integer(1);
+      if (!is_not_yield)
+        shared_sm->m_sm_stats.m_stats_map["total_num_next_stage_notready_yield"]->increment_with_integer(1);
+      if (!is_not_warp_waiting_ldgdepbar)
+        shared_sm->m_sm_stats.m_stats_map["total_num_next_stage_notready_ldgdepbar"]->increment_with_integer(1);
+    }
+  }
+
+  shared_sm->m_sm_stats.m_stats_map["total_num_cycles_next_stage_scanned"]->increment_with_integer(1);
+  if (n_ready > 0) {
+    shared_sm->m_sm_stats.m_stats_map["total_num_cycles_next_stage_with_ready_warp"]->increment_with_integer(1);
+    shared_sm->m_sm_stats.m_stats_map["total_num_ready_warps_during_next_stage"]->increment_with_integer(n_ready);
+  }
+}
+
 void Subcore::issue(SM *shared_sm) {
   bool is_valid_inst =
       false;  // there was one warp with a valid instruction to issue
@@ -845,6 +920,11 @@ void Subcore::issue(SM *shared_sm) {
     shared_sm->m_sm_stats.m_stats_map["total_num_cycles_issue_stage_selected"]->increment_with_integer(1);
   }else if(!is_next_stage_availabe){
     shared_sm->m_sm_stats.m_stats_map["total_num_cycles_issue_stage_stall_next_stage_not_available"]->increment_with_integer(1);
+    // [Head-of-line lever] the warp-scan loop was skipped this cycle (ISSUE_CONTROL latch full);
+    // read-only re-scan to size how much of this is recoverable head-of-line blocking. Gated.
+    if (m_config->headofline_instrument_enable) {
+      scan_head_of_line_when_blocked(shared_sm);
+    }
   }else if(is_issue_port_busy) { // IMAD.WIDE scenario
     shared_sm->m_sm_stats.m_stats_map["total_num_cycles_issue_stage_stall_issue_port_busy"]->increment_with_integer(1);
   }else if(!is_valid_inst) {
