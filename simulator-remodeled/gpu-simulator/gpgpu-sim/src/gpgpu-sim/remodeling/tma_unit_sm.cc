@@ -344,7 +344,21 @@ tma_unit_sm::tma_unit_sm(std::vector<register_set_uniptr *> result_ports,
           1, reception_ports, 1, nullptr, 0, false,
           TraceEnhancedOperandType::NONE),
       m_icnt(icnt),
-      m_mf_allocator(mf_allocator) {}
+      m_mf_allocator(mf_allocator) {
+  // Opt6 4.11.4 early boot confirmation (once, from the first constructed TMA unit):
+  // print the HW-calibrated injection rate so a 12h run can verify the knob is live in
+  // the first seconds. 1 line/cyc = 4 sector/cyc = 124 byte/clk/SM (HW). Old value: 2.
+  static bool logged_tma_inject_knob = false;
+  if (!logged_tma_inject_knob && m_config) {
+    unsigned n = m_config->gpgpu_tma_max_lines_per_cycle;
+    std::cerr << "[TMA][inject] gpgpu_tma_max_lines_per_cycle = " << n << " ("
+              << (n * SECTOR_CHUNCK_SIZE) << " sector/cyc, "
+              << (n * SECTOR_CHUNCK_SIZE * SECTOR_SIZE)
+              << " byte/clk/SM; HW-calibrated=1 -> 4 sector/cyc/124 byte/clk, old=2)"
+              << std::endl;
+    logged_tma_inject_knob = true;
+  }
+}
 
 tma_unit_sm::~tma_unit_sm() { debug_dump_tma_counters(); }
 
@@ -725,6 +739,16 @@ void tma_unit_sm::advance_in_flight_transfers() {
 
 // ---- Hopper data mover (Blackwell plugs a different mover at these hooks) ----
 
+// Max 128B AGU lines injected into the shared SM->L2 port per cycle, from
+// -gpgpu_tma_max_lines_per_cycle. HW-calibrated default 1 (=4 sector/clk =
+// 124 byte/clk/SM, arXiv:2501.12084 Table 5). A value of 0 in the config would
+// stall the mover forever, so clamp to >=1 and assert to catch a misconfig early.
+uint32_t tma_unit_sm::max_lines_per_cycle() const {
+  uint32_t n = m_config ? m_config->gpgpu_tma_max_lines_per_cycle : 1u;
+  assert(n >= 1 && "gpgpu_tma_max_lines_per_cycle must be >= 1 (0 stalls TMA)");
+  return n == 0 ? 1u : n;
+}
+
 void tma_unit_sm::mover_issue_requests(TMATransferEntry &entry,
                                        int current_cycle) {
   // AGU throughput is modelled in units of 128B cache-line requests (the rate
@@ -769,8 +793,9 @@ void tma_unit_sm::mover_issue_requests(TMATransferEntry &entry,
   }
 
   uint32_t agu_requests_this_cycle = 0;
+  const uint32_t lines_per_cycle = max_lines_per_cycle();
   while (entry.requests_issued < kSectorMfGoal &&
-         agu_requests_this_cycle < kMaxRequestsPerCycle) {
+         agu_requests_this_cycle < lines_per_cycle) {
     if (m_icnt == nullptr || m_mf_allocator == nullptr) {
       break;
     }

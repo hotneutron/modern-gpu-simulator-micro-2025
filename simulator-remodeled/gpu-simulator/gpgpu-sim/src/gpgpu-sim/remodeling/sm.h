@@ -486,4 +486,64 @@ class SM : public core_t, public shader_core_ctx_wrapper {
 
   // Power
   PowerscalingCoefficients *m_scaling_coeffs;
+
+  // [CTA-imbalance diag] Per-CTA-slot raw count of TENSOR_CORE (WGMMA) ops.
+  // Indexed by hardware CTA slot (get_cta_id, 0..MAX_CTA_PER_SHADER-1) so a SM
+  // that runs multiple CTAs sequentially (bwd: Waves/SM=2.91) counts each CTA
+  // separately — a SM-wide scalar would wrongly fold earlier CTAs into later
+  // ones. Also stamps each slot's launch cycle so both tensor density AND
+  // elapsed cycles can be correlated with the finish cycle. Observe-only;
+  // increment is always-on, emission is gated by -wgmma_step0_instrument_enable.
+  unsigned long long m_tensor_ops_by_cta_slot[MAX_CTA_PER_SHADER] = {0};
+  unsigned long long m_cta_slot_start_cycle[MAX_CTA_PER_SHADER] = {0};
+  // SM-idle cycles (no subcore issued) with >=1 subcore blocked only by the tensor
+  // re-issue lockout, attributed to the CTA slot(s) resident this cycle. For 1-CTA/SM
+  // (fwd) this exactly attributes the tensor-caused drain to that CTA; for multi-CTA
+  // SMs it credits every resident slot (read as an upper bound there). Lets [CTAFIN]
+  // correlate a CTA's tensor-caused idle with its tensor density in ONE line.
+  unsigned long long m_sm_idle_tensor_cyc_by_cta_slot[MAX_CTA_PER_SHADER] = {0};
+  // Cycles with >=1 subcore whose head WGMMA was blocked because the tensor FU is busy
+  // (NCU `mma`, the producer/FU-busy tensor stall), attributed to each resident CTA slot.
+  // Counted every cycle (not only SM-idle), since a WGMMA can wait on the tensor FU while
+  // another subcore still issues. In this trace-driven model there is no separate consumer-
+  // side warpgroup_arrive (WGMMA result waits fold into wait_barrier), so this is THE tensor-
+  // attributable per-CTA stall. Exact for 1-CTA/SM (fwd); upper bound for bwd.
+  unsigned long long m_fu_occupied_tensor_cyc_by_cta_slot[MAX_CTA_PER_SHADER] = {0};
+  // [CTA stall breakdown] Per-CTA-slot NON-tensor drain-idle counters, for correlating
+  // fwd CTA finish-cycle variance with non-tensor causes. Gated by
+  // -cta_stall_breakdown_instrument_enable. `m_sm_idle_cyc_by_cta_slot` counts every
+  // true SM-idle cycle (no subcore issued) resident to this CTA = the drain-idle that
+  // dominates fwd (1.39x). `m_sm_idle_ibuffer_empty_cyc_by_cta_slot` is the subset where
+  // the idle head warp had an empty ibuffer (trace-drained), the suspected fwd cause.
+  unsigned long long m_sm_idle_cyc_by_cta_slot[MAX_CTA_PER_SHADER] = {0};
+  unsigned long long m_sm_idle_ibuffer_empty_cyc_by_cta_slot[MAX_CTA_PER_SHADER] = {0};
+  // [FWD drain-idle 축1] per-CTA mutually-exclusive partition signals: recoverable mbarrier-only
+  // idle vs floor (all-drained) idle. Gated by wgmma_step0_instrument_enable; reset at launch/exit.
+  unsigned long long m_wait_barrier_only_cyc_by_cta_slot[MAX_CTA_PER_SHADER] = {0};
+  unsigned long long m_drained_cyc_by_cta_slot[MAX_CTA_PER_SHADER] = {0};
+  // [FWD drain-idle 축2] producer/consumer role split. sticky per-warp booleans (set on first
+  // TMA/arrive_expect_tx = producer, first WGMMA = consumer), and per-warp last trace-drain cycle
+  // (0 = not yet drained). At CTA exit the [CTAFIN] line derives per-role max drain from these.
+  bool m_warp_is_producer[MAX_WARP_PER_SHADER] = {false};
+  bool m_warp_is_consumer[MAX_WARP_PER_SHADER] = {false};
+  unsigned long long m_warp_drain_cycle[MAX_WARP_PER_SHADER] = {0};
+  // [FWD drain-idle 축4] per-CTA mbarrier test counts (per-SM SYNCDBG re-attributed per CTA slot).
+  unsigned long long m_wait_pending_by_cta_slot[MAX_CTA_PER_SHADER] = {0};
+  unsigned long long m_wait_released_by_cta_slot[MAX_CTA_PER_SHADER] = {0};
+  // [FWD drain-idle 축3] mbarrier wait-duration histogram (observe-only; does NOT touch
+  // m_pending_sync_waits, which feeds the issue-path warp_waiting_at_barrier). first-miss cycle +
+  // barrier addr per warp; on the pass (next hit) we bucket (now - first_miss). Gated by
+  // sync_wait_hist_instrument_enable. Buckets: {0, 1-16, 17-64, 65-256, 257-1024, 1024+}.
+  address_type m_sync_first_miss_barrier[MAX_WARP_PER_SHADER] = {0};
+  unsigned long long m_sync_first_miss_cycle[MAX_WARP_PER_SHADER] = {0};
+  unsigned long long m_sync_wait_cycle_hist[6] = {0};
+ public:
+  // Increment the tensor-op count for the CTA slot that owns hardware warp wid.
+  void inc_tensor_ops_for_warp(unsigned wid) {
+    unsigned cta_slot = m_physical_warp[wid]->get_cta_id();
+    if (cta_slot < MAX_CTA_PER_SHADER) m_tensor_ops_by_cta_slot[cta_slot]++;
+  }
+  // [FWD drain-idle 축2] sticky role marks (observe-only; set on first occurrence).
+  void mark_producer_warp(unsigned wid) { if (wid < MAX_WARP_PER_SHADER) m_warp_is_producer[wid] = true; }
+  void mark_consumer_warp(unsigned wid) { if (wid < MAX_WARP_PER_SHADER) m_warp_is_consumer[wid] = true; }
 };

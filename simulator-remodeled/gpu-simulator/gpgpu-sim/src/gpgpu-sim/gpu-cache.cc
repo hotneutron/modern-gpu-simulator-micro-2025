@@ -1158,7 +1158,10 @@ void baseline_cache::bandwidth_management::use_data_port(
       // in case of sector cache we need to write bank only the modified sectors
       cache_event ev(WRITE_BACK_REQUEST_SENT);
       if (was_writeback_sent(events, ev)) {
-        unsigned data_cycles = ev.m_evicted_block.m_modified_size / port_width;
+        unsigned modified_size = ev.m_evicted_block.m_modified_size;
+        unsigned data_cycles =
+            modified_size / port_width +
+            ((modified_size % port_width > 0) ? 1 : 0);
         m_data_port_occupied_cycles += data_cycles;
       }
     } break;
@@ -1175,7 +1178,10 @@ void baseline_cache::bandwidth_management::use_data_port(
 /// use the fill port
 void baseline_cache::bandwidth_management::use_fill_port(mem_fetch *mf) {
   // assume filling the entire line with the returned request
-  unsigned fill_cycles = m_config.get_atom_sz() / m_config.m_data_port_width;
+  unsigned atom_sz = m_config.get_atom_sz();
+  unsigned port_width = m_config.m_data_port_width;
+  unsigned fill_cycles =
+      atom_sz / port_width + ((atom_sz % port_width > 0) ? 1 : 0);
   m_fill_port_occupied_cycles += fill_cycles;
 }
 

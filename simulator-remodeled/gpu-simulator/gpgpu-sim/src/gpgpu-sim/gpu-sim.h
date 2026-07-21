@@ -371,6 +371,30 @@ class memory_config {
   // eject faster; each mf still passes icnt_has_buffer/icnt_push, so the icnt
   // reply-bandwidth accounting is untouched (exp1 vs exp3 stay separable).
   unsigned gpgpu_l2_reply_drain_per_cycle;
+  // Opt6: max request mf popped from the icnt xbar out_buffer into each L2 sub-partition
+  // per L2 tick. Default 1 = current behavior. Paired with -icnt_grant_passes_per_cycle
+  // so the faster icnt injection drain is actually absorbed by L2 instead of relocating
+  // the stall to the icnt->L2 pop; each pop still respects sub_partition full().
+  unsigned gpgpu_icnt_to_l2_pop_per_cycle;
+  // Opt8: max L2 admissions (cache_cycle probes that are pop()ed, i.e. not
+  // RESERVATION_FAIL) per sub-partition per L2 tick. Default 1 = current behavior
+  // (1 sector/32B per slice/cycle). N=2 matches the HW H100 L2 slice throughput of
+  // 64B/cycle (2x32B sectors). The whole N-probe batch is gated ONCE on
+  // data_port_free()+output_full at loop top (i.e. the data port is modeled 64B-wide
+  // for N=2), so it does NOT saturate the 1/tick port replenish. Each probe still
+  // goes through the real access()+MSHR+data_port, so L2 hit-rate / DRAM work is
+  // invariant (timing-only rate calibration). See L2_SLICE_PARALLELISM_H100.md.
+  unsigned gpgpu_l2_admit_sectors_per_cycle;
+  // Opt9 Gate A: max sectors moved ROP->m_icnt_L2_queue per sub-partition per
+  // L2-tick (the ROP delay-queue drain). Default 1 = current behavior. The fixed
+  // rop_latency is UNCHANGED; only the drain throughput widens. N=2 = HW 64B/cycle
+  // per slice. Timing-only; work invariant. See TMA_LATENCY_INJECTION_H100.md 4.11.8.
+  unsigned gpgpu_l2_rop_drain_per_cycle;
+  // Opt9 Gate B: max returned lines moved m_dram_L2_queue->{L2 fill | L2_icnt} per
+  // sub-partition per L2-tick (the DRAM->L2 reply drain). Default 1 = current
+  // behavior. The FILL port is modeled M-wide via replenish_fill_port_extra so it
+  // does not saturate. N=2 = HW 64B/cycle per slice. Timing-only; work invariant.
+  unsigned gpgpu_l2_dram_reply_drain_per_cycle;
   unsigned gpgpu_frfcfs_dram_sched_queue_size;
   unsigned gpgpu_dram_return_queue_size;
   enum dram_ctrl_t scheduler_type;
@@ -1025,6 +1049,10 @@ class gpgpu_sim : public gpgpu_t {
   // performance counter for stalls due to congestion.
   unsigned int gpu_stall_dramfull;
   unsigned int gpu_stall_icnt2sh;
+  // Opt6 icnt->L2 multi-pop instrumentation: total mfs popped from icnt into L2, and how
+  // many of those were extra pops (2nd+ pop in a tick, = throughput the pop knob added).
+  unsigned long long gpu_icnt_to_l2_pops_total;
+  unsigned long long gpu_icnt_to_l2_extra_pops;
   unsigned long long partiton_reqs_in_parallel;
   unsigned long long partiton_reqs_in_parallel_total;
   unsigned long long partiton_reqs_in_parallel_util;

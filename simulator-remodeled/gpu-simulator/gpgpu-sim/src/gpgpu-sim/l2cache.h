@@ -299,6 +299,45 @@ class memory_sub_partition {
   unsigned long long m_tma_l2_res_fails = 0;
   unsigned long long m_tma_l2_output_full_cycles = 0;
   unsigned long long m_tma_l2_port_busy_cycles = 0;
+  // Opt8 admission-parallelism instrumentation (timing-neutral). Per-sub-partition
+  // so gpu_print_stat can build the across-slice histogram that reveals whether the
+  // ROP wall is a few hot slices (spread problem) or a genuine per-slice throughput
+  // limit (the Opt8 lever). See L2_SLICE_PARALLELISM_H100.md section 8.
+  //  - m_l2_admissions      : total accepted probes (== this slice's L2 accesses)
+  //  - m_l2_active_cycles   : L2 ticks where this slice accepted >=1 probe
+  //  - m_l2_multi_admit_cycles: L2 ticks where this slice accepted >1 (proves the
+  //                            widened budget was actually used; 0 when knob==1)
+  unsigned long long m_l2_admissions = 0;
+  unsigned long long m_l2_active_cycles = 0;
+  unsigned long long m_l2_multi_admit_cycles = 0;
+  // Opt9 drain-lever instrumentation (timing-neutral, per-sub-partition). Prove
+  // each drain lever actually fired (>1 moved in a tick) — the direct analogue of
+  // m_l2_multi_admit_cycles for Opt8. 0 when the knob is 1.
+  //  Gate A (ROP -> m_icnt_L2_queue):
+  unsigned long long m_l2_rop_drained = 0;         // total sectors ROP->icnt_L2
+  unsigned long long m_l2_rop_multi_cycles = 0;    // ticks that drained >1
+  //  Gate B (m_dram_L2_queue -> L2 fill | L2_icnt):
+  unsigned long long m_l2_dram_reply_drained = 0;  // total returns drained
+  unsigned long long m_l2_dram_reply_multi_cycles = 0;  // ticks that drained >1
+
+ public:
+  unsigned long long get_l2_admissions() const { return m_l2_admissions; }
+  unsigned long long get_l2_active_cycles() const { return m_l2_active_cycles; }
+  unsigned long long get_l2_multi_admit_cycles() const {
+    return m_l2_multi_admit_cycles;
+  }
+  unsigned long long get_l2_rop_drained() const { return m_l2_rop_drained; }
+  unsigned long long get_l2_rop_multi_cycles() const {
+    return m_l2_rop_multi_cycles;
+  }
+  unsigned long long get_l2_dram_reply_drained() const {
+    return m_l2_dram_reply_drained;
+  }
+  unsigned long long get_l2_dram_reply_multi_cycles() const {
+    return m_l2_dram_reply_multi_cycles;
+  }
+
+ private:
 };
 
 class L2interface : public mem_fetch_interface {
@@ -309,10 +348,13 @@ class L2interface : public mem_fetch_interface {
     // assume read and write packets all same size
     return m_unit->m_L2_dram_queue->full();
   }
-  virtual void push(mem_fetch *mf) {
-    mf->set_status(IN_PARTITION_L2_TO_DRAM_QUEUE, 0 /*FIXME*/);
-    m_unit->m_L2_dram_queue->push(mf);
-  }
+  // Defined out-of-line in l2cache.cc so it can stamp the real GPU cycle. The
+  // old inline body used a hard-coded 0 for the status-change timestamp (the
+  // original FIXME), which corrupted any per-stage residency measured off
+  // m_status_change: the next transition computed (cycle - 0) = an absolute
+  // timestamp instead of a delta. This is the L2 miss port, so every enabled-L2
+  // miss hit it.
+  virtual void push(mem_fetch *mf);
 
   virtual void flush() {}
 

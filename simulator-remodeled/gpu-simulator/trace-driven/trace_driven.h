@@ -156,6 +156,11 @@ class trace_config {
 
   void set_latency(unsigned category, unsigned &latency,
                    unsigned &initiation_interval) const;
+  // [NANOSLEEP spin lever] opcode-aware overload: identical to the category-only version except that
+  // when category==MISCELLANEOUS_NO_QUEUE_OP and opcode==OP_NANOSLEEP it applies the dedicated
+  // nanosleep latency/init (so widening NANOSLEEP does NOT perturb other MISC_NO_QUEUE ops).
+  void set_latency(unsigned category, unsigned opcode, unsigned &latency,
+                   unsigned &initiation_interval) const;
   void parse_config();
   void reg_options(option_parser_t opp);
   char *get_traces_filename() { return g_traces_filename; }
@@ -192,6 +197,9 @@ class trace_config {
   unsigned int get_miscellaneous_no_queue_init() const {
     return miscellaneous_no_queue_init;
   }
+  // [NANOSLEEP spin lever] dedicated nanosleep latency/init (default 1,1 = old behavior).
+  unsigned int get_nanosleep_latency() const { return nanosleep_latency; }
+  unsigned int get_nanosleep_init() const { return nanosleep_init; }
 
  private:
   unsigned int_latency, fp_latency, dp_latency, sfu_latency, tensor_latency;
@@ -201,6 +209,8 @@ class trace_config {
       miscellaneous_queue_latency, miscellaneous_queue_init,
       miscellaneous_no_queue_latency,
       miscellaneous_no_queue_init;
+  // [NANOSLEEP spin lever] dedicated nanosleep timing (default 1,1).
+  unsigned int nanosleep_latency, nanosleep_init;
   unsigned specialized_unit_latency[SPECIALIZED_UNIT_NUM];
   unsigned specialized_unit_initiation[SPECIALIZED_UNIT_NUM];
 
@@ -216,6 +226,8 @@ class trace_config {
   char *trace_opcode_latency_initiation_predicate;
   char *trace_opcode_latency_initiation_miscellaneous_queue;
   char *trace_opcode_latency_initiation_miscellaneous_no_queue;
+  // [NANOSLEEP spin lever] dedicated nanosleep opt string (default "1,1").
+  char *trace_opcode_latency_initiation_nanosleep;
   char *trace_opcode_latency_initiation_specialized_op[SPECIALIZED_UNIT_NUM];
 
   bool is_extra_traces_enabled; // MOD. Improved tracer

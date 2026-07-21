@@ -387,6 +387,9 @@ void Subcore::issue(SM *shared_sm) {
   bool is_valid_inst =
       false;  // there was one warp with a valid instruction to issue
   bool is_issued_inst = false;  // Achieved to issue an instruction?
+  // [NANOSLEEP spin lever] set true iff the issued winner this cycle was a producer mbarrier spin
+  // poll (PHASECHK/TRYWAIT). Finalized against n_eligible_this_cycle in the stats block. Observe-only.
+  bool issued_spin_op_this_cycle = false;
   bool is_issue_port_busy = true;
   bool is_next_stage_availabe = true;
   bool is_any_invalid_head_decode_pending = false;
@@ -429,6 +432,25 @@ void Subcore::issue(SM *shared_sm) {
   bool is_any_waiting_in_scoreboard = false;     // traditional scoreboard collision (non-TMA)
   bool is_any_waiting_in_result_queue_full = false; // RF result-queue full (non-TMA)
   bool is_any_waiting_l1c = false;               // const cache -> NCU "short_scoreboard" (non-TMA)
+  // [NCU stall-taxonomy] warpgroup-arrive wait (WGMMA WARPGROUP.ARRIVE / .DEPBAR) split out of
+  // the wait_barrier bucket to match NCU `warpgroup_arrive`. See .plan/NCU_STALL_TAXONOMY_METRICS_IMPL.md.
+  bool is_any_waiting_in_warpgroup_arrive = false;
+  // [NCU stall-taxonomy] dispatch/issue-port + RF-result-queue backpressure (NCU `dispatch_stall`),
+  // re-derived into the per-warp axis (a warp was otherwise-ready but its result queue was full).
+  bool is_any_waiting_in_dispatch = false;
+  // [NCU stall-taxonomy] not_selected + eligible accounting (Phase 2): once the loop would have
+  // broken, keep iterating in read-only mode over the post-stop tail; count eligible-but-not-picked.
+  bool tail_readonly = false;
+  unsigned long long n_not_selected_this_cycle = 0;
+  unsigned long long n_eligible_this_cycle = 0;
+  // [FWD drain-idle 축1] mutually-exclusive sole-block accounting for this subcore this cycle.
+  // We scan valid-head warps that failed to issue; for each we count how many issue conditions are
+  // unmet. If exactly one is unmet it yields an ONLY_* reason, else SB_MULTI. Across warps we keep
+  // the highest recover-value reason (WAIT_BARRIER>TENSOR>STALL_COUNT>FU_NONTENSOR>NEXT_STAGE>L1C>
+  // OTHER>MULTI). If NO warp had a valid head at all -> SB_DRAINED (floor). Gated by wgmma step0.
+  bool any_valid_head_this_cycle = false;
+  int best_sole_block_rank = -1;         // higher rank wins; -1 = none seen
+  Step0SoleBlock best_sole_block = SB_MULTI;
 
   modify_warp_state();
   if(m_num_pending_cycles_with_issue_port_busy > 0) {
@@ -450,6 +472,15 @@ void Subcore::issue(SM *shared_sm) {
       assert(c_warp_id == subcore_warp_id);
       bool is_valid_inst_in_the_warp =
           c_warp->get_IBuffer_remodeled()->is_next_valid();
+
+      // [NCU stall-taxonomy] Phase 2 tail: once the loop has already stopped this cycle, a warp with
+      // NO valid head instruction cannot be `not_selected` (it is a frontend/no_valid case), so skip
+      // it without running the frontend-classification path (which today never executes after the
+      // break, and would otherwise perturb the no_valid_instruction sub-counters). Valid-head tail
+      // warps fall through to the read-only eligibility check inside the valid block below.
+      if (tail_readonly && !is_valid_inst_in_the_warp) {
+        continue;
+      }
 
       if (!is_valid_inst_in_the_warp) {
         IBuffer_Remodeled *ibuffer = c_warp->get_IBuffer_remodeled();
@@ -570,18 +601,23 @@ void Subcore::issue(SM *shared_sm) {
         }
 
         bool is_not_warp_waiting_ldgdepbar = !is_waiting_ldgdepbar(pI, subcore_warp_id);
-        bool is_not_warp_waiting_in_programmer_barrier = !c_warp->waiting();
+        // [NCU stall-taxonomy] On the read-only tail (already stopped this cycle) do NOT call the
+        // side-effecting waiting()/warp_waiting_at_tma_flush(): they map to NCU barrier/membar/tma_flush,
+        // NOT not_selected, and re-invoking them would perturb membar/log state (bit-identity).
+        // See .plan/NCU_STALL_TAXONOMY_METRICS_IMPL.md Phase 2.
+        bool is_not_warp_waiting_in_programmer_barrier =
+            tail_readonly ? true : !c_warp->waiting();
         // UTMACMDFLUSH (cp.async.bulk.wait_group 0) stalls its warp until all of
         // that warp's outstanding store-class TMA transfers drain (warp-local).
         bool is_not_warp_waiting_tma_flush =
-            !shared_sm->warp_waiting_at_tma_flush(sm_warp_id, pI);
+            tail_readonly ? true : !shared_sm->warp_waiting_at_tma_flush(sm_warp_id, pI);
         functional_unit* fu = get_fu(pI);
         bool is_fu_available = true;;
         bool is_fixed_latency_inst = fu->is_fixed_latency_unit();
         if(is_fixed_latency_inst) {
           is_fu_available = fu->can_issue(pI);
         }
-        bool is_l1c_ready = are_l1c_operands_ready(shared_sm, pI);
+        bool is_l1c_ready = tail_readonly ? true : are_l1c_operands_ready(shared_sm, pI);
         bool is_write_available_result_queue_for_fixed_latency_available = true;
         bool has_dst_regs = false;
         TraceEnhancedOperandType dst_type = TraceEnhancedOperandType::NONE;
@@ -622,7 +658,60 @@ void Subcore::issue(SM *shared_sm) {
         }
 
         bool is_inst_ready_to_issue = are_switch_warp_conditions_ready && is_l1c_ready;
+        // [NCU stall-taxonomy] Phase 2: on the read-only tail (a warp strictly AFTER the cycle's
+        // stop) never issue. Count it as not_selected iff it satisfies the read-only eligibility
+        // (are_switch_warp_conditions_ready; l1c excluded by design — see plan). No side effects.
+        if (tail_readonly) {
+          if (are_switch_warp_conditions_ready) {
+            ++n_eligible_this_cycle;
+            ++n_not_selected_this_cycle;
+          }
+          continue;
+        }
+        // [FWD drain-idle 축1] observe-only sole-block classification for this valid-head warp.
+        // Reached only for warps WITH a valid head (invalid heads `continue` above), so mark that
+        // this subcore had >=1 valid head this cycle (=> NOT drained). Count unmet issue conditions;
+        // exactly-one => the matching ONLY_* reason, >=2 => SB_MULTI. Keep the highest recover-value
+        // reason across warps. Pure read (no side effects); gated by wgmma step0.
+        if (m_config->wgmma_step0_instrument_enable) {
+          any_valid_head_this_cycle = true;
+          if (!is_inst_ready_to_issue) {
+            bool head_is_tensor = (pI->op == TENSOR_CORE_OP);
+            // condition -> (met?, sole-reason-if-this-is-the-only-unmet, rank)
+            struct { bool met; Step0SoleBlock reason; int rank; } conds[] = {
+              { are_wait_barriers_ready,
+                SB_ONLY_WAIT_BARRIER, 7 },
+              { !( !is_fu_available && head_is_tensor ),
+                SB_ONLY_TENSOR, 6 },
+              { is_stall_counter_0,
+                SB_ONLY_STALL_COUNT, 5 },
+              { !( !is_fu_available && !head_is_tensor ),
+                SB_ONLY_FU_NONTENSOR, 4 },
+              { is_write_available_result_queue_for_fixed_latency_available,
+                SB_ONLY_NEXT_STAGE, 3 },
+              { is_l1c_ready,
+                SB_ONLY_L1C, 2 },
+              { is_not_yield && is_not_warp_waiting_in_programmer_barrier &&
+                is_not_warp_waiting_ldgdepbar && is_not_warp_waiting_tma_flush &&
+                are_traditional_scoreaboards_ready,
+                SB_ONLY_OTHER, 1 },
+            };
+            int unmet = 0; Step0SoleBlock sole = SB_MULTI; int sole_rank = 0;
+            for (auto &c : conds) {
+              if (!c.met) { unmet++; sole = c.reason; sole_rank = c.rank; }
+            }
+            Step0SoleBlock warp_reason; int warp_rank;
+            if (unmet == 1) { warp_reason = sole; warp_rank = sole_rank; }
+            else            { warp_reason = SB_MULTI; warp_rank = 0; }
+            if (warp_rank > best_sole_block_rank) {
+              best_sole_block_rank = warp_rank;
+              best_sole_block = warp_reason;
+            }
+          }
+        }
         if (is_inst_ready_to_issue) {
+          // This warp is eligible AND selected (the winner). Counts toward eligible, not not_selected.
+          ++n_eligible_this_cycle;
           const active_mask_t &active_mask =
               shared_sm->get_active_mask(sm_warp_id, pI);
           assert(c_warp->inst_in_pipeline());
@@ -633,9 +722,18 @@ void Subcore::issue(SM *shared_sm) {
           }
           issue_warp(shared_sm, m_ISSUE_CONTROL_latch, pI, active_mask, sm_warp_id, fu, is_fixed_latency_inst, use_traditional_scoreboarding, has_dst_regs, dst_type);
           is_issued_inst = true;
+          // [NANOSLEEP spin lever] record whether the winning op is a producer mbarrier spin poll
+          // (PHASECHK/TRYWAIT). Used with n_eligible_this_cycle (finalized on the tail) to detect
+          // spin displacing a co-eligible warp. Observe-only; gated at the stats site.
+          issued_spin_op_this_cycle =
+              (pI->sync_kind == SyncInstructionKind::PHASECHK ||
+               pI->sync_kind == SyncInstructionKind::TRYWAIT);
           m_greedy_pointer_issue = subcore_warp_id;
           m_num_pending_cycles_constant_cache_misses_before_switch_to_other_warp = m_config->num_const_cache_cycle_misses_before_switch_to_other_warp;
-          break;
+          // [NCU stall-taxonomy] was: break; — now keep iterating the SAME loop in read-only mode
+          // over the post-winner tail to count not_selected. No further issue_warp / side effects.
+          tail_readonly = true;
+          continue;
         }else {
           if(!are_switch_warp_conditions_ready) {
             if(!is_fu_available) {
@@ -687,9 +785,19 @@ void Subcore::issue(SM *shared_sm) {
             }
             if(!are_traditional_scoreaboards_ready) {
               is_any_waiting_in_scoreboard = true;
+              // [NCU stall-taxonomy] split NCU `warpgroup_arrive` out of scoreboard stalls: the warp
+              // is RAW-blocked on a register that is a pending dst of an in-flight tensor (WGMMA) op.
+              // This is where a consumer waiting on a warpgroup-MMA result actually stalls (WGMMA is a
+              // tensor-FU op, so it surfaces as a scoreboard RAW, NOT an mbarrier wait). Read-only.
+              if(shared_sm->get_scoreboard()->checkTensorCollision_remodeling(sm_warp_id, pI)) {
+                is_any_waiting_in_warpgroup_arrive = true;
+              }
             }
             if(!is_write_available_result_queue_for_fixed_latency_available) {
               is_any_waiting_in_result_queue_full = true;
+              // [NCU stall-taxonomy] result-queue backpressure at the dispatch/RF-write port maps to
+              // NCU `dispatch_stall` (re-derived into the per-warp axis).
+              is_any_waiting_in_dispatch = true;
             }
             if(!is_l1c_ready) {
               is_any_waiting_l1c = true;
@@ -700,7 +808,11 @@ void Subcore::issue(SM *shared_sm) {
                 is_any_waiting_l1c = true;
               }
             }else {
-              break;
+              // [NCU stall-taxonomy] was: break; — the greedy warp is blocked only on the const cache
+              // and cannot yield. It is the stop point (l1c wait = NCU short_scoreboard/imc_miss, NOT
+              // not_selected). Keep iterating read-only over the tail instead of breaking.
+              tail_readonly = true;
+              continue;
             }
           }
         
@@ -712,8 +824,25 @@ void Subcore::issue(SM *shared_sm) {
   }
 
   // Stats
+  // [NCU stall-taxonomy] Phase 2 accumulators — emitted every cycle regardless of the branch below.
+  // n_eligible = warps that satisfied read-only eligibility this cycle (winner + tail); n_not_selected
+  // = eligible tail warps that were not the winner. See .plan/NCU_STALL_TAXONOMY_METRICS_IMPL.md.
+  shared_sm->m_sm_stats.m_stats_map["total_num_warps_eligible_accumulator"]->increment_with_integer(n_eligible_this_cycle);
+  shared_sm->m_sm_stats.m_stats_map["total_num_cycles_issue_stage_not_selected"]->increment_with_integer(n_not_selected_this_cycle);
+  // [NANOSLEEP spin lever] observe-only: count cycles where the winner was a producer mbarrier spin
+  // poll, and (of those) cycles where >=1 other warp was eligible but not selected (n_not_selected>0)
+  // = spin displaced a co-eligible warp. Gated so default runs stay bit-identical.
+  if (m_config->spin_instrument_enable && is_issued_inst && issued_spin_op_this_cycle) {
+    shared_sm->m_sm_stats.m_stats_map["total_num_cycles_spin_ops_issued"]->increment_with_integer(1);
+    shared_sm->m_sm_stats.m_stats_map["total_num_spin_phasechk_issued"]->increment_with_integer(1);
+    if (n_not_selected_this_cycle > 0) {
+      shared_sm->m_sm_stats.m_stats_map["total_num_cycles_spin_won_over_eligible"]->increment_with_integer(1);
+    }
+  }
   if(is_issued_inst) {
     shared_sm->m_sm_stats.m_stats_map["total_num_cycles_issue_stage_issuing"]->increment_with_integer(1);
+    // [NCU stall-taxonomy] `selected` == the issued winner (NCU per-issue denominator).
+    shared_sm->m_sm_stats.m_stats_map["total_num_cycles_issue_stage_selected"]->increment_with_integer(1);
   }else if(!is_next_stage_availabe){
     shared_sm->m_sm_stats.m_stats_map["total_num_cycles_issue_stage_stall_next_stage_not_available"]->increment_with_integer(1);
   }else if(is_issue_port_busy) { // IMAD.WIDE scenario
@@ -748,6 +877,10 @@ void Subcore::issue(SM *shared_sm) {
     shared_sm->m_sm_stats.m_stats_map["total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_scoreboard"]->increment_with_integer(is_any_waiting_in_scoreboard);
     shared_sm->m_sm_stats.m_stats_map["total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_result_queue_full"]->increment_with_integer(is_any_waiting_in_result_queue_full);
     shared_sm->m_sm_stats.m_stats_map["total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_l1c"]->increment_with_integer(is_any_waiting_l1c);
+    // [NCU stall-taxonomy] warpgroup_arrive (WGMMA-group wait split out of wait_barrier) +
+    // dispatch (RF result-queue / issue-port backpressure re-derived into the per-warp axis).
+    shared_sm->m_sm_stats.m_stats_map["total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_warpgroup_arrive"]->increment_with_integer(is_any_waiting_in_warpgroup_arrive);
+    shared_sm->m_sm_stats.m_stats_map["total_num_cycles_issue_stage_stall_dispatch"]->increment_with_integer(is_any_waiting_in_dispatch);
     // [WGMMA Opt6 Step-0] (I)/(III)/(VI) per-pipe + tensor-specific stall attribution.
     shared_sm->m_sm_stats.m_stats_map["total_num_cycles_issue_stage_stall_at_least_one_warp_with_fu_occupied_tensor"]->increment_with_integer(is_any_fu_occupied_tensor);
     shared_sm->m_sm_stats.m_stats_map["total_num_cycles_issue_stage_stall_at_least_one_warp_with_fu_occupied_sfu"]->increment_with_integer(is_any_fu_occupied_sfu);
@@ -761,6 +894,19 @@ void Subcore::issue(SM *shared_sm) {
   // tensor pipe this cycle? Used to count true SM-wide idle cycles vs tensor-only idle.
   m_step0_issued_this_cycle = is_issued_inst;
   m_step0_blocked_by_tensor_only_this_cycle = is_any_tensor_reissue_lockout_only;
+  // [FWD drain-idle 축1] finalize this subcore's mutually-exclusive sole-block reason:
+  // issued -> SB_ISSUED; else no valid head all cycle -> SB_DRAINED (floor); else the highest
+  // recover-value ONLY_*/MULTI reason seen among valid-head warps. Observe-only.
+  if (is_issued_inst)                 m_step0_sole_block_this_cycle = SB_ISSUED;
+  else if (!any_valid_head_this_cycle) m_step0_sole_block_this_cycle = SB_DRAINED;
+  else                                 m_step0_sole_block_this_cycle = best_sole_block;
+  // [CTA-imbalance diag] tensor-FU-busy stall: >=1 warp's head is a WGMMA blocked because the
+  // tensor FU is still busy (== NCU `mma`). In this trace-driven model WGMMA is a fixed-latency
+  // SPECIALIZED FU op and there is NO separate consumer-side "warpgroup_arrive" scoreboard wait
+  // (result waits fold into wait_barrier/DEPBAR, indistinguishable from mbarrier). So the
+  // tensor-attributable stall the model DOES expose is this producer/FU-busy signal; we export
+  // it (not the scoreboard warpgroup_arrive, which is 0 in trace mode) for per-CTA attribution.
+  m_step0_blocked_by_fu_occupied_tensor_this_cycle = is_any_fu_occupied_tensor;
   // [Frontend Step-0] also export whether this subcore had >=1 warp blocked on the L1I
   // stream-buffer frontend this cycle, for the SM-level frontend-idle measurement.
   m_step0_blocked_by_frontend_sbwait_this_cycle = is_any_invalid_head_waiting_frontend_in_l0i_response_queue_stream_buffer_wait;

@@ -48,6 +48,8 @@ xbar_router::xbar_router(unsigned router_id, enum Interconnect_type m_type,
   verbose = m_localinct_config.verbose;
   grant_cycles = m_localinct_config.grant_cycles;
   grant_cycles_count = m_localinct_config.grant_cycles;
+  grant_passes_per_cycle = m_localinct_config.grant_passes_per_cycle;
+  if (grant_passes_per_cycle == 0) grant_passes_per_cycle = 1;
   in_buffers.resize(total_nodes);
   out_buffers.resize(total_nodes);
   next_node.resize(total_nodes, 0);
@@ -73,6 +75,8 @@ xbar_router::xbar_router(unsigned router_id, enum Interconnect_type m_type,
   conflicts_util = 0;
   cycles_util = 0;
   reqs_util = 0;
+  grant_passes_run = 0;
+  extra_pass_grants = 0;
   packets_num_per_device.resize(total_nodes, 0);
 }
 
@@ -206,7 +210,26 @@ void xbar_router::iSLIP_Advance() {
     conflicts_util += conflict_sub;
     cycles_util++;
   }
-  // do iSLIP
+  // do iSLIP. Repeat the grant matching up to grant_passes_per_cycle times per tick:
+  // each pass grants <=1 packet per (input,dest) and consumes those inputs, so N passes
+  // let a single input node eject up to N packets/cycle -- relieving the shared REQ-net
+  // in_buffer saturation from TMA 768x32B bursts. Per-tick stats (cycles/util above) are
+  // accumulated once; only the grant loop repeats, so no stat is double-counted.
+  unsigned passes = grant_passes_per_cycle == 0 ? 1 : grant_passes_per_cycle;
+  for (unsigned pass = 0; pass < passes; ++pass) {
+    if (pass > 0) {
+      // rebuild input_nodes / destination_set from what is left after prior passes
+      input_nodes.clear();
+      destination_set.clear();
+      for (unsigned i = 0; i < total_nodes; ++i) {
+        if (!in_buffers[i].empty()) {
+          input_nodes.insert(i);
+          destination_set.insert(in_buffers[i].front().output_deviceID);
+        }
+      }
+      if (input_nodes.empty()) break;
+    }
+    unsigned reqs_before = reqs;
   for (auto dest : destination_set) {
     if (Has_Buffer_Out(dest, 1)) {
       unsigned start_node = next_node[dest];
@@ -248,6 +271,10 @@ void xbar_router::iSLIP_Advance() {
     } else {
       out_buffer_full++;
     }
+  }
+    grant_passes_run++;
+    if (pass > 0) extra_pass_grants += (reqs - reqs_before);
+    if (reqs == reqs_before) break;  // nothing granted this pass -> stop early
   }
 
   if (active) {
@@ -322,6 +349,16 @@ void LocalInterconnect::CreateInterconnect(unsigned m_n_shader,
   for (unsigned i = 0; i < n_subnets; ++i) {
     net[i] = new xbar_router(i, static_cast<Interconnect_type>(i), m_n_shader,
                              m_n_mem, m_inct_config);
+  }
+  // Early boot confirmation for long runs: if the multi-pass arbiter knob is enabled,
+  // print it once to stderr so a 12h run can be verified in the first seconds instead
+  // of only via end-of-run stats.
+  if (m_inct_config.grant_passes_per_cycle > 1) {
+    std::cerr << "[ICNT] local-xbar grant_passes_per_cycle = "
+              << m_inct_config.grant_passes_per_cycle
+              << " (>1: multi-pass injection drain enabled; subnets=" << n_subnets
+              << ", arbiter_algo=" << (unsigned)m_inct_config.arbiter_algo << ")"
+              << std::endl;
   }
 }
 
@@ -412,6 +449,24 @@ void LocalInterconnect::DisplayStats() {
   printf("Req_Network_out_buffer_avg_util = %12.4f\n",
          ((float)(net[REQ_NET]->out_buffer_util) / (net[REQ_NET]->cycles) /
           net[REQ_NET]->active_out_buffers));
+  // Multi-pass arbiter instrumentation (-icnt_grant_passes_per_cycle). If the config is
+  // 1, avg_passes_per_active_cycle should be ~1 and extra_pass_grants 0 (bit-identical to
+  // the original single-pass arbiter). If >1, avg_passes>1 and extra_pass_grants>0 proves
+  // the knob is actually draining more packets/cycle from the REQ in_buffer.
+  printf("Req_Network_grant_passes_per_cycle_cfg = %u\n",
+         net[REQ_NET]->grant_passes_per_cycle);
+  printf("Req_Network_grant_passes_run_total = %lld\n",
+         net[REQ_NET]->grant_passes_run);
+  printf("Req_Network_avg_passes_per_active_cycle = %12.4f\n",
+         net[REQ_NET]->cycles_util
+             ? (float)(net[REQ_NET]->grant_passes_run) / (net[REQ_NET]->cycles_util)
+             : 0.0f);
+  printf("Req_Network_extra_pass_grants_total = %lld\n",
+         net[REQ_NET]->extra_pass_grants);
+  printf("Reply_Network_grant_passes_per_cycle_cfg = %u\n",
+         net[REPLY_NET]->grant_passes_per_cycle);
+  printf("Reply_Network_extra_pass_grants_total = %lld\n",
+         net[REPLY_NET]->extra_pass_grants);
 
   printf("\n");
   printf("Reply_Network_injected_packets_num = %lld\n",

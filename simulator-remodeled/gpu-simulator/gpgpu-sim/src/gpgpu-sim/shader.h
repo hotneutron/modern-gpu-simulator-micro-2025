@@ -2035,6 +2035,15 @@ class shader_core_config : public core_config {
   unsigned n_simt_clusters;
   unsigned n_simt_ejection_buffer_size;
   unsigned ldst_unit_response_queue_size;
+  // Opt6 4.11.6: max reply mf a cluster ejects from the REPLY icnt into the core
+  // per ICNT tick (both handoffs in simt_core_cluster::icnt_cycle). Default 1 =
+  // original 1-packet/tick behavior. HW load-return bandwidth is 124 byte/clk =
+  // ~4 sector/clk (arXiv:2501.12084), the SAME per-SM quantum already used on the
+  // injection side (grant_passes/icnt_to_l2_pop=4). This is the ejection-side
+  // mirror; it removes the per-SM 1/tick reply choke that reply_drain (§4.5) kept
+  // relocating onto. Each ejected mf still passes its buffer-full gate, so no mf
+  // count or byte accounting changes (pure timing calibration, 4.12 work axis).
+  unsigned gpgpu_cluster_reply_eject_per_cycle;
 
   int simt_core_sim_order;
 
@@ -2224,6 +2233,26 @@ class shader_core_config : public core_config {
   // [L1I frontend Step-0] Enable the observe-only frontend SM-idle instrumentation
   // (sm_idle_blocked_by_frontend_sbwait). Disabled by default.
   bool l1i_frontend_step0_instrument_enable;
+  // [CTA stall breakdown] Enable observe-only per-CTA-slot NON-tensor stall counters
+  // added to the [CTAFIN] line (drain-idle + its ibuffer-empty component). Lets fwd's
+  // CTA finish-cycle variance be correlated with non-tensor causes in one run. Emitted
+  // only when this AND -wgmma_step0_instrument_enable (which prints [CTAFIN]) are set.
+  // Increment path is cheap; disabled by default. See .plan/WARP_GROUP_H100.md /
+  // .plan/CTA_FINISH_TENSOR_CORRELATION.md.
+  bool cta_stall_breakdown_instrument_enable;
+
+  // [FWD drain-idle 축3] mbarrier wait-duration histogram (observe-only; dedicated arrays, does NOT
+  // touch the issue-path m_pending_sync_waits). Independent gate so a bit-identity failure can be
+  // bisected against 축1·2·4 (which share -wgmma_step0_instrument_enable). Default 0.
+  bool sync_wait_hist_instrument_enable;
+
+  // [NANOSLEEP spin lever] Observe-only counters that measure how often the producer's mbarrier
+  // spin-loop (PHASECHK/TRYWAIT/NANOSLEEP) wins an issue slot and, in doing so, displaces another
+  // warp that was eligible the same cycle. Used to test whether widening NANOSLEEP latency (config)
+  // frees issue slots for the consumer (eligible-warp fidelity vs HW 0.83). Pure read of existing
+  // per-cycle state; no timing change. Independent gate for bit-identity bisection. Default 0.
+  // See .plan/FWD_DRAIN_IDLE_MBARRIER_CEILING.md.
+  bool spin_instrument_enable;
 
   // Hopper mbarrier sync debug logging (SYNCDBG). Disabled by default.
   bool sync_debug_enable;
@@ -2248,6 +2277,14 @@ class shader_core_config : public core_config {
   // tma_real_base_addr_enable (the base map must be loaded). Off by default so the
   // UBLKRED/UBLKCP synthetic-address behavior is preserved unless opted in.
   bool tma_operand_addr_tiling_enable;
+
+  // TMA-injection (Opt6 4.11.4): max 128B AGU lines the TMA mover injects into the
+  // shared SM->L2 port per cycle. Each line = SECTOR_CHUNCK_SIZE (4) x 32B sector
+  // mfs, so N lines/cyc = 4N sector/cyc. HW per-SM injection bandwidth is
+  // 124 byte/clk/SM = 3.875 ~= 4 sector/clk = 1 line/clk (arXiv:2501.12084 Table 5),
+  // so the HW-calibrated default is 1. The old hardcoded behavior was 2 (=8 sector/clk,
+  // 2x the HW per-SM bandwidth, which over-injected and inflated Req in_buffer_full).
+  unsigned int gpgpu_tma_max_lines_per_cycle;
 
   // BAR named-barrier (BAR.SYNC / BAR.ARV) debug logging (BARDBG). Independent of
   // sync_debug_enable / tma_debug_enable so the named-barrier decode + release +

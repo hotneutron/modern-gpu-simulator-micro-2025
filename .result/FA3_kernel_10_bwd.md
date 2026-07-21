@@ -196,7 +196,7 @@ issued 13.3%; frontend ~2.8%. → TMA pipeline and consumer compute/scheduling a
 | sm__inst_executed_pipe_xu (MUFU/transcendental) | 21.44% | exp/log in softmax bwd |
 | sm__inst_executed_pipe_lsu | 16.28% | shared-memory traffic |
 | sm__inst_executed_pipe_alu | 15.34% | |
-| sm__pipe_tensor_cycles_active | 15.33% | WGMMA+HMMA combined |
+| sm__pipe_tensor_cycles_active | **53.61%** | WGMMA+HMMA combined (`.avg.pct_of_peak_sustained_active`, ncu raw). ⚠️ Corrected 2026-07-17 from an earlier mis-recorded 15.33% (that value duplicated the `alu` row and is inconsistent with the active/elapsed ratio; the raw report's authoritative figure is 53.6%). |
 | sm__inst_executed_pipe_fma | 9.45% | |
 | sm__inst_executed_pipe_tensor_op_gmma | 5.36% | WGMMA |
 | sm__inst_executed_pipe_tensor_op_hmma | 2.68% | HMMA |

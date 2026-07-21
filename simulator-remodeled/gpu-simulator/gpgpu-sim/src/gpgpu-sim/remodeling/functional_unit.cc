@@ -169,6 +169,17 @@ void functional_unit::issue(register_set_uniptr &source_reg) {
         assert(0);
         break;
     }
+    // [CTA-imbalance diag] raw per-CTA-slot WGMMA/tensor op count (observe-only,
+    // always-on; printed only under -wgmma_step0_instrument_enable). Keyed by the
+    // issuing warp's CTA slot so multi-wave SMs (bwd) count each CTA separately.
+    // NOTE: the tensor pipeline is created with m_type_of_pipeline == SPECIALIZED__OP
+    // (see subcore.cc), NOT TENSOR_CORE__OP, so we must key off the INSTRUCTION op
+    // (is_tensor_core_op) here — the pipeline type does not identify a WGMMA.
+    if (ready_reg->is_tensor_core_op()) {
+      m_sm->inc_tensor_ops_for_warp(ready_reg->warp_id());
+      // [FWD drain-idle 축2] a warp that issues a WGMMA is a compute/consumer warp (sticky).
+      m_sm->mark_consumer_warp(ready_reg->warp_id());
+    }
 
     m_sm->incexecstat(ready_reg);
     if (!m_dispatch_reg->empty()) {
@@ -304,6 +315,24 @@ void functional_unit::cycle() {
         move_warp_uniptr(m_pipeline_reg[start_stage], m_dispatch_reg);
         m_active_insts_in_pipeline++;
       }
+    }
+  }
+
+  // [throughput metric] Tensor-pipe active-cycle counter (observe-only, timing-neutral).
+  // NCU "Compute (SM) Throughput" is dominated by the tensor/WGMMA pipe for FA3. Existing
+  // counters only track cycles where OTHER warps were blocked BY tensor, which under-counts
+  // when tensor runs alone. Here we count every cycle this tensor FU is actually doing work
+  // (an inst in-flight in its pipeline, in its dispatch reg, or held by the WGMMA
+  // initiation-interval lockout). Guarded to the TENSOR FU by name (created "TENSOR" in
+  // subcore.cc).
+  if (m_name == "TENSOR" && m_sm != NULL) {
+    bool tensor_busy = (m_active_insts_in_pipeline > 0) ||
+                       (!m_dispatch_reg->empty()) ||
+                       (m_dispatch_pending_reserved_cycles > 0);
+    if (tensor_busy) {
+      auto it = m_sm->m_sm_stats.m_stats_map.find("total_num_cycles_tensor_pipe_active");
+      if (it != m_sm->m_sm_stats.m_stats_map.end())
+        it->second->increment_with_integer(1);
     }
   }
 

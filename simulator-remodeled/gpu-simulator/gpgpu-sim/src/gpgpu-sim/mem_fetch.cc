@@ -34,6 +34,10 @@
 
 unsigned mem_fetch::sm_next_mf_request_uid = 1;
 
+// Opt6 4.11.2 latency-bucket instrumentation (observe-only, timing-neutral).
+unsigned long long mem_fetch::s_tma_status_cycles[NUM_MEM_REQ_STAT] = {0};
+unsigned long long mem_fetch::s_tma_status_visits[NUM_MEM_REQ_STAT] = {0};
+
 mem_fetch::mem_fetch(const mem_access_t &access, const warp_inst_t *inst,
                      unsigned ctrl_size, unsigned wid, unsigned sid,
                      unsigned tpc, const memory_config *config,
@@ -120,8 +124,80 @@ void mem_fetch::print(FILE *fp, bool print_inst) const {
 
 void mem_fetch::set_status(enum mem_fetch_status status,
                            unsigned long long cycle) {
+  // Opt6 4.11.2: attribute the time just spent in the PREVIOUS status to a
+  // TMA-only per-stage bucket before overwriting it. Observe-only: it reads the
+  // existing m_status / m_status_change and writes only to static counters, so
+  // it cannot change any simulated timing. Guarded to TMA mfs and to valid,
+  // monotonic transitions so parent/child sector splits or re-probes cannot
+  // corrupt the totals.
+  if (m_is_tma && (unsigned)m_status < NUM_MEM_REQ_STAT &&
+      cycle >= m_status_change) {
+    s_tma_status_cycles[m_status] += (cycle - m_status_change);
+    ++s_tma_status_visits[m_status];
+  }
   m_status = status;
   m_status_change = cycle;
+}
+
+// Opt6 4.11.2: dump the TMA-only per-stage residency table plus the three
+// summary buckets used in the plan (req_side / reply_side / queue_wait). Called
+// once from gpu_print_stat(). Bucket assignment follows the 4.10 stage map:
+//   req_side  = SM-inject .. DRAM-accept   (ICNT_TO_MEM, ROP_DELAY, ICNT_TO_L2,
+//               L2_TO_DRAM, DRAM_LATENCY, DRAM, plus MC_* interface queues)
+//   reply_side= DRAM-return .. SM-receive  (DRAM_TO_L2, L2_FILL, L2_TO_ICNT,
+//               ICNT_TO_SHADER, CLUSTER_TO_SHADER, LDST_RESPONSE_FIFO)
+//   queue_wait= anything not clearly on either side (INITIALIZED etc.)
+void mem_fetch::print_tma_status_residency(FILE *fp) {
+  unsigned long long total = 0;
+  for (unsigned i = 0; i < NUM_MEM_REQ_STAT; ++i) total += s_tma_status_cycles[i];
+  fprintf(fp, "TMA_status_residency_total_cycles = %llu\n", total);
+  if (total == 0) return;
+
+  unsigned long long req_side = 0, reply_side = 0, queue_wait = 0;
+  for (unsigned i = 0; i < NUM_MEM_REQ_STAT; ++i) {
+    unsigned long long c = s_tma_status_cycles[i];
+    if (c == 0) continue;
+    switch ((enum mem_fetch_status)i) {
+      // MEM_FETCH_INITIALIZED = creation (in the TMA mover) until first partition
+      // entry = time in the shared REQ icnt (injection + traversal). The plan's
+      // req_side == icnt2mem is measured from mf creation, so this belongs here.
+      case MEM_FETCH_INITIALIZED:
+      case IN_ICNT_TO_MEM:
+      case IN_PARTITION_ROP_DELAY:
+      case IN_PARTITION_ICNT_TO_L2_QUEUE:
+      case IN_PARTITION_L2_TO_DRAM_QUEUE:
+      case IN_PARTITION_DRAM_LATENCY_QUEUE:
+      case IN_PARTITION_L2_MISS_QUEUE:
+      case IN_PARTITION_MC_INTERFACE_QUEUE:
+      case IN_PARTITION_MC_INPUT_QUEUE:
+      case IN_PARTITION_MC_BANK_ARB_QUEUE:
+      case IN_PARTITION_DRAM:
+      case IN_PARTITION_MC_RETURNQ:
+        req_side += c;
+        break;
+      case IN_PARTITION_DRAM_TO_L2_QUEUE:
+      case IN_PARTITION_L2_FILL_QUEUE:
+      case IN_PARTITION_L2_TO_ICNT_QUEUE:
+      case IN_ICNT_TO_SHADER:
+      case IN_CLUSTER_TO_SHADER_QUEUE:
+      case IN_SHADER_LDST_RESPONSE_FIFO:
+        reply_side += c;
+        break;
+      default:
+        queue_wait += c;
+        break;
+    }
+    unsigned long long v = s_tma_status_visits[i];
+    fprintf(fp, "TMA_status[%-28s] cycles=%llu visits=%llu avg=%.2f pct=%.2f\n",
+            Status_str[i], c, v, v ? (double)c / (double)v : 0.0,
+            100.0 * (double)c / (double)total);
+  }
+  fprintf(fp, "TMA_status_bucket_req_side_cycles   = %llu (%.2f%%)\n", req_side,
+          100.0 * (double)req_side / (double)total);
+  fprintf(fp, "TMA_status_bucket_reply_side_cycles = %llu (%.2f%%)\n",
+          reply_side, 100.0 * (double)reply_side / (double)total);
+  fprintf(fp, "TMA_status_bucket_queue_wait_cycles = %llu (%.2f%%)\n",
+          queue_wait, 100.0 * (double)queue_wait / (double)total);
 }
 
 bool mem_fetch::isatomic() const {

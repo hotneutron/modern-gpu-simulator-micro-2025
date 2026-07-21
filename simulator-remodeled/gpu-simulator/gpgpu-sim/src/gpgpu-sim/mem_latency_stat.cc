@@ -566,6 +566,20 @@ void memory_stats_t::memlatstat_print(unsigned n_mem, unsigned gpu_mem_n_bk) {
     printf("DRAM_nonTMA_BW_total_GBps = %12.4lf\n", dram_non_tma_bw);
     printf("DRAM_TMA_read_atoms = %llu\n", total_tma_dram_reads);
     printf("DRAM_TMA_write_atoms = %llu\n", total_tma_dram_writes);
+    // [throughput metric] DRAM% and absolute served bytes (cycle-independent). served =
+    // total_accesses * dram_atom_bytes; peak = channels * dram_atom_bytes * dram_cycles
+    // (one atom/channel/cycle). Compare the absolute bytes to NCU dram__bytes.sum first;
+    // the % is cycle-contaminated (see TMA_LATENCY_INJECTION_H100.md sec 4.12).
+    {
+      double dram_served_bytes = total_accesses * dram_atom_bytes;
+      double dram_peak_bytes = (double)m_memory_config->m_n_mem * dram_atom_bytes *
+                               (double)m_gpu->dram_tot_sim_cycle;
+      double dram_tp = (dram_peak_bytes > 0.0)
+                           ? 100.0 * dram_served_bytes / dram_peak_bytes
+                           : 0.0;
+      printf("Throughput_DRAM_pct = %12.4lf\n", dram_tp);
+      printf("Throughput_DRAM_served_bytes = %.0lf\n", dram_served_bytes);
+    }
     /*AVERAGE MF LATENCY PER BANK*/
     printf("average mf latency per bank:\n");
     for (i = 0; i < n_mem; i++) {

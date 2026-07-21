@@ -368,7 +368,10 @@ bool trace_warp_inst_t::parse_from_trace_struct(
 
   // fill latency and initl
   if(tconfig != nullptr) {
-    tconfig->set_latency(op, latency, initiation_interval);
+    // [NANOSLEEP spin lever] pass the decoded opcode so NANOSLEEP gets its dedicated latency split out
+    // of the shared MISCELLANEOUS_NO_QUEUE knob (m_opcode is set at line ~311). Bit-identical unless
+    // -trace_opcode_latency_initiation_nanosleep is changed from its 1,1 default.
+    tconfig->set_latency(op, m_opcode, latency, initiation_interval);
   }
 
   if( ((m_opcode == OP_LDC) || (m_opcode == OP_ULDC)) && !trace.is_constant_addr_already_calculated) {
@@ -749,6 +752,17 @@ void trace_config::reg_options(option_parser_t opp) {
                          "Opcode latencies and initiation for miscellaneous no queue in trace "
                          "driven mode <latency,initiation>",
                          "1,1");
+  // [NANOSLEEP spin lever] dedicated NANOSLEEP latency/init. NANOSLEEP decodes to
+  // MISCELLANEOUS_NO_QUEUE_OP, so this splits it out of the shared MISC_NO_QUEUE knob to let the
+  // producer mbarrier backoff-sleep be widened WITHOUT perturbing any other MISC_NO_QUEUE op. Default
+  // "1,1" reproduces the pre-split behavior exactly (bit-identical). See
+  // .plan/FWD_DRAIN_IDLE_MBARRIER_CEILING.md.
+  option_parser_register(opp, "-trace_opcode_latency_initiation_nanosleep",
+                         OPT_CSTR, &trace_opcode_latency_initiation_nanosleep,
+                         "Dedicated NANOSLEEP latency and initiation in trace driven mode "
+                         "<latency,initiation>. Split from miscellaneous_no_queue so it can be "
+                         "widened in isolation (drain-idle experiment). Default 1,1 = old behavior.",
+                         "1,1");
 
   for (unsigned j = 0; j < SPECIALIZED_UNIT_NUM; ++j) {
     std::stringstream ss;
@@ -783,6 +797,8 @@ void trace_config::parse_config() {
   sscanf(trace_opcode_latency_initiation_predicate, "%u,%u", &predicate_latency, &predicate_init);
   sscanf(trace_opcode_latency_initiation_miscellaneous_queue, "%u,%u", &miscellaneous_queue_latency, &miscellaneous_queue_init);
   sscanf(trace_opcode_latency_initiation_miscellaneous_no_queue, "%u,%u", &miscellaneous_no_queue_latency, &miscellaneous_no_queue_init);
+  // [NANOSLEEP spin lever] dedicated nanosleep timing (default 1,1).
+  sscanf(trace_opcode_latency_initiation_nanosleep, "%u,%u", &nanosleep_latency, &nanosleep_init);
 
   for (unsigned j = 0; j < SPECIALIZED_UNIT_NUM; ++j) {
     sscanf(trace_opcode_latency_initiation_specialized_op[j], "%u,%u",
@@ -850,6 +866,19 @@ void trace_config::set_latency(unsigned category, unsigned &latency,
     assert(spec_id >= 0 && spec_id < SPECIALIZED_UNIT_NUM);
     latency = specialized_unit_latency[spec_id];
     initiation_interval = specialized_unit_initiation[spec_id];
+  }
+}
+
+// [NANOSLEEP spin lever] opcode-aware wrapper. Resolves the category latency first, then, for the one
+// case that needs a per-opcode split (NANOSLEEP, which shares MISCELLANEOUS_NO_QUEUE_OP with unrelated
+// ops), overrides with the dedicated nanosleep knob. Default nanosleep "1,1" == the MISC_NO_QUEUE
+// default, so this is bit-identical until the nanosleep knob is deliberately changed.
+void trace_config::set_latency(unsigned category, unsigned opcode, unsigned &latency,
+                               unsigned &initiation_interval) const {
+  set_latency(category, latency, initiation_interval);
+  if (category == MISCELLANEOUS_NO_QUEUE_OP && opcode == OP_NANOSLEEP) {
+    latency = nanosleep_latency;
+    initiation_interval = nanosleep_init;
   }
 }
 

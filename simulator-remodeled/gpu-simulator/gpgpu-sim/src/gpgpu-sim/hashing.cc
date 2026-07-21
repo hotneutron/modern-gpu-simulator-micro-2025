@@ -229,3 +229,30 @@ unsigned PAE_hash_function(new_addr_type higher_bits, unsigned index,
     return 0;
   }
 }
+
+// Opt8/Opt9: balanced sub-partition hash for a non-power-of-two slice count.
+// See the header comment for the motivation (the `% 80` pigeonhole 2:1 bias).
+//
+// Algorithm: avalanche-mix the high address bits (fold high halves down + a
+// SplitMix64-style multiply/shift) together with the IPoly-derived `index`, then
+// take `% n_slices`. The mixing decorrelates any power-of-two stride from the
+// modulus, so the fold is statistically uniform for all such strides (verified in
+// python: cv<=0.015 for stride 128/1024/4096, vs the raw `%80` which is 2:1). It is
+// a pure function of (higher_bits,index,n_slices): same line -> same slice always
+// (deterministic + address-stable, so L2 caching/partition_address are untouched),
+// and it only changes WHICH slice, never the number of accesses (work-invariant).
+unsigned balanced_subpartition_hash(new_addr_type higher_bits, unsigned index,
+                                    unsigned n_slices) {
+  if (n_slices == 0) return 0;
+  // Combine the address high bits with the IPoly index so the good stride
+  // properties of IPoly are folded in, not discarded.
+  unsigned long long x = higher_bits ^ (((unsigned long long)index) << 40);
+  // SplitMix64 finalizer (strong avalanche: every input bit affects every output
+  // bit), which is exactly what breaks the stride<->modulus correlation.
+  x ^= x >> 30;
+  x *= 0xbf58476d1ce4e5b9ULL;
+  x ^= x >> 27;
+  x *= 0x94d049bb133111ebULL;
+  x ^= x >> 31;
+  return (unsigned)(x % (unsigned long long)n_slices);
+}

@@ -47,6 +47,11 @@ struct inct_config {
   Arbiteration_type arbiter_algo;
   unsigned verbose;
   unsigned grant_cycles;
+  // Number of full arbiter grant passes performed per Advance() (per ICNT tick).
+  // 1 = original behavior (<=1 packet ejected per input node per cycle). Higher
+  // values let a single SM inject/drain more sector mem_fetches per cycle, relieving
+  // the shared REQ-net in_buffer saturation seen when TMA emits 768x32B per transfer.
+  unsigned grant_passes_per_cycle;
 };
 
 class xbar_router {
@@ -77,6 +82,11 @@ class xbar_router {
   unsigned long long in_buffer_util;
   unsigned long long packets_num;
   std::vector<unsigned long long> packets_num_per_device;
+  // Multi-pass instrumentation (-icnt_grant_passes_per_cycle > 1). grant_passes_run =
+  // total arbiter passes executed across all ticks; extra_pass_grants = packets granted
+  // by passes AFTER the first pass in a tick (=the throughput the knob actually added).
+  unsigned long long grant_passes_run;
+  unsigned long long extra_pass_grants;
 
  private:
   void iSLIP_Advance();
@@ -104,6 +114,7 @@ class xbar_router {
 
   unsigned grant_cycles;
   unsigned grant_cycles_count;
+  unsigned grant_passes_per_cycle;  // arbiter grant passes per Advance() (default 1)
 
   friend class LocalInterconnect;
 };

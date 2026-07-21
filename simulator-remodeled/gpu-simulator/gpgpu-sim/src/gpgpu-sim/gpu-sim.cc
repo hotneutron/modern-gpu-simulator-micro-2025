@@ -910,6 +910,44 @@ void memory_config::reg_options(class OptionParser *opp) {
                          "check, so icnt reply BW accounting is unchanged.",
                          "1");
 
+  option_parser_register(opp, "-gpgpu_icnt_to_l2_pop_per_cycle", OPT_UINT32,
+                         &gpgpu_icnt_to_l2_pop_per_cycle,
+                         "Opt6: max request mf popped from the icnt (xbar out_buffer) "
+                         "into each L2 sub-partition per L2 tick. 1 = current behavior. "
+                         "Paired with -icnt_grant_passes_per_cycle so the faster icnt "
+                         "injection drain does not just relocate the stall to the "
+                         "icnt->L2 pop; each pop still respects sub_partition full().",
+                         "1");
+
+  option_parser_register(opp, "-gpgpu_l2_admit_sectors_per_cycle", OPT_UINT32,
+                         &gpgpu_l2_admit_sectors_per_cycle,
+                         "Opt8: max L2 admissions per sub-partition per L2 tick "
+                         "(cache_cycle probes that are accepted, i.e. not "
+                         "RESERVATION_FAIL). 1 = current behavior (1 sector/32B per "
+                         "slice/cycle). 2 = HW H100 L2 slice throughput (64B/cycle = "
+                         "2x32B). Batch gated once on data_port_free/output_full at "
+                         "loop top (port modeled N*32B-wide), each probe still runs the "
+                         "real access()+MSHR so L2 hit-rate/DRAM work is invariant.",
+                         "1");
+
+  option_parser_register(opp, "-gpgpu_l2_rop_drain_per_cycle", OPT_UINT32,
+                         &gpgpu_l2_rop_drain_per_cycle,
+                         "Opt9 Gate A: max sectors drained from the ROP delay queue "
+                         "into m_icnt_L2_queue per sub-partition per L2 tick. 1 = "
+                         "current behavior (1/tick serialization). 2 = HW 64B/cycle "
+                         "per slice. Fixed rop_latency is unchanged; only the drain "
+                         "throughput widens (timing-only, work invariant).",
+                         "1");
+
+  option_parser_register(opp, "-gpgpu_l2_dram_reply_drain_per_cycle", OPT_UINT32,
+                         &gpgpu_l2_dram_reply_drain_per_cycle,
+                         "Opt9 Gate B: max returned lines drained from m_dram_L2_queue "
+                         "into the L2 fill or the L2->icnt reply queue per sub-partition "
+                         "per L2 tick. 1 = current behavior. 2 = HW 64B/cycle per slice. "
+                         "The fill port is modeled M-wide (extra fill-port replenish) so "
+                         "it does not saturate. Timing-only, work invariant.",
+                         "1");
+
   option_parser_register(opp, "-l2_ideal", OPT_BOOL, &l2_ideal,
                          "Use a ideal L2 cache that always hit", "0");
   option_parser_register(opp, "-gpgpu_cache:dl2", OPT_CSTR,
@@ -1099,6 +1137,17 @@ void shader_core_config::reg_options(class OptionParser *opp) {
       opp, "-gpgpu_n_ldst_response_buffer_size", OPT_UINT32,
       &ldst_unit_response_queue_size,
       "number of response packets in ld/st unit ejection buffer", "2");
+  option_parser_register(
+      opp, "-gpgpu_cluster_reply_eject_per_cycle", OPT_UINT32,
+      &gpgpu_cluster_reply_eject_per_cycle,
+      "Opt6 4.11.6: max reply mf a cluster ejects from the REPLY icnt into the "
+      "core per ICNT tick (both handoffs in simt_core_cluster::icnt_cycle). "
+      "1 = original 1-packet/tick. HW load-return BW ~4 sector/clk = the same "
+      "per-SM quantum as the injection knobs (grant_passes/icnt_to_l2_pop). "
+      "Ejection-side mirror; removes the per-SM 1/tick reply choke reply_drain "
+      "kept relocating onto. Each mf still passes its buffer-full gate, so mf "
+      "count / byte accounting is unchanged (default=1)",
+      "1");
   option_parser_register(
       opp, "-gpgpu_shmem_per_block", OPT_UINT32, &gpgpu_shmem_per_block,
       "Size of shared memory per thread block or CTA (default 48kB)", "49152");
@@ -1920,6 +1969,32 @@ void shader_core_config::reg_options(class OptionParser *opp) {
                          "decomposition (sm_idle_reason_*) is emitted when EITHER this or "
                          "-wgmma_step0_instrument_enable is set. (default=0)",
                          "0");
+  option_parser_register(opp, "-cta_stall_breakdown_instrument_enable", OPT_BOOL,
+                         &cta_stall_breakdown_instrument_enable,
+                         "Enable observe-only per-CTA-slot NON-tensor stall counters in the "
+                         "[CTAFIN] line (drain-idle sm_idle_cyc + its ibuffer-empty component). "
+                         "Correlates fwd CTA finish-cycle variance with non-tensor causes. "
+                         "No timing change; emitted only when -wgmma_step0_instrument_enable "
+                         "(which prints [CTAFIN]) is also set. See .plan/WARP_GROUP_H100.md. "
+                         "(default=0)",
+                         "0");
+  option_parser_register(opp, "-sync_wait_hist_instrument_enable", OPT_BOOL,
+                         &sync_wait_hist_instrument_enable,
+                         "Enable observe-only mbarrier wait-duration histogram (first-miss to pass "
+                         "cycle, bucketed). Uses dedicated arrays only (never the issue-path "
+                         "m_pending_sync_waits), so timing is unchanged. Independent gate for "
+                         "bit-identity bisection. See .plan FWD_DRAIN_IDLE_MBARRIER_CEILING. "
+                         "(default=0)",
+                         "0");
+  option_parser_register(opp, "-spin_instrument_enable", OPT_BOOL,
+                         &spin_instrument_enable,
+                         "Enable observe-only NANOSLEEP/PHASECHK spin-loop issue-slot counters "
+                         "(spin ops issued, spin winning an issue slot, and spin displacing a "
+                         "co-eligible warp). Tests whether widening NANOSLEEP latency frees issue "
+                         "slots for the consumer (eligible-warp fidelity). No timing change. "
+                         "Independent gate for bit-identity bisection. See .plan "
+                         "FWD_DRAIN_IDLE_MBARRIER_CEILING. (default=0)",
+                         "0");
   option_parser_register(opp, "-sync_debug_enable", OPT_BOOL,
                          &sync_debug_enable,
                          "Enable Hopper mbarrier sync debug logging (SYNCDBG)."
@@ -1958,6 +2033,14 @@ void shader_core_config::reg_options(class OptionParser *opp) {
                          "real GMEM base + visit-counter mock tiling from tma_pc_base_map.json "
                          "instead of the synthetic address. Requires "
                          "-tma_real_base_addr_enable. On by default (M4). (default=1)",
+                         "1");
+  option_parser_register(opp, "-gpgpu_tma_max_lines_per_cycle", OPT_UINT32,
+                         &gpgpu_tma_max_lines_per_cycle,
+                         "Opt6 4.11.4: max 128B AGU lines the TMA mover injects into the shared "
+                         "SM->L2 port per cycle (each line = 4x 32B sector mfs). HW per-SM "
+                         "injection bandwidth is 124 byte/clk = 4 sector/clk = 1 line/clk "
+                         "(arXiv:2501.12084), so default 1 is HW-calibrated; the old hardcoded "
+                         "value was 2 (2x over-injection). (default=1)",
                          "1");
   option_parser_register(opp, "-bar_debug_enable", OPT_BOOL,
                          &bar_debug_enable,
@@ -2463,6 +2546,48 @@ gpgpu_sim::gpgpu_sim(const gpgpu_sim_config &config, gpgpu_context *ctx)
 
   gpu_stall_dramfull = 0;
   gpu_stall_icnt2sh = 0;
+  gpu_icnt_to_l2_pops_total = 0;
+  gpu_icnt_to_l2_extra_pops = 0;
+  // Opt6 early boot confirmation (once): mirror the icnt grant-passes boot log so a 12h
+  // run can verify the paired icnt->L2 pop knob is actually enabled in the first seconds.
+  {
+    static bool logged_icnt_pop_knob = false;
+    if (!logged_icnt_pop_knob &&
+        m_memory_config->gpgpu_icnt_to_l2_pop_per_cycle > 1) {
+      std::cerr << "[ICNT->L2] gpgpu_icnt_to_l2_pop_per_cycle = "
+                << m_memory_config->gpgpu_icnt_to_l2_pop_per_cycle
+                << " (>1: multi-pop downstream drain enabled, paired with "
+                << "icnt_grant_passes_per_cycle)" << std::endl;
+      logged_icnt_pop_knob = true;
+    }
+  }
+  // Opt8 early boot confirmation (once): confirm the L2 admission-width knob is live.
+  {
+    static bool logged_l2_admit_knob = false;
+    if (!logged_l2_admit_knob &&
+        m_memory_config->gpgpu_l2_admit_sectors_per_cycle > 1) {
+      std::cerr << "[L2-ADMIT] gpgpu_l2_admit_sectors_per_cycle = "
+                << m_memory_config->gpgpu_l2_admit_sectors_per_cycle
+                << " (>1: multi-sector L2 admission enabled; 2 = HW 64B/cycle slice)"
+                << std::endl;
+      logged_l2_admit_knob = true;
+    }
+  }
+  // Opt9 early boot confirmation (once): confirm the two L2 drain knobs are live.
+  {
+    static bool logged_l2_drain_knobs = false;
+    if (!logged_l2_drain_knobs &&
+        (m_memory_config->gpgpu_l2_rop_drain_per_cycle > 1 ||
+         m_memory_config->gpgpu_l2_dram_reply_drain_per_cycle > 1)) {
+      std::cerr << "[L2-ROP-DRAIN] gpgpu_l2_rop_drain_per_cycle = "
+                << m_memory_config->gpgpu_l2_rop_drain_per_cycle
+                << " ; [L2-DRAM-REPLY-DRAIN] gpgpu_l2_dram_reply_drain_per_cycle = "
+                << m_memory_config->gpgpu_l2_dram_reply_drain_per_cycle
+                << " (>1: multi-sector ROP/reply drain enabled; 2 = HW 64B/cycle slice)"
+                << std::endl;
+      logged_l2_drain_knobs = true;
+    }
+  }
   partiton_reqs_in_parallel = 0;
   partiton_reqs_in_parallel_total = 0;
   partiton_reqs_in_parallel_util = 0;
@@ -2573,6 +2698,9 @@ void gpgpu_sim::create_gpu_per_sm_stats() {
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_l1d_instructions", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_conflicts_shared_instructions", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_shared_instructions", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  // [throughput metric] shared-memory served bytes (active lanes * data size), for the
+  // shared component of the L1/TEX throughput% (Hopper unified L1D+SMEM). Observe-only.
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_shared_access_bytes", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_shared_mem_accesses", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_ldst_unit_instructions", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_dp_instructions", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
@@ -2694,6 +2822,24 @@ void gpgpu_sim::create_gpu_per_sm_stats() {
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_result_queue_full", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_l1c", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_issue_stage_evaluated", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  // [NCU stall-taxonomy alignment] observe-only counters (no timing change). See
+  // .plan/NCU_STALL_TAXONOMY_METRICS_IMPL.md. selected = issued winner (per-issue denominator);
+  // dispatch = issue-port/RF-queue backpressure re-derived into the per-warp axis;
+  // warpgroup_arrive = WGMMA-group wait split out of wait_barrier;
+  // not_selected = eligible-but-not-picked (Gap C, counted on the post-stop read-only tail);
+  // warps_eligible_accumulator = per-cycle sum of eligible warps (for eligible_warps_per_scheduler).
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_issue_stage_selected", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_issue_stage_stall_dispatch", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_warpgroup_arrive", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_issue_stage_not_selected", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_warps_eligible_accumulator", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  // [NANOSLEEP spin lever] observe-only spin issue-slot counters (gated by -spin_instrument_enable).
+  // spin_ops_issued        = cycles whose issued winner was a PHASECHK/TRYWAIT/NANOSLEEP spin op.
+  // spin_won_over_eligible = of those, the cycles where >=1 OTHER warp was also eligible (spin
+  //                          displaced a co-eligible warp = the issue-slot-theft signal).
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_spin_ops_issued", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_spin_won_over_eligible", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_spin_phasechk_issued", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
   // [WGMMA Opt6 Step-0 instrumentation] observe-only counters (no timing change).
   // (I) split fu_occupied by pipe op.
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_issue_stage_stall_at_least_one_warp_with_fu_occupied_tensor", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
@@ -2706,10 +2852,26 @@ void gpgpu_sim::create_gpu_per_sm_stats() {
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_tensor_fu_occupied_and_wait_barrier_coupled", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
   // (VII) tensor-only RF/latch conflict that extends the tensor re-issue lockout beyond static II.
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_tensor_add_extra_cycle_initiation_interval", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  // [throughput metric] tensor pipe active cycles (busy-cycle count, not a stall count) for
+  // the Compute(tensor) throughput% metric. Incremented in functional_unit::cycle() for the
+  // TENSOR FU when it has work in flight / dispatch / II-lockout. Observe-only, timing-neutral.
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_tensor_pipe_active", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
   // (V) SM-level: cycles where NO subcore issued anything; sub-variant where every non-issuing
   // subcore that had an eligible-but-blocked warp was blocked specifically by the tensor pipe.
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_sm_all_subcores_idle", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_sm_idle_all_blocked_by_tensor", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  // [FWD drain-idle 축1] mutually-exclusive SM-idle partition (sum == sm_all_subcores_idle) + the
+  // independent wait_barrier ceiling (cross-checks partition only_wait_barrier). Observe-only.
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_sm_idle_all_blocked_by_wait_barrier", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_sm_idle_partition_drained", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_sm_idle_partition_only_wait_barrier", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_sm_idle_partition_only_tensor", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_sm_idle_partition_only_stall_count", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_sm_idle_partition_only_fu_nontensor", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_sm_idle_partition_only_next_stage", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_sm_idle_partition_only_l1c", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_sm_idle_partition_only_other", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_sm_idle_partition_multi", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_sm_idle_blocked_by_frontend_sbwait", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
   // Full SM-idle decomposition: for each non-issue reason, SM-idle cycles where >=1 subcore had it.
   {
@@ -3361,6 +3523,63 @@ void gpgpu_sim::gpu_print_stat() {
   // performance counter for stalls due to congestion.
   printf("gpu_stall_dramfull = %d\n", gpu_stall_dramfull);
   printf("gpu_stall_icnt2sh    = %d\n", gpu_stall_icnt2sh);
+  // Opt6 icnt->L2 multi-pop: if -gpgpu_icnt_to_l2_pop_per_cycle > 1, extra_pops > 0 proves
+  // the downstream drain actually moved more packets (i.e. the icnt out_buffer was NOT the
+  // limiter). extra_pops ~= 0 means either the knob is off or L2 full() gated it.
+  printf("gpu_icnt_to_l2_pops_total = %llu\n", gpu_icnt_to_l2_pops_total);
+  printf("gpu_icnt_to_l2_extra_pops = %llu\n", gpu_icnt_to_l2_extra_pops);
+
+  // Opt6 4.11.6 reply-eject multi-drain diagnostics (observe-only; defined in
+  // shader.cc icnt_cycle). Only meaningful when -gpgpu_cluster_reply_eject_per_cycle
+  // > 1. These are the "did the lever actually fire?" evidence for a 12h run:
+  //  - *_multi_ticks > 0 proves the per-SM reply eject genuinely moved >1 mf in a
+  //    tick (the 1/tick choke was real and is now relieved). If cycles are still
+  //    flat with large multi_ticks, the wall is downstream (candidate 2 / barrier).
+  //  - *_multi_ticks ~= 0 means this stage was NOT the choke (a valid null, not a
+  //    broken run) -- eject rarely had >1 mf queued, so widening it cannot help.
+  //  - fifo (fifo->core) vs icnt (icnt->fifo) separate the two paired handoffs so
+  //    a residual choke can be pinned to the exact one.
+  {
+    extern unsigned long long g_reply_eject_fifo_active_ticks;
+    extern unsigned long long g_reply_eject_fifo_multi_ticks;
+    extern unsigned long long g_reply_eject_fifo_total;
+    extern unsigned g_reply_eject_fifo_max_burst;
+    extern unsigned long long g_reply_eject_icnt_active_ticks;
+    extern unsigned long long g_reply_eject_icnt_multi_ticks;
+    extern unsigned long long g_reply_eject_icnt_total;
+    extern unsigned g_reply_eject_icnt_max_burst;
+    printf("reply_eject_fifo2core_active_ticks = %llu\n",
+           g_reply_eject_fifo_active_ticks);
+    printf("reply_eject_fifo2core_multi_ticks  = %llu\n",
+           g_reply_eject_fifo_multi_ticks);
+    printf("reply_eject_fifo2core_total_mf     = %llu\n",
+           g_reply_eject_fifo_total);
+    printf("reply_eject_fifo2core_max_burst    = %u\n",
+           g_reply_eject_fifo_max_burst);
+    printf("reply_eject_fifo2core_avg_per_active = %.3f\n",
+           g_reply_eject_fifo_active_ticks
+               ? (double)g_reply_eject_fifo_total /
+                     (double)g_reply_eject_fifo_active_ticks
+               : 0.0);
+    printf("reply_eject_icnt2fifo_active_ticks = %llu\n",
+           g_reply_eject_icnt_active_ticks);
+    printf("reply_eject_icnt2fifo_multi_ticks  = %llu\n",
+           g_reply_eject_icnt_multi_ticks);
+    printf("reply_eject_icnt2fifo_total_mf     = %llu\n",
+           g_reply_eject_icnt_total);
+    printf("reply_eject_icnt2fifo_max_burst    = %u\n",
+           g_reply_eject_icnt_max_burst);
+    printf("reply_eject_icnt2fifo_avg_per_active = %.3f\n",
+           g_reply_eject_icnt_active_ticks
+               ? (double)g_reply_eject_icnt_total /
+                     (double)g_reply_eject_icnt_active_ticks
+               : 0.0);
+  }
+
+  // Opt6 4.11.2: TMA-only per-stage residency (observe-only, timing-neutral).
+  // Splits each TMA sector mf's lifetime by mem_fetch_status so the "unaccounted
+  // queue wait" is attributed to req_side vs reply_side vs a specific stage.
+  mem_fetch::print_tma_status_residency(stdout);
 
   // printf("partiton_reqs_in_parallel = %lld\n", partiton_reqs_in_parallel);
   // printf("partiton_reqs_in_parallel_total    = %lld\n",
@@ -3565,6 +3784,74 @@ void gpgpu_sim::gpu_print_stat() {
                  (double)tma_l2_res_fails_total / (double)tma_l2_probes);
         }
       }
+      // Opt8: per-sub-partition L2-admission parallelism (timing-neutral). Reveals
+      // whether the ROP wall is a few HOT slices (spread problem) or a genuine
+      // per-slice throughput limit (the Opt8 1->2 admission lever). See
+      // L2_SLICE_PARALLELISM_H100.md section 8.
+      //   admit_per_active = admissions / active_cycles: the realized admission rate
+      //     on busy slices (pinned ~1.0 with knob=1; rises toward N with knob=N if
+      //     the slice was actually backlogged -> proves the widened budget was used).
+      //   util p50/p95/max across slices = active-cycle fraction (hot-slice tail).
+      //   multi_admit_cycles = ticks a slice admitted >1 (0 when knob=1).
+      {
+        unsigned nsp = m_memory_config->m_n_mem_sub_partition;
+        std::vector<double> util(nsp, 0.0);
+        std::vector<unsigned long long> adm(nsp, 0);
+        unsigned long long adm_total = 0, active_total = 0, multi_total = 0;
+        for (unsigned i = 0; i < nsp; i++) {
+          unsigned long long a = m_memory_sub_partition[i]->get_l2_admissions();
+          unsigned long long ac = m_memory_sub_partition[i]->get_l2_active_cycles();
+          unsigned long long mc =
+              m_memory_sub_partition[i]->get_l2_multi_admit_cycles();
+          adm[i] = a;
+          adm_total += a;
+          active_total += ac;
+          multi_total += mc;
+          util[i] = (gpu_sim_cycle > 0) ? (double)ac / (double)gpu_sim_cycle : 0.0;
+        }
+        std::sort(util.begin(), util.end());
+        std::sort(adm.begin(), adm.end());
+        auto pct = [nsp](std::vector<double> &v, double p) {
+          if (nsp == 0) return 0.0;
+          unsigned idx = (unsigned)(p * (nsp - 1));
+          return v[idx];
+        };
+        printf("L2_admit_total = %llu\n", adm_total);
+        printf("L2_admit_active_cycles_total = %llu\n", active_total);
+        printf("L2_admit_multi_cycles_total = %llu\n", multi_total);
+        if (active_total > 0)
+          printf("L2_admit_per_active_cycle = %.4lf\n",
+                 (double)adm_total / (double)active_total);
+        printf("L2_slice_util_p50 = %.4lf\n", pct(util, 0.50));
+        printf("L2_slice_util_p95 = %.4lf\n", pct(util, 0.95));
+        printf("L2_slice_util_max = %.4lf\n", nsp ? util[nsp - 1] : 0.0);
+        printf("L2_slice_admissions_p50 = %llu\n",
+               nsp ? adm[(nsp - 1) / 2] : 0);
+        printf("L2_slice_admissions_p95 = %llu\n",
+               nsp ? adm[(unsigned)(0.95 * (nsp - 1))] : 0);
+        printf("L2_slice_admissions_max = %llu\n", nsp ? adm[nsp - 1] : 0);
+      }
+      // Opt9: per-sub-partition drain-lever firing (timing-neutral). Proves the two
+      // 1->N drain gates actually moved >1/tick (the direct analogue of Opt8's
+      // L2_admit_multi_cycles). If *_multi_cycles_total == 0 while the knob is >1,
+      // the widened drain was never used (valid null). See TMA_LATENCY_INJECTION_H100
+      // .md 4.11.8.
+      {
+        unsigned nsp = m_memory_config->m_n_mem_sub_partition;
+        unsigned long long rop_drained = 0, rop_multi = 0;
+        unsigned long long reply_drained = 0, reply_multi = 0;
+        for (unsigned i = 0; i < nsp; i++) {
+          rop_drained += m_memory_sub_partition[i]->get_l2_rop_drained();
+          rop_multi += m_memory_sub_partition[i]->get_l2_rop_multi_cycles();
+          reply_drained += m_memory_sub_partition[i]->get_l2_dram_reply_drained();
+          reply_multi +=
+              m_memory_sub_partition[i]->get_l2_dram_reply_multi_cycles();
+        }
+        printf("L2_rop_drained_total = %llu\n", rop_drained);
+        printf("L2_rop_multi_cycles_total = %llu\n", rop_multi);
+        printf("L2_dram_reply_drained_total = %llu\n", reply_drained);
+        printf("L2_dram_reply_multi_cycles_total = %llu\n", reply_multi);
+      }
       double l2_elapsed_seconds =
           (double)(gpu_tot_sim_cycle + gpu_sim_cycle) * m_config.l2_period;
       double l2_bw_total =
@@ -3616,7 +3903,56 @@ void gpgpu_sim::gpu_print_stat() {
       printf("L2_total_cache_reservation_fail_breakdown:\n");
       l2_stats.print_fail_stats(stdout, "L2_cache_stats_fail_breakdown");
       total_l2_css.print_port_stats(stdout, "L2_cache");
+      // [throughput metric] L2%: served L2 bytes vs peak 32B/sub-partition/cycle.
+      // (Inside the L2 block because total_l2_css is scoped here.)
+      {
+        unsigned long long l2_served_bytes = (unsigned long long)total_l2_css.bytes;
+        double l2_peak_bytes = (double)m_memory_config->m_n_mem_sub_partition * 32.0 *
+                               (double)gpu_sim_cycle;
+        double l2_tp = (l2_peak_bytes > 0.0)
+                           ? 100.0 * (double)l2_served_bytes / l2_peak_bytes
+                           : 0.0;
+        printf("Throughput_L2_pct = %12.4lf\n", l2_tp);
+        printf("Throughput_L2_served_bytes = %llu\n", l2_served_bytes);
+      }
     }
+  }
+
+  // ============================================================================
+  // [throughput metrics] NCU-style pipe utilization = served_work / (peak_per_cycle *
+  // cycles) * 100. Read the ABSOLUTE served counts too (cycle-independent) — throughput%
+  // itself is cycle-contaminated (sim cycles ~2x HW), so compare absolute work first and
+  // only trust the % once cycles converge (see TMA_LATENCY_INJECTION_H100.md sec 4.12).
+  // DRAM% is printed separately in memlatstat_print (served DRAM bytes live there);
+  // L2% is printed inside the L2 block above (total_l2_css scope).
+  {
+    unsigned long long run_cycles = gpu_sim_cycle;  // this-launch cycles
+    unsigned n_sm = m_config.num_shader();
+    // ---- L1/TEX throughput%: L1D bytes + shared bytes (Hopper unified L1TEX) ----
+    unsigned long long l1d_bytes = (unsigned long long)core_cache_css.bytes;
+    unsigned long long shared_bytes =
+        m_gpu_per_sm_stats.m_stats_map.count("total_shared_access_bytes")
+            ? m_gpu_per_sm_stats.m_stats_map["total_shared_access_bytes"]->get_value()
+            : 0ULL;
+    unsigned long long l1tex_served_bytes = l1d_bytes + shared_bytes;
+    double l1tex_peak_bytes = (double)n_sm * 128.0 * (double)run_cycles;
+    double l1tex_tp = (l1tex_peak_bytes > 0.0)
+                          ? 100.0 * (double)l1tex_served_bytes / l1tex_peak_bytes
+                          : 0.0;
+    printf("Throughput_L1TEX_pct = %12.4lf\n", l1tex_tp);
+    printf("Throughput_L1TEX_served_bytes = %llu (L1D=%llu shared=%llu)\n",
+           l1tex_served_bytes, l1d_bytes, shared_bytes);
+    // ---- Compute(tensor) throughput%: tensor active cycles vs (n_sm * cycles) ----
+    unsigned long long tensor_active =
+        m_gpu_per_sm_stats.m_stats_map.count("total_num_cycles_tensor_pipe_active")
+            ? m_gpu_per_sm_stats.m_stats_map["total_num_cycles_tensor_pipe_active"]->get_value()
+            : 0ULL;
+    double tensor_peak = (double)n_sm * (double)run_cycles;  // 1 tensor pipe per subcore; per-SM cycles as denom
+    double tensor_tp = (tensor_peak > 0.0)
+                           ? 100.0 * (double)tensor_active / tensor_peak
+                           : 0.0;
+    printf("Throughput_ComputeTensor_pct = %12.4lf\n", tensor_tp);
+    printf("Throughput_ComputeTensor_active_cycles = %llu\n", tensor_active);
   }
 
   if (m_config.gpgpu_cflog_interval != 0) {
@@ -4139,22 +4475,41 @@ void gpgpu_sim::cycle() {
       // backed up) Note:This needs to be called in DRAM clock domain if there
       // is no L2 cache in the system In the worst case, we may need to push
       // SECTOR_CHUNCK_SIZE requests, so ensure you have enough buffer for them
-      if (m_memory_sub_partition[i]->full(SECTOR_CHUNCK_SIZE)) {
-        gpu_stall_dramfull++;
-      } else {
+      // Opt6: pop up to gpgpu_icnt_to_l2_pop_per_cycle requests from the icnt
+      // out_buffer into this sub-partition per L2 tick, so a faster icnt injection
+      // drain (-icnt_grant_passes_per_cycle) is absorbed here instead of backing up
+      // in the xbar out_buffer. Each pop re-checks full() (push may have filled it)
+      // and stops when the icnt has nothing (mf==NULL). GRID_BARRIER handling and
+      // cache_cycle stay once-per-tick, outside this pop loop.
+      unsigned pops = m_memory_config->gpgpu_icnt_to_l2_pop_per_cycle;
+      if (pops == 0) pops = 1;
+      for (unsigned p = 0; p < pops; ++p) {
+        if (m_memory_sub_partition[i]->full(SECTOR_CHUNCK_SIZE)) {
+          gpu_stall_dramfull++;
+          break;
+        }
         mem_fetch *mf = (mem_fetch *)icnt_pop(m_shader_config->mem2device(i), 0);
-        if(mf) {
-          if(mf->get_inst().op == GRID_BARRIER_OP) {
+        if (mf) {
+          if (mf->get_inst().op == GRID_BARRIER_OP) {
             std::unique_ptr<grid_barrier_notify_info> notifcation_res = register_grid_barrier_arrivement(mf);
             mf = nullptr;
-            if(notifcation_res) {
+            if (notifcation_res) {
               m_grid_barrier_notify_queue.push(std::move(notifcation_res));
             }
-          }else {
+          } else {
             partiton_reqs_in_parallel_per_cycle++;
           }
+          m_memory_sub_partition[i]->push(mf, gpu_sim_cycle + gpu_tot_sim_cycle);
+          gpu_icnt_to_l2_pops_total++;
+          if (p > 0) gpu_icnt_to_l2_extra_pops++;
+        } else {
+          // icnt out_buffer for this sub-partition is empty this tick; nothing
+          // more to pop. Preserve the original behavior of pushing a NULL once
+          // (harmless) only on the first pass so cache_cycle sees a consistent
+          // sub-partition state.
+          if (p == 0) m_memory_sub_partition[i]->push(mf, gpu_sim_cycle + gpu_tot_sim_cycle);
+          break;
         }
-        m_memory_sub_partition[i]->push(mf, gpu_sim_cycle + gpu_tot_sim_cycle);
       }
       m_memory_sub_partition[i]->cache_cycle(gpu_sim_cycle + gpu_tot_sim_cycle);
       if(m_config.g_power_simulation_enabled && (((gpu_tot_sim_cycle + gpu_sim_cycle) + 1) % m_config.gpu_stat_sample_freq == 0)) {
