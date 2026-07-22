@@ -698,6 +698,12 @@ class gpgpu_sim_config : public power_config,
   int gpu_stat_sample_freq;
   int gpu_runtime_stat_flag;
 
+  // Wall-clock section timing (simulator-speed profiling; timing-neutral: does
+  // not change any simulated cycle). When enabled, gpgpu_sim::cycle() accumulates
+  // per-section host wall-clock and prints a breakdown every gpu_stat_sample_freq
+  // cycles and once at teardown. See .plan/SIM_PERF_OPT.md.
+  bool gpgpu_section_timing_enable;
+
   // Device Limits
   size_t stack_size_limit;
   size_t heap_size_limit;
@@ -936,6 +942,25 @@ class gpgpu_sim : public gpgpu_t {
 
   omp_sched_t m_current_omp_scheduler;
   float m_active_sms_this_cycle;
+
+  // Wall-clock section-timing accumulators (nanoseconds), guarded by
+  // m_config.gpgpu_section_timing_enable. Timing-neutral profiling only.
+  // "_win" = since last periodic print (head-vs-tail view); "_tot" = whole run.
+  unsigned long long m_sect_ns_icnt_cycle_win, m_sect_ns_icnt_cycle_tot;
+  unsigned long long m_sect_ns_icnt_reply_win, m_sect_ns_icnt_reply_tot;
+  unsigned long long m_sect_ns_dram_win, m_sect_ns_dram_tot;
+  unsigned long long m_sect_ns_l2_win, m_sect_ns_l2_tot;
+  unsigned long long m_sect_ns_icnt_xfer_win, m_sect_ns_icnt_xfer_tot;
+  unsigned long long m_sect_ns_core_win, m_sect_ns_core_tot;
+  // CORE sub-timing: m_sect_ns_core_work = the critical-path (max over threads) of the
+  // actual per-cluster core_cycle() work in the parallel-for. (core_tot - core_work)
+  // is the fork/join + barrier + load-imbalance overhead of that parallel region.
+  // m_sect_ns_core_worksum = sum over ALL threads of their core_cycle() work; comparing
+  // max vs sum/nthreads isolates load imbalance (B lever) from pure fork/join (A lever).
+  unsigned long long m_sect_ns_core_work_win, m_sect_ns_core_work_tot;
+  unsigned long long m_sect_ns_core_worksum_win, m_sect_ns_core_worksum_tot;
+  unsigned m_sect_core_nthreads;  // omp threads seen in the CORE loop (for C sanity + B math)
+  void print_section_timing(bool final_dump);
 
 
  private:
