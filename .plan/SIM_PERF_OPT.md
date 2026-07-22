@@ -269,6 +269,19 @@ elapsed within ~2-5%: on the 64-thread run `.o51`, cumulative `total_ms` = 636.4
 | C-64 | 64 | 64 | ~24% | **1636.0 s (27.3 min)** | **1.45x faster (BEST)** | `.o51` |
 | C-48 | 48 | 48 | ~21% | 1732.3 s (28.9 min) | 1.37x faster | `.o52` |
 | C-96 | 96 | 96 | ~41% | 1742.0 s (29.0 min) | 1.36x faster | `.o53` |
+| B-64-dyn | 64 | 64 | ~23% | 1805.5 s (30.1 min) | 1.32x (WORSE than C-64) | `.o54` |
+
+**B (force dynamic OMP scheduling, ratio_to_dynamic 0.3 -> 1.0) — REJECTED, reverted to 0.3.**
+On top of the 64-thread config, forcing dynamic in the busy mid-run:
+- did **not** reduce imbalance (24% -> 23.4%, essentially unchanged), and
+- was **~10% slower** (1636 -> 1805 s) due to dynamic's per-iteration atomic/steal overhead.
+
+Why imbalance is floor-bound (key insight): the residual ~24% is NOT caused by static
+placement — it is the ratio `heaviest_single_SM / mean_per_thread_load`. A cluster (SM) is the
+atomic unit of the loop and cannot be split, so the busiest SM sets the critical path every
+tick regardless of static-vs-dynamic. Work-stealing cannot break a single heavy iteration.
+Lowering imbalance further would require sub-SM (subcore-level) parallelism, which is
+invasive. So **C-64 static remains the best; B buys nothing.**
 
 **Sweep result: 64 is the optimum (clear U-curve 48 -> 64 -> 96 -> 132).**
 - 96 threads: imbalance jumps back to **41%** — 132 clusters over 96 threads = 96 threads get
