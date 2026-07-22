@@ -4659,26 +4659,28 @@ void gpgpu_sim::cycle() {
 
   SECT_TIC();
   if (m_current_cycle_clock_mask & CORE) {
-    // L1 cache + shader core pipeline stages
-    // st_work_max = busiest thread's total core_cycle() work (critical path, reduction max);
-    // st_work_sum = total work over all iterations (reduction +). max vs sum/nthreads
-    // separates load imbalance (B lever) from pure fork/join+barrier (A lever).
-    long long st_work_max = 0;
-    long long st_work_sum = 0;
-    unsigned st_nthreads = 1;
-    #pragma omp parallel for schedule(runtime) reduction(+:m_active_sms_this_cycle) reduction(max:st_work_max) reduction(+:st_work_sum)
+    // L1 cache + shader core pipeline stages.
+    // Per-thread work accumulators: each thread sums its own core_cycle() time into its
+    // private slot; after the loop, max over slots = critical path (A lever), sum = total
+    // work (B lever via sum/nthreads). Using an explicit array avoids the ill-defined
+    // "reduction(max) with +=" (max's private init is INT_MIN, not 0).
+    static std::vector<long long> st_thread_ns;  // reused across cycles; sized once
+    if (st_on) {
+      unsigned maxthr = (unsigned)omp_get_max_threads();
+      if (st_thread_ns.size() < maxthr) st_thread_ns.assign(maxthr, 0);
+      else std::fill(st_thread_ns.begin(), st_thread_ns.end(), 0LL);
+    }
+    #pragma omp parallel for schedule(runtime) reduction(+:m_active_sms_this_cycle)
     for (unsigned i = 0; i < m_shader_config->n_simt_clusters; i++) {
-      if (st_on && i == 0) st_nthreads = omp_get_num_threads();
       std::chrono::steady_clock::time_point st_w0;
       if (st_on) st_w0 = std::chrono::steady_clock::now();
       if (m_cluster[i]->get_not_completed() || get_more_cta_left()) {
        m_cluster[i]->core_cycle();
       }
       if (st_on) {
-        long long st_dt_i = std::chrono::duration_cast<std::chrono::nanoseconds>(
-            std::chrono::steady_clock::now() - st_w0).count();
-        st_work_max += st_dt_i;  // per-thread running sum; reduction(max) keeps the busiest
-        st_work_sum += st_dt_i;  // reduction(+) totals across all threads
+        st_thread_ns[omp_get_thread_num()] +=
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - st_w0).count();
       }
       // Update core icnt/cache stats for AccelWattch
       if(m_config.g_power_simulation_enabled && (((gpu_tot_sim_cycle + gpu_sim_cycle) + 1) % m_config.gpu_stat_sample_freq == 0)) {
@@ -4689,11 +4691,19 @@ void gpgpu_sim::cycle() {
       m_active_sms_this_cycle += m_cluster[i]->get_n_active_sms();
     }
     if (st_on) {
+      long long st_work_max = 0, st_work_sum = 0;
+      unsigned st_nthreads_used = 0;
+      for (size_t t = 0; t < st_thread_ns.size(); t++) {
+        if (st_thread_ns[t] > 0) st_nthreads_used++;
+        st_work_sum += st_thread_ns[t];
+        if (st_thread_ns[t] > st_work_max) st_work_max = st_thread_ns[t];
+      }
       m_sect_ns_core_work_win += (unsigned long long)st_work_max;
       m_sect_ns_core_work_tot += (unsigned long long)st_work_max;
       m_sect_ns_core_worksum_win += (unsigned long long)st_work_sum;
       m_sect_ns_core_worksum_tot += (unsigned long long)st_work_sum;
-      m_sect_core_nthreads = st_nthreads;
+      // nthreads actually doing work this cycle (>0), min 1 to avoid div-by-zero later
+      m_sect_core_nthreads = st_nthreads_used ? st_nthreads_used : 1;
     }
       float temp = 0;
       float previous_active_sms = *active_sms;
