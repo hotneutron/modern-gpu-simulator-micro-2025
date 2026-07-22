@@ -554,16 +554,22 @@ bool trace_warp_inst_t::parse_from_trace_struct(
       bar_type = SYNC;
       break;
     case OP_BAR: {
-      // CTA barrier decode is architecture-sensitive:
-      //   - pre-Hopper: keep the broader pre-H100 behavior. Decode id/count from the
-      //     static/runtime operands below and treat ARV as ARRIVE, everything else as
-      //     legacy blocking SYNC. Do not add a pre-Hopper BAR-form allowlist here.
-      //   - Hopper+: only the characterized named-barrier forms are accepted here:
-      //       BAR.ARV
-      //       BAR.SYNC.DEFER_BLOCKING
-      //     Any other BAR form still aborts so a new Hopper-era opcode is never silently
-      //     mis-modeled.
+      // CTA named barrier (PTX bar.sync / bar.arrive). Decode id / count from the static
+      // operands (with runtime-register fallback), then decide blocking-vs-non-blocking
+      // from the architecture-specific rule below.
       // operand 0 = barrier id, operand 1 = thread count.
+      //
+      // pre-Hopper: keep the broader historical behavior. Decode id/count from the
+      // trace, treat BAR.ARV as arrive-only, and leave every other BAR form on the
+      // legacy blocking CTA-barrier path.
+      //
+      // Hopper+: only the two forms observed across the characterized H100 kernels are
+      // accepted; anything else aborts so an unverified BAR form is never silently
+      // mis-modeled:
+      //   - BAR.ARV                 -> arrive-only
+      //   - BAR.SYNC.DEFER_BLOCKING -> arrive whose real wait is split off into the
+      //                                instruction's scoreboard wait (wait_barrier_bits),
+      //                                EXCEPT the plain full-CTA __syncthreads form.
       bool is_arv = false;
       bool is_sync_defer = false;
       for (const auto &tok : opcode_tokens) {
@@ -609,8 +615,9 @@ bool trace_warp_inst_t::parse_from_trace_struct(
       }
 
       // --- bar_type (blocking vs non-blocking) and BAR subtype ---
-      // pre-Hopper keeps the broader historical behavior: ARV is arrive-only; every other
-      // BAR form stays on the legacy blocking CTA-barrier path using the decoded id/count.
+      // pre-Hopper keeps the broader historical behavior: BAR.ARV is arrive-only; every
+      // other BAR form stays on the legacy blocking CTA-barrier path using the decoded
+      // id/count.
       //
       // Hopper+ uses the narrower H100-era characterization: the ONLY blocking case is a
       // plain full-CTA __syncthreads encoded as SYNC.DEFER with id==0, full-CTA count,
