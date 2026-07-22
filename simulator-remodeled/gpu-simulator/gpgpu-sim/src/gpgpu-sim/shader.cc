@@ -1357,6 +1357,24 @@ void shader_core_stats::print_remodeling_stats(FILE *fout) {
   fprintf(fout, "total_num_cycles_issue_stage_evaluated = %llu\n", total_num_cycles_issue_stage_evaluated);
   fprintf(fout, "total_num_cycles_issue_stage_issuing = %llu\n", total_num_cycles_issue_stage_issuing);
   fprintf(fout, "total_num_cycles_issue_stage_stall_next_stage_not_available = %llu\n", total_num_cycles_issue_stage_stall_next_stage_not_available);
+  // [Head-of-line lever] emit the gated head-of-line re-scan counters (0 unless
+  // -headofline_instrument_enable). See .plan/CONSUMER_COMPUTE_BOUND.md.
+  fprintf(fout, "total_num_cycles_next_stage_scanned = %llu\n", m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_cycles_next_stage_scanned"]->get_value());
+  fprintf(fout, "total_num_cycles_next_stage_with_ready_warp = %llu\n", m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_cycles_next_stage_with_ready_warp"]->get_value());
+  fprintf(fout, "total_num_ready_warps_during_next_stage = %llu\n", m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_ready_warps_during_next_stage"]->get_value());
+  fprintf(fout, "total_num_next_stage_valid_head_warps = %llu\n", m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_next_stage_valid_head_warps"]->get_value());
+  fprintf(fout, "total_num_next_stage_blocked_by_tensor = %llu\n", m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_next_stage_blocked_by_tensor"]->get_value());
+  fprintf(fout, "total_num_next_stage_blocked_by_mem = %llu\n", m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_next_stage_blocked_by_mem"]->get_value());
+  fprintf(fout, "total_num_next_stage_blocked_by_other = %llu\n", m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_next_stage_blocked_by_other"]->get_value());
+  fprintf(fout, "total_num_next_stage_notready_wait_barrier = %llu\n", m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_next_stage_notready_wait_barrier"]->get_value());
+  fprintf(fout, "total_num_next_stage_notready_scoreboard = %llu\n", m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_next_stage_notready_scoreboard"]->get_value());
+  fprintf(fout, "total_num_next_stage_notready_stall_count = %llu\n", m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_next_stage_notready_stall_count"]->get_value());
+  fprintf(fout, "total_num_next_stage_notready_yield = %llu\n", m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_next_stage_notready_yield"]->get_value());
+  fprintf(fout, "total_num_next_stage_notready_ldgdepbar = %llu\n", m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_next_stage_notready_ldgdepbar"]->get_value());
+  // [NANOSLEEP spin lever] emit the gated spin counters (0 unless -spin_instrument_enable).
+  fprintf(fout, "total_num_cycles_spin_ops_issued = %llu\n", m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_cycles_spin_ops_issued"]->get_value());
+  fprintf(fout, "total_num_cycles_spin_won_over_eligible = %llu\n", m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_cycles_spin_won_over_eligible"]->get_value());
+  fprintf(fout, "total_num_spin_phasechk_issued = %llu\n", m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_spin_phasechk_issued"]->get_value());
   fprintf(fout, "total_num_cycles_issue_stage_stall_issue_port_busy = %llu\n", total_num_cycles_issue_stage_stall_issue_port_busy);
   fprintf(fout, "total_num_cycles_issue_stage_stall_no_valid_instruction = %llu\n", total_num_cycles_issue_stage_stall_no_valid_instruction);
   fprintf(fout, "total_num_cycles_issue_stage_stall_no_valid_instruction_decode_pending = %llu\n", total_num_cycles_issue_stage_stall_no_valid_instruction_decode_pending);
