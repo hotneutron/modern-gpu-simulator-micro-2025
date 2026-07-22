@@ -2574,6 +2574,9 @@ gpgpu_sim::gpgpu_sim(const gpgpu_sim_config &config, gpgpu_context *ctx)
   m_sect_ns_l2_win = m_sect_ns_l2_tot = 0;
   m_sect_ns_icnt_xfer_win = m_sect_ns_icnt_xfer_tot = 0;
   m_sect_ns_core_win = m_sect_ns_core_tot = 0;
+  m_sect_ns_core_work_win = m_sect_ns_core_work_tot = 0;
+  m_sect_ns_core_worksum_win = m_sect_ns_core_worksum_tot = 0;
+  m_sect_core_nthreads = 0;
   // Opt6 early boot confirmation (once): mirror the icnt grant-passes boot log so a 12h
   // run can verify the paired icnt->L2 pop knob is actually enabled in the first seconds.
   {
@@ -4419,28 +4422,43 @@ void gpgpu_sim::print_section_timing(bool final_dump) {
   unsigned long long l2         = final_dump ? m_sect_ns_l2_tot         : m_sect_ns_l2_win;
   unsigned long long icnt_xfer  = final_dump ? m_sect_ns_icnt_xfer_tot  : m_sect_ns_icnt_xfer_win;
   unsigned long long core       = final_dump ? m_sect_ns_core_tot       : m_sect_ns_core_win;
+  unsigned long long core_work  = final_dump ? m_sect_ns_core_work_tot  : m_sect_ns_core_work_win;
+  unsigned long long core_wsum  = final_dump ? m_sect_ns_core_worksum_tot : m_sect_ns_core_worksum_win;
   unsigned long long total = icnt_cycle + icnt_reply + dram + l2 + icnt_xfer + core;
   // Parallel = OpenMP sections (CORE compute loop + DRAM loop). Serial = everything
   // else (icnt_cycle load, ICNT reply drain, L2 sub-partition loop, booksim transfer).
   unsigned long long parallel = core + dram;
   unsigned long long serial = icnt_cycle + icnt_reply + l2 + icnt_xfer;
+  // CORE decomposition (all as % of the CORE section):
+  //   core_work (max)  = busiest thread's actual work = the ideal parallel floor.
+  //   ideal_bal        = core_wsum / nthreads = perfectly-balanced work floor.
+  //   imbalance        = core_work - ideal_bal  (B lever: scheduler/chunk tuning helps)
+  //   forkjoin         = core - core_work       (A lever: persistent-region rewrite helps)
+  unsigned nthr = m_sect_core_nthreads ? m_sect_core_nthreads : 1;
+  unsigned long long ideal_bal = core_wsum / nthr;
+  unsigned long long imbalance = (core_work > ideal_bal) ? (core_work - ideal_bal) : 0;
+  unsigned long long forkjoin  = (core > core_work) ? (core - core_work) : 0;
 
   const char *tag = final_dump ? "SECTTIME-TOTAL" : "SECTTIME-WINDOW";
   printf("[%s] cycle=%llu total_ms=%.1f | "
          "CORE(par)=%.1f%% DRAM(par)=%.1f%% | "
          "icnt_load(ser)=%.1f%% icnt_reply(ser)=%.1f%% L2(ser)=%.1f%% booksim(ser)=%.1f%% | "
-         "PARALLEL=%.1f%% SERIAL=%.1f%%\n",
+         "PARALLEL=%.1f%% SERIAL=%.1f%% | "
+         "nthr=%u CORE_ideal=%.1f%% CORE_imbalance=%.1f%% CORE_forkjoin=%.1f%% (of_core)\n",
          tag, (unsigned long long)(gpu_tot_sim_cycle + gpu_sim_cycle),
          (double)total / 1e6,
          pct(core, total), pct(dram, total),
          pct(icnt_cycle, total), pct(icnt_reply, total), pct(l2, total), pct(icnt_xfer, total),
-         pct(parallel, total), pct(serial, total));
+         pct(parallel, total), pct(serial, total),
+         nthr, pct(ideal_bal, core), pct(imbalance, core), pct(forkjoin, core));
   fflush(stdout);
 
   if (!final_dump) {
     // reset window accumulators so the next print reflects only that window
     m_sect_ns_icnt_cycle_win = m_sect_ns_icnt_reply_win = m_sect_ns_dram_win = 0;
     m_sect_ns_l2_win = m_sect_ns_icnt_xfer_win = m_sect_ns_core_win = 0;
+    m_sect_ns_core_work_win = 0;
+    m_sect_ns_core_worksum_win = 0;
   }
 }
 
@@ -4642,10 +4660,25 @@ void gpgpu_sim::cycle() {
   SECT_TIC();
   if (m_current_cycle_clock_mask & CORE) {
     // L1 cache + shader core pipeline stages
-    #pragma omp parallel for schedule(runtime) reduction(+:m_active_sms_this_cycle)
+    // st_work_max = busiest thread's total core_cycle() work (critical path, reduction max);
+    // st_work_sum = total work over all iterations (reduction +). max vs sum/nthreads
+    // separates load imbalance (B lever) from pure fork/join+barrier (A lever).
+    long long st_work_max = 0;
+    long long st_work_sum = 0;
+    unsigned st_nthreads = 1;
+    #pragma omp parallel for schedule(runtime) reduction(+:m_active_sms_this_cycle) reduction(max:st_work_max) reduction(+:st_work_sum)
     for (unsigned i = 0; i < m_shader_config->n_simt_clusters; i++) {
+      if (st_on && i == 0) st_nthreads = omp_get_num_threads();
+      std::chrono::steady_clock::time_point st_w0;
+      if (st_on) st_w0 = std::chrono::steady_clock::now();
       if (m_cluster[i]->get_not_completed() || get_more_cta_left()) {
        m_cluster[i]->core_cycle();
+      }
+      if (st_on) {
+        long long st_dt_i = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - st_w0).count();
+        st_work_max += st_dt_i;  // per-thread running sum; reduction(max) keeps the busiest
+        st_work_sum += st_dt_i;  // reduction(+) totals across all threads
       }
       // Update core icnt/cache stats for AccelWattch
       if(m_config.g_power_simulation_enabled && (((gpu_tot_sim_cycle + gpu_sim_cycle) + 1) % m_config.gpu_stat_sample_freq == 0)) {
@@ -4654,6 +4687,13 @@ void gpgpu_sim::cycle() {
             m_power_stats->pwr_mem_stat->n_mem_to_simt[CURRENT_STAT_IDX][i]);
       }
       m_active_sms_this_cycle += m_cluster[i]->get_n_active_sms();
+    }
+    if (st_on) {
+      m_sect_ns_core_work_win += (unsigned long long)st_work_max;
+      m_sect_ns_core_work_tot += (unsigned long long)st_work_max;
+      m_sect_ns_core_worksum_win += (unsigned long long)st_work_sum;
+      m_sect_ns_core_worksum_tot += (unsigned long long)st_work_sum;
+      m_sect_core_nthreads = st_nthreads;
     }
       float temp = 0;
       float previous_active_sms = *active_sms;

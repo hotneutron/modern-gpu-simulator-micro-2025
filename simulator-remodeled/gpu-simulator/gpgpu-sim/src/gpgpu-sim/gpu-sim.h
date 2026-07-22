@@ -952,6 +952,14 @@ class gpgpu_sim : public gpgpu_t {
   unsigned long long m_sect_ns_l2_win, m_sect_ns_l2_tot;
   unsigned long long m_sect_ns_icnt_xfer_win, m_sect_ns_icnt_xfer_tot;
   unsigned long long m_sect_ns_core_win, m_sect_ns_core_tot;
+  // CORE sub-timing: m_sect_ns_core_work = the critical-path (max over threads) of the
+  // actual per-cluster core_cycle() work in the parallel-for. (core_tot - core_work)
+  // is the fork/join + barrier + load-imbalance overhead of that parallel region.
+  // m_sect_ns_core_worksum = sum over ALL threads of their core_cycle() work; comparing
+  // max vs sum/nthreads isolates load imbalance (B lever) from pure fork/join (A lever).
+  unsigned long long m_sect_ns_core_work_win, m_sect_ns_core_work_tot;
+  unsigned long long m_sect_ns_core_worksum_win, m_sect_ns_core_worksum_tot;
+  unsigned m_sect_core_nthreads;  // omp threads seen in the CORE loop (for C sanity + B math)
   void print_section_timing(bool final_dump);
 
 

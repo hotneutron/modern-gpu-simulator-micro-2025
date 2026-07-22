@@ -188,6 +188,22 @@ cancellation of) the effect. Recommended order **A -> B -> C**:
   every tick. Hoist to a persistent parallel region (`#pragma omp parallel` outside the
   cycle loop + `#pragma omp for` inside, single-thread the post-processing). Source change +
   rebuild; timing-neutral.
+
+  **A-0 (DONE): first measure whether fork/join is even worth attacking.** Before the risky
+  persistent-region rewrite, we instrumented the CORE parallel-for. Every `[SECTTIME-*]` line
+  now decomposes the CORE section (all as % of CORE), so A/B/C can be judged from ONE run:
+  - `nthr` = OpenMP threads actually used in the CORE loop (sanity-checks C: is it 192?).
+  - `CORE_ideal` = `sum_of_all_threads_work / nthr` = perfectly-balanced parallel floor.
+  - `CORE_imbalance` = `busiest_thread_work - CORE_ideal` = **load imbalance** -> the **B**
+    lever (OMP scheduler / chunk tuning) helps here.
+  - `CORE_forkjoin` = `core_section_total - busiest_thread_work` = fork/join + implicit
+    barrier -> the **A** lever (persistent-region rewrite) helps here.
+
+  Decision rules (read after a ~1 h run with `-gpgpu_section_timing_enable 1`):
+  - `CORE_forkjoin` large (>~25% of CORE) -> do the A persistent-region rewrite.
+  - `CORE_imbalance` large -> do B (scheduler/chunk) instead / first.
+  - both small (CORE ~= CORE_ideal) -> parallelism is already efficient; the only remaining
+    win is speeding up `core_cycle()` internals (sub-profile fetch/issue/execute/LSU).
 - **B. Tune the custom OMP scheduler** (`gpu-sim.cc` static<->dynamic, chunk=1). With 132
   clusters and near-uniform load in FA3 fwd, a larger static chunk may beat chunk=1.
   Config/one-line change.
