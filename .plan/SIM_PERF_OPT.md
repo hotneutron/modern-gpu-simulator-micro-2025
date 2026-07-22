@@ -135,61 +135,112 @@ you specifically want the tail breakdown — and even then prefer a shrunk confi
 
 ## 2.6 MEASURED RESULTS (kernel-5, `-gpgpu_section_timing_enable 1`, trace_enabled 0)
 
-Run with the section timers on (Docker `.o48`, 500-cycle windows). **The early windows are
-DRAM-warmup-biased; the steady state is what matters.**
+**FULL RUN completed** (Docker `.o48`): 136,502 sim-cycles, total wall-clock
+**45,362.8 s (~12.6 h)**, 273 windows. The final wall-clock-weighted breakdown is the
+`[SECTTIME-TOTAL]` line; per-window `total_ms` varies 100x (226 ms .. 92,000 ms), so only
+the time-weighted total is authoritative — a plain window average would be misleading.
 
-Early (warmup — do NOT conclude from these):
+### FINAL (whole-run, wall-clock-weighted) — CONFIRMED
 
-| cycle | CORE (par) | DRAM (par) | icnt_load | icnt_reply | L2 | booksim | SERIAL |
-|---|---|---|---|---|---|---|---|
-| 3000 | 21.6% | 77.5% | 0.2% | 0.2% | 0.4% | 0.1% | 0.9% |
-| 5000 | 44.8% | 54.7% | 0.2% | 0.1% | 0.2% | 0.0% | 0.5% |
-| 6500 | 57.4% | 39.4% | 0.3% | 0.4% | 2.3% | 0.2% | 3.2% |
-| 9000 | 70.1% | 29.0% | 0.2% | 0.2% | 0.4% | 0.2% | 1.0% |
+```
+[SECTTIME-TOTAL] cycle=136502  total=45,362.8 s (~12.6 h)
+  CORE(par)  = 94.7%   (~42,970 s)   <-- the bottleneck
+  DRAM(par)  =  5.1%   (~2,313 s)
+  icnt_load  =  0.0%   icnt_reply = 0.0%   L2 = 0.1%   booksim = 0.0%
+  PARALLEL   = 99.9%   SERIAL = 0.1%
+```
 
-Steady state (cycle ~20k+, this is the real breakdown):
+### Distribution across the run (head -> mid -> tail)
 
-| cycle | CORE (par) | DRAM (par) | icnt_load | icnt_reply | L2 | booksim | SERIAL |
-|---|---|---|---|---|---|---|---|
-| 20000 | 90.8% | 9.1% | 0.0% | 0.0% | 0.0% | 0.0% | 0.1% |
-| 22000 | 90.3% | 9.6% | 0.0% | 0.0% | 0.1% | 0.0% | 0.1% |
-| 23000 | 92.7% | 7.0% | 0.0% | 0.0% | 0.1% | 0.0% | 0.3% |
-| 24500 | 92.3% | 7.6% | 0.0% | 0.0% | 0.1% | 0.0% | 0.1% |
+- **Head (cycle 500-2500):** CORE 20-48%, DRAM 49-80% — DRAM warmup burst. These windows
+  are either very short (226 ms) or a few large ones; their total time share is tiny.
+- **Mid (cycle ~20k-130k, the bulk of wall-clock):** CORE **90-95%**, DRAM 5-10%. This is
+  where almost all 12.6 h is spent.
+- **Tail (cycle ~130k-136.5k, kernel drain):** CORE falls 94% -> 29%, DRAM rises 6% -> 71%
+  as SMs empty and only DRAM drain remains. But these tail windows are small in `total_ms`
+  (29k -> 7k ms), so their whole-run contribution is minor.
 
-### Findings (steady state — these are the conclusions)
+The head/tail DRAM spikes wash out under time-weighting: the authoritative whole-run figure
+is **CORE 94.7% / DRAM 5.1% / serial 0.1%**.
 
-1. **CORE is ~92% of wall-clock.** The parallel `core_cycle` compute loop over 132 clusters
-   is the overwhelming cost. This IS the thing to optimize.
+### Findings — CONFIRMED (whole run)
 
-2. **DRAM is only ~8% in steady state — NOT the bottleneck.** The early 40-77% DRAM share
-   was a **warmup artifact** (little CORE work yet to amortize against + initial DRAM burst).
-   It monotonically fell to ~8% by cycle 20k and stayed there. The earlier "DRAM fork/join
-   is the main cost" hypothesis is **refuted** — do not spend effort there.
+1. **CORE `core_cycle` is 94.7% of wall-clock.** Any real speedup MUST come from the CORE
+   parallel path. This is now confirmed over the full kernel, not just a window.
 
-3. **Serial sections (icnt_load/icnt_reply/L2/booksim) are ~0.1%.** Parallelizing the L2
-   loop or simplifying booksim would buy essentially nothing. **Dropped.**
+2. **DRAM 5.1%, serial (icnt/L2/booksim) 0.1%.** The earlier "DRAM fork/join is the main
+   cost" and "parallelize L2 / simplify booksim" hypotheses are **definitively refuted**
+   (combined <5.2%). Dropped for good.
 
-4. Wall-clock is slow in absolute terms (~9 min to reach cycle ~9k; ~1 h to ~24.5k), which
-   is consistent with a full run being many hours — and confirms the cost is CORE, so any
-   real speedup must come from the CORE parallel path.
+3. Full run took ~12.6 h, matching the user's report, and 94.7% of that is CORE.
 
-### Revised optimization priority (evidence-based, steady state)
+### Revised optimization priority (evidence-based, whole run)
 
-Because ~92% is the CORE `#pragma omp parallel for`, the levers are all about CORE parallel
-efficiency, not the memory/serial sections:
+All levers are about CORE parallel efficiency (94.7%), not memory/serial sections.
+**Do them ONE AT A TIME** and re-measure against the baseline (see 2.7): with a single
+baseline, changing several at once makes it impossible to attribute (or notice mutual
+cancellation of) the effect. Recommended order **A -> B -> C**:
 
-1. **Thread count vs physical cores.** `OMP_NUM_THREADS` is unset under `--launcher local`
-   -> 192 threads on 96 physical cores (2:1 HT oversubscription). Measure 96 vs 192 on the
-   same window; if 96 is not slower, cap threads (cheaper team spawns, less HT contention).
-   Zero model change.
-2. **Remove per-tick fork/join on the CORE loop.** The CORE `parallel for` opens/closes a
-   thread team every core tick (hundreds of thousands of times). Hoist to a persistent
-   parallel region (`#pragma omp parallel` outside the cycle loop + `#pragma omp for`
-   inside) so the team is reused. Source change + rebuild; timing-neutral.
-3. **Tune the custom OMP scheduler** (`gpu-sim.cc` static<->dynamic, chunk=1). With 132
-   clusters and near-uniform load in FA3 fwd, a larger static chunk may beat chunk=1.
-4. **(deprioritized)** DRAM fork/join, L2-loop parallelization, booksim simplification —
-   proven <10% / <1% and not worth it.
+- **A. Remove per-tick fork/join on the CORE loop (highest expected win).** The CORE
+  `parallel for` opens/closes a thread team every core tick (~136k times here), and a
+  192-thread team fork/join is expensive. There is also serial post-processing right after
+  the loop (occupancy aggregation, scheduler decision), so the team is torn down and rebuilt
+  every tick. Hoist to a persistent parallel region (`#pragma omp parallel` outside the
+  cycle loop + `#pragma omp for` inside, single-thread the post-processing). Source change +
+  rebuild; timing-neutral.
+- **B. Tune the custom OMP scheduler** (`gpu-sim.cc` static<->dynamic, chunk=1). With 132
+  clusters and near-uniform load in FA3 fwd, a larger static chunk may beat chunk=1.
+  Config/one-line change.
+- **C. Thread count 96 vs 192 (LOW priority per user).** HT means 2 threads/core is not
+  necessarily a loss for a latency-bearing loop, so this is expected to be small. Worth a
+  quick measurement but not a primary lever. Zero model change.
+- **(deprioritized)** DRAM fork/join, L2-loop parallelization, booksim simplification —
+  proven <5.2% combined and not worth it.
+- **(biggest absolute ceiling, accuracy-risky)** Speed up per-SM `core_cycle()` internals
+  (fetch/issue/execute/LSU) — 94.7% of time lives here, but changing the model risks
+  changing `sim_cycle`; only attempt with a per-stage sub-profile and strict equality checks.
+
+## 2.7 BASELINE + 1-hour benchmark protocol (how to test each optimization)
+
+We cannot run the full 12.6 h per experiment. Instead, compare **how far a fixed wall-clock
+budget gets** (sim-cycles reached), using the baseline `.o48` curve below. This works
+because the run is a steady grind (CORE ~94.7% throughout the mid-run).
+
+### Baseline curve (`.o48`, current code, 192 threads, trace_enabled 0)
+
+| elapsed wall | sim-cycle reached |
+|---|---|
+| ~11 min | 10,000 |
+| ~40 min | 20,000 |
+| **~60 min (1 h)** | **~23,000** |
+| ~88 min | 30,000 |
+| ~145 min | 40,000 |
+| ~3.4 h | 50,000 |
+| ~12.4 h | 130,000 (near end; total 136,502 @ 45,362.8 s) |
+
+**1-hour benchmark rule of thumb: baseline reaches ~23,000 sim-cycles in the first hour.**
+After an optimization, run ~1 h (trace_enabled 0, section timers optional) and read the
+`gpu_sim_cycle` progress. **>23,000 = faster, <23,000 = slower.** For a cleaner number,
+compare "seconds to reach cycle 20,000" (baseline = ~2,377 s / ~40 min).
+
+### Source of truth / where results live
+- Full baseline log: `.o48` at
+  `sim_run_12.8/.../H100_80GB-OnlyKernel5/...warmup_-63a73d452237.o48`
+  (contains all 273 `[SECTTIME-WINDOW]` lines + final `[SECTTIME-TOTAL]`).
+- Each future experiment: keep its `.oNN`, and record its "cycle reached at ~1 h" and
+  "seconds to cycle 20,000" in a comparison table appended here.
+
+### Per-experiment procedure
+1. Apply exactly ONE change (A, B, or C above).
+2. Rebuild if needed; run with `trace_enabled 0`.
+3. Stop at ~1 h (or after it passes cycle 20,000).
+4. Record: sim-cycle reached at 1 h, and wall-seconds to cycle 20,000.
+5. Compare to baseline (23,000 cyc/1 h; 2,377 s to 20,000). Keep only if clearly better.
+6. **Timing-neutral check:** confirm the change did not alter `sim_cycle` at a common
+   checkpoint (e.g. cycle 20,000 exists in both and downstream stats match).
+
+
+
 
 
 
