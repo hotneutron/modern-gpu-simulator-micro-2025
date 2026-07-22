@@ -255,6 +255,68 @@ compare "seconds to reach cycle 20,000" (baseline = ~2,377 s / ~40 min).
 6. **Timing-neutral check:** confirm the change did not alter `sim_cycle` at a common
    checkpoint (e.g. cycle 20,000 exists in both and downstream stats match).
 
+### 2.7.1 total_ms is a validated wall-clock proxy (no rerun needed for baseline)
+`.o48` has no absolute timestamps, but the summed section `total_ms` tracks the real process
+elapsed within ~2-5%: on the 64-thread run `.o51`, cumulative `total_ms` = 636.4 s vs real
+`etimes` = 650 s at the same instant (2% off), and 1636 s vs 1713 s at cycle 20k (~5%). So
+**comparing cumulative `total_ms` at cycle 20,000 across runs is a fair, rerun-free metric.**
+
+### 2.7.2 EXPERIMENT LOG (cycle-20,000 = warmup-free checkpoint; lower s = faster)
+
+| exp | OMP threads | nthr (actual) | CORE_imbalance | cum total_ms @ cyc 20k | vs baseline | log |
+|---|---|---|---|---|---|---|
+| baseline | unset (->132) | 132 | ~46% | **2376.8 s (39.6 min)** | 1.00x | `.o48` |
+| C-64 | 64 | 64 | ~24% | **1636.0 s (27.3 min)** | **1.45x faster (BEST)** | `.o51` |
+| C-48 | 48 | 48 | ~21% | 1732.3 s (28.9 min) | 1.37x faster | `.o52` |
+| C-96 | 96 | 96 | ~41% | 1742.0 s (29.0 min) | 1.36x faster | `.o53` |
+
+**Sweep result: 64 is the optimum (clear U-curve 48 -> 64 -> 96 -> 132).**
+- 96 threads: imbalance jumps back to **41%** — 132 clusters over 96 threads = 96 threads get
+  1 cluster, 36 get 2, a lopsided split, so it is worse than 64 despite more threads.
+- 64 threads: ~2 clusters/thread, `schedule(runtime)`/dynamic mixes heavy+light SMs -> lowest
+  imbalance (24%) with enough parallelism -> fastest.
+- 48 threads: imbalance a touch lower (21%) but too few threads costs throughput -> slightly
+  slower than 64.
+
+**DECISION: set `OMP_NUM_THREADS=64` for this workload (132-cluster H100). ~1.45x speedup at
+the warmup-free cycle-20k checkpoint; ~12.6 h -> ~8.7 h projected for the full run.** Zero
+model change, timing-neutral (sim_cycle unchanged). Residual imbalance is 24%, so B (OMP
+scheduler chunk tuning) could squeeze a bit more, but C alone already gives the 1.45x.
+
+### 2.7.3 The optimum tracks CLUSTER COUNT, not nproc (portability rule)
+
+The sweet spot is set by **the loop's iteration count = number of clusters (132 here)**, not
+by the machine's `nproc`. The parallel-for has exactly 132 iterations, so:
+- More than 132 threads is useless (idle threads); the default unset -> 132 is already the
+  1-cluster-per-thread worst case for imbalance.
+- The win comes from `clusters / threads ~= 2-3` so dynamic scheduling can mix heavy+light
+  SMs into each thread and shrink the critical path. 64 gives 2.06 clusters/thread.
+- Divisors of 132 are the cleanest: **66 (=132/2), 44 (=132/3), 33 (=132/4)** give perfectly
+  even splits and may beat 64 slightly (66 is the top candidate: exactly 2 clusters/thread).
+
+**Portability (e.g. a 256-logical-core / 128-physical server):** the optimum is still ~64
+(or 66), NOT scaled to nproc — because it is bounded by the 132 clusters, not the core count.
+A bigger machine only means more physical cores are free, so 64/66 still fits without HT
+contention. Only re-sweep {44, 64, 66, 88} briefly on a new machine to confirm; do not raise
+threads just because nproc is larger.
+
+General rule: **optimal `OMP_NUM_THREADS` ~= a divisor of the cluster count that lands ~2-3
+clusters/thread and stays <= physical cores.** For 132 SMs: try 66 first, then 64/44.
+
+**Finding so far (overturns the earlier "C is low priority" guess):** dropping `OMP_NUM_THREADS`
+from the default 132 to **64 gives ~1.45x** at cycle 20k (bigger, ~2.3x, in the warmup head;
+converges to 1.45x by 20k). Root cause chain, confirmed by the CORE decomposition:
+`CORE_forkjoin ~= 0-2%` (so the A rewrite is pointless), but `CORE_imbalance` fell 46% -> 24%
+when going 132 -> 64 threads. With 132 threads the loop is 1 cluster/thread (static 1:1), so
+the single heaviest SM sets the critical path every tick and 131 threads spin-wait at the
+barrier; fewer threads let `schedule(runtime)`/dynamic mix heavy+light SMs per thread and cut
+the critical path. The high CPU% at 132 threads was spin-wait waste, not useful work — lower
+CPU% at 64 threads is *faster*, not worse.
+
+Next: sweep 48 and 96 to find the optimum (imbalance still 24% at 64, so fewer threads may
+help further; but too few loses parallelism — the total-work floor). Pick the min-total_ms
+point. Then optionally combine with B (scheduler chunk) if imbalance is still the residual.
+
 
 
 

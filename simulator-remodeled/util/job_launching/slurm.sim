@@ -54,10 +54,24 @@ echo "doing export CUDA_LAUNCH_BLOCKING=1"
 export CUDA_LAUNCH_BLOCKING=1
 
 if [ -n "${SLURM_CPUS_PER_TASK:-}" ]; then
+    # Under SLURM (sbatch): honor the allocation.
     export OMP_NUM_THREADS=$SLURM_CPUS_PER_TASK
+elif [ -n "${OMP_NUM_THREADS:-}" ]; then
+    # Local launcher (procman): honor an OMP_NUM_THREADS the user exported before
+    # invoking run_simulations.py, e.g. `OMP_NUM_THREADS=64 ./run_simulations.py ...`.
+    export OMP_NUM_THREADS=$OMP_NUM_THREADS
 else
-    unset OMP_NUM_THREADS
+    # No SLURM alloc and no user override: fall back to the per-benchmark openmp-cpus
+    # value from the YAML (templated into --cpus-per-task above). REPLACE_OPENMP_CPUS is
+    # substituted by run_simulations.py; guard against a non-numeric leftover.
+    __oc="REPLACE_OPENMP_CPUS"
+    if [ -n "$__oc" ] && [ "$__oc" -eq "$__oc" ] 2>/dev/null; then
+        export OMP_NUM_THREADS=$__oc
+    else
+        unset OMP_NUM_THREADS
+    fi
 fi
+echo "doing: OMP_NUM_THREADS=${OMP_NUM_THREADS:-<unset>}"
 
 echo "doing: REPLACE_EXEC_NAME REPLACE_COMMAND_LINE"
 REPLACE_EXEC_NAME REPLACE_COMMAND_LINE
