@@ -554,29 +554,33 @@ bool trace_warp_inst_t::parse_from_trace_struct(
       bar_type = SYNC;
       break;
     case OP_BAR: {
-      // CTA named barrier (PTX bar.sync / bar.arrive). Decode id / count from the static
-      // operands (with runtime-register fallback), then decide blocking-vs-non-blocking
-      // from the verified rule below.
+      // CTA barrier decode is architecture-sensitive:
+      //   - pre-Hopper: keep the broader pre-H100 behavior. Decode id/count from the
+      //     static/runtime operands below and treat ARV as ARRIVE, everything else as
+      //     legacy blocking SYNC. Do not add a pre-Hopper BAR-form allowlist here.
+      //   - Hopper+: only the characterized named-barrier forms are accepted here:
+      //       BAR.ARV
+      //       BAR.SYNC.DEFER_BLOCKING
+      //     Any other BAR form still aborts so a new Hopper-era opcode is never silently
+      //     mis-modeled.
       // operand 0 = barrier id, operand 1 = thread count.
-      //
-      // Opcode handling (only the two forms observed across all 9 traced kernels are
-      // accepted; anything else aborts so an unverified BAR form is never silently
-      // mis-modeled):
-      //   - BAR.ARV                 -> arrive-only
-      //   - BAR.SYNC.DEFER_BLOCKING -> arrive whose real wait is split off into the
-      //                                instruction's scoreboard wait (wait_barrier_bits),
-      //                                EXCEPT the plain full-CTA __syncthreads form.
       bool is_arv = false;
       bool is_sync_defer = false;
       for (const auto &tok : opcode_tokens) {
         if (tok == "ARV") is_arv = true;
         if (tok == "DEFER_BLOCKING") is_sync_defer = true;
       }
-      // trace.opcode is the full mnemonic, e.g. "BAR.SYNC.DEFER_BLOCKING" / "BAR.ARV".
-      assert((is_arv || is_sync_defer) &&
-             "Unverified BAR opcode form reached OP_BAR decode (only BAR.ARV and "
-             "BAR.SYNC.DEFER_BLOCKING have been characterized); see "
-             ".plan/fix_op_bar_named_barrier_decoding.md");
+      bool is_hopper_or_newer =
+          kernel_trace_info->binary_verion >= HOPPER_BINART_VERSION;
+
+      if (is_hopper_or_newer) {
+        // trace.opcode is the full mnemonic, e.g.
+        // "BAR.SYNC.DEFER_BLOCKING" / "BAR.ARV".
+        assert((is_arv || is_sync_defer) &&
+               "Unverified Hopper+ BAR opcode form reached OP_BAR decode "
+               "(only BAR.ARV and BAR.SYNC.DEFER_BLOCKING have been "
+               "characterized); see .plan/BAR_OP_H100.md");
+      }
 
       traced_instruction &bar_inst =
           static_trace_info.get_kernel_by_unique_function_id(unique_function_id)
@@ -605,18 +609,28 @@ bool trace_warp_inst_t::parse_from_trace_struct(
       }
 
       // --- bar_type (blocking vs non-blocking) and BAR subtype ---
-      // The ONLY blocking case is a plain full-CTA __syncthreads: id==0, full-CTA count,
-      // and no scoreboard wait. Every other observed BAR (BAR.ARV, any named id, any
-      // partial count, or a full-CTA SYNC whose wait is offloaded to a scoreboard wait on
-      // a preceding SYNCS/FENCE) is a non-blocking arrive; its actual synchronization is
-      // handled by the scoreboard / mbarrier models. Blocking those produces deadlocks
-      // (verified on FA3 fwd kernel 5 and bwd kernel 10).
+      // pre-Hopper keeps the broader historical behavior: ARV is arrive-only; every other
+      // BAR form stays on the legacy blocking CTA-barrier path using the decoded id/count.
+      //
+      // Hopper+ uses the narrower H100-era characterization: the ONLY blocking case is a
+      // plain full-CTA __syncthreads encoded as SYNC.DEFER with id==0, full-CTA count,
+      // and no scoreboard wait. Every other observed Hopper BAR (BAR.ARV, any named id,
+      // any partial count, or a full-CTA SYNC whose wait is offloaded to a preceding
+      // SYNCS/FENCE scoreboard wait) is modeled as a non-blocking arrive.
       unsigned wait_barrier_bits =
           bar_inst.get_control_bits().get_wait_barrier_bits();
       bool is_plain_full_cta_syncthreads =
           is_sync_defer && (bar_id == 0) && (bar_count == (unsigned)-1) &&
           (wait_barrier_bits == 0);
-      if (is_arv) {
+      if (!is_hopper_or_newer) {
+        if (is_arv) {
+          bar_subop = BAR_SUBOP_ARV;
+          bar_type = ARRIVE;
+        } else {
+          bar_subop = BAR_SUBOP_SYNC_PLAIN;
+          bar_type = SYNC;
+        }
+      } else if (is_arv) {
         bar_subop = BAR_SUBOP_ARV;
         bar_type = ARRIVE;
       } else if (is_plain_full_cta_syncthreads) {
