@@ -2882,6 +2882,12 @@ void gpgpu_sim::create_gpu_per_sm_stats() {
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_next_stage_blocked_by_tensor", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_next_stage_blocked_by_mem", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_next_stage_blocked_by_other", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  // [Head-of-line lever] finer split of blocked_by_other (the ISSUE_CONTROL-holding op's FU), so the
+  // fix knows WHICH pipe's read_stage/FU-latency to deepen. sfu = MUFU/SFU; sp_int_dp = SP/INT/DP/HALF/
+  // UNIFORM; branch_other = BRANCH/everything else.
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_next_stage_blocked_by_sfu", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_next_stage_blocked_by_sp_int_dp", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_next_stage_blocked_by_branch_other", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
   // [Head-of-line lever] why the OTHER warps were not warp-side-ready during next_stage cycles (summed
   // over warps × cycles). If `with_ready_warp` is low, this says whether the whole warpgroup is stuck on
   // the SAME dependency (lockstep — e.g. all on wait_barrier/scoreboard waiting on the same WGMMA), which
@@ -2892,6 +2898,17 @@ void gpgpu_sim::create_gpu_per_sm_stats() {
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_next_stage_notready_yield", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_next_stage_notready_ldgdepbar", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_next_stage_valid_head_warps", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  // [Head-of-line lever] WHY the ISSUE_CONTROL latch could not drain this cycle (root of head-of-line).
+  // control-stage side: control_allocate_full (fixed-latency, CONTROL_ALLOCATE occupied) vs
+  // fu_cannot_issue (non-fixed op, target FU queue full). allocate-stage side (why CONTROL_ALLOCATE
+  // stays occupied): read_stage_full / rf_conflict / fu_latency_full. Distinguishes "deepen the latch"
+  // (latch/queue depth) from "FU throughput/latency" as the real limiter. Gated by
+  // -headofline_instrument_enable. See .plan/CONSUMER_COMPUTE_BOUND.md.
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_hol_reason_control_allocate_full", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_hol_reason_fu_cannot_issue", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_hol_reason_read_stage_full", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_hol_reason_rf_conflict", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_hol_reason_fu_latency_full", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
   // [WGMMA Opt6 Step-0 instrumentation] observe-only counters (no timing change).
   // (I) split fu_occupied by pipe op.
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_issue_stage_stall_at_least_one_warp_with_fu_occupied_tensor", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);

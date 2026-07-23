@@ -245,6 +245,46 @@ warps with a valid head seen across all scanned cycles). Read:
   specific over-conservative dependency) is the lever, NOT latch depth.
 - reasons spread out / rotating ⇒ genuine diverse waits, closer to a real dependency floor.
 
+## ⭐⭐⭐ RESULT (2026-07-20d, bwd `OnlyKernel10/.o30`) — head-of-line is REAL and RECOVERABLE (99.2%)
+
+First run with the counters actually emitted (the `.o48/.o29` run had the counters registered but not
+printed — fixed in shader.cc). bwd (gpu_sim_cycle 215,934):
+
+```
+next_stage_scanned          = 16,365,885   (== next_stage_not_available exactly ✓ instrumentation sane)
+next_stage_with_ready_warp  = 16,229,962   → 99.2% of next_stage cycles HAD a ready warp
+ready_warps_during_next_stage = 33,730,794 → ~2.06 ready warps per next_stage cycle on average
+valid_head_warps            = 36,065,505
+next_stage / evaluated      = 16.37M / 76.67M = 21.3%
+```
+
+**Verdict: next_stage is NOT a dependency floor — it is recoverable head-of-line blocking.** On 99.2% of
+the cycles where the subcore issued nothing (because the 1-deep ISSUE_CONTROL latch was full), there were
+on average ~2 OTHER warps that WOULD have been able to issue if the latch were free. The sim throws these
+away because `Subcore::issue()` skips the whole warp-scan when the latch is occupied. This is ~21% of all
+evaluated subcore-cycles — a large recoverable lever, not a floor.
+
+**What holds the head of line (`blocked_by_*`):**
+```
+blocked_by_tensor = 3          (~0 — WGMMA is NOT the clog, contrary to the earlier guess)
+blocked_by_mem    = 484,495    (3.0%)
+blocked_by_other  = 15,881,387 (97.0%)   <-- fixed-latency non-tensor ops (SP/INT/SFU/UNIFORM/BRANCH)
+```
+So the instruction stuck in ISSUE_CONTROL is almost always a **plain fixed-latency op**, whose downstream
+(CONTROL_ALLOCATE → read_stage(≤3) → FU latency-bitset) is momentarily full, which then blocks the entire
+subcore for that cycle even though ~2 other warps were ready. (⚠️ `other` is a coarse bucket — SP/INT/SFU/
+UNIFORM/BRANCH combined; splitting it is a cheap next counter but not needed for the verdict.)
+
+**not-ready reasons for the few blocked warps** (only the ~0.8% residual): stall_count 1.58M >
+wait_barrier 785K > yield 423K; scoreboard/ldgdepbar 0. Minor — 99.2% were ready.
+
+**Conclusion:** the fwd/bwd 2× "compute-sparse / SM-active 64% vs HW 90%" is driven by the **1-deep
+ISSUE_CONTROL→CONTROL_ALLOCATE issue pipeline serializing warp issue**: when the head instruction can't
+advance, the subcore stalls instead of issuing a different ready warp (HW warp-switches; NCU
+`not_selected`=0.82). Fixing this is a genuine cycle lever (~21% of evaluated cycles in bwd). fwd (`.o48`
+re-run) pending but expected to show the same shape.
+
+
 ## Other debug counters live in this build (12h-run harvest)
 
 Gates on in the H100 config for this run (all timing-neutral): `-headofline_instrument_enable`,

@@ -333,6 +333,14 @@ void Subcore::allocate(SM *shared_sm) {
         if(m_config->wgmma_step0_instrument_enable && current_ins->op == TENSOR_CORE_OP) {
           shared_sm->m_sm_stats.m_stats_map["total_num_tensor_add_extra_cycle_initiation_interval"]->increment_with_integer(1);
         }
+        // [Head-of-line lever] CONTROL_ALLOCATE cannot drain because RF read and/or the FU latency
+        // bitset is unavailable — the root cause behind control_allocate_full one stage up.
+        if(m_config->headofline_instrument_enable) {
+          if(!is_rf_ready)
+            shared_sm->m_sm_stats.m_stats_map["total_num_hol_reason_rf_conflict"]->increment_with_integer(1);
+          if(!is_fu_latency_available)
+            shared_sm->m_sm_stats.m_stats_map["total_num_hol_reason_fu_latency_full"]->increment_with_integer(1);
+        }
       }
     }else {
       fu->add_extra_cycle_initiation_interval();
@@ -340,6 +348,11 @@ void Subcore::allocate(SM *shared_sm) {
       // [WGMMA Opt6 Step-0] (VII) tensor-only lockout extension.
       if(m_config->wgmma_step0_instrument_enable && current_ins->op == TENSOR_CORE_OP) {
         shared_sm->m_sm_stats.m_stats_map["total_num_tensor_add_extra_cycle_initiation_interval"]->increment_with_integer(1);
+      }
+      // [Head-of-line lever] CONTROL_ALLOCATE cannot drain because the read_stage pipeline reg for this
+      // (WGMMA=6-deep / other=3-deep) latency class is still occupied.
+      if(m_config->headofline_instrument_enable) {
+        shared_sm->m_sm_stats.m_stats_map["total_num_hol_reason_read_stage_full"]->increment_with_integer(1);
       }
     }
   }
@@ -369,6 +382,10 @@ void Subcore::control_stage(SM *shared_sm) {
         // If it is not a fixed_latency_instruction, it is direclty issued to its functional unit
         if(fu->can_issue(current_ins)) {
           fu->issue(m_ISSUE_CONTROL_latch);
+        } else if(m_config->headofline_instrument_enable) {
+          // [Head-of-line lever] non-fixed op stuck: target FU cannot accept it (queue full) -> the
+          // ISSUE_CONTROL latch stays occupied and blocks the whole subcore next issue.
+          shared_sm->m_sm_stats.m_stats_map["total_num_hol_reason_fu_cannot_issue"]->increment_with_integer(1);
         }
       }
     }else {
@@ -377,6 +394,11 @@ void Subcore::control_stage(SM *shared_sm) {
         // [WGMMA Opt6 Step-0] (VII) tensor-only lockout extension (CONTROL->ALLOCATE latch full).
         if(m_config->wgmma_step0_instrument_enable && current_ins->op == TENSOR_CORE_OP) {
           shared_sm->m_sm_stats.m_stats_map["total_num_tensor_add_extra_cycle_initiation_interval"]->increment_with_integer(1);
+        }
+        // [Head-of-line lever] fixed-latency op stuck: CONTROL_ALLOCATE latch is full -> ISSUE_CONTROL
+        // cannot drain -> whole-subcore head-of-line stall.
+        if(m_config->headofline_instrument_enable) {
+          shared_sm->m_sm_stats.m_stats_map["total_num_hol_reason_control_allocate_full"]->increment_with_integer(1);
         }
       }
     }
@@ -398,6 +420,17 @@ void Subcore::scan_head_of_line_when_blocked(SM *shared_sm) {
     else if (held->is_load() || held->is_store())   key = "total_num_next_stage_blocked_by_mem";
     else                                            key = "total_num_next_stage_blocked_by_other";
     shared_sm->m_sm_stats.m_stats_map[key]->increment_with_integer(1);
+    // finer split of "other" so the fix knows which pipe's read_stage/FU-latency to deepen.
+    if (held->op != TENSOR_CORE_OP && !held->is_load() && !held->is_store()) {
+      const char *okey;
+      switch (held->op) {
+        case SFU_OP: okey = "total_num_next_stage_blocked_by_sfu"; break;
+        case SP_OP: case INTP_OP: case DP_OP: case HALF_OP: case UNIFORM_OP:
+                     okey = "total_num_next_stage_blocked_by_sp_int_dp"; break;
+        default:     okey = "total_num_next_stage_blocked_by_branch_other"; break;
+      }
+      shared_sm->m_sm_stats.m_stats_map[okey]->increment_with_integer(1);
+    }
   }
 
   unsigned long long n_ready = 0;

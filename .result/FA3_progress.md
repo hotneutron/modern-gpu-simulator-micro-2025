@@ -397,6 +397,13 @@ Decomposing WHY sim is compute-sparse (SM-active 64% vs HW 90%): sim per-SMSP cy
   `next_stage` cycles (recoverable head-of-line) or none was ready (not recoverable) — the loop is
   skipped so the stat can't tell. Decisive test = gated read-only eligible-scan in the `else` branch;
   secondary = widen ISSUE_CONTROL/CONTROL_ALLOCATE to 2-deep. Full analysis in [CONSUMER_COMPUTE_BOUND.md](file:///home/jihyun/modern-gpu-simulator-micro-2025/.plan/CONSUMER_COMPUTE_BOUND.md).
+- **✅ CONFIRMED (2026-07-20d, bwd `.o30`): head-of-line is REAL and RECOVERABLE.**
+  `next_stage_with_ready_warp / scanned = 16,229,962 / 16,365,885 = **99.2%**`, ~2.06 other warps ready
+  per stalled cycle; next_stage = **21.3%** of evaluated. What holds the head: `blocked_by_other`
+  (fixed-latency non-tensor op) **97%**, mem 3%, **tensor ~0**. ⇒ the 1-deep ISSUE_CONTROL→CONTROL_
+  ALLOCATE pipe stalls the whole subcore instead of warp-switching to one of the ~2 ready warps. This is
+  a genuine cycle lever (~21% of evaluated). Fix direction under discussion (deepen latch / decouple
+  warp-scan from latch-full so a ready warp can issue). fwd `.o48` re-run pending (same shape expected).
 
 
 
