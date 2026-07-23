@@ -404,6 +404,20 @@ Decomposing WHY sim is compute-sparse (SM-active 64% vs HW 90%): sim per-SMSP cy
   ALLOCATE pipe stalls the whole subcore instead of warp-switching to one of the ~2 ready warps. This is
   a genuine cycle lever (~21% of evaluated). Fix direction under discussion (deepen latch / decouple
   warp-scan from latch-full so a ready warp can issue). fwd `.o48` re-run pending (same shape expected).
+- **✅✅ ROOT CAUSE PINNED (2026-07-20e, fwd `.o56`): SFU initiation interval = 8.** With root-cause
+  counters: fwd next_stage = 25.1% of evaluated, **98.3%** recoverable (~2.77 ready warps/cyc). What
+  holds the latch: **`blocked_by_sfu` 99.7%**; why it can't drain: **`hol_reason_fu_cannot_issue` 99.8%**,
+  `read_stage_full=0`, `control_allocate_full≈0`. → NOT a latch-depth problem; it is the SFU FU refusing
+  new ops. `functional_unit_sfu::can_issue()`=`m_dispatch_reg->empty()` + `-sfu_initiation 8` (trace
+  `8,8`) = **1 MUFU / 8 cyc**. FA3 softmax `MUFU.EX2` (HW's busiest pipe, xu 47.75%) serializes on this
+  narrow SFU → head MUFU clogs the 1-deep ISSUE_CONTROL latch → whole-subcore stall despite ready warps.
+  This reconciles the pipe paradox (HW MUFU 48% vs sim SFU fu_occupied ~0: the MUFU work turned into
+  issue-stall). **Fix (next, implement): lower SFU initiation interval to HW-faithful MUFU throughput**
+  (II 8→1–2) → MUFU flows, latch unclogs, SM-active 64%→toward 90%, cycles drop. ⚠️ throughput knob
+  (opposite of TODO-2 latency); verify vs H100 real SFU rate, A/B, re-check counters collapse. Full
+  analysis in [CONSUMER_COMPUTE_BOUND.md](file:///home/jihyun/modern-gpu-simulator-micro-2025/.plan/CONSUMER_COMPUTE_BOUND.md).
+  **bwd `.o31` confirms the same:** next_stage 21.3% of evaluated, 99.1% recoverable, `blocked_by_sfu`
+  **93.8%**, `hol_reason_fu_cannot_issue` 99.8%, `read_stage_full`=0. Both kernels ⇒ SFU II=8 is the clog.
 
 
 

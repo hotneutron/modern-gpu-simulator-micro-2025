@@ -284,6 +284,66 @@ advance, the subcore stalls instead of issuing a different ready warp (HW warp-s
 `not_selected`=0.82). Fixing this is a genuine cycle lever (~21% of evaluated cycles in bwd). fwd (`.o48`
 re-run) pending but expected to show the same shape.
 
+## ⭐⭐⭐⭐ ROOT CAUSE PINNED (2026-07-20e, fwd `OnlyKernel5/.o56`) — SFU initiation interval = 8
+
+With the root-cause counters emitted, fwd (gpu_sim_cycle 136,069) nails it:
+
+```
+next_stage_scanned          = 11,533,614   (== next_stage_not_available ✓)
+next_stage_with_ready_warp  = 11,339,290   → 98.3%  (recoverable head-of-line, ~2.77 ready warps/cyc)
+next_stage / evaluated      = 11.53M / 46.02M = 25.1%
+
+-- what holds the ISSUE_CONTROL latch (FU class) --
+blocked_by_sfu        = 11,498,648  → 99.7% !!!
+blocked_by_sp_int_dp  = 22,806      (0.2%)
+blocked_by_tensor/mem = 4 / 2,640   (~0)
+
+-- why the latch cannot drain (root reason) --
+hol_reason_fu_cannot_issue     = 11,508,436  → 99.8% !!!
+hol_reason_control_allocate_full = 25,350    (0.2%)
+hol_reason_read_stage_full     = 0           <-- NOT a latch/read-stage depth problem
+hol_reason_rf_conflict         = 33,064
+hol_reason_fu_latency_full     = 35
+```
+
+**Verdict: fwd's 25%-of-evaluated head-of-line is 99.7% the SFU functional unit refusing new ops.**
+`functional_unit_sfu::can_issue()` = `m_dispatch_reg->empty()` ([functional_unit.cc:523](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/functional_unit.cc#L522)); the SFU
+dispatch reg is held for the initiation interval, and the config is **`-sfu_initiation 8` /
+`-trace_opcode_latency_initiation_sfu 8,8`** → the SFU accepts only **1 MUFU every 8 cycles**. FA3 softmax
+issues a stream of `MUFU.EX2` (HW's busiest pipe, xu 47.75%); in sim they serialize on this narrow SFU,
+so 7 of every 8 cycles the head MUFU sits in the 1-deep ISSUE_CONTROL latch with `can_issue=false`, which
+stalls the ENTIRE subcore even though ~2.77 other warps were ready. `read_stage_full=0` and
+`control_allocate_full≈0` prove it is **NOT** a latch/pipeline-depth problem — it is pure **SFU
+throughput (initiation interval)**.
+
+**This reconciles the earlier pipe paradox.** HW xu(MUFU) pipe is 47.75% active (busiest); sim's SFU is
+so throughput-starved (II=8) that MUFU can't flow, so sim's SFU fu_occupied read as ~0 while the MUFU
+stream instead piles up as head-of-line `next_stage` stalls. The MUFU work didn't vanish — it turned into
+issue-stall.
+
+**Fix direction (next: implement, not measure):** lower the SFU initiation interval to match H100's real
+MUFU throughput (II=8 is far too coarse for a pipe that HW keeps ~48% active). Candidate:
+`-sfu_initiation` / `-trace_opcode_latency_initiation_sfu` init from 8 → 1–2. Expected effect: MUFU
+stream flows → SFU stops clogging ISSUE_CONTROL → the ~2.77 ready warps issue → SM-active rises toward
+HW 90% → **cycles drop**. ⚠️ This is a *throughput* knob (initiation), the opposite axis from TODO-2
+(SFU *latency*, which would slow sim); lowering II should reduce the ratio. Validate with an A/B run and
+re-check the head-of-line counters collapse.
+
+⚠️ Physical sanity before committing to II=1: check H100's actual MUFU/SFU throughput per SM (transcendental
+issue rate). If HW SFU is e.g. 1 op / 4 threads-worth per cycle, pick the II that matches, don't just
+minimize. The point is HW-faithful throughput, not a free speedup.
+
+### bwd confirms the same (2026-07-20e, `OnlyKernel10/.o31`, gpu_sim_cycle 216,174)
+
+```
+next_stage / evaluated      = 16.36M / 76.84M = 21.3% ;  with_ready_warp = 99.1% (~2.06 ready/cyc)
+blocked_by_sfu        = 15,351,266  → 93.8%   (branch_other 3.0%, mem 3.0%, sp_int_dp 0.1%, tensor ~0)
+hol_reason_fu_cannot_issue = 16,334,823 → 99.8% ; read_stage_full 0 ; control_allocate_full 0.1%
+```
+Same verdict as fwd: SFU `can_issue=false` (II=8) is the dominant head-of-line clog (93.8%), not
+latch depth. bwd has a little more branch/mem diversity (pre/post-processing) but SFU still dominates.
+Both kernels: fix = HW-faithful SFU initiation interval.
+
 
 ## Other debug counters live in this build (12h-run harvest)
 
