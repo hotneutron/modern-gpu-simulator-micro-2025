@@ -418,6 +418,15 @@ Decomposing WHY sim is compute-sparse (SM-active 64% vs HW 90%): sim per-SMSP cy
   analysis in [CONSUMER_COMPUTE_BOUND.md](file:///home/jihyun/modern-gpu-simulator-micro-2025/.plan/CONSUMER_COMPUTE_BOUND.md).
   **bwd `.o31` confirms the same:** next_stage 21.3% of evaluated, 99.1% recoverable, `blocked_by_sfu`
   **93.8%**, `hol_reason_fu_cannot_issue` 99.8%, `read_stage_full`=0. Both kernels ⇒ SFU II=8 is the clog.
+- **⛔ CORRECTED (2026-07-20f): SFU II=8 is HW-FAITHFUL — do NOT lower it.** H100 has 2,112 SFU / 132 SM =
+  4 SFU/subcore ⇒ 32 lanes / 4 = **8 cyc/MUFU-warp** = exactly the sim II. The bug is NOT the II value; it
+  is that sim's **1-deep ISSUE_CONTROL latch can't warp-switch** around a correctly-throttled FU: while
+  the SFU is (rightly) locked out 8 cyc, ~2 other warps are ready but `Subcore::issue()` skips the whole
+  warp-scan ([subcore.cc:458](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/subcore.cc#L458)) → full-subcore stall. HW hides the same
+  8-cyc SFU throughput by warp-switching (`not_selected` 0.82, SM 90% active). **Corrected fix = a
+  scheduler-model change** (let issue pick a different ready warp when the head warp's FU is busy), NOT a
+  config knob; keep II/latency HW-faithful. This is the same structural limit the async-WGMMA axis hit.
+  Full trace in [CONSUMER_COMPUTE_BOUND.md](file:///home/jihyun/modern-gpu-simulator-micro-2025/.plan/CONSUMER_COMPUTE_BOUND.md) "MAJOR CORRECTION".
 
 
 
@@ -1211,6 +1220,18 @@ knobs.
 > The TODO-2 slot below is a **new, unrelated** item (SFU/MUFU latency).
 
 ### TODO-2: SFU/MUFU (transcendental) latency is under-modeled in trace-driven mode
+
+> **⚠️ CORRECTED (2026-07-20e) — the "default 4,1" premise below is WRONG, and the direction warning is
+> likely wrong too.** The tracked baseline run (`OnlyKernel5/.o37`, gpu_sim_cycle 137,053) actually dumps
+> **`-trace_opcode_latency_initiation_sfu 8,8`** (not the `4,1` this TODO assumed) — the on-disk config
+> TODO-2 inspected was not the config the runs used. So SFU is **already given a high II (8)**, and the
+> per-FU head-of-line split (`.o56`/`.o31`) shows this SFU II is the dominant issue-stall clog
+> (`blocked_by_sfu` 99.7%/93.8%, `hol_reason_fu_cannot_issue` 99.8%, 25%/21% of evaluated cycles).
+> **Consequently the fix is the OPPOSITE of what's written below:** the problem is not "SFU latency too
+> low" — it is **SFU throughput too low (II=8 non-pipelined)**. The exp result latency is driven by
+> `latency` (`m_pipeline_reg[latency-1]`), independent of II, so **lowering II 8→1 pipelines the SFU,
+> unclogs ISSUE_CONTROL, and should REDUCE cycles** (not raise them). See
+> [CONSUMER_COMPUTE_BOUND.md](file:///home/jihyun/modern-gpu-simulator-micro-2025/.plan/CONSUMER_COMPUTE_BOUND.md). The original TODO-2 text is kept below for history.
 
 - **Status**: not fixed. The softmax `exp` (SASS `MUFU.EX2`) decodes correctly to `OP_MUFU` /
   `SFU_OP` ([hopper_opcode.h:30](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/ISA_Def/hopper_opcode.h#L30)) and routes to a **real, dedicated per-subcore SFU

@@ -333,6 +333,77 @@ re-check the head-of-line counters collapse.
 issue rate). If HW SFU is e.g. 1 op / 4 threads-worth per cycle, pick the II that matches, don't just
 minimize. The point is HW-faithful throughput, not a free speedup.
 
+## ⛔⛔ MAJOR CORRECTION (2026-07-20f) — SFU II=8 is HW-FAITHFUL; the bug is head-of-line, NOT the II value
+
+Checked H100 SFU throughput against hardware (web sources):
+- **H100 has 2,112 SFUs / 132 SMs = 16 SFU/SM = 4 SFU per subcore (SMSP).** (NVIDIA specs; SM90.)
+- An SFU is scalar; a 32-lane warp transcendental takes `warp_size / SFU_per_subcore = 32 / 4 =` **8
+  cycles** to issue one MUFU warp-inst. This is the classic SFU throughput (Fermi onward: 4 SFU ⇒ 32/4).
+- So **sim's `-trace_opcode_latency_initiation_sfu` II = 8 is exactly the correct HW throughput** (1 MUFU
+  warp / 8 cyc per subcore). It is NOT too big. **Lowering it would be an anti-HW fake win — do NOT do it.**
+
+**This overturns the "lower SFU II" fix proposed above.** The MUFU throughput model is right. The real
+bug is what the head-of-line counters actually showed: while the SFU is (correctly) locked out for its
+8-cyc throughput window, **~2 other warps are ready but the sim cannot issue them**, because the 1-deep
+ISSUE_CONTROL latch holds the stuck MUFU and `Subcore::issue()` skips the whole warp-scan
+([subcore.cc:458](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/subcore.cc#L458)). HW hides the same 8-cyc SFU throughput by
+warp-switching (NCU `not_selected`=0.82, SM-active 90%); sim can't, so SFU throughput turns into a
+full-subcore stall (SM-active 64%).
+
+**Corrected root cause:** not "SFU II too large" but **"the sim issue stage cannot warp-switch around a
+correctly-throttled FU."** The SFU II=8 is the *trigger* (FA3 is MUFU-heavy so it's the FU that most often
+occupies the latch), but the *defect* is the 1-deep ISSUE_CONTROL latch serializing issue.
+
+**Corrected fix direction (structural, harder — verify carefully):** make `Subcore::issue()` able to
+issue a different ready warp when the head warp's target FU can't accept it, instead of skipping the whole
+warp-scan on `!ISSUE_CONTROL_latch.has_free()`. Options: (a) decouple the warp-scan from latch-full and
+let a ready warp whose FU *can* accept it issue; (b) widen/parallelize the ISSUE_CONTROL path per-FU. This
+is exactly HW's per-SMSP scheduler behavior. ⚠️ NOT a config knob — a scheduler-model change; must keep II
+(FU throughput) and latency intact and validate the head-of-line counters collapse without inflating any
+FU beyond HW. Also re-confirm this is the same structural issue the async-WGMMA axis hit (WGMMA II is also
+HW-faithful; tensor just rarely holds the latch, so it wasn't the visible trigger).
+
+
+
+## Mechanism (same II path as WGMMA) — how the latch gets stuck
+
+Traced the SFU issue path end-to-end. It is the **same II mechanism** the async-WGMMA work analyzed:
+- `warp_inst_t::issue()` sets **`cycles = initiation_interval`** ([abstract_hardware_model.cc:97](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/abstract_hardware_model.cc#L97)).
+- SFU uses the **base** `functional_unit::cycle()` (functional_unit_sfu overrides only `can_issue`, not
+  `cycle`): [functional_unit.cc:306-319](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/functional_unit.cc#L306) — `if(!m_dispatch_reg->dispatch_delay())` counts
+  `cycles` (=II) down before the op leaves `m_dispatch_reg` into `m_pipeline_reg[latency-1]`.
+- `functional_unit_sfu::can_issue()` = `m_dispatch_reg->empty()` ([functional_unit.cc:522](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/functional_unit.cc#L522)).
+So a MUFU **holds the SFU dispatch reg for `initiation_interval` cycles** → `can_issue=false` for those
+cycles → the head MUFU sits in the 1-deep ISSUE_CONTROL latch → whole-subcore head-of-line. This is
+exactly WGMMA's `tensor_add_extra_cycle_initiation_interval` re-issue lockout, on the SFU pipe.
+
+**This RESOLVES `WGMMA_FU_OCCUPIED_H100.md` Caveat #1** (which flagged that `fu_occupied` is not
+tensor-only and that the tensor-vs-SFU split of the 13.6%/17.75% was an unmeasured hypothesis, esp.
+"fwd has 47% MUFU busy on HW"). Measured answer: the fwd/bwd `fu_occupied`/head-of-line clog is **99.7% /
+93.8% SFU, tensor ~0**. So the "over-estimated fu_occupied" lever that async-WGMMA chased was actually the
+**SFU pipe**, not WGMMA — which is why async-WGMMA (tensor II) was correctly refuted (tensor II wasn't the
+clog) while the real clog (SFU II) went unnoticed until this per-FU split.
+
+**Fix safety CONFIRMED (resolves Caveat #3 too).** The concern "does lowering II keep the result/
+dependency wait?" is answered by the code: the op is placed at `m_pipeline_reg[latency-1]`
+([functional_unit.cc:308](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/functional_unit.cc#L308)), so the **result latency is driven by `latency`, independent of the
+initiation interval**. Therefore setting `-trace_opcode_latency_initiation_sfu <latency>,1` (keep the
+latency the run used — 8 or the HW-anchored 21 — and set **II=1**) preserves the exp result-dependency
+wait while pipelining the throughput — a clean, HW-faithful fix, config-only (no rebuild).
+
+⚠️ **Config provenance — RESOLVED (2026-07-20e).** TODO-2 in FA3_progress.md claimed trace-mode SFU
+defaults to `4,1` (II=1, not a bottleneck) "because the config never sets
+`-trace_opcode_latency_initiation_sfu`". **That is wrong.** The tracked baseline run itself
+(`OnlyKernel5/.o37`, gpu_sim_cycle **137,053** — the canonical fwd baseline) dumps
+**`-trace_opcode_latency_initiation_sfu 8,8`** (+ `-sfu_latency 21`, `-sfu_initiation 8`). So the real
+baseline is **II=8, not 4,1** — SFU is genuinely the clog, and the head-of-line result (`.o56`, 136,069,
+same `8,8`) applies directly to the tracked baseline. The primary config file on disk currently shows no
+explicit `-trace_opcode_latency_initiation_sfu` line, so the actual value the runs use is injected
+elsewhere (job_launching config copy / a merged config) — the on-disk file that TODO-2 inspected was NOT
+the config the runs executed with. **Net: the "SFU II=8 is the FA3 root cause" conclusion is VALID; TODO-2
+needs correcting (its `4,1`/`fu_occupied_sfu=0` reasoning was based on the wrong config).**
+
+
 ### bwd confirms the same (2026-07-20e, `OnlyKernel10/.o31`, gpu_sim_cycle 216,174)
 
 ```
