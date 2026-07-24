@@ -560,6 +560,12 @@ void Subcore::issue(SM *shared_sm) {
   int best_sole_block_rank = -1;         // higher rank wins; -1 = none seen
   Step0SoleBlock best_sole_block = SB_MULTI;
 
+  // [intra-SMSP warp-switch] set true iff, this cycle, at least one warp's head targeted a busy
+  // no-queue FU (SFU) and was filtered at issue time by the new gate (can_issue=false). Combined
+  // with is_issued_inst in the stats block to record: fix fired / another warp then issued (the
+  // recovered slot) / still nobody issued. Only meaningful when -intra_smsp_warpswitch_enable is on.
+  bool intra_ws_sfu_filtered_this_cycle = false;
+
   modify_warp_state();
   if(m_num_pending_cycles_with_issue_port_busy > 0) {
     m_num_pending_cycles_with_issue_port_busy--;
@@ -724,6 +730,17 @@ void Subcore::issue(SM *shared_sm) {
         bool is_fixed_latency_inst = fu->is_fixed_latency_unit();
         if(is_fixed_latency_inst) {
           is_fu_available = fu->can_issue(pI);
+        } else if(m_config->intra_smsp_warpswitch_enable && !fu->get_has_queue()) {
+          // [intra-SMSP warp-switch] A no-queue FU (SFU) holds its dispatch reg for a DETERMINISTIC
+          // II (dispatch_delay counts initiation_interval down), so — like a fixed-latency unit — we
+          // know at issue time whether it can accept an op. Checking can_issue() here filters a busy
+          // SFU MUFU BEFORE it enters the 1-deep ISSUE_CONTROL latch, so the warp-scan continues and
+          // GTO picks another ready warp instead of the whole subcore stalling. Queue-based FUs are
+          // excluded (their drain is non-deterministic; deferred check is correct for them). II is
+          // untouched. Gated; default off = baseline bit-identical. See .plan/CONSUMER_COMPUTE_BOUND.md.
+          is_fu_available = fu->can_issue(pI);
+          // record that the fix actually filtered a busy-SFU head this cycle (for the effect counters).
+          if(!is_fu_available) intra_ws_sfu_filtered_this_cycle = true;
         }
         bool is_l1c_ready = tail_readonly ? true : are_l1c_operands_ready(shared_sm, pI);
         bool is_write_available_result_queue_for_fixed_latency_available = true;
@@ -945,6 +962,18 @@ void Subcore::issue(SM *shared_sm) {
     shared_sm->m_sm_stats.m_stats_map["total_num_spin_phasechk_issued"]->increment_with_integer(1);
     if (n_not_selected_this_cycle > 0) {
       shared_sm->m_sm_stats.m_stats_map["total_num_cycles_spin_won_over_eligible"]->increment_with_integer(1);
+    }
+  }
+  // [intra-SMSP warp-switch] effect counters — the DIRECT causal evidence for the fix (gated; only
+  // fires when -intra_smsp_warpswitch_enable filtered a busy-SFU head this cycle). Records, per cycle
+  // where the fix acted: how often ANOTHER warp then issued into the freed slot (the recovered slot =
+  // proof the warp-switch worked) vs. nobody issued (structural idle the fix cannot recover).
+  if (m_config->intra_smsp_warpswitch_enable && intra_ws_sfu_filtered_this_cycle) {
+    shared_sm->m_sm_stats.m_stats_map["total_num_intra_warpswitch_sfu_filtered"]->increment_with_integer(1);
+    if (is_issued_inst) {
+      shared_sm->m_sm_stats.m_stats_map["total_num_intra_warpswitch_other_warp_issued"]->increment_with_integer(1);
+    } else {
+      shared_sm->m_sm_stats.m_stats_map["total_num_intra_warpswitch_still_idle"]->increment_with_integer(1);
     }
   }
   if(is_issued_inst) {

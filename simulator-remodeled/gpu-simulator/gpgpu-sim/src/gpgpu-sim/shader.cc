@@ -1380,6 +1380,12 @@ void shader_core_stats::print_remodeling_stats(FILE *fout) {
   fprintf(fout, "total_num_hol_reason_read_stage_full = %llu\n", m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_hol_reason_read_stage_full"]->get_value());
   fprintf(fout, "total_num_hol_reason_rf_conflict = %llu\n", m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_hol_reason_rf_conflict"]->get_value());
   fprintf(fout, "total_num_hol_reason_fu_latency_full = %llu\n", m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_hol_reason_fu_latency_full"]->get_value());
+  // [intra-SMSP warp-switch] emit the fix-effect counters (0 unless -intra_smsp_warpswitch_enable).
+  // other_warp_issued / sfu_filtered = fraction of fix-fired cycles where the warp-switch recovered a
+  // slot (direct causal proof). See .plan/CONSUMER_COMPUTE_BOUND.md "Fix design".
+  fprintf(fout, "total_num_intra_warpswitch_sfu_filtered = %llu\n", m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_intra_warpswitch_sfu_filtered"]->get_value());
+  fprintf(fout, "total_num_intra_warpswitch_other_warp_issued = %llu\n", m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_intra_warpswitch_other_warp_issued"]->get_value());
+  fprintf(fout, "total_num_intra_warpswitch_still_idle = %llu\n", m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_intra_warpswitch_still_idle"]->get_value());
   // [NANOSLEEP spin lever] emit the gated spin counters (0 unless -spin_instrument_enable).
   fprintf(fout, "total_num_cycles_spin_ops_issued = %llu\n", m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_cycles_spin_ops_issued"]->get_value());
   fprintf(fout, "total_num_cycles_spin_won_over_eligible = %llu\n", m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_cycles_spin_won_over_eligible"]->get_value());

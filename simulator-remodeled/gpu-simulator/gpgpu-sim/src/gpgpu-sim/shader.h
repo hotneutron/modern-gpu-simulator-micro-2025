@@ -2266,6 +2266,15 @@ class shader_core_config : public core_config {
   // See .plan/CONSUMER_COMPUTE_BOUND.md.
   bool headofline_instrument_enable;
 
+  // [intra-SMSP warp-switch] When on, Subcore::issue() checks fu->can_issue() at issue time for
+  // deterministic-II FUs that have NO queue (i.e. SFU, which today is misfiled as non-fixed-latency
+  // via m_is_sfu and thus skips the issue-time FU check). This filters a busy-SFU MUFU BEFORE it
+  // enters the 1-deep ISSUE_CONTROL latch, so GTO can pick another ready warp (intra-SMSP warp-switch)
+  // instead of the whole subcore stalling. Queue-based FUs (MEM/TMA/MISC_QUEUE) are left on the
+  // deferred path (their drain time is non-deterministic). II/latency values are unchanged. Default 0
+  // reproduces baseline bit-identically. See .plan/CONSUMER_COMPUTE_BOUND.md "Fix design".
+  bool intra_smsp_warpswitch_enable;
+
   // Hopper mbarrier sync debug logging (SYNCDBG). Disabled by default.
   bool sync_debug_enable;
   unsigned int sync_debug_print_budget;

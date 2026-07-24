@@ -11,6 +11,81 @@ below as the reasoning trail.
 
 ---
 
+## Background — SM / SMSP (subcore) hierarchy + warp scheduling (GTO)
+
+This section grounds the terminology used throughout (subcore = SMSP, warp-switch, greedy pointer)
+so the head-of-line root cause below is unambiguous. It reflects H100 (SM90) hardware and how this
+simulator maps to it (verified in `subcore.cc`).
+
+### Hardware hierarchy (big → small)
+
+```
+GPU (H100)
+ └─ SM (Streaming Multiprocessor) × 132
+     └─ SMSP (SM Sub-Partition) × 4          ← the simulator calls this a "subcore"
+         └─ 1 warp scheduler (picks ≤1 warp to issue per cycle)
+         └─ functional units: FP / INT / TENSOR / SFU / ...
+         └─ resident warps (H100: up to 16 / SMSP)
+             └─ warp = 32 threads that always execute in lockstep (SIMT)
+```
+
+- **SMSP == subcore.** "SMSP" (SM Sub-Partition) is NVIDIA's term; "subcore" is this simulator's name
+  for the same unit. An SM has **4** of them, each an independent scheduler + its own FUs.
+- **Warp = 32 threads**, the atomic scheduling unit (not a thread). The scheduler reasons about warps.
+
+### How work maps onto the hardware
+
+- The grid's CTAs are distributed to SMs by the GigaThread engine. **A CTA's warps are then split
+  across the SM's 4 SMSPs and stay pinned there for the CTA's lifetime — no warp migration between
+  SMSPs, and none between SMs.** A warp's location is fixed at launch.
+- **Resident vs executing (the key distinction):**
+  - *Resident cap:* 132 SM × 4 SMSP × 16 warp = **8,448 warps** can be *loaded* (≈270K threads;
+    equivalently 64 warps/SM). Context-switch cost is **zero** — every resident warp's registers stay
+    live in the register file, so the scheduler can swap warps cycle-to-cycle for free.
+  - *Executing:* each SMSP issues **≤1 warp/cycle**, so at most 132×4 = **528 warps** issue in any
+    single cycle. The other resident warps are **not idle waste — they are the pool the scheduler
+    switches to when the front warp stalls** (this is latency hiding, the whole point of high
+    occupancy).
+- **Waves.** When there are more CTAs than fit at once (e.g. FA3 is 1 CTA/SM due to shared-mem), the
+  extras wait in the launch queue and load onto an SM only after a resident CTA finishes. fwd =
+  `Waves Per SM 1.00` (132 CTAs, one wave); bwd = `2.91` (384 CTAs over several waves → the causal
+  tail imbalance).
+
+### Warp scheduling policy — GTO (Greedy-Then-Oldest), what this simulator uses
+
+Each SMSP scheduler must pick, every cycle, one **eligible** warp among its residents. This simulator
+implements **GTO** (verified: [order_greedy_then_highest_id()](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/subcore.cc#L1288)):
+
+1. **Greedy:** keep issuing the *same* warp that issued last (`m_greedy_pointer_issue` is pushed to
+   the front of the priority list, [subcore.cc:1291](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/subcore.cc#L1291); refreshed on a successful issue,
+   [subcore.cc:839](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/subcore.cc#L839)) — stick with it until it stalls. Good for **cache/data
+   locality** (the hot warp keeps reusing what it just loaded).
+2. **Then-Oldest:** once the greedy warp stalls, fall back to the **oldest** warp — the rest are
+   sorted by `dynamic_warp_id` ascending (smallest = launched earliest = oldest,
+   [subcore.cc:1310](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/subcore.cc#L1310)); `done_exit()`/`waiting()` warps are pushed to the back
+   ([subcore.cc:1305-1308](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/subcore.cc#L1305)). Retiring the oldest first frees its
+   registers/shared-mem soonest (lets new CTAs in) and prevents starvation. `dynamic_warp_id` (not
+   static `warp_id`) is used so warp recycling across waves still reflects true launch order.
+
+GTO is the de-facto GPGPU-Sim standard and matches real NVIDIA scheduler behavior well.
+
+### Two levels of "switch" — where the bug is NOT vs where it IS
+
+| level | what | HW? | this simulator? |
+|---|---|---|---|
+| **Inter-SMSP** | one SMSP blocked → the other 3 SMSPs still issue | ✅ | ✅ modeled correctly (4 independent `Subcore`s) |
+| **Intra-SMSP warp-switch** | one scheduler picks another ready warp when the front warp's FU is busy | ✅ (NCU `not_selected` 0.82, SM-active 90%) | ❌ **the defect** |
+
+**Crucially, the GTO policy itself is correct and HW-faithful — the bug is upstream of it.** The
+warp-scan that applies GTO runs **only if** the 1-deep ISSUE_CONTROL latch is free
+(`else if(m_ISSUE_CONTROL_latch.has_free())`, [subcore.cc:566](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/subcore.cc#L566)). When a MUFU is stuck in
+that latch (SFU busy for its HW-faithful 8-cyc II), the whole scan is skipped, so GTO **never gets to
+pick** the ~2.77 other ready warps. HW would greedy→oldest onto a free pipe (TENSOR/FMA/ALU); the
+simulator stalls the entire SMSP instead. The sections below quantify this (25% of fwd subcore-cycles,
+99.7% SFU-held, 98.3% recoverable).
+
+---
+
 ## TL;DR (original — see correction above)
 
 The fwd 2.0× sim-vs-HW gap is **not** a memory, producer, frontend, or occupancy problem. A per-CTA
@@ -416,6 +491,89 @@ latch depth. bwd has a little more branch/mem diversity (pre/post-processing) bu
 Both kernels: fix = HW-faithful SFU initiation interval.
 
 
+## WGMMA vs SFU — SAME structural defect, DIFFERENT magnitude (2026-07-23)
+
+Q (raised this session): the deferred WGMMA axis (`WGMMA_FU_OCCUPIED_H100.md`, FA3_progress.md
+"Deferred Opts → async-WGMMA") had the *identical* II/latency/`fu_occupied` story. Is the SFU
+head-of-line the same bug? Does HW really schedule around a throttled FU this way? Answer below.
+
+**1. Same code mechanism — confirmed.** Both TENSOR (WGMMA) and SFU (MUFU) ride the exact same path:
+- issue sets `cycles = initiation_interval` ([abstract_hardware_model.cc:97](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/abstract_hardware_model.cc#L97));
+- `can_issue()` returns false while the dispatch reg / reserved-cycles hold (SFU:
+  [functional_unit.cc:522](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/functional_unit.cc#L522); tensor: `m_dispatch_pending_reserved_cycles`);
+- result latency is driven separately by `latency` (`m_pipeline_reg[latency-1]`,
+  [functional_unit.cc:308](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/functional_unit.cc#L308)), so shrinking II preserves the dependency wait on **both** pipes.
+So they are two instances of one mechanism, not two different bugs. This is why the SFU finding is
+annotated "same II path as WGMMA" in the Mechanism section above, and why it **RESOLVES
+`WGMMA_FU_OCCUPIED_H100.md` Caveat #1** (which explicitly flagged that `fu_occupied` was not
+tensor-only and that "fwd has 47% MUFU busy on HW" was an unmeasured hypothesis — the SFU split is
+that missing measurement).
+
+**2. Two DISTINCT stall sites (this is the whole subtlety).** `Subcore::issue()` has two places a
+warp can fail to issue, and WGMMA vs SFU hit them with very different frequency:
+
+| site | code | behavior |
+|---|---|---|
+| **(A) latch-entry gate** | `else if(m_ISSUE_CONTROL_latch.has_free())` ([subcore.cc:566](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/subcore.cc#L566)) | latch full ⇒ **whole warp-scan skipped** = per-subcore head-of-line |
+| **(B) in-loop FU check** | `!fu->can_issue()` ⇒ bump `fu_occupied`, `continue` | only **that** warp skipped; scan keeps looking |
+
+`WGMMA_FU_OCCUPIED_H100.md` studied (B) (`fu_occupied`) and explicitly noted the loop "skips a
+blocked warp rather than stalling the whole SM" (§2). The SFU analysis here found the damage is at
+(A): the MUFU stuck in the 1-deep ISSUE_CONTROL latch skips the *entire* scan.
+
+**3. Why WGMMA was a small lever but SFU is a big one — the trigger frequency differs.** Same defect,
+opposite magnitude, and the measured counters pin exactly why:
+
+| | WGMMA (tensor) | SFU (MUFU) |
+|---|---|---|
+| holds the ISSUE_CONTROL latch (`blocked_by_*`, `.o56`) | **~0** (`blocked_by_tensor` = 3–4) | **99.7%** (`blocked_by_sfu` = 11.5M) |
+| dynamic II-lockout extension (`add_extra_cycle`, Step-0) | 0.028% fwd / 0.024% bwd (negligible) | — |
+| per-subcore `..._reissue_lockout_only` | 4.69% fwd / 10.58% bwd | (folds into 25% next_stage) |
+| **SM-level** recoverable (`sm_idle_all_blocked_by_tensor`) | **0.65% fwd / 1.59% bwd** | 25.1% fwd / 21.3% bwd next_stage |
+
+The decisive number is the **SM-level** one. `WGMMA_FU_OCCUPIED_H100.md` (V) found that when one
+subcore is locked on the tensor II, **another subcore is almost always issuing**, so the per-subcore
+4.69% collapses to 0.65% SM-wide (~7× overcount) → "at most ~0.65–1.59% recoverable" → correctly
+**Deferred**. WGMMA simply does not occupy the latch often enough (a warpgroup issues an HGMMA then
+moves on; the tensor II rarely sits at the head). **SFU is the opposite:** FA3 softmax emits a dense
+`MUFU.EX2` stream (HW's busiest pipe, xu 47.75%), so a MUFU sits at the head of the 1-deep latch
+~7 of every 8 cycles → the latch is clogged 99.7% of head-of-line cycles → 25% of evaluated.
+
+**⇒ Reconciliation:** WGMMA and SFU are the SAME structural defect (1-deep ISSUE_CONTROL latch cannot
+warp-switch around a correctly-throttled FU). The async-WGMMA / `WGMMA_FU_OCCUPIED` deferral was
+**correct** — tensor rarely triggers it, so its recoverable ceiling really is ~1%. The defect only
+became a large lever once the *frequently-latch-occupying* pipe (SFU) was measured. WGMMA didn't
+"miss" it; its Caveat #1 named the exact unmeasured suspect (MUFU), which this analysis then filled in.
+
+**4. Does HW actually schedule this way? — YES, this is HW's normal latency-hiding, not a sim hack.**
+The warp-switch does **not** re-send anything to the (correctly) busy SFU. It issues a *different*
+ready warp to a *different, idle* FU (TENSOR / FMA / ALU). Evidence is direct HW measurement (NCU
+kernel-5), not a sim assumption:
+- `smsp__average_warps_issue_stalled_not_selected` = **0.82** — every issue-active cycle HW has, on
+  average, 0.82 *other* eligible-but-not-picked warps it can switch to.
+- `dispatch_stall` = 0.787 is a **per-warp** stall (that one warp waits for its port); the scheduler
+  issues a different warp meanwhile → SMSP stays busy → **SM-active 90%**.
+- Physical basis: H100 SMSP has 4 SFU ⇒ a 32-lane MUFU legitimately ties up the SFU for 8 cyc (II=8
+  is HW-faithful, do NOT lower it). During those 8 cyc the TENSOR/FMA/ALU pipes are free, and a
+  consumer warp on a different tile/stage runs there. sim's 1-deep latch forbids this (warp-scan
+  skipped) → the 8-cyc SFU throughput turns into a full-subcore stall (SM-active 64%).
+
+**5. Open nuance (noted, not yet separately measured).** The SM-level dilution that shrank WGMMA to
+0.65% relies on *another subcore* issuing while one is blocked. For SFU that dilution is evidently
+NOT saving us (fwd next_stage is 25% SM-wide, per-SM counters). The likely reason: all 4 subcores of
+an FA3 fwd SM run the same MUFU-heavy consumer warpgroup, so they tend to hit SFU head-of-line
+**in lockstep** (no subcore free to cover). The head-of-line counters are per-SM (already SM-wide),
+so the 25% is real SM-level; but the direct "how often are all 4 subcores SFU-blocked simultaneously"
+split — the SFU analogue of `WGMMA_FU_OCCUPIED_H100.md` (V) `sm_idle_all_blocked_by_tensor` — has NOT
+been isolated yet. If/when instrumentation resumes, that is the one counter that would convert the 25%
+head-of-line into an exact recoverable-cycle bound for the scheduler-model fix.
+
+**Bottom line:** same bug, and the WGMMA deferral stands as correct for the tensor pipe. The
+scheduler-model fix (let `Subcore::issue()` pick another ready warp when the head warp's FU is busy)
+is the shared cure for both pipes; it restores what HW already does (`not_selected` 0.82), keeps every
+FU's II/latency HW-faithful, and its payoff is dominated by the SFU trigger, not WGMMA.
+
+
 ## Other debug counters live in this build (12h-run harvest)
 
 Gates on in the H100 config for this run (all timing-neutral): `-headofline_instrument_enable`,
@@ -432,3 +590,84 @@ closed), so cycles are comparable to the tracked baseline modulo the ~0.4% instr
   The TMA-timeline pattern is a property of the trace + pipeline, not of the (reverted) NANOSLEEP knob.
 - HW: `nv_reports/h100/flashattn-fa3-bf16-bwd-causal-b1-s2048-hd64-nh24_full_rpt.ncu-rep`, kernel 5.
 - HW trace: `hw_run/traces/device-0/12.8/.../kernel_5/`.
+
+
+## Fix design — deterministic-II FUs should be issue-gated (2026-07-24)
+
+Code review of the issue pipeline (`subcore.cc`, `functional_unit.{h,cc}`, `abstract_hardware_model.h`)
+pinned the mechanism one level deeper than "1-deep latch": it is that **the FU-availability check is
+skipped at issue time for non-fixed-latency FUs**, so an op whose FU is busy still enters the latch and
+clogs it. The fix follows directly.
+
+### The two-category split and why SFU is misfiled
+
+`is_fixed_latency_unit()` = `!m_has_queue && !m_is_sfu` ([functional_unit.cc:109](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/functional_unit.cc#L109)). In
+`Subcore::issue()` the FU is checked **only if fixed-latency** ([subcore.cc:724-727](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/subcore.cc#L724)):
+
+```cpp
+bool is_fixed_latency_inst = fu->is_fixed_latency_unit();
+if(is_fixed_latency_inst) { is_fu_available = fu->can_issue(pI); }   // non-fixed: stays true
+```
+
+- **Fixed-latency (SP/INT/TENSOR/BRANCH/UNIFORM/MISC_NO_QUEUE):** `can_issue` checked at issue → a busy
+  FU makes the warp non-eligible, it is **filtered before the latch**, the scan continues to other
+  warps, and the latch stays free. This is why `blocked_by_tensor ≈ 0` — WGMMA never clogs the latch.
+- **Queue-based (MEM/TMA/MISC_QUEUE):** `can_issue = m_dispatch_reg->empty()` and
+  `functional_unit_with_queue::cycle()` drains `m_dispatch_reg` into the queue every cycle, gated by
+  **non-deterministic** RF/memory readiness ([functional_unit.cc:473-504](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/functional_unit.cc#L473)). You **cannot know at issue
+  time** when it will free, and the queue absorbs bursts — so deferring the check is **correct** for
+  these. (User's insight, confirmed in code: variable-latency + burst-absorbing ⇒ can't pre-decide
+  block.)
+- **SFU is misfiled between the two.** `functional_unit_sfu` sets `m_is_sfu=true`
+  ([functional_unit.cc:519](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/functional_unit.cc#L519)) so `is_fixed_latency_unit()` is false ⇒ it gets the
+  **deferred (queue-style) treatment** — but SFU has **no queue** (`m_has_queue=false`). It uses the
+  base `functional_unit::cycle()`, holding `m_dispatch_reg` for a **deterministic** II via
+  `dispatch_delay()` (`cycles=initiation_interval` → count down, [abstract_hardware_model.h:1654](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/abstract_hardware_model.h#L1654),
+  [abstract_hardware_model.cc:97](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/abstract_hardware_model.cc#L97)). So SFU knows **exactly** when it frees (8 cyc), just like a
+  fixed-latency unit — it should be issue-gated, but isn't. This one misfiling is the whole FA3 clog.
+
+### The fix (narrowed by the deterministic-II criterion)
+
+Gate `Subcore::issue()` to check `can_issue` for **deterministic-II FUs**, i.e. `!m_has_queue` (which
+now includes SFU) instead of `is_fixed_latency_unit()`. Concretely, at [subcore.cc:725](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/subcore.cc#L725), under a new
+default-off gate, evaluate `is_fu_available = fu->can_issue(pI)` when the FU has no queue (SFU + all
+current fixed-latency units), leaving queue-based FUs (MEM/TMA/MISC_QUEUE) on the deferred path
+untouched. Effect: a busy-SFU MUFU becomes non-eligible at issue → filtered before the latch → GTO
+picks the next ready warp (WGMMA/FMA/ALU) → latch no longer clogs → intra-SMSP warp-switch restored.
+II and latency values are **unchanged** (SFU II=8 stays HW-faithful).
+
+> Alternative considered — **reclassify SFU as fixed-latency** (drop the `m_is_sfu` exception): rejected
+> as riskier, because `is_fixed_latency_unit()` also routes SFU through CONTROL_ALLOCATE + the structured
+> RF-read/latency-bitset path ([subcore.cc:288-359](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/subcore.cc#L288),
+> [functional_unit.cc:306-319](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/functional_unit.cc#L306)), a much larger behavior change. Gating only the
+> issue-time `can_issue` check is the minimal, targeted change.
+
+### Side-effect audit (issue-gating SFU) — SAFE
+
+Traced every side effect on the issue path (`issue_warp()` → `SM::issue_warp()`) to confirm filtering an
+SFU op *before* the latch does not change ordering/correctness. All side effects fire **only on a
+successful issue**, so deferring them to the real issue cycle is neutral-or-more-correct:
+
+| side effect | site | impact of issue-gating SFU |
+|---|---|---|
+| `IBuffer->issued()` (ibuffer pop) | [sm.cc:799](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/sm.cc#L799) | more correct — no pop when it didn't actually issue (matches fixed-latency) |
+| `func_exec_inst` (functional exec) | [sm.cc:811](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/sm.cc#L811) | only delayed to real issue; MUFU still executes → same result |
+| `set_num_pending_cycles_with_issue_port_busy` | [subcore.cc:826](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/subcore.cc#L826) | called only on issue-success → already not called when blocked |
+| `reserve_unit` (holds dispatch_reg for II) | [subcore.cc:1283-1284](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/subcore.cc#L1283) | guarded by `is_fixed_latency_inst` → **not called for SFU today anyway**; II is set via `warp_inst.cycles` on `issue()`, so the II mechanism is untouched |
+| wait-barrier increment (READ/WRITE) | [subcore.cc:366-375](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/subcore.cc#L366) | runs in `control_stage()` on the latch occupant; SFU (MUFU.EX2) rarely carries read/write barriers, and if it does the set is merely deferred to real issue (op hasn't executed yet → logically correct) |
+| `MBARRIER_OP`/`BARRIER_OP` special handling | [sm.cc:827-849](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/sm.cc#L827) | routed to MISC_NO_QUEUE (fixed-latency), **not SFU** → unaffected |
+
+**Verdict: safe for SFU.** The only thing to watch in the A/B is the wait-barrier timing shift (expected
+zero-impact since SFU seldom sets barriers) — confirm the mbarrier wait-duration histogram and scoreboard
+outcomes are unchanged. Gate default-off must reproduce baseline **bit-identically**.
+
+### Validation plan (unchanged principles: gated, default-off, timing-neutral off)
+
+1. New gate `-intra_smsp_warpswitch_enable` (default 0). Off ⇒ bit-identical to baseline.
+2. A/B on fwd (vs `.o56`) + bwd: head-of-line counters must collapse
+   (`next_stage_with_ready_warp`↓ toward 0), SM-active 64%→toward HW 90%, cycles drop.
+3. HW-fidelity guards: no pipe's `fu_occupied`/tensor-active may exceed HW (NCU); `gpu_sim_insn`
+   unchanged (same work); II/latency values untouched.
+4. Regression: since only SFU newly gates (queue FUs excluded), memory-bound kernels should be
+   unaffected — spot-check one if available.
+5. wait-barrier timing: confirm mbarrier histogram / scoreboard results unchanged (side-effect audit).

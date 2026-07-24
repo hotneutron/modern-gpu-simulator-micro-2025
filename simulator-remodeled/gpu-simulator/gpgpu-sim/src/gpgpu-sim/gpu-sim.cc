@@ -2006,6 +2006,15 @@ void shader_core_config::reg_options(class OptionParser *opp) {
                          "No timing change. Independent gate. See .plan CONSUMER_COMPUTE_BOUND. "
                          "(default=0)",
                          "0");
+  option_parser_register(opp, "-intra_smsp_warpswitch_enable", OPT_BOOL,
+                         &intra_smsp_warpswitch_enable,
+                         "Enable intra-SMSP warp-switch around a busy deterministic-II FU: at issue "
+                         "time, also check fu->can_issue() for no-queue FUs (SFU) so a busy-SFU MUFU is "
+                         "filtered BEFORE the 1-deep ISSUE_CONTROL latch, letting GTO pick another ready "
+                         "warp instead of stalling the whole subcore. Queue-based FUs (MEM/TMA/MISC) are "
+                         "left on the deferred path. II/latency unchanged. Default 0 = baseline "
+                         "bit-identical. See .plan/CONSUMER_COMPUTE_BOUND.md 'Fix design'. (default=0)",
+                         "0");
   option_parser_register(opp, "-sync_debug_enable", OPT_BOOL,
                          &sync_debug_enable,
                          "Enable Hopper mbarrier sync debug logging (SYNCDBG)."
@@ -2909,6 +2918,16 @@ void gpgpu_sim::create_gpu_per_sm_stats() {
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_hol_reason_read_stage_full", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_hol_reason_rf_conflict", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_hol_reason_fu_latency_full", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  // [intra-SMSP warp-switch] effect counters (gated by -intra_smsp_warpswitch_enable; the fix itself
+  // changes timing, so these describe THIS run's behavior, not an observe-only overlay).
+  // sfu_filtered      = cycles the fix filtered a busy-SFU head at issue (denominator = fix fired).
+  // other_warp_issued = of those, cycles where ANOTHER warp then issued into the freed slot
+  //                     (the RECOVERED slot; sfu_filtered - this = still-idle). == direct proof of the
+  //                     intra-SMSP warp-switch. Compare against the baseline head-of-line blocked_by_sfu.
+  // still_idle        = of those, cycles where nobody issued anyway (structural idle the fix can't fix).
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_intra_warpswitch_sfu_filtered", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_intra_warpswitch_other_warp_issued", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_intra_warpswitch_still_idle", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
   // [WGMMA Opt6 Step-0 instrumentation] observe-only counters (no timing change).
   // (I) split fu_occupied by pipe op.
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_issue_stage_stall_at_least_one_warp_with_fu_occupied_tensor", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
