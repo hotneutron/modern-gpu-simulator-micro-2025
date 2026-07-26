@@ -188,6 +188,27 @@ consumer-compute model on the 2× ratio is therefore not obvious and must be mea
 
 ## Pipe-level breakdown (2026-07-20b) — the CORRECTED conclusion
 
+> ⛔⛔ **SUPERSEDED (2026-07-26b) — the "sim SFU ≈ 0 / SFU@4-cyc / MUFU under-modeled (TODO-2)" reading
+> in THIS section is a MEASUREMENT ARTIFACT, now corrected.** Two static findings overturn it:
+> 1. **`fu_occupied_sfu = 0.00%` was a counter artifact, not a real ~0.** It is tallied *inside* the
+>    `Subcore::issue()` warp-scan loop; in the baseline the busy SFU clogged the 1-deep ISSUE_CONTROL
+>    latch, so the loop was **skipped** and the SFU-busy cycles were booked to `next_stage` /
+>    `blocked_by_sfu` (25% / 99.7%) instead of `fu_occupied_sfu`. With Opt 10 (issue-gate) the loop runs
+>    and **`fu_occupied_sfu` = 30.95%** (fwd `.o58`) — SFU is one of sim's busiest pipes, NOT free. So
+>    "sim has almost no MUFU work to interleave" is **false**; the MUFU work was there all along, hidden
+>    as an issue-stall.
+> 2. **SFU is NOT modeled at "4-cyc FP-add cost".** The tracked run uses `-sfu_latency 21`
+>    (`[LATCFG] sfu=21`) and `-sfu_initiation 8`. HW microbenchmarks put SFU/MUFU latency at **~16 cyc**
+>    (Ampere/Hopper, several independent sources) — so sim's 21 is if anything **slightly OVER**-modeled,
+>    not under. **TODO-2's premise (SFU@4-cyc, under-modeled, fixing it slows sim) is wrong on both
+>    counts** and must be re-audited (likely a wrong-config inspection, same class of error as the
+>    earlier `8,8`-vs-`4,1` provenance bug).
+>
+> The real root cause is NOT "missing MUFU cost / can't reproduce xu 47.75%". It is the **issue-stage
+> head-of-line block** (fixed by Opt 10) plus the residual **SFU-throughput bound** (`still_idle` ≡
+> `fu_occupied_sfu`; consumer warps queue on the one HW-faithful SFU). The text below is retained as the
+> reasoning trail but its SFU/TODO-2 claims are void — see "RESULT (2026-07-26)" and the note below.
+
 Measured HW pipe-active (NCU kernel 5, `sm__pipe_*` / `sm__inst_executed_pipe_*` .avg.pct_of_peak_
 sustained_active) vs sim per-pipe fu_occupied (`.o45`, step0 counters). This is the decisive split.
 
@@ -707,24 +728,40 @@ eliminated on both kernels; the ~25% (fwd) / 21% (bwd) of subcore-cycles previou
 |---|---:|---:|---|
 | `sfu_filtered` (fix fired) | 19,148,406 | 21,412,122 | busy-SFU heads filtered at issue |
 | **`other_warp_issued`** (recovered slot) | **6,066,539 (31.7%)** | **5,634,782 (26.3%)** | another warp issued into the freed slot = the warp-switch working |
-| `still_idle` | 13,081,867 | 15,777,340 | SFU filtered but no other warp ready that cycle |
+| `still_idle` | 13,081,867 | 15,777,340 | SFU filtered and the subcore still issued nothing that cycle |
 
 So ~27–32% of fix-fired cycles directly recovered an issue slot via intra-SMSP warp-switch.
 
-⚠️ **Note — recovery rate (31.7%) is LOWER than the baseline head-of-line "98.4% had a ready warp".**
-Not a contradiction: the baseline "98.4% recoverable / ~2.73 ready warps" was a snapshot of the
-*un-fixed* pipeline. Once the fix changes timing, the warp-state distribution shifts — many cycles
-that used to show "another warp ready" now have that warp already issued elsewhere (its slot was
-consumed earlier), so the residual `still_idle` is genuine low-occupancy idle (1 CTA/SM), not a
-recoverable stall. This is consistent with the fix capturing the bulk of the recoverable cycles
-(−22% fwd) while the structural 1-CTA/SM idle floor remains. `still_idle` did NOT re-stall the whole
-subcore the way the baseline latch-clog did — it just means no work existed that cycle.
+⚠️ **Note — why the recovery rate is "only" 31.7% (CORRECTED 2026-07-26b, static analysis).** An
+earlier draft attributed the 68.3% `still_idle` to a "1-CTA/SM low-occupancy floor (no other warp
+ready)". **That was wrong.** A static cross-check of the existing counters (no new run) shows
+`still_idle` = **13,081,867** vs `fu_occupied_sfu` = **13,081,770** — the same set to within **97
+cycles (0.0007%)**. These two counters are computed on independent code paths, so their 1:1 match is
+strong evidence that on a `still_idle` cycle a warp **is** present and eligible-except-for-the-FU —
+it is **waiting on the (correctly HW-faithful, II=8) SFU**, not absent. The wall is **SFU throughput**,
+not occupancy: when the front warp's MUFU is filtered, the other ready warps' heads are *also* MUFU
+targeting the same single SFU, so there is no free-pipe warp to switch to. (This reconciles with the
+baseline "98.4% had a ready warp": that snapshot counted *warp-side* readiness, excluding the FU — so
+those warps were "ready" only in the sense the fix now correctly rejects.)
+
+⚠️ **What is NOT statically provable.** The counters are per-cycle "≥1 warp" overlap counters, so we
+can pin *that SFU dominates* `still_idle` (Test 1 above), but **not** decompose whether every warp on
+those cycles wanted *only* MUFU vs. a mix (some also on tensor/scoreboard). The specific mechanism
+**"softmax MUFU-lockstep"** (all 12 consumer warps in the same softmax stage at once) is a strong
+inference — supported by (a) the SFU-dominance match and (b) source: GTO does not force warp-stagger
+and the fix only skips-then-retries, it does not spread warps across pipe stages
+([subcore.cc:774](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/subcore.cc#L774)) — but it is **not confirmed**; proving it needs a per-cycle
+concurrent-PC / per-warp-head-op-class histogram (a new gated counter), deferred.
 
 ### Verdict
 
 The intra-SMSP warp-switch (SFU issue-gating) is a **confirmed cycle lever**: fwd −22.4% / bwd −16.7%,
 work-invariant, head-of-line collapsed to ~0, SFU clog eliminated, warp-switch fired and recovered
-slots as designed. The residual gap (fwd 1.56×) is now the structural 1-CTA/SM low-occupancy floor
-(no eligible warp exists on `still_idle` cycles), not the issue-pipeline defect. Remaining fidelity
-check (deferred, not blocking): confirm mbarrier histogram / scoreboard unchanged (SFU rarely sets
-barriers, expected zero-impact).
+slots as designed. The residual gap (fwd 1.56×) is **not** an occupancy floor — it is **SFU throughput
+bound** (`still_idle` ≡ `fu_occupied_sfu`): the consumer warps queue on the single HW-faithful SFU
+(II=8), so there is no free-pipe warp to switch to on those cycles. HW hides the same 8-cyc SFU
+throughput by staggering its 12 consumer warps across different pipe stages (SM-active 90%); the sim's
+lack of that stagger (likely softmax MUFU-lockstep, unproven) is the next candidate axis — an
+overlap/scheduling property, not a per-op latency or the (now-fixed) issue-latch defect. Remaining
+fidelity check (deferred, not blocking): confirm mbarrier histogram / scoreboard unchanged (SFU rarely
+sets barriers, expected zero-impact).

@@ -36,7 +36,7 @@ To keep this file easy to extend, use the following update pattern whenever a ne
 | Opt 7 | TMA queue/interconnect calibration (inject + reply) | HW-calibrated per-SM 4 sector/clk drain on both inject and reply paths: `-icnt_grant_passes_per_cycle 4` + `-gpgpu_icnt_to_l2_pop_per_cycle 4` (inject) + `-gpgpu_l2_reply_drain_per_cycle 4` + `-gpgpu_cluster_reply_eject_per_cycle 4` (reply), paired so no 1/tick choke remains. Timing-only (work invariant). | 138,021 cycles (2.04x vs HW, **-5.4% vs Opt 6**). fwd `.o35`. `L2_TMA_true_hit_rate` 0.9456 (unchanged → work invariant). | 250,026 cycles (1.88x vs HW, **-13.9% vs Opt 6**). bwd `.o18`. `L2_TMA_true_hit_rate` 0.8688 (unchanged). `gpu_stall_icnt2sh` 1.82M→5.8K, `L2_TMA_output_full` 1.39M→441. | Done. TMA queue tuning now **exhausted** — every queue stage at noise floor; next wall is `ROP_DELAY` (fixed-latency), see Ongoing. |
 | Opt 8 | L2 slice parallelism (admission-rate + balanced slice hash) | Part 1: `-gpgpu_l2_admit_sectors_per_cycle 2` (HW 64B/cycle/slice). Part 2: `-gpgpu_l2_slice_balanced_hash 1` (SplitMix64 hash removes the `ipoly%80` 2:1 spatial imbalance from the 40-channel non-2^n config). Timing-only (work invariant). | 137,053 cycles (2.02x vs HW, **-0.7% vs Opt 7**). fwd `.o37`. `L2_TMA_true_hit_rate` 0.9453 (unchanged). Correctly a near no-op — fwd's TMA path was already at floor (ROP_DELAY 126≈fixed 100); its bottleneck is frontend tail + hit-rate over-model, not the TMA queue. | 234,665 cycles (**1.77x** vs HW, **-6.1% vs Opt 7**). bwd `.o20`. `L2_TMA_true_hit_rate` 0.8688 (unchanged). **Part 2 did the heavy lifting**: slice imbalance removed (util p50≈max), ROP_DELAY 1,483→558 (-62%), `gpu_stall_dramfull` 137K→0. | Done. Placement bias fixed; residual bwd wall is per-transfer temporal-burst / fixed-overhead (see Ongoing). |
 | Opt 9 | L2 sub-partition drain widening (ROP-drain + DRAM-reply-drain) | Two symmetric 1-sector/tick L2 gates, each its own knob: `-gpgpu_l2_rop_drain_per_cycle 2` (Gate A, REQUEST: ROP delay-queue→m_icnt_L2_queue) + `-gpgpu_l2_dram_reply_drain_per_cycle 2` (Gate B, REPLY: m_dram_L2_queue→L2 fill/L2_icnt; fill port modeled M-wide). Fixed latencies unchanged; timing-only (work invariant). | 135,999 cycles (2.01x vs HW, **-0.8% vs Opt 8**). fwd `.o38`. `L2_TMA_true_hit_rate` 0.9455 (unchanged). Small (fwd still frontend-tail bound). | 215,895 cycles (**1.62x** vs HW, **-8.0% vs Opt 8**). bwd `.o21`. `L2_TMA_true_hit_rate` 0.8682 (unchanged). **Unlocked Opt 8**: `L2_admit_per_active_cycle` 1.00→**1.93** (the 2-wide bank was starved by the 1/tick ROP feed); ROP_DELAY 558→**164** (-71%), `averagemflatency` 692→369. | Done. Opt 8+9 were a matched pair. Residual now spread across ROP(45%)+inject(37%)+reply(12.5%); no single 1/tick gate dominates. |
-| Opt 10 | intra-SMSP warp-switch (SFU issue-gating) | `-intra_smsp_warpswitch_enable 1` (code + config). At issue time, also check `fu->can_issue()` for no-queue FUs (SFU), so a busy-SFU MUFU (deterministic II=8) is filtered BEFORE the 1-deep `ISSUE_CONTROL` latch and GTO warp-switches to a ready warp instead of stalling the whole subcore. Queue FUs (MEM/TMA/MISC) keep the deferred path. II/latency unchanged; timing-only (work invariant). | 105,464 cycles (**1.56x** vs HW, **-22.4% vs Opt 9**). fwd `.o58`. `gpu_sim_insn` **bit-identical** to baseline (455,565,060); `issue_stage_issuing` bit-identical (16,064,281). Head-of-line `next_stage` 25.1%→**0.06%**, `blocked_by_sfu` 11.48M→**0**. | 178,856 cycles (**1.35x** vs HW, **-16.7% vs Opt 9**). bwd `.o33`. `gpu_sim_insn` bit-identical (629,211,348). `next_stage` 21.3%→**1.6%**, `blocked_by_sfu` 15.36M→**0**. Warp-switch recovered slot (`other_warp_issued/sfu_filtered`) fwd 31.7% / bwd 26.3%. | Done. The compute-path issue-pipeline defect (SFU head-of-line) fixed; residual (fwd 1.56x) is the structural 1-CTA/SM occupancy floor. See [CONSUMER_COMPUTE_BOUND.md](file:///home/jihyun/modern-gpu-simulator-micro-2025/.plan/CONSUMER_COMPUTE_BOUND.md). |
+| Opt 10 | intra-SMSP warp-switch (SFU issue-gating) | `-intra_smsp_warpswitch_enable 1` (code + config). At issue time, also check `fu->can_issue()` for no-queue FUs (SFU), so a busy-SFU MUFU (deterministic II=8) is filtered BEFORE the 1-deep `ISSUE_CONTROL` latch and GTO warp-switches to a ready warp instead of stalling the whole subcore. Queue FUs (MEM/TMA/MISC) keep the deferred path. II/latency unchanged; timing-only (work invariant). | 105,464 cycles (**1.56x** vs HW, **-22.4% vs Opt 9**). fwd `.o58`. `gpu_sim_insn` **bit-identical** to baseline (455,565,060); `issue_stage_issuing` bit-identical (16,064,281). Head-of-line `next_stage` 25.1%→**0.06%**, `blocked_by_sfu` 11.48M→**0**. | 178,856 cycles (**1.35x** vs HW, **-16.7% vs Opt 9**). bwd `.o33`. `gpu_sim_insn` bit-identical (629,211,348). `next_stage` 21.3%→**1.6%**, `blocked_by_sfu` 15.36M→**0**. Warp-switch recovered slot (`other_warp_issued/sfu_filtered`) fwd 31.7% / bwd 26.3%. | Done. The compute-path issue-pipeline defect (SFU head-of-line) fixed; residual (fwd 1.56x) is **SFU-throughput bound** (`still_idle` ≡ `fu_occupied_sfu`, warps queue on the one HW-faithful SFU), not an occupancy floor — next candidate axis is warp-stagger/overlap. See [CONSUMER_COMPUTE_BOUND.md](file:///home/jihyun/modern-gpu-simulator-micro-2025/.plan/CONSUMER_COMPUTE_BOUND.md). |
 
 ### Simulator Cycle Breakdown
 
@@ -661,11 +661,16 @@ whether a slot was recovered.
   → **0**; bwd 21.3% → **1.6%**, `blocked_by_sfu` 15.36M → **0**. `issuing` (SM-active proxy) fwd 35.0%
   → 38.0%, bwd 29.5% → 32.3%.
 - **Warp-switch fired (direct causal proof):** `other_warp_issued / sfu_filtered` = fwd 6.07M/19.15M
-  = **31.7%**, bwd 5.63M/21.41M = **26.3%** of fix-fired cycles recovered an issue slot. Residual
-  `still_idle` (fwd 13.08M / bwd 15.78M) = genuine 1-CTA/SM low-occupancy idle (no other warp existed
-  that cycle), which no longer re-stalls the whole subcore.
-- **Residual:** fwd 1.56× is now the structural 1-CTA/SM occupancy floor (233 KB shmem/block → 1 CTA/SM,
-  HW-matched), not the issue-pipeline defect. Deferred/non-blocking fidelity check: mbarrier
+  = **31.7%**, bwd 5.63M/21.41M = **26.3%** of fix-fired cycles recovered an issue slot. The residual
+  `still_idle` (fwd 13.08M / bwd 15.78M) is **not** occupancy idle — a static cross-check shows it ≡
+  `fu_occupied_sfu` (fwd 13,081,867 vs 13,081,770, **97-cycle / 0.0007% match**), i.e. a warp IS present
+  but waiting on the single HW-faithful SFU (II=8). It no longer re-stalls the whole subcore.
+- **Residual:** fwd 1.56× is **SFU-throughput bound**, not an occupancy floor — on `still_idle` cycles
+  the consumer warps queue on the one SFU (their heads are also MUFU), so there is no free-pipe warp to
+  switch to. HW hides the same 8-cyc SFU throughput by staggering its 12 consumer warps across pipe
+  stages (SM-active 90%); the sim's missing stagger (likely softmax MUFU-lockstep, **unproven** — needs
+  a per-warp head-op / concurrent-PC histogram) is the next candidate axis, an overlap/scheduling
+  property, not the (now-fixed) issue-latch defect. Deferred/non-blocking fidelity check: mbarrier
   histogram / scoreboard unchanged (SFU rarely sets barriers, expected zero-impact).
 
 ## 3. Arch TODO
@@ -698,66 +703,3 @@ knobs.
   reads — it does not change which L2 slice a line lands on. The two are orthogonal (different memory
   layers). Whether TMA bursts actually exploit the L2 slice spread is a separate, measurable question —
   see [L2_SLICE_PARALLELISM_H100.md](file:///home/jihyun/modern-gpu-simulator-micro-2025/.plan/L2_SLICE_PARALLELISM_H100.md) §8 (per-slice admission histogram) / §9.
-
-> Note: the *original* TODO-2 (real TMA base address) has been implemented — real per-site GMEM
-> base + CTA-indexed tile spread (M2/M2.5). It is no longer a TODO; see the Ongoing section above
-> and [TMA_exact_base_mapping_integration.md](file:///home/jihyun/modern-gpu-simulator-micro-2025/.plan/TMA_exact_base_mapping_integration.md).
-> The TODO-2 slot below is a **new, unrelated** item (SFU/MUFU latency).
-
-### TODO-2: SFU/MUFU (transcendental) latency is under-modeled in trace-driven mode
-
-> **⚠️ CORRECTED (2026-07-20e) — the "default 4,1" premise below is WRONG, and the direction warning is
-> likely wrong too.** The tracked baseline run (`OnlyKernel5/.o37`, gpu_sim_cycle 137,053) actually dumps
-> **`-trace_opcode_latency_initiation_sfu 8,8`** (not the `4,1` this TODO assumed) — the on-disk config
-> TODO-2 inspected was not the config the runs used. So SFU is **already given a high II (8)**, and the
-> per-FU head-of-line split (`.o56`/`.o31`) shows this SFU II is the dominant issue-stall clog
-> (`blocked_by_sfu` 99.7%/93.8%, `hol_reason_fu_cannot_issue` 99.8%, 25%/21% of evaluated cycles).
-> **Consequently the fix is the OPPOSITE of what's written below:** the problem is not "SFU latency too
-> low" — it is **SFU throughput too low (II=8 non-pipelined)**. The exp result latency is driven by
-> `latency` (`m_pipeline_reg[latency-1]`), independent of II, so **lowering II 8→1 pipelines the SFU,
-> unclogs ISSUE_CONTROL, and should REDUCE cycles** (not raise them). See
-> [CONSUMER_COMPUTE_BOUND.md](file:///home/jihyun/modern-gpu-simulator-micro-2025/.plan/CONSUMER_COMPUTE_BOUND.md). The original TODO-2 text is kept below for history.
-
-- **Status**: not fixed. The softmax `exp` (SASS `MUFU.EX2`) decodes correctly to `OP_MUFU` /
-  `SFU_OP` ([hopper_opcode.h:30](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/ISA_Def/hopper_opcode.h#L30)) and routes to a **real, dedicated per-subcore SFU
-  functional unit** ([functional_unit.h:190](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/functional_unit.h#L190); routed at
-  [subcore.cc:1092-1093](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/subcore.cc#L1092-L1093)) — so the pipe **is** modeled. The gap is the **latency/throughput**
-  it is given.
-- **The bug (config gap, not code).** In trace-driven mode the per-op timing comes from
-  `-trace_opcode_latency_initiation_sfu` ([trace_driven.cc:711-715](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/trace-driven/trace_driven.cc#L711-L715), consumed for
-  `SFU_OP` at [trace_driven.cc:812-814](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/trace-driven/trace_driven.cc#L812-L814)). The H100 config
-  (`SM90_H100_L2_50MB_80GB/gpgpusim.config`) sets only `-ptx_opcode_latency_sfu 21` /
-  `-ptx_opcode_initiation_sfu 8` (lines 89-90), which feed the **PTX functional-sim path**
-  (`cuda-sim.cc`), NOT the trace-driven timing. It never sets `-trace_opcode_latency_initiation_sfu`,
-  so trace mode falls back to the default **`"4,1"`** → **latency = 4 cyc, initiation interval = 1**,
-  *identical to an FP add* (`-trace_opcode_latency_initiation_sp` also defaults to `"4,1"`,
-  [trace_driven.cc:701-705](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/trace-driven/trace_driven.cc#L701-L705); config does not override it either). This is why the Opt-8 fwd run
-  reports `fu_occupied_sfu = 0.00%` — with 4 SFU units (one per subcore) each accepting one MUFU/cycle
-  at 4-cyc latency, the transcendental pipe **never bottlenecks**.
-- **Why it matters (fidelity).** On real H100, MUFU/transcendental runs at roughly **¼ the FMA rate**,
-  and for FA3 **fwd** the xu/MUFU pipe is the **single busiest pipe on HW** — `SM Busy = 47.75%`
-  (NCU, kernel 5), driven by the softmax `exp`. See [FA3_kernel_5_fwd.md](file:///home/jihyun/modern-gpu-simulator-micro-2025/.result/FA3_kernel_5_fwd.md) HW pipe table
-  (`sm__inst_executed_pipe_xu = 47.75%`). Modeling `exp` at FP-add cost under-represents fwd's
-  dominant compute cost.
-- **⚠ Direction warning — this is a FIDELITY fix, NOT a cycle-reduction lever (it makes the sim
-  SLOWER).** fwd currently over-estimates at **2.02×** HW (137,053 vs 67,696). Because the sim already
-  under-costs its busiest pipe yet is still 2× too slow, giving SFU a realistic (higher) latency/II
-  will push fwd cycles **UP**, widening the raw ratio. It must therefore be landed as an accuracy
-  item, and only alongside re-checking the residual axes — the under-costed SFU is currently a
-  **compensating error** that partially masks an over-estimation elsewhere (exposed
-  warp-not-ready / mbarrier-wait under the 1-CTA/SM occupancy). Do **not** treat closing it as a win
-  on the sim-vs-HW cycle ratio.
-- **TODO (fix, when accuracy work is prioritized)**:
-  1. Add `-trace_opcode_latency_initiation_sfu <lat>,<ii>` to the H100 config. Start from the PTX-path
-     values already present (`21,8`) as the HW-plausible anchor (MUFU ~¼ FMA throughput ⇒ II≈4-8),
-     then calibrate `lat`/`ii` against the NCU xu-pipe utilization (target: sim SFU-pipe occupancy
-     approaches HW `pipe_xu` 47.75% for fwd) rather than guessing.
-  2. Re-verify the pipe actually saturates: `fu_occupied_sfu` should become **> 0** once the II is
-     realistic (that counter is the built-in proof the SFU pipe now bottlenecks —
-     [subcore.cc:647](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/subcore.cc#L647), gated on `-wgmma_step0_instrument_enable`).
-  3. Because it raises cycles, land it together with a re-measurement of the compensated axis
-     (`wait_barrier` / warp-not-ready), and keep the work axis (instruction counts, hit rate)
-     invariant — this is a pure per-op *timing* change.
-  4. **Bit-identity safety**: gate via config only (no code change needed for the minimal fix); with
-     the option absent the default `"4,1"` reproduces today's behavior exactly, so existing 12h runs
-     stay bit-identical until the config is deliberately changed.
