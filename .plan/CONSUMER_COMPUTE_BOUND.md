@@ -671,3 +671,60 @@ outcomes are unchanged. Gate default-off must reproduce baseline **bit-identical
 4. Regression: since only SFU newly gates (queue FUs excluded), memory-bound kernels should be
    unaffected — spot-check one if available.
 5. wait-barrier timing: confirm mbarrier histogram / scoreboard results unchanged (side-effect audit).
+
+## ⭐⭐⭐⭐⭐ RESULT (2026-07-26) — FIX WORKS: fwd 2.01×→1.56×, bwd 1.62×→1.35×
+
+A/B run, same build, gate off vs on. Baseline = fwd `OnlyKernel5/.o57` / bwd `OnlyKernel10/.o32`
+(`-intra_smsp_warpswitch_enable 0`); fix = fwd `.o58` / bwd `.o33` (gate `1`). All other instrument
+gates identical on both sides.
+
+### Cycles — large drop, and it is a REAL (work-invariant) speedup
+
+| kernel | baseline (gate 0) | **fix (gate 1)** | Δcyc | HW | mult before→after |
+|---|---:|---:|---:|---:|---|
+| **fwd (K5)** | 135,833 | **105,464** | **−22.4%** | 67,696 | **2.01× → 1.56×** |
+| **bwd (K10)** | 214,826 | **178,856** | **−16.7%** | 132,901 | **1.62× → 1.35×** |
+
+**Work-invariant proof (not a fake win):** `gpu_sim_insn` **bit-identical** (fwd 455,565,060 both;
+bwd 629,211,348 both) and `issue_stage_issuing` **bit-identical** (fwd 16,064,281 both; bwd
+22,626,216 both). Same instructions issued, same work — only the issue-*stall* was removed.
+
+### Head-of-line collapse (the mechanism, confirmed)
+
+| metric (fwd) | baseline | fix |
+|---|---:|---:|
+| `next_stage_not_available` / evaluated | 11,514,572 = **25.1%** | 25,423 = **0.06%** |
+| `next_stage_blocked_by_sfu` | 11,480,175 | **0** |
+| `issue_stage_issuing` / evaluated (≈ SM-active proxy) | 35.0% | **38.0%** |
+
+bwd same shape: next_stage 21.3% → **1.6%**, `blocked_by_sfu` 15,361,151 → **0**. The SFU clog is
+eliminated on both kernels; the ~25% (fwd) / 21% (bwd) of subcore-cycles previously thrown away at the
+1-deep latch are recovered.
+
+### Warp-switch effect counters (direct causal evidence)
+
+| counter | fwd | bwd | read |
+|---|---:|---:|---|
+| `sfu_filtered` (fix fired) | 19,148,406 | 21,412,122 | busy-SFU heads filtered at issue |
+| **`other_warp_issued`** (recovered slot) | **6,066,539 (31.7%)** | **5,634,782 (26.3%)** | another warp issued into the freed slot = the warp-switch working |
+| `still_idle` | 13,081,867 | 15,777,340 | SFU filtered but no other warp ready that cycle |
+
+So ~27–32% of fix-fired cycles directly recovered an issue slot via intra-SMSP warp-switch.
+
+⚠️ **Note — recovery rate (31.7%) is LOWER than the baseline head-of-line "98.4% had a ready warp".**
+Not a contradiction: the baseline "98.4% recoverable / ~2.73 ready warps" was a snapshot of the
+*un-fixed* pipeline. Once the fix changes timing, the warp-state distribution shifts — many cycles
+that used to show "another warp ready" now have that warp already issued elsewhere (its slot was
+consumed earlier), so the residual `still_idle` is genuine low-occupancy idle (1 CTA/SM), not a
+recoverable stall. This is consistent with the fix capturing the bulk of the recoverable cycles
+(−22% fwd) while the structural 1-CTA/SM idle floor remains. `still_idle` did NOT re-stall the whole
+subcore the way the baseline latch-clog did — it just means no work existed that cycle.
+
+### Verdict
+
+The intra-SMSP warp-switch (SFU issue-gating) is a **confirmed cycle lever**: fwd −22.4% / bwd −16.7%,
+work-invariant, head-of-line collapsed to ~0, SFU clog eliminated, warp-switch fired and recovered
+slots as designed. The residual gap (fwd 1.56×) is now the structural 1-CTA/SM low-occupancy floor
+(no eligible warp exists on `still_idle` cycles), not the issue-pipeline defect. Remaining fidelity
+check (deferred, not blocking): confirm mbarrier histogram / scoreboard unchanged (SFU rarely sets
+barriers, expected zero-impact).

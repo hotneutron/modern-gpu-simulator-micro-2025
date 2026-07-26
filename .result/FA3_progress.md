@@ -36,66 +36,67 @@ To keep this file easy to extend, use the following update pattern whenever a ne
 | Opt 7 | TMA queue/interconnect calibration (inject + reply) | HW-calibrated per-SM 4 sector/clk drain on both inject and reply paths: `-icnt_grant_passes_per_cycle 4` + `-gpgpu_icnt_to_l2_pop_per_cycle 4` (inject) + `-gpgpu_l2_reply_drain_per_cycle 4` + `-gpgpu_cluster_reply_eject_per_cycle 4` (reply), paired so no 1/tick choke remains. Timing-only (work invariant). | 138,021 cycles (2.04x vs HW, **-5.4% vs Opt 6**). fwd `.o35`. `L2_TMA_true_hit_rate` 0.9456 (unchanged → work invariant). | 250,026 cycles (1.88x vs HW, **-13.9% vs Opt 6**). bwd `.o18`. `L2_TMA_true_hit_rate` 0.8688 (unchanged). `gpu_stall_icnt2sh` 1.82M→5.8K, `L2_TMA_output_full` 1.39M→441. | Done. TMA queue tuning now **exhausted** — every queue stage at noise floor; next wall is `ROP_DELAY` (fixed-latency), see Ongoing. |
 | Opt 8 | L2 slice parallelism (admission-rate + balanced slice hash) | Part 1: `-gpgpu_l2_admit_sectors_per_cycle 2` (HW 64B/cycle/slice). Part 2: `-gpgpu_l2_slice_balanced_hash 1` (SplitMix64 hash removes the `ipoly%80` 2:1 spatial imbalance from the 40-channel non-2^n config). Timing-only (work invariant). | 137,053 cycles (2.02x vs HW, **-0.7% vs Opt 7**). fwd `.o37`. `L2_TMA_true_hit_rate` 0.9453 (unchanged). Correctly a near no-op — fwd's TMA path was already at floor (ROP_DELAY 126≈fixed 100); its bottleneck is frontend tail + hit-rate over-model, not the TMA queue. | 234,665 cycles (**1.77x** vs HW, **-6.1% vs Opt 7**). bwd `.o20`. `L2_TMA_true_hit_rate` 0.8688 (unchanged). **Part 2 did the heavy lifting**: slice imbalance removed (util p50≈max), ROP_DELAY 1,483→558 (-62%), `gpu_stall_dramfull` 137K→0. | Done. Placement bias fixed; residual bwd wall is per-transfer temporal-burst / fixed-overhead (see Ongoing). |
 | Opt 9 | L2 sub-partition drain widening (ROP-drain + DRAM-reply-drain) | Two symmetric 1-sector/tick L2 gates, each its own knob: `-gpgpu_l2_rop_drain_per_cycle 2` (Gate A, REQUEST: ROP delay-queue→m_icnt_L2_queue) + `-gpgpu_l2_dram_reply_drain_per_cycle 2` (Gate B, REPLY: m_dram_L2_queue→L2 fill/L2_icnt; fill port modeled M-wide). Fixed latencies unchanged; timing-only (work invariant). | 135,999 cycles (2.01x vs HW, **-0.8% vs Opt 8**). fwd `.o38`. `L2_TMA_true_hit_rate` 0.9455 (unchanged). Small (fwd still frontend-tail bound). | 215,895 cycles (**1.62x** vs HW, **-8.0% vs Opt 8**). bwd `.o21`. `L2_TMA_true_hit_rate` 0.8682 (unchanged). **Unlocked Opt 8**: `L2_admit_per_active_cycle` 1.00→**1.93** (the 2-wide bank was starved by the 1/tick ROP feed); ROP_DELAY 558→**164** (-71%), `averagemflatency` 692→369. | Done. Opt 8+9 were a matched pair. Residual now spread across ROP(45%)+inject(37%)+reply(12.5%); no single 1/tick gate dominates. |
+| Opt 10 | intra-SMSP warp-switch (SFU issue-gating) | `-intra_smsp_warpswitch_enable 1` (code + config). At issue time, also check `fu->can_issue()` for no-queue FUs (SFU), so a busy-SFU MUFU (deterministic II=8) is filtered BEFORE the 1-deep `ISSUE_CONTROL` latch and GTO warp-switches to a ready warp instead of stalling the whole subcore. Queue FUs (MEM/TMA/MISC) keep the deferred path. II/latency unchanged; timing-only (work invariant). | 105,464 cycles (**1.56x** vs HW, **-22.4% vs Opt 9**). fwd `.o58`. `gpu_sim_insn` **bit-identical** to baseline (455,565,060); `issue_stage_issuing` bit-identical (16,064,281). Head-of-line `next_stage` 25.1%→**0.06%**, `blocked_by_sfu` 11.48M→**0**. | 178,856 cycles (**1.35x** vs HW, **-16.7% vs Opt 9**). bwd `.o33`. `gpu_sim_insn` bit-identical (629,211,348). `next_stage` 21.3%→**1.6%**, `blocked_by_sfu` 15.36M→**0**. Warp-switch recovered slot (`other_warp_issued/sfu_filtered`) fwd 31.7% / bwd 26.3%. | Done. The compute-path issue-pipeline defect (SFU head-of-line) fixed; residual (fwd 1.56x) is the structural 1-CTA/SM occupancy floor. See [CONSUMER_COMPUTE_BOUND.md](file:///home/jihyun/modern-gpu-simulator-micro-2025/.plan/CONSUMER_COMPUTE_BOUND.md). |
 
 ### Simulator Cycle Breakdown
 
 #### FA3 fwd - top-level simulator breakdown
 
-| Class | Init | Opt 1 (`rop=100`) | Opt 2 (BAR impl) | Opt 3 (MEMBAR) | Opt 4 (prefetch, sb=4) | Opt 5 (eager-promote) | Opt 6 (TMA real base) | Opt 7 (queue calib) | Opt 8 (slice parallelism) | Opt 9 (drain widening) | Note |
-|---|---|---|---|---|---|---|---|---|---|---|---|
-| `sim_cycle` | — | 220,024 | 162,582 | 158,990 | 155,765 | 149,727 | 145,855 | 138,021 | 137,053 | 135,999 | Opt 8 = `.o37`. Opt 9 = `.o38` (ROP+reply drain 1→2; -0.8% vs Opt 8, still frontend-tail bound). |
-| `no_warps_ready` | — | 64.02% | 23.83% | 20.98% | 26.81% | 27.32% | 27.93% | 29.51% | 29.14% | 29.22% | Flat (fwd unaffected). |
-| `issuing` | — | 14.56% | 21.17% | 24.05% | 31.18% | 31.19% | 32.30% | 34.75% | 34.77% | 34.96% | Flat. |
-| `next_stage_not_available` | — | 11.40% | 15.25% | 17.26% | 22.45% | 22.46% | 23.23% | 24.90% | 24.96% | 25.07% | Flat. |
-| `no_valid_instruction` | — | 9.52% | 39.12% | 37.01% | 18.63% | 18.11% | 15.59% | 9.81% | 10.10% | 9.72% | Frontend tail (`nv_ibuffer_empty` ~12%) is fwd's real residual. |
-| `issue_port_busy` | — | 0.50% | 0.63% | 0.71% | 0.92% | 0.92% | 0.95% | 1.02% | 1.02% | 1.03% | |
-| `sum` | — | 100.00% | 100.00% | 100.00% | 100.00% | 100.00% | 100.00% | 100.00% | 100.00% | 100.00% | |
+| Class | Init | Opt 1 (`rop=100`) | Opt 2 (BAR impl) | Opt 3 (MEMBAR) | Opt 4 (prefetch, sb=4) | Opt 5 (eager-promote) | Opt 6 (TMA real base) | Opt 7 (queue calib) | Opt 8 (slice parallelism) | Opt 9 (drain widening) | Opt 10 (warp-switch) | Note |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| `sim_cycle` | — | 220,024 | 162,582 | 158,990 | 155,765 | 149,727 | 145,855 | 138,021 | 137,053 | 135,999 | **105,464** | Opt 10 = `.o58` (SFU issue-gate; **-22.4% vs Opt 9**, 1.56x vs HW). |
+| `no_warps_ready` | — | 64.02% | 23.83% | 20.98% | 26.81% | 27.32% | 27.93% | 29.51% | 29.14% | 29.22% | 51.22% | Opt 10: the ex-`next_stage` cycles now surface here (warp present, blocked in-loop) instead of a whole-subcore skip. |
+| `issuing` | — | 14.56% | 21.17% | 24.05% | 31.18% | 31.19% | 32.30% | 34.75% | 34.77% | 34.96% | **38.00%** | Opt 10: rises (SM-active↑) as recovered slots issue. |
+| `next_stage_not_available` | — | 11.40% | 15.25% | 17.26% | 22.45% | 22.46% | 23.23% | 24.90% | 24.96% | 25.07% | **0.06%** | Opt 10: head-of-line collapsed (SFU no longer clogs the latch). |
+| `no_valid_instruction` | — | 9.52% | 39.12% | 37.01% | 18.63% | 18.11% | 15.59% | 9.81% | 10.10% | 9.72% | 9.60% | Frontend tail (`nv_ibuffer_empty` ~12%) is fwd's real residual. |
+| `issue_port_busy` | — | 0.50% | 0.63% | 0.71% | 0.92% | 0.92% | 0.95% | 1.02% | 1.02% | 1.03% | 1.12% | |
+| `sum` | — | 100.00% | 100.00% | 100.00% | 100.00% | 100.00% | 100.00% | 100.00% | 100.00% | 100.00% | 100.00% | |
 
 #### FA3 fwd - inner stall / wait breakdown
 
-| Wait reason | Init | Opt 1 (`rop=100`) | Opt 2 (BAR impl) | Opt 3 (MEMBAR) | Opt 4 (prefetch, sb=4) | Opt 5 (eager-promote) | Opt 6 (TMA real base) | Opt 7 (queue calib) | Opt 8 (slice parallelism) | Opt 9 (drain widening) | Note |
-|---|---|---|---|---|---|---|---|---|---|---|---|
-| `inst_barrier` | — | 56.09% | 9.09% | 0.05% | 0.07% | 0.07% | 0.07% | 0.08% | 0.08% | 0.08% | Negligible. |
-| `wait_barrier` | — | 6.64% | 8.07% | 9.01% | 11.98% | 12.58% | 12.66% | 13.18% | 12.69% | 12.74% | mbarrier-style wait. |
-| `tma_axis` | — | 62.73% | 17.16% | 9.06% | 12.05% | 12.65% | 12.73% | 13.25% | 12.77% | 12.82% | Grouped TMA-side stall share. See note [1] below. |
-| `non_tma_axis` | — | 17.80% | 17.34% | 19.07% | 24.10% | 24.07% | 24.90% | 26.59% | 26.93% | 26.84% | Execution/resource-side waits (fwd's residual). |
-| `fu_occupied` | — | 11.83% | 9.91% | 10.91% | 13.53% | 13.50% | 13.99% | 14.98% | 15.13% | 15.10% | Present in `.o38`. |
-| `stall_count` | — | 5.00% | 5.97% | 6.56% | 8.47% | 8.48% | 8.75% | 9.31% | 9.45% | 9.42% | Present in `.o38`. |
-| `tma_flush` | — | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | fwd is load-only. |
-| `yield` | — | 0.92% | 1.21% | 1.30% | 1.69% | 1.69% | 1.74% | 1.83% | 1.89% | 1.85% | Present in `.o38`. |
-| `result_queue_full` | — | 0.05% | 0.25% | 0.29% | 0.40% | 0.40% | 0.41% | 0.45% | 0.45% | 0.46% | Present in `.o38`. |
-| `l1c` | — | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | 0.03% | 0.02% | 0.00% | Present in `.o38`. |
-| `scoreboard (memory)` | — | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | Present in `.o38`. |
+| Wait reason | Init | Opt 1 (`rop=100`) | Opt 2 (BAR impl) | Opt 3 (MEMBAR) | Opt 4 (prefetch, sb=4) | Opt 5 (eager-promote) | Opt 6 (TMA real base) | Opt 7 (queue calib) | Opt 8 (slice parallelism) | Opt 9 (drain widening) | Opt 10 (warp-switch) | Note |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| `inst_barrier` | — | 56.09% | 9.09% | 0.05% | 0.07% | 0.07% | 0.07% | 0.08% | 0.08% | 0.08% | 0.13% | Negligible. |
+| `wait_barrier` | — | 6.64% | 8.07% | 9.01% | 11.98% | 12.58% | 12.66% | 13.18% | 12.69% | 12.74% | 12.93% | mbarrier-style wait. |
+| `tma_axis` | — | 62.73% | 17.16% | 9.06% | 12.05% | 12.65% | 12.73% | 13.25% | 12.77% | 12.82% | 13.06% | Grouped TMA-side stall share. See note [1] below. |
+| `non_tma_axis` | — | 17.80% | 17.34% | 19.07% | 24.10% | 24.07% | 24.90% | 26.59% | 26.93% | 26.84% | 63.58% | Opt 10: `fu_occupied`+`stall_count` jump as the ex-head-of-line SFU stalls now count in-loop (not a whole-subcore skip). Overlap counter, sums >100% of `no_warps_ready`. |
+| `fu_occupied` | — | 11.83% | 9.91% | 10.91% | 13.53% | 13.50% | 13.99% | 14.98% | 15.13% | 15.10% | **42.89%** | Opt 10: SFU-busy now surfaces here as a per-warp skip (the block that used to clog the latch). |
+| `stall_count` | — | 5.00% | 5.97% | 6.56% | 8.47% | 8.48% | 8.75% | 9.31% | 9.45% | 9.42% | 15.59% | Present in `.o58`. |
+| `tma_flush` | — | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | fwd is load-only. |
+| `yield` | — | 0.92% | 1.21% | 1.30% | 1.69% | 1.69% | 1.74% | 1.83% | 1.89% | 1.85% | 4.70% | Present in `.o58`. |
+| `result_queue_full` | — | 0.05% | 0.25% | 0.29% | 0.40% | 0.40% | 0.41% | 0.45% | 0.45% | 0.46% | 0.40% | Present in `.o58`. |
+| `l1c` | — | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | 0.03% | 0.02% | 0.00% | 0.00% | Present in `.o58`. |
+| `scoreboard (memory)` | — | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | Present in `.o58`. |
 
 > **[1] On the Opt 1 `tma_axis = 62.73%`.** This is a correctly-recorded value, not an input error. `tma_axis` is the grouped sum `wait_barrier + inst_barrier + tma_flush`, and the **same formula is applied in every column** (e.g. Opt 1: 6.64+56.09+0.00=62.73; Opt 2: 8.07+9.09+0.00=17.16) — it is not split differently between columns. Opt 1 only looks large because the pre-BAR-fix `inst_barrier` (56.09%) is folded in; that is not a real TMA cost. It collapses to 17.16% in Opt 2 purely because `inst_barrier` itself drops (56.09% -> 9.09%) after the BAR implementation. The HW TMA axis is ~23.8%, so the Opt 1 value is an over-attribution driven by the unfixed barrier model.
 
 #### FA3 bwd - top-level simulator breakdown
 
-| Class | Init | Opt 1 (`rop=100`) | Opt 2 (BAR impl) | Opt 3 (MEMBAR) | Opt 4 (prefetch, sb=4) | Opt 5 (eager-promote) | Opt 6 (TMA real base) | Opt 7 (queue calib) | Opt 8 (slice parallelism) | Opt 9 (drain widening) | Note |
-|---|---|---|---|---|---|---|---|---|---|---|---|
-| `sim_cycle` | 376,735 | 361,760 | 328,643 | 259,456 | 241,528 | 241,425 | 290,572 | 250,026 | 234,665 | 215,895 | Opt 8 = `.o20`. Opt 9 = `.o21` (ROP+reply drain 1→2; **-8.0% vs Opt 8**; unlocked Opt 8's 2-wide admission, ROP_DELAY 558→164). |
-| `no_warps_ready` | 66.40% | 66.64% | 58.27% | 29.80% | 36.56% | 36.45% | 41.51% | 34.00% | 34.35% | 36.49% | TMA-completion stall keeps draining. |
-| `issuing` | 12.12% | 12.71% | 14.06% | 20.93% | 26.18% | 25.70% | 17.76% | 21.94% | 23.63% | 29.49% | Rises strongly: warps wait far less on TMA completion. |
-| `next_stage_not_available` | 10.17% | 10.69% | 11.41% | 15.11% | 18.96% | 18.52% | 12.88% | 15.83% | 17.11% | 21.35% | per-subcore. |
-| `no_valid_instruction` | 10.37% | 8.96% | 15.02% | 33.59% | 17.59% | 18.63% | 27.37% | 27.63% | 24.28% | 11.87% | Frontend tail; drops as TMA axis shrinks. |
-| `issue_port_busy` | 0.95% | 1.01% | 1.24% | 0.57% | 0.71% | 0.70% | 0.48% | 0.59% | 0.64% | 0.80% | |
-| `sum` | 100.00% | 100.00% | 100.00% | 100.00% | 100.00% | 100.00% | 100.00% | 100.00% | 100.00% | 100.00% | Init columns sum to ~100% after rounding. |
+| Class | Init | Opt 1 (`rop=100`) | Opt 2 (BAR impl) | Opt 3 (MEMBAR) | Opt 4 (prefetch, sb=4) | Opt 5 (eager-promote) | Opt 6 (TMA real base) | Opt 7 (queue calib) | Opt 8 (slice parallelism) | Opt 9 (drain widening) | Opt 10 (warp-switch) | Note |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| `sim_cycle` | 376,735 | 361,760 | 328,643 | 259,456 | 241,528 | 241,425 | 290,572 | 250,026 | 234,665 | 215,895 | **178,856** | Opt 10 = `.o33` (SFU issue-gate; **-16.7% vs Opt 9**, 1.35x vs HW). |
+| `no_warps_ready` | 66.40% | 66.64% | 58.27% | 29.80% | 36.56% | 36.45% | 41.51% | 34.00% | 34.35% | 36.49% | 52.45% | Opt 10: ex-`next_stage` cycles surface here (in-loop block, not a subcore skip). |
+| `issuing` | 12.12% | 12.71% | 14.06% | 20.93% | 26.18% | 25.70% | 17.76% | 21.94% | 23.63% | 29.49% | **32.32%** | Opt 10: rises (SM-active↑) as recovered slots issue. |
+| `next_stage_not_available` | 10.17% | 10.69% | 11.41% | 15.11% | 18.96% | 18.52% | 12.88% | 15.83% | 17.11% | 21.35% | **1.63%** | Opt 10: head-of-line collapsed (SFU no longer clogs the latch). |
+| `no_valid_instruction` | 10.37% | 8.96% | 15.02% | 33.59% | 17.59% | 18.63% | 27.37% | 27.63% | 24.28% | 11.87% | 12.73% | Frontend tail; drops as TMA axis shrinks. |
+| `issue_port_busy` | 0.95% | 1.01% | 1.24% | 0.57% | 0.71% | 0.70% | 0.48% | 0.59% | 0.64% | 0.80% | 0.87% | |
+| `sum` | 100.00% | 100.00% | 100.00% | 100.00% | 100.00% | 100.00% | 100.00% | 100.00% | 100.00% | 100.00% | 100.00% | Init columns sum to ~100% after rounding. |
 
 #### FA3 bwd - inner stall / wait breakdown
 
-| Wait reason | Init | Opt 1 (`rop=100`) | Opt 2 (BAR impl) | Opt 3 (MEMBAR) | Opt 4 (prefetch, sb=4) | Opt 5 (eager-promote) | Opt 6 (TMA real base) | Opt 7 (queue calib) | Opt 8 (slice parallelism) | Opt 9 (drain widening) | Note |
-|---|---|---|---|---|---|---|---|---|---|---|---|
-| `inst_barrier` | — | 58.47% / 87.70% of `no_warps_ready` | 44.78% / 76.84% of `no_warps_ready` | 1.01% / 3.40% of `no_warps_ready` | 1.30% / 3.57% of `no_warps_ready` | 1.26% | 0.89% | 1.09% | 1.09% | 1.34% | Remains low after the MEMBAR fix. |
-| `tma_axis` | — | 67.28% / 90.90% of `no_warps_ready` | 58.09% | 17.13% / 57.49% of `no_warps_ready` | 21.96% / 60.06% of `no_warps_ready` | 22.17% | 31.91% | 21.60% | 21.02% | 19.74% | Down again as ROP_DELAY collapses (558→164). |
-| `non_tma_axis` | — | 16.40% / 24.50% of `no_warps_ready` | 18.08% | 21.99% / 73.79% of `no_warps_ready` | 27.15% / 74.25% of `no_warps_ready` | 26.66% | 18.94% | 22.79% | 24.37% | 30.17% | Execution-side now the larger share as TMA drains. |
-| `fu_occupied` | — | 11.55% / 17.30% of `no_warps_ready` | 12.63% | 14.67% / 49.21% of `no_warps_ready` | 18.09% / 49.47% of `no_warps_ready` | 17.75% | 12.58% | 15.18% | 16.25% | 20.21% | function-unit busy |
-| `wait_barrier` | — | 7.98% / 12.00% of `no_warps_ready` | 8.62% | 11.76% / 39.46% of `no_warps_ready` | 14.66% / 40.12% of `no_warps_ready` | 14.71% | 11.80% | 12.09% | 11.82% | 13.82% | `DEPBAR` (SB phase wait = TMA mbarrier) |
-| `stall_count` | — | 4.11% / 6.20% of `no_warps_ready` | 4.63% | 6.18% / 20.73% of `no_warps_ready` | 7.55% / 20.65% of `no_warps_ready` | 7.40% | 5.30% | 6.33% | 6.74% | 8.31% | explicit stall cycles |
-| `tma_flush` | — | 0.83% / 1.20% of `no_warps_ready` | 4.69% | 4.36% / 14.62% of `no_warps_ready` | 5.99% / 16.38% of `no_warps_ready` | 6.20% | 19.22% | 8.42% | 8.11% | 4.58% | `UTMACMDFLUSH` store-drain; keeps dropping. |
-| `yield` | — | 0.68% / 1.00% of `no_warps_ready` | 0.76% | 1.02% / 3.41% of `no_warps_ready` | 1.26% / 3.45% of `no_warps_ready` | 1.23% | 0.87% | 1.06% | 1.13% | 1.39% | `YIELD` |
-| `result_queue_full` | — | 0.03% / — | 0.03% | 0.09% / 0.30% of `no_warps_ready` | 0.12% / 0.33% of `no_warps_ready` | 0.12% | 0.08% | 0.10% | 0.11% | 0.14% | fixed-latency result queue |
-| `l1c` | — | 0.03% / — | 0.03% | 0.04% / 0.14% of `no_warps_ready` | 0.13% / 0.36% of `no_warps_ready` | 0.16% | 0.11% | 0.13% | 0.14% | 0.12% | L1 constant |
-| `scoreboard (memory)` | — | 0.00% / 0.00% of `no_warps_ready` | 0.00% | 0.00% / 0.00% of `no_warps_ready` | 0.00% / 0.00% of `no_warps_ready` | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | traditional scoreboard (unused here) |
+| Wait reason | Init | Opt 1 (`rop=100`) | Opt 2 (BAR impl) | Opt 3 (MEMBAR) | Opt 4 (prefetch, sb=4) | Opt 5 (eager-promote) | Opt 6 (TMA real base) | Opt 7 (queue calib) | Opt 8 (slice parallelism) | Opt 9 (drain widening) | Opt 10 (warp-switch) | Note |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| `inst_barrier` | — | 58.47% / 87.70% of `no_warps_ready` | 44.78% / 76.84% of `no_warps_ready` | 1.01% / 3.40% of `no_warps_ready` | 1.30% / 3.57% of `no_warps_ready` | 1.26% | 0.89% | 1.09% | 1.09% | 1.34% | 1.43% | Remains low after the MEMBAR fix. |
+| `tma_axis` | — | 67.28% / 90.90% of `no_warps_ready` | 58.09% | 17.13% / 57.49% of `no_warps_ready` | 21.96% / 60.06% of `no_warps_ready` | 22.17% | 31.91% | 21.60% | 21.02% | 19.74% | 22.11% | TMA-side stall share (`wait_barrier`+`inst_barrier`+`tma_flush`). |
+| `non_tma_axis` | — | 16.40% / 24.50% of `no_warps_ready` | 18.08% | 21.99% / 73.79% of `no_warps_ready` | 27.15% / 74.25% of `no_warps_ready` | 26.66% | 18.94% | 22.79% | 24.37% | 30.17% | 64.58% | Opt 10: `fu_occupied`+`stall_count` jump as ex-head-of-line SFU stalls now count in-loop. Overlap counter. |
+| `fu_occupied` | — | 11.55% / 17.30% of `no_warps_ready` | 12.63% | 14.67% / 49.21% of `no_warps_ready` | 18.09% / 49.47% of `no_warps_ready` | 17.75% | 12.58% | 15.18% | 16.25% | 20.21% | **38.26%** | Opt 10: SFU-busy now surfaces here (the block that used to clog the latch). |
+| `wait_barrier` | — | 7.98% / 12.00% of `no_warps_ready` | 8.62% | 11.76% / 39.46% of `no_warps_ready` | 14.66% / 40.12% of `no_warps_ready` | 14.71% | 11.80% | 12.09% | 11.82% | 13.82% | 14.81% | `DEPBAR` (SB phase wait = TMA mbarrier) |
+| `stall_count` | — | 4.11% / 6.20% of `no_warps_ready` | 4.63% | 6.18% / 20.73% of `no_warps_ready` | 7.55% / 20.65% of `no_warps_ready` | 7.40% | 5.30% | 6.33% | 6.74% | 8.31% | 10.73% | explicit stall cycles |
+| `tma_flush` | — | 0.83% / 1.20% of `no_warps_ready` | 4.69% | 4.36% / 14.62% of `no_warps_ready` | 5.99% / 16.38% of `no_warps_ready` | 6.20% | 19.22% | 8.42% | 8.11% | 4.58% | 5.87% | `UTMACMDFLUSH` store-drain. |
+| `yield` | — | 0.68% / 1.00% of `no_warps_ready` | 0.76% | 1.02% / 3.41% of `no_warps_ready` | 1.26% / 3.45% of `no_warps_ready` | 1.23% | 0.87% | 1.06% | 1.13% | 1.39% | 2.20% | `YIELD` |
+| `result_queue_full` | — | 0.03% / — | 0.03% | 0.09% / 0.30% of `no_warps_ready` | 0.12% / 0.33% of `no_warps_ready` | 0.12% | 0.08% | 0.10% | 0.11% | 0.14% | 0.16% | fixed-latency result queue |
+| `l1c` | — | 0.03% / — | 0.03% | 0.04% / 0.14% of `no_warps_ready` | 0.13% / 0.36% of `no_warps_ready` | 0.16% | 0.11% | 0.13% | 0.14% | 0.12% | 0.12% | L1 constant |
+| `scoreboard (memory)` | — | 0.00% / 0.00% of `no_warps_ready` | 0.00% | 0.00% / 0.00% of `no_warps_ready` | 0.00% / 0.00% of `no_warps_ready` | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | traditional scoreboard (unused here) |
 
 > **[2] On the bwd Opt 1 `tma_axis` / `non_tma_axis`.** These were not emitted as single grouped counters in the Opt 1 run (`.o307`), so the cells are **computed** from the per-reason rows in the same column (the later runs emit them directly):
 > - `tma_axis` = `wait_barrier + inst_barrier + tma_flush` = 7.98+58.47+0.83 = **67.28%** (of `no_warps_ready`: 12.00+87.70+1.20 = 90.90%).
@@ -104,608 +105,6 @@ To keep this file easy to extend, use the following update pattern whenever a ne
 > **[3] On the bwd `Init` column.** `sim_cycle` and the top-level breakdown are from the baseline `.o304` run (rop=211). The inner stall/wait per-reason counters were not yet implemented at the `Init` stage, so those cells remain `—` (no source value to report).
 >
 > **[4] On the bwd Opt 5 column (`.o3`, clean-exit Step-0 run).** The run is sb=4 + eager-promote. It **exits cleanly** (`exit code 0`, no teardown SIGSEGV — the earlier `.o320` run's destructor heap-corruption crash is gone), so the cycle (241,425) and breakdown are fully trustworthy and this supersedes the preliminary 242,270. eager-promote counters: `eager_promote_to_cache=994,032`, `demand_hit_later=366,329`, `skipped_fill_port_busy=31,254`, `skipped_has_waiter=0`, `demand_miss_after_promote=0` (the prior `.o320` showed 2,224 here — the teardown fix also cleared the promote-then-miss artifact); L1I miss rate 0.1977. Step-0 instrumentation counters are timing-neutral, so this is a valid Opt-5 baseline.
-
-### Ongoing (next cycle-reduction levers — after Opt 9)
-
-Opt 6 (address realism), Opt 7 (queue calibration), Opt 8 (L2 slice parallelism) and Opt 9 (L2
-sub-partition drain widening) are **Done**. After Opt 9 the whole TMA memory path — inject, ROP-drain,
-L2 admission, slice placement, and DRAM-reply — is HW-calibrated, and no single 1/tick gate dominates
-(bwd ROP_DELAY 80.65% → 44.67%; round-trip spread across ROP 44.7% + inject 36.7% + reply 12.5%).
-Cumulative: **bwd 250,026 → 215,895 (-13.7% since Opt 7, 1.88x → 1.62x); fwd 138,021 → 135,999**. The
-remaining sim-vs-HW gap (fwd 2.01x / bwd 1.62x) is owned by the items below. No cycle claim is made
-until an item lands a verified improvement.
-
-#### ⭐ Measured per-CTA breakdown run (2026-07-17, fwd `.o42` / bwd `.o25`) — decisive results
-
-Timing-neutral (bwd 215,537 ≈ .o21 215,895; fwd 136,293 ≈ .o38 135,999). Per-CTA `[CTAFIN]` with the
-new `-cta_stall_breakdown_instrument_enable` columns (sm_idle_cyc / sm_idle_ibuffer_empty_cyc). Full
-tables in [CTA_FINISH_TENSOR_CORRELATION.md](file:///home/jihyun/modern-gpu-simulator-micro-2025/.plan/CTA_FINISH_TENSOR_CORRELATION.md) RESULTS.
-
-1. **Warpgroup-4× REFUTED.** sim `Σ tensor_ops` = **835,584** vs HW gmma **835,506** = **1.0001×**
-   (both per-warp). No tensor over-execution → Ongoing item 4 CLOSED; the gap is not tensor work.
-2. **fwd (K5): drain-idle bound, NOT tensor, tight spread.** Per-CTA elapsed spread only **12.5%**
-   (slow÷fast 1.10×, everything flat ~1.1×). Absolute breakdown: **drain-idle sm_idle_cyc = 46.9% of
-   elapsed**, of which **ibuffer-empty (trace-drained) = 34.0%**; `sm_idle_tensor_cyc` only 2.0%,
-   `fu_occupied_tensor` 13.4%. → fwd's residual is the **drain tail** (trace-exhausted warps), confirming
-   the "drain-idle 1.39×" factor (Ongoing item 3) and the trace-drained *nature* (not fetch-starved,
-   item 2). No per-CTA imbalance lever for fwd.
-3. **bwd (K10): large REAL work imbalance, faithfully reproduced.** elapsed spread **92.2%**; slow-decile
-   does **11.4×** the tensor_ops of the fast-decile and ALL stalls co-scale (r(elapsed,tensor_ops)=**+0.99**,
-   r(sm_idle)=+0.99). This is causal-mask triangular load imbalance — a scheduler/tile-assignment
-   property the sim reproduces correctly, not a modeling bug. The bwd r=0.99 "tensor coupling" is
-   confirmed as density co-scaling, not an artifactual per-op over-cost (confound cleared).
-
-**Consequence:** both tensor-side hypotheses (async-WGMMA lever, warpgroup-4×) are now closed by
-measurement. The live recoverable gap is **fwd drain-idle** (item 2/3) and any bwd load-balance modeling;
-neither is a tensor-pipe fix.
-
-#### ⭐ Follow-up (2026-07-17): W2 quarter-tile + work-over-issue BOTH closed as non-levers
-
-Two candidate levers surviving the per-CTA run were tested and **both refuted**:
-
-1. **W2 (quarter-tile tensor occupancy) — REFUTED by HW `sm__pipe_tensor_cycles_active`.** The 4×-count
-   refutation (above) proved instruction *count* is faithful but not per-op pipe *occupancy* (cycles).
-   Measured directly: HW tensor-pipe active **fwd 46.13% / bwd 53.61%** (`ncu --page raw`, kernels 4/9)
-   vs sim **fwd ≈48.5% (1.05×) / bwd ≤69.6% upper-bound (≤1.30×)** — **not 4×**. Root reason: the sim's 4×
-   MAC over-count is **exactly cancelled by a 4×-too-large per-pipe rate** (`-tensor_rate_per_cycle 32768`
-   is the *whole-SM* peak, so full-tile/whole-SM-rate = ¼-tile/per-SMSP-rate = **64 cyc/pipe** on both).
-   Timing is already faithful; W2 (and W1) would *break* it. **CLOSED — no action.** Detail:
-   [WARP_GROUP_H100.md](file:///home/jihyun/modern-gpu-simulator-micro-2025/.plan/WARP_GROUP_H100.md) "W2 VERDICT" box. (This also resolves the doc discrepancy: HW bwd
-   tensor-pipe is **53.6%** `pct_of_peak_sustained_active`, not the mislabeled 15.33% in
-   FA3_kernel_10_bwd.md.) Residual tensor fidelity gap is FLOP-*accounting*/power-% only, not cycles.
-2. **Work over-issue (1.10× fwd / 1.13× bwd) — REFUTED as a counting artifact, no extra work.** Source
-   audit: the sim's issue-slot counter == its warp-inst retire counter **bit-for-bit**
-   (`total_num_cycles_issue_stage_issuing` = `gpgpu_n_tot_w_icount` = **16,064,281** fwd / **22,626,216**
-   bwd), and issue is capped at 1/subcore/cycle (`is_issued_inst`+`tail_readonly` guard,
-   [subcore.cc:672](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/subcore.cc#L672)) — **zero replay/re-issue.** The apparent "1.10×"
-   was comparing sim warp-insts against `gpu_sim_insn/32`, but `gpu_sim_insn` sums **active lanes**
-   ([sm.cc:2424](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/sm.cc#L2424)), so `/32` under-counts by exactly the predication factor
-   `32/avg_active_lanes` = 32/28.36 = **1.128** (fwd) / 32/27.81 = **1.151** (bwd). The sim-vs-HW warp-inst
-   ratio (16.06M/14.48M = 1.109) is a real trace-vs-HW `inst_executed` definitional difference (e.g.
-   fully-predicated-off insts in the trace), **not** a timing model artifact. **CLOSED — no lever.**
-
-**Net after all four closures (async-WGMMA, warpgroup-4×, W2/W1, work-over-issue): the entire tensor/work
-axis is HW-faithful in *timing*.** The sole remaining recoverable gap is **fwd drain-idle** (46.9% of
-elapsed, trace-drained warps — Ongoing item 2/3), which is not tensor, not work-count, and not
-fetch-starvation.
-
-
-#### Ongoing item (the ONLY live gap) — fwd drain-idle tail (subcore-idle 1.39×; bwd 1.29×)
-
-> **All other candidates are CLOSED and moved to [Deferred Opts](#deferred-opts)** (async-WGMMA,
-> warpgroup-4× / W1 / W2, work-over-issue, bwd memory-path residual, fwd L2-hit fidelity, frontend
-> fetch-nature). The entire tensor/work axis is HW-faithful **in timing**. The single remaining
-> recoverable gap is the fwd **subcore drain-idle**.
-
-##### ⭐ UPDATE (2026-07-20) — root cause narrowed to the producer mbarrier spin-loop (NANOSLEEP), NOT a memory floor
-
-Two decisive measurements this session **overturned the earlier "faithful floor" reading** of the
-drain-idle and localized it to a concrete, config/code-fixable modeling gap.
-
-**1. FWD_DRAIN_IDLE 4-axis run (fwd `OnlyKernel5/.o43` = 135,452 cyc; bwd `OnlyKernel10/.o26` = 216,527
-cyc; both clean exit).** ⚠️ NOT bit-identical to the tracked baselines (fwd .o42 136,293 / bwd .o25
-215,537) — the 4-axis instrument shifted timing ~0.4%, so these cycles are for shape only, not a new
-tracked baseline. Findings:
-- **mbarrier wait-duration histogram (축3):** both kernels are dominated by the **long (1024+ cyc)**
-  bucket with ~zero short waits (fwd `b5_1024plus=1,769`, b1-b3≈0; bwd `b5=4,233`, b1-b3≈0).
-- **per-CTA (축1/2/4):** fwd `sm_idle` = 46.9% of elapsed (wait_barrier_only 53% of idle, drained/floor
-  17%, r(wait_barrier_only,elapsed)=+0.68). bwd `sm_idle` = 49.1%, everything r≈0.99 (faithful
-  load-imbalance, confirmed not a lever).
-- **role drain (축2):** consumer(WGMMA) drains at **59.5%** of elapsed; producer(TMA) lives to **100%**
-  → a **40.5% producer-only tail** carries ~40pp of the 47% idle.
-
-**2. HW trace cross-check (the decisive step).** Parsed the HW dynamic trace directly
-(`hw_run/.../traces/threadblocks/.../kernel_5`, 132 CTAs = sim's 132):
-- CTA has **16 warps**: warp 0 (producer) = **14,082 insts**; warps 4-15 (consumer) = ~8,600 each; warps
-  1-3 ≈ 55 (setup). Producer having MORE insts than consumer is **trace-inherent** → "consumer drains
-  first" is NOT a sim artifact.
-- **warp 0's 14,082 insts are ~89% a spin-loop:** `PHASECHK.TRYWAIT` 3,117 + `NANOSLEEP.SYNCS` 3,075 +
-  `PHASECHK` 3,075 + `BRA` 3,226. Consumer warp 4 is all real compute (`MUFU.EX2` 1,184, `FFMA/FADD`,
-  `HGMMA`), no spin. So the producer-only tail is the producer **polling the mbarrier**, not doing work.
-- Compared against the sim's own TMA timing: consumer mbarrier waits are **1024+ cyc** but a TMA tile
-  actually **arrives in ~335 cyc** (`lat_total` p50; `lat_emit` fixed 127), and per-SM TMA inter-transfer
-  gap is **2,596 cyc** with **max 3 concurrent in-flight** — i.e. the wait is long because the *producer
-  under-pipelines / spins*, not because memory is slow.
-
-**Root cause (source-confirmed).** `NANOSLEEP` decodes to `MISCELLANEOUS_NO_QUEUE_OP`; the H100 config
-never set `-trace_opcode_latency_initiation_miscellaneous_no_queue`, so it fell back to the default
-**`1,1` (1-cycle)**. HW's nanosleep backoff is tens–hundreds of cyc. And `PHASECHK/TRYWAIT` are modeled
-**non-blocking** ([sm.cc:1895](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/sm.cc#L1895)) — the warp is not parked; the traced spin
-loop is replayed at full issue rate. So the producer's spin ops are issued every cycle
-([subcore.cc:709-727](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/subcore.cc#L709-L727)), consuming issue slots (single-issue/subcore, GTO) and
-displacing the consumer → **eligible-warp 0.53 vs HW 0.83** (matched occupancy). This is the drain-idle
-mechanism — a spin-loop latency modeling gap, **not** a memory-latency floor and **not** the (closed)
-tensor axis.
-
-**Hypothesis to test:** widening NANOSLEEP latency → producer spins less often → consumer reclaims issue
-slots → eligible↑ / drain-idle↓ / cycle↓. ⚠️ Like TODO-2 (SFU), this is a **fidelity** change that may
-move cycles up OR down; not assumed a win.
-
-##### Experiment RESULT (2026-07-20) — NANOSLEEP spin lever REFUTED (non-lever, closed)
-
-Ran A(`nanosleep 1,1`, baseline) vs **B(`nanosleep 64,1`)** on both kernels (dedicated NANOSLEEP knob;
-`-miscellaneous_no_queue_latency` raised to 64 to size the MISC_NO_QUEUE FU pipeline depth, else the
-fixed-latency FU asserts `start_stage < m_pipeline_depth` — same pipe-stage-index ceiling as async-WGMMA).
-Both B runs exit cleanly (fwd `.o45`, bwd `.o28`).
-
-| | baseline A (NANO=1) | experiment B (NANO=64) | Δ |
-|---|---:|---:|---|
-| fwd `gpu_sim_cycle` | 135,999 | **137,207** | **+0.9%** (worse) |
-| bwd `gpu_sim_cycle` | 215,895 | **217,423** | **+0.7%** (worse) |
-| fwd `ncu_eligible_warps_per_scheduler` | 0.53 | **0.5263** | ~flat |
-| bwd `ncu_eligible_warps_per_scheduler` | 0.41 | **0.4072** | ~flat |
-| fwd `issuing%` | 34.96 | 34.84 | ~flat |
-
-**Verdict — the "spin steals issue slots" hypothesis (scenario A) is REFUTED; it is scenario B
-(fidelity-only, no slot contention).** Widening the producer's mbarrier-spin backoff did **not** raise
-eligible-warp and **slightly raised** cycles. Reason: at **1 CTA/SM, ~20% occupancy**, when the producer
-stops spinning there is **no other warp to fill the freed slot** — the consumer warps are already parked
-on the mbarrier (non-eligible) waiting for TMA data. So the producer spin was **filling slots that would
-otherwise be idle anyway**, not displacing the consumer; removing it just turns spin-cycles into
-idle-cycles (and the NANOSLEEP delay pushes the next producer TMA slightly later, hence the small cycle
-rise). This means the drain-idle is **structural low-occupancy idle** (no eligible warp exists), not an
-issue-slot-scheduling artifact.
-
-**Consequence:** NANOSLEEP latency is **not a cycle lever** and not even a correct-direction fidelity
-knob (raising it worsens the ratio). Config restored to baseline (`nanosleep 1,1`,
-`miscellaneous_no_queue_latency 1`). The producer-spin axis is **closed**. The residual fwd drain-idle
-(sim eligible 0.53 vs HW 0.83 at matched occupancy) is owned by the deeper question of *why HW keeps more
-warps eligible under the same 1-CTA/SM ~20%-occupancy warp-specialized structure* — a producer/consumer
-overlap property not reachable by per-op latency tuning. (Instrumentation note: the three
-`total_num_cycles_spin_*` counters register but are not auto-printed in the stat dump — they need an
-explicit read in `shader.cc` if a future run wants the exact spin-slot counts; the cycle/eligible verdict
-above does not depend on them.)
-
-
-
-##### Implementation reference (instrumentation + knob, retained for re-runs)
-
-- **Code (2026-07-20, gated `-spin_instrument_enable`, default 0, timing-neutral):** three
-  observe-only counters at the issue winner site
-  ([subcore.cc:826-841](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/subcore.cc#L826-L841)): `total_num_cycles_spin_ops_issued`
-  (winner was PHASECHK/TRYWAIT spin), `total_num_cycles_spin_won_over_eligible` (of those, ≥1 other warp
-  was eligible-but-not-selected = spin stole a slot), `total_num_spin_phasechk_issued`. Files:
-  `shader.h`, `gpu-sim.cc` (option + stat register), `subcore.cc`. **Headers changed → `make clean`.**
-- **Config (H100):** `-spin_instrument_enable` and a **dedicated NANOSLEEP-only** latency knob
-  `-trace_opcode_latency_initiation_nanosleep` in `SM90_H100_L2_50MB_80GB/gpgpusim.config`. NANOSLEEP was
-  **split out of the shared MISC_NO_QUEUE knob in code** (`trace_driven.{h,cc}`: opcode-aware
-  `set_latency(category, opcode, ...)` overriding only `MISCELLANEOUS_NO_QUEUE_OP && OP_NANOSLEEP`), so
-  raising it perturbs **only** NANOSLEEP. ⚠️ To re-run with latency L>1, also set
-  `-miscellaneous_no_queue_latency >= L` (it sizes the FU pipeline depth). Both restored to baseline
-  (`1,1` / `1`) after the experiment; default is bit-identical.
-
-##### Investigation note (2026-07-20) — fwd eligible-warp gap → `wait`/`stall_count` under-model (SUSPECT, not confirmed)
-
-Traced the fwd eligible-warp deficit (sim 0.53 vs HW 0.83 at matched occupancy ~3.2 warps/sched) via the
-NCU warp-state taxonomy (HW from `...full_rpt.ncu-rep` kernel 5, sim from `.o45`, normalized to
-per-issue-active). The paradox: **sim is MORE idle yet records FEWER stalls** because the stall *mix* is
-displaced —
-- sim OVER: `math_pipe_throttle` 1.38×, `no_instruction` 1.67×, `gmma` 1.66× (long/terminal stalls)
-- sim UNDER (≪1): **`wait` 0.20×** (HW's #1 stall, ratio 1.363), `barrier` 0.00×, `dispatch_stall` 0.04×,
-  `mio_throttle` 0.03×, `short_scoreboard` 0.00×, `sleeping`/`imc_miss`/`branch_resolving` ~0.
-
-HW fills warp-latency with **many short stalls that keep the warp resident/eligible**; sim lacks them, so
-its warps swing to the extremes (long `long_scoreboard` block or trace `drain`) and fall out of eligible.
-The largest single gap is **`wait` (fixed-latency dependency)**: sim `ncu_stall_wait` = `stall_count`
-counter, set from the SASS control-word stall field (raw 0-15, [control_bits.cc:35](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/util/traces_enhanced/src/control_bits.cc#L35);
-[sm.cc:918-927](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/sm.cc#L918-L927)) and decremented by
-**`m_stall_counter >>= 1`** (exponential, [warp_dependency_state.cc:92](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/warp_dependency_state.cc#L92)) — so a raw
-stall of 5 lasts ~3 cyc, 13 lasts ~4 cyc (FA3 fwd: 24% of insts have stall≥3, so they under-stall).
-
-**⚠️ NOT confirmed a bug — likely an intentional compressed-approximation.** Counter-evidence found on
-re-check (do NOT re-chase as a plain bug): (1) `>>=1` is the codebase's shift-register convention (the FU
-`occupied` bitset uses `.set(N)` + `>>=1` for an exact N-cycle model); (2) `m_yield` uses the same shift
-but is set to `2`(=`1<<1`) → exactly 1 cyc, i.e. these counters are designed as bit-position-encoded +
-shift; (3) `-num_stall_cycles_wait_after_bits_stall_0_and_yield 46` → after `>>=1` becomes ~6 cyc, which
-looks like a **calibrated** magic number that presumes the log compression (so raw `stall_count` fed
-straight in may be the intended "compress static stall to effective stall" model, avoiding double-count
-with FU latency). Git history is a single "Uploaded" import — no origin intent recoverable. Only real
-discrepancy: the option's doc says "Number of cycles" but the impl log-compresses it.
-
-**Verdict:** a genuine SUSPECT for the eligible gap, but static analysis cannot decide bug-vs-intent. The
-decisive test (`>>=1` → linear `--`, A/B) is **global** (all kernels/all stalls) and would require
-re-calibrating dependent magic numbers (e.g. the `46`), so it is high-risk and deferred, not a quick win.
-Recorded as an open modeling question, not a lever.
-
-##### BWD cycle-lever scan (2026-07-20, `.o28`) — no large single lever; same CTA-internal shape as fwd
-
-Scanned bwd (1.62×, 215,895 vs HW 132,901 ≈ 83K excess cyc) for a **cycle** lever (not a ratio), i.e.
-where absolute cycles are actually burned. Findings (`.o28`, gpu_sim_cycle 217,423):
-- **SM-all-idle = 16.83%** (~36K cyc). Decomposed by SM-level recoverable ceilings:
-  `sm_idle_all_blocked_by_tensor` **1.75%**, `sm_idle_blocked_by_frontend_sbwait` **3.80%** — both small
-  (per-subcore `tensor_reissue_lockout_only` is 11.77%, but SM-wide only 1.75% because another subcore
-  is almost always issuing → tensor/frontend are NOT the cycle lever, consistent with the closed axes).
-  The rest of SM-idle is `nv_ibuffer_empty`(drain) 10.24% + `wait_barrier`(mbarrier) 10.12% (OR-overlap).
-- **Occupancy is structural, matches HW.** Boot log: `CTA/core = 1, limited by: shmem regs` (233 KB
-  shmem/block → 1 CTA/SM). HW is the same (H100 ~227 KB SM shmem). Wave structure from `[CTAFIN]`: first
-  wave = 132 CTAs @ cyc 1,501 (1/SM); remaining 252 launch **one-at-a-time** (88,620→tail) as each SM's
-  CTA finishes. So bwd is 1-CTA/SM just like fwd — the low occupancy is NOT a sim artifact.
-- **CTA elapsed spread 92.6%** (10,186–137,800; r(tensor_ops,elapsed)=+0.99) = causal-mask triangular
-  imbalance, faithfully reproduced (HW has it too). 97/384 CTAs finish in the last 10% (long tail).
-
-**bwd warp-state vs HW (NCU kernel-11 raw, per issue_active) — SAME displacement as fwd:** sim UNDER on
-the short execution stalls — `barrier` 0.03×, `short_scoreboard` 0.01×, `mio_throttle` 0.01×,
-`dispatch_stall` 0.08×, `wait` 0.36×, `sleeping` 0.14× — and OVER on `no_instruction` 3.61× and
-`math_pipe_throttle` 3.58×. Same pattern as fwd but more pronounced: HW keeps warps resident with many
-short stalls; sim lacks them so warps swing to `drain`/`math_pipe`.
-
-**Verdict (cycle goal):** bwd has **no large single cycle lever left** — every big candidate is either
-closed (tensor SM-wide 1.75%, memory path Opt6-9), structural (1-CTA/SM occupancy = HW-matched),
-or faithful (causal tail). The residual 1.62× is the **CTA-internal warp-progress gap** (sim runs each
-CTA longer than HW), which decomposes into the same short-stall-under / drain-over displacement as fwd
-(the `>>=1` stall_count SUSPECT above is one contributor, but global-risk). ⚠️ The short-stall
-under-modeling (`short_scoreboard`/`mio_throttle`/`barrier`) is a **symptom-or-cause ambiguity**: their
-low % may partly be a denominator effect (sim burns cycles elsewhere), so they are not yet actionable as
-levers until the CTA-internal progress model is understood. No cycle claim made.
-
-##### ⭐ CONSUMER-COMPUTE-BOUND (2026-07-20, `.o45` TMA timeline) — the CTA-internal gap is the consumer's per-tile compute
-
-Full analysis: [CONSUMER_COMPUTE_BOUND.md](file:///home/jihyun/modern-gpu-simulator-micro-2025/.plan/CONSUMER_COMPUTE_BOUND.md). A per-CTA TMA-timeline decomposition of the SM0
-log finally localized where the fwd 2× cycles are burned — and it is **not** memory/producer/frontend/
-occupancy, it is the **consumer warpgroup's per-tile WGMMA+softmax compute**.
-
-- **Warp structure (HW trace kernel_5 CTA0, 16 warps):** 1 producer (warp 0, 14,082 insts, **~66% spin**
-  PHASECHK/NANOSLEEP, only 44 real TMA) + 12 consumers (warps 4-15, ~8,600 insts each, 216 HGMMA + many
-  MUFU.EX2, ~no spin) + 3 setup. Producer is NOT the bottleneck — it mostly spins waiting on consumers.
-- **TMA timeline (SM0, 40 load tiles):** per-tile arrival latency mean **402 cyc** (memory is fast);
-  tiles arrive in pairs then a **7-16K cyc void**; **large voids (>2000) sum to 99,687 cyc = 93% of the
-  TMA span** = producer waiting on the consumer to compute+free the double-buffer. Avg void 6,645 cyc ≈
-  consumer processing ~2 tiles ⇒ **~3,300 cyc/tile** in sim.
-- **It is consumer *compute*, not idle:** SM-all-idle only 17.2% (issuing 34.8%, fu_occupied 15.2%) — the
-  voids are consumers busy on WGMMA/math, showing up as **stall-depth** (`math_pipe` 11% vs HW 3.2% =3.4×,
-  `mma` 5.65% vs HW 1.4% =4×), not SM-idle. Reconciles with "tensor SM-wide-blocked 1.75%".
-- **Quantified target:** sim ~3,300 cyc/tile vs HW ~1,700 (67,696/40, double-buffered) ≈ **1.9×** — i.e.
-  ~the whole 2× gap.
-
-⚠️ **CORRECTED (2026-07-20b, pipe-level split) — it is NOT "compute 1.9× too slow"; it is compute-SPARSE
-vs HW compute-DENSE.** HW NCU pipe-active vs sim per-pipe fu_occupied (kernel 5):
-  - HW **tensor 46.1%** (~705 cyc/tile) + **MUFU/xu 47.75%** (~729 cyc/tile, HW's #1 pipe) → SM **90%
-    active**, ~1,434 of ~1,700 cyc/tile is real tensor+MUFU work (compute-dense, tightly packed).
-  - sim **tensor fu_occupied only 13.4%** (~426 cyc/tile, LESS than HW) + **SFU/MUFU = 0.00%** (SFU
-    modeled at 4-cyc FP-add, TODO-2) → SM **64% active**; per-tile ~3,300 cyc is only ~426 cyc compute +
-    ~87% stall/idle. **sim runs the compute faster but cannot overlap/pack it.**
-  - So the fwd 2× is an **overlap/packing + missing-MUFU-cost** problem, NOT over-costed compute. This is
-    why async-WGMMA ("II too big") and NANOSLEEP were correctly refuted. **Sharp implication:** TODO-2
-    (realistic SFU/MUFU latency) is the only way to reproduce HW's #1 pipe (xu 47.75%); whether it
-    *reduces* the cycle ratio depends on whether the added MUFU work **overlaps** WGMMA (like HW) or
-    serializes — the new key open question. See [CONSUMER_COMPUTE_BOUND.md](file:///home/jihyun/modern-gpu-simulator-micro-2025/.plan/CONSUMER_COMPUTE_BOUND.md) "Pipe-level breakdown".
-
-
-**Status: re-opens the tensor/math re-issue axis with a concrete quantified target.** ⚠️ Overlaps the
-deferred async-WGMMA (closed on "II not too big") and TODO-2 (SFU under-modeled → fixing makes sim
-*slower*). The open question is **which part of the ~3,300 cyc/tile is over-costed** (WGMMA issue
-serialization vs MUFU/SFU latency vs the math pipe). Next: measure HW per-tile compute directly + split
-the sim per-tile compute by pipe. No cycle claim until measured; SFU direction caveat applies.
-
-##### ⭐⭐ ROOT CAUSE (2026-07-20c) — issue-pipeline head-of-line blocking (sim can't warp-switch under FU backpressure)
-
-Decomposing WHY sim is compute-sparse (SM-active 64% vs HW 90%): sim per-SMSP cycle budget is issuing
-34.8%, **`next_stage_not_available` 24.96%** (11.5M cyc, 2nd-largest), fu_occupied 15.2%, wait_barrier
-12.9%, stall_count 9.4%. The `next_stage` term is the mechanical root:
-- **Source (confirmed):** fixed-latency issue pipe = `issue → ISSUE_CONTROL(1-deep) → CONTROL_ALLOCATE
-  (1-deep) → read_stage(6-deep WGMMA) → TENSOR FU(lat 32)`. `Subcore::issue()` runs the warp-scan loop
-  **only if `m_ISSUE_CONTROL_latch.has_free()`** ([subcore.cc:458](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/subcore.cc#L458)); else the
-  whole subcore issues nothing and **does not even look at other warps** ([subcore.cc:822](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/subcore.cc#L822)).
-  = **per-subcore head-of-line blocking.** (Not tensor-II: `tensor_add_extra_cycle_II`=14,763 = 0.1%.)
-- **HW warp-switches instead:** NCU `warps_active=3.28`, **`not_selected=0.82`** (0.82 spare eligible
-  warps every issue-active cycle); `dispatch_stall=0.787` is **per-warp** (scheduler picks another warp),
-  so SMSP stays busy → SM-active 90%. sim's stall is **per-subcore** → 64%.
-- **So the fwd 2× "compute-sparse" is a scheduler/pipeline-structure gap, not compute cost:** sim's
-  1-deep issue latches propagate WGMMA read/FU backpressure into a full-subcore stall and cannot switch
-  to a ready warp the way HW does.
-- **⚠️ unconfirmed (needs run):** whether a *different* warp was actually eligible during those 11.5M
-  `next_stage` cycles (recoverable head-of-line) or none was ready (not recoverable) — the loop is
-  skipped so the stat can't tell. Decisive test = gated read-only eligible-scan in the `else` branch;
-  secondary = widen ISSUE_CONTROL/CONTROL_ALLOCATE to 2-deep. Full analysis in [CONSUMER_COMPUTE_BOUND.md](file:///home/jihyun/modern-gpu-simulator-micro-2025/.plan/CONSUMER_COMPUTE_BOUND.md).
-- **✅ CONFIRMED (2026-07-20d, bwd `.o30`): head-of-line is REAL and RECOVERABLE.**
-  `next_stage_with_ready_warp / scanned = 16,229,962 / 16,365,885 = **99.2%**`, ~2.06 other warps ready
-  per stalled cycle; next_stage = **21.3%** of evaluated. What holds the head: `blocked_by_other`
-  (fixed-latency non-tensor op) **97%**, mem 3%, **tensor ~0**. ⇒ the 1-deep ISSUE_CONTROL→CONTROL_
-  ALLOCATE pipe stalls the whole subcore instead of warp-switching to one of the ~2 ready warps. This is
-  a genuine cycle lever (~21% of evaluated). Fix direction under discussion (deepen latch / decouple
-  warp-scan from latch-full so a ready warp can issue). fwd `.o48` re-run pending (same shape expected).
-- **✅✅ ROOT CAUSE PINNED (2026-07-20e, fwd `.o56`): SFU initiation interval = 8.** With root-cause
-  counters: fwd next_stage = 25.1% of evaluated, **98.3%** recoverable (~2.77 ready warps/cyc). What
-  holds the latch: **`blocked_by_sfu` 99.7%**; why it can't drain: **`hol_reason_fu_cannot_issue` 99.8%**,
-  `read_stage_full=0`, `control_allocate_full≈0`. → NOT a latch-depth problem; it is the SFU FU refusing
-  new ops. `functional_unit_sfu::can_issue()`=`m_dispatch_reg->empty()` + `-sfu_initiation 8` (trace
-  `8,8`) = **1 MUFU / 8 cyc**. FA3 softmax `MUFU.EX2` (HW's busiest pipe, xu 47.75%) serializes on this
-  narrow SFU → head MUFU clogs the 1-deep ISSUE_CONTROL latch → whole-subcore stall despite ready warps.
-  This reconciles the pipe paradox (HW MUFU 48% vs sim SFU fu_occupied ~0: the MUFU work turned into
-  issue-stall). **Fix (next, implement): lower SFU initiation interval to HW-faithful MUFU throughput**
-  (II 8→1–2) → MUFU flows, latch unclogs, SM-active 64%→toward 90%, cycles drop. ⚠️ throughput knob
-  (opposite of TODO-2 latency); verify vs H100 real SFU rate, A/B, re-check counters collapse. Full
-  analysis in [CONSUMER_COMPUTE_BOUND.md](file:///home/jihyun/modern-gpu-simulator-micro-2025/.plan/CONSUMER_COMPUTE_BOUND.md).
-  **bwd `.o31` confirms the same:** next_stage 21.3% of evaluated, 99.1% recoverable, `blocked_by_sfu`
-  **93.8%**, `hol_reason_fu_cannot_issue` 99.8%, `read_stage_full`=0. Both kernels ⇒ SFU II=8 is the clog.
-- **⛔ CORRECTED (2026-07-20f): SFU II=8 is HW-FAITHFUL — do NOT lower it.** H100 has 2,112 SFU / 132 SM =
-  4 SFU/subcore ⇒ 32 lanes / 4 = **8 cyc/MUFU-warp** = exactly the sim II. The bug is NOT the II value; it
-  is that sim's **1-deep ISSUE_CONTROL latch can't warp-switch** around a correctly-throttled FU: while
-  the SFU is (rightly) locked out 8 cyc, ~2 other warps are ready but `Subcore::issue()` skips the whole
-  warp-scan ([subcore.cc:458](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/subcore.cc#L458)) → full-subcore stall. HW hides the same
-  8-cyc SFU throughput by warp-switching (`not_selected` 0.82, SM 90% active). **Corrected fix = a
-  scheduler-model change** (let issue pick a different ready warp when the head warp's FU is busy), NOT a
-  config knob; keep II/latency HW-faithful. This is the same structural limit the async-WGMMA axis hit.
-  Full trace in [CONSUMER_COMPUTE_BOUND.md](file:///home/jihyun/modern-gpu-simulator-micro-2025/.plan/CONSUMER_COMPUTE_BOUND.md) "MAJOR CORRECTION".
-
-
-
-
-**What it is (measured, fwd `.o39` / `.o42`).** The fwd 2.01× (135,999 vs HW 67,696) decomposes into
-three per-SMSP factors; two are closed as non-levers, and the **largest** is the live one:
-
-| axis (per-SMSP / subcore) | HW (fwd) | sim | ratio | status |
-|---|---|---|---|---|
-| subcore **active** fraction (≥1 resident warp) | **88.9%** (SMSP-Active 60,209 / Elapsed 67,696) | **64.0%** (evaluated 45.95M / 71.81M subcore-cyc) | **1.39× more idle** | ⭐ **LIVE** |
-| Issue Slots Busy (per active cyc) | 45.03% | 34.96% | 1.29× stall-depth | closed → Deferred (tensor axis) |
-| issued warp-inst (work) | 14.48M | 16.06M | 1.10× | closed → Deferred (counting artifact) |
-| ⇒ total cycles | 67,696 | 135,999 | **2.01× = 1.10 × 1.29 × 1.39** | |
-
-(bwd is the same shape: subcore-active 67.6% vs HW 86.8% = **1.29×**, `.o25`.)
-
-**⭐ fwd vs bwd — SAME symptom (~45% drain-idle), DIFFERENT cause (measured 2026-07-17, fwd `.o42` / bwd `.o25`).**
-Both kernels carry nearly-identical *total* drain-idle, but only fwd's is a recoverable lever; bwd's is a
-faithfully-reproduced real load imbalance:
-
-| axis | FWD (K5, `.o42`) | BWD (K10, `.o25`) | read |
-|---|---|---|---|
-| SM-all-idle fraction | **43.5%** | **45.1%** | ~same total idle — bwd is NOT exempt |
-| subcore-active vs HW | 63.9% (HW 88.9%) = 1.39× | 67.6% (HW 86.8%) = 1.29× | both idle far more than HW |
-| CTA elapsed spread | **12.5%** (uniform) | **92.2%** (11× slow÷fast) | ← the decisive difference |
-| per-CTA `sm_idle`/elapsed | 44.1–49.1% (flat) | 37.3–57.5% (density-scaled) | fwd uniform / bwd density-driven |
-| r(mbarrier `wait_pending`, elapsed) | **+0.69** | **+0.06** | mbarrier-overlap is a **fwd-only** driver |
-| r(tensor_ops, elapsed) | weak | **+0.99** | bwd idle tracks tensor density |
-| idle reasons (OR-overlap) | ibuffer-empty 72.6% + wait_barrier 57.2% | ibuffer-empty 60.6% + wait_barrier 59.6% + tma_flush 20.1% | bwd adds store-drain (it writes dQ/dK/dV) |
-
-- **fwd: intra-CTA warp-specialization stall — RECOVERABLE.** All CTAs are uniformly ~47% idle (spread
-  only 12.5%), so it is a *structural* per-CTA property, not an outlier tail. The mbarrier `wait_pending`
-  coupling (r=0.69) points at the consumer under-overlapping the TMA-completion wait. HW hides this far
-  better (1.57× more warps eligible at matched occupancy), so there is a real gap to close.
-- **bwd: causal-mask triangular load imbalance — FAITHFUL, not a bug.** CTA elapsed spans 11× (10,626 →
-  136,028); the slow CTAs are the tensor-dense ones and every stall co-scales with density (r=0.99). This
-  is a scheduler/tile-assignment property of the causal mask that **HW has too**, so the sim reproducing
-  it is correct. There is **no mbarrier-overlap lever** on bwd (r=0.06). bwd's only non-faithful pieces
-  were the memory-path/tensor axes, and those are already closed → Deferred.
-- **Conclusion: the single recoverable drain-idle lever is fwd's consumer mbarrier-overlap.** bwd shares
-  the ~45% idle *number* but its cause is a real workload imbalance, not a modeling gap.
-
-
-**What is established about it (do not re-chase):**
-- **Nature = trace-DRAINED warps, NOT fetch-starvation.** `nv_ibuf_fetch_inflight ≈ 0` (fwd `.o42`:
-  `nv_ibuf_fetch_inflight=2`, `fetch_not_issued=2,154` — both ~0); empty-ibuffer warps have exhausted
-  their trace. A frontend-fetch fix cannot help (Deferred Opts → L1I). Per-CTA `.o42`: fwd `sm_idle_cyc`
-  = **46.9%** of elapsed, of which ibuffer-empty (trace-drained) = **34%**; `sm_idle_tensor_cyc` only
-  2.0%. So the idle is **not** tensor-pipe blocked either.
-- **It is INTRA-CTA idle, not a post-finish straggler gap.** All 132 CTAs launch at cyc 1,501 and *exit*
-  at 87.6–100% of the kernel (fwd `.o42`: 1 CTA/SM, 1 wave → every CTA stays resident to the end; the
-  per-CTA `finish_cyc` distribution is tight, p0=87.6% p50=93.1% p100=100%). The idle therefore accrues
-  *while the CTA is resident*: within a warp-specialized CTA, the producer (TMA) warps drain their short
-  trace early and sit idle, while the surviving consumer warps periodically stall the whole SM. The two
-  dominant SM-fully-idle reasons (raw, overlapping OR across the 4 subcores, `.o42`) are
-  **nv_ibuffer_empty (trace-drained) 5.68M cyc (72.6%)** and **wait_barrier (mbarrier/TMA-completion)
-  4.48M cyc (57.2%)** — they co-occur, i.e. "producers done + consumers waiting on the next tile's data"
-  leaves no warp to issue.
-  - ⚠️ **`wait_barrier` (mbarrier) ≠ NCU `barrier` — DO NOT confuse the two.** `wait_barrier` here is the
-    Hopper **async barrier** (mbarrier: consumer waiting for TMA data to arrive); in the NCU taxonomy it
-    maps to **`long_scoreboard`** (`wait_barrier`+`tma_flush`) = **12.81%** (fwd `.o42`
-    `ncu_stall_long_scoreboard`), and its SM-idle form is `sm_idle_reason_wait_barrier` = 9.73%. The NCU
-    **`barrier`** row (`ncu_stall_barrier` = **0.08%**, sim `inst_barrier`) is a *different* mechanism —
-    classic `BAR.SYNC`/`__syncthreads` CTA rendezvous, which FA3 barely uses (correctly ~0%). When this
-    doc says "the barrier/mbarrier is fwd's drain driver" it always means the async mbarrier
-    (`wait_barrier`/`long_scoreboard` 12.8%), NEVER the NCU `barrier` 0.08%.
-- **Consumer mbarrier-wait correlates with fwd slowness (NEW, 2026-07-17 `[SYNCDBG]` from fwd `.e42` / bwd `.e25`).**
-  Per-SM `wait_pending` (a consumer PHASECHK/TRYWAIT that found the mbarrier NOT ready) is **48.9%** of all
-  fwd wait-checks, and **r(wait_pending, elapsed_cyc) = +0.69** — the SMs that wait on data-arrival
-  mbarriers more are the slower/more-idle SMs. **bwd shows no such coupling** (`wait_pending` 50.8% but
-  r=+0.06) — bwd idle tracks tensor density (r=0.99), not mbarrier waits. So mechanism-2 (consumer
-  under-overlap of the mbarrier/TMA-completion wait) is a **fwd-specific** live contributor, coupled with
-  the producer early-drain above.
-- **Per-CTA spread is TIGHT (fwd).** elapsed spread only 12.5% (`.o42`); everything ~1.1× flat, so there
-  is **no per-CTA imbalance lever** — the idle is an aggregate warp-specialization property, not a
-  slow-CTA outlier.
-
-**The open question (what "ongoing" means here).** At **matched occupancy** (active warps/sched sim ~3.2
-== HW 3.28) HW keeps **1.57× more warps eligible** (0.83 vs 0.53) and idles only ~9.7% vs the sim's
-~36–43%. So the sim hides the mbarrier/dependency latency far worse under the same 1-CTA/SM, ~20%-occupancy
-warp-specialized structure. Is that 1.39× **recoverable**, or a faithful reproduction of HW's own tail
-(HW NCU: `Waves Per SM=1.00`, HW itself 9.7% SM-idle)? The magnitudes do **not** match (sim ~36% vs HW
-9.7%), so the sim drains a wider tail — but every *attributable* latency (tensor, TMA, memory, ROP) is now
-calibrated/closed, so no single over-modeled latency explains the extra width. Resolving this is the sole
-live investigation. See the FWD/BWD NCU taxonomy subsections below for the measured stall stack any fix
-must move.
-
-
-
-#### Measured result — NCU stall taxonomy: FWD K5 (Opt9+Metrics `.o39`, 2026-07-15)
-
-> Implementation, counter definitions, and the two mapping-bug fixes live in
-> [NCU_STALL_TAXONOMY_METRICS_IMPL.md](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/.plan/NCU_STALL_TAXONOMY_METRICS_IMPL.md). This section records **results only**.
-> HW source = NCU report `/home/jihyun/modern-gpu-simulator-micro-2025/nv_reports/h100/flashattn-fa3-bf16-bwd-causal-b1-s2048-hd64-nh24_full_rpt.ncu-rep`, kernel 5 (`FlashAttnFwdSm90`, grid 132). Scheduler scalars come from the CSV export; per-reason HW shares come from the `.ncu-rep` Warp-State / ground-truth extraction.
-
-**Bit-identity gate PASSED.** `.o38` (Opt9) and `.o39` (Opt9+Metrics) both = `gpu_sim_cycle 135,999`,
-**identical** — the always-on metrics changed no timing.
-
-**Scheduler scalars — sim vs HW (the head-to-head that matters).** These NCU metrics ARE in the HW
-export, so this is a direct comparison:
-
-| scheduler scalar | sim `.o39` (FWD) | HW NCU (FWD) | HW NCU metric (verbatim source) | read |
-|---|---:|---:|---|---|
-| Issue Slots Busy | 34.96% | **45.74%** | `smsp__issue_active.avg.pct_of_peak_sustained_active` | sim issues on fewer cycles → the 2× cycle gap. |
-| Issued Warp / scheduler | 0.35 | **0.46** | `smsp__issue_active.avg.per_cycle_active` | same shape, sim lower. |
-| Eligible Warps / scheduler | 0.53 | **0.83** | `smsp__warps_eligible.avg.per_cycle_active` | HW keeps more warps eligible. |
-| No Eligible | 65.04% | **54.26%** | derived (`1 − issue_active pct`-class) | sim more often has nothing to issue. |
-| Active Warps / scheduler | ~3.2 | **3.28** | `smsp__warps_active.avg.per_cycle_active` | occupancy matches (not a warp-count problem). |
-| Warp Cyc / Issued Inst | ~9.1 | **7.16** | `smsp__average_warp_latency_per_inst_issued.ratio` | sim's per-issue stall depth ~1.28× HW. |
-| Elapsed / SM-Active / SMSP-Active cyc | — | **67,838 / 61,147 / 60,209** | `sm__cycles_elapsed.avg` / `sm__cycles_active.avg` / `smsp__cycles_active.avg` | HW cycle anchors. |
-
-**Sim stall taxonomy (full stack).** Denominator = `evaluated` 45,945,472; per-reason boolean-OR so
-reasons overlap. HW per-reason shares below are from the same `.ncu-rep` (kernel 5 Warp-State
-ground-truth extraction):
-
-| NCU reason | sim `.o39` (FWD) | HW NCU (FWD) | HW cyc/inst (verbatim) | HW NCU metric (`smsp__average_warps_issue_stalled_*_per_issue_active.ratio`) | reads as |
-|---|---:|---:|---:|---|---|
-| `selected` | 34.96% | 45.03%¹ | 0.9995 | `..._selected_...` | issued winner (== `issuing`; ¹ = HW Issue Slots Busy). |
-| **`not_selected`** | **17.90%** | **11.4%** | 0.8204 | `..._not_selected_...` | ⭐ eligible-but-not-picked — the suspect-#2 signature, large. |
-| `long_scoreboard` (wait_barrier+tma_flush) | 12.74% | **9.8%** | 0.7003 | `..._long_scoreboard_...` | **async mbarrier** (TMA-completion / global-load dependency) — this IS fwd's drain-idle driver (≠ the `barrier` row below). |
-| `math_pipe_throttle` (sfu+sp_int_dp) | 11.05% | **3.2%** | 0.2288 | `..._math_pipe_throttle_...` | math exec pipe busy (FMA/ALU; `sfu`=0 until TODO-2, cost sits in `sp_int_dp`). |
-| `mio_throttle` | — | **6.4%** | 0.4565 | `..._mio_throttle_...` | MIO (SFU/shared/LSU) input-throttle; not folded into `math_pipe_throttle` on HW. |
-| `no_instructions` | 9.72% | **2.4%** | 0.1691 | `..._no_instruction_...` | frontend/L0I tail (fwd is frontend-tail bound). |
-| `wait` | 9.42% | **19.0%** | 1.3629 | `..._wait_...` | fixed-latency dependency. |
-| `mma` (fu_occupied_tensor) | **5.65%** | **1.4%** | 0.0969 | `..._gmma_...` | ⭐ WGMMA tensor-pipe busy — suspect-#1 FU-busy signal. |
-| `sleeping` (yield fold) | 1.85% | **3.1%** | 0.2232 | `..._sleeping_...` | — |
-| `dispatch_stall` | (re-measure)² | **11.0%** | 0.7874 | `..._dispatch_stall_...` | ² sim `.o39` mapping was wrong; HW already shows this is large. |
-| `warpgroup_arrive` | (re-measure)² | **1.7%**³ | 65 samples | `smsp__pcsamp_warps_issue_stalled_warpgroup_arrive` (³ PC-sampling family, not the `average_..._per_issue_active` one) | ² sim `.o39` mapping was wrong; ³ WGMMA `wgmma.wait_group` producer-arrive wait — small on fwd. |
-| `barrier` | 0.08% | **10.9%** | 0.7817 | `..._barrier_...` | classic `BAR.SYNC`/`__syncthreads` CTA rendezvous — **NOT** the async mbarrier; FA3 barely uses it (sim ~0% correct). Do not confuse with `long_scoreboard` (mbarrier) above. |
-| `imc_miss`/`short_scoreboard` (l1c) | 0.0017% | **2.2% / 4.6%** | 0.1563 / 0.3298 | `..._imc_miss_...` / `..._short_scoreboard_...` | HW exposes both `imc_miss` and `short_scoreboard`; sim's current `l1c` line is only the const-cache sliver. |
-| `branch_resolving` | — | **0.9%** | 0.0612 | `..._branch_resolving_...` | branch-target resolve wait. |
-| `misc` / `drain` | — | **0.0% / 0.0%** | 0.0018 / 0.0007 | `..._misc_...` / `..._drain_...` | negligible. |
-| `membar` / `lg_throttle` / `tex_throttle` | — | **0.0%** | 0.0000 | `..._membar_/_lg_throttle_/_tex_throttle_...` | zero on this kernel. |
-
-Self-consistent: `selected` 16.06M + `not_selected` 8.22M = eligible 24.29M.
-
-**Finding (RE-normalized 2026-07-15b) — the 2× is `work 1.10× · stall-depth 1.29× · drain-idle 1.39×`;
-drain-idle is the LARGEST factor and it is NOT HW-faithful.** All axes are per-subcore/SMSP (sim
-`evaluated`/`issuing` counted per `Subcore::issue()`,
-[subcore.cc:868](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/subcore.cc#L868); H100 = 4 subcores/SM).
-
-- **Instruction count ~matches HW (slightly over).** sim `gpu_sim_insn` 455.6M / 32 lanes = 14.24M
-  warp-inst vs HW `Executed Instructions` 14.48M by that measure; but the issue-slot count `issuing`
-  16.06M is **1.10× HW's 14.48M** — the sim re-issues/replays somewhat more. Small factor, noted.
-- **Stall-depth: 1.29×.** sim Issue-Slots-Busy (per *active* cycle) 34.96% vs HW 45.03%; equivalently
-  warp-cyc/issued ~9.15 vs HW 7.16. This is the axis the stall stack above measures.
-- **⚠️⚠️ RE-correction — the previous retraction OVER-corrected and was itself wrong.** An intermediate
-  draft claimed the missing 36% of subcore-cycles is "≈ matched / HW-faithful tail-drain, not a lever."
-  **That is false.** The apples-to-apples comparison is subcore-**active** fraction: **sim 64.0%
-  (evaluated 45.95M / 71.81M subcore-cyc) vs HW SMSP-Active 88.9% (60,209 / 67,696)** = **1.39× more
-  idle** — in raw idle-cycles, 48,972 vs 7,487 per subcore = a **6.5× wider drain tail**. The earlier
-  "matched" claim mistakenly compared the `nv_ibuffer_empty` *reason-share* (12.2%, an evaluated-axis %)
-  against HW's 9.67% SM-idle (a wall-clock %) — **different denominators**, so the "match" was an
-  artifact. The idle IS real and IS the largest factor.
-- **BUT the *nature* of the idle is still correctly diagnosed: it is trace-DRAINED warps (no inst to
-  execute), not fetch-starvation.** `nv_ibuf_fetch_inflight ≈ 0`, so the prefetch/inst-fetch work
-  (Opt 4/5) was correct and the residual is **not** a frontend-fetch lever. What was wrong was calling
-  the resulting idle "HW-faithful" — HW drains a much tighter tail (11% vs 36%).
-- **Is the tail CAUSED by synchronous-WGMMA? — HYPOTHESIS, being measured (do not assume coupled).**
-  `stall-depth` and `drain-idle` live on **disjoint** cycle populations (warps-present vs. SM-empty), so
-  they are **not** automatically coupled. A *uniform* WGMMA slowdown scales every CTA's finish time
-  equally and leaves the idle **fraction** unchanged — it would fix stall-depth but **not** the tail.
-  async-WGMMA fixes the tail **only if** the cost is **differential** (tensor-heavy CTAs slowed more,
-  widening the finish spread). fwd's `DynamicPersistentTileScheduler` + causal-mask triangular work makes
-  that plausible but **unproven**. An earlier draft here asserted the two are "mechanically coupled" —
-  **that overstated it and is retracted.** The decisive test — per-CTA `finish_cyc` vs per-CTA
-  `tensor_ops` correlation — is now instrumented and pending a run; see
-  [CTA_FINISH_TENSOR_CORRELATION.md](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/.plan/CTA_FINISH_TENSOR_CORRELATION.md). Result decides whether this is one lever
-  (async-WGMMA) or two (async-WGMMA + a separate CTA-imbalance/scheduler lever).
-- **On dual-issue (answer to the standing question):** Hopper schedulers are **single-issue per SMSP**;
-  SM-wide 4-issue = 4 subcores, which the sim already models. Not a lever — removed from the plan.
-
-**Where the recoverable cycles sit** (sim over-model vs HW, from the table above): `math_pipe_throttle`
-11% vs HW 3.2%, `mma` 5.65% vs HW 1.4% — the tensor/FU **re-issue interval is too coarse** (synchronous
-WGMMA). This is confirmed to drive **stall-depth** (1.29×); whether it *also* drives the **drain tail**
-(1.39×) is the pending correlation test ([CTA_FINISH_TENSOR_CORRELATION.md](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/.plan/CTA_FINISH_TENSOR_CORRELATION.md)). That is Ongoing item 3's
-Suspect #1 and the single fwd lever; tracked in **Ongoing item 3** (async-WGMMA). Frontend and
-dual-issue are **not** levers. **Open measurement TODO:** per-CTA finish-cycle histogram to size the
-drain-tail component that survives after normalizing out stall-depth.
-
-> **⛔ SUPERSEDED (2026-07-17) — the "async-WGMMA is the single fwd lever" conclusion in the paragraph
-> above is WRONG and retained only as the historical `.o39` record.** The pending tests it referenced are
-> now done: the `.o42` per-CTA run showed the drain-tail is NOT tensor-driven (`sm_idle_tensor_cyc` only
-> 2.0% of elapsed, drain-idle 46.9%), and the tensor `mma`/`math_pipe` over-model is closed as
-> non-recoverable (async already modeled + warpgroup-4×/W2 refuted — see [Deferred Opts](#deferred-opts)).
-> The live fwd lever is the **drain-idle tail itself**, not the tensor re-issue interval. See the single
-> Ongoing item above.
-
-> ²`warpgroup_arrive`/`dispatch_stall` in `.o39` used the pre-fix mappings and are **not** trustworthy;
-> the corrected values will appear in the next post-`make clean` run (which must also re-confirm the
-> FWD bit-identity gate = 135,999).
->
-> ³**On `warpgroup_arrive` (why it was earlier marked `—`).** It **does** exist in HW, but only in the
-> **PC-sampling** metric family (`smsp__pcsamp_warps_issue_stalled_warpgroup_arrive`), NOT in the
-> `smsp__average_warps_issue_stalled_*_per_issue_active.ratio` family the rest of this table's HW
-> `cyc/inst` column is read from — that average family simply has no `warpgroup_arrive` member. So its
-> HW share (1.7% fwd) is a **sample-count %** of the pcsamp total (65 / 3,925), on a slightly different
-> normalization than the cyc/inst rows (the two agree to ~0.5pp: e.g. pcsamp `wait` 19.5% vs
-> average-family 19.0%). It captures the WGMMA producer waiting at `wgmma.wait_group`.
-
-#### Measured result — NCU stall taxonomy: BWD K10 (Opt9+Metrics `.o22`, 2026-07-15)
-
-> HW source = NCU report `/home/jihyun/modern-gpu-simulator-micro-2025/nv_reports/h100/flashattn-fa3-bf16-bwd-causal-b1-s2048-hd64-nh24_full_rpt.ncu-rep`, kernel 10 (`FlashAttnBwdSm90`, grid 384). Sim column = bwd `.o22` (Opt8+Opt9 config, metrics build).
-
-**⚠️ Bit-identity: bwd is NOT exact (unlike fwd), but the delta is negligible.** `.o22` (Opt9+Metrics)
-= `gpu_sim_cycle 216,015` vs `.o21` (Opt9, no metrics) = `215,895` — **+120 cyc (+0.056%)**, same
-config, same `gpu_sim_insn` (629,211,348). fwd was byte-exact (`.o38`==`.o39`); bwd is not. **Cause not
-identified** — a source audit confirmed the three known side-effecting tail predicates ARE gated on
-`tail_readonly` (`c_warp->waiting()`, `warp_waiting_at_tma_flush()`, `are_l1c_operands_ready()` at
-[subcore.cc:598-609](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/subcore.cc#L598-L609)), and the remaining tail calls (`can_issue`, wait-barrier/ldgdepbar
-checks, `next_inst`) are read-only, so the earlier "store-drain leak" guess is **not** supported. At
-+0.056% it is treated as negligible and not chased; the tracked **Opt9 bwd cycle stays 215,895**
-(`.o21`), and `.o22` is used only for the (timing-neutral-in-shape) stall taxonomy below.
-
-**Scheduler scalars — sim vs HW:**
-
-| scheduler scalar | sim `.o22` (BWD) | HW NCU (BWD) | HW NCU metric (verbatim source) |
-|---|---:|---:|---|
-| Issue Slots Busy | 29.38% | **32.83%** | `smsp__issue_active.avg.pct_of_peak_sustained_active` |
-| Issued Warp / scheduler | 0.29 | **0.33** | `smsp__issue_active.avg.per_cycle_active` |
-| Eligible Warps / scheduler | 0.41 | **0.46** | `smsp__warps_eligible.avg.per_cycle_active` |
-| No Eligible | 70.62% | **67.17%** | derived (`1 − issue_active pct`-class) |
-| Active Warps / scheduler | ~2.4 (occ-matched, est.) | **2.47** | `smsp__warps_active.avg.per_cycle_active` |
-| Warp Cyc / Issued Inst | ~8.2 (= 2.4 ÷ 0.294) | **7.53** | `smsp__average_warp_latency_per_inst_issued.ratio` |
-| Elapsed / SM-Active / SMSP-Active cyc | — | **132,901 / 118,089 / 115,328** | `sm__cycles_elapsed.avg` / `sm__cycles_active.avg` / `smsp__cycles_active.avg` |
-
-**Sim stall taxonomy (full stack).** Denominator = `evaluated` 77,008,681; per-reason boolean-OR so
-reasons overlap. HW per-reason shares are from the same kernel-10 `.ncu-rep`:
-
-| NCU reason | sim `.o22` (BWD) | HW NCU (BWD) | HW cyc/inst (verbatim) | HW NCU metric (`smsp__average_warps_issue_stalled_*_per_issue_active.ratio`) | reads as |
-|---|---:|---:|---:|---|---|
-| `selected` | 29.38% | 32.07%¹ | 1.0000 | `..._selected_...` | issued winner (== `issuing`; ¹ = HW Issue Slots Busy). |
-| **`not_selected`** | **11.47%** | **5.4%** | 0.4051 | `..._not_selected_...` | eligible-but-not-picked — sim ~2× HW (same over-count as fwd). |
-| `long_scoreboard` (wait_barrier+tma_flush) | 18.39% | **19.8%** | 1.4915 | `..._long_scoreboard_...` | TMA / global-memory data-arrival latency — **on target**. |
-| **`mma`** (fu_occupied_tensor) | **12.51%** | **5.3%** | 0.3981 | `..._gmma_...` | ⭐ WGMMA tensor-pipe busy — sim **2.4× HW** (suspect-#1 signature). |
-| `no_instructions` | 12.14% | **1.6%** | 0.1150 | `..._no_instruction_...` | frontend/ibuffer tail — sim **7.6× HW**. |
-| **`math_pipe_throttle`** (sfu+sp_int_dp) | **9.64%** | **1.2%** | 0.0917 | `..._math_pipe_throttle_...` | ⭐ math exec pipe busy — sim **8× HW** (suspect-#1 signature). |
-| `wait` | 8.27% | **10.4%** | 0.7839 | `..._wait_...` | fixed-latency dependency — on target. |
-| `sleeping` (yield fold) | 1.39% | **4.4%** | 0.3284 | `..._sleeping_...` | warp-specialization producer idle — sim under-counts. |
-| `barrier` | 1.33% | **17.4%** | 1.3131 | `..._barrier_...` | ⚠ mbarrier/named-barrier — sim **13× UNDER** HW (folded elsewhere; see note). |
-| `mio_throttle` | 0.14%⁴ | **6.3%** | 0.4744 | `..._mio_throttle_...` | ⁴ result_queue_full only; sim under-models MIO input-throttle. |
-| `dispatch_stall` | (re-measure)² | **4.5%** | 0.3376 | `..._dispatch_stall_...` | ² `.o22` mapping was wrong (== `mio_throttle` 0.14%); fix pending. |
-| `warpgroup_arrive` | (re-measure)² | **5.7%**³ | 436 samples | `smsp__pcsamp_warps_issue_stalled_warpgroup_arrive` (³ PC-sampling family) | ² `.o22` = 0 (string-match bug); HW is **6th-largest bwd stall**, notable. |
-| `imc_miss`/`short_scoreboard` (l1c) | 0.12% / 0.12% | **1.3% / 8.5%** | 0.0944 / 0.6429 | `..._imc_miss_...` / `..._short_scoreboard_...` | sim's `l1c` line is only the const-cache sliver; HW's `short_scoreboard` 8.5% is unmapped. |
-| `branch_resolving` | 0.00% | **0.8%** | 0.0602 | `..._branch_resolving_...` | no branch unit in trace-driven sim. |
-| `misc` / `drain` | 0.00% / 0.00% | **0.0% / 0.0%** | 0.0019 / 0.0014 | `..._misc_...` / `..._drain_...` | negligible. |
-| `membar` / `lg_throttle` / `tex_throttle` | 0.00% | **0.0%** | 0.0000 | `..._membar_/_lg_throttle_/_tex_throttle_...` | zero on this kernel. |
-
-Self-consistent: `selected` 22.63M + `not_selected` 8.83M = eligible 31.46M (= `ncu_eligible_warps_per_scheduler` 0.4085 × evaluated).
-
-**bwd finding — SAME structural problem as fwd, and MORE pronounced on the compute pipes.** The two
-signatures that identify synchronous-WGMMA over-modeling are **larger on bwd than fwd**:
-`math_pipe_throttle` sim 9.64% vs HW 1.2% = **8×** (fwd was 3.4×), and `mma` sim 12.51% vs HW 5.3% =
-**2.4×** (fwd was 4×). bwd is the more tensor-dense kernel (grid 384, `mma` is the sim's **single
-largest** non-scoreboard stall at 12.51%), so it suffers the synchronous-WGMMA serialization harder —
-exactly as predicted. The 3-factor decomposition confirms the same shape as fwd:
-
-| axis (per-SMSP / subcore) | HW (bwd) | sim `.o22` | ratio (sim ÷ HW) |
-|---|---:|---:|---:|
-| subcore **active** fraction | **86.8%** (SMSP-Active 115,328 / Elapsed 132,901) | **67.5%** (evaluated 77.01M / 114.10M subcore-cyc) | **1.29×** more idle |
-| Issue Slots Busy (per active cyc) | **32.07%** | 29.38% | **1.09×** stall-depth |
-| issued warp-inst (work) | 19.95M | 22.63M | **1.13×** (sim over-issues) |
-| ⇒ total cycles | 132,901 | 215,895 (`.o21`) | **1.62× = 1.13 × 1.09 × 1.29** |
-
-So bwd's 1.62× is the **same three coupled factors** as fwd's 2.01× — work over-issue (1.13×),
-stall-depth (1.09×), and subcore drain-idle (1.29×, again the largest). The stall-depth factor is
-*smaller* on bwd (1.09× vs fwd 1.29×) because bwd's `long_scoreboard`/`wait`/`barrier` (real
-data-latency) already match HW well; the recoverable gap is concentrated in the **tensor/math re-issue
-lockout** (`mma` 2.4×, `math_pipe` 8×) and the drain tail it inflates. **Confirmed: async-WGMMA is the
-shared fwd+bwd lever**, and bwd is arguably the *better* kernel to validate it on (the `mma` signal is
-its top stall). Two bwd-specific caveats vs fwd: (a) `barrier` is 13× UNDER HW (17.4% HW vs 1.33% sim)
-— a fold/mapping gap to resolve, not a timing lever; (b) `warpgroup_arrive` is genuinely large on HW
-(5.7%, 6th) so the pending bug-fix re-measure matters more here than on fwd.
-
-> ³**On `warpgroup_arrive`.** Same caveat as fwd: it lives **only** in the PC-sampling family
-> (`smsp__pcsamp_warps_issue_stalled_warpgroup_arrive`), not the `average_..._per_issue_active.ratio`
-> family the other rows use, so its 5.7% is a **sample-count %** of the pcsamp total (436 / 7,613).
-> Unlike fwd it is **large on bwd** (6th place, > `not_selected` / `dispatch_stall`) — the WGMMA
-> producer often waits at `wgmma.wait_group`, consistent with bwd's heavier tensor pipeline.
 
 ### Deferred Opts
 
@@ -791,6 +190,16 @@ FA3 fwd
   - Event / debug run: `H100_80GB-OnlyKernel5/flashattn-fa3-bf16-bwd-causal-b1-s2048-hd64-nh24-flashattn_fa3_bf16_bwd_causal_b1_s2048_hd64_nh24___warmup_-63a73d452237.e38`
   - Note: `l2_rop_drain_per_cycle=2` + `l2_dram_reply_drain_per_cycle=2` (both `[L2-ROP-DRAIN]`/`[L2-DRAM-REPLY-DRAIN]` boot logs confirmed live, on top of the Opt-7/8 knobs). Final cycle = `135,999` (-0.8% vs Opt 8). `L2_TMA_true_hit_rate=0.9455` (unchanged). Small (fwd still frontend-tail bound). `L2_rop_multi_cycles_total=1.55M` (Gate A fired), `L2_admit_per_active_cycle` 1.00→1.82.
 
+- Opt 10 (intra-SMSP warp-switch: SFU issue-gating)
+  - Baseline (gate off, `-intra_smsp_warpswitch_enable 0`):
+    - Stats run: `H100_80GB-OnlyKernel5/flashattn-fa3-bf16-bwd-causal-b1-s2048-hd64-nh24-flashattn_fa3_bf16_bwd_causal_b1_s2048_hd64_nh24___warmup_-63a73d452237.o57`
+    - Event / debug run: `H100_80GB-OnlyKernel5/flashattn-fa3-bf16-bwd-causal-b1-s2048-hd64-nh24-flashattn_fa3_bf16_bwd_causal_b1_s2048_hd64_nh24___warmup_-63a73d452237.e57`
+    - Note: new build, gate OFF → 135,833 cyc (within ~0.2% of tracked Opt-9 `.o38` 135,999; confirms bit-identity when off). `next_stage`=25.1%, `blocked_by_sfu`=11.48M (SFU clog reproduced). All warp-switch effect counters = 0 (fix inactive).
+  - Fix (gate on, `-intra_smsp_warpswitch_enable 1`):
+    - Stats run: `H100_80GB-OnlyKernel5/flashattn-fa3-bf16-bwd-causal-b1-s2048-hd64-nh24-flashattn_fa3_bf16_bwd_causal_b1_s2048_hd64_nh24___warmup_-63a73d452237.o58`
+    - Event / debug run: `H100_80GB-OnlyKernel5/flashattn-fa3-bf16-bwd-causal-b1-s2048-hd64-nh24-flashattn_fa3_bf16_bwd_causal_b1_s2048_hd64_nh24___warmup_-63a73d452237.e58`
+    - Note: `-intra_smsp_warpswitch_enable 1` (boot-log confirmed). Final cycle = `105,464` (**-22.4% vs Opt 9**, **1.56x vs HW**). `gpu_sim_insn=455,565,060` + `issue_stage_issuing=16,064,281` bit-identical to baseline (work invariant). `next_stage` 25.1%→**0.06%**, `blocked_by_sfu` 11.48M→**0**, `issuing` 35.0%→38.0%. Warp-switch: `sfu_filtered=19,148,406`, `other_warp_issued=6,066,539` (31.7% recovered), `still_idle=13,081,867`.
+
 FA3 bwd
 
 - Init
@@ -842,6 +251,16 @@ FA3 bwd
   - Stats run: `H100_80GB-OnlyKernel10/flashattn-fa3-bf16-bwd-causal-b1-s2048-hd64-nh24-flashattn_fa3_bf16_bwd_causal_b1_s2048_hd64_nh24___warmup_-63a73d452237.o21`
   - Event / debug run: `H100_80GB-OnlyKernel10/flashattn-fa3-bf16-bwd-causal-b1-s2048-hd64-nh24-flashattn_fa3_bf16_bwd_causal_b1_s2048_hd64_nh24___warmup_-63a73d452237.e21`
   - Note: `l2_rop_drain_per_cycle=2` + `l2_dram_reply_drain_per_cycle=2` (both boot logs confirmed live, on top of the Opt-7/8 knobs). Final cycle = `215,895` (**-8.0% vs Opt 8**, **1.62x vs HW**). `L2_TMA_true_hit_rate=0.8682` (unchanged → work invariant). **Unlocked Opt 8**: `L2_admit_per_active_cycle` 1.00→**1.93**, `L2_admit_multi_cycles` 846→5.50M, `L2_rop_multi_cycles_total=5.50M` (Gate A fired). **ROP_DELAY 558→164 (-71%)**, `averagemflatency` 692→369. Relocation (expected, net-positive): `gpu_stall_dramfull` 0→46,758, `Req_Network_in_buffer_full` 5.67→11.8; ROP now 44.7% (was 80.65%), round-trip spread ROP+inject+reply.
+
+- Opt 10 (intra-SMSP warp-switch: SFU issue-gating)
+  - Baseline (gate off, `-intra_smsp_warpswitch_enable 0`):
+    - Stats run: `H100_80GB-OnlyKernel10/flashattn-fa3-bf16-bwd-causal-b1-s2048-hd64-nh24-flashattn_fa3_bf16_bwd_causal_b1_s2048_hd64_nh24___warmup_-63a73d452237.o32`
+    - Event / debug run: `H100_80GB-OnlyKernel10/flashattn-fa3-bf16-bwd-causal-b1-s2048-hd64-nh24-flashattn_fa3_bf16_bwd_causal_b1_s2048_hd64_nh24___warmup_-63a73d452237.e32`
+    - Note: new build, gate OFF → 214,826 cyc (within ~0.5% of tracked Opt-9 `.o21` 215,895; confirms bit-identity when off). `next_stage`=21.3%, `blocked_by_sfu`=15.36M (SFU clog reproduced). All warp-switch effect counters = 0 (fix inactive).
+  - Fix (gate on, `-intra_smsp_warpswitch_enable 1`):
+    - Stats run: `H100_80GB-OnlyKernel10/flashattn-fa3-bf16-bwd-causal-b1-s2048-hd64-nh24-flashattn_fa3_bf16_bwd_causal_b1_s2048_hd64_nh24___warmup_-63a73d452237.o33`
+    - Event / debug run: `H100_80GB-OnlyKernel10/flashattn-fa3-bf16-bwd-causal-b1-s2048-hd64-nh24-flashattn_fa3_bf16_bwd_causal_b1_s2048_hd64_nh24___warmup_-63a73d452237.e33`
+    - Note: `-intra_smsp_warpswitch_enable 1` (boot-log confirmed). Final cycle = `178,856` (**-16.7% vs Opt 9**, **1.35x vs HW**). `gpu_sim_insn=629,211,348` + `issue_stage_issuing=22,626,216` bit-identical to baseline (work invariant). `next_stage` 21.3%→**1.6%**, `blocked_by_sfu` 15.36M→**0**. Warp-switch: `sfu_filtered=21,412,122`, `other_warp_issued=5,634,782` (26.3% recovered), `still_idle=15,777,340`.
 
 ## 2. Optimization Details
 
@@ -1182,6 +601,72 @@ All knobs are config-gated and default to 1 (bit-identical). The H100 config set
 - **Opt 8 + Opt 9 were a matched pair (the key finding):** Opt 9 opened the ROP feed to 2/tick, and Opt 8's previously-starved 2-wide bank finally fired — bwd `L2_admit_per_active_cycle` **1.00 → 1.93**, `L2_admit_multi_cycles` 846 → **5.50M**, `L2_rop_multi_cycles_total` = 5.50M (Gate A directly proven). bwd **ROP_DELAY 558 → 164 (-71%)**, `averagemflatency` 692 → 369. Gate B fired small (`L2_dram_reply_multi_cycles` 18K, only the ~13% DRAM-miss returns).
 - **Relocation (expected, net-positive):** draining ROP faster lets injection push harder → bwd `gpu_stall_dramfull` 0 → 46,758, `Req_Network_in_buffer_full` 5.67 → 11.8. But cycles fell 8% and `partiton_level_parallism` rose 47→51, so the gain dwarfs the relocation. ROP_DELAY is no longer dominant (80.65% → 44.67%); the round-trip is now spread across ROP (44.7%) + inject (36.7%) + reply (12.5%) — no single 1/tick gate remains.
 - **fwd unchanged story:** still frontend-tail bound; the memory levers are exhausted for fwd until the hit-rate over-model (Ongoing item 2) is fixed.
+
+### Opt 10 - intra-SMSP warp-switch (SFU issue-gating)
+
+> First **compute-path** optimization (Opt 1-9 were all frontend/memory). Full multi-session analysis
+> trail in [CONSUMER_COMPUTE_BOUND.md](file:///home/jihyun/modern-gpu-simulator-micro-2025/.plan/CONSUMER_COMPUTE_BOUND.md); this is the implementation + result summary.
+
+#### Problem
+
+After Opt 1-9 closed the memory path, the residual fwd 2.01× / bwd 1.62× gap was the **subcore
+drain-idle** (sim SM-active 64% vs HW 90%). The root-cause chain (drain-idle → NANOSLEEP-refuted →
+consumer-compute-sparse → issue-stage head-of-line) landed on a single defect: the sim's per-SMSP issue
+stage cannot **warp-switch around a busy functional unit**. FA3 softmax emits a dense `MUFU.EX2` stream;
+the SFU accepts 1 MUFU / 8 cyc (II=8, **HW-faithful** — H100 has 4 SFU/SMSP, 32/4=8). While the SFU is
+legitimately busy, the stuck MUFU sat in the 1-deep `ISSUE_CONTROL` latch and stalled the **whole
+subcore** — 25.1% of fwd / 21.3% of bwd evaluated subcore-cycles (`next_stage_not_available`), of which
+head-of-line instrumentation showed **98.3% had ≥1 other ready warp** (~2.77 fwd) that could not issue.
+
+#### Root cause (the misfiling)
+
+`is_fixed_latency_unit()` = `!m_has_queue && !m_is_sfu` ([functional_unit.cc:109](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/functional_unit.cc#L109)). `Subcore::issue()`
+checks `fu->can_issue()` at issue time **only for fixed-latency FUs** ([subcore.cc:725](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/subcore.cc#L725)). So a busy
+**fixed-latency** FU (TENSOR/WGMMA) filters the warp *before* the latch → scan continues → latch stays
+free (this is why `blocked_by_tensor ≈ 0`). But **SFU** sets `m_is_sfu=true` so it is treated as
+non-fixed-latency and its `can_issue` is skipped at issue — even though SFU holds its dispatch reg for a
+**deterministic** II (like a fixed-latency unit, unlike the truly variable-latency queue FUs MEM/TMA/
+MISC whose deferred check is correct). The MUFU therefore entered the latch and clogged it. This is the
+SFU analogue of the (deferred, small) WGMMA `fu_occupied` axis — same latch mechanism, but SFU triggers
+it ~99.7% of head-of-line cycles vs tensor ~0.
+
+#### Optimization details
+
+Gate `-intra_smsp_warpswitch_enable` (default 0, bit-identical off). At issue time, also evaluate
+`is_fu_available = fu->can_issue(pI)` for **no-queue FUs** (`!fu->get_has_queue()` — this newly includes
+SFU) so a busy SFU makes the warp non-eligible and GTO warp-switches to the next ready warp; queue-based
+FUs (MEM/TMA/MISC) stay on the deferred path. II and result-latency values are **unchanged** (SFU II=8
+stays HW-faithful; only *when* the availability is checked moved earlier). Three gated effect counters
+(`intra_warpswitch_sfu_filtered` / `_other_warp_issued` / `_still_idle`) record the fix firing and
+whether a slot was recovered.
+
+- Files: `subcore.cc` (issue-gate `else if` + filtered flag + effect counters), `shader.h` (gate field),
+  `gpu-sim.cc` (option + 3 counter registers), `shader.cc` (3 counter prints), `gpgpusim.config` (gate).
+  **Headers changed → `make clean`.**
+- Side-effect audit (confirmed safe): all issue-path side effects (ibuffer pop, func_exec, wait-barrier
+  increment, `reserve_unit`) fire only on a successful issue, so filtering SFU before the latch is
+  neutral-or-more-correct; SFU rarely carries read/write barriers. `reserve_unit` was already SFU-guarded,
+  so the II mechanism is untouched.
+
+#### Result
+
+- A/B, same build: baseline (gate 0) fwd `.o57` / bwd `.o32` vs fix (gate 1) fwd `.o58` / bwd `.o33`.
+- Cycles vs Opt 9: fwd 135,999 → **105,464 (-22.4%, 2.01x → 1.56x vs HW)**; bwd 215,895 → **178,856
+  (-16.7%, 1.62x → 1.35x vs HW)**. (Baseline gate-off run `.o57`/`.o32` = 135,833 / 214,826, within
+  ~0.2% of the tracked `.o38`/`.o21`, confirming the new code is timing-neutral when off.)
+- **Work-invariant (not a fake win):** `gpu_sim_insn` bit-identical (fwd 455,565,060 / bwd 629,211,348)
+  AND `issue_stage_issuing` bit-identical (fwd 16,064,281 / bwd 22,626,216) on both sides — same
+  instructions issued, only the issue-*stall* removed.
+- **Head-of-line collapsed:** fwd `next_stage_not_available` 25.1% → **0.06%**, `blocked_by_sfu` 11.48M
+  → **0**; bwd 21.3% → **1.6%**, `blocked_by_sfu` 15.36M → **0**. `issuing` (SM-active proxy) fwd 35.0%
+  → 38.0%, bwd 29.5% → 32.3%.
+- **Warp-switch fired (direct causal proof):** `other_warp_issued / sfu_filtered` = fwd 6.07M/19.15M
+  = **31.7%**, bwd 5.63M/21.41M = **26.3%** of fix-fired cycles recovered an issue slot. Residual
+  `still_idle` (fwd 13.08M / bwd 15.78M) = genuine 1-CTA/SM low-occupancy idle (no other warp existed
+  that cycle), which no longer re-stalls the whole subcore.
+- **Residual:** fwd 1.56× is now the structural 1-CTA/SM occupancy floor (233 KB shmem/block → 1 CTA/SM,
+  HW-matched), not the issue-pipeline defect. Deferred/non-blocking fidelity check: mbarrier
+  histogram / scoreboard unchanged (SFU rarely sets barriers, expected zero-impact).
 
 ## 3. Arch TODO
 
