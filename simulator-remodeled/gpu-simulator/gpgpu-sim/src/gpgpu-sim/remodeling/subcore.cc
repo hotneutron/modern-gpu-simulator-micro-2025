@@ -566,6 +566,20 @@ void Subcore::issue(SM *shared_sm) {
   // recovered slot) / still nobody issued. Only meaningful when -intra_smsp_warpswitch_enable is on.
   bool intra_ws_sfu_filtered_this_cycle = false;
 
+  // [MUFU-lockstep probe] per-cycle tallies of valid-head warps by head-op class (only meaningful when
+  // -mufu_lockstep_instrument_enable). Finalized into per-SM sums in the stats block IFF this cycle
+  // ended as still_idle (issued nothing AND >=1 SFU-blocked head). Pure read of pI->op.
+  unsigned int mufu_ls_head_mufu = 0;
+  unsigned int mufu_ls_head_tensor = 0;
+  unsigned int mufu_ls_head_other = 0;
+  unsigned int mufu_ls_valid_head = 0;
+  // [MUFU-lockstep probe] of the non-SFU (free-pipe) valid-head warps, why each could not issue — so
+  // that if the residual is NOT lockstep (free-pipe warps present) we still learn the blocking reason
+  // in the same run. Counted only for head-op != SFU_OP warps.
+  unsigned int mufu_ls_nonsfu_wait_barrier = 0;
+  unsigned int mufu_ls_nonsfu_stall_count = 0;
+  unsigned int mufu_ls_nonsfu_scoreboard = 0;
+
   modify_warp_state();
   if(m_num_pending_cycles_with_issue_port_busy > 0) {
     m_num_pending_cycles_with_issue_port_busy--;
@@ -783,6 +797,22 @@ void Subcore::issue(SM *shared_sm) {
         }
 
         bool is_inst_ready_to_issue = are_switch_warp_conditions_ready && is_l1c_ready;
+        // [MUFU-lockstep probe] tally this valid-head warp by head-op class (read-only). On a still_idle
+        // cycle nobody issues so tail_readonly stays false and every valid-head warp is counted here;
+        // on cycles that DO issue the tally is simply discarded (finalize is gated on still_idle below).
+        if (m_config->mufu_lockstep_instrument_enable) {
+          mufu_ls_valid_head++;
+          if (pI->op == SFU_OP)              mufu_ls_head_mufu++;
+          else if (pI->op == TENSOR_CORE_OP) mufu_ls_head_tensor++;
+          else                               mufu_ls_head_other++;
+          // For non-SFU (free-pipe) heads only, record why they could not issue (non-exclusive: a warp
+          // may miss several). Lets us diagnose the NOT-lockstep case in the same run.
+          if (pI->op != SFU_OP) {
+            if (!are_wait_barriers_ready)          mufu_ls_nonsfu_wait_barrier++;
+            if (!is_stall_counter_0)               mufu_ls_nonsfu_stall_count++;
+            if (!are_traditional_scoreaboards_ready) mufu_ls_nonsfu_scoreboard++;
+          }
+        }
         // [NCU stall-taxonomy] Phase 2: on the read-only tail (a warp strictly AFTER the cycle's
         // stop) never issue. Count it as not_selected iff it satisfies the read-only eligibility
         // (are_switch_warp_conditions_ready; l1c excluded by design — see plan). No side effects.
@@ -975,6 +1005,21 @@ void Subcore::issue(SM *shared_sm) {
     } else {
       shared_sm->m_sm_stats.m_stats_map["total_num_intra_warpswitch_still_idle"]->increment_with_integer(1);
     }
+  }
+  // [MUFU-lockstep probe] finalize the per-cycle head-op tallies IFF this cycle was still_idle (issued
+  // nothing AND >=1 SFU-head warp present). Uses the probe's own tally (mufu_ls_head_mufu>0), NOT
+  // is_any_fu_occupied_sfu (which is gated behind wgmma_step0), so this gate is self-contained /
+  // independent. head_mufu/valid_head ~1 => lockstep (lever=warp-stagger); head_tensor+other > 0 =>
+  // free-pipe warps blocked otherwise. Read-only; gated.
+  if (m_config->mufu_lockstep_instrument_enable && !is_issued_inst && mufu_ls_head_mufu > 0) {
+    shared_sm->m_sm_stats.m_stats_map["total_num_mufu_lockstep_sfu_cycles"]->increment_with_integer(1);
+    shared_sm->m_sm_stats.m_stats_map["total_num_mufu_lockstep_sum_head_mufu"]->increment_with_integer(mufu_ls_head_mufu);
+    shared_sm->m_sm_stats.m_stats_map["total_num_mufu_lockstep_sum_head_tensor"]->increment_with_integer(mufu_ls_head_tensor);
+    shared_sm->m_sm_stats.m_stats_map["total_num_mufu_lockstep_sum_head_other"]->increment_with_integer(mufu_ls_head_other);
+    shared_sm->m_sm_stats.m_stats_map["total_num_mufu_lockstep_sum_valid_head"]->increment_with_integer(mufu_ls_valid_head);
+    shared_sm->m_sm_stats.m_stats_map["total_num_mufu_lockstep_nonsfu_wait_barrier"]->increment_with_integer(mufu_ls_nonsfu_wait_barrier);
+    shared_sm->m_sm_stats.m_stats_map["total_num_mufu_lockstep_nonsfu_stall_count"]->increment_with_integer(mufu_ls_nonsfu_stall_count);
+    shared_sm->m_sm_stats.m_stats_map["total_num_mufu_lockstep_nonsfu_scoreboard"]->increment_with_integer(mufu_ls_nonsfu_scoreboard);
   }
   if(is_issued_inst) {
     shared_sm->m_sm_stats.m_stats_map["total_num_cycles_issue_stage_issuing"]->increment_with_integer(1);

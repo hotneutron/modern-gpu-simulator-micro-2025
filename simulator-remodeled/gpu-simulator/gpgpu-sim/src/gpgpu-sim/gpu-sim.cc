@@ -2015,6 +2015,15 @@ void shader_core_config::reg_options(class OptionParser *opp) {
                          "left on the deferred path. II/latency unchanged. Default 0 = baseline "
                          "bit-identical. See .plan/CONSUMER_COMPUTE_BOUND.md 'Fix design'. (default=0)",
                          "0");
+  option_parser_register(opp, "-mufu_lockstep_instrument_enable", OPT_BOOL,
+                         &mufu_lockstep_instrument_enable,
+                         "On still_idle cycles (subcore issued nothing AND >=1 SFU-blocked head), tally "
+                         "valid-head warps by head-op class (MUFU/TENSOR/other) into per-SM sums, to "
+                         "decide if the post-Opt-10 SFU-throughput residual is softmax MUFU-lockstep "
+                         "(all warps on MUFU) vs free-pipe warps blocked otherwise. Read-only, "
+                         "timing-neutral, default 0 = baseline bit-identical. See "
+                         ".plan/CONSUMER_COMPUTE_BOUND.md 'Next axis'. (default=0)",
+                         "0");
   option_parser_register(opp, "-sync_debug_enable", OPT_BOOL,
                          &sync_debug_enable,
                          "Enable Hopper mbarrier sync debug logging (SYNCDBG)."
@@ -2928,6 +2937,19 @@ void gpgpu_sim::create_gpu_per_sm_stats() {
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_intra_warpswitch_sfu_filtered", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_intra_warpswitch_other_warp_issued", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_intra_warpswitch_still_idle", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  // [MUFU-lockstep probe] on still_idle cycles (issued nothing AND >=1 SFU-blocked head), sum valid-head
+  // warps by head-op class. head_mufu/valid_head ~1 => softmax MUFU-lockstep (lever=warp-stagger);
+  // head_tensor+other > 0 => free-pipe warps blocked otherwise (different lever). Gated, read-only.
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_mufu_lockstep_sfu_cycles", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_mufu_lockstep_sum_head_mufu", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_mufu_lockstep_sum_head_tensor", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_mufu_lockstep_sum_head_other", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_mufu_lockstep_sum_valid_head", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  // [MUFU-lockstep probe] of the non-SFU (free-pipe) heads on still_idle cycles, blocking reason (why
+  // they could not issue) — diagnoses the NOT-lockstep case in the same run.
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_mufu_lockstep_nonsfu_wait_barrier", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_mufu_lockstep_nonsfu_stall_count", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_mufu_lockstep_nonsfu_scoreboard", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
   // [WGMMA Opt6 Step-0 instrumentation] observe-only counters (no timing change).
   // (I) split fu_occupied by pipe op.
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_issue_stage_stall_at_least_one_warp_with_fu_occupied_tensor", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);

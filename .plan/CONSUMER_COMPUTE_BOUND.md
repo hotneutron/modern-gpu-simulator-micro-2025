@@ -765,3 +765,55 @@ lack of that stagger (likely softmax MUFU-lockstep, unproven) is the next candid
 overlap/scheduling property, not a per-op latency or the (now-fixed) issue-latch defect. Remaining
 fidelity check (deferred, not blocking): confirm mbarrier histogram / scoreboard unchanged (SFU rarely
 sets barriers, expected zero-impact).
+
+## Next axis — instrumentation design: is the residual softmax MUFU-lockstep? (2026-07-26c, run pending)
+
+**The open question.** After Opt 10 the residual (fwd 1.56×) is SFU-throughput bound: `still_idle` ≡
+`fu_occupied_sfu` (13.08M cyc). But "SFU-throughput bound" has two very different sub-causes, and the
+fix direction depends on which:
+- **(A) MUFU-lockstep:** on a `still_idle` cycle, *all* resident consumer warps have a `MUFU` at their
+  head at once, so there genuinely is no free-pipe (WGMMA/FMA) warp to switch to. ⇒ lever = **warp-
+  stagger** (spread the 12 consumer warps across different pipe stages, as HW does — NCU SM-active 90%).
+- **(B) not lockstep:** some warps have WGMMA/FMA heads (free pipe) but still can't issue for *another*
+  reason (wait_barrier / stall_count / scoreboard). ⇒ the lever is that other dependency, NOT stagger.
+
+**Why static analysis can't decide.** The existing per-cycle counters are "≥1 warp" flags
+([subcore.cc:868-874](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/subcore.cc#L868)), so on a `still_idle` cycle we know *that* ≥1 warp was
+SFU-blocked and *that* ≥1 was tensor-blocked (the reasons co-occur: fu_sfu 60.4% + fu_tensor 17.4% +
+sp_int_dp 26.8% + stall_count 30.4% of `no_warps_ready`, sum ≫ 100%), but **not how many warps** were
+on each — i.e. we can't tell "12/12 on MUFU" (lockstep) from "1 on MUFU, rest blocked otherwise".
+That warp-count-per-op is exactly what decides A vs B, and it needs a new counter.
+
+**Instrumentation (gated `-mufu_lockstep_instrument_enable`, default 0, read-only, timing-neutral).**
+The `Subcore::issue()` warp-scan already visits every valid-head warp and classifies `pI->op`
+([subcore.cc:868-874](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/subcore.cc#L868)). Add per-cycle local tallies of the valid-head warps
+by head-op class, and — only on a cycle that ended as `still_idle` (issued nothing AND
+`is_any_fu_occupied_sfu`) — accumulate them into per-SM counters:
+- `mufu_lockstep_sfu_cycles` — # of still_idle cycles measured (denominator).
+- `mufu_lockstep_sum_head_mufu` — Σ over those cycles of (valid-head warps whose head is `SFU_OP`).
+- `mufu_lockstep_sum_head_tensor` — Σ head is `TENSOR_CORE_OP` (WGMMA — a *free* pipe while SFU busy).
+- `mufu_lockstep_sum_head_other` — Σ head is SP/FMA/INT/mem/branch/etc (also free pipes).
+- `mufu_lockstep_sum_valid_head` — Σ total valid-head warps (so we get averages per cycle).
+- `mufu_lockstep_nonsfu_{wait_barrier,stall_count,scoreboard}` — for the **non-SFU (free-pipe)** heads
+  on those cycles, WHY each could not issue (non-exclusive). Diagnoses the NOT-lockstep case (B) in the
+  SAME run: if free-pipe warps exist but are blocked, this says on what (wait_barrier = mbarrier /
+  WGMMA.WAIT ; stall_count = fixed-latency dep ; scoreboard = RAW — note trace-mode FA3 books WGMMA
+  result-wait as wait_barrier, and traditional scoreboard is ~0, so wait_barrier is the key signal).
+
+The op tallies are counted in the same loop pass that already computes `is_any_fu_occupied_*`; the
+still_idle gating is finalized in the stats block next to the `intra_warpswitch_*` counters
+([subcore.cc:967-978](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/subcore.cc#L967)). Pure read of `pI->op`; no side effects; default-off ⇒
+bit-identical. Files: `subcore.cc` (tallies + finalize), `shader.h` (gate), `gpu-sim.cc` (option + 5
+stat registers), `shader.cc` (5 prints). **Headers changed → `make clean`.**
+
+**Read of results (after run):**
+- `sum_head_mufu / sum_valid_head` **high (→ ~1.0, i.e. avg ~all warps on MUFU)** ⇒ **lockstep CONFIRMED
+  (A)** → next lever is warp-stagger. Combined with `sum_head_tensor+other ≈ 0`, decisive.
+- `sum_head_tensor + sum_head_other` **materially > 0** ⇒ **NOT lockstep (B)** → free-pipe warps exist
+  but are blocked; cross with `wait_barrier`/`stall_count` co-occurrence to find the real reason. This
+  would REFUTE the stagger hypothesis and redirect the axis.
+- avg valid-head warps per still_idle cycle (`sum_valid_head / sfu_cycles`) also sizes how many warps
+  are even resident/eligible at those moments (sanity vs the ~2.77 ready-warp baseline).
+
+⚠️ This confirms the *mechanism* of the residual; it is not itself a cycle lever. Run it alongside the
+existing gates (headofline / wgmma_step0) so one pass both re-confirms Opt 10 and sizes this axis.

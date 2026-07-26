@@ -1386,6 +1386,16 @@ void shader_core_stats::print_remodeling_stats(FILE *fout) {
   fprintf(fout, "total_num_intra_warpswitch_sfu_filtered = %llu\n", m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_intra_warpswitch_sfu_filtered"]->get_value());
   fprintf(fout, "total_num_intra_warpswitch_other_warp_issued = %llu\n", m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_intra_warpswitch_other_warp_issued"]->get_value());
   fprintf(fout, "total_num_intra_warpswitch_still_idle = %llu\n", m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_intra_warpswitch_still_idle"]->get_value());
+  // [MUFU-lockstep probe] emit the gated head-op tallies (0 unless -mufu_lockstep_instrument_enable).
+  // sum_head_mufu / sum_valid_head ~1 => softmax MUFU-lockstep. See .plan/CONSUMER_COMPUTE_BOUND.md "Next axis".
+  fprintf(fout, "total_num_mufu_lockstep_sfu_cycles = %llu\n", m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_mufu_lockstep_sfu_cycles"]->get_value());
+  fprintf(fout, "total_num_mufu_lockstep_sum_head_mufu = %llu\n", m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_mufu_lockstep_sum_head_mufu"]->get_value());
+  fprintf(fout, "total_num_mufu_lockstep_sum_head_tensor = %llu\n", m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_mufu_lockstep_sum_head_tensor"]->get_value());
+  fprintf(fout, "total_num_mufu_lockstep_sum_head_other = %llu\n", m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_mufu_lockstep_sum_head_other"]->get_value());
+  fprintf(fout, "total_num_mufu_lockstep_sum_valid_head = %llu\n", m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_mufu_lockstep_sum_valid_head"]->get_value());
+  fprintf(fout, "total_num_mufu_lockstep_nonsfu_wait_barrier = %llu\n", m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_mufu_lockstep_nonsfu_wait_barrier"]->get_value());
+  fprintf(fout, "total_num_mufu_lockstep_nonsfu_stall_count = %llu\n", m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_mufu_lockstep_nonsfu_stall_count"]->get_value());
+  fprintf(fout, "total_num_mufu_lockstep_nonsfu_scoreboard = %llu\n", m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_mufu_lockstep_nonsfu_scoreboard"]->get_value());
   // [NANOSLEEP spin lever] emit the gated spin counters (0 unless -spin_instrument_enable).
   fprintf(fout, "total_num_cycles_spin_ops_issued = %llu\n", m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_cycles_spin_ops_issued"]->get_value());
   fprintf(fout, "total_num_cycles_spin_won_over_eligible = %llu\n", m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_cycles_spin_won_over_eligible"]->get_value());

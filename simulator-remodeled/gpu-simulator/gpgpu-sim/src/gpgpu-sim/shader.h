@@ -2275,6 +2275,14 @@ class shader_core_config : public core_config {
   // reproduces baseline bit-identically. See .plan/CONSUMER_COMPUTE_BOUND.md "Fix design".
   bool intra_smsp_warpswitch_enable;
 
+  // [MUFU-lockstep probe] When on, on every cycle the subcore issued nothing AND had >=1 SFU-blocked
+  // head (still_idle), tally the valid-head warps by head-op class (MUFU / TENSOR / other) into per-SM
+  // sums. Decides whether the post-Opt-10 SFU-throughput residual is genuine softmax MUFU-lockstep (all
+  // warps on MUFU at once => lever is warp-stagger) or free-pipe warps blocked otherwise (=> different
+  // lever). Read-only (pure read of pI->op), no side effects, default 0 = bit-identical. See
+  // .plan/CONSUMER_COMPUTE_BOUND.md "Next axis".
+  bool mufu_lockstep_instrument_enable;
+
   // Hopper mbarrier sync debug logging (SYNCDBG). Disabled by default.
   bool sync_debug_enable;
   unsigned int sync_debug_print_budget;
