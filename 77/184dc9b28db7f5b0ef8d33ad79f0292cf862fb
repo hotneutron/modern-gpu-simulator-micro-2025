@@ -1,0 +1,72 @@
+simulator-remodeled/gpu-simulator/gpgpu-sim/configs/tested-cfgs/SM90_H100_L2_50MB_80GB/gpgpusim.config
+  h_35c34d310c0197 288
+  s_8f5f8f516806ed::t_dddeda53081aa5 465-471 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a65829a8017000003849605","tool_type":"agent","tool_id":"Edit","line_ranges":[{"Range":[465,471]}]}]}
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "77184dc9b28db7f5b0ef8d33ad79f0292cf862fb",
+  "prompts": {},
+  "humans": {
+    "h_35c34d310c0197": {
+      "author": "Jihyun Ryoo <jihyun.ryoo@bytedance.com>"
+    }
+  },
+  "sessions": {
+    "s_8f5f8f516806ed": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6a6287038017000003849225",
+        "model": "openrouter-3o__max"
+      },
+      "human_author": "Jihyun Ryoo <jihyun.ryoo@bytedance.com>"
+    }
+  },
+  "attestation_metadata": {
+    "simulator-remodeled/gpu-simulator/gpgpu-sim/configs/tested-cfgs/SM90_H100_L2_50MB_80GB/gpgpusim.config": [
+      {
+        "hash": "s_8f5f8f516806ed::t_dddeda53081aa5",
+        "line_ranges": [
+          {
+            "Range": [
+              465,
+              471
+            ]
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a65829a8017000003849605",
+            "tool_type": "agent",
+            "tool_id": "Edit",
+            "line_ranges": [
+              {
+                "Range": [
+                  465,
+                  471
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "remote_transcripts": {
+    "s_8f5f8f516806ed": {
+      "tool": "trae",
+      "conversation_id": "6a6287038017000003849225",
+      "session_id": "6a6287038017000003849225",
+      "status": "remote_only",
+      "message": "Remote transcript resolution is not implemented yet for TRAE prompts."
+    },
+    "s_8f5f8f516806ed::t_dddeda53081aa5": {
+      "tool": "trae",
+      "conversation_id": "6a6287038017000003849225",
+      "session_id": "6a6287038017000003849225",
+      "status": "remote_only",
+      "message": "Remote transcript resolution is not implemented yet for TRAE prompts."
+    }
+  }
+}
