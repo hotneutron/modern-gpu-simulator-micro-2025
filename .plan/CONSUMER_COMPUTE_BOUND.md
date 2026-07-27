@@ -817,3 +817,77 @@ stat registers), `shader.cc` (5 prints). **Headers changed → `make clean`.**
 
 ⚠️ This confirms the *mechanism* of the residual; it is not itself a cycle lever. Run it alongside the
 existing gates (headofline / wgmma_step0) so one pass both re-confirms Opt 10 and sizes this axis.
+
+## RESULT — MUFU-lockstep probe (2026-07-27, fwd `.o59` / bwd `.o34`)
+
+Ran with the fix + probe gates on. Cycles held (fwd 105,245 / bwd 178,389 ≈ Opt 10). still_idle head-op
+composition:
+
+| still_idle valid-head | FWD (.o59) | BWD (.o34) |
+|---|---|---|
+| sfu_cycles (denominator) | 13,083,159 | 15,799,258 |
+| avg valid-head warps / cycle | 2.716 | 2.155 |
+| **head_mufu** | **74.6%** | **70.2%** |
+| head_tensor | 5.8% | 9.1% |
+| head_other (SP/FMA/INT/…) | 19.6% | 20.7% |
+| **free-pipe (tensor+other)** | **25.4%** | **29.8%** |
+
+**Verdict: partial lockstep — MUFU-lockstep is the DOMINANT cause (~75%) but NOT the only one.** ~3/4 of
+still_idle cycles are genuine lockstep (all valid heads on MUFU ⇒ nowhere to warp-switch), confirming
+warp-stagger as the largest lever. But a free-pipe head is present on ~25% of them, so it is not the
+pure case (A).
+
+**Why the free-pipe warps still can't issue** (FWD non-SFU heads = 9.04M; reasons non-exclusive):
+- `wait_barrier` 25.0% — mbarrier / WGMMA.WAIT: genuine producer→consumer data dependency (TMA tile not
+  yet landed, or waiting a prior WGMMA result). Not switch-recoverable — the data isn't there.
+- `stall_count` 27.7% — trace-encoded fixed stall/latency the warp itself must serve. Not recoverable.
+- `scoreboard` 0% — as expected in trace mode (WGMMA result-wait books as wait_barrier).
+- **rest ~47% — STATICALLY NARROWED (2026-07-27), no new counter needed.** These free-pipe heads passed
+  wb/sc/sb but were rejected by one of the other six `are_switch_warp_conditions_ready` gates
+  ([subcore.cc:781-784](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/subcore.cc#L781)). Cross-referencing the existing per-cycle "at_least_one_warp"
+  counters in the same run (`.o59`) against `no_warps_ready` (21.62M) resolves the composition:
+  - `fu_occupied_tensor` 3.75M (17.3%) + `fu_occupied_sp_int_dp` 5.83M (27.0%) + `fu_occupied_other`
+    0.35M (1.6%) = **~44% is a non-SFU compute FU being busy** (`is_fu_available=false`).
+  - `result_queue_full` 0.17M (**0.8%**), `tma_flush` **0**, `ldgdepbar` **0**, `inst_barrier` 0.25% —
+    all negligible. The result-queue-depth "lever" I worried about is **not** a bottleneck.
+  ⇒ the "rest" is essentially **non-SFU FU-throughput bound** (tensor/sp/int/dp busy), the same physical
+  nature as the MUFU lockstep — a compute limit, NOT a queue/backpressure artifact and NOT a latch bug.
+  Confirmed at the mechanism level: fixed-latency `can_issue()` = `m_dispatch_pending_reserved_cycles==0
+  && m_dispatch_reg->empty()` with `assert(!m_has_queue)` ([functional_unit.cc:137-140](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/functional_unit.cc#L137)) — it is
+  purely II occupancy of a queue-less compute pipe, not a queue-full condition. **Not an actionable
+  lever; closed.** (Caveat: the "at_least_one" counters are ≥1-warp flags, so this is a strong
+  composition bound, not a warp-exact attribution — but the non-fu_occupied gates summing to <1% makes
+  the conclusion robust without a dedicated counter.)
+
+### lever B (extend Opt 10 issue-gating to tensor/fma) — INVESTIGATED, DOES NOT EXIST
+
+Initial hypothesis: the ~47% "rest" were tensor/fma warps whose own FU was busy but that clogged the
+latch like the SFU did (a tensor/fma head-of-line Opt 10 missed). **Checked in code — refuted:**
+- `is_fixed_latency_unit() = !m_has_queue && !m_is_sfu` ([functional_unit.cc:109](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/functional_unit.cc#L109)).
+- TENSOR / SP / INT / UNIFORM / BRANCH pipelines are all built with `has_queue=false, is_sfu=false`
+  ([subcore.cc:1722-1732](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/subcore.cc#L1722)) ⇒ they are **fixed-latency**.
+- Fixed-latency FUs ALREADY check `can_issue()` at issue time ([subcore.cc:745-746](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/subcore.cc#L745)), independent of the
+  Opt 10 gate. So a busy tensor/fma warp is filtered BEFORE the ISSUE_CONTROL latch and never clogs it.
+
+⇒ There is no tensor/fma *latch head-of-line* to fix; Opt 10 already covered every FU that could clog
+the 1-deep ISSUE_CONTROL latch (SFU was the sole misfiled one). **BUT that only closes the latch-clog
+hypothesis — it does NOT prove the "rest ~47%" bucket is all genuine-dependency.** A busy tensor/fma warp
+is filtered at issue (correct, no latch clog), yet if that happens *often* it means the tensor pipe is
+itself throughput-bound the same way SFU is — a real limit worth sizing, just not a latch bug. Likewise
+an `is_write_..._result_queue_..._available` rejection is a queue-depth limit that may be tunable. So:
+**lever B (extend the latch issue-gate) is closed, but the "rest ~47%" is still unmeasured and may hide
+a tensor-throughput or result-queue lever — see the breakdown TODO above.**
+
+### Consequence — the residual splits, and one part is still unmeasured
+
+- **Recoverable-by-scheduling (proven):** the lockstep MUFU 74.6%, bounded because HW is itself partly
+  SFU-bound (xu 47.75%). Treatment = **warp-stagger** (lever A), which is NOT a scheduler-policy tweak
+  (GTO↔LRR only reorders eligible warps; on a lockstep cycle every warp is on MUFU so reordering changes
+  nothing, and mbarrier re-synchronizes them each tile). Tracked as a new axis —
+  see `.plan/WARP_STAGGER_LOCKSTEP.md`.
+- **Genuine dependency (proven):** the free-pipe `wait_barrier` + `stall_count` portion — data/latency
+  dependencies, overlapping the structural 1-CTA/SM low-occupancy floor. No cycle claim.
+- **Non-SFU FU-throughput bound (rest ~47%, statically resolved 2026-07-27):** ~44% is tensor/sp/int/dp
+  `is_fu_available=false` (compute pipe busy on its II) — same physical nature as the MUFU lockstep, not
+  a queue/latch artifact; result-queue/tma_flush/ldgdepbar all <1%. Not an actionable lever; closed.
+  Deferred (may revisit if occupancy raised) — see FA3_progress.md Deferred Opts.

@@ -137,6 +137,8 @@ gap. Kept here so they are not re-attempted blindly.
 
 **fwd L2-hit over-model + frontend-tail *fetch-nature* (accuracy / not-a-lever).** (Former Ongoing item 2, split from its drain-idle *magnitude*, which stays live in the Ongoing section.) **Deferred for two distinct reasons:** (a) **fwd L2-hit over-model is a fidelity item, not a timing lever** — fwd `L2_TMA_true_hit_rate` 0.9456 vs HW 0.6958 is caused by the **CTA-count cap** (132 CTAs < 384 tiles → ≤132 distinct tiles/tensor); closing it needs real tile `coords` (Opt-6 approach B), an **addressing** fix, and is parked because bwd hit rate is already on target (0.8688 vs HW 0.8226). (b) **the frontend-tail *fetch* interpretation is ruled out** — `nv_ibuffer_empty` warps are **trace-DRAINED** (`nv_ibuf_fetch_inflight ≈ 0`), not fetch-starved, so no frontend-fetch fix helps (Opt 4/5 were correctly scoped and are exhausted). ⚠️ **Note:** the drain-idle *magnitude* (sim 64.0% active vs HW 88.9% = 1.39× more idle) is NOT deferred — it is the sole live Ongoing item below; only the *fetch-nature* and the *L2-hit fidelity* pieces are parked here.
 
+**Non-SFU FU-throughput bound (post-Opt-10 residual "rest ~47%" of `no_warps_ready`).** After Opt 10 removed the SFU head-of-line block, the residual `still_idle` splits into two buckets: (i) the dominant **MUFU-lockstep / warp-stagger** part (all consumer warp-heads land on the busy SFU at once — this is the live *lever A*, see [WARP_STAGGER_LOCKSTEP.md](file:///home/jihyun/modern-gpu-simulator-micro-2025/.plan/WARP_STAGGER_LOCKSTEP.md)), and (ii) this bucket: the ~47% of `no_warps_ready` cycles where a *free-pipe* head passed wait-barrier / scoreboard / stall-count yet still did not issue. **Deferred (statically resolved 2026-07-27 — genuine compute-throughput, no queue lever):** decomposing that bucket with the existing per-condition counters shows **~44% is non-SFU functional-unit busy** — `fu_occupied_tensor` 3.75M (17.3% of `no_warps_ready`=21.62M) + `fu_occupied_sp_int_dp` 5.83M (27.0%) + `fu_occupied_other` 0.35M (1.6%) — with `result_queue_full` 0.17M (0.8%), `tma_flush` 0, `ldgdepbar` 0, and `inst_barrier` ~0.25% all **negligible**. This is **not** a queue-backpressure or burst-absorption problem: the fixed-latency FUs (TENSOR/SP/INT/UNIFORM/BRANCH) are constructed with `has_queue=false`, and their availability gate [functional_unit.cc:137-140](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/functional_unit.cc#L137) is `assert(!m_has_queue); return m_dispatch_pending_reserved_cycles == 0 && m_dispatch_reg->empty();` — i.e. the head is blocked purely because the compute pipe is still counting down its `initiation_interval` II from a prior op (`m_dispatch_pending_reserved_cycles`, set in [reserve_unit](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/functional_unit.cc#L125)), **the real compute unit is busy, not a queue draining**. It is a structural reflection of FA3's compute density (same class as the SFU/MUFU lockstep), not a tunable simulator defect, so there is no code lever here. Full detail and the "rest 47%" decomposition live in [CONSUMER_COMPUTE_BOUND.md](file:///home/jihyun/modern-gpu-simulator-micro-2025/.plan/CONSUMER_COMPUTE_BOUND.md) (the "rest ~47% — STATICALLY NARROWED" bullet + the "Consequence" section). ⚠️ **Revisit trigger:** if occupancy is ever raised above 1 CTA/SM (lever A resolved) and this bucket still dominates, re-open with per-condition counters already wired behind `-mufu_lockstep_instrument_enable`.
+
 
 ### Run Paths
 
@@ -261,6 +263,29 @@ FA3 bwd
     - Stats run: `H100_80GB-OnlyKernel10/flashattn-fa3-bf16-bwd-causal-b1-s2048-hd64-nh24-flashattn_fa3_bf16_bwd_causal_b1_s2048_hd64_nh24___warmup_-63a73d452237.o33`
     - Event / debug run: `H100_80GB-OnlyKernel10/flashattn-fa3-bf16-bwd-causal-b1-s2048-hd64-nh24-flashattn_fa3_bf16_bwd_causal_b1_s2048_hd64_nh24___warmup_-63a73d452237.e33`
     - Note: `-intra_smsp_warpswitch_enable 1` (boot-log confirmed). Final cycle = `178,856` (**-16.7% vs Opt 9**, **1.35x vs HW**). `gpu_sim_insn=629,211,348` + `issue_stage_issuing=22,626,216` bit-identical to baseline (work invariant). `next_stage` 21.3%→**1.6%**, `blocked_by_sfu` 15.36M→**0**. Warp-switch: `sfu_filtered=21,412,122`, `other_warp_issued=5,634,782` (26.3% recovered), `still_idle=15,777,340`.
+
+### Ongoing — MUFU-lockstep / warp-stagger (lever A)
+
+The dominant remaining compute-path residual after Opt 10. **No cycle claim** until a mechanism is
+proven and verified. Full design + plan: [`.plan/WARP_STAGGER_LOCKSTEP.md`](../.plan/WARP_STAGGER_LOCKSTEP.md); measurement detail in
+[`.plan/CONSUMER_COMPUTE_BOUND.md`](../.plan/CONSUMER_COMPUTE_BOUND.md) "RESULT — MUFU-lockstep probe".
+
+- **What it is.** On ~3/4 of post-Opt-10 `still_idle` cycles (fwd 74.6% / bwd 70.2%, probe run
+  `.o59`/`.o34`) *every* valid-head warp is on a `MUFU.EX2` at once, so all want the one HW-faithful SFU
+  (II=8) and there is no free-pipe (WGMMA/FMA) warp to switch to. HW de-phases its warps across pipe
+  stages (NCU `not_selected=0.82`, SM-active 90%, xu 47.75%); the simulator's 12 consumer warps march in
+  phase, re-synchronized every tile by the TMA/WGMMA mbarrier.
+- **Sizing / caveats.** avg valid-head warps per stalled cycle is only ~2.7 (fwd) / ~2.2 (bwd), not 12 —
+  most warps are themselves parked (own mbarrier/stall). HW is itself partly SFU-bound (xu 47.75%), so
+  the achievable ceiling from de-phasing is bounded, not 2×.
+- **Ruled out already.** GTO→LRR / weakening greedy does nothing (reordering an all-MUFU eligible set
+  can't help; Opt 10 already scans past blocked heads). lever B (tensor/fma issue-gate) does not exist —
+  tensor/fma are fixed-latency and already `can_issue()`-checked, never clog the latch.
+- **Open question first.** Rule the structural 1-CTA/SM occupancy floor in/out before any code: if the
+  lockstep merely reflects too few resident warps (HW hides SFU with a larger pool FA3's SMEM forbids),
+  it is a faithful floor to *document*, not a defect to "fix." Candidate mechanisms if it is phasing:
+  launch-phase stagger (cheap, but mbarrier likely washes it out) or execution jitter modeling
+  (HW-honest but invasive, fidelity-sensitive). See the plan doc for the investigation order.
 
 ## 2. Optimization Details
 
