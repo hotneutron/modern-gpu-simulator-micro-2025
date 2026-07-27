@@ -783,26 +783,6 @@ void Subcore::issue(SM *shared_sm) {
             is_fu_available && is_not_warp_waiting_in_programmer_barrier &&
             is_not_warp_waiting_ldgdepbar && is_not_warp_waiting_tma_flush && are_traditional_scoreaboards_ready && is_write_available_result_queue_for_fixed_latency_available;
 
-        // [oracle de-phase probe / lever A E1] ORACLE upper-bound: force a one-time per-warp launch-phase
-        // offset so the lockstep consumer warps enter WGMMA->softmax out of phase. On the FIRST cycle a
-        // warp is otherwise fully eligible (base conditions met, not on the read-only tail), arm its
-        // release cycle = now + (cta_local_warp_index * stride); until that cycle the warp is held out of
-        // issue. Arming is one-time per warp (survives across tiles by design: we do NOT re-arm, so it is
-        // a pure launch offset — this directly tests whether the per-tile mbarrier re-synchronizes them).
-        // Gate default-off => is_oracle_dephase_ready() returns true (never armed) => bit-identical.
-        if (m_config->oracle_dephase_enable && !tail_readonly) {
-          if (!c_warp->is_oracle_dephase_armed() && are_switch_warp_conditions_ready && is_l1c_ready) {
-            unsigned warps_per_cta = c_warp->get_kernel_info()->threads_per_cta() / m_config->warp_size;
-            unsigned cta_local_idx = (warps_per_cta > 0) ? (c_warp->get_warp_id() % warps_per_cta) : 0;
-            unsigned long long release = shared_sm->get_current_gpu_cycle() +
-                (unsigned long long)cta_local_idx * m_config->oracle_dephase_stride;
-            c_warp->arm_oracle_dephase(release);
-          }
-          if (!c_warp->is_oracle_dephase_ready(shared_sm->get_current_gpu_cycle())) {
-            are_switch_warp_conditions_ready = false;
-          }
-        }
-
         bool can_l1c_switch_warp = true;
 
         if(m_greedy_pointer_issue == subcore_warp_id ) {

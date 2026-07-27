@@ -185,10 +185,6 @@ class shd_warp_t {
     m_next = 0;
     m_last_unique_inst_id = 0;
 
-    // [oracle de-phase probe] cleared at (re)launch so a reused hw warp slot starts unstaggered.
-    m_oracle_dephase_release_cycle = 0;
-    m_oracle_dephase_armed = false;
-
     // Jin: cdp support
     m_cdp_latency = 0;
     m_cdp_dummy = false;
@@ -392,20 +388,6 @@ class shd_warp_t {
   unsigned get_dynamic_warp_id() const { return m_dynamic_warp_id; }
   unsigned get_warp_id() const { return m_warp_id; }
 
-  // [oracle de-phase probe] one-time arm of this warp's launch-phase release cycle. Called the first
-  // time the warp is otherwise eligible to issue; the offset (cta_local_index * stride) staggers the
-  // lockstep consumer warps. is_oracle_dephase_ready() gates issue until that cycle. Observe/probe only.
-  void arm_oracle_dephase(unsigned long long release_cycle) {
-    if (!m_oracle_dephase_armed) {
-      m_oracle_dephase_release_cycle = release_cycle;
-      m_oracle_dephase_armed = true;
-    }
-  }
-  bool is_oracle_dephase_armed() const { return m_oracle_dephase_armed; }
-  bool is_oracle_dephase_ready(unsigned long long cur_cycle) const {
-    return !m_oracle_dephase_armed || cur_cycle >= m_oracle_dephase_release_cycle;
-  }
-
   // MOD. Begin IBuffer_ooo debug
   std::map<unsigned,unsigned> pc_incs;
   std::map<unsigned,unsigned> pc_decs;
@@ -465,10 +447,6 @@ class shd_warp_t {
   unsigned m_warp_id;
   unsigned m_warp_size;
   unsigned m_dynamic_warp_id;
-
-  // [oracle de-phase probe] per-warp one-time launch-phase offset state (see arm_oracle_dephase).
-  unsigned long long m_oracle_dephase_release_cycle;
-  bool m_oracle_dephase_armed;
 
   address_type m_next_pc;
   unsigned n_completed;  // number of threads in warp completed
@@ -2296,16 +2274,6 @@ class shader_core_config : public core_config {
   // deferred path (their drain time is non-deterministic). II/latency values are unchanged. Default 0
   // reproduces baseline bit-identically. See .plan/CONSUMER_COMPUTE_BOUND.md "Fix design".
   bool intra_smsp_warpswitch_enable;
-
-  // [oracle de-phase probe / lever A E1] When enabled, force a ONE-TIME per-warp launch-phase offset:
-  // the first time a warp is eligible to issue, delay it by (cta_local_warp_index * stride) cycles, so
-  // the 12 lockstep consumer warps enter the WGMMA->softmax sequence out of phase. This is an ORACLE
-  // (not HW-faithful) upper-bound probe: it answers "if the warps WERE de-phased, how many cycles would
-  // overlap recover, and does the per-tile mbarrier wash it out?" — sizing whether the (expensive)
-  // faithful jitter model (candidate B) is worth building. gpu_sim_insn stays bit-identical (same work,
-  // only issue timing shifts). Default 0 = baseline bit-identical. See .plan/WARP_STAGGER_LOCKSTEP.md.
-  bool oracle_dephase_enable;
-  unsigned int oracle_dephase_stride;
 
   // [MUFU-lockstep probe] When on, on every cycle the subcore issued nothing AND had >=1 SFU-blocked
   // head (still_idle), tally the valid-head warps by head-op class (MUFU / TENSOR / other) into per-SM

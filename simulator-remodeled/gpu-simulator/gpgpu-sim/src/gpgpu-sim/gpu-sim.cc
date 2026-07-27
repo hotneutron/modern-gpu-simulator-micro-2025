@@ -2024,23 +2024,6 @@ void shader_core_config::reg_options(class OptionParser *opp) {
                          "timing-neutral, default 0 = baseline bit-identical. See "
                          ".plan/CONSUMER_COMPUTE_BOUND.md 'Next axis'. (default=0)",
                          "0");
-  option_parser_register(opp, "-oracle_dephase_enable", OPT_BOOL,
-                         &oracle_dephase_enable,
-                         "[lever A E1 probe] Force a ONE-TIME per-warp launch-phase offset: the first "
-                         "time a warp is otherwise eligible, delay its issue by (cta_local_warp_index * "
-                         "oracle_dephase_stride) cycles, staggering the lockstep consumer warps. ORACLE "
-                         "upper-bound probe (NOT HW-faithful): measures whether de-phasing recovers "
-                         "cycles and whether the per-tile mbarrier washes it out. gpu_sim_insn stays "
-                         "bit-identical (same work). Default 0 = baseline bit-identical. See "
-                         ".plan/WARP_STAGGER_LOCKSTEP.md. (default=0)",
-                         "0");
-  option_parser_register(opp, "-oracle_dephase_stride", OPT_UINT32,
-                         &oracle_dephase_stride,
-                         "[lever A E1 probe] Per-warp launch-phase stride in cycles (offset = "
-                         "cta_local_warp_index * stride). Only active when -oracle_dephase_enable 1. "
-                         "Sweep e.g. 8/16/32 to probe the softmax-region-length that maximizes overlap. "
-                         "(default=16)",
-                         "16");
   option_parser_register(opp, "-sync_debug_enable", OPT_BOOL,
                          &sync_debug_enable,
                          "Enable Hopper mbarrier sync debug logging (SYNCDBG)."

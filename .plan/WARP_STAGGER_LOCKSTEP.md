@@ -354,7 +354,59 @@ dynamic cross-warp contention model), C is a rejected knob.
    bounded by HW's own 54% No-Eligible" is itself a defensible floor — make no cycle claim, and consider
    the compute-path axis closed.
 
-## E1 — oracle de-phase probe: IMPLEMENTED, run pending (2026-07-27)
+## E1 — oracle de-phase probe: RUN DONE → NEGATIVE (mbarrier washes it out) (2026-07-27)
+
+> ⛔ **RESULT: de-phasing recovers ~0 cycles; the per-tile mbarrier re-synchronizes the warps exactly as
+> predicted. Lever A is a structural floor. The E1 oracle code was REVERTED per the up-front disposition
+> (kept only in git history + this doc).** Details below; the design/run-plan text is retained as the record.
+
+### Measured result (fwd `.o60` / bwd `.o35`, `-oracle_dephase_enable 1`, stride=16)
+
+| metric | FWD K5 baseline (`.o58`) | FWD E1 (`.o60`) | BWD K10 baseline (`.o33`) | BWD E1 (`.o35`) |
+|---|---:|---:|---:|---:|
+| `gpu_sim_cycle` | 105,464 | **105,862 (+0.38%)** | 178,856 | **178,724 (−0.07%)** |
+| `gpu_sim_insn` (work) | 455,565,060 | 455,565,060 (bit-identical) | 629,211,348 | 629,211,348 (bit-identical) |
+| `head_mufu / valid_head` | 0.746 | **0.745 (unchanged)** | 0.702 | **0.703 (unchanged)** |
+
+**Verdict — decisive NEGATIVE, both diagnostics agree:**
+1. **Cycles did not improve** — fwd +0.38% (slightly *worse*), bwd −0.07% (noise). Against the ≈1.9×
+   per-tile overlap ceiling, the recovered fraction is **zero**. `gpu_sim_insn` bit-identical confirms the
+   oracle ran correctly (work invariant), so the null is real, not a measurement error.
+2. **Lockstep re-formed** — `head_mufu/valid_head` moved 0.746→0.745 (fwd) / 0.702→0.703 (bwd), i.e. it
+   **did not budge**. The launch-phase offset was fully erased by the first tile's mbarrier: the warps
+   arrived staggered exactly once, then the atomic phase-flip release
+   ([sm.cc:1799](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/sm.cc#L1799))
+   re-collapsed them into phase. This is the **direct empirical confirmation** of the code-level
+   "mbarrier washes out any launch stagger" prediction (arrive-vs-release section).
+
+**Why a stride sweep (8/32) was NOT run:** the failure is not a wrong stride — `head_mufu` not moving at
+all means the offset is annihilated at tile 1 regardless of its size. No stride survives one mbarrier, so
+sweeping cannot change the verdict.
+
+### Disposition executed: E1 code REVERTED
+
+Per the up-front decision (below), the oracle produced ~null / washed-out ⇒ the probe did its job
+(proved the floor) and the knob must not linger. The 4 source+config edits from commit `0b863b0`
+(`shader.h`, `gpu-sim.cc`, `subcore.cc`, `gpgpusim.config`) were removed — those files are now
+byte-identical to the pre-E1 state (`e9a64e8`). Only this analysis doc is kept. `0b863b0` remains in
+history as the reproducible source state that produced `.o60`/`.o35`.
+
+### Conclusion for lever A: STRUCTURAL FLOOR — axis closed
+
+Combined with Step 1 (occupancy floor ruled out) and the feasibility scan, the chain is now complete:
+- **not occupancy** (sim resident warps == HW theoretical);
+- **is phasing** (issue-density 1.41× fwd), but **phasing is not recoverable by staggering** because the
+  per-tile mbarrier deterministically re-synchronizes the warps (E1 proved it empirically);
+- the only faithful path left (candidate B: dynamic cross-warp bank/port contention jitter) would have to
+  overcome that same re-synchronization *and* stay bounded by HW's own 54% No-Eligible — E1 shows even a
+  perfect launch stagger yields 0, so B's realistic payoff is almost certainly negligible.
+
+⇒ **Lever A / MUFU-lockstep is a structural deterministic-model floor. No cycle claim. Compute-path axis
+closed.** Recorded in FA3_progress.md.
+
+---
+
+## E1 design + run plan (retained as the record)
 
 **Purpose.** The one big unknown is the *upper bound*: if the lockstep consumer warps WERE de-phased,
 how many cycles would pipe-overlap actually recover — and does the per-tile mbarrier wash the stagger

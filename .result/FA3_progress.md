@@ -264,28 +264,32 @@ FA3 bwd
     - Event / debug run: `H100_80GB-OnlyKernel10/flashattn-fa3-bf16-bwd-causal-b1-s2048-hd64-nh24-flashattn_fa3_bf16_bwd_causal_b1_s2048_hd64_nh24___warmup_-63a73d452237.e33`
     - Note: `-intra_smsp_warpswitch_enable 1` (boot-log confirmed). Final cycle = `178,856` (**-16.7% vs Opt 9**, **1.35x vs HW**). `gpu_sim_insn=629,211,348` + `issue_stage_issuing=22,626,216` bit-identical to baseline (work invariant). `next_stage` 21.3%→**1.6%**, `blocked_by_sfu` 15.36M→**0**. Warp-switch: `sfu_filtered=21,412,122`, `other_warp_issued=5,634,782` (26.3% recovered), `still_idle=15,777,340`.
 
-### Ongoing — MUFU-lockstep / warp-stagger (lever A)
+### Closed — MUFU-lockstep / warp-stagger (lever A): STRUCTURAL FLOOR (2026-07-27)
 
-The dominant remaining compute-path residual after Opt 10. **No cycle claim** until a mechanism is
-proven and verified. Full design + plan: [`.plan/WARP_STAGGER_LOCKSTEP.md`](../.plan/WARP_STAGGER_LOCKSTEP.md); measurement detail in
+The dominant post-Opt-10 compute-path residual, now **closed as a structural deterministic-model floor —
+NO cycle claim**. Full trail: [`.plan/WARP_STAGGER_LOCKSTEP.md`](../.plan/WARP_STAGGER_LOCKSTEP.md); probe detail in
 [`.plan/CONSUMER_COMPUTE_BOUND.md`](../.plan/CONSUMER_COMPUTE_BOUND.md) "RESULT — MUFU-lockstep probe".
 
-- **What it is.** On ~3/4 of post-Opt-10 `still_idle` cycles (fwd 74.6% / bwd 70.2%, probe run
-  `.o59`/`.o34`) *every* valid-head warp is on a `MUFU.EX2` at once, so all want the one HW-faithful SFU
-  (II=8) and there is no free-pipe (WGMMA/FMA) warp to switch to. HW de-phases its warps across pipe
-  stages (NCU `not_selected=0.82`, SM-active 90%, xu 47.75%); the simulator's 12 consumer warps march in
-  phase, re-synchronized every tile by the TMA/WGMMA mbarrier.
-- **Sizing / caveats.** avg valid-head warps per stalled cycle is only ~2.7 (fwd) / ~2.2 (bwd), not 12 —
-  most warps are themselves parked (own mbarrier/stall). HW is itself partly SFU-bound (xu 47.75%), so
-  the achievable ceiling from de-phasing is bounded, not 2×.
-- **Ruled out already.** GTO→LRR / weakening greedy does nothing (reordering an all-MUFU eligible set
-  can't help; Opt 10 already scans past blocked heads). lever B (tensor/fma issue-gate) does not exist —
-  tensor/fma are fixed-latency and already `can_issue()`-checked, never clog the latch.
-- **Open question first.** Rule the structural 1-CTA/SM occupancy floor in/out before any code: if the
-  lockstep merely reflects too few resident warps (HW hides SFU with a larger pool FA3's SMEM forbids),
-  it is a faithful floor to *document*, not a defect to "fix." Candidate mechanisms if it is phasing:
-  launch-phase stagger (cheap, but mbarrier likely washes it out) or execution jitter modeling
-  (HW-honest but invasive, fidelity-sensitive). See the plan doc for the investigation order.
+- **What it is.** On ~3/4 of post-Opt-10 `still_idle` cycles (fwd 74.6% / bwd 70.2%, probe `.o59`/`.o34`)
+  *every* valid-head warp is on a `MUFU.EX2` at once, so all want the one HW-faithful SFU (II=8) and there
+  is no free-pipe (WGMMA/FMA) warp to switch to. HW de-phases its warps across pipe stages (NCU
+  `not_selected=0.82`, SM-active 90%, xu 47.75%); the sim's 12 consumer warps march in phase.
+- **Not occupancy (ruled out, static).** sim resident warps/SMSP (fwd 4 / bwd 3, 1 CTA/SM) **match HW
+  theoretical** (16÷4 / 12÷4); sim achieved occupancy ≥ HW achieved. The gap is **issue-density** (sim
+  0.289 vs HW 0.407 warp-inst/scheduler/cyc = 1.41× fwd), i.e. phasing, not too-few-warps.
+- **Phasing is NOT recoverable — mbarrier re-synchronizes (E1 proved it).** The E1 oracle de-phase probe
+  (`-oracle_dephase_enable`, gated) forced a per-warp launch offset and measured the upper bound:
+  fwd 105,464→**105,862 (+0.38%)**, bwd 178,856→**178,724 (−0.07%)** — **~0 recovery** vs the ≈1.9×
+  ceiling; `gpu_sim_insn` bit-identical (oracle correct). `head_mufu/valid_head` stayed **0.746→0.745**
+  (fwd) / **0.702→0.703** (bwd) = lockstep re-formed at the first tile's atomic mbarrier phase-flip
+  ([sm.cc:1799](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/sm.cc#L1799)).
+  The E1 code was **reverted** after the run (probe-only; committed at `0b863b0`, reverted to keep the
+  oracle knob out of the tree — the analysis lives in the plan doc).
+- **Also ruled out:** GTO→LRR (reordering an all-MUFU eligible set does nothing); lever B tensor/fma
+  issue-gate (they are fixed-latency, already `can_issue()`-checked, never clog the latch). The only
+  faithful path left (candidate B: dynamic cross-warp bank/port-contention jitter) must overcome the same
+  mbarrier re-sync E1 showed annihilates any stagger, and stay bounded by HW's own 54% No-Eligible — so
+  its realistic payoff is negligible. **Not pursued; compute-path axis closed.**
 
 ## 2. Optimization Details
 
