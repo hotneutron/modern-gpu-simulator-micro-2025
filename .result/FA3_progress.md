@@ -266,16 +266,28 @@ FA3 bwd
 
 ### Ongoing — post-Opt-10 issue-density gap (lever A reframed: trace `stall_count` latency)
 
-The dominant post-Opt-10 compute-path residual. **No cycle claim.** The stagger sub-lever is dead but the
-gap is not a floor — it was **reframed 2026-07-27b** away from "SFU-throughput bound" to a **trace
-`stall_count` latency** axis (probe pending). Full trail:
-[`.plan/WARP_STAGGER_LOCKSTEP.md`](../.plan/WARP_STAGGER_LOCKSTEP.md); probe detail in
-[`.plan/CONSUMER_COMPUTE_BOUND.md`](../.plan/CONSUMER_COMPUTE_BOUND.md) "RESULT — MUFU-lockstep probe".
+The dominant post-Opt-10 compute-path residual. **No cycle claim.** Multiple leads were investigated and
+closed (stagger dead; `stall_count`-latency refuted; tensor over-model refuted by raw-count re-profile —
+sim tensor is 0.69× UNDER, `peak_sustained=4`). The residual is now positively localized to
+**issue-density / pipe-overlap** (fwd density sim 0.289 vs HW 0.407 = 1.41×), with EVERY per-pipe cost
+confirmed HW-faithful-or-lighter. **Active work + the full HW-vs-sim comparison now lives in the clean
+baseline [`.plan/HW_VS_SIM_COMPARISON.md`](../.plan/HW_VS_SIM_COMPARISON.md).** The dead-end trail
+(warp-stagger / lockstep / E1) is archived in the now-CLOSED
+[`.plan/WARP_STAGGER_LOCKSTEP.md`](../.plan/WARP_STAGGER_LOCKSTEP.md).
 
 - **The gap.** sim keeps its ~3 warps/scheduler issuing only **28.9%** of cycles vs HW **40.7%**
   (issue-density 1.41× fwd) — this, not work, is the fwd 1.55× gap (`cycle = work 1.10× × density 1.41×`).
 - **Not occupancy (ruled out, static).** sim resident warps/SMSP (fwd 4 / bwd 3, 1 CTA/SM) **match HW
   theoretical** (16÷4 / 12÷4); sim achieved occupancy ≥ HW achieved. The gap is phasing/latency, not pool.
+- **The "64% vs 90% SM-active" framing was apples-vs-oranges (corrected 2026-07-27d, NCU-verified).**
+  sim "SM-active" = ISSUE rate ([sm.cc:612](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/sm.cc#L612)
+  `!any_subcore_issued`); HW `sm__cycles_active` 90% = RESIDENT rate. HW's issue-basis metric is
+  **`Issue Slots Busy` 45%** (`No Eligible` 54.26%, eligible warps/sched **0.83** fwd) — so HW too spends
+  the majority of its "active" cycles NOT issuing. Def-consistent, sim `issuing` 38% vs HW 45% = ~1.18×,
+  and the real residual is **issue-density 1.41×**. Full trail:
+  [WARP_STAGGER_LOCKSTEP.md](file:///home/jihyun/modern-gpu-simulator-micro-2025/.plan/WARP_STAGGER_LOCKSTEP.md)
+  "Active-definition MISMATCH".
+
 - **Not recoverable by warp-stagger (E1, measured).** The E1 oracle de-phase probe forced a per-warp
   launch offset: fwd 105,464→105,862 (+0.38%), bwd 178,856→178,724 (−0.07%) = **~0**, and
   `head_mufu/valid_head` stayed 0.746→0.745 — the per-tile mbarrier re-synchronizes the warps at tile 1.
@@ -287,11 +299,23 @@ gap is not a floor — it was **reframed 2026-07-27b** away from "SFU-throughput
   [sm.cc:918](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/sm.cc#L918),
   decayed `>>=1`/cyc at [warp_dependency_state.cc:92](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/warp_dependency_state.cc#L92)),
   NOT the SFU FU latency (so `-sfu_latency` is not a lever) and NOT II (throughput isn't the wall).
-- **Open (probe pending, needs a build).** Decompose still_idle: are the MUFU-head warps (74.5%) serving
-  their own just-issued `stall_count` (latency ⇒ stall-model is the lever) or genuinely waiting on SFU
-  issue (throughput) / wait_barrier (producer→consumer data dep ⇒ floor)? Also: is the `>>=1` decay
-  HW-faithful, and does GTO waste slots by re-picking a stalling warp? Only a wait_barrier-dominated
-  result supports a floor conclusion; the static evidence currently points at the `stall_count` latency.
+- **`stall_count` axis RULED OUT by decay audit (2026-07-27c).** Static audit of the `>>=1` decay
+  ([warp_dependency_state.cc:92](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/warp_dependency_state.cc#L92))
+  shows it blocks a stalling warp for only `floor(log2 V)+1` cycles (V=8→4, V=15→4), i.e. it
+  **under**-applies the trace stall vs HW's linear V-cycle wait. So if `stall_count` were the inflator the
+  sim would be *faster*, not 1.56× slower — it **cannot** be the source of the excess cycles. Recorded as
+  a known modeling gap (**Arch TODO-2**) and parked (linearizing it would only make the sim slower). The
+  30%-of-`still_idle` `stall_count` share (`.o59`) is a **lockstep symptom** — all consumer warps serve
+  their short post-MUFU stall window at the same time — not a stall-magnitude problem. Full audit trail:
+  [WARP_STAGGER_LOCKSTEP.md](file:///home/jihyun/modern-gpu-simulator-micro-2025/.plan/WARP_STAGGER_LOCKSTEP.md)
+  "`>>=1` decay AUDIT".
+- **Real axis = consumer-warp lockstep / pipe-overlap absence (next).** `still_idle` (21.62M) is
+  multi-factor — `stall_count` 30% + `wait_barrier` 25% + non-SFU fu_occupied ~20% + yield 9% — all
+  overlapping the same structural cause: the 12 consumer warps march in phase (head_mufu 74.6%) and the
+  sim cannot overlap the SFU/tensor pipes the way HW does (SM-active 90% vs sim ~64%). E1 launch-stagger
+  was null because the per-tile mbarrier re-synchronizes; the open question is whether any faithful
+  mechanism can de-phase them (or whether it is a defensible structural floor bounded by HW's own 54%
+  No-Eligible).
 
 ## 2. Optimization Details
 
@@ -734,3 +758,50 @@ knobs.
   reads — it does not change which L2 slice a line lands on. The two are orthogonal (different memory
   layers). Whether TMA bursts actually exploit the L2 slice spread is a separate, measurable question —
   see [L2_SLICE_PARALLELISM_H100.md](file:///home/jihyun/modern-gpu-simulator-micro-2025/.plan/L2_SLICE_PARALLELISM_H100.md) §8 (per-slice admission histogram) / §9.
+
+
+### TODO-2: `stall_count` decay is a right-shift (`>>=1`), not an HW-faithful linear countdown
+
+- **Status**: not fixed (intentionally parked). Each SASS instruction carries a compiler-scheduled
+  **stall field** (the 4-bit `stall_count`, values 0..15, decoded at
+  [control_bits.cc:34](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/util/traces_enhanced/src/control_bits.cc#L34)
+  as `control_bits_num & 0x0000f`) that tells HW to wait N cycles after issuing this instruction before
+  the SAME warp may issue its next instruction (compiler-static pipeline delay). In trace mode
+  (scoreboard off, [subcore.cc:711](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/subcore.cc#L711))
+  this is the per-warp readiness gate `is_stall_counter_0()`.
+- **The gap**: the sim sets the counter to the trace value at issue
+  ([sm.cc:918-927](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/sm.cc#L918))
+  but then decays it with a **right-shift** `m_stall_counter >>= 1` every cycle
+  ([warp_dependency_state.cc:92](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/warp_dependency_state.cc#L92)),
+  instead of a linear `--`. HW's stall is a **linear** N-cycle wait; the shift makes a value V block the
+  warp for only `floor(log2 V) + 1` cycles:
+
+  | issued stall V | `>>=1` cycles blocked | HW (linear) |
+  |---|---|---|
+  | 1 | 1 | 1 |
+  | 2 | 2 | 2 |
+  | 3 | 2 | 3 |
+  | 4 | 3 | 4 |
+  | 7 | 3 | 7 |
+  | 8 | 4 | 8 |
+  | 15 | 4 | 15 |
+
+  So the shift **under**-applies the stall (V=8 → 4 cyc, V=15 → 4 cyc): the sim holds a stalling warp for
+  FEWER cycles than HW, roughly logarithmically.
+- **Audit consequence (why this refutes the "stall_count latency" residual axis, 2026-07-27c)**: the
+  post-Opt-10 residual was reframed in
+  [WARP_STAGGER_LOCKSTEP.md](file:///home/jihyun/modern-gpu-simulator-micro-2025/.plan/WARP_STAGGER_LOCKSTEP.md)
+  as a "trace `stall_count` latency" axis. This audit **rules that out as the inflator**: if
+  `stall_count` were what makes the sim slow, then — because `>>=1` applies it *shorter* than HW — the
+  sim would be *faster*, not 1.56× slower. A too-short stall cannot be the source of excess cycles.
+  The `stall_count`-dominated share of `still_idle` (`.o59`: `at_least_one_warp_waiting_stall_count`
+  6.58M ≈ 30% of `no_warps_ready` 21.62M) is therefore a **lockstep symptom** — all consumer warps
+  serve their (even if short) post-MUFU stall window at the same time, so the subcore idles as a whole —
+  **not** a stall-magnitude problem. The real axis is the consumer-warp lockstep / pipe-overlap absence,
+  not this decay rule.
+- **Why parked (not fixed now)**: (1) **wrong direction for the gap** — making the decay HW-faithful
+  (`--`) would *lengthen* stalls and make the sim *slower*, moving away from HW, so it is not a cycle
+  lever here; (2) the simulator very likely chose `>>=1` deliberately (a cheap saturating decay that
+  keeps short stalls short while collapsing large ones), and untangling that is a fidelity task with no
+  expected FA3 speedup. Left as a known modeling gap; revisit only if a future workload is shown to be
+  genuinely stall-latency-bound (linear-countdown A/B behind a gate) rather than lockstep-bound.

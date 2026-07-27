@@ -1,3 +1,17 @@
+> ⛔ **CLOSED / SUPERSEDED (2026-07-27g).** This doc was the "lever A = warp-stagger / MUFU-lockstep"
+> investigation. That hypothesis is **dead** and the framing it was built on has been overturned:
+> - warp-stagger (E1 launch-offset) recovers ~0 (mbarrier re-synchronizes each tile; reverted `0b863b0`);
+> - the "trace `stall_count` latency" reframe is refuted (`>>=1` decay UNDER-applies the stall — Arch TODO-2);
+> - the "sim 64% vs HW 90% SM-active" premise was a definition mismatch (issue-rate vs resident-rate);
+> - raw-count re-profile (`peak_sustained=4`) shows the tensor pipe is UNDER-modeled 0.69×, not over — no
+>   per-pipe cost is the cause. The residual is **issue-density / pipe-overlap**.
+>
+> **Active work moved to [`HW_VS_SIM_COMPARISON.md`](file:///home/jihyun/modern-gpu-simulator-micro-2025/.plan/HW_VS_SIM_COMPARISON.md)**
+> (the clean, definition-checked baseline). This file is retained ONLY as the historical record of the
+> stagger/lockstep dead-ends + the E1 reverted-commit trail. Do NOT add new findings here.
+
+---
+
 # FA3 fwd — Warp-Stagger / MUFU-Lockstep Axis (lever A) (2026-07-27)
 
 Owner axis for the DOMINANT part of the post-Opt-10 SFU-throughput residual: **MUFU-lockstep**
@@ -448,6 +462,41 @@ Traced the dependency model for FA3 (trace mode, `is_captured_from_binary=1`,
 - Stagger (E1) can't help because `stall_count` rides *every* instruction regardless of warp phase, and
   the mbarrier re-aligns phase anyway. So E1's null is consistent — it just wasn't the right lever.
 
+### `>>=1` decay AUDIT — DONE (2026-07-27c): the decay UNDER-applies the stall ⇒ stall_count is NOT the inflator
+
+Static audit of the decay rule (no build). Findings:
+- `stall_count` is a 4-bit trace field (0..15), decoded `control_bits_num & 0x0000f`
+  ([control_bits.cc:34](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/util/traces_enhanced/src/control_bits.cc#L34)).
+  HW semantics: value V ⇒ wait exactly V cycles (linear) before the same warp issues next.
+- sim decays it with a **right-shift** `m_stall_counter >>= 1` per cycle
+  ([warp_dependency_state.cc:92](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/warp_dependency_state.cc#L92)),
+  gated by `is_stall_counter_0()`. A shift blocks the warp for only `floor(log2 V)+1` cycles:
+
+  | V | `>>=1` blocked cyc | HW linear |
+  |---|---|---|
+  | 1 | 1 | 1 |
+  | 2 | 2 | 2 |
+  | 4 | 3 | 4 |
+  | 8 | 4 | 8 |
+  | 15 | 4 | 15 |
+
+- **Verdict — this REFUTES the "trace stall_count latency" reframe as the inflator.** The shift makes the
+  sim hold a stalling warp for FEWER cycles than HW (V=8 → 4, V=15 → 4). If `stall_count` were the source
+  of the excess cycles, the sim would be *faster* than HW, not 1.56× slower. A too-short stall cannot
+  inflate cycles.
+- **What the `stall_count`-dominated `still_idle` share actually is.** `.o59`:
+  `at_least_one_warp_waiting_stall_count` = 6.58M ≈ 30% of `no_warps_ready` (21.62M) — the largest single
+  wait reason, but it co-occurs with `wait_barrier` 5.49M (25%), non-SFU fu_occupied (~20%), yield 1.98M
+  (9%): still_idle is **multi-factor, not a single stall_count axis**. Since the stall itself is short,
+  the 30% share is a **lockstep symptom** (all consumer warps serve their short post-MUFU stall window at
+  once ⇒ the whole subcore idles that window), not a stall-magnitude problem.
+- **Disposition**: recorded as a known modeling gap in FA3_progress.md **Arch TODO-2**, and parked —
+  making the decay linear (`--`) would *lengthen* stalls and make the sim slower (wrong direction), so it
+  is not a cycle lever. The residual axis is the consumer-warp lockstep / pipe-overlap absence, NOT the
+  stall latency. (This also downgrades the "two open sub-questions" below: sub-question 1 is answered —
+  the decay is not HW-faithful but that under-applies the stall, so it is not the lever; sub-question 2,
+  GTO re-picking a stalling warp, remains open but is a lockstep/scheduling property, not a stall axis.)
+
 ### Two open sub-questions (un-probed — this is the new axis)
 
 1. **Is the `>>=1` decay HW-faithful?** A shift makes a stall field V last only `floor(log2 V)+1` cycles
@@ -534,6 +583,206 @@ result is traceable to an exact source state. After the run:
 ⚠️ E1 is an **oracle measurement**, not a shippable optimization: the launch offset is injected, not
 emergent, so even a positive result does NOT authorize a cycle claim — it only authorizes building the
 *faithful* mechanism (candidate B) that would produce the same de-phasing from real physics.
+
+## ⭐ Active-definition MISMATCH — the "sim 64% vs HW 90% SM-active" framing is apples-vs-oranges (2026-07-27d)
+
+The whole "sim can't fill the SM (64%) the way HW does (90%) ⇒ lockstep" narrative rested on comparing
+two metrics that **measure different things**. Verified against both the sim source and the H100 NCU report
+(kernel 5, `nv_reports/h100/...ncu-rep`, read in-container via `ncu -i`).
+
+### The two definitions
+- **sim "SM-active" (≈64% fwd) = ISSUE rate.** [sm.cc:612](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/sm.cc#L612):
+  `if (!any_subcore_issued) sm_all_subcores_idle++;` — a cycle is "idle" unless ≥1 of the 4 subcores
+  **actually issued** an instruction. The tracked `issuing` proxy (fwd 38%) is likewise an issue count.
+- **HW `sm__cycles_active` (90%) = RESIDENT rate.** NCU "SM Active Cycles" 61,147 / elapsed 67,838 =
+  90.1% counts every cycle a warp is **resident** on the SM, whether it issues or stalls. The SAME NCU
+  report states **`No Eligible = 54.26%`** ("every cycle with no eligible warp results in no instruction
+  being issued") and **`Issue Slots Busy = 45.03%`**, `Issued Warp/Scheduler = 0.46`.
+
+### The correct correspondence
+| basis | sim | HW | ratio |
+|---|---|---|---|
+| **issue rate** (apples-to-apples) | `issuing` ~38% | **`Issue Slots Busy` 45%** | ~1.18× |
+| resident rate | ~100% (1 CTA/SM, minus drain tail) | `sm__cycles_active` 90% | ~1× |
+| issue-DENSITY (insts÷sched÷cyc, def-consistent) | 0.289 | 0.407 | **1.41×** |
+
+So "64% vs 90%" was never a valid gap — it compared sim's *issue* rate against HW's *resident* rate. The
+only def-consistent gap is **issue-density 1.41×** (which the doc computed correctly elsewhere).
+
+### Consequence for the lockstep framing
+- HW spends **54% of its "active" cycles with No-Eligible** (eligible warps/scheduler = **0.83** fwd /
+  **0.46** bwd). HW is **itself** mostly-waiting on this workload — the same phenomenon as sim's lockstep,
+  not a sim-only pathology. HW just books those waiting cycles as "active" (warp resident) while sim books
+  them as "idle" (no issue).
+- ⇒ the achievable ceiling from de-phasing is even more tightly bounded than the doc's "≈1.9× per-tile":
+  HW's own No-Eligible 54% is the wall. Lockstep is a **real but small-ceiling** effect, not the 1.4×
+  driver by itself.
+- The def-consistent residual is **issue-density 1.41×**: sim issues 1.41× less often per elapsed cycle.
+  Since occupancy matches and de-phase is bounded, the live question is now **WHERE the missing issues
+  go** — cross the sim `no_warps_ready` sub-reasons against HW's stall breakdown (below), which is a
+  latency/stall axis, not purely lockstep.
+
+### HW stall breakdown (per issue_active, NCU raw) — the map for the next step
+| stall reason | HW fwd | HW bwd |
+|---|---|---|
+| `wait` (mbarrier / async / WGMMA.wait) | **1.363** | 0.784 |
+| `long_scoreboard` (global/L2 latency) | 0.700 | **1.491** |
+| `barrier` (named/CTA barrier) | 0.782 | **1.313** |
+| `not_selected` | 0.820 | 0.405 |
+| `dispatch_stall` | 0.787 | 0.338 |
+| `mio_throttle` (MIO/shared/SFU queue) | 0.457 | 0.474 |
+| `short_scoreboard` (MIO/SFU latency) | 0.330 | 0.643 |
+| `math_pipe_throttle` | 0.229 | 0.092 |
+| pipe active: tensor / xu(MUFU) / alu / fma | 46.1 / 47.7 / 27.3 / 16.9 | 53.6 / 21.4 / 15.3 / 9.5 |
+
+Reads: fwd's #1 HW stall is `wait` (mbarrier/async data dep) — the producer→consumer dependency, which is
+a genuine floor and exactly what sim's `wait_barrier` (25% of `no_warps_ready`) mirrors. bwd's #1 is
+`long_scoreboard` (memory latency). Neither is "warps in lockstep on the SFU". This is the concrete
+evidence that the residual is a **stall/latency-overlap** axis (how densely each pipe's waits are hidden),
+consistent with — but broader than — the lockstep sub-lever.
+
+## Pipe-utilization sim-vs-HW — DEFINITION-MATCHED comparison (2026-07-27e)
+
+Comparing sim per-FU occupancy against NCU pipe metrics, being careful that (as with the active-def
+mismatch above) sim and NCU count different things. Verified in code + NCU raw (fwd kernel5).
+
+### The three DIFFERENT tensor metrics (do not confuse)
+1. **NCU `sm__pipe_tensor_cycles_active`** = cycles the tensor pipe is **busy processing** (a WGMMA
+   occupies it for many cycles) ÷ SM-**active** cycles = **46.1%** fwd. On an **elapsed** basis
+   (× active/elapsed 90.1%) = **41.6%**.
+2. **NCU `sm__inst_executed_pipe_tensor_op_hmma`** = HGMMA **issue** rate ÷ peak = **2.16%**. This is
+   per-op issue, NOT busy — WGMMA issues rarely but runs long. (Comparing sim busy against THIS would be
+   the mistake.)
+3. **sim `total_num_cycles_tensor_pipe_active`** ([functional_unit.cc:321-337](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/functional_unit.cc#L321):
+   `m_active_insts_in_pipeline>0 || !dispatch_reg.empty() || reserved_cycles>0`) = the TRUE pipe-busy
+   counter, reported as `Throughput_ComputeTensor_pct` ÷ (n_sm × elapsed) = **74.18%** (`.o59`).
+   Same definition as (1), same (elapsed) denominator — so (3) vs (1-elapsed) is apples-to-apples.
+
+### ⭐ Result — sim OVER-models the tensor pipe ~1.78×
+| tensor pipe-busy (elapsed basis) | sim | HW | ratio |
+|---|---|---|---|
+| % of (n_sm × elapsed) | **74.18%** | **41.58%** | **1.78×** |
+| implied cycles / tensor-op | **29.5** | **10.7** | **2.76×** |
+
+- sim holds the tensor pipe busy **29.5 cyc/op** vs HW's **10.7** — the tensor pipe occupancy per WGMMA
+  is ~2.76× too long in the sim (the per-op latency/II from `generate_tensor_core_latencies()` —
+  `M*N*K*operand_bit / tensor_rate_per_cycle=32768`, then split II=`nc/2`, latency=`nc-II`).
+- ⚠️ **Caveat before acting**: WGMMA is a warpgroup op — 4 warps each issue the full-tile HGMMA in the
+  sim (the deferred "4× over-execution" axis, FA3_progress.md Deferred Opts). If the sim counts 4× the
+  ops AND each at the whole-SM `tensor_rate`, the 2.76×/1.78× could be that same 4×-vs-rate interaction
+  rather than a raw latency error. The `29.5 cyc/op` here is computed against sim's own `tensor_ops`
+  count, so whether HW's `gmma` count uses the same per-warp convention must be re-checked before
+  calling this a lever. This measurement REFRAMES the tensor axis from "faithful" (the old
+  ≈48% vs 46% claim in CONSUMER_COMPUTE_BOUND, which used the wrong II=16 hand-calc) to "possibly
+  over-modeled ~1.8× on a busy-cycle basis" — needs the op-count convention pinned.
+- **Note the earlier hand-calc was WRONG**: II=16 (config `[LATCFG] tensor_init=16`) gives 43.5%, but the
+  config value is NOT used in trace mode — the effective per-op occupancy is dynamic (~29.5 cyc). Always
+  read `Throughput_ComputeTensor_pct`, never the config II.
+
+### SFU(MUFU): no sim pipe-busy counter exists
+- NCU `sm__inst_executed_pipe_xu` = **47.7%** fwd / 21.4% bwd (MUFU issue-rate ÷ peak). This is the busiest
+  HW pipe in fwd.
+- sim has **no** SFU pipe-busy counter (only tensor has `total_num_cycles_tensor_pipe_active`). To compare
+  SFU on the same basis needs either a new gated counter mirroring the tensor one, or an issue-count
+  derivation. Deferred to a follow-up (the tensor over-model is the sharper lead).
+
+### Why this matters for the issue-density gap
+If the tensor pipe is genuinely ~1.8× over-busy, it directly throttles issue-density: a WGMMA sitting in
+the pipe ~2.76× too long keeps the consumer warp's dependent softmax (MUFU) waiting longer, which is
+exactly the `stall_count`/`wait_barrier` window that shows up as `still_idle`. This is a more concrete,
+measurable lead than "lockstep" — and unlike lockstep it is a per-op MODEL quantity, not a phasing
+property. **Next: pin the WGMMA op-count convention (sim 4-warp vs HW gmma) to decide if 1.78× is a real
+over-model or a counting artifact.**
+
+## Pipe-utilization comparison — CORRECTION (2026-07-27f): op-count matches, but the pipe-count normalization is the confound
+
+The prior section's "sim tensor 1.78× over-model" claim was PREMATURE. Follow-up pinned two things: the
+op-count convention (settled) and a pipe-count normalization mismatch that makes the 74.18%-vs-41.6%
+comparison invalid as stated.
+
+### Settled — op-count convention is IDENTICAL (no 4× artifact)
+- sim `tensor_ops` total (Σ CTAFIN) = **349,008** (fwd) vs HW `sass_inst_executed_op_shared_gmma.sum` =
+  **349,056** — a **0.01% match**. bwd likewise (sim 835,584-order == HW 835,584). Both count WGMMA
+  **per-warp** (all 4 warps of a warpgroup each counted). So the residual is purely **cycles-per-op**, not
+  a count artifact. (Confirms FA3_progress Deferred "count is faithful".)
+- sim per-op tensor-pipe occupancy from the shape calc ([abstract_hardware_model.cc:434-439](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/abstract_hardware_model.cc#L434)):
+  `[WGMMADBG-MNK] m64n128k16 -> number_of_cycles=64, II=32, latency=32` (and m64n64k16 -> 32/16/16). One
+  tensor pipe is "busy" (in-flight OR dispatch-reg OR reserved) ~II+latency-overlapped ≈ **29.5 cyc/op**
+  measured. Self-consistent with the shape calc.
+
+### The confound — sim's tensor-pipe-active counter is a 4-subcore SUM, but the reported % divides by n_sm×1
+- `total_num_cycles_tensor_pipe_active` is incremented **independently by each subcore's TENSOR FU**
+  ([functional_unit.cc:328-336](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/functional_unit.cc#L328))
+  into the shared per-SM stat → up to **+4 per cycle** (4 subcores). But `Throughput_ComputeTensor_pct`
+  divides by `n_sm × run_cycles` ([gpu-sim.cc:4062](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/gpu-sim.cc#L4062)) = **1 pipe/SM peak**. Numerator counts 4 pipes, denominator assumes 1 ⇒ the 74.18% is inflated by up to 4×.
+- Normalizing to the same basis gives two bracketing readings, and NEITHER can be confirmed without the
+  NCU raw `peak_sustained` count (not stored in this report):
+  - sim ÷ (n_sm × **1** × cyc) = **74.18%** (numerator 4-pipe sum, wrong denom)
+  - sim ÷ (n_sm × **4** × cyc) = **18.5%** (one-pipe basis) vs HW **41.6%** (elapsed) ⇒ sim ~0.44× (UNDER)
+- HW `sm__pipe_tensor_cycles_active` is a **per-SM** metric normalized to the SM's tensor peak; whether
+  that peak = 1 SM-tensor-unit or 4-SMSP-units decides which sim normalization matches. Cannot resolve
+  from the stored report (raw peak_sustained count absent, driver unavailable in-container).
+
+### Honest verdict (this axis is UNRESOLVED, not a proven lever)
+- **CONFIRMED**: op-count identical; sim one-pipe occupancy ≈ 29.5 cyc/op, HW-implied ≈ 10.7 cyc/op on a
+  1-pipe basis — a **2.76× per-op** gap IF the 1-pipe basis is the right one for both.
+- **UNCONFIRMED**: whether HW's per-SM tensor metric should be compared to sim's 1-pipe (÷4) or 4-pipe-sum
+  number. The two give opposite conclusions (sim under vs over). So "tensor over-model 1.78×" is
+  **retracted** as a claim; it is at most a *candidate* pending a definition-exact normalization.
+- To resolve without guessing: either (a) obtain NCU raw `sm__pipe_tensor_cycles_active` absolute count +
+  its `.peak_sustained` to fix HW's per-cycle pipe basis, or (b) add a sim SM-level OR counter ("≥1 subcore
+  tensor-busy this cycle") to match HW's per-SM active-cycle semantics directly (small gated counter,
+  mirrors the existing `any_subcore_*` pattern at [sm.cc:577-601](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/sm.cc#L577)). (b) is the clean apples-to-apples fix.
+
+⇒ Supersedes the "sim OVER-models tensor ~1.78×" result in the section above — that number used a
+numerator/denominator pipe-count mismatch. The tensor axis is a **definition-pending candidate**, not a
+confirmed lever.
+
+## ⭐⭐ RESOLVED via raw-count re-profile (2026-07-27g): peak_sustained=4 ⇒ sim tensor is UNDER-modeled, not over
+
+The pipe-count confound is now SETTLED with a fresh NCU run that captured the raw `.sum` + `.peak_sustained`
+the original `--set full` report omitted (`nv_reports/h100/fa3_pipe_rawcounts.ncu-rep`, produced by
+[rerun_ncu_pipe_rawcounts.sh](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/rerun_ncu_pipe_rawcounts.sh)).
+
+### The decisive value: `sm__pipe_tensor_cycles_active.avg.peak_sustained = 4`
+HW normalizes the per-SM tensor-busy metric by **4** (one tensor pipe per SMSP × 4 SMSP). Verified:
+`pct_active = tensor_sum / (SM_active × 4)` reproduces the report exactly (fwd 14,893,056/(8,075,759×… ) →
+46.10% == report). ⇒ HW's per-SM tensor number is a **4-pipe sum**, EXACTLY the same basis as the sim's
+`total_num_cycles_tensor_pipe_active` (which sums all 4 subcore TENSOR FUs). So they ARE directly
+comparable — the earlier `÷1` was the bug, `÷4` is correct.
+
+### Definition-exact tensor comparison (fwd, same op-count 349,056)
+| tensor (4-pipe basis) | sim | HW | sim/HW |
+|---|---|---|---|
+| busy cycles / op | **29.5** | **42.7** | **0.69×** |
+| busy % (÷ n_sm×elapsed×4) | 18.6% | 41.0% | 0.45× |
+| bwd busy cyc/op | — | 40.0 | — |
+
+⇒ **sim UNDER-models the tensor pipe (~0.69× cyc/op), it does NOT over-model it.** The prior
+"1.78× over" was purely the ÷1-vs-÷4 normalization error and is now fully **retracted**.
+
+### What this means for the residual (important reframe)
+- sim runs each WGMMA in **fewer** cycles than HW (29.5 vs 42.7) yet the whole kernel is **1.56× slower**.
+  So the tensor pipe's *execution time* is categorically **not** the source of the gap — if anything sim
+  finishes tensor work faster.
+- The gap must therefore be in **overlap / scheduling / dependency waiting**: HW keeps the tensor pipe
+  busy 42.7 cyc/op AND simultaneously runs the MUFU pipe (xu 47.7%) and others, filling the SM
+  (issue-density 0.407); sim cannot overlap those pipes (issue-density 0.289), so its shorter tensor ops
+  still leave the SM idle waiting between dependent stages. This is the SAME issue-density/overlap axis,
+  now positively confirmed to be NOT a per-pipe cost error.
+
+### SFU / MUFU also definition-confirmed HW-faithful
+- `sm__inst_executed_pipe_xu.avg.peak_sustained = 0.5` inst/cyc/SM = 0.125/SMSP = **1 MUFU / 8 cyc/SMSP**
+  — exactly the sim's SFU II=8 (4 SFU/SMSP, 32-lane warp ⇒ 32/4=8). HW MUFU issue = 47.7% of peak (fwd) /
+  21.1% (bwd). sim MUFU op-count is work-invariant (same trace). ⇒ the SFU throughput model is HW-faithful
+  (confirms Opt 10), and MUFU is NOT over-modeled either.
+
+### Net conclusion of the whole pipe-utilization investigation
+Every per-pipe COST is HW-faithful or lighter in the sim (tensor 0.69×, SFU II exact, op-counts exact).
+The 1.41× issue-density gap is therefore **not** a functional-unit cost-model error — it is an
+**overlap/scheduling** property (how densely HW interleaves tensor + MUFU + memory waits vs the sim's
+in-phase consumer warps). This closes the "tensor over-model" lead and points the residual squarely back
+at issue-density/overlap — with the reassurance that no pipe is being over-charged.
 
 ## Guardrails
 
