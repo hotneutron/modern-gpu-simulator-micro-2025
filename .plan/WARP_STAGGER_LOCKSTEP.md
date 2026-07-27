@@ -391,18 +391,85 @@ Per the up-front decision (below), the oracle produced ~null / washed-out ⇒ th
 byte-identical to the pre-E1 state (`e9a64e8`). Only this analysis doc is kept. `0b863b0` remains in
 history as the reproducible source state that produced `.o60`/`.o35`.
 
-### Conclusion for lever A: STRUCTURAL FLOOR — axis closed
+### Conclusion for the STAGGER sub-lever: dead. (The gap itself is NOT closed — see reframe below.)
 
-Combined with Step 1 (occupancy floor ruled out) and the feasibility scan, the chain is now complete:
+Combined with Step 1 (occupancy floor ruled out) and the feasibility scan:
 - **not occupancy** (sim resident warps == HW theoretical);
 - **is phasing** (issue-density 1.41× fwd), but **phasing is not recoverable by staggering** because the
   per-tile mbarrier deterministically re-synchronizes the warps (E1 proved it empirically);
-- the only faithful path left (candidate B: dynamic cross-warp bank/port contention jitter) would have to
-  overcome that same re-synchronization *and* stay bounded by HW's own 54% No-Eligible — E1 shows even a
-  perfect launch stagger yields 0, so B's realistic payoff is almost certainly negligible.
+- so warp-stagger / launch-offset / jitter-to-de-phase (mechanisms 1–3) are all **dead ends** for this
+  workload — the mbarrier annihilates any stagger.
 
-⇒ **Lever A / MUFU-lockstep is a structural deterministic-model floor. No cycle claim. Compute-path axis
-closed.** Recorded in FA3_progress.md.
+⇒ **The warp-stagger *sub-lever* is closed.** But this does NOT make the residual a floor: the
+issue-density gap (1.41×) is real and still unexplained by throughput. The very next step
+(2026-07-27b) re-examined *why* the warps stall at all and found it is the trace `stall_count`
+latency, not SFU throughput — a different, still-open axis. **Do not read this section as "axis closed."**
+See "Reframe" below.
+
+## Reframe (2026-07-27b) — the residual is NOT SFU-throughput; it is trace `stall_count` latency
+
+The user pushed back on closing as a floor ("issue is far too low vs HW — think differently"). Re-examining
+the numbers with a fresh lens overturns the "SFU-throughput bound" label that Opt 10 left in place.
+
+### SFU is NOT saturated (demand/capacity ≈ 28%)
+
+- SFU capacity over the run = `eval_subcore_cyc / II` = (105,862 × 132 × 4) / 8 = **6.99M** MUFU slots.
+- HW MUFU demand (from NCU xu 47.75% over SM-active) ≈ **1.93M** MUFU warp-inst; sim runs the same trace
+  (work-invariant) so its MUFU count is the same order.
+- ⇒ **demand/capacity ≈ 27.6%.** A throughput-bound pipe sits near 100%. **SFU is nowhere near saturated**,
+  so "SFU-throughput bound" (the Opt-10 residual label) is **wrong** — the warps are not queued on SFU
+  *capacity*. They are stalled for some *latency* while the SFU pipe sits mostly idle.
+
+### Source: the post-MUFU stall is the trace-encoded `stall_count`, not the SFU FU latency
+
+Traced the dependency model for FA3 (trace mode, `is_captured_from_binary=1`,
+`-is_remodeling_scoreboarding_enabled 0`):
+- The register scoreboard is **OFF** for these traces
+  ([subcore.cc:711](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/subcore.cc#L711)),
+  so a dependent op's readiness is gated by the **per-warp `stall_count`**, not by a scoreboard bit tied
+  to SFU pipeline retirement.
+- `stall_count` is set from the issuing instruction's SASS control word
+  (`get_stall_count()`, [sm.cc:918](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/sm.cc#L918))
+  and decayed **by a right-shift** `m_stall_counter >>= 1` each cycle
+  ([warp_dependency_state.cc:92](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/warp_dependency_state.cc#L92)),
+  checked via `is_stall_counter_0()` in the issue predicate.
+- **Consequence:** changing `-sfu_latency` / the SFU FU `latency` field does **NOT** move this stall
+  (scoreboard off ⇒ FU-pipeline retirement does not gate the dependent). II (=8) is only a MUFU→MUFU
+  throughput lever, and we just showed throughput isn't the wall. **The load-bearing quantity is the
+  trace `stall_count` and how the sim decays it.**
+
+### Why this is the real axis (and why stagger was a red herring)
+
+- The `stall_count` is HW's compiler-computed static-scheduling delay (≈ the result latency the SASS
+  scheduler budgeted after each op). On HW those cycles are hidden by *other* warps; in the sim's lockstep
+  all eligible warps serve the *same* `stall_count` window at once ⇒ subcore idle. This is why still_idle
+  co-occurs with "all heads MUFU" (they just issued MUFU and are all serving its post-stall) — but the
+  cause is the **stall, not SFU capacity**.
+- Stagger (E1) can't help because `stall_count` rides *every* instruction regardless of warp phase, and
+  the mbarrier re-aligns phase anyway. So E1's null is consistent — it just wasn't the right lever.
+
+### Two open sub-questions (un-probed — this is the new axis)
+
+1. **Is the `>>=1` decay HW-faithful?** A shift makes a stall field V last only `floor(log2 V)+1` cycles
+   (V=8 ⇒ 4 cycles), i.e. it *under*-applies vs a linear countdown. If the sim is nonetheless slower than
+   HW, the `stall_count` *values* in the trace (or their interaction with lockstep) must be the inflator —
+   needs a per-still_idle-cycle measurement of how many warps are blocked *specifically* on `stall_count`
+   vs everything else.
+2. **Does GTO make it worse by re-picking a stalling warp?** If the greedy pointer keeps selecting a warp
+   that is serving its `stall_count` (instead of another warp whose stall already decayed), the sim wastes
+   issue slots HW would fill. This is a *scheduler* question distinct from occupancy/stagger.
+
+### Next step — measure, don't assume (gated read-only probe, needs a build)
+
+The existing `mufu_lockstep_nonsfu_stall_count` counter only tallies non-SFU heads. Add a per-still_idle
+decomposition: on each still_idle cycle, of the valid-head warps, how many are blocked **only** by
+`stall_count` (would issue if stall were 0) vs by wait_barrier vs by a genuinely busy non-SFU FU. If
+`stall_count`-only dominates, the lever is the stall model / its decay (sub-question 1) — a compute-latency
+fidelity axis, testable by A/B on the decay rule — NOT a floor. Only if the residual is genuinely
+wait_barrier (producer→consumer data dep) does the floor conclusion hold.
+
+**Until this probe runs, do NOT record lever A as a closed floor in FA3_progress.md** — downgrade it to
+"reframed: trace-stall_count latency axis, probe pending".
 
 ---
 

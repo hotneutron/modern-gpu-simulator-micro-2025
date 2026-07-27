@@ -264,32 +264,34 @@ FA3 bwd
     - Event / debug run: `H100_80GB-OnlyKernel10/flashattn-fa3-bf16-bwd-causal-b1-s2048-hd64-nh24-flashattn_fa3_bf16_bwd_causal_b1_s2048_hd64_nh24___warmup_-63a73d452237.e33`
     - Note: `-intra_smsp_warpswitch_enable 1` (boot-log confirmed). Final cycle = `178,856` (**-16.7% vs Opt 9**, **1.35x vs HW**). `gpu_sim_insn=629,211,348` + `issue_stage_issuing=22,626,216` bit-identical to baseline (work invariant). `next_stage` 21.3%→**1.6%**, `blocked_by_sfu` 15.36M→**0**. Warp-switch: `sfu_filtered=21,412,122`, `other_warp_issued=5,634,782` (26.3% recovered), `still_idle=15,777,340`.
 
-### Closed — MUFU-lockstep / warp-stagger (lever A): STRUCTURAL FLOOR (2026-07-27)
+### Ongoing — post-Opt-10 issue-density gap (lever A reframed: trace `stall_count` latency)
 
-The dominant post-Opt-10 compute-path residual, now **closed as a structural deterministic-model floor —
-NO cycle claim**. Full trail: [`.plan/WARP_STAGGER_LOCKSTEP.md`](../.plan/WARP_STAGGER_LOCKSTEP.md); probe detail in
+The dominant post-Opt-10 compute-path residual. **No cycle claim.** The stagger sub-lever is dead but the
+gap is not a floor — it was **reframed 2026-07-27b** away from "SFU-throughput bound" to a **trace
+`stall_count` latency** axis (probe pending). Full trail:
+[`.plan/WARP_STAGGER_LOCKSTEP.md`](../.plan/WARP_STAGGER_LOCKSTEP.md); probe detail in
 [`.plan/CONSUMER_COMPUTE_BOUND.md`](../.plan/CONSUMER_COMPUTE_BOUND.md) "RESULT — MUFU-lockstep probe".
 
-- **What it is.** On ~3/4 of post-Opt-10 `still_idle` cycles (fwd 74.6% / bwd 70.2%, probe `.o59`/`.o34`)
-  *every* valid-head warp is on a `MUFU.EX2` at once, so all want the one HW-faithful SFU (II=8) and there
-  is no free-pipe (WGMMA/FMA) warp to switch to. HW de-phases its warps across pipe stages (NCU
-  `not_selected=0.82`, SM-active 90%, xu 47.75%); the sim's 12 consumer warps march in phase.
+- **The gap.** sim keeps its ~3 warps/scheduler issuing only **28.9%** of cycles vs HW **40.7%**
+  (issue-density 1.41× fwd) — this, not work, is the fwd 1.55× gap (`cycle = work 1.10× × density 1.41×`).
 - **Not occupancy (ruled out, static).** sim resident warps/SMSP (fwd 4 / bwd 3, 1 CTA/SM) **match HW
-  theoretical** (16÷4 / 12÷4); sim achieved occupancy ≥ HW achieved. The gap is **issue-density** (sim
-  0.289 vs HW 0.407 warp-inst/scheduler/cyc = 1.41× fwd), i.e. phasing, not too-few-warps.
-- **Phasing is NOT recoverable — mbarrier re-synchronizes (E1 proved it).** The E1 oracle de-phase probe
-  (`-oracle_dephase_enable`, gated) forced a per-warp launch offset and measured the upper bound:
-  fwd 105,464→**105,862 (+0.38%)**, bwd 178,856→**178,724 (−0.07%)** — **~0 recovery** vs the ≈1.9×
-  ceiling; `gpu_sim_insn` bit-identical (oracle correct). `head_mufu/valid_head` stayed **0.746→0.745**
-  (fwd) / **0.702→0.703** (bwd) = lockstep re-formed at the first tile's atomic mbarrier phase-flip
-  ([sm.cc:1799](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/sm.cc#L1799)).
-  The E1 code was **reverted** after the run (probe-only; committed at `0b863b0`, reverted to keep the
-  oracle knob out of the tree — the analysis lives in the plan doc).
-- **Also ruled out:** GTO→LRR (reordering an all-MUFU eligible set does nothing); lever B tensor/fma
-  issue-gate (they are fixed-latency, already `can_issue()`-checked, never clog the latch). The only
-  faithful path left (candidate B: dynamic cross-warp bank/port-contention jitter) must overcome the same
-  mbarrier re-sync E1 showed annihilates any stagger, and stay bounded by HW's own 54% No-Eligible — so
-  its realistic payoff is negligible. **Not pursued; compute-path axis closed.**
+  theoretical** (16÷4 / 12÷4); sim achieved occupancy ≥ HW achieved. The gap is phasing/latency, not pool.
+- **Not recoverable by warp-stagger (E1, measured).** The E1 oracle de-phase probe forced a per-warp
+  launch offset: fwd 105,464→105,862 (+0.38%), bwd 178,856→178,724 (−0.07%) = **~0**, and
+  `head_mufu/valid_head` stayed 0.746→0.745 — the per-tile mbarrier re-synchronizes the warps at tile 1.
+  E1 code was reverted (probe-only, `0b863b0`).
+- **Reframed (2026-07-27b): NOT SFU-throughput; it is trace `stall_count`.** SFU demand/capacity ≈ **27.6%**
+  (nowhere near saturated), so the Opt-10 "SFU-throughput bound" label is wrong. In trace mode
+  (scoreboard off, [subcore.cc:711](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/subcore.cc#L711))
+  the post-MUFU stall is the per-warp **`stall_count`** (SASS control-word delay, set at
+  [sm.cc:918](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/sm.cc#L918),
+  decayed `>>=1`/cyc at [warp_dependency_state.cc:92](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/warp_dependency_state.cc#L92)),
+  NOT the SFU FU latency (so `-sfu_latency` is not a lever) and NOT II (throughput isn't the wall).
+- **Open (probe pending, needs a build).** Decompose still_idle: are the MUFU-head warps (74.5%) serving
+  their own just-issued `stall_count` (latency ⇒ stall-model is the lever) or genuinely waiting on SFU
+  issue (throughput) / wait_barrier (producer→consumer data dep ⇒ floor)? Also: is the `>>=1` decay
+  HW-faithful, and does GTO waste slots by re-picking a stalling warp? Only a wait_barrier-dominated
+  result supports a floor conclusion; the static evidence currently points at the `stall_count` latency.
 
 ## 2. Optimization Details
 
