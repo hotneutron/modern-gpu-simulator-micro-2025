@@ -336,6 +336,22 @@ void functional_unit::cycle() {
     }
   }
 
+  // [overlap probe] SFU-pipe active-cycle counter, symmetric to the TENSOR one above. Lets us compute
+  // the sim's SFU (MUFU) pipe-busy fraction on the SAME basis as NCU sm__inst_executed_pipe_xu (which
+  // is HW's #1 fwd pipe at 47.7%) and — combined with the tensor counter — measure whether the two
+  // pipes are BUSY in the same cycles (overlap, HW) or alternately (serialized, the suspected sim gap).
+  // Observe-only, timing-neutral (a plain stat increment), always on like the tensor counter.
+  if (m_name == "SFU" && m_sm != NULL) {
+    bool sfu_busy = (m_active_insts_in_pipeline > 0) ||
+                    (!m_dispatch_reg->empty()) ||
+                    (m_dispatch_pending_reserved_cycles > 0);
+    if (sfu_busy) {
+      auto it = m_sm->m_sm_stats.m_stats_map.find("total_num_cycles_sfu_pipe_active");
+      if (it != m_sm->m_sm_stats.m_stats_map.end())
+        it->second->increment_with_integer(1);
+    }
+  }
+
   occupied >>= 1;
 }
 

@@ -65,6 +65,12 @@ class Subcore {
   Subcore* getptr();
   void cycle();
 
+  // [overlap probe] read-only: is this subcore's tensor / SFU FU doing work this cycle? Used by
+  // SM::cycle() to measure tensor-vs-SFU pipe overlap (both busy = overlap like HW; only-one = serialized).
+  // Defined in subcore.cc (functional_unit is only forward-declared here).
+  bool is_tensor_pipe_busy_this_cycle() const;
+  bool is_sfu_pipe_busy_this_cycle() const;
+
   int get_fixed_latency_result_queue_size();
   
   void issue_warp(SM *shared_sm, register_set_uniptr &dispatch_latch, warp_inst_t *pI,

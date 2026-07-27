@@ -560,6 +560,25 @@ void SM::cycle() {
     subcore->cycle();
   }
 
+  // [overlap probe] SM-level tensor-vs-SFU pipe overlap this cycle (read-only, gated). OR the busy flags
+  // across the 4 subcores, then classify the cycle into both / tensor-only / sfu-only / neither. HW
+  // overlaps tensor(46%)+MUFU(48%) so 'both' should be large on HW; if the sim shows mostly tensor-only
+  // + sfu-only, the pipes are being run SERIALLY (the suspected root of the 1.56x issue-density gap).
+  // Compare 'both' fraction against HW min(tensor%,xu%) which is the max possible overlap.
+  if (m_config->overlap_instrument_enable) {
+    bool any_tensor_busy = false, any_sfu_busy = false;
+    for (auto subcore : m_subcores) {
+      if (subcore->is_tensor_pipe_busy_this_cycle()) any_tensor_busy = true;
+      if (subcore->is_sfu_pipe_busy_this_cycle())    any_sfu_busy = true;
+    }
+    const char *key;
+    if (any_tensor_busy && any_sfu_busy)      key = "total_num_cycles_overlap_tensor_and_sfu";
+    else if (any_tensor_busy)                 key = "total_num_cycles_overlap_tensor_only";
+    else if (any_sfu_busy)                    key = "total_num_cycles_overlap_sfu_only";
+    else                                      key = "total_num_cycles_overlap_neither";
+    auto it = m_sm_stats.m_stats_map.find(key);
+    if (it != m_sm_stats.m_stats_map.end()) it->second->increment_with_integer(1);
+  }
   // [WGMMA Opt6 Step-0] (V) SM-level idle accounting. A subcore being blocked on the
   // tensor pipe is only a real cycle loss if NO subcore on this SM issued this cycle.
   if(m_config->wgmma_step0_instrument_enable || m_config->l1i_frontend_step0_instrument_enable) {

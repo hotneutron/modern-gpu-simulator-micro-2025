@@ -267,6 +267,14 @@ void Subcore::execute() {
   }
 }
 
+// [overlap probe] defined here (functional_unit is a complete type in this TU).
+bool Subcore::is_tensor_pipe_busy_this_cycle() const {
+  return m_tensor_pipeline && m_tensor_pipeline->is_busy_this_cycle();
+}
+bool Subcore::is_sfu_pipe_busy_this_cycle() const {
+  return m_sfu_pipeline && m_sfu_pipeline->is_busy_this_cycle();
+}
+
 void Subcore::read_rf(SM *shared_sm) {
   if(!m_pipeline_read_stage_latency_reg[0]->empty()) {
     functional_unit* fu = m_pipeline_read_stage_latency_reg[0]->get_fu_assigned();
@@ -812,6 +820,36 @@ void Subcore::issue(SM *shared_sm) {
             if (!is_stall_counter_0)               mufu_ls_nonsfu_stall_count++;
             if (!are_traditional_scoreaboards_ready) mufu_ls_nonsfu_scoreboard++;
           }
+        }
+        // [overlap probe] Probe 1+4: per-warp WARP-CYCLE accounting of why each valid-head warp did NOT
+        // issue this cycle, on the SAME basis as HW's "warp cycles per issued inst" stall breakdown
+        // (each stalled warp contributes 1 warp-cycle to its blocking reason). Non-exclusive (a warp can
+        // miss several conditions); the counters are summed over all valid-head, non-issuing warps × all
+        // cycles. Dividing each by total issued warp-insts gives sim's warp-cycles/inst per reason, which
+        // is directly comparable to HW smsp__average_warps_issue_stalled_X_per_issue_active (wait 1.363,
+        // long/short_scoreboard, etc). This is the definition-matched wait-magnitude audit. Read-only.
+        if (m_config->overlap_instrument_enable && !is_inst_ready_to_issue) {
+          if (!are_wait_barriers_ready)
+            m_sm->m_sm_stats.m_stats_map["total_num_warpcyc_stalled_wait_barrier"]->increment_with_integer(1);
+          if (!is_stall_counter_0)
+            m_sm->m_sm_stats.m_stats_map["total_num_warpcyc_stalled_stall_count"]->increment_with_integer(1);
+          if (!is_not_yield)
+            m_sm->m_sm_stats.m_stats_map["total_num_warpcyc_stalled_yield"]->increment_with_integer(1);
+          if (!is_fu_available) {
+            m_sm->m_sm_stats.m_stats_map["total_num_warpcyc_stalled_fu_any"]->increment_with_integer(1);
+            switch (pI->op) {
+              case TENSOR_CORE_OP:
+                m_sm->m_sm_stats.m_stats_map["total_num_warpcyc_stalled_fu_tensor"]->increment_with_integer(1); break;
+              case SFU_OP:
+                m_sm->m_sm_stats.m_stats_map["total_num_warpcyc_stalled_fu_sfu"]->increment_with_integer(1); break;
+              default:
+                m_sm->m_sm_stats.m_stats_map["total_num_warpcyc_stalled_fu_other"]->increment_with_integer(1); break;
+            }
+          }
+          if (!are_traditional_scoreaboards_ready)
+            m_sm->m_sm_stats.m_stats_map["total_num_warpcyc_stalled_scoreboard"]->increment_with_integer(1);
+          // denominator: total valid-head, non-issuing warp-cycles observed.
+          m_sm->m_sm_stats.m_stats_map["total_num_warpcyc_stalled_any"]->increment_with_integer(1);
         }
         // [NCU stall-taxonomy] Phase 2: on the read-only tail (a warp strictly AFTER the cycle's
         // stop) never issue. Count it as not_selected iff it satisfies the read-only eligibility

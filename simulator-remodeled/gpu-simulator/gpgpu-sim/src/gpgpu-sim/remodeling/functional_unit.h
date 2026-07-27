@@ -60,6 +60,14 @@ class functional_unit {
   const char *get_name();
   bool get_has_queue();
 
+  // [overlap probe] true iff this FU is doing work this cycle (in-flight inst / dispatch reg held /
+  // II-lockout). Same predicate the tensor/sfu pipe-active counters use. Read-only, for the SM-level
+  // tensor-vs-SFU overlap measurement. Defined inline so no .cc dependency.
+  bool is_busy_this_cycle() const {
+    return (m_active_insts_in_pipeline > 0) || (!m_dispatch_reg->empty()) ||
+           (m_dispatch_pending_reserved_cycles > 0);
+  }
+
   bool is_fixed_latency_unit();
   bool get_has_to_go_to_shared_sm_structure();
   TraceEnhancedOperandType get_result_queue_type();

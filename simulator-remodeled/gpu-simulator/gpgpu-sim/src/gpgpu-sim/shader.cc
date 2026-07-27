@@ -1396,6 +1396,22 @@ void shader_core_stats::print_remodeling_stats(FILE *fout) {
   fprintf(fout, "total_num_mufu_lockstep_nonsfu_wait_barrier = %llu\n", m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_mufu_lockstep_nonsfu_wait_barrier"]->get_value());
   fprintf(fout, "total_num_mufu_lockstep_nonsfu_stall_count = %llu\n", m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_mufu_lockstep_nonsfu_stall_count"]->get_value());
   fprintf(fout, "total_num_mufu_lockstep_nonsfu_scoreboard = %llu\n", m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_mufu_lockstep_nonsfu_scoreboard"]->get_value());
+  // [overlap probe] SFU pipe-active (always on, like tensor) + SM-level tensor||SFU overlap + per-warp
+  // warp-cycle stall breakdown (0 unless -overlap_instrument_enable). See .plan/HW_VS_SIM_COMPARISON.md §5.
+  fprintf(fout, "total_num_cycles_sfu_pipe_active = %llu\n", m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_cycles_sfu_pipe_active"]->get_value());
+  fprintf(fout, "total_num_cycles_overlap_tensor_and_sfu = %llu\n", m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_cycles_overlap_tensor_and_sfu"]->get_value());
+  fprintf(fout, "total_num_cycles_overlap_tensor_only = %llu\n", m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_cycles_overlap_tensor_only"]->get_value());
+  fprintf(fout, "total_num_cycles_overlap_sfu_only = %llu\n", m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_cycles_overlap_sfu_only"]->get_value());
+  fprintf(fout, "total_num_cycles_overlap_neither = %llu\n", m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_cycles_overlap_neither"]->get_value());
+  fprintf(fout, "total_num_warpcyc_stalled_any = %llu\n", m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_warpcyc_stalled_any"]->get_value());
+  fprintf(fout, "total_num_warpcyc_stalled_wait_barrier = %llu\n", m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_warpcyc_stalled_wait_barrier"]->get_value());
+  fprintf(fout, "total_num_warpcyc_stalled_stall_count = %llu\n", m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_warpcyc_stalled_stall_count"]->get_value());
+  fprintf(fout, "total_num_warpcyc_stalled_yield = %llu\n", m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_warpcyc_stalled_yield"]->get_value());
+  fprintf(fout, "total_num_warpcyc_stalled_fu_any = %llu\n", m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_warpcyc_stalled_fu_any"]->get_value());
+  fprintf(fout, "total_num_warpcyc_stalled_fu_tensor = %llu\n", m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_warpcyc_stalled_fu_tensor"]->get_value());
+  fprintf(fout, "total_num_warpcyc_stalled_fu_sfu = %llu\n", m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_warpcyc_stalled_fu_sfu"]->get_value());
+  fprintf(fout, "total_num_warpcyc_stalled_fu_other = %llu\n", m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_warpcyc_stalled_fu_other"]->get_value());
+  fprintf(fout, "total_num_warpcyc_stalled_scoreboard = %llu\n", m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_warpcyc_stalled_scoreboard"]->get_value());
   // [NANOSLEEP spin lever] emit the gated spin counters (0 unless -spin_instrument_enable).
   fprintf(fout, "total_num_cycles_spin_ops_issued = %llu\n", m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_cycles_spin_ops_issued"]->get_value());
   fprintf(fout, "total_num_cycles_spin_won_over_eligible = %llu\n", m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_cycles_spin_won_over_eligible"]->get_value());

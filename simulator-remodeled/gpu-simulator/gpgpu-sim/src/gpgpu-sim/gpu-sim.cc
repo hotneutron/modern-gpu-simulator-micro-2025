@@ -2024,6 +2024,15 @@ void shader_core_config::reg_options(class OptionParser *opp) {
                          "timing-neutral, default 0 = baseline bit-identical. See "
                          ".plan/CONSUMER_COMPUTE_BOUND.md 'Next axis'. (default=0)",
                          "0");
+  option_parser_register(opp, "-overlap_instrument_enable", OPT_BOOL,
+                         &overlap_instrument_enable,
+                         "Enable the tensor-vs-SFU pipe-overlap + wait/stall warp-cycle probes: per-cycle "
+                         "SM-level tensor||SFU busy-combination counters (both/tensor-only/sfu-only/neither) "
+                         "and per-warp warp-cycle stall accounting by reason (wait_barrier/stall_count/yield/"
+                         "fu_tensor/fu_sfu/fu_other/scoreboard), comparable to HW warp-cycles-per-inst stall "
+                         "breakdown. Read-only, timing-neutral, default 0 = bit-identical. See "
+                         ".plan/HW_VS_SIM_COMPARISON.md section 5. (default=0)",
+                         "0");
   option_parser_register(opp, "-sync_debug_enable", OPT_BOOL,
                          &sync_debug_enable,
                          "Enable Hopper mbarrier sync debug logging (SYNCDBG)."
@@ -2966,6 +2975,23 @@ void gpgpu_sim::create_gpu_per_sm_stats() {
   // the Compute(tensor) throughput% metric. Incremented in functional_unit::cycle() for the
   // TENSOR FU when it has work in flight / dispatch / II-lockout. Observe-only, timing-neutral.
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_tensor_pipe_active", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  // [overlap probe] SFU pipe-active (symmetric to tensor) + SM-level tensor||SFU overlap classification +
+  // per-warp warp-cycle stall accounting by reason. All observe-only. SFU-pipe-active is always on (like
+  // tensor); the rest fire only under -overlap_instrument_enable.
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_sfu_pipe_active", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_overlap_tensor_and_sfu", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_overlap_tensor_only", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_overlap_sfu_only", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_overlap_neither", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_warpcyc_stalled_any", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_warpcyc_stalled_wait_barrier", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_warpcyc_stalled_stall_count", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_warpcyc_stalled_yield", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_warpcyc_stalled_fu_any", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_warpcyc_stalled_fu_tensor", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_warpcyc_stalled_fu_sfu", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_warpcyc_stalled_fu_other", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_warpcyc_stalled_scoreboard", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
   // (V) SM-level: cycles where NO subcore issued anything; sub-variant where every non-issuing
   // subcore that had an eligible-but-blocked warp was blocked specifically by the tensor pipe.
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_sm_all_subcores_idle", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
