@@ -316,6 +316,17 @@ baseline [`.plan/HW_VS_SIM_SFU.md`](../.plan/HW_VS_SIM_SFU.md).** The dead-end t
   was null because the per-tile mbarrier re-synchronizes; the open question is whether any faithful
   mechanism can de-phase them (or whether it is a defensible structural floor bounded by HW's own 54%
   No-Eligible).
+- **Updated (2026-07-27) — gap localized to SM-idle 31.7% from failed latency-hiding; sized the lever.**
+  Full analysis in [HW_VS_SIM_SFU.md](file:///home/jihyun/modern-gpu-simulator-micro-2025/.plan/HW_VS_SIM_SFU.md).
+  Every per-pipe COST is HW-faithful-or-lighter (tensor busy 0.69× via NCU raw-count `peak_sustained=4`;
+  SFU II=8 + total-lat 16 HW-faithful; op-counts bit-match). Per tile the compute work is identical
+  (~730 cyc) but sim wall/tile ≈3300 vs HW ≈1700 — the whole gap is wait/idle. sim is **SM fully-idle
+  31.7%** (HW ~10%): each warp's own critical-path wait is short (≤HW) but the 3 in-phase consumer
+  warps/SMSP hit them together → latency-hiding fails. SM-idle 34.5% splits into **rest ~9.9%
+  (recoverable), wait_barrier 19.1% (PENDING probe: WGMMA=recoverable / TMA=floor), drain-tail ~24.7%
+  (floor)**. A gated `warpcyc_wb_wait_{tensor,tma,other}` probe (under `-overlap_instrument_enable`) is
+  implemented to split the 19.1%; total recoverable = 9.9% + 19.1%×WGMMA-fraction (→ sim 1.57× down to
+  1.41–1.11× upper-bound depending on the split).
 
 ## 2. Optimization Details
 

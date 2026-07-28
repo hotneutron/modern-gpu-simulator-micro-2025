@@ -1,4 +1,4 @@
-# FA3 — HW (NCU) vs Simulator comparison — the clean baseline for closing the gap (2026-07-27)
+# FA3 — HW (NCU) vs Simulator: SFU / critical-path / SM-idle analysis (HW_VS_SIM_SFU.md, 2026-07-27)
 
 Goal: reduce the FA3 sim-vs-HW cycle gap (fwd **1.56×**, bwd **1.35×** after Opt 10). This doc is the
 **fresh, definition-checked baseline** for that work. It supersedes the tangle of findings that had
@@ -10,6 +10,77 @@ Target HW: H100. Kernels: FA3 fwd = kernel 5 (`FlashAttnFwdSm90`), bwd = kernel 
 NCU reports: `nv_reports/h100/...full_rpt.ncu-rep` (ratios only) and
 `nv_reports/h100/fa3_pipe_rawcounts.ncu-rep` (raw `.sum` + `.peak_sustained`, produced by
 `simulator-remodeled/rerun_ncu_pipe_rawcounts.sh`).
+
+## Executive Summary (state as of 2026-07-27, read this first)
+
+**Problem confirmed.** fwd is 1.56× HW (105k vs 68k). Decomposition path: `cycle = work(1.10×) ×
+issue-density(1.41×)`. The gap is issue-density, i.e. the sim does not keep its warps issuing as densely
+as HW.
+
+**What has been RULED OUT (all HW-faithful or refuted):**
+- per-pipe COSTS: tensor busy-cyc/op sim 29.5 vs HW 42.7 (sim UNDER-models, `peak_sustained=4` confirmed);
+  SFU II=8 and total latency 16 both HW-faithful; op-counts (tensor/MUFU) bit-match HW. §1c, §6, §7.
+- issue-path serialization (1-deep ISSUE_CONTROL latch): already fixed by Opt 10, head-of-line ~0.06%. §4.
+- trace `stall_count`: `>>=1` decay UNDER-applies vs HW → cannot inflate cycles. Arch TODO-2.
+- warp-stagger via launch-offset (E1): mbarrier re-synchronizes each tile → ~0. (WARP_STAGGER closed.)
+- "sim 64% vs HW 90% SM-active": apples-vs-oranges (issue-rate vs resident-rate). §0.4.
+
+**Where the gap actually is (critical-path / SM-idle).** Per tile the compute WORK is identical sim/HW
+(~730 cyc if overlapped) but sim wall-clock/tile ≈ 3300 vs HW ≈ 1700 — the whole gap is **wait/idle**.
+sim SM is **fully-idle 31.7%** (HW ~10%). Each warp's own critical-path wait is SHORT (sim ≤ HW), but the
+3 in-phase consumer warps/SMSP hit those waits SIMULTANEOUSLY → SM stalls as a whole = **failed
+latency-hiding**. §8. This unifies the "SFU contention" and "de-phasing" framings: the lever is filling the
+31.7% SM-idle by de-phasing warps so one runs during another's dependency wait — NOT emptying an SFU queue
+(SFU is only 28%-floored).
+
+Per-tile wall-clock decomposition (fwd, per SMSP) — the clearest picture of the gap:
+
+| per tile (fwd, SMSP) | sim | HW |
+|---|---|---|
+| tensor work (16.5 op; sim 29.5 / HW 42.7 busy-cyc/op) | 487 | 705 |
+| MUFU work (91.2 op; II 8) | 730 | 730† |
+| **compute work (if overlapped = max of the two)** | **~730** | **~730** |
+| **wall-clock / tile** | **~3300** | **~1700** |
+| **pure wait/idle / tile** | **~2570** | **~970** |
+
+Note the tensor work is NOT equal (sim 487 < HW 705 — HW holds each WGMMA in the pipe longer, §6); it's the
+MUFU term (730, II=8 HW-faithful) that DOMINATES, so `compute = max(tensor, MUFU) ≈ 730` on BOTH — equal by
+coincidence, not because tensor matches. The key point stands and is stronger: **HW runs MORE tensor work
+per op yet finishes each tile in ~1700, while sim runs LESS and takes ~3300** ⇒ the ~1600 gap is entirely
+**wait/idle** (sim 2570 vs HW 970), never compute.
+
+† **MUFU work "730" is an II=8 THROUGHPUT-FLOOR, not an HW measurement.** op-count is identical sim=HW
+(work-invariant); II=8 is HW-faithful (peak_sustained 0.5/cyc/SM = 8 cyc/MUFU/SMSP). But unlike tensor
+(which has an HW busy-cycle counter → 42.7/op measured), the **SFU has NO HW pipe-busy counter** (§1c), so
+HW's real per-op SFU occupancy cannot be measured — only the II floor. HW's actual MUFU issue rate is 48%
+of peak, i.e. SFU is far from saturated. So "730=730" means "same op-count × same II floor", NOT a measured
+equality.
+
+**How much can be recovered (the number the user wants).** SM-idle 34.5% splits into:
+| bucket | % of elapsed | recoverable by de-phasing? |
+|---|---|---|
+| rest (clearly recoverable) | **~9.9%** | ✅ yes (this is the "10%") |
+| wait_barrier_only | 19.1% | ⏳ PENDING probe: WGMMA=recoverable by de-phasing / TMA=NOT by de-phasing (producer/mem axis) |
+| ibuffer_empty + drained | ~24.7% | ❌ trace-drain straggler tail (floor) |
+
+So the total recoverable = **rest 9.9% + (wait_barrier 19.1% × WGMMA-fraction)**. Pending probe scenarios:
+WGMMA 0% → recover 9.9% (1.57×→1.41×); 50% → 19.5% (→1.26×); 100% → 29% (→1.11×). Upper-bound (idle-fill
+isn't 100% cycle-for-cycle).
+
+**Next measurement (probe implemented, awaiting 12h run):** `-overlap_instrument_enable` now also emits
+`warpcyc_wb_wait_{tensor,tma,other}` — splits the 19.1% wait_barrier into WGMMA-result (recoverable) vs
+TMA (producer floor). That decides the WGMMA-fraction above and thus the final recoverable cycle count.
+
+**Why WGMMA is recoverable but TMA is not (by de-phasing):** the distinction is WHO produces the awaited
+data. A `wgmma.wait_group` wait is for the warp's OWN tensor result — produced INSIDE the SM; while warp A
+waits, a de-phased warp B can run its independent work, so the wait is hidden ⇒ recoverable. A TMA-tile
+wait is for the producer to land the next tile from GMEM→SMEM — produced OUTSIDE the SM; if the tile isn't
+there yet, NO warp on the SM can proceed on that data, so re-phasing SM-internal warps cannot help ⇒ NOT
+recoverable by de-phasing. **Caveat:** TMA is only a hard floor if it's DRAM-bandwidth-bound; here DRAM
+util is low (~12% fwd), so a large TMA-wait would instead point at a producer scheduling/issue problem
+(a DIFFERENT, still-open lever) — not necessarily an immovable floor. So read "TMA" as "not fixable by
+de-phasing" rather than "unfixable".
+
 
 ---
 
@@ -331,6 +402,155 @@ about). II and latency are two numbers precisely because a pipelined unit has in
   (§6, 2.211 warp-cyc/inst) is therefore NOT a latency over-model — it is purely the II=8 throughput
   meeting the in-phase consumer warps (the phasing root). No SFU-cost lever exists; the lever remains
   de-phasing the warps so their MUFU streams interleave.
+
+
+## 8. CRITICAL-PATH static analysis (2026-07-27l) — the gap is SM-idle from failed latency-hiding, NOT SFU cost
+
+User pushback (correct): "if the sim is fully deterministic and warps just pile onto the SFU at the same
+cycle, the total cycle should be the same — de-phasing only reorders, it can't cut cycles unless the SFU is
+a real throughput bottleneck." This forced a critical-path re-analysis. The user is right, and it resolves
+the paradox (per-op latencies are ≤ HW yet total is 1.56×).
+
+### SFU is NOT the sim bottleneck (user confirmed)
+- SFU throughput floor = MUFU/SMSP(3650) × II(8) = **29,196 cyc = only 28% of sim elapsed** (106,045).
+  The sim runs 3.6× longer than its own SFU floor ⇒ SFU throughput is not what sets the cycle count.
+- `fu_sfu` 2.211 warp-cyc/inst is an issue-stage OBSERVATION (non-exclusive overlap counter); much of it
+  is warps that were ALSO waiting on their own data dep, double-attributed to "SFU busy". Not a lever by itself.
+
+### The real decomposition — per tile (fwd, SMSP)
+| component (per tile, fwd, SMSP) | sim | HW |
+|---|---|---|
+| tensor work (16.5 op; busy-cyc/op sim 29.5 / HW 42.7) | 487 | 705 |
+| MUFU work (91.2 op; II 8) | 730 | 730† |
+| **compute work (if overlapped = max)** | **730** | **730** |
+| **wall-clock / tile** | **~3300** | **~1700** |
+| **pure wait/idle / tile** | **~2570** | **~970** |
+
+(Tensor work differs — HW is LONGER per op, §6 — but MUFU 730 dominates so compute≈730 on both by
+coincidence. HW does more tensor work yet finishes faster ⇒ the gap is wait/idle, not compute.
+† MUFU 730 is an II=8 throughput-floor, not an HW measurement: op-count is identical and II=8 is
+HW-faithful, but the SFU has no HW busy-cycle counter (§1c) so HW's real per-op SFU occupancy is
+unmeasurable — HW's actual MUFU issue is only 48% of peak.)
+
+The compute work (730) is identical sim/HW; the **entire gap is wait/idle** — sim wastes ~2570 cyc/tile vs
+HW's ~970.
+
+### Where the wait shows up: SM FULLY-IDLE = 31.7% (fwd)
+- `total_num_cycles_sm_all_subcores_idle` = 4,442,929 ⇒ **31.7% of elapsed** (= /(132×106,045)).
+  ⚠️ the run's printed `percentage_..._sm_all_subcores_idle = 10.50%` is WRONG — it divides the SM-cycle
+  numerator by the subcore-cycle denominator (evaluated 42.3M = 132×4×cyc), a 4× definition mismatch. The
+  correct SM-idle is 31.7%. (HW SM-idle is ~10%.)
+- Per-warp waits are SHORT: sim `wait_barrier` 0.552 + `stall_count` 0.622 = 1.17 warp-cyc/inst, actually
+  LESS than HW `wait` 1.363. So each warp's own critical-path wait is HW-faithful/shorter.
+
+### ⭐ Resolution — critical-path and de-phasing are the SAME problem
+1. Each warp's critical-path wait (WGMMA→MUFU→WGMMA data deps) is NOT over-modeled (sim ≤ HW per warp).
+2. BUT the 3 in-phase warps/SMSP hit those waits **simultaneously**, so the whole SM stalls together →
+   **SM fully-idle 31.7%** = failed latency-hiding. HW overlaps: while warp A waits on a WGMMA/MUFU result,
+   warp B issues → SM-idle ~10%.
+- So the earlier "SFU-contention lever" framing was a symptom; the ROOT is **latency-hiding failure from
+  warp lockstep**. de-phasing's payoff is NOT emptying an SFU queue (SFU is 28%-floored) — it is
+  **filling the 31.7% SM-idle** by letting a non-waiting warp run during another's dependency wait.
+- ⇒ **This RE-VALIDATES de-phasing as the lever** (user: "keep de-phasing in mind"), now with the correct
+  mechanism (idle-fill, not queue-drain) and a sized target: cut SM-idle 31.7% → ~10% (HW) ≈ the whole gap.
+
+### Caveat / next check
+The 2570-cyc/tile wait must be decomposed into: (a) intra-warp dependency stall that COULD be hidden by
+another warp (recoverable by de-phasing) vs (b) genuine all-warps-blocked (e.g. all waiting on the same
+TMA tile via mbarrier — a producer floor). The overlap `neither` bucket (tensor&SFU both idle) + the
+per-CTA `sm_idle_wait_barrier_only` (CTAFIN) can size (b). If (b) dominates, de-phasing is capped by the
+producer; if (a) dominates, de-phasing is the real lever. This is the next static/probe step.
+
+
+## 9. (a) recoverable vs (b) floor decomposition (2026-07-27m) — SM-idle is MOSTLY wait_barrier; need to split it
+
+Decomposed the 34.5% SM-fully-idle (CTAFIN, fwd `.o61`) to see if de-phasing is a real lever (a) or capped
+by a producer/mbarrier floor (b).
+
+### SM-idle breakdown (avg/SM, % of elapsed 97,609)
+| component | % of elapsed | % of SM-idle | interpretation |
+|---|---|---|---|
+| **wait_barrier_only** | 19.1% | **55.4%** | SM-idle whose sole block is `wait_barrier` (mbarrier/DEPBAR) |
+| ibuffer_empty | 19.3% | 56.0% | trace-drained head (tail / winding down) |
+| drained | 5.4% | 15.7% | trace exhausted (straggler tail) |
+| tensor-block | 3.5% | — | tensor FU busy |
+| **rest (not wb-only, not drained)** | ~9.9% | **~29%** | the clearest recoverable-by-scheduling bucket |
+| **total SM fully-idle** | **34.5%** | 100% | |
+
+### The blocker to a clean (a)/(b) verdict: wait_barrier is TWO things merged
+`wait_barrier_only` (55% of idle) is the dominant idle reason, BUT the sim's single `are_wait_barriers_ready`
+check does NOT distinguish:
+- **(b) TMA-tile mbarrier** — consumer waiting for the producer to land the next tile ⇒ NOT recoverable by
+  de-phasing (the tile is produced outside the SM). NOTE this is a producer/mem-axis wait, not necessarily
+  an immovable floor: with DRAM util ~12% it may be a producer scheduling/prefetch gap (separate lever).
+- **(a) WGMMA-result DEPBAR** (`wgmma.wait_group`) — consumer waiting on its OWN prior WGMMA ⇒ if warps were
+  de-phased, another warp could run during this wait ⇒ recoverable.
+So the 55% cannot yet be assigned to (a) or (b).
+
+### Producer/consumer timing (CTAFIN) — a hint, not a verdict
+- `producer_last_drain` = 99,103 ≈ `finish` 99,110 → the producer (TMA) keeps landing tiles until ~kernel
+  end.
+- `consumer_last_drain` = 77,848 = **78% of finish** → the consumer does its last work at 78%, then the last
+  ~22% is drain/idle (straggler tail).
+- ⚠️ This looks like "producer busy to the end, consumer finishes early" — the OPPOSITE of the old
+  CONSUMER_COMPUTE_BOUND "producer waits on consumer" reading. But `producer_last_drain≈finish` may just be
+  the producer warp's teardown, not late tile supply, so treat as a hint only.
+
+### Verdict so far
+- **~29% of SM-idle is clearly recoverable** (rest bucket), **~16% is drain tail (floor)**, and the big
+  **55% wait_barrier chunk is UNRESOLVED** (split needed).
+- If most of the 55% is WGMMA-DEPBAR (a), de-phasing is a large lever (up to ~55%+29% ≈ 84% of the 34.5%
+  idle ≈ recovering ~29% of elapsed → could bring sim near HW's 10% idle). If most is TMA-mbarrier (b),
+  de-phasing won't recover it and the investigation reroutes to the producer path (bandwidth vs prefetch
+  scheduling) — a true floor only if the producer is genuinely bandwidth-bound (DRAM ~12% suggests not).
+
+### Next step (needs a build) — split wait_barrier by kind
+Add a gated read-only counter that, on a `wait_barrier`-blocked warp, classifies the barrier it waits on:
+TMA-tile mbarrier (producer floor) vs WGMMA/DEPBAR (recoverable). The sync-barrier addr / kind is already
+known at the wait site (`build_sync_barrier_key`, HopperMBarrier vs the SASS wait_barrier bits). This is
+THE measurement that decides whether de-phasing is the lever or a producer floor caps it. Fold into the
+next 12h run alongside the existing overlap probe.
+
+## 10. wait_barrier-kind probe — IMPLEMENTED (2026-07-27n), awaiting 12h run
+
+To split the unresolved 19.1% `wait_barrier` (§9) into recoverable (WGMMA-result) vs floor (TMA), a gated
+read-only probe was added under the existing `-overlap_instrument_enable`.
+
+### Mechanism (why it can separate them)
+- Each warp has 6 scoreboard (SB) wait-barriers. An async op that will later signal SB#k arms it at
+  control_stage (`add_pending_wait_barrier_increment`, sm.cc). We tag that SB with the ARMING op's class:
+  `WB_ARM_TENSOR` (WGMMA), `WB_ARM_TMA` (UTMALDG/cp.async.bulk), or `WB_ARM_OTHER`.
+- When a warp is blocked at issue on `!are_wait_barriers_ready`, we look up which of its checked SBs are
+  NOT ready and return the dominant arming class (precedence TENSOR>TMA>OTHER), accumulating per-SM into
+  `warpcyc_wb_wait_{tensor,tma,other,unknown}`.
+- Files: `warp_dependency_state.{h,cc}` (enum + Wait_Barrier tag + `blocking_wait_barrier_armed_op`),
+  `sm.cc` (tag at arm time), `subcore.cc` (classify at stall), `gpu-sim.cc`/`shader.cc` (4 stats+prints).
+  Read-only; arm-time tag is a plain enum push (timing-neutral). Headers changed → `make clean`.
+- ⚠️ Caveat from the search audit: in this trace model, WGMMA RESULT waits may surface as
+  `stall_count`/traditional-scoreboard rather than SB `wait_barrier`, and TMA-tile arrival mostly goes
+  through the mbarrier path (`waiting()` = inst_barrier, which is ~0.03% here). So the SB `wait_barrier`
+  bucket is expected to be dominated by DEPBAR / `wgmma.wait_group` (WGMMA-group) — the probe will confirm
+  or refute this. If `wb_wait_tensor` dominates ⇒ the 19.1% is largely recoverable.
+
+### Analysis plan for the next run (combine with the "10%")
+1. Read `warpcyc_wb_wait_tensor / tma / other` (fwd `.o*`, bwd `.o*`).
+2. WGMMA-fraction = `wb_wait_tensor / (tensor+tma+other)`.
+3. Total recoverable-by-de-phasing = **rest 9.9% + 19.1% × WGMMA-fraction** (of elapsed).
+4. Upper-bound new cycle = `sim_cyc × (1 − recoverable%)`; report the new sim×HW multiplier.
+   (Reminder: this is an UPPER bound — idle-fill via de-phasing is not 100% cycle-for-cycle because the
+   per-warp critical paths only partly overlap; the honest deliverable is the sized ceiling, then a
+   faithful de-phasing mechanism (candidate B: dynamic cross-warp bank/RF-port contention) would be built
+   only if the ceiling justifies it.)
+
+### If the probe says WGMMA dominates (recoverable is large)
+Then de-phasing is the real lever and the next build is the faithful jitter mechanism (candidate B from the
+CLOSED WARP_STAGGER doc — cross-warp bank/RF-port contention that survives the mbarrier). If TMA dominates,
+de-phasing SM-internal warps will NOT recover it (the awaited tile is produced outside the SM) — but that
+does NOT automatically make it an immovable floor: with DRAM util only ~12% (fwd) the tiles are not
+bandwidth-starved, so a large TMA-wait would indicate a PRODUCER scheduling/prefetch problem (a separate,
+still-open lever), whereas a true floor only holds if the producer is genuinely bandwidth-bound. So a
+TMA-dominated result reroutes the investigation to the producer path, it does not simply cap the gain at
+rest-9.9%.
 
 
 ⚠️ Guardrails: keep every II/latency HW-faithful (confirmed above); no pipe may exceed its NCU occupancy;
