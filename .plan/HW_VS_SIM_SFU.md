@@ -553,6 +553,54 @@ TMA-dominated result reroutes the investigation to the producer path, it does no
 rest-9.9%.
 
 
+## 11. Solution direction — scheduler policy (GTO → LRR/GTLRR) to break the lockstep (2026-07-27o)
+
+The "how", designed while the wait_barrier-kind run is in flight. Root cause (mechanism): the sim's
+**GTO** scheduler actively CREATES the lockstep — it greedily pushes one warp until it stalls, then the
+next warp runs the SAME deterministic code the same distance and stalls at the SAME point, so the 3
+consumer warps/SMSP converge to one phase and hit dependency waits together (SM-idle 31.7%).
+
+### What NVIDIA HW actually does (web audit)
+- H100 SM = 4 warp schedulers (1/SMSP), 1 issue/cycle; eligible = operands ready + target FU free; zero-
+  overhead switch to a ready warp when one stalls. Matches the sim's per-subcore 1-issue model.
+- **The exact warp-selection policy is NOT public (black-box).** NVIDIA docs and academic microbench
+  papers (WPI thread-block scheduler; "Dissecting Blackwell" arXiv:2507.10789) only say "pick a ready
+  warp"; they cannot pin GTO vs LRR vs age. GPGPU-Sim lore: real HW is closer to an age+round-robin mix
+  than to pure GTO.
+
+### Sim status (code)
+- The remodeling `subcore.cc` HARD-CODES GTO via `order_greedy_then_highest_id` ([subcore.cc:589](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/subcore.cc#L589));
+  there is no policy switch on this path. Stock GPGPU-Sim's LRR / GTO / GTLRR / two-level (shader.h:529-543)
+  live only in the original `scheduler_unit`, which the remodeling issue path does NOT use.
+
+### The plan: add an LRR / GTLRR ordering to the remodeling subcore, gated, and A/B it
+- **GTO** (today): greedy → aligns warps → lockstep.
+- **LRR** (loose round-robin): rotate warps every cycle → warps naturally spread across different
+  instruction stages → de-phase → a warp is likely in a non-waiting stage while another waits ⇒ fills
+  SM-idle. 
+- **GTLRR** (greedy-then-LRR) is the sweet spot: keep greedy locality (good for i-cache/RF), but when the
+  greedy warp stalls, fall to round-robin instead of oldest — so the fallback doesn't re-pick a warp that
+  will stall at the same point. This directly targets the lockstep without throwing away GTO's locality.
+- Why this is defensible (not an arbitrary knob like physical jitter): LRR/GTLRR are established GPGPU-Sim
+  policies with published fidelity data; HW's true policy is unknown and believed to be a round-robin-ish
+  mix, so LRR/GTLRR is a legitimate hypothesis, not a fudge.
+
+### Risk / open question (same failure mode as E1)
+GTO→LRR reorders WHO issues, but if every warp still runs the identical deterministic path, LRR may only
+shift the phase without WIDENING it — the warps could re-converge (this is exactly why launch-offset E1
+died on the per-tile mbarrier). LRR's advantage over E1 is that it re-applies the rotation EVERY cycle
+(not once at launch), so a warp pulled ahead stays ahead until the next mbarrier — but whether that
+survives the mbarrier re-sync is the empirical question. **Validate cheaply first:** add the ordering as a
+gated option, A/B on FA3, and read SM-idle 31.7% + the overlap `neither`/`sfu_only` buckets. If SM-idle
+drops, it's real; if it re-converges, we learn LRR alone is insufficient and the jitter must come from
+somewhere the mbarrier can't erase (→ candidate B).
+
+### Guardrail
+Any new ordering is gated + default-off (GTO stays the default, bit-identical when off). Report the new
+cycle count AND confirm `gpu_sim_insn` stays bit-identical (work-invariant) so we know only scheduling,
+not work, changed.
+
+
 ⚠️ Guardrails: keep every II/latency HW-faithful (confirmed above); no pipe may exceed its NCU occupancy;
 any prototype gated + default-off + bit-identical when off; if the honest answer is "structural floor
 bounded by HW's own 54% No-Eligible", accept it and make no cycle claim.
