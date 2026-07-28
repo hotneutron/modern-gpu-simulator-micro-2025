@@ -1397,7 +1397,7 @@ void shader_core_stats::print_remodeling_stats(FILE *fout) {
   fprintf(fout, "total_num_mufu_lockstep_nonsfu_stall_count = %llu\n", m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_mufu_lockstep_nonsfu_stall_count"]->get_value());
   fprintf(fout, "total_num_mufu_lockstep_nonsfu_scoreboard = %llu\n", m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_mufu_lockstep_nonsfu_scoreboard"]->get_value());
   // [overlap probe] SFU pipe-active (always on, like tensor) + SM-level tensor||SFU overlap + per-warp
-  // warp-cycle stall breakdown (0 unless -overlap_instrument_enable). See .plan/HW_VS_SIM_COMPARISON.md §5.
+  // warp-cycle stall breakdown (0 unless -overlap_instrument_enable). See .plan/HW_VS_SIM_SFU.md §5.
   fprintf(fout, "total_num_cycles_sfu_pipe_active = %llu\n", m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_cycles_sfu_pipe_active"]->get_value());
   fprintf(fout, "total_num_cycles_overlap_tensor_and_sfu = %llu\n", m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_cycles_overlap_tensor_and_sfu"]->get_value());
   fprintf(fout, "total_num_cycles_overlap_tensor_only = %llu\n", m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_cycles_overlap_tensor_only"]->get_value());

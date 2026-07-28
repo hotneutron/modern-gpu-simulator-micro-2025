@@ -271,7 +271,7 @@ closed (stagger dead; `stall_count`-latency refuted; tensor over-model refuted b
 sim tensor is 0.69× UNDER, `peak_sustained=4`). The residual is now positively localized to
 **issue-density / pipe-overlap** (fwd density sim 0.289 vs HW 0.407 = 1.41×), with EVERY per-pipe cost
 confirmed HW-faithful-or-lighter. **Active work + the full HW-vs-sim comparison now lives in the clean
-baseline [`.plan/HW_VS_SIM_COMPARISON.md`](../.plan/HW_VS_SIM_COMPARISON.md).** The dead-end trail
+baseline [`.plan/HW_VS_SIM_SFU.md`](../.plan/HW_VS_SIM_SFU.md).** The dead-end trail
 (warp-stagger / lockstep / E1) is archived in the now-CLOSED
 [`.plan/WARP_STAGGER_LOCKSTEP.md`](../.plan/WARP_STAGGER_LOCKSTEP.md).
 

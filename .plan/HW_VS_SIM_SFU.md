@@ -221,6 +221,118 @@ even perfect tensor∥MUFU overlap cannot beat max(31%,43%)=43% of HW elapsed as
 achievable sim improvement is from 105,245 toward ~HW's overlap efficiency, not below it.
 
 
+## 6. RESULT — overlap+warp-cyc probe (2026-07-27j, fwd `.o61` / bwd `.o36`)
+
+The 12h instrumentation run (gate `-overlap_instrument_enable 1`). `gpu_sim_insn` bit-identical
+(fwd 455,565,060 / bwd 629,211,348 = work invariant); `gpu_sim_cycle` fwd 106,045 (+0.76% vs `.o59`
+105,245) / bwd 179,175 — the per-warp map-lookup counters cost a hair of timing but do not affect the
+composition below.
+
+### Finding 1 — tensor↔SFU OVERLAP is actually GOOD (the earlier "no overlap" worry is refuted)
+Per-SM-cycle classification (÷ n_sm×cyc):
+| | both tensor&SFU | tensor-only | sfu-only | neither |
+|---|---|---|---|---|
+| FWD | 38.6% | 2.5% | 19.2% | 31.7% |
+| BWD | 40.5% | 3.5% | 8.1% | 40.4% |
+
+Of cycles where ≥1 of {tensor,SFU} is busy, **BOTH = 64% fwd / 78% bwd**. tensor-only is only 2.5/3.5%.
+⇒ when the tensor pipe runs, the SFU almost always runs too. **The pipes DO overlap**; serialization of
+tensor-vs-SFU is NOT the main lever. (This corrects §5's overlap-deficit hypothesis.)
+
+### Finding 2 — the real concentration is SFU CONTENTION (the dominant stall)
+Per-warp warp-cycles stalled, per issued warp-inst (HW `warp cycles per issued inst` basis):
+| reason | FWD | BWD | HW-ish ref (fwd) |
+|---|---|---|---|
+| **fu_sfu** | **2.211** | **1.313** | (math_pipe 0.229 + mio 0.457 + short_sb 0.330 = ~1.0) |
+| fu_other (sp/int/uniform) | 1.007 | 0.788 | alu/fma stalls |
+| stall_count | 0.622 | 0.464 | (folded into HW pipe latencies) |
+| wait_barrier | 0.552 | 0.626 | HW `wait` 1.363 |
+| fu_tensor | 0.482 | 0.745 | HW `gmma` 0.097 |
+| yield | 0.180 | 0.094 | HW `sleeping` 0.223 |
+| **any (sum, non-excl)** | 4.561 | 3.882 | |
+
+- **`fu_sfu` is the #1 sim stall — 48.5% of all stall warp-cycles (fwd)** — versus HW's SFU-ish share
+  (~16.6% of stall). **sim is ~3× over-concentrated on SFU contention.**
+- Each MUFU issue is associated with **~18 warp-cycles** of OTHER warps blocked on the SFU (fwd), i.e.
+  ~2.3 warps queued on the one SFU for its full II=8 window every MUFU. Heavy same-cycle SFU contention.
+- Note **`wait_barrier` is sim 0.552 vs HW `wait` 1.363** — the sim actually waits LESS on mbarrier/DEPBAR
+  than HW. So the producer→consumer data-dep is NOT over-modeled; it is a HW-faithful/under floor. The
+  excess is squarely SFU contention, not the barrier wait.
+
+
+### fwd vs bwd — is the SFU over-concentration the same in both? (2026-07-27k)
+Both kernels have SFU as the #1 stall, and the PER-MUFU contention is nearly identical; but the SHARE
+differs because bwd has more tensor/barrier stall diluting it.
+| metric | FWD (k5, .o61) | BWD (k10, .o36) |
+|---|---|---|
+| fu_sfu warp-cyc/inst | **2.211** | **1.313** |
+| fu_sfu share of tracked stall | **43.7%** | **32.6%** |
+| fu_sfu warp-cyc PER MUFU op | 18.4 | 17.8 |
+| avg warps blocked over the II=8 window | **2.30** | **2.22** |
+| fu_tensor warp-cyc/inst | 0.482 | 0.745 |
+| wait_barrier warp-cyc/inst | 0.552 | 0.626 |
+
+- **The per-MUFU SFU contention is the SAME in both** (~18 warp-cyc/op, ~2.3 warps queued over II=8) —
+  it is the same in-phase consumer-warp structure.
+- **But SFU DOMINATES fwd (43.7%) while in bwd it is #1-but-shared (32.6%)**: bwd runs fewer MUFU
+  (HW xu 21.4% vs fwd 47.7%) and more tensor (53.6% vs 46%), so bwd's fu_tensor (0.745) and wait_barrier
+  (0.626) rise to SFU's level and spread the stall out.
+- So the earlier "~3× over-concentrated on SFU" statement is a **fwd** figure. bwd is SFU-led but
+  multi-factor. The de-phasing lever helps both (identical per-MUFU contention) but its ceiling is larger
+  for fwd.
+
+### Interpretation — same root (phasing), now precisely localized to SFU contention
+II=8 is HW-faithful (confirmed by `peak_sustained` 0.5/cyc/SM = 8/SMSP). The sim's 3 consumer warps/SMSP
+hit the SFU **in phase** (all in the softmax MUFU stage at once), so they queue on the single SFU;
+HW's 12 warps are phase-dispersed so the same MUFU work spreads out (xu 47.7% steady, low per-warp SFU
+stall). So the gap is the same lockstep/phasing root, but its DOMINANT symptom is SFU issue contention
+(fu_sfu 2.211), not tensor cost (faithful), not overlap (good), not wait_barrier (under HW).
+
+### Consequence for a lever
+- The only faithful way to reduce fu_sfu contention is to **de-phase the consumer warps** so their MUFU
+  streams interleave (HW's behavior) — the same candidate B (real cross-warp jitter) from the closed
+  stagger doc, now with a concrete target (cut fu_sfu 2.211 → toward HW ~1.0 ⇒ recovers a large share of
+  the 48.5% SFU stall). Launch-offset (E1) is dead (mbarrier re-sync); the jitter must live INSIDE the
+  per-tile compute region and survive the bell.
+- ⚠️ Bounded: HW itself is ~43% MUFU-throughput-floored, so even perfect de-phasing cannot go below that.
+  But sim's fu_sfu 2.211 vs HW ~1.0 is headroom well above the floor — this IS a real, sized lever.
+
+
+## 7. SFU latency/II — clarified (2026-07-27k): total is ALREADY 16 (HW-faithful); config was just confusing
+
+Investigating whether SFU result latency is over-modeled (suspected 21 vs HW ~16) resolved to: **it is
+already 16, and correct.** An earlier read in this session that "SFU op latency = 21" was WRONG — it
+confused the FU pipeline-array depth with the op's latency field. Corrected trace:
+
+### The mechanism (why II and latency are two numbers)
+The SFU is modeled as a **pipelined** unit. An op:
+1. sits in `m_dispatch_reg` for **II** cycles (`dispatch_delay` counts `cycles=initiation_interval` down,
+   [functional_unit.cc:306-318](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/functional_unit.cc#L306)) — during this window `can_issue()=false` so it blocks OTHER warps' SFU issue (this is the throughput/contention term);
+2. then enters `m_pipeline_reg[latency_field-1]` and takes **latency_field** more cycles to produce its
+   result (the result-latency term).
+So **total result latency = II + latency_field**, and because II<total, up to `total/II ≈ 2` ops are
+in-flight concurrently (real pipelining — the "op1 in the back half, op2 in the front half" the user asked
+about). II and latency are two numbers precisely because a pipelined unit has independent throughput vs depth.
+
+### The THREE confusing SFU knobs (only one drives FA3)
+| knob | value | used for FA3 (trace mode)? |
+|---|---|---|
+| **`-trace_opcode_latency_initiation_sfu 8,8`** | lat=8, II=8 | ✅ **THE real value** ([trace_driven.cc:811,849-852](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/trace-driven/trace_driven.cc#L811)) ⇒ total = 8+8 = **16** |
+| `-ptx_opcode_latency_sfu 21` / `_initiation 8` | 21 / 8 | ❌ PTX functional-sim only ([cuda-sim.cc:1009](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/cuda-sim/cuda-sim.cc#L1009)); ignored in trace |
+| `-sfu_latency 21` (default) | 21 | ❌ only sizes the FU pipeline-array depth `m_pipeline_depth` ([subcore.cc:1772](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/subcore.cc#L1772)); op enters stage 7, so it's just array capacity, NOT timing. This is why `[LATCFG]` prints sfu=21 while the real op latency is 8. |
+
+### Verdict
+- **SFU total result latency = 16 cyc = HW-faithful** (Ampere/Hopper MUFU microbench ~16). Confirmed by the
+  tensor precedent: `generate_tensor_core_latencies` also splits one op's total as `II=nc/2; latency=nc-II`
+  (II+latency=total). So there is **nothing to lower** — the earlier "reduce 21→16" plan is moot.
+- Config action taken: added a disambiguation comment block at the `-ptx_opcode_*_sfu` lines so the three
+  knobs are no longer confusing (timing unchanged / bit-identical).
+- ⇒ SFU is HW-faithful in BOTH II (8, throughput) AND total latency (16). The `fu_sfu` contention
+  (§6, 2.211 warp-cyc/inst) is therefore NOT a latency over-model — it is purely the II=8 throughput
+  meeting the in-phase consumer warps (the phasing root). No SFU-cost lever exists; the lever remains
+  de-phasing the warps so their MUFU streams interleave.
+
+
 ⚠️ Guardrails: keep every II/latency HW-faithful (confirmed above); no pipe may exceed its NCU occupancy;
 any prototype gated + default-off + bit-identical when off; if the honest answer is "structural floor
 bounded by HW's own 54% No-Eligible", accept it and make no cycle claim.

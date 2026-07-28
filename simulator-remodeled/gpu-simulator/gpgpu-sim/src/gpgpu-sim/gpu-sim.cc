@@ -2031,7 +2031,7 @@ void shader_core_config::reg_options(class OptionParser *opp) {
                          "and per-warp warp-cycle stall accounting by reason (wait_barrier/stall_count/yield/"
                          "fu_tensor/fu_sfu/fu_other/scoreboard), comparable to HW warp-cycles-per-inst stall "
                          "breakdown. Read-only, timing-neutral, default 0 = bit-identical. See "
-                         ".plan/HW_VS_SIM_COMPARISON.md section 5. (default=0)",
+                         ".plan/HW_VS_SIM_SFU.md section 5. (default=0)",
                          "0");
   option_parser_register(opp, "-sync_debug_enable", OPT_BOOL,
                          &sync_debug_enable,

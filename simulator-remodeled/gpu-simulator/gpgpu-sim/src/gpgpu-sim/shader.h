@@ -2288,7 +2288,7 @@ class shader_core_config : public core_config {
   // HW overlaps them. This gate turns on: (1) SM-level per-cycle tensor∥SFU busy-combination counters,
   // (2) per-warp wait_barrier/stall_count/yield DURATION histograms, (3) consumer warp stage-transition
   // gaps, (4) per-warp total stall/wait warp-cycles. All read-only, timing-neutral, default 0 =
-  // bit-identical. See .plan/HW_VS_SIM_COMPARISON.md §5.
+  // bit-identical. See .plan/HW_VS_SIM_SFU.md §5.
   bool overlap_instrument_enable;
 
   // Hopper mbarrier sync debug logging (SYNCDBG). Disabled by default.

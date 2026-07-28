@@ -6,7 +6,7 @@
 > - raw-count re-profile (`peak_sustained=4`) shows the tensor pipe is UNDER-modeled 0.69×, not over — no
 >   per-pipe cost is the cause. The residual is **issue-density / pipe-overlap**.
 >
-> **Active work moved to [`HW_VS_SIM_COMPARISON.md`](file:///home/jihyun/modern-gpu-simulator-micro-2025/.plan/HW_VS_SIM_COMPARISON.md)**
+> **Active work moved to [`HW_VS_SIM_SFU.md`](file:///home/jihyun/modern-gpu-simulator-micro-2025/.plan/HW_VS_SIM_SFU.md)**
 > (the clean, definition-checked baseline). This file is retained ONLY as the historical record of the
 > stagger/lockstep dead-ends + the E1 reverted-commit trail. Do NOT add new findings here.
 
