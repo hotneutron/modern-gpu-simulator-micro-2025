@@ -46,14 +46,25 @@ enum Wait_Barrier_Action {
     DECREASE_COUNTER
 };
 
+// [wait_barrier-kind probe] op-class that armed a scoreboard (SB) wait-barrier, so that when a warp
+// stalls on that SB we can tell WHAT it is waiting for: a WGMMA/tensor result (recoverable by warp
+// de-phasing) vs a TMA transfer completing (producer floor) vs other. Read-only diagnostic.
+enum Wait_Barrier_Armed_Op {
+    WB_ARM_UNKNOWN = 0,
+    WB_ARM_TENSOR,   // WGMMA / tensor-core op (wgmma.commit_group style)
+    WB_ARM_TMA,      // TMA transfer (UTMALDG / cp.async.bulk)
+    WB_ARM_OTHER     // everything else (LDGSTS, generic fixed-latency, etc.)
+};
+
 struct Wait_Barrier_Entry_Modifier {
     Wait_Barrier_Entry_Modifier(unsigned int sm_warp_id, unsigned int barrier_id, Wait_Barrier_Type barrier_type, Wait_Barrier_Action barrier_action,
-                                new_addr_type pc_inst) {
+                                new_addr_type pc_inst, Wait_Barrier_Armed_Op armed_op = WB_ARM_UNKNOWN) {
         this->sm_warp_id = sm_warp_id;
         this->barrier_id = barrier_id;
         this->barrier_type = barrier_type;
         this->barrier_action = barrier_action;
         this->pc = pc_inst;
+        this->armed_op = armed_op;
     }
 
     new_addr_type pc;
@@ -61,6 +72,7 @@ struct Wait_Barrier_Entry_Modifier {
     unsigned int barrier_id;
     Wait_Barrier_Type barrier_type;
     Wait_Barrier_Action barrier_action;
+    Wait_Barrier_Armed_Op armed_op;
 };
 
 struct Wait_Barrier_Checking {
@@ -83,11 +95,16 @@ class Wait_Barrier {
         unsigned int get_counter();
         unsigned int get_barrier_id();
 
+        // [wait_barrier-kind probe] op-class that most recently armed this SB (read-only diagnostic).
+        void set_armed_op(Wait_Barrier_Armed_Op op) { m_armed_op = op; }
+        Wait_Barrier_Armed_Op get_armed_op() const { return m_armed_op; }
+
         void print_state(FILE *out);
 
     private:
         unsigned int m_counter;
         unsigned int m_barrier_id;
+        Wait_Barrier_Armed_Op m_armed_op = WB_ARM_UNKNOWN;
 };
 
 class Dependency_State {
@@ -106,6 +123,11 @@ class Dependency_State {
         bool is_yield_ready();
         bool is_stall_counter_0();
         bool are_wait_barriers_ready(std::vector<Wait_Barrier_Checking> wait_barriers_checking);
+
+        // [wait_barrier-kind probe] For a warp blocked on wait-barriers: of the SBs in
+        // `wait_barriers_checking` that are NOT ready (the ones actually blocking), return the op-class
+        // that armed them. Precedence TENSOR > TMA > OTHER when several block. Read-only.
+        Wait_Barrier_Armed_Op blocking_wait_barrier_armed_op(const std::vector<Wait_Barrier_Checking> &wait_barriers_checking);
         
         void increase_num_pending_ldgsts();
         void decrease_num_pending_ldgsts();

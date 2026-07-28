@@ -758,8 +758,13 @@ void SM::add_pending_wait_barrier_decrement(warp_inst_t *inst,
 
 void SM::add_pending_wait_barrier_increment(warp_inst_t *inst,
                                             Wait_Barrier_Type barrier_type, unsigned int barrier_id) {                                    
+  // [wait_barrier-kind probe] tag the SB with the op-class arming it, so a later stall on this SB can
+  // be attributed to WGMMA-result (recoverable by de-phasing) vs TMA (producer floor) vs other.
+  Wait_Barrier_Armed_Op armed_op = WB_ARM_OTHER;
+  if (inst->is_tensor_core_op())      armed_op = WB_ARM_TENSOR;
+  else if (inst->is_tma_op())         armed_op = WB_ARM_TMA;
   m_pending_wait_barrier_increments.push(Wait_Barrier_Entry_Modifier(
-    inst->warp_id(), barrier_id, barrier_type, Wait_Barrier_Action::INCREASE_COUNTER, inst->pc));
+    inst->warp_id(), barrier_id, barrier_type, Wait_Barrier_Action::INCREASE_COUNTER, inst->pc, armed_op));
 }
 
 

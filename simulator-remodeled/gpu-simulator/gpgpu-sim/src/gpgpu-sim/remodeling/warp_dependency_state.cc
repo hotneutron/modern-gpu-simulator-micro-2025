@@ -103,12 +103,31 @@ void Dependency_State::set_stall_counter(unsigned int stall_counter) {
 void Dependency_State::action_over_wait_barrier(Wait_Barrier_Entry_Modifier *wait_barrier_entry_modifier) {
     if(wait_barrier_entry_modifier->barrier_action == Wait_Barrier_Action::INCREASE_COUNTER){
         m_wait_barriers[wait_barrier_entry_modifier->barrier_id].increase_counter();
+        // [wait_barrier-kind probe] tag which op-class armed this SB (read-only diagnostic).
+        if(wait_barrier_entry_modifier->armed_op != WB_ARM_UNKNOWN){
+            m_wait_barriers[wait_barrier_entry_modifier->barrier_id].set_armed_op(wait_barrier_entry_modifier->armed_op);
+        }
     }else if(wait_barrier_entry_modifier->barrier_action == Wait_Barrier_Action::DECREASE_COUNTER){
         m_wait_barriers[wait_barrier_entry_modifier->barrier_id].decrease_counter();
     }else{
         std::cout << "Error: Wait barrier action not recognized" << std::endl;
         abort();
     }
+}
+
+// [wait_barrier-kind probe] of the SBs this warp is checking, return the armed op-class of the ones
+// that are NOT ready (actually blocking). Precedence TENSOR > TMA > OTHER (so a blocking WGMMA wins).
+Wait_Barrier_Armed_Op Dependency_State::blocking_wait_barrier_armed_op(const std::vector<Wait_Barrier_Checking> &wait_barriers_checking) {
+    Wait_Barrier_Armed_Op best = WB_ARM_UNKNOWN;
+    for(const auto &wbc : wait_barriers_checking){
+        if(!m_wait_barriers[wbc.barrier_id].is_ready(wbc.min_val)){
+            Wait_Barrier_Armed_Op a = m_wait_barriers[wbc.barrier_id].get_armed_op();
+            // precedence: TENSOR(2) > TMA(1) > OTHER(0) > UNKNOWN; map to a rank.
+            auto rank=[](Wait_Barrier_Armed_Op o){ switch(o){case WB_ARM_TENSOR:return 3;case WB_ARM_TMA:return 2;case WB_ARM_OTHER:return 1;default:return 0;} };
+            if(rank(a) > rank(best)) best = a;
+        }
+    }
+    return best;
 }
 
 bool Dependency_State::is_yield_ready() {

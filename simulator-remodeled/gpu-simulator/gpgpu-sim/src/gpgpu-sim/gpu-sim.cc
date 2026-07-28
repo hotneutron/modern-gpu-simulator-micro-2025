@@ -2992,6 +2992,12 @@ void gpgpu_sim::create_gpu_per_sm_stats() {
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_warpcyc_stalled_fu_sfu", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_warpcyc_stalled_fu_other", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_warpcyc_stalled_scoreboard", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  // [wait_barrier-kind probe] of the wait_barrier-stalled warp-cycles, which op-class armed the blocking
+  // SB: TENSOR (WGMMA result = recoverable by de-phasing) vs TMA (producer floor) vs other.
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_warpcyc_wb_wait_tensor", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_warpcyc_wb_wait_tma", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_warpcyc_wb_wait_other", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_warpcyc_wb_wait_unknown", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
   // (V) SM-level: cycles where NO subcore issued anything; sub-variant where every non-issuing
   // subcore that had an eligible-but-blocked warp was blocked specifically by the tensor pipe.
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_sm_all_subcores_idle", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);

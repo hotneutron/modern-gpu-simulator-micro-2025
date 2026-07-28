@@ -1412,6 +1412,12 @@ void shader_core_stats::print_remodeling_stats(FILE *fout) {
   fprintf(fout, "total_num_warpcyc_stalled_fu_sfu = %llu\n", m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_warpcyc_stalled_fu_sfu"]->get_value());
   fprintf(fout, "total_num_warpcyc_stalled_fu_other = %llu\n", m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_warpcyc_stalled_fu_other"]->get_value());
   fprintf(fout, "total_num_warpcyc_stalled_scoreboard = %llu\n", m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_warpcyc_stalled_scoreboard"]->get_value());
+  // [wait_barrier-kind probe] wait_barrier-stalled warp-cycles split by armed op-class (TENSOR=WGMMA
+  // result recoverable / TMA=producer floor / other). See .plan/HW_VS_SIM_SFU.md §9.
+  fprintf(fout, "total_num_warpcyc_wb_wait_tensor = %llu\n", m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_warpcyc_wb_wait_tensor"]->get_value());
+  fprintf(fout, "total_num_warpcyc_wb_wait_tma = %llu\n", m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_warpcyc_wb_wait_tma"]->get_value());
+  fprintf(fout, "total_num_warpcyc_wb_wait_other = %llu\n", m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_warpcyc_wb_wait_other"]->get_value());
+  fprintf(fout, "total_num_warpcyc_wb_wait_unknown = %llu\n", m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_warpcyc_wb_wait_unknown"]->get_value());
   // [NANOSLEEP spin lever] emit the gated spin counters (0 unless -spin_instrument_enable).
   fprintf(fout, "total_num_cycles_spin_ops_issued = %llu\n", m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_cycles_spin_ops_issued"]->get_value());
   fprintf(fout, "total_num_cycles_spin_won_over_eligible = %llu\n", m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_cycles_spin_won_over_eligible"]->get_value());

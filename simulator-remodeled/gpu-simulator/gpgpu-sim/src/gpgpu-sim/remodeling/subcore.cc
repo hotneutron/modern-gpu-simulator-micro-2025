@@ -829,8 +829,25 @@ void Subcore::issue(SM *shared_sm) {
         // is directly comparable to HW smsp__average_warps_issue_stalled_X_per_issue_active (wait 1.363,
         // long/short_scoreboard, etc). This is the definition-matched wait-magnitude audit. Read-only.
         if (m_config->overlap_instrument_enable && !is_inst_ready_to_issue) {
-          if (!are_wait_barriers_ready)
+          if (!are_wait_barriers_ready) {
             m_sm->m_sm_stats.m_stats_map["total_num_warpcyc_stalled_wait_barrier"]->increment_with_integer(1);
+            // [wait_barrier-kind probe] classify WHAT this warp is waiting on: WGMMA-result (recoverable
+            // by de-phasing) vs TMA (producer floor) vs other. Recompute the SB check list this warp
+            // would consult (same as is_wait_barriers_ready_entry_point) and ask the dependency state
+            // which blocking SB armed-op dominates. Read-only.
+            std::vector<Wait_Barrier_Checking> wbc = wait_barriers_to_check_generic(pI, subcore_warp_id);
+            if (pI->op == DEPBAR_OP) {
+              std::vector<Wait_Barrier_Checking> wbc_depbar = wait_barriers_to_check_depbar(pI, subcore_warp_id);
+              wbc.insert(wbc.end(), wbc_depbar.begin(), wbc_depbar.end());
+            }
+            Wait_Barrier_Armed_Op ao = c_warp->get_dependency_state()->blocking_wait_barrier_armed_op(wbc);
+            switch (ao) {
+              case WB_ARM_TENSOR: m_sm->m_sm_stats.m_stats_map["total_num_warpcyc_wb_wait_tensor"]->increment_with_integer(1); break;
+              case WB_ARM_TMA:    m_sm->m_sm_stats.m_stats_map["total_num_warpcyc_wb_wait_tma"]->increment_with_integer(1); break;
+              case WB_ARM_OTHER:  m_sm->m_sm_stats.m_stats_map["total_num_warpcyc_wb_wait_other"]->increment_with_integer(1); break;
+              default:            m_sm->m_sm_stats.m_stats_map["total_num_warpcyc_wb_wait_unknown"]->increment_with_integer(1); break;
+            }
+          }
           if (!is_stall_counter_0)
             m_sm->m_sm_stats.m_stats_map["total_num_warpcyc_stalled_stall_count"]->increment_with_integer(1);
           if (!is_not_yield)
