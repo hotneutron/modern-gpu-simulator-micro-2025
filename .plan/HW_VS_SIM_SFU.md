@@ -948,7 +948,8 @@ Comparison against the current sim CTAFIN runs:
 | K5 fwd | 7,950.9 | 19,298.6 | **2.43x** | -11,347.7 | 7,916 | 20,092 | 8,074 | 23,151 |
 | K10 bwd | 16,448.0 | 12,574.6 | **0.76x** | **+3,873.4** | 14,388 | 12,254 | 29,467 | 22,764 |
 
-The K10 difference is also substantial, but it is in the opposite direction from K5:
+The aggregate K10 difference is also substantial, but its wide P50-to-P95 range is not measurement
+noise:
 
 - HW mean is 30.8% longer than sim (`16,448.0 / 12,574.6 = 1.31x`);
 - HW P50 is 17.4% longer (`14,388` vs `12,254`);
@@ -956,9 +957,29 @@ The K10 difference is also substantial, but it is in the opposite direction from
 - 12.5% of HW CTA samples have a negative tail (a consumer exits after both producers), versus only
   1/384 sim CTAs (0.3%).
 
-Therefore K10 has a real role-lifetime fidelity mismatch, not a matched/no-difference result. Correcting
-it toward HW would lengthen the sim tail and move bwd cycles in the wrong direction for the current
-sim-vs-HW cycle gap.
+Per-CTA values are reproducible across the three HW runs (pairwise correlation `r=0.903-0.916`) and
+form deterministic CTA-index populations:
+
+| K10 CTA range | Count | HW mean | HW P50 | HW P95 | Sim mean | Sim-HW mean |
+|---|---:|---:|---:|---:|---:|---:|
+| 0-127 | 128 | 26,876.7 | 27,036 | 29,620 | 13,027.4 | -13,849.3 |
+| 128-255 | 128 | 14,728.1 | 13,431 | 23,498 | 17,069.4 | +2,341.3 |
+| 256-335 | 80 | 12,443.5 | 11,649 | 21,727 | 9,561.1 | -2,882.4 |
+| 336-383 | 48 | -1,502.1 | -1,476 | -1,334 | 4,403.5 | +5,905.6 |
+
+On HW, consumer warp 11 is last for all 384 CTAs. Producer warp 0 is last for CTA 0-335, while producer
+warp 1 is last for CTA 336-383; exactly those final 48 CTAs have a negative tail in all three runs. The
+high P95 comes primarily from CTA 0-127, not from random runtime variation.
+
+Sim does not preserve this structure well: HW-vs-sim per-CTA correlation is only `r=0.359`, and sim has
+only one negative-tail CTA. Therefore K10 has a large, structured role-lifetime fidelity mismatch that
+the aggregate mean hides. Its cycle direction cannot be inferred from the aggregate mean because some
+CTA populations are under-modeled while others are over-modeled.
+
+The current sim global critical CTA is CTA 283 in the 256-335 population. Its sim tail is 12,748 cycles,
+versus an HW three-run median of 11,947 cycles (+801 cycles, +6.7% sim over HW). Thus the large K10
+distribution mismatch is real, but the tail of the current bwd critical CTA is already close and does
+not identify a large immediate cycle-reduction lever.
 
 For K5, the last-finishing sim CTA is also the max-tail CTA:
 
@@ -985,10 +1006,11 @@ claim: no simulator timing has been changed yet.
 - **K5 fwd: reopen the producer-only role-lifetime axis.** The mechanism exists on HW as expected, but
   sim over-models its mean magnitude by 2.43x. Next isolate whether the excess is frozen producer polling
   in the full NVBit trace, warp-retirement timing, or warp-to-SMSP placement.
-- **K10 bwd: track as a separate, opposite-direction fidelity issue.** HW mean/P95 tails are 30.8% /
-  29.4% longer than sim, and 12.5% of CTA samples are negative. This is significant, but it is not a
-  cycle-reduction lever: making K10 role lifetime HW-faithful would increase, not decrease, current bwd
-  cycles. Applying the K5 correction to bwd would be wrong.
+- **K10 bwd: track as a separate, structured fidelity issue.** The wide distribution is a deterministic
+  CTA-index effect, with large errors in both directions and missing negative-tail behavior in sim.
+  Aggregate correction is invalid. Because the current critical CTA tail differs by only +6.7%, this
+  result does not yet provide a large bwd cycle-reduction lever; first identify why the four CTA
+  populations and producer-last roles differ.
 
 ### Default-off probe policy
 
