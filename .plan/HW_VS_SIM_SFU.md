@@ -35,8 +35,11 @@ started with, nothing new. The earlier "SM idle 3.2×" was an apples-vs-oranges 
 NOT saturated either — it has ~54% No-Eligible active cycles and <1 eligible warp/SMSP. So the honest
 statement is narrower: **on matched definitions the sim issues 0.71× as densely as HW, with SHORTER
 per-warp waits and lighter per-op costs** — still a real gap, but smaller and less mysterious than the
-raw idle numbers suggested. Root still not pinned (not per-op cost / WGMMA-sync / tensor-HoL / queues /
-ordering; §4-14).
+raw idle numbers suggested. Consistent with the prior producer/consumer analysis (§15,
+`CONSUMER_COMPUTE_BOUND.md`): the residual localizes to the consumer's tensor/math re-issue interval
+(`math_pipe_throttle` sim ~11% vs HW 3.2%, `mma` sim ~5.65% vs HW 1.4%). NOT yet explained (not per-op
+cost / WGMMA-sync / tensor-HoL / queues / ordering; §4-15). **Open for further verification in a later
+session — no floor/exhaustion conclusion drawn here.**
 
 
 **Problem confirmed.** fwd is 1.56× HW (105k vs 68k). Decomposition path: `cycle = work(1.10×) ×
@@ -759,6 +762,55 @@ the sim, given both are in-order and neither is queue-bound here?** No current h
 thought. (Candidate angles not yet examined: HW instruction MIX/count per warp vs the sim's trace — does
 HW issue more short filler insts between the long ops? — and whether the sim's `warps_active`=4 vs HW's
 measured 3.28 hides a per-warp readiness difference.)
+
+
+## 15. Cross-check with the prior producer/consumer analysis (2026-07-27s)
+
+Revisited the earlier work in `CONSUMER_COMPUTE_BOUND.md` and `FWD_DRAIN_IDLE_MBARRIER_CEILING.md` (which
+had ALREADY been measured in prior sessions). This session's findings line up with them; recording the
+connection so the next session can continue from a consistent picture. No conclusion about whether the
+residual is or isn't removable — that is left open for further verification.
+
+### What the prior producer/consumer measurement found (fwd, SM0 TMA timeline `.o45`)
+- fwd is **consumer-side**: the producer (warp 0) fetches ~2 tiles then waits ~6,645 cyc on average for
+  the consumer warpgroup to compute and free the shared-mem buffer. **93% of the TMA span is
+  producer-waiting-on-consumer**; per-tile TMA arrival latency is only ~402 cyc (memory is not the wall).
+- Producer warp 0: 14,082 insts, ~66% a spin loop (PHASECHK/NANOSLEEP), only 44 real UTMALDG. Consumer
+  warps 4-15: ~216 HGMMA each + MUFU.EX2. Producer-has-more-insts is trace-inherent.
+- **The producer "wait" is NOT SM-idle**: during those voids the 12 consumer warps are busy; only ~17%
+  of the kernel is fully idle. So SM-wide it is consumer compute, surfacing as stall-depth
+  (`math_pipe`/`mma`), not as idle.
+- Per-tile wall: sim ~3,300 vs HW ~1,700 cyc; the difference is stall/overlap, not raw compute cost.
+- 3-factor identity: `cycle 2.03× = work 1.11× × active-frac 1.39× × issue-depth 1.31×`.
+- NANOSLEEP spin-widening experiment: refuted (spin is a symptom of waiting on the consumer, not a driver;
+  at 1 CTA/SM the freed slots have no other warp to fill).
+
+### How this session's results map onto that
+- wait_barrier-kind probe (§12): TMA/producer barrier waits ~0.4% → consistent with "producer is not the
+  wall / memory is not the wall". The consumer's blocking is SM-internal (`other` 99%), matching
+  "consumer compute" rather than producer/mbarrier.
+- SFU-contention + fu_occupied (§6, §8): the consumer warps concentrating on the tensor/SFU pipes is the
+  same "consumer compute / stall-depth" picture, seen from the issue side.
+- GTLRR / E1 (§13): reordering/launch-offset don't change it — consistent with the prior "producer spin
+  is a symptom, occupancy=1 leaves no filler" observation.
+- Definition audit (table): the one clean cross-checked gap is issue-density 0.71× (elapsed) = cycle
+  1.56× ÷ work 1.10× — the same issue-depth/active-frac factors above.
+
+### The one still-unexplained quantitative delta (for the next session)
+The prior docs localize the residual to the **tensor/math re-issue interval**: `math_pipe_throttle` sim
+~11% vs HW 3.2%, `mma` sim ~5.65% vs HW 1.4%. tensor II/total-latency were checked HW-faithful (§7), so
+this excess is the consumer warps meeting the tensor/SFU pipes together (the same lockstep axis that E1
+and GTLRR did not move). **This delta is the concrete open item to verify further next session** — e.g.
+whether it is an artifact of how the 12 consumer warps are distributed across the 4 SMSP tensor pipes,
+or of the per-op tensor/math accounting, or genuinely the in-phase concentration. Left open; not
+adjudicated here.
+
+### Pointers
+- `CONSUMER_COMPUTE_BOUND.md` — TMA-timeline analysis, 3-factor identity, consumer-compute localization.
+- `FWD_DRAIN_IDLE_MBARRIER_CEILING.md` — the 4-axis SM-idle / producer-consumer-role instrumentation plan
+  (partially realized via the CTAFIN counters used in §9).
+- This doc §1-14 — per-pipe cost audit, overlap/warpcyc/wait_barrier-kind probes, GTLRR null result,
+  definition audit.
 
 
 ⚠️ Guardrails: keep every II/latency HW-faithful (confirmed above); no pipe may exceed its NCU occupancy;
