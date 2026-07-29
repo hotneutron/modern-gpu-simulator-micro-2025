@@ -601,6 +601,50 @@ cycle count AND confirm `gpu_sim_insn` stays bit-identical (work-invariant) so w
 not work, changed.
 
 
+## 12. RESULT — wait_barrier-kind probe (2026-07-27p, fwd `.o62` / bwd `.o37`)
+
+The probe ran (work bit-identical: fwd 455,565,060 / bwd 629,211,348). Counter self-consistency holds
+(tensor+tma+other = wait_barrier total).
+
+| wait_barrier split | FWD | BWD |
+|---|---|---|
+| total wait_barrier warp-cyc | 8,677,707 | 14,149,763 |
+| WGMMA (tensor) | **0.0%** | **0.0%** |
+| TMA (producer) | **0.4%** | **0.8%** |
+| other (SM-internal) | **99.6%** | **99.2%** |
+
+### Reading
+- **TMA producer-floor is negligible (0.4–0.8%).** So the big §9 unknown — is the 19.1% wait_barrier a
+  producer floor? — is answered NO. The de-phasing ceiling is NOT capped by the producer.
+- WGMMA = 0 as expected: in this trace model WGMMA-result waits go through the traditional scoreboard
+  (→ `stall_count`), not the SB wait_barrier. So the SB wait_barrier bucket is dominated by **`other`**
+  = ordinary fixed-latency instructions (softmax scaling/convert arithmetic etc.) arming an SB that the
+  next dependent instruction waits on — an **SM-internal** dependency.
+- ⇒ ~99% of wait_barrier is SM-internal (not producer), i.e. a de-phasing candidate.
+
+### Combined recoverable estimate (fwd) — the "how much"
+| bucket | % of elapsed | recoverable? |
+|---|---|---|
+| rest (clearly recoverable) | 9.9% | ✅ |
+| wait_barrier_only, minus TMA 0.4% | ~19.0% | ✅ (SM-internal `other`) |
+| ibuffer_empty + drained | ~24.7% | ❌ drain tail floor |
+| **total recoverable (upper bound)** | **~28.9%** | |
+
+Upper-bound: sim 105,774 → ~75,180 = **1.56× → 1.11×** if ALL SM-internal idle were hidden by de-phasing.
+
+### ⚠️ The remaining unknown — is `other` actually de-phasable?
+`other` is SM-internal, but that alone doesn't prove a de-phased warp CAN fill it. Two cases:
+- (recoverable) the dependency is a short per-warp pipe latency that hits all 3 warps at the SAME cycle
+  because they're in phase → de-phasing lets warp B run during warp A's wait.
+- (not) if the structure forces each warp to wait its own turn regardless of phase, de-phasing won't fill it.
+This can only be settled by the GTLRR A/B itself: de-phase and see whether SM-idle 31.7% actually drops.
+The 28.9% is therefore an UPPER BOUND / motivation, not a promise.
+
+### Net: green light for the GTLRR experiment
+The producer floor is ruled out (TMA ~0.5%), the idle is SM-internal, and the ceiling (→1.11×) is large
+enough to justify building the gated GTLRR ordering and measuring whether SM-idle actually falls.
+
+
 ⚠️ Guardrails: keep every II/latency HW-faithful (confirmed above); no pipe may exceed its NCU occupancy;
 any prototype gated + default-off + bit-identical when off; if the honest answer is "structural floor
 bounded by HW's own 54% No-Eligible", accept it and make no cycle claim.
