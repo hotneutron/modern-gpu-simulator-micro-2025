@@ -13,6 +13,32 @@ NCU reports: `nv_reports/h100/...full_rpt.ncu-rep` (ratios only) and
 
 ## Executive Summary (state as of 2026-07-27, read this first)
 
+### ⭐ HW vs sim — number-for-number (FWD kernel 5)
+| metric | sim | HW | sim/HW | note |
+|---|---|---|---|---|
+| **kernel cycles** | **105,774** | **67,696** | **1.56×** | the gap |
+| thread-inst executed (work) | 455,565,060 | 457,900,688 | 1.00× | **work-invariant ✓** (0.5%, thread-level) |
+| warp-inst issued | 16,064,281 | 14,482,551 | (1.11×)† | †DEFINITION diff (HW warp-inst vs sim; pred). Use thread-level for the true match. NOT a real work diff. |
+| **issue rate / SMSP / ELAPSED-cyc** | **0.288** | **0.404** | **0.71×** | ⚠️ BOTH on elapsed basis (fixed). This is just cycle 1.56× ÷ work 1.10× — the SAME issue-density gap, not new. |
+| issue rate / SMSP / ACTIVE-cyc (HW native) | ~0.29 | 0.456 | — | ⚠️ do NOT mix: HW's native metric is per-ACTIVE (0.456); sim≈elapsed since 1 CTA/SM |
+| warps_active / SMSP | 4.0 | 3.28 | 1.22× | different DEFINITION: sim=resident(1 CTA/SM); HW=avg-active (drops at tail as warps exit). Not comparable as-is. |
+| **HW No-Eligible (active cyc, 0 eligible warp)** | — | **~54%** | — | HW itself issues on <half its ACTIVE cycles — HW is far from saturated too |
+| ~~SM fully-idle~~ | 31.7% | ~10% | — | ❌ REMOVED — apples-vs-oranges: sim=eligible-warp-0 while executing; HW=warp-not-resident (start/end tail). NOT comparable. |
+| per-warp wait_barrier (warp-cyc/inst) | 0.55 | 1.36 (`wait`) | 0.40× | sim waits LESS per warp (see paradox) |
+| tensor busy-cyc / op | 29.5 | 42.7 | 0.69× | sim UNDER-models tensor |
+| SFU II / total latency | 8 / 16 | 8 / 16 | 1.00× | HW-faithful |
+| MUFU op count | =HW | (work-inv) | 1.00× | identical |
+
+**Corrected reading (after the definition audit):** the ONLY clean cross-checked gap is **issue rate
+0.71× on a matched elapsed basis** = cycle 1.56× ÷ work 1.10× — i.e. exactly the issue-density gap we
+started with, nothing new. The earlier "SM idle 3.2×" was an apples-vs-oranges artifact (removed). HW is
+NOT saturated either — it has ~54% No-Eligible active cycles and <1 eligible warp/SMSP. So the honest
+statement is narrower: **on matched definitions the sim issues 0.71× as densely as HW, with SHORTER
+per-warp waits and lighter per-op costs** — still a real gap, but smaller and less mysterious than the
+raw idle numbers suggested. Root still not pinned (not per-op cost / WGMMA-sync / tensor-HoL / queues /
+ordering; §4-14).
+
+
 **Problem confirmed.** fwd is 1.56× HW (105k vs 68k). Decomposition path: `cycle = work(1.10×) ×
 issue-density(1.41×)`. The gap is issue-density, i.e. the sim does not keep its warps issuing as densely
 as HW.
@@ -643,6 +669,96 @@ The 28.9% is therefore an UPPER BOUND / motivation, not a promise.
 ### Net: green light for the GTLRR experiment
 The producer floor is ruled out (TMA ~0.5%), the idle is SM-internal, and the ceiling (→1.11×) is large
 enough to justify building the gated GTLRR ordering and measuring whether SM-idle actually falls.
+
+
+## 13. RESULT — GTLRR A/B: re-convergence, scheduler ordering is NOT the lever (2026-07-27q)
+
+Built + ran GTLRR (`-subcore_gtlrr_enable 1`). fwd `.o63`/`.e63`, bwd `.o38`.
+
+### Verification
+- `[GTLRRDBG] ACTIVE` confirms it's live and round-robin: `greedy=1 → order=[1 2 3 0]`, `greedy=2 →
+  [2 3 0 1]` (vs GTO's oldest-first). ✅
+- `gpu_sim_insn` bit-identical (fwd 455,565,060 / bwd 629,211,348) — scheduling-only, work-invariant. ✅
+
+### Result — essentially no effect (predicted re-convergence)
+| | GTO | GTLRR | Δ |
+|---|---|---|---|
+| fwd cycle | 105,774 | 104,093 | **-1.6%** (1.56×→1.54×) |
+| bwd cycle | 178,129 | 174,586 | -2.0% (1.35×→1.31×) |
+| fwd lockstep (head_mufu/valid_head) | 74.6% | **73.8%** | ~none |
+| fwd SM-idle | 31.7% | **31.5%** | ~none |
+
+### Verdict — scheduler ORDERING cannot de-phase a deterministic workload
+Changing only WHICH warp issues (GTO→GTLRR→...) does not widen the phase: all warps run the identical
+deterministic path with identical latencies, so after any reorder they re-converge to the same phase and
+hit the dependency waits together — exactly the E1 (launch-offset) failure mode, same root. lockstep
+stayed 74.6%→73.8%; SM-idle 31.7%→31.5%. The 1.6-2% is noise-level, not a lever.
+
+⇒ **Approach A (scheduler policy) is REFUTED.** The lockstep's root is NOT the scheduler; it is the
+**deterministic execution timing** — every warp takes exactly the same cycles through each stage, so no
+ordering keeps them staggered. De-phasing can only come from a source that makes warps take DIFFERENT
+times per stage.
+
+### What remains — candidate B (physical cross-warp jitter), now the only live de-phase lever
+For warps to STAY de-phased, per-warp execution time must differ. The faithful source HW has and the sim
+lacks (it's warp-symmetric → zero variance): **dynamic cross-warp contention** — two warps hitting the
+same shared-mem bank / RF read-write port in the same cycle, one delayed 1+ cyc. This creates real,
+data-dependent per-warp jitter that (unlike launch-offset or ordering) is regenerated continuously and
+survives the mbarrier. This is the CLOSED WARP_STAGGER doc's candidate B.
+- ⚠️ Risk: it introduces a timing-model change with a tunable (contention penalty) → fidelity must be
+  pinned against a HW microbench (bank-conflict / RF-port latency), else it's a fudge. Bigger build.
+- Honest status: the 28.9% recoverable ceiling (§12) still stands as a ceiling, but we now know the ONLY
+  mechanism that can approach it is physical jitter (B); ordering (A) and launch-offset (E1) are both dead.
+- Decision point: build B (with a HW-anchored penalty) vs accept the deterministic-lockstep floor. B is
+  the last unexhausted faithful lever; if its penalty can be tied to a real HW number, it's worth trying.
+
+### Note
+GTLRR left in the tree, gated + default-off (GTO remains default, bit-identical). It's a correct,
+harmless option; just not effective for this workload. Revert config to `-subcore_gtlrr_enable 0` for
+normal runs.
+
+
+## 14. Ruled out: WGMMA-sync, tensor head-of-line, queue backpressure (2026-07-27r)
+
+After GTLRR failed (§13), re-examined whether the excess idle is a sim-only structural defect (user's
+question: "HW doesn't have this problem, why does the sim?"). Three concrete suspects, all checked in
+code + data, all NOT the cause:
+
+### (1) Is WGMMA modeled synchronously (warp stalls until result)? → NO, it's async (correct)
+- Issue immediately pops the IBuffer front ([sm.cc:823](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/sm.cc#L823) `issued()`); the warp can issue its NEXT
+  instruction the following cycle. There is NO per-warp "one in-flight" gate (`inst_in_pipeline()` is only
+  an assert). A warp blocks on a WGMMA result ONLY at a real RAW (scoreboard) or an explicit
+  `wgmma.wait_group`/DEPBAR (its own wait_barrier bits) — HW-faithful async.
+
+### (2) Does a busy tensor FU cause head-of-line (stalls the whole subcore)? → NO, already handled
+- tensor is a fixed-latency FU, so `is_fu_available = fu->can_issue()` ([subcore.cc:755-756](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/subcore.cc#L755)) is folded
+  into the issue-eligibility predicate BEFORE the ISSUE_CONTROL latch, so a busy-tensor warp is skipped and
+  the scan tries another warp (same effect Opt 10 gave SFU). `blocked_by_tensor` ≈ 0, `next_stage` 0.06%.
+
+### (3) Does post-issue queue/latch backpressure block issue? → present but NEGLIGIBLE here
+- The issue predicate DOES include `is_write_available_result_queue_for_fixed_latency_available`
+  ([subcore.cc:794](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/subcore.cc#L794)) — a full RF-write result-queue DOES block fixed-latency (incl. tensor) issue. But
+  measured: `result_queue_full` 0.47%, `next_stage` (ISSUE_CONTROL) 0.06%, `control_allocate_full` 0.04%
+  → all post-issue backpressure sums to ~0.6%. Queue size is 8 (config, >default 1) so it rarely fills.
+- Noted: `max_pops_per_cycle_register_file_write_queue_for_fixed_latency = 1` (1 write-back/cyc). Could in
+  principle throttle write-back, but result_queue_full is 0.47% so it does not gate issue in practice.
+
+### Where that leaves us
+All three sim-specific structural suspects are excluded. So the excess idle is NOT: WGMMA-sync, tensor
+head-of-line, or queue backpressure. It re-converges on the same picture:
+- `fu_occupied` = 41% of no_warps_ready (SFU 31% dominant): a warp wants to issue but its target FU is
+  busy AND there is no OTHER ready warp to switch to.
+- Per-warp waits are SHORT (sim 0.55 < HW 1.36) yet issue-rate is LOW (sim 0.29 < HW 0.46).
+- GTO/GTLRR ordering can't fix it (deterministic re-convergence, §13); launch-offset can't (E1); physical
+  jitter would only slow things (user's point).
+
+### The unresolved core question (for further thought)
+Same 12 warps, same async WGMMA (II=8), same op-counts, per-warp waits SHORTER than HW — yet HW issues
+0.46/cyc/SMSP and the sim only 0.29. **What lets HW keep a warp issuable a larger fraction of cycles than
+the sim, given both are in-order and neither is queue-bound here?** No current hypothesis; parked for
+thought. (Candidate angles not yet examined: HW instruction MIX/count per warp vs the sim's trace — does
+HW issue more short filler insts between the long ops? — and whether the sim's `warps_active`=4 vs HW's
+measured 3.28 hides a per-warp readiness difference.)
 
 
 ⚠️ Guardrails: keep every II/latency HW-faithful (confirmed above); no pipe may exceed its NCU occupancy;
