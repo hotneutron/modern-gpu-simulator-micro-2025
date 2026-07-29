@@ -818,7 +818,7 @@ any prototype gated + default-off + bit-identical when off; if the honest answer
 bounded by HW's own 54% No-Eligible", accept it and make no cycle claim.
 
 
-## 16. Next measurement — HW producer-only tail via EXIT-only NVBit timestamps
+## 16. RESULT — HW producer-only tail via EXIT-only NVBit timestamps
 
 ### Why this measurement is needed
 
@@ -920,19 +920,71 @@ Do not run NCU and NVBit simultaneously. Compare uninstrumented and EXIT-only ke
 accept the timestamp result only if overhead is below 1.0%. Run at least three repetitions and use the
 median per-kernel tail distribution.
 
+### Result (three H100 runs, 2026-07-29)
+
+All expected warp EXIT records were captured with no missing CTA, no cross-SM CTA mismatch, and no
+capture overflow:
+
+| Kernel | Runs | CTAs/run | Rows/run | Missing CTA | SM mismatch |
+|---|---:|---:|---:|---:|---:|
+| K5 fwd | 3 | 132 | 2,112 | 0 | 0 |
+| K10 bwd | 3 | 384 | 4,608 | 0 | 0 |
+
+H100 producer-only tail distribution, pooling all three runs:
+
+| Kernel | Samples | Negative | Min | P50 | Mean | P95 | Max |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| K5 fwd | 396 | 0 | 7,798 | 7,916 | 7,950.9 | 8,074 | 10,024 |
+| K10 bwd | 1,152 | 144 | -1,846 | 14,388 | 16,448.0 | 29,467 | 32,271 |
+
+K5 run-to-run means were `7,948.5 / 7,946.0 / 7,958.2` cycles (spread below 0.2%), and the measured
+maximum of 10,024 cycles is consistent with the independent NCU aggregate upper bound of 9,983 cycles
+(0.4% difference). The measurement is stable and definition-consistent.
+
+Comparison against the current sim CTAFIN runs:
+
+| Kernel | HW mean | Sim mean | Sim/HW | HW P50 | Sim P50 | HW P95 | Sim P95 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| K5 fwd | 7,950.9 | 19,298.6 | **2.43x** | 7,916 | 20,092 | 8,074 | 23,151 |
+| K10 bwd | 16,448.0 | 12,574.6 | 0.76x | 14,388 | 12,254 | 29,467 | 22,764 |
+
+For K5, the last-finishing sim CTA is also the max-tail CTA:
+
+```text
+global_cta=56
+finish_cyc=104,092
+producer_last_drain=104,085
+consumer_last_drain=79,325
+producer_only_tail=24,760 cycles
+```
+
+Using the measured HW maximum tail (10,024) as a conservative critical-tail target gives an oracle
+upper bound:
+
+```text
+104,093 - (24,760 - 10,024) = 89,357 cycles
+```
+
+This corresponds to `89,357 cycles (32.0% error, -14.2% vs current)`. It is a sizing bound, not a cycle
+claim: no simulator timing has been changed yet.
+
 ### Decision after the run
 
-- HW tail near 19K: sim magnitude is consistent; keep the imbalance axis closed.
-- HW tail near the aggregate upper bound (about 10K fwd): sim producer-only tail is about 2x too long;
-  reopen the role-lifetime axis and identify whether the excess comes from trace control flow,
-  warp-retirement timing, or warp-to-SMSP placement.
-- HW tail well below 10K: prioritize the producer-only tail as the next model problem.
+- **K5 fwd: reopen the producer-only role-lifetime axis.** The mechanism exists on HW as expected, but
+  sim over-models its mean magnitude by 2.43x. Next isolate whether the excess is frozen producer polling
+  in the full NVBit trace, warp-retirement timing, or warp-to-SMSP placement.
+- **K10 bwd: do not optimize this axis.** HW has a longer and structurally mixed tail; 12.5% of CTA
+  samples are negative (a consumer exits after both producers). Applying the K5 correction to bwd would
+  be wrong.
 
-No cycle reduction is claimed by this measurement.
+### Default-off probe policy
 
-### Temporary-code and revert policy
+The EXIT-only implementation is isolated in code commit `ed804b4` and is default-off:
 
-The EXIT-only NVBit implementation is probe-only code. Keep its code changes in one standalone commit,
-separate from this documentation commit. After the H100 result and analysis are recorded, revert only
-the code commit with `git revert <exit-only-code-commit>`; retain this section and append the measured
-result so the experiment remains reproducible.
+- unset `WARP_LIFETIME_ONLY` or set it to `0`: the original full instruction trace, run directory, TMA
+  capture, and post-processing paths are used;
+- set `WARP_LIFETIME_ONLY=1`: only EXIT timestamps are collected into kernel-specific lifetime run
+  directories.
+
+The probe may remain in the tree for reproducibility; a revert is not required. If code cleanup is
+desired later, `git revert ed804b4` removes only the probe while retaining this result.
