@@ -943,10 +943,22 @@ maximum of 10,024 cycles is consistent with the independent NCU aggregate upper 
 
 Comparison against the current sim CTAFIN runs:
 
-| Kernel | HW mean | Sim mean | Sim/HW | HW P50 | Sim P50 | HW P95 | Sim P95 |
-|---|---:|---:|---:|---:|---:|---:|---:|
-| K5 fwd | 7,950.9 | 19,298.6 | **2.43x** | 7,916 | 20,092 | 8,074 | 23,151 |
-| K10 bwd | 16,448.0 | 12,574.6 | 0.76x | 14,388 | 12,254 | 29,467 | 22,764 |
+| Kernel | HW mean | Sim mean | Sim/HW | HW-Sim mean | HW P50 | Sim P50 | HW P95 | Sim P95 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| K5 fwd | 7,950.9 | 19,298.6 | **2.43x** | -11,347.7 | 7,916 | 20,092 | 8,074 | 23,151 |
+| K10 bwd | 16,448.0 | 12,574.6 | **0.76x** | **+3,873.4** | 14,388 | 12,254 | 29,467 | 22,764 |
+
+The K10 difference is also substantial, but it is in the opposite direction from K5:
+
+- HW mean is 30.8% longer than sim (`16,448.0 / 12,574.6 = 1.31x`);
+- HW P50 is 17.4% longer (`14,388` vs `12,254`);
+- HW P95 is 29.4% longer (`29,467` vs `22,764`);
+- 12.5% of HW CTA samples have a negative tail (a consumer exits after both producers), versus only
+  1/384 sim CTAs (0.3%).
+
+Therefore K10 has a real role-lifetime fidelity mismatch, not a matched/no-difference result. Correcting
+it toward HW would lengthen the sim tail and move bwd cycles in the wrong direction for the current
+sim-vs-HW cycle gap.
 
 For K5, the last-finishing sim CTA is also the max-tail CTA:
 
@@ -973,9 +985,10 @@ claim: no simulator timing has been changed yet.
 - **K5 fwd: reopen the producer-only role-lifetime axis.** The mechanism exists on HW as expected, but
   sim over-models its mean magnitude by 2.43x. Next isolate whether the excess is frozen producer polling
   in the full NVBit trace, warp-retirement timing, or warp-to-SMSP placement.
-- **K10 bwd: do not optimize this axis.** HW has a longer and structurally mixed tail; 12.5% of CTA
-  samples are negative (a consumer exits after both producers). Applying the K5 correction to bwd would
-  be wrong.
+- **K10 bwd: track as a separate, opposite-direction fidelity issue.** HW mean/P95 tails are 30.8% /
+  29.4% longer than sim, and 12.5% of CTA samples are negative. This is significant, but it is not a
+  cycle-reduction lever: making K10 role lifetime HW-faithful would increase, not decrease, current bwd
+  cycles. Applying the K5 correction to bwd would be wrong.
 
 ### Default-off probe policy
 
