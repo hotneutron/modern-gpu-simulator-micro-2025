@@ -62,6 +62,20 @@ typedef struct {
   uint32_t per_operand_type;
 } inst_trace_t;
 
+/* Probe-only EXIT timestamp capture for FA3 producer/consumer lifetime.
+ * The current workload uses at most 384 CTAs and 16 warps/CTA; the larger fixed
+ * bounds keep the tool reusable without adding device-side allocation logic. */
+#define WARP_LIFETIME_MAX_CTAS 4096
+#define WARP_LIFETIME_MAX_WARPS 32
+#define WARP_LIFETIME_MAX_SLOTS \
+  (WARP_LIFETIME_MAX_CTAS * WARP_LIFETIME_MAX_WARPS)
+
+typedef struct {
+  unsigned long long exit_clock[WARP_LIFETIME_MAX_SLOTS];
+  unsigned int sm_id[WARP_LIFETIME_MAX_SLOTS];
+  unsigned int overflow_count;
+} warp_lifetime_capture_t;
+
 /* Phase 0b (TMA_BASE_ADDR.md §2.13, host-deref Gate 0):
  * one managed slot per device that the entry ULDC.64 URx, c[0x0][K] writes its
  * loaded value (param_base, the device-global pointer to the kernel param block)

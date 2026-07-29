@@ -163,6 +163,45 @@ extern "C" __device__ __noinline__ void instrument_inst(
   }
 }
 
+/* Probe-only FA3 warp lifetime timestamp. Injected only before SASS EXIT when
+ * WARP_LIFETIME_ONLY=1. A predicated EXIT can execute more than once as lanes
+ * leave; the same warp writes its slot in program order, so the last write is
+ * the final observed EXIT timestamp. */
+extern "C" __device__ __noinline__ void record_warp_exit(
+    int32_t pred, uint64_t pcapture) {
+  const unsigned int active_mask = __activemask();
+  const unsigned int exiting_mask = __ballot_sync(active_mask, pred);
+  if (exiting_mask == 0) {
+    return;
+  }
+
+  const int laneid = get_laneid();
+  const int first_exiting_lane = __ffs(exiting_mask) - 1;
+  if (laneid != first_exiting_lane) {
+    return;
+  }
+
+  const unsigned int linear_tid =
+      threadIdx.z * blockDim.y * blockDim.x +
+      threadIdx.y * blockDim.x + threadIdx.x;
+  const unsigned int warp_id = linear_tid / 32;
+  const unsigned int cta_id =
+      (blockIdx.z * gridDim.y + blockIdx.y) * gridDim.x + blockIdx.x;
+  warp_lifetime_capture_t *capture =
+      reinterpret_cast<warp_lifetime_capture_t *>(pcapture);
+
+  if (cta_id >= WARP_LIFETIME_MAX_CTAS ||
+      warp_id >= WARP_LIFETIME_MAX_WARPS) {
+    atomicAdd(&capture->overflow_count, 1);
+    return;
+  }
+
+  const unsigned int slot =
+      cta_id * WARP_LIFETIME_MAX_WARPS + warp_id;
+  capture->exit_clock[slot] = clock64();
+  capture->sm_id[slot] = get_smid();
+}
+
 /* Phase 0b (TMA_BASE_ADDR.md §2.13). Injected at IPOINT_AFTER on the kernel-entry
  * ULDC.64 URx, c[0x0][K] that loads param_base. dst_lo/dst_hi are the loaded
  * destination UREG pair (read post-execution => the param_base value). First

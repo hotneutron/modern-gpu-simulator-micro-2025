@@ -133,6 +133,18 @@ int exclude_pred_off = 1;
 int active_from_start = 1;
 /* used to select region of interest when active from start is 0 */
 bool active_region = true;
+/* Probe-only mode: instrument SASS EXIT and record one final clock64 timestamp
+ * per CTA-local warp. Full instruction tracing stays unchanged when disabled. */
+int warp_lifetime_only = 0;
+warp_lifetime_capture_t *warp_lifetime_capture = nullptr;
+bool warp_lifetime_capture_active = false;
+bool warp_lifetime_output_initialized = false;
+unsigned int warp_lifetime_grid_x = 0;
+unsigned int warp_lifetime_grid_y = 0;
+unsigned int warp_lifetime_grid_z = 0;
+unsigned int warp_lifetime_warps_per_cta = 0;
+int warp_lifetime_kernel_id = 0;
+std::string warp_lifetime_kernel_name;
 
 /* Should we terminate the program once we are done tracing? */
 int terminate_after_limit_number_of_kernels_reached = 0;
@@ -1619,6 +1631,10 @@ void nvbit_at_init() {
          active_from_start, "ACTIVE_FROM_START", 1,
          "Start instruction tracing from start or wait for cuProfilerStart "
          "and cuProfilerStop. If set to 0, DYNAMIC_KERNEL_LIMIT options have no effect");
+  GET_VAR_INT(
+      warp_lifetime_only, "WARP_LIFETIME_ONLY", 0,
+      "Probe-only mode: record clock64 at SASS EXIT per CTA-local warp and "
+      "disable full dynamic instruction tracing");
   GET_VAR_INT(verbose, "TOOL_VERBOSE", 0, "Enable verbosity inside the tool");
   GET_VAR_INT(intermediate_extra_files_persistance, "INTERMEDIATE_EXTRA_FILES_PERSISTANCE", 0, "Enable to not delete intermediate files from the extra trace generation");
   GET_VAR_INT(print_core_id, "TOOL_TRACE_CORE", 0,
@@ -1645,6 +1661,11 @@ void nvbit_at_init() {
               "SPIKE 6 (§2.18): at executed UTMALDG/UTMASTG, classify the descriptor VA address space (crash-safe) and dump it to tma_desc_factcheck.csv.");
   GET_VAR_INT(tma_desc_factcheck_read, "TMA_DESC_FACTCHECK_READ", 0,
               "SPIKE 6 (§2.18): opt-in — also device-read 128B at the descriptor VA (only when GLOBAL). Off by default because a generic load of a SMEM/raw operand faults.");
+  if (warp_lifetime_only) {
+    enable_tma_desc = 0;
+    incremental_flush_threshold = 0;
+    printf("[WARP-LIFETIME] EXIT-only probe enabled; full trace and TMA capture disabled\n");
+  }
   std::string pad(100, '-');
   printf("%s\n", pad.c_str());
 
@@ -1707,7 +1728,8 @@ void instrument_function_if_needed(CUcontext ctx, CUfunction func, int device_id
     /* iterate on all the static instructions in the function */
     for (auto instr : instrs) {
 
-      if (cnt < instr_begin_interval || cnt >= instr_end_interval) {
+      if (!warp_lifetime_only &&
+          (cnt < instr_begin_interval || cnt >= instr_end_interval)) {
         cnt++;
         continue;
       }
@@ -1726,7 +1748,20 @@ void instrument_function_if_needed(CUcontext ctx, CUfunction func, int device_id
 
       int opcode_id = opcode_to_id_map[instr->getOpcode()];
       int vpc = (int)instr->getOffset();
+      std::string opcode_str =
+          instr->getOpcode() ? std::string(instr->getOpcode()) : "";
       pc_to_opcode[next_candidate_unique_function_id][vpc] = opcode_id;
+
+      if (warp_lifetime_only) {
+        if (opcode_str.rfind("EXIT", 0) == 0) {
+          nvbit_insert_call(instr, "record_warp_exit", IPOINT_BEFORE);
+          nvbit_add_call_arg_guard_pred_val(instr);
+          nvbit_add_call_arg_const_val64(
+              instr, reinterpret_cast<uint64_t>(warp_lifetime_capture));
+        }
+        cnt++;
+        continue;
+      }
 
       std::string inst_str = ReplaceAll(instr->getSass(), ",", " ");
       inst_str = replaceInstructionNewExtraInformation(inst_str);
@@ -1778,7 +1813,6 @@ void instrument_function_if_needed(CUcontext ctx, CUfunction func, int device_id
       std::vector<int> aux_reg_ids;
       uint64_t call_ret_imm = 0;
       uint32_t num_of_injects = 0;
-      std::string opcode_str = instr->getOpcode() ? std::string(instr->getOpcode()) : "";
       sync_runtime_capture_site_info sync_site_info;
       bar_runtime_capture_site_info bar_site_info;
 
@@ -2146,6 +2180,90 @@ __global__ void flush_channel(ChannelDev* ch_dev) {
   ch_dev->flush();
 }
 
+static void reset_warp_lifetime_capture(
+    int kernel_trace_id, const char *kernel_name,
+    const cuLaunchKernel_params *params) {
+  assert(warp_lifetime_capture != nullptr);
+  const unsigned long long num_ctas =
+      static_cast<unsigned long long>(params->gridDimX) *
+      params->gridDimY * params->gridDimZ;
+  const unsigned int num_threads =
+      params->blockDimX * params->blockDimY * params->blockDimZ;
+  const unsigned int num_warps = (num_threads + 31) / 32;
+  if (num_ctas > WARP_LIFETIME_MAX_CTAS ||
+      num_warps > WARP_LIFETIME_MAX_WARPS) {
+    fprintf(stderr,
+            "[WARP-LIFETIME] launch exceeds capture bounds: ctas=%llu/%u "
+            "warps_per_cta=%u/%u\n",
+            num_ctas, WARP_LIFETIME_MAX_CTAS, num_warps,
+            WARP_LIFETIME_MAX_WARPS);
+    abort();
+  }
+
+  const bool prior_skip_callback = skip_callback_flag;
+  skip_callback_flag = true;
+  CUDA_SAFECALL(cuMemsetD8(
+      reinterpret_cast<CUdeviceptr>(warp_lifetime_capture), 0,
+      sizeof(warp_lifetime_capture_t)));
+  skip_callback_flag = prior_skip_callback;
+  warp_lifetime_grid_x = params->gridDimX;
+  warp_lifetime_grid_y = params->gridDimY;
+  warp_lifetime_grid_z = params->gridDimZ;
+  warp_lifetime_warps_per_cta = num_warps;
+  warp_lifetime_kernel_id = kernel_trace_id;
+  warp_lifetime_kernel_name = kernel_name ? kernel_name : "<unknown>";
+  warp_lifetime_capture_active = true;
+
+  if (!warp_lifetime_output_initialized) {
+    std::ofstream out(traces_path + "/warp_exit_timestamps.csv",
+                      std::ios::out | std::ios::trunc);
+    out << "kernel_id,kernel_name,cta_x,cta_y,cta_z,warp_id,sm_id,"
+           "exit_clock64\n";
+    out.close();
+    warp_lifetime_output_initialized = true;
+  }
+}
+
+static void dump_warp_lifetime_capture() {
+  if (!warp_lifetime_capture_active || warp_lifetime_capture == nullptr) {
+    return;
+  }
+
+  std::ofstream out(traces_path + "/warp_exit_timestamps.csv",
+                    std::ios::out | std::ios::app);
+  const unsigned int num_ctas =
+      warp_lifetime_grid_x * warp_lifetime_grid_y * warp_lifetime_grid_z;
+  unsigned int rows = 0;
+  for (unsigned int cta = 0; cta < num_ctas; ++cta) {
+    const unsigned int cta_x = cta % warp_lifetime_grid_x;
+    const unsigned int cta_y =
+        (cta / warp_lifetime_grid_x) % warp_lifetime_grid_y;
+    const unsigned int cta_z =
+        cta / (warp_lifetime_grid_x * warp_lifetime_grid_y);
+    for (unsigned int warp = 0; warp < warp_lifetime_warps_per_cta; ++warp) {
+      const unsigned int slot =
+          cta * WARP_LIFETIME_MAX_WARPS + warp;
+      const unsigned long long exit_clock =
+          warp_lifetime_capture->exit_clock[slot];
+      if (exit_clock == 0) {
+        continue;
+      }
+      out << warp_lifetime_kernel_id << "," << warp_lifetime_kernel_name
+          << "," << cta_x << "," << cta_y << "," << cta_z
+          << "," << warp << "," << warp_lifetime_capture->sm_id[slot]
+          << "," << exit_clock << "\n";
+      rows++;
+    }
+  }
+  out.close();
+
+  printf("[WARP-LIFETIME] kernel=%d rows=%u overflow=%u output=%s\n",
+         warp_lifetime_kernel_id, rows,
+         warp_lifetime_capture->overflow_count,
+         (traces_path + "/warp_exit_timestamps.csv").c_str());
+  warp_lifetime_capture_active = false;
+}
+
 static FILE *statsFile = NULL;
 static bool first_call = true;
 static unsigned int pending_devices_to_finish = 0;
@@ -2329,6 +2447,10 @@ void nvbit_at_cuda_event(CUcontext ctx, int is_exit, nvbit_api_cuda_t cbid,
         assert(it_map_already_instrumented != map_function_to_kernel_name_and_variant_id.end());
         variant_id = std::get<1>(it_map_already_instrumented->second);
         std::string kernel_name(nvbit_get_func_name(ctx, p->f, true));
+        if (warp_lifetime_only) {
+          reset_warp_lifetime_capture(kernel_id[device_id],
+                                      kernel_name.c_str(), p);
+        }
 
         // std::vector<int> kernel_argument_sizes = nvbit_get_kernel_argument_sizes(p->f);
         
@@ -2404,6 +2526,12 @@ void nvbit_at_cuda_event(CUcontext ctx, int is_exit, nvbit_api_cuda_t cbid,
         abort();
       }
       assert(cuErr == cudaSuccess);
+
+      if (warp_lifetime_only && !stop_report[device_id] &&
+          warp_lifetime_capture_active &&
+          warp_lifetime_kernel_id == kernel_id[device_id] - 1) {
+        dump_warp_lifetime_capture();
+      }
 
       /* make sure we prevent re-entry on the nvbit_callback when issuing
        * the flush_channel kernel */
@@ -2605,6 +2733,19 @@ void *recv_thread_fun(void *args) {
   while (ctx_state->recv_thread_done == RecvThreadState::WORKING) {
     uint32_t num_recv_bytes = ch_host->recv(recv_buffer, CHANNEL_SIZE);
     if (num_recv_bytes > 0) {
+      if (warp_lifetime_only) {
+        uint32_t offset = 0;
+        while (offset + sizeof(inst_trace_t) <= num_recv_bytes) {
+          inst_trace_t *token =
+              reinterpret_cast<inst_trace_t *>(&recv_buffer[offset]);
+          if (token->cta_id_x == -1) {
+            recv_thread_receiving[ctx] = false;
+            break;
+          }
+          offset += sizeof(inst_trace_t);
+        }
+        continue;
+      }
       uint32_t num_processed_bytes = 0;
       dynamic_trace::cuda_stream &stream = (*gpu_dev.mutable_streams())[current_stream_id[device_id]];
       dynamic_trace::kernel &ker = (*stream.mutable_kernels())[kernel_id[device_id]-2]; 
@@ -3353,6 +3494,14 @@ void init_context_state(CUcontext ctx) {
       kernel_id.push_back(1);
       current_stream_id.push_back(0);
     }
+    if (warp_lifetime_only) {
+      CUDA_SAFECALL(cuMemAllocManaged(
+          reinterpret_cast<CUdeviceptr *>(&warp_lifetime_capture),
+          sizeof(warp_lifetime_capture_t), CU_MEM_ATTACH_GLOBAL));
+      CUDA_SAFECALL(cuMemsetD8(
+          reinterpret_cast<CUdeviceptr>(warp_lifetime_capture), 0,
+          sizeof(warp_lifetime_capture_t)));
+    }
     /* Phase 0b: one managed param-base capture slot (single device assumed here,
      * matching the rest of the tool's single-stream simplification). */
     if (enable_tma_desc) {
@@ -3397,7 +3546,7 @@ void nvbit_at_ctx_term(CUcontext ctx) {
   assert(ctx_state_map.find(ctx) != ctx_state_map.end());
   CTXstate* ctx_state = ctx_state_map[ctx];
   pending_devices_to_finish--;
-  if(pending_devices_to_finish == 0) {
+  if(pending_devices_to_finish == 0 && !warp_lifetime_only) {
     dyn_trace.set_nvbit_version(NVBIT_VERSION);
     dyn_trace.set_accelsim_version(TRACER_VERSION);
     dyn_trace.set_is_gathered_registers_values(static_cast<bool>(gather_registers));
@@ -3428,6 +3577,11 @@ void nvbit_at_ctx_term(CUcontext ctx) {
   while (ctx_state->recv_thread_done != RecvThreadState::FINISHED);
   ctx_state->channel_host.destroy(false);
   CUDA_SAFECALL(cuMemFree(reinterpret_cast<CUdeviceptr>(ctx_state->channel_dev)));
+  if (pending_devices_to_finish == 0 && warp_lifetime_capture != nullptr) {
+    CUDA_SAFECALL(cuMemFree(
+        reinterpret_cast<CUdeviceptr>(warp_lifetime_capture)));
+    warp_lifetime_capture = nullptr;
+  }
   skip_callback_flag = false;
   delete ctx_state;
   pthread_mutex_unlock(&mutex);

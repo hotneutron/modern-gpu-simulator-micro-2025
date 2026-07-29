@@ -23,6 +23,7 @@ import psutil
 traces_root_dir = os.getenv('TRACES_ROOT_DIR')
 if not traces_root_dir:
     traces_root_dir = "../.."
+warp_lifetime_only = os.getenv("WARP_LIFETIME_ONLY") == "1"
 # MOD. End. Improved tracer
 
 # We will look for the benchmarks 
@@ -130,6 +131,9 @@ for bench in benchmarks:
         extra_env = argpair.get("env", {})
         benchmark_name = argpair.get("benchmark_name", exe)
         run_name = os.path.join( benchmark_name, common.get_argfoldername( args ) )
+        if warp_lifetime_only:
+            lifetime_kernel = os.getenv("DYNAMIC_KERNEL_LIMIT_START", "all")
+            run_name += "-warp-lifetime-k" + lifetime_kernel
 
         # MOD. Begin. Improved tracer
         if(options.compressed == "0"):
@@ -219,6 +223,7 @@ for bench in benchmarks:
             if subprocess.call(["bash","run.sh"]) != 0:
                 sys.exit("Error invoking nvbit on {0}".format(this_run_dir))
             os.chdir(saved_dir)
-            build_tma_descriptor_mapping_if_available(this_trace_folder)
-            build_tma_operand_mapping_if_available(this_trace_folder)
-            build_sync_operand_mapping_if_available(this_trace_folder)
+            if not warp_lifetime_only:
+                build_tma_descriptor_mapping_if_available(this_trace_folder)
+                build_tma_operand_mapping_if_available(this_trace_folder)
+                build_sync_operand_mapping_if_available(this_trace_folder)
