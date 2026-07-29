@@ -816,3 +816,123 @@ adjudicated here.
 ⚠️ Guardrails: keep every II/latency HW-faithful (confirmed above); no pipe may exceed its NCU occupancy;
 any prototype gated + default-off + bit-identical when off; if the honest answer is "structural floor
 bounded by HW's own 54% No-Eligible", accept it and make no cycle claim.
+
+
+## 16. Next measurement — HW producer-only tail via EXIT-only NVBit timestamps
+
+### Why this measurement is needed
+
+The producer/consumer mechanism itself is expected: after the consumer warps exit, the producer warp can
+remain live on one SMSP while the other three SMSPs have no active warp. The unresolved question is the
+**magnitude** of that producer-only tail on uninstrumented H100 versus the simulator.
+
+The prior closure compared sim `nv_ibuffer_empty` against HW SMSP-inactive time. That comparison is not
+definition-exact:
+
+- sim `nv_ibuffer_empty` is an issue-state classification while a subcore is still being evaluated;
+- NCU `Average SMSP Active Cycles` counts SMSP residency/activity;
+- the definition-matched sim counter is `total_num_cycles_issue_stage_evaluated`, because
+  `Subcore::cycle()` calls `issue()` only while `m_num_active_warps_subcore > 0`.
+
+For fwd K5, the existing NCU report gives `Elapsed Cycles = 67,696` and
+`Average SMSP Active Cycles = 60,209`. If every inactive SMSP-cycle came only from a tail where one of
+four SMSPs remains active, the HW producer-only tail is bounded by:
+
+```text
+(67,696 - 60,209) * 4 / 3 = 9,983 cycles
+```
+
+This is an upper bound, not a direct measurement. The current sim CTAFIN data reports an average
+`producer_last_drain - consumer_last_drain` of about 19.3K cycles, so an exact low-overhead HW
+measurement is justified before accepting or reopening the imbalance axis.
+
+### Measurement design
+
+Add a temporary `WARP_LIFETIME_ONLY=1` mode to the NVBit tracer. In this mode:
+
+- instrument only SASS `EXIT` instructions at `IPOINT_BEFORE`;
+- do not emit the full dynamic instruction trace;
+- record only the final `clock64()` timestamp per `(kernel, CTA, warp)`, plus SM id;
+- use the first predicated-active lane and retain the latest timestamp because a warp may execute
+  multiple predicated `EXIT` instances;
+- write `warp_exit_timestamps.csv` after the selected kernel completes.
+
+Role definitions from the existing H100 protobuf trace:
+
+| Kernel | Producer warps | Consumer warps | Setup warps |
+|---|---|---|---|
+| K5 fwd | 0 | 4-15 | 1-3 |
+| K10 bwd | 0-1 | 4-11 | 2-3 |
+
+Per-CTA derivation:
+
+```text
+K5 producer_end = exit[0]
+K5 consumer_end = max(exit[4..15])
+
+K10 producer_end = max(exit[0], exit[1])
+K10 consumer_end = max(exit[4..11])
+
+producer_only_tail = producer_end - consumer_end
+```
+
+`clock64()` is valid for this delta because all warps of one CTA remain on the same SM. No cross-SM
+timestamp subtraction is used.
+
+### GPU-server run
+
+The Python/PyTorch runner is compatible with NVBit injection. `run_hw_trace.py` already launches it with
+`CUDA_INJECTION64_PATH` and `LD_PRELOAD`; only the temporary tracer mode and kernel range are added.
+
+K5:
+
+```bash
+WARP_LIFETIME_ONLY=1 \
+ENABLE_TMA_DESC=0 \
+DYNAMIC_KERNEL_LIMIT_START=5 \
+./util/tracer_nvbit/run_hw_trace.py \
+  -B flashattn:flashattn-fa3-bf16-bwd-causal-b1-s2048-hd64-nh24 \
+  -D 0 -l 5
+```
+
+K10:
+
+```bash
+WARP_LIFETIME_ONLY=1 \
+ENABLE_TMA_DESC=0 \
+DYNAMIC_KERNEL_LIMIT_START=10 \
+./util/tracer_nvbit/run_hw_trace.py \
+  -B flashattn:flashattn-fa3-bf16-bwd-causal-b1-s2048-hd64-nh24 \
+  -D 0 -l 10
+```
+
+When `WARP_LIFETIME_ONLY=1`, `run_hw_trace.py` writes into a separate run directory with a
+kernel-specific suffix and skips the normal TMA/sync trace post-processing. The result files are:
+
+```text
+<run>-warp-lifetime-k5/traces/warp_exit_timestamps.csv
+<run>-warp-lifetime-k10/traces/warp_exit_timestamps.csv
+```
+
+The existing full-trace directory is not modified.
+
+Do not run NCU and NVBit simultaneously. Compare uninstrumented and EXIT-only kernel duration first;
+accept the timestamp result only if overhead is below 1.0%. Run at least three repetitions and use the
+median per-kernel tail distribution.
+
+### Decision after the run
+
+- HW tail near 19K: sim magnitude is consistent; keep the imbalance axis closed.
+- HW tail near the aggregate upper bound (about 10K fwd): sim producer-only tail is about 2x too long;
+  reopen the role-lifetime axis and identify whether the excess comes from trace control flow,
+  warp-retirement timing, or warp-to-SMSP placement.
+- HW tail well below 10K: prioritize the producer-only tail as the next model problem.
+
+No cycle reduction is claimed by this measurement.
+
+### Temporary-code and revert policy
+
+The EXIT-only NVBit implementation is probe-only code. Keep its code changes in one standalone commit,
+separate from this documentation commit. After the H100 result and analysis are recorded, revert only
+the code commit with `git revert <exit-only-code-commit>`; retain this section and append the measured
+result so the experiment remains reproducible.
