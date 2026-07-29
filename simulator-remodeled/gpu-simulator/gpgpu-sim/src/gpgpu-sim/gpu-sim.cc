@@ -2033,6 +2033,15 @@ void shader_core_config::reg_options(class OptionParser *opp) {
                          "breakdown. Read-only, timing-neutral, default 0 = bit-identical. See "
                          ".plan/HW_VS_SIM_SFU.md section 5. (default=0)",
                          "0");
+  option_parser_register(opp, "-subcore_gtlrr_enable", OPT_BOOL,
+                         &subcore_gtlrr_enable,
+                         "Warp-ordering policy for the remodeling subcore issue/fetch path. 0 = GTO "
+                         "(baseline order_greedy_then_highest_id: greedy, then oldest). 1 = GTLRR "
+                         "(greedy, then loose round-robin from greedy_pointer+1) — de-phases in-phase "
+                         "consumer warps so a stalled greedy warp hands off to the NEXT warp instead of "
+                         "re-picking the oldest. Scheduling-only, work-invariant; default 0 = bit-identical "
+                         "GTO. See .plan/HW_VS_SIM_SFU.md section 11-12. (default=0)",
+                         "0");
   option_parser_register(opp, "-sync_debug_enable", OPT_BOOL,
                          &sync_debug_enable,
                          "Enable Hopper mbarrier sync debug logging (SYNCDBG)."

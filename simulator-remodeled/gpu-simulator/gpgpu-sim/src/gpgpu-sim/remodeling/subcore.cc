@@ -29,6 +29,8 @@
 #include <cassert>
 #include <cstdio>
 #include <memory>
+#include <set>
+#include <string>
 
 #include "subcore.h"
 #include "functional_unit.h"
@@ -1415,6 +1417,37 @@ void Subcore::issue_warp(SM *shared_sm, register_set_uniptr &dispatch_latch, war
 }
 
 std::vector<unsigned int> Subcore::order_greedy_then_highest_id(SM *shared_sm, unsigned int greedy_pointer) {
+  // [GTLRR lever] greedy-then-loose-round-robin: keep greedy_pointer first, then the remaining warps in
+  // round-robin order starting at greedy_pointer+1 (wrapping), instead of oldest-first. A stalled greedy
+  // warp thus hands off to the NEXT warp rather than re-selecting the oldest (which, being in phase, would
+  // stall at the same point) — de-phasing the consumer warps. Scheduling-only, work-invariant; gated.
+  if (m_config->subcore_gtlrr_enable) {
+    std::vector<unsigned int> result_list;
+    result_list.push_back(greedy_pointer);
+    unsigned int n = m_warps_of_subcore.size();
+    for (unsigned int step = 1; step < n; step++) {
+      unsigned int wid = (greedy_pointer + step) % n;
+      shd_warp_t *w = m_warps_of_subcore[wid];
+      if (w != nullptr && !w->done_exit()) {
+        result_list.push_back(wid);
+      }
+    }
+    // [GTLRRDBG] one-time-per-distinct-order sanity dump: prove GTLRR is active and produces a
+    // round-robin order that differs from GTO's oldest-first. Deduped on (greedy_pointer, n) so it
+    // prints only a handful of lines over the whole 12h run (never floods). Gated by the same flag.
+    {
+      static std::set<unsigned long long> s_seen_gtlrr_orders;
+      unsigned long long key = ((unsigned long long)greedy_pointer << 32) ^ (unsigned long long)n;
+      if (s_seen_gtlrr_orders.insert(key).second) {
+        std::string ord;
+        for (auto id : result_list) ord += std::to_string(id) + " ";
+        std::fprintf(stderr, "[GTLRRDBG] ACTIVE sm=%u subcore=%u greedy=%u n=%u order=[ %s]\n",
+                     m_sm ? m_sm->get_sid() : 0u, m_subcore_id, greedy_pointer, n, ord.c_str());
+      }
+    }
+    return result_list;
+  }
+
   std::vector<unsigned int> result_list;
   std::vector<shd_warp_t*> temp = m_warps_of_subcore;
   result_list.push_back(greedy_pointer);

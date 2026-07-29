@@ -2290,7 +2290,13 @@ class shader_core_config : public core_config {
   // gaps, (4) per-warp total stall/wait warp-cycles. All read-only, timing-neutral, default 0 =
   // bit-identical. See .plan/HW_VS_SIM_SFU.md §5.
   bool overlap_instrument_enable;
-
+  // [GTLRR lever] warp-ordering policy for the remodeling subcore issue path (default 0 = GTO, the
+  // baseline order_greedy_then_highest_id). 1 = GTLRR (greedy-then-loose-round-robin): keep the greedy
+  // warp first, but order the fallback warps round-robin from greedy_pointer+1 instead of oldest-first,
+  // so a stalled greedy warp hands off to the NEXT warp rather than re-picking the oldest that will stall
+  // at the same point — this de-phases the in-phase consumer warps. Timing-affecting (scheduling only,
+  // work-invariant); default off = bit-identical GTO. See .plan/HW_VS_SIM_SFU.md §11-12.
+  bool subcore_gtlrr_enable;
   // Hopper mbarrier sync debug logging (SYNCDBG). Disabled by default.
   bool sync_debug_enable;
   unsigned int sync_debug_print_budget;
