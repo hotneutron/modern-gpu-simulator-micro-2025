@@ -62,9 +62,10 @@ typedef struct {
   uint32_t per_operand_type;
 } inst_trace_t;
 
-/* Probe-only EXIT timestamp capture for FA3 producer/consumer lifetime.
- * The current workload uses at most 384 CTAs and 16 warps/CTA; the larger fixed
- * bounds keep the tool reusable without adding device-side allocation logic. */
+/* EXIT timestamp capture for FA3 producer/consumer lifetime, shared by the
+ * EXIT-only probe and the full-trace sidecar. The current workload uses at most
+ * 384 CTAs and 16 warps/CTA; the larger fixed bounds keep the tool reusable
+ * without adding device-side allocation logic. */
 #define WARP_LIFETIME_MAX_CTAS 4096
 #define WARP_LIFETIME_MAX_WARPS 32
 #define WARP_LIFETIME_MAX_SLOTS \

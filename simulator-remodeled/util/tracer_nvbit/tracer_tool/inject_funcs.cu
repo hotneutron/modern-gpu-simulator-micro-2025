@@ -163,10 +163,10 @@ extern "C" __device__ __noinline__ void instrument_inst(
   }
 }
 
-/* Probe-only FA3 warp lifetime timestamp. Injected only before SASS EXIT when
- * WARP_LIFETIME_ONLY=1. A predicated EXIT can execute more than once as lanes
- * leave; the same warp writes its slot in program order, so the last write is
- * the final observed EXIT timestamp. */
+/* FA3 warp lifetime timestamp. Injected before SASS EXIT by either the
+ * EXIT-only probe or the full-trace sidecar. A predicated EXIT can execute more
+ * than once as lanes leave; the same warp writes its slot in program order, so
+ * the last write is the final observed EXIT timestamp. */
 extern "C" __device__ __noinline__ void record_warp_exit(
     int32_t pred, uint64_t pcapture) {
   const unsigned int active_mask = __activemask();

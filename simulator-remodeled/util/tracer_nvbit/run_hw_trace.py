@@ -24,6 +24,11 @@ traces_root_dir = os.getenv('TRACES_ROOT_DIR')
 if not traces_root_dir:
     traces_root_dir = "../.."
 warp_lifetime_only = os.getenv("WARP_LIFETIME_ONLY") == "1"
+warp_lifetime_sidecar = os.getenv("WARP_LIFETIME_SIDECAR") == "1"
+if warp_lifetime_only and warp_lifetime_sidecar:
+    raise RuntimeError(
+        "WARP_LIFETIME_ONLY and WARP_LIFETIME_SIDECAR are mutually exclusive"
+    )
 # MOD. End. Improved tracer
 
 # We will look for the benchmarks 
@@ -134,6 +139,9 @@ for bench in benchmarks:
         if warp_lifetime_only:
             lifetime_kernel = os.getenv("DYNAMIC_KERNEL_LIMIT_START", "all")
             run_name += "-warp-lifetime-k" + lifetime_kernel
+        elif warp_lifetime_sidecar:
+            lifetime_kernel = os.getenv("DYNAMIC_KERNEL_LIMIT_START", "all")
+            run_name += "-fulltrace-lifetime-k" + lifetime_kernel
 
         # MOD. Begin. Improved tracer
         if(options.compressed == "0"):

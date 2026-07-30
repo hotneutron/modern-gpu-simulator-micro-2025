@@ -1996,6 +1996,13 @@ void shader_core_config::reg_options(class OptionParser *opp) {
                          "Independent gate for bit-identity bisection. See .plan "
                          "FWD_DRAIN_IDLE_MBARRIER_CEILING. (default=0)",
                          "0");
+  option_parser_register(opp, "-producer_tail_instrument_enable", OPT_BOOL,
+                         &producer_tail_instrument_enable,
+                         "Enable observe-only per-CTA producer-tail decomposition after all "
+                         "consumer-role warps have drained: producer issue/opcode counts, modeled "
+                         "PHASECHK ready/not-ready outcomes, and non-issue reasons. Does not alter "
+                         "the existing Hopper mbarrier model. (default=0)",
+                         "0");
   option_parser_register(opp, "-headofline_instrument_enable", OPT_BOOL,
                          &headofline_instrument_enable,
                          "Enable observe-only head-of-line counters: on next_stage_not_available "

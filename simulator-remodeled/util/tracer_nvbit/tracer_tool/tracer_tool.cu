@@ -136,6 +136,10 @@ bool active_region = true;
 /* Probe-only mode: instrument SASS EXIT and record one final clock64 timestamp
  * per CTA-local warp. Full instruction tracing stays unchanged when disabled. */
 int warp_lifetime_only = 0;
+/* Sidecar mode: keep the complete dynamic trace path enabled and additionally
+ * timestamp SASS EXIT. This measures the lifetime perturbation of full tracing
+ * itself, using the same capture/output buffer as WARP_LIFETIME_ONLY. */
+int warp_lifetime_sidecar = 0;
 warp_lifetime_capture_t *warp_lifetime_capture = nullptr;
 bool warp_lifetime_capture_active = false;
 bool warp_lifetime_output_initialized = false;
@@ -1635,6 +1639,16 @@ void nvbit_at_init() {
       warp_lifetime_only, "WARP_LIFETIME_ONLY", 0,
       "Probe-only mode: record clock64 at SASS EXIT per CTA-local warp and "
       "disable full dynamic instruction tracing");
+  GET_VAR_INT(
+      warp_lifetime_sidecar, "WARP_LIFETIME_SIDECAR", 0,
+      "Record clock64 at SASS EXIT while retaining the full dynamic trace "
+      "and normal TMA/sync capture");
+  if (warp_lifetime_only && warp_lifetime_sidecar) {
+    fprintf(stderr,
+            "WARP_LIFETIME_ONLY and WARP_LIFETIME_SIDECAR are mutually "
+            "exclusive\n");
+    abort();
+  }
   GET_VAR_INT(verbose, "TOOL_VERBOSE", 0, "Enable verbosity inside the tool");
   GET_VAR_INT(intermediate_extra_files_persistance, "INTERMEDIATE_EXTRA_FILES_PERSISTANCE", 0, "Enable to not delete intermediate files from the extra trace generation");
   GET_VAR_INT(print_core_id, "TOOL_TRACE_CORE", 0,
@@ -1665,6 +1679,8 @@ void nvbit_at_init() {
     enable_tma_desc = 0;
     incremental_flush_threshold = 0;
     printf("[WARP-LIFETIME] EXIT-only probe enabled; full trace and TMA capture disabled\n");
+  } else if (warp_lifetime_sidecar) {
+    printf("[WARP-LIFETIME] EXIT sidecar enabled; full trace and TMA capture retained\n");
   }
   std::string pad(100, '-');
   printf("%s\n", pad.c_str());
@@ -1761,6 +1777,13 @@ void instrument_function_if_needed(CUcontext ctx, CUfunction func, int device_id
         }
         cnt++;
         continue;
+      }
+
+      if (warp_lifetime_sidecar && opcode_str.rfind("EXIT", 0) == 0) {
+        nvbit_insert_call(instr, "record_warp_exit", IPOINT_BEFORE);
+        nvbit_add_call_arg_guard_pred_val(instr);
+        nvbit_add_call_arg_const_val64(
+            instr, reinterpret_cast<uint64_t>(warp_lifetime_capture));
       }
 
       std::string inst_str = ReplaceAll(instr->getSass(), ",", " ");
@@ -2447,7 +2470,7 @@ void nvbit_at_cuda_event(CUcontext ctx, int is_exit, nvbit_api_cuda_t cbid,
         assert(it_map_already_instrumented != map_function_to_kernel_name_and_variant_id.end());
         variant_id = std::get<1>(it_map_already_instrumented->second);
         std::string kernel_name(nvbit_get_func_name(ctx, p->f, true));
-        if (warp_lifetime_only) {
+        if (warp_lifetime_only || warp_lifetime_sidecar) {
           reset_warp_lifetime_capture(kernel_id[device_id],
                                       kernel_name.c_str(), p);
         }
@@ -2527,7 +2550,8 @@ void nvbit_at_cuda_event(CUcontext ctx, int is_exit, nvbit_api_cuda_t cbid,
       }
       assert(cuErr == cudaSuccess);
 
-      if (warp_lifetime_only && !stop_report[device_id] &&
+      if ((warp_lifetime_only || warp_lifetime_sidecar) &&
+          !stop_report[device_id] &&
           warp_lifetime_capture_active &&
           warp_lifetime_kernel_id == kernel_id[device_id] - 1) {
         dump_warp_lifetime_capture();
@@ -3494,7 +3518,7 @@ void init_context_state(CUcontext ctx) {
       kernel_id.push_back(1);
       current_stream_id.push_back(0);
     }
-    if (warp_lifetime_only) {
+    if (warp_lifetime_only || warp_lifetime_sidecar) {
       CUDA_SAFECALL(cuMemAllocManaged(
           reinterpret_cast<CUdeviceptr *>(&warp_lifetime_capture),
           sizeof(warp_lifetime_capture_t), CU_MEM_ATTACH_GLOBAL));

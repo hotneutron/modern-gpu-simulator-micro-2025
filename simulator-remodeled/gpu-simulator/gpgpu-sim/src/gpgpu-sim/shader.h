@@ -2254,6 +2254,13 @@ class shader_core_config : public core_config {
   // See .plan/FWD_DRAIN_IDLE_MBARRIER_CEILING.md.
   bool spin_instrument_enable;
 
+  // [Producer-tail probe] Observe the interval after every consumer-role warp
+  // in a CTA has drained while at least one producer-role warp remains live.
+  // Reports per-CTA producer issues by opcode class, modeled PHASECHK
+  // ready/not-ready outcomes, and non-issue reasons. The existing Hopper
+  // mbarrier state machine is read but never modified. Default 0.
+  bool producer_tail_instrument_enable;
+
   // [Head-of-line lever] Observe-only counters for the issue-pipeline head-of-line blocking test.
   // On cycles where the subcore issues nothing because the 1-deep ISSUE_CONTROL latch is full
   // (next_stage_not_available), the normal warp-scan loop is skipped, so we cannot tell whether a

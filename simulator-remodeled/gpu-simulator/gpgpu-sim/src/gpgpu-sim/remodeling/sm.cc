@@ -47,6 +47,7 @@
 
 #include "../../../../../util/traces_enhanced/src/traced_operand.h"
 
+#include <algorithm>
 #include <sstream>
 
 #define STRSIZE 1024
@@ -560,6 +561,10 @@ void SM::cycle() {
     subcore->cycle();
   }
 
+  if (m_config->producer_tail_instrument_enable) {
+    account_producer_tail_cycle();
+  }
+
   // [overlap probe] SM-level tensor-vs-SFU pipe overlap this cycle (read-only, gated). OR the busy flags
   // across the 4 subcores, then classify the cycle into both / tensor-only / sfu-only / neither. HW
   // overlaps tensor(46%)+MUFU(48%) so 'both' should be large on HW; if the sim shows mostly tensor-only
@@ -736,6 +741,176 @@ void SM::cycle() {
 
 void SM::set_num_cycles_to_wait_to_dispatch_another_inst_from_subcore_to_sm_shared_pipeline(unsigned int num_cycles) {
   m_num_cycles_to_wait_to_dispatch_another_inst_from_subcore_to_sm_shared_pipeline = num_cycles;
+}
+
+bool SM::producer_tail_active_for_warp(unsigned wid) const {
+  if (!m_config->producer_tail_instrument_enable ||
+      wid >= MAX_WARP_PER_SHADER || m_physical_warp[wid] == nullptr ||
+      !m_warp_is_producer[wid] || m_warp_drain_cycle[wid] != 0) {
+    return false;
+  }
+
+  const unsigned cta_slot = m_physical_warp[wid]->get_cta_id();
+  if (cta_slot >= MAX_CTA_PER_SHADER || m_cta_status[cta_slot] == 0) {
+    return false;
+  }
+
+  bool saw_consumer = false;
+  for (unsigned w = 0; w < MAX_WARP_PER_SHADER; ++w) {
+    if (m_physical_warp[w] == nullptr ||
+        m_physical_warp[w]->get_cta_id() != cta_slot ||
+        !m_warp_is_consumer[w]) {
+      continue;
+    }
+    saw_consumer = true;
+    if (m_warp_drain_cycle[w] == 0) {
+      return false;
+    }
+  }
+  return saw_consumer;
+}
+
+void SM::record_producer_tail_issue(unsigned wid, const warp_inst_t *inst) {
+  if (!producer_tail_active_for_warp(wid) || inst == nullptr) {
+    return;
+  }
+  const unsigned cta_slot = m_physical_warp[wid]->get_cta_id();
+  ProducerTailCounters &tail = m_producer_tail_by_cta_slot[cta_slot];
+  tail.issued++;
+  tail.last_producer_issue_cycle = get_current_gpu_cycle();
+
+  const bool is_phasechk =
+      inst->sync_kind == SyncInstructionKind::PHASECHK ||
+      inst->sync_kind == SyncInstructionKind::TRYWAIT;
+  std::string opcode;
+  if (inst->has_extra_trace_instruction_info()) {
+    opcode = inst->get_extra_trace_instruction_info().get_op_code();
+  }
+  if (is_phasechk) {
+    tail.issued_phasechk++;
+  } else if (opcode.rfind("NANOSLEEP", 0) == 0) {
+    tail.issued_nanosleep++;
+  } else if (inst->op == BRANCH_OP) {
+    tail.issued_branch++;
+  } else if (inst->is_tma_op()) {
+    tail.issued_tma++;
+  } else {
+    tail.issued_other++;
+  }
+}
+
+void SM::record_producer_tail_phasechk_result(unsigned wid, bool ready) {
+  if (!producer_tail_active_for_warp(wid)) {
+    return;
+  }
+  const unsigned cta_slot = m_physical_warp[wid]->get_cta_id();
+  ProducerTailCounters &tail = m_producer_tail_by_cta_slot[cta_slot];
+  if (ready) {
+    tail.phasechk_ready++;
+  } else {
+    tail.phasechk_not_ready++;
+  }
+}
+
+void SM::account_producer_tail_cycle() {
+  const unsigned long long now = get_current_gpu_cycle();
+  for (unsigned cta_slot = 0; cta_slot < MAX_CTA_PER_SHADER; ++cta_slot) {
+    if (m_cta_status[cta_slot] == 0) {
+      continue;
+    }
+
+    bool active_tail = false;
+    bool producer_subcore_issued = false;
+    unsigned int producer_reason_mask = 0;
+    for (unsigned w = 0; w < MAX_WARP_PER_SHADER; ++w) {
+      if (!producer_tail_active_for_warp(w)) {
+        continue;
+      }
+      if (m_physical_warp[w]->get_cta_id() != cta_slot) {
+        continue;
+      }
+      active_tail = true;
+      const unsigned subcore_id =
+          translate_warp_id_of_sm_to_subcore(w, get_num_subcores());
+      assert(subcore_id < m_subcores.size());
+      producer_subcore_issued |=
+          m_subcores[subcore_id]->step0_issued_this_cycle();
+      producer_reason_mask |=
+          m_subcores[subcore_id]->step0_reason_mask_this_cycle();
+    }
+    if (!active_tail) {
+      continue;
+    }
+
+    ProducerTailCounters &tail = m_producer_tail_by_cta_slot[cta_slot];
+    if (tail.start_cycle == 0) {
+      tail.start_cycle = now;
+    }
+    tail.cycles++;
+    if (tail.last_producer_issue_cycle == now) {
+      continue;
+    }
+
+    tail.stall_cycles++;
+    bool attributed = false;
+    if (producer_subcore_issued) {
+      tail.stall_not_selected++;
+      attributed = true;
+    }
+    if (producer_reason_mask & Subcore::STEP0_R_NEXT_STAGE) {
+      tail.stall_next_stage++;
+      attributed = true;
+    }
+    if (producer_reason_mask & Subcore::STEP0_R_ISSUE_PORT_BUSY) {
+      tail.stall_issue_port++;
+      attributed = true;
+    }
+    if (producer_reason_mask &
+        (Subcore::STEP0_R_NO_VALID_FRONTEND |
+         Subcore::STEP0_R_NO_VALID_OTHER)) {
+      tail.stall_no_valid++;
+      attributed = true;
+    }
+    if (producer_reason_mask & Subcore::STEP0_R_WAIT_BARRIER) {
+      tail.stall_wait_barrier++;
+      attributed = true;
+    }
+    if (producer_reason_mask & Subcore::STEP0_R_STALL_COUNT) {
+      tail.stall_stall_count++;
+      attributed = true;
+    }
+    if (producer_reason_mask & Subcore::STEP0_R_FU_OCCUPIED) {
+      tail.stall_fu_occupied++;
+      attributed = true;
+    }
+    if (producer_reason_mask & Subcore::STEP0_R_INST_BARRIER) {
+      tail.stall_inst_barrier++;
+      attributed = true;
+    }
+    if (producer_reason_mask & Subcore::STEP0_R_TMA_FLUSH) {
+      tail.stall_tma_flush++;
+      attributed = true;
+    }
+    if (producer_reason_mask & Subcore::STEP0_R_SCOREBOARD) {
+      tail.stall_scoreboard++;
+      attributed = true;
+    }
+    if (producer_reason_mask & Subcore::STEP0_R_L1C) {
+      tail.stall_l1c++;
+      attributed = true;
+    }
+    if (producer_reason_mask & Subcore::STEP0_R_RESULT_QUEUE_FULL) {
+      tail.stall_result_queue++;
+      attributed = true;
+    }
+    if (producer_reason_mask & Subcore::STEP0_R_YIELD) {
+      tail.stall_yield++;
+      attributed = true;
+    }
+    if (!attributed) {
+      tail.stall_unattributed++;
+    }
+  }
 }
 
 bool SM::can_send_inst_from_subcore_to_sm_shared_pipeline() const {
@@ -1002,7 +1177,8 @@ void SM::func_exec_inst(warp_inst_t &inst) {
       m_trace_warp->get_IBuffer_remodeled()->flush(true);
       m_barriers.warp_exit(inst.warp_id());
       // [FWD drain-idle 축2] stamp the cycle this warp's trace drained (first time only).
-      if (m_config->wgmma_step0_instrument_enable) {
+      if (m_config->wgmma_step0_instrument_enable ||
+          m_config->producer_tail_instrument_enable) {
         unsigned wid = inst.warp_id();
         if (wid < MAX_WARP_PER_SHADER && m_warp_drain_cycle[wid] == 0) {
           m_warp_drain_cycle[wid] = get_current_gpu_cycle();
@@ -1074,6 +1250,7 @@ void SM::init_warps(unsigned cta_id, unsigned start_thread, unsigned end_thread,
     m_drained_cyc_by_cta_slot[cta_id] = 0;
     m_wait_pending_by_cta_slot[cta_id] = 0;
     m_wait_released_by_cta_slot[cta_id] = 0;
+    m_producer_tail_by_cta_slot[cta_id] = ProducerTailCounters();
   }
   if (m_config->model == POST_DOMINATOR) {
     unsigned start_warp = start_thread / m_config->warp_size;
@@ -1477,6 +1654,61 @@ void SM::register_cta_thread_exit(unsigned cta_num, kernel_info_t *kernel) {
     unsigned global_cta_id = m_local_to_global_cta_id[cta_num];
     m_gpu->record_first_completed_cta(global_cta_id, m_sm_id);
 
+    if (m_config->producer_tail_instrument_enable) {
+      unsigned producer_warps = 0, consumer_warps = 0;
+      unsigned long long producer_last_drain = 0;
+      unsigned long long consumer_last_drain = 0;
+      for (unsigned w = 0; w < MAX_WARP_PER_SHADER; ++w) {
+        if (m_physical_warp[w] == nullptr ||
+            m_physical_warp[w]->get_cta_id() != cta_num) {
+          continue;
+        }
+        if (m_warp_is_producer[w]) {
+          producer_warps++;
+          producer_last_drain =
+              std::max(producer_last_drain, m_warp_drain_cycle[w]);
+        }
+        if (m_warp_is_consumer[w]) {
+          consumer_warps++;
+          consumer_last_drain =
+              std::max(consumer_last_drain, m_warp_drain_cycle[w]);
+        }
+      }
+      const ProducerTailCounters &tail =
+          m_producer_tail_by_cta_slot[cta_num];
+      printf(
+          "[PRODTAIL] sm=%u cta_slot=%u global_cta=%u "
+          "producer_warps=%u consumer_warps=%u "
+          "producer_last_drain=%llu consumer_last_drain=%llu "
+          "tail_start=%llu tail_cycles=%llu issued=%llu "
+          "issued_phasechk=%llu issued_nanosleep=%llu "
+          "issued_branch=%llu issued_tma=%llu issued_other=%llu "
+          "phasechk_ready=%llu phasechk_not_ready=%llu "
+          "stall_cycles=%llu stall_not_selected=%llu "
+          "stall_next_stage=%llu stall_issue_port=%llu "
+          "stall_no_valid=%llu stall_wait_barrier=%llu "
+          "stall_stall_count=%llu stall_fu_occupied=%llu "
+          "stall_inst_barrier=%llu stall_tma_flush=%llu "
+          "stall_scoreboard=%llu stall_l1c=%llu "
+          "stall_result_queue=%llu stall_yield=%llu "
+          "stall_unattributed=%llu\n",
+          m_sm_id, cta_num, global_cta_id, producer_warps,
+          consumer_warps, producer_last_drain, consumer_last_drain,
+          tail.start_cycle, tail.cycles, tail.issued,
+          tail.issued_phasechk, tail.issued_nanosleep,
+          tail.issued_branch, tail.issued_tma, tail.issued_other,
+          tail.phasechk_ready, tail.phasechk_not_ready,
+          tail.stall_cycles, tail.stall_not_selected,
+          tail.stall_next_stage, tail.stall_issue_port,
+          tail.stall_no_valid, tail.stall_wait_barrier,
+          tail.stall_stall_count, tail.stall_fu_occupied,
+          tail.stall_inst_barrier, tail.stall_tma_flush,
+          tail.stall_scoreboard, tail.stall_l1c,
+          tail.stall_result_queue, tail.stall_yield,
+          tail.stall_unattributed);
+      m_producer_tail_by_cta_slot[cta_num] = ProducerTailCounters();
+    }
+
     // [CTA-imbalance diag] Emit this CTA's finish cycle, elapsed cycles, and raw
     // tensor-op (WGMMA) count so tail-drain can be correlated with tensor density
     // AND per-CTA duration. Keyed by hardware CTA slot so multi-wave SMs (bwd)
@@ -1876,9 +2108,13 @@ void SM::handle_sync_instruction(warp_inst_t &inst, unsigned int warp_id) {
     if (warp_id < m_pending_sync_waits.size()) {
       const bool is_trywait =
           inst.sync_kind == SyncInstructionKind::TRYWAIT;
-      if (is_sync_wait_satisfied(
-              HopperMBarrierPendingWait{true, is_trywait, key,
-                                        inst.sync_semantic_raw})) {
+      const bool wait_ready = is_sync_wait_satisfied(
+          HopperMBarrierPendingWait{true, is_trywait, key,
+                                    inst.sync_semantic_raw});
+      if (m_config->producer_tail_instrument_enable) {
+        record_producer_tail_phasechk_result(warp_id, wait_ready);
+      }
+      if (wait_ready) {
         m_sync_debug_wait_released++;
         // [FWD drain-idle 축4] per-CTA mbarrier test count (released = immediate hit).
         if (m_config->cta_stall_breakdown_instrument_enable &&

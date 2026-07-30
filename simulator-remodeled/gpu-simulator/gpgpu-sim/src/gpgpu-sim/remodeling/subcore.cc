@@ -932,6 +932,9 @@ void Subcore::issue(SM *shared_sm) {
               (m_config->interwarp_coalescing_selection_policy == DEP_COUNT_WAIT_DETECTED_AT_DECODE_CHECKING_WARP_ID)))  {
             remove_interwarp_coalescing_dep_counter_at_decode_tracking(pI, sm_warp_id);
           }
+          if (m_config->producer_tail_instrument_enable) {
+            shared_sm->record_producer_tail_issue(sm_warp_id, pI);
+          }
           issue_warp(shared_sm, m_ISSUE_CONTROL_latch, pI, active_mask, sm_warp_id, fu, is_fixed_latency_inst, use_traditional_scoreboarding, has_dst_regs, dst_type);
           is_issued_inst = true;
           // [NANOSLEEP spin lever] record whether the winning op is a producer mbarrier spin poll
@@ -1158,7 +1161,9 @@ void Subcore::issue(SM *shared_sm) {
   // (only meaningful when it did NOT issue). SM::cycle() ORs these across the 4 subcores on
   // true SM-idle cycles, so one run attributes ALL of sm_all_subcores_idle to every reason.
   // Computed when EITHER Step-0 flag is on (shared infra for WGMMA + frontend measurements).
-  if(m_config->wgmma_step0_instrument_enable || m_config->l1i_frontend_step0_instrument_enable) {
+  if(m_config->wgmma_step0_instrument_enable ||
+     m_config->l1i_frontend_step0_instrument_enable ||
+     m_config->producer_tail_instrument_enable) {
     unsigned int mask = 0;
     if(!is_issued_inst) {
       if(!is_next_stage_availabe)      mask |= STEP0_R_NEXT_STAGE;

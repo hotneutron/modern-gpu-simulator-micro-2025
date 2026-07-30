@@ -537,6 +537,38 @@ class SM : public core_t, public shader_core_ctx_wrapper {
   address_type m_sync_first_miss_barrier[MAX_WARP_PER_SHADER] = {0};
   unsigned long long m_sync_first_miss_cycle[MAX_WARP_PER_SHADER] = {0};
   unsigned long long m_sync_wait_cycle_hist[6] = {0};
+  // [Producer-tail probe] CTA-cycle and producer-issue decomposition after all
+  // consumer-role warps have drained. PHASECHK ready/not-ready is sampled from
+  // the existing Hopper mbarrier state machine at execution; no state is changed.
+  struct ProducerTailCounters {
+    unsigned long long start_cycle = 0;
+    unsigned long long cycles = 0;
+    unsigned long long issued = 0;
+    unsigned long long issued_phasechk = 0;
+    unsigned long long issued_nanosleep = 0;
+    unsigned long long issued_branch = 0;
+    unsigned long long issued_tma = 0;
+    unsigned long long issued_other = 0;
+    unsigned long long phasechk_ready = 0;
+    unsigned long long phasechk_not_ready = 0;
+    unsigned long long last_producer_issue_cycle = 0;
+    unsigned long long stall_cycles = 0;
+    unsigned long long stall_not_selected = 0;
+    unsigned long long stall_next_stage = 0;
+    unsigned long long stall_issue_port = 0;
+    unsigned long long stall_no_valid = 0;
+    unsigned long long stall_wait_barrier = 0;
+    unsigned long long stall_stall_count = 0;
+    unsigned long long stall_fu_occupied = 0;
+    unsigned long long stall_inst_barrier = 0;
+    unsigned long long stall_tma_flush = 0;
+    unsigned long long stall_scoreboard = 0;
+    unsigned long long stall_l1c = 0;
+    unsigned long long stall_result_queue = 0;
+    unsigned long long stall_yield = 0;
+    unsigned long long stall_unattributed = 0;
+  };
+  ProducerTailCounters m_producer_tail_by_cta_slot[MAX_CTA_PER_SHADER];
  public:
   // Increment the tensor-op count for the CTA slot that owns hardware warp wid.
   void inc_tensor_ops_for_warp(unsigned wid) {
@@ -546,4 +578,10 @@ class SM : public core_t, public shader_core_ctx_wrapper {
   // [FWD drain-idle 축2] sticky role marks (observe-only; set on first occurrence).
   void mark_producer_warp(unsigned wid) { if (wid < MAX_WARP_PER_SHADER) m_warp_is_producer[wid] = true; }
   void mark_consumer_warp(unsigned wid) { if (wid < MAX_WARP_PER_SHADER) m_warp_is_consumer[wid] = true; }
+  // [Producer-tail probe] read-only hooks used by Subcore::issue() and the
+  // existing mbarrier execution path.
+  bool producer_tail_active_for_warp(unsigned wid) const;
+  void record_producer_tail_issue(unsigned wid, const warp_inst_t *inst);
+  void record_producer_tail_phasechk_result(unsigned wid, bool ready);
+  void account_producer_tail_cycle();
 };
