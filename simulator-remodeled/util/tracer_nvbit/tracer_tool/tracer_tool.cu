@@ -2771,8 +2771,6 @@ void *recv_thread_fun(void *args) {
         continue;
       }
       uint32_t num_processed_bytes = 0;
-      dynamic_trace::cuda_stream &stream = (*gpu_dev.mutable_streams())[current_stream_id[device_id]];
-      dynamic_trace::kernel &ker = (*stream.mutable_kernels())[kernel_id[device_id]-2]; 
       while (num_processed_bytes < num_recv_bytes) {
         inst_trace_t *ma = (inst_trace_t *)&recv_buffer[num_processed_bytes];
 
