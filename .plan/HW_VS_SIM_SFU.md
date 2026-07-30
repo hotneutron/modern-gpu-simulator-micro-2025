@@ -1169,3 +1169,71 @@ If `wait_barrier` remains the sole unmet condition for most of the 11.5K cycles,
 barrier lifetime/release model. If it mostly overlaps `stall_count` or FU occupancy, use the exclusive
 partition to select the actual timing lever. Any fix must remain default-off during validation and
 preserve `gpu_sim_insn`, HGMMA, MUFU, and TMA counts bit-identically.
+
+
+## 18. Trace over-poll evidence (fwd AND bwd) + whole-lifetime producer-spin probe
+
+### Direct trace-vs-HW branch counts
+
+The spin loop is `SYNCS.PHASECHK.TRANS64 -> NANOSLEEP.SYNCS -> BRA`, so one BRA per iteration
+makes branch count a direct proxy for iterations. NCU branch counts are hardware performance
+counters (not instrumentation), so they are the un-perturbed HW truth. The dynamic trace protobufs
+that the simulator actually replays were parsed directly (varint decode, no protoc):
+
+| Branch (BRA) count | HW (NCU) | Replayed trace | Ratio |
+|---|---:|---:|---:|
+| K5 fwd | 203,049 | 576,296 | 2.84x |
+| K10 bwd | 229,938 | 844,000 | 3.67x |
+
+Trace dynamic-instruction totals equal the simulator's `gpgpu_n_tot_w_icount` exactly
+(fwd 16,064,281; bwd 22,626,216), confirming the counts are what the simulator consumes. The trace
+`total_insts` in `stats.csv` (K5 47,401,323) matches the full-trace sidecar capture (47,387,527),
+confirming this trace was produced under full instrumentation - i.e. the excess spin is baked into
+the captured control flow, not synthesized by the simulator scheduler.
+
+### Per-warp: spin is concentrated on the producer
+
+CTA-0 BRA counts show the excess is almost entirely the producer warp:
+
+- K5 fwd: warp 0 (producer) = 3,226 BRA; setup warps 1-3 = 7 each; consumers 4-15 = 79-113 each.
+- K10 bwd: warp 0 (main producer) = 3,234 BRA, 13,970 insts; warp 1 (aux producer) = 69 BRA, 823
+  insts; setup warps 2-3 = 6 each; consumers 4-11 = 69-80 each.
+
+### Why the tail-only probe missed bwd
+
+Section 17's `[PRODTAIL]` probe activates only after every consumer-role warp has drained. In fwd the
+producer's excess spin lands in that post-drain tail, so it was visible. In bwd the producer (warps 0
+and 1) is interleaved with consumers throughout the main loop, so its excess spin is spread across the
+whole kernel and does not appear as a post-drain tail. This is why the EXIT-timestamp tail comparison
+showed bwd sim tail (12,575) shorter than HW (16,448): "bwd has no tail problem" was the wrong
+conclusion; bwd has an over-poll problem located outside the tail.
+
+### New probe: whole-lifetime producer-spin ready-retry (commit `293e21c`)
+
+Added `-producer_spin_ready_instrument_enable` (default-off). Unlike the tail probe it is NOT gated by
+consumer drain: for every PHASECHK/TRYWAIT a producer-role warp executes over its whole lifetime, it
+samples the existing Hopper mbarrier result (`is_sync_wait_satisfied`) and classifies it. It reads
+mbarrier state only - no change to mbarrier state, issue conditions, trace order, timing, or
+`gpu_sim_insn`. Emits one `[PRODSPIN]` line per CTA:
+
+- `phasechk_total` - all producer PHASECHK/TRYWAIT;
+- `phasechk_ready` - modeled mbarrier already satisfied at the test (over-poll candidate);
+- `phasechk_not_ready` - barrier genuinely not yet satisfied (legitimate wait);
+- `ready_run_retries` - within a maximal run of consecutive ready tests on one warp, every test beyond
+  the first (redundant re-polls of an already-satisfied barrier);
+- `issued_phasechk` / `issued_nanosleep` / `issued_branch` / `issued_other`.
+
+### Run and decision
+
+Both probes are enabled in `configs/tested-cfgs/SM90_H100_L2_50MB_80GB/gpgpusim.config`. Run K5 and
+K10 as usual and collect `[PRODSPIN]`.
+
+| Observation | Conclusion |
+|---|---|
+| High `ready_run_retries` / `phasechk_total` (fwd and bwd) | Captured trace re-polls an already-ready barrier; excess iterations are a capture artifact the simulator replays |
+| `ready_run_retries` ~ 0 but `phasechk_not_ready` high | Simulator mbarrier releases later than HW; investigate release timing, not iteration count |
+| bwd `[PRODSPIN]` excess ~ trace 3.67x proxy | Confirms bwd over-poll is real and main-loop-resident, not a tail effect |
+
+Any later fix that removes the replayed-spin cycle cost must preserve `gpu_sim_insn`, HGMMA, MUFU, and
+TMA counts bit-identically (retire the captured ops; remove only their stall cycles), and must be a
+general mbarrier-polling mechanism, not a K5-specific clamp. It must not regress K10.
