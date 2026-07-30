@@ -569,6 +569,27 @@ class SM : public core_t, public shader_core_ctx_wrapper {
     unsigned long long stall_unattributed = 0;
   };
   ProducerTailCounters m_producer_tail_by_cta_slot[MAX_CTA_PER_SHADER];
+
+  // [Producer-spin ready-retry probe] Whole-producer-lifetime spin accounting,
+  // NOT gated by consumer drain. Sizes captured excess polling for fwd AND bwd
+  // (bwd spin is spread across the main loop, so the tail-only probe misses it).
+  // All fields are read-only samples of the existing Hopper mbarrier result.
+  struct ProducerSpinCounters {
+    unsigned long long phasechk_total = 0;       // all PHASECHK/TRYWAIT by producers
+    unsigned long long phasechk_ready = 0;       // mbarrier already satisfied at test
+    unsigned long long phasechk_not_ready = 0;   // mbarrier not yet satisfied
+    unsigned long long issued_phasechk = 0;      // PHASECHK/TRYWAIT issued
+    unsigned long long issued_nanosleep = 0;     // NANOSLEEP issued
+    unsigned long long issued_branch = 0;        // BRA issued
+    unsigned long long issued_other = 0;         // any other producer op
+    // Consecutive-ready run tracking: a maximal run of back-to-back ready
+    // PHASECHK on one warp with no intervening not-ready is "redundant re-poll".
+    unsigned long long ready_run_retries = 0;    // ready tests beyond the 1st in a run
+  };
+  ProducerSpinCounters m_producer_spin_by_cta_slot[MAX_CTA_PER_SHADER];
+  // Per-warp last-PHASECHK-was-ready flag, for consecutive-ready run detection.
+  bool m_producer_spin_prev_ready[MAX_WARP_PER_SHADER] = {false};
+  bool m_producer_spin_in_ready_run[MAX_WARP_PER_SHADER] = {false};
  public:
   // Increment the tensor-op count for the CTA slot that owns hardware warp wid.
   void inc_tensor_ops_for_warp(unsigned wid) {
@@ -584,4 +605,7 @@ class SM : public core_t, public shader_core_ctx_wrapper {
   void record_producer_tail_issue(unsigned wid, const warp_inst_t *inst);
   void record_producer_tail_phasechk_result(unsigned wid, bool ready);
   void account_producer_tail_cycle();
+  // [Producer-spin ready-retry probe] whole-lifetime hooks (not tail-gated).
+  void record_producer_spin_issue(unsigned wid, const warp_inst_t *inst);
+  void record_producer_spin_phasechk_result(unsigned wid, bool ready);
 };

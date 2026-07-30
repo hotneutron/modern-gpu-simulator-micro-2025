@@ -2003,6 +2003,15 @@ void shader_core_config::reg_options(class OptionParser *opp) {
                          "PHASECHK ready/not-ready outcomes, and non-issue reasons. Does not alter "
                          "the existing Hopper mbarrier model. (default=0)",
                          "0");
+  option_parser_register(opp, "-producer_spin_ready_instrument_enable", OPT_BOOL,
+                         &producer_spin_ready_instrument_enable,
+                         "Enable observe-only whole-lifetime producer-spin ready-retry counters. "
+                         "For every PHASECHK/TRYWAIT a producer-role warp executes (not gated by "
+                         "consumer drain), sample the existing Hopper mbarrier result and classify "
+                         "ready (already satisfied, captured trace keeps polling) vs not-ready, plus "
+                         "spin-loop opcode counts. Sizes fwd+bwd excess captured spin. Reads mbarrier "
+                         "state only; never modifies it. (default=0)",
+                         "0");
   option_parser_register(opp, "-headofline_instrument_enable", OPT_BOOL,
                          &headofline_instrument_enable,
                          "Enable observe-only head-of-line counters: on next_stage_not_available "

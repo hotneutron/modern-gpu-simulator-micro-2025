@@ -812,6 +812,69 @@ void SM::record_producer_tail_phasechk_result(unsigned wid, bool ready) {
   }
 }
 
+// [Producer-spin ready-retry probe] whole-producer-lifetime opcode accounting.
+// Unlike the tail probe, this fires for every producer-role warp instruction
+// regardless of consumer-drain state, so it captures bwd main-loop spin too.
+void SM::record_producer_spin_issue(unsigned wid, const warp_inst_t *inst) {
+  if (!m_config->producer_spin_ready_instrument_enable || inst == nullptr ||
+      wid >= MAX_WARP_PER_SHADER || m_physical_warp[wid] == nullptr ||
+      !m_warp_is_producer[wid]) {
+    return;
+  }
+  const unsigned cta_slot = m_physical_warp[wid]->get_cta_id();
+  if (cta_slot >= MAX_CTA_PER_SHADER) {
+    return;
+  }
+  ProducerSpinCounters &spin = m_producer_spin_by_cta_slot[cta_slot];
+  const bool is_phasechk =
+      inst->sync_kind == SyncInstructionKind::PHASECHK ||
+      inst->sync_kind == SyncInstructionKind::TRYWAIT;
+  std::string opcode;
+  if (inst->has_extra_trace_instruction_info()) {
+    opcode = inst->get_extra_trace_instruction_info().get_op_code();
+  }
+  if (is_phasechk) {
+    spin.issued_phasechk++;
+  } else if (opcode.rfind("NANOSLEEP", 0) == 0) {
+    spin.issued_nanosleep++;
+  } else if (inst->op == BRANCH_OP) {
+    spin.issued_branch++;
+  } else {
+    spin.issued_other++;
+  }
+}
+
+// [Producer-spin ready-retry probe] sample the existing mbarrier result at each
+// producer PHASECHK/TRYWAIT. "ready" means the modeled Hopper mbarrier is already
+// satisfied yet the captured trace still issued this poll. Consecutive ready
+// tests on the same warp (a ready-run) beyond the first are redundant re-polls.
+void SM::record_producer_spin_phasechk_result(unsigned wid, bool ready) {
+  if (!m_config->producer_spin_ready_instrument_enable ||
+      wid >= MAX_WARP_PER_SHADER || m_physical_warp[wid] == nullptr ||
+      !m_warp_is_producer[wid]) {
+    return;
+  }
+  const unsigned cta_slot = m_physical_warp[wid]->get_cta_id();
+  if (cta_slot >= MAX_CTA_PER_SHADER) {
+    return;
+  }
+  ProducerSpinCounters &spin = m_producer_spin_by_cta_slot[cta_slot];
+  spin.phasechk_total++;
+  if (ready) {
+    spin.phasechk_ready++;
+    // A ready test that continues an already-open ready-run is a redundant
+    // re-poll (the barrier was already satisfied on the prior test).
+    if (m_producer_spin_in_ready_run[wid]) {
+      spin.ready_run_retries++;
+    }
+    m_producer_spin_in_ready_run[wid] = true;
+  } else {
+    spin.phasechk_not_ready++;
+    m_producer_spin_in_ready_run[wid] = false;
+  }
+  m_producer_spin_prev_ready[wid] = ready;
+}
+
 void SM::account_producer_tail_cycle() {
   const unsigned long long now = get_current_gpu_cycle();
   for (unsigned cta_slot = 0; cta_slot < MAX_CTA_PER_SHADER; ++cta_slot) {
@@ -1709,6 +1772,29 @@ void SM::register_cta_thread_exit(unsigned cta_num, kernel_info_t *kernel) {
       m_producer_tail_by_cta_slot[cta_num] = ProducerTailCounters();
     }
 
+    if (m_config->producer_spin_ready_instrument_enable) {
+      const ProducerSpinCounters &spin = m_producer_spin_by_cta_slot[cta_num];
+      printf(
+          "[PRODSPIN] sm=%u cta_slot=%u global_cta=%u "
+          "phasechk_total=%llu phasechk_ready=%llu phasechk_not_ready=%llu "
+          "ready_run_retries=%llu issued_phasechk=%llu issued_nanosleep=%llu "
+          "issued_branch=%llu issued_other=%llu\n",
+          m_sm_id, cta_num, m_local_to_global_cta_id[cta_num],
+          spin.phasechk_total, spin.phasechk_ready, spin.phasechk_not_ready,
+          spin.ready_run_retries, spin.issued_phasechk, spin.issued_nanosleep,
+          spin.issued_branch, spin.issued_other);
+      m_producer_spin_by_cta_slot[cta_num] = ProducerSpinCounters();
+      // Reset per-warp ready-run trackers for warps owned by this CTA slot so a
+      // reused slot (bwd multi-wave) starts clean.
+      for (unsigned w = 0; w < MAX_WARP_PER_SHADER; ++w) {
+        if (m_physical_warp[w] != nullptr &&
+            m_physical_warp[w]->get_cta_id() == cta_num) {
+          m_producer_spin_prev_ready[w] = false;
+          m_producer_spin_in_ready_run[w] = false;
+        }
+      }
+    }
+
     // [CTA-imbalance diag] Emit this CTA's finish cycle, elapsed cycles, and raw
     // tensor-op (WGMMA) count so tail-drain can be correlated with tensor density
     // AND per-CTA duration. Keyed by hardware CTA slot so multi-wave SMs (bwd)
@@ -2113,6 +2199,9 @@ void SM::handle_sync_instruction(warp_inst_t &inst, unsigned int warp_id) {
                                     inst.sync_semantic_raw});
       if (m_config->producer_tail_instrument_enable) {
         record_producer_tail_phasechk_result(warp_id, wait_ready);
+      }
+      if (m_config->producer_spin_ready_instrument_enable) {
+        record_producer_spin_phasechk_result(warp_id, wait_ready);
       }
       if (wait_ready) {
         m_sync_debug_wait_released++;

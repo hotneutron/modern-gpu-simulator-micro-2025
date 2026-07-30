@@ -935,6 +935,9 @@ void Subcore::issue(SM *shared_sm) {
           if (m_config->producer_tail_instrument_enable) {
             shared_sm->record_producer_tail_issue(sm_warp_id, pI);
           }
+          if (m_config->producer_spin_ready_instrument_enable) {
+            shared_sm->record_producer_spin_issue(sm_warp_id, pI);
+          }
           issue_warp(shared_sm, m_ISSUE_CONTROL_latch, pI, active_mask, sm_warp_id, fu, is_fixed_latency_inst, use_traditional_scoreboarding, has_dst_regs, dst_type);
           is_issued_inst = true;
           // [NANOSLEEP spin lever] record whether the winning op is a producer mbarrier spin poll

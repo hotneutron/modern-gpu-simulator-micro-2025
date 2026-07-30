@@ -2261,6 +2261,16 @@ class shader_core_config : public core_config {
   // mbarrier state machine is read but never modified. Default 0.
   bool producer_tail_instrument_enable;
 
+  // [Producer-spin ready-retry probe] Observe-only, whole-producer-lifetime
+  // (NOT gated by consumer drain like producer_tail_*). For every PHASECHK/
+  // TRYWAIT a producer-role warp executes, sample the existing Hopper mbarrier
+  // result and classify it as ready (mbarrier already satisfied but the trace
+  // keeps polling) vs not-ready. Also counts spin-loop opcodes over the whole
+  // lifetime. Sizes the fwd+bwd "excess captured spin" that the tail-only probe
+  // cannot see in bwd (where producer spin is spread across the main loop).
+  // Reads mbarrier state only; never modifies it. Default 0.
+  bool producer_spin_ready_instrument_enable;
+
   // [Head-of-line lever] Observe-only counters for the issue-pipeline head-of-line blocking test.
   // On cycles where the subcore issues nothing because the 1-deep ISSUE_CONTROL latch is full
   // (next_stage_not_available), the normal warp-scan loop is skipped, so we cannot tell whether a
