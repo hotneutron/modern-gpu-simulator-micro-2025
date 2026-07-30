@@ -1025,11 +1025,11 @@ The probe may remain in the tree for reproducibility; a revert is not required. 
 desired later, `git revert ed804b4` removes only the probe while retaining this result.
 
 
-## 17. Next measurement — K5 full-trace perturbation vs simulator tail CPI
+## 17. RESULT — K5 producer-only tail decomposition
 
 ### Existing mbarrier model
 
-This measurement does **not** assume that Hopper mbarrier semantics are missing. The simulator already
+This result does **not** indicate that Hopper mbarrier semantics are missing. The simulator already
 models:
 
 - CTA-scoped mbarrier objects and phase parity;
@@ -1037,79 +1037,135 @@ models:
 - TMA completion binding;
 - `PHASECHK` / `TRYWAIT` through `is_sync_wait_satisfied()`.
 
-The unresolved distinction is narrower. `PHASECHK` is correctly modeled as a nonblocking predicate test,
-but the simulator replays the dynamic control-flow path captured by NVBit. The probe determines whether
-the full tracer captured a longer retry path, or whether the simulator takes too many cycles to execute
-the same producer-tail instruction stream. No mbarrier state or timing is changed.
+The producer-tail probe reads the existing readiness result and changes no mbarrier state, issue
+condition, trace order, or instruction count.
 
-### Probe A — full-trace EXIT sidecar on H100
+### Full-trace sidecar — timing result rejected
 
 Code commit `b5390dc` adds `WARP_LIFETIME_SIDECAR=1`. Unlike `WARP_LIFETIME_ONLY=1`, sidecar mode retains
 the complete dynamic trace and normal TMA/sync post-processing while also recording the final
 `clock64()` value at each warp's SASS `EXIT`.
 
-The two lifetime modes are mutually exclusive and default-off. K5 command:
+The sidecar capture was complete (132 CTAs, 2,112 warp EXIT records, no missing CTA or cross-SM
+mismatch), but full instruction instrumentation destroyed the timing:
 
-```bash
-unset WARP_LIFETIME_ONLY
-WARP_LIFETIME_SIDECAR=1 \
-DYNAMIC_KERNEL_LIMIT_START=5 \
-./util/tracer_nvbit/run_hw_trace.py \
-  -B flashattn:flashattn-fa3-bf16-bwd-causal-b1-s2048-hd64-nh24 \
-  -D 0 -l 5
-```
+| K5 H100 tail | EXIT-only | Full-trace sidecar |
+|---|---:|---:|
+| P50 | 7,916 | 56,038,667 |
+| Mean | 7,950.9 | 56,239,407.5 |
+| P95 | 8,074 | 90,852,956 |
+| Max | 10,024 | 187,425,326 |
 
-The sidecar writes a separate directory and does not overwrite either prior run:
+Full tracing inflated the measured tail by 7,073x and erased the natural CTA distribution
+(`r=0.028` against EXIT-only per-CTA tails). The sidecar itself did not materially alter the full-trace
+workload: original vs sidecar callback counts were `47,401,323` vs `47,387,527` (`-0.029%`).
 
-```text
-<run>-fulltrace-lifetime-k5/traces/dynamic_trace.pb
-<run>-fulltrace-lifetime-k5/traces/warp_exit_timestamps.csv
-```
+Therefore the full-trace `clock64()` result is rejected as an HW timing reference. It proves that
+full NVBit collection strongly perturbs wall-clock timing, but it cannot separate captured polling
+control flow from simulator timing. The valid HW target remains the three-run EXIT-only measurement.
 
-Compare the K5 producer-only tail against:
+### Simulator result (`K5 .o64`, original trace)
 
-```text
-EXIT-only H100 mean = 7,950.9 cycles
-current sim mean    = 19,298.6 cycles
-```
-
-### Probe B — simulator producer-tail decomposition
-
-Enable:
+The probe emitted 132 complete `[PRODTAIL]` records with the expected role set
+(`1 producer + 12 consumers` per CTA). All per-CTA invariants passed:
 
 ```text
--producer_tail_instrument_enable 1
-```
-
-The probe activates after every consumer-role warp in a CTA has drained while a producer-role warp
-remains live. It emits one `[PRODTAIL]` line per CTA with:
-
-- `tail_cycles` and total producer `issued`;
-- issued classes: `phasechk`, `nanosleep`, `branch`, `tma`, `other`;
-- existing mbarrier results: `phasechk_ready` and `phasechk_not_ready`;
-- producer-SMSP non-issue reasons: not-selected, next-stage, issue-port, no-valid, wait-barrier,
-  stall-count, FU occupied, instruction barrier, TMA flush, scoreboard, L1C, result queue, yield, and
-  unattributed.
-
-The stall-reason fields are overlapping diagnostics. The invariant fields are:
-
-```text
+tail_cycles = producer_last_drain - consumer_last_drain
 issued = phasechk + nanosleep + branch + tma + other
-tail_CPI = tail_cycles / issued
 ```
 
-The probe reads the existing mbarrier result inside `handle_sync_instruction()` and leaves all mbarrier
-state, issue conditions, trace order, and instruction counts unchanged.
+The timing and work counters also stayed at the established values:
 
-### Decision after the run
+```text
+gpu_sim_cycle          = 104,617
+gpu_sim_insn           = 455,565,060
+gpgpu_n_tot_w_icount   = 16,064,281
+```
 
-| Observation | Conclusion | Next implementation |
-|---|---|---|
-| Full-trace HW tail approaches 19K | Full NVBit capture inflates the dynamic retry path | Normalize captured polling into a semantic wait |
-| Full-trace HW tail remains near 8K | Simulator tail CPI is too high | Fix the dominant `[PRODTAIL]` stall class |
-| `issued > 7,951` on the mean CTA | Captured tail work cannot fit the EXIT-only HW mean at 1 issue/cycle | Trace-control-flow correction is required |
-| Many tail `PHASECHK` execute with `phasechk_ready` | Existing mbarrier says ready while captured retry records continue | Skip only ready-after-capture retry bodies |
-| `issued <= 7,951`, but `tail_CPI` is high | Dynamic work can fit HW; timing model is the excess | Correct pipeline/stall timing, not trace work |
+Tail mismatch:
 
-Any later timing fix must remain default-off during validation and preserve `gpu_sim_insn`, HGMMA, MUFU,
-and TMA counts bit-identically.
+| K5 tail | H100 EXIT-only | Sim `.o64` | Sim/HW |
+|---|---:|---:|---:|
+| Mean | 7,950.9 | 20,117.6 | 2.53x |
+| P50 | 7,916 | 20,630 | 2.61x |
+| P95 | 8,074 | 23,410 | 2.90x |
+| Max | 10,024 | 24,318 | 2.43x |
+
+The current last-finishing sim CTA is CTA 56:
+
+```text
+tail_cycles=23,614
+issued=4,044
+tail_CPI=5.84
+HW maximum tail=10,024
+critical-tail excess=13,590 cycles
+```
+
+Using the HW maximum as a conservative sizing target gives
+`91,027 cycles (34.5% error, -13.0% vs current)`. This is an upper-bound estimate, not a demonstrated
+cycle reduction.
+
+### New findings
+
+The mean producer tail contains only 3,468.9 issued instructions but takes 20,117.6 cycles:
+
+| Metric | K5 mean |
+|---|---:|
+| Producer instructions | 3,468.9 |
+| Issue fraction | 17.2% |
+| Stall fraction | 82.8% |
+| Tail CPI | 5.80 |
+| CPI required to fit the same work in the HW mean tail | 2.29 |
+
+The tail is overwhelmingly polling control:
+
+| Issued class | Mean | Share |
+|---|---:|---:|
+| `PHASECHK` / `TRYWAIT` | 1,589.1 | 45.8% |
+| `NANOSLEEP` | 789.9 | 22.8% |
+| Branch | 834.1 | 24.0% |
+| TMA + other | 255.8 | 7.4% |
+
+Thus 92.6% of tail-issued instructions are polling control, but the captured instruction count is not
+a physical lower bound preventing an 8K tail: 3,468.9 instructions can fit within 7,950.9 HW cycles.
+
+The existing Hopper mbarrier result was ready for 54.4% of executed tail `PHASECHK` / `TRYWAIT`
+instructions. This does not by itself prove that the next captured branch incorrectly retries, but it
+rules out the interpretation that the complete tail is simply waiting for an unready Hopper mbarrier.
+
+Non-issue reasons (overlapping, normalized by `stall_cycles`):
+
+| Producer-tail stall reason | Fraction |
+|---|---:|
+| SASS dependency `wait_barrier` | 68.8% |
+| `stall_count` | 25.1% |
+| FU occupied | 6.1% |
+| no-valid | 4.9% |
+| issue-port | 0.3% |
+| not-selected | <0.1% |
+
+The 11,462.5 mean cycles attributed to `wait_barrier` are **not** Hopper mbarrier waits. They are SASS
+control-code read/write dependency scoreboard waits evaluated by `are_wait_barriers_ready`. In contrast,
+Hopper mbarrier phase/transaction readiness is the separate nonblocking `PHASECHK` result above.
+
+`next_stage`, traditional scoreboard, TMA flush, instruction barrier, and result-queue stalls were zero;
+not-selected averaged less than one cycle per CTA. This rules out inter-warp contention, Opt-10
+issue-latch blocking, and TMA store drain as the producer-tail wall.
+
+Numerically, `20,117.6 - 11,462.5 = 8,655.1 cycles`, close to the HW mean of 7,950.9. This is only a
+sizing clue because stall reasons overlap; removing one condition can expose another.
+
+### Next decision
+
+Reopen the K5 producer-tail axis as a real simulator fidelity problem. Before changing timing, extend
+the simulator probe with:
+
+- exclusive `wait_barrier`-only cycles in the producer tail;
+- blocked head PC/opcode and wait-SB id;
+- PC/opcode that armed the pending SB;
+- pending counter value and age at each blocked cycle.
+
+If `wait_barrier` remains the sole unmet condition for most of the 11.5K cycles, fix the SASS dependency
+barrier lifetime/release model. If it mostly overlaps `stall_count` or FU occupancy, use the exclusive
+partition to select the actual timing lever. Any fix must remain default-off during validation and
+preserve `gpu_sim_insn`, HGMMA, MUFU, and TMA counts bit-identically.
