@@ -1237,3 +1237,31 @@ K10 as usual and collect `[PRODSPIN]`.
 Any later fix that removes the replayed-spin cycle cost must preserve `gpu_sim_insn`, HGMMA, MUFU, and
 TMA counts bit-identically (retire the captured ops; remove only their stall cycles), and must be a
 general mbarrier-polling mechanism, not a K5-specific clamp. It must not regress K10.
+
+### Reconciling with the "work matches HW" result (thread-inst vs warp-inst)
+
+An apparent contradiction: section 1 reports work as invariant (thread-inst 455,565,060 sim vs
+457,900,688 HW = 1.00x), yet the producer is said to over-poll. If a loop runs far more often, why is
+instruction count not far larger? Because the two statements use different instruction scales:
+
+| Scale | Sim | HW | Ratio |
+|---|---:|---:|---:|
+| thread-inst executed | 455,565,060 | 457,900,688 | 1.00x |
+| warp-inst issued | 16,064,281 | 14,482,551 | 1.109x |
+
+`thread-inst = warp-inst x active-lanes`. The spin loop (`PHASECHK/NANOSLEEP/BRA`) runs on the
+producer's elected lane, i.e. effectively 1 active lane, while consumer compute (HGMMA etc.) runs on
+32 lanes. So extra spin iterations inflate warp-inst but contribute almost nothing to thread-inst.
+The "work matches at 1.00x" holds on the thread-inst scale precisely because spin is lane-sparse and
+hides there; the excess appears only on the warp-inst scale (1.109x).
+
+Quantitatively the warp-inst excess is 16,064,281 - 14,482,551 = 1,581,730. The trace's dynamic spin
+opcodes (PHASECHK 407,234 + NANOSLEEP 407,234 + BRA 576,296 = 1,390,764) account for 88% of it, and
+the sim's implied average active lanes is 455,565,060 / 16,064,281 = 28.36 (not 32), consistent with
+lane-sparse spin diluting the thread-inst average. So the 1.109x warp-inst gap is not purely a
+predication-definition artifact as section 1 states; a large part is real, lane-sparse, replayed spin.
+
+This does not contradict work-invariance and does not by itself prove a cycle lever: lane-sparse ops
+are cheap per issue. It reframes the 1.109x as "mostly replayed producer spin, hidden on the
+thread-inst scale," and the `[PRODSPIN]` `ready_run_retries` count is the test for how much of that
+spin is redundant (barrier already satisfied) rather than a genuine wait.
