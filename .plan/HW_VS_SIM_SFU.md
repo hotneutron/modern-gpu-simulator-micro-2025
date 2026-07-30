@@ -1241,27 +1241,47 @@ general mbarrier-polling mechanism, not a K5-specific clamp. It must not regress
 ### Reconciling with the "work matches HW" result (thread-inst vs warp-inst)
 
 An apparent contradiction: section 1 reports work as invariant (thread-inst 455,565,060 sim vs
-457,900,688 HW = 1.00x), yet the producer is said to over-poll. If a loop runs far more often, why is
-instruction count not far larger? Because the two statements use different instruction scales:
+457,900,688 HW = 1.00x), yet the producer is said to over-poll. Worse, the sim thread-inst is slightly
+*lower* than HW - which is impossible if the sim genuinely executes more spin. Resolving this shows the
+1.00x "match" is a measurement artifact, not evidence of equal work.
 
-| Scale | Sim | HW | Ratio |
-|---|---:|---:|---:|
-| thread-inst executed | 455,565,060 | 457,900,688 | 1.00x |
-| warp-inst issued | 16,064,281 | 14,482,551 | 1.109x |
+The two thread-inst numbers are not the same kind of measurement:
 
-`thread-inst = warp-inst x active-lanes`. The spin loop (`PHASECHK/NANOSLEEP/BRA`) runs on the
-producer's elected lane, i.e. effectively 1 active lane, while consumer compute (HGMMA etc.) runs on
-32 lanes. So extra spin iterations inflate warp-inst but contribute almost nothing to thread-inst.
-The "work matches at 1.00x" holds on the thread-inst scale precisely because spin is lane-sparse and
-hides there; the excess appears only on the warp-inst scale (1.109x).
+| Quantity | Sim | HW | Source |
+|---|---:|---:|---|
+| warp-inst | 16,064,281 | 14,482,551 | sim retire counter / NCU `Executed Instructions` |
+| avg active lanes/warp | 28.36 | 31.62 | sim 455.57M/16.06M / NCU `Avg. Active Threads Per Warp` |
+| thread-inst | 455,565,060 | 457,900,688 | sim: direct lane sum (`inst.active_count()`); HW: **derived** = 14,482,551 x 31.62 |
 
-Quantitatively the warp-inst excess is 16,064,281 - 14,482,551 = 1,581,730. The trace's dynamic spin
-opcodes (PHASECHK 407,234 + NANOSLEEP 407,234 + BRA 576,296 = 1,390,764) account for 88% of it, and
-the sim's implied average active lanes is 455,565,060 / 16,064,281 = 28.36 (not 32), consistent with
-lane-sparse spin diluting the thread-inst average. So the 1.109x warp-inst gap is not purely a
-predication-definition artifact as section 1 states; a large part is real, lane-sparse, replayed spin.
+The sim thread-inst is a direct lane-accurate sum (`gpu_sim_insn += inst.active_count()`,
+sm.cc:2928). The HW thread-inst is NOT a measured counter - NCU reports warp-inst (14,482,551) and an
+average lane occupancy (31.62); 457,900,688 is their product. So the "1.00x" compares a direct sum
+against a warp-count x average-lane estimate.
 
-This does not contradict work-invariance and does not by itself prove a cycle lever: lane-sparse ops
-are cheap per issue. It reframes the 1.109x as "mostly replayed producer spin, hidden on the
-thread-inst scale," and the `[PRODSPIN]` `ready_run_retries` count is the test for how much of that
-spin is redundant (barrier already satisfied) rather than a genuine wait.
+Why they land close is a cancellation, not agreement:
+
+```text
+Sim: many warp-inst (16.06M) x low avg lane (28.36) = 455.6M
+HW : few  warp-inst (14.48M) x high avg lane (31.62) = 457.9M
+```
+
+The sim runs 1.109x more warp-inst, but its extra ops are the 1-lane spin polls
+(`PHASECHK/NANOSLEEP/BRA`), which drag the average lane occupancy down from 31.62 to 28.36. The two
+effects offset, so the products nearly match - and can even leave the sim product marginally lower.
+This is exactly why the sim thread-inst can be below HW despite more spin: dividing a slightly larger
+lane-sum across many more warp-insts lowers the average, and HW's product uses that higher average.
+
+Quantitatively the warp-inst excess is 16,064,281 - 14,482,551 = 1,581,730, and the trace's dynamic
+spin opcodes (PHASECHK 407,234 + NANOSLEEP 407,234 + BRA 576,296 = 1,390,764) account for 88% of it.
+
+Conclusion: the thread-inst 1.00x is a warp-up x lane-down cancellation artifact and is NOT a valid
+work-match proof. The trustworthy, same-definition comparisons all point the same way:
+
+- warp-inst: sim 16.06M vs HW 14.48M = 1.109x (sim higher);
+- avg active lanes: sim 28.36 vs HW 31.62 (sim lower, i.e. more 1-lane spin);
+- HW branch (NCU hardware counter) 203,049 vs replayed trace 576,296 = 2.84x.
+
+This still does not by itself prove a cycle lever - lane-sparse ops are cheap per issue - but it removes
+"work matches at 1.00x" as a reason to dismiss the over-poll. The `[PRODSPIN]` `ready_run_retries`
+count remains the test for how much of the replayed spin is redundant (barrier already satisfied)
+rather than a genuine wait.
