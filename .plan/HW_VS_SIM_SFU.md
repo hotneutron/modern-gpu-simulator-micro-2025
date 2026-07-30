@@ -1023,3 +1023,93 @@ The EXIT-only implementation is isolated in code commit `ed804b4` and is default
 
 The probe may remain in the tree for reproducibility; a revert is not required. If code cleanup is
 desired later, `git revert ed804b4` removes only the probe while retaining this result.
+
+
+## 17. Next measurement — K5 full-trace perturbation vs simulator tail CPI
+
+### Existing mbarrier model
+
+This measurement does **not** assume that Hopper mbarrier semantics are missing. The simulator already
+models:
+
+- CTA-scoped mbarrier objects and phase parity;
+- arrive counts and expected/completed transaction bytes;
+- TMA completion binding;
+- `PHASECHK` / `TRYWAIT` through `is_sync_wait_satisfied()`.
+
+The unresolved distinction is narrower. `PHASECHK` is correctly modeled as a nonblocking predicate test,
+but the simulator replays the dynamic control-flow path captured by NVBit. The probe determines whether
+the full tracer captured a longer retry path, or whether the simulator takes too many cycles to execute
+the same producer-tail instruction stream. No mbarrier state or timing is changed.
+
+### Probe A — full-trace EXIT sidecar on H100
+
+Code commit `b5390dc` adds `WARP_LIFETIME_SIDECAR=1`. Unlike `WARP_LIFETIME_ONLY=1`, sidecar mode retains
+the complete dynamic trace and normal TMA/sync post-processing while also recording the final
+`clock64()` value at each warp's SASS `EXIT`.
+
+The two lifetime modes are mutually exclusive and default-off. K5 command:
+
+```bash
+unset WARP_LIFETIME_ONLY
+WARP_LIFETIME_SIDECAR=1 \
+DYNAMIC_KERNEL_LIMIT_START=5 \
+./util/tracer_nvbit/run_hw_trace.py \
+  -B flashattn:flashattn-fa3-bf16-bwd-causal-b1-s2048-hd64-nh24 \
+  -D 0 -l 5
+```
+
+The sidecar writes a separate directory and does not overwrite either prior run:
+
+```text
+<run>-fulltrace-lifetime-k5/traces/dynamic_trace.pb
+<run>-fulltrace-lifetime-k5/traces/warp_exit_timestamps.csv
+```
+
+Compare the K5 producer-only tail against:
+
+```text
+EXIT-only H100 mean = 7,950.9 cycles
+current sim mean    = 19,298.6 cycles
+```
+
+### Probe B — simulator producer-tail decomposition
+
+Enable:
+
+```text
+-producer_tail_instrument_enable 1
+```
+
+The probe activates after every consumer-role warp in a CTA has drained while a producer-role warp
+remains live. It emits one `[PRODTAIL]` line per CTA with:
+
+- `tail_cycles` and total producer `issued`;
+- issued classes: `phasechk`, `nanosleep`, `branch`, `tma`, `other`;
+- existing mbarrier results: `phasechk_ready` and `phasechk_not_ready`;
+- producer-SMSP non-issue reasons: not-selected, next-stage, issue-port, no-valid, wait-barrier,
+  stall-count, FU occupied, instruction barrier, TMA flush, scoreboard, L1C, result queue, yield, and
+  unattributed.
+
+The stall-reason fields are overlapping diagnostics. The invariant fields are:
+
+```text
+issued = phasechk + nanosleep + branch + tma + other
+tail_CPI = tail_cycles / issued
+```
+
+The probe reads the existing mbarrier result inside `handle_sync_instruction()` and leaves all mbarrier
+state, issue conditions, trace order, and instruction counts unchanged.
+
+### Decision after the run
+
+| Observation | Conclusion | Next implementation |
+|---|---|---|
+| Full-trace HW tail approaches 19K | Full NVBit capture inflates the dynamic retry path | Normalize captured polling into a semantic wait |
+| Full-trace HW tail remains near 8K | Simulator tail CPI is too high | Fix the dominant `[PRODTAIL]` stall class |
+| `issued > 7,951` on the mean CTA | Captured tail work cannot fit the EXIT-only HW mean at 1 issue/cycle | Trace-control-flow correction is required |
+| Many tail `PHASECHK` execute with `phasechk_ready` | Existing mbarrier says ready while captured retry records continue | Skip only ready-after-capture retry bodies |
+| `issued <= 7,951`, but `tail_CPI` is high | Dynamic work can fit HW; timing model is the excess | Correct pipeline/stall timing, not trace work |
+
+Any later timing fix must remain default-off during validation and preserve `gpu_sim_insn`, HGMMA, MUFU,
+and TMA counts bit-identically.
