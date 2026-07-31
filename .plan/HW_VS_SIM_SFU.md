@@ -1362,3 +1362,639 @@ Direction for the fix (design pending, not yet implemented):
   captured spin, vs (2) simulator replay-side loop termination on modeled
   mbarrier-ready. Must be a general mbarrier-polling mechanism, not a K5 clamp,
   and must not regress K10.
+
+
+## 19. STATIC SASS proof — the spin `wait_barrier` is loop-internal, so over-poll IS the cycle lever (2026-07-31)
+
+This was settled **without running the simulator**, by decoding the SASS control bits of the producer
+spin loop directly. It closes the §17/§18 open question ("is the tail cost `branch` itself, or a separate
+`wait_barrier` axis that would survive removing the spin?"). Answer: they are the SAME loop body — cutting
+the over-poll cuts the `wait_barrier` with it.
+
+### Method (no run needed)
+The dynamic trace's `wait_barrier` = the SASS scoreboard-barrier (SB) dependency encoded in each
+instruction's control word, NOT the Hopper mbarrier (that is the separate nonblocking `PHASECHK` result,
+§17). The decoder is [control_bits.cc:35-41](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/util/traces_enhanced/src/control_bits.cc#L35-L41): from the 2nd 64-bit word, `>> 41`
+([CCPos_arch_7x_8x](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/util/traces_enhanced/src/traced_constants.h#L31)), then
+stall=[3:0], yield=[4], write_bar=[7:5], read_bar=[10:8], wait_mask=[16:11] (id 7 = none). Applied to the
+producer spin loop in
+[flash_fwd_hdim64_bf16_sm90.sm_90a.sass:4771-4778](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/hw_run/traces/device-0/12.8/flashattn-fa3-bf16-bwd-causal-b1-s2048-hd64-nh24/flashattn_fa3_bf16_bwd_causal_b1_s2048_hd64_nh24___warmup_0___iters_1/traces/extra_info/sass/flash_fwd_hdim64_bf16_sm90.sm_90a.sass#L4771-L4778).
+
+### The decoded spin loop (fwd, `PHASECHK/NANOSLEEP/BRA`)
+| PC | op | stall | write_bar | read_bar | wait_mask |
+|---|---|---|---|---|---|
+| 94f0 | `SYNCS.PHASECHK.TRANS64.TRYWAIT` | 2 | **SB#3** | **SB#1** | **SB#1** |
+| 9500 | `@!P0 NANOSLEEP.SYNCS` | 5 | none | none | SB#3 |
+| 9510 | `@!P0 SYNCS.PHASECHK.TRANS64` | 2 | SB#3 | none | none |
+| 9520 | `@!P0 BRA 0x94f0` | 5 | none | none | SB#3 |
+
+### Findings (static, definitive)
+1. **The spin loop's `wait_barrier` is the SYNCS/PHASECHK op's OWN result-dependency**, not WGMMA and not
+   TMA. Each `TRYWAIT` arms SB#3 (write) + SB#1 (read); the very next ops (`NANOSLEEP`, `BRA`) wait on those
+   SBs. This is exactly the §17 result that 68.8% of tail stall is `wait_barrier` that is NOT a Hopper
+   mbarrier wait — now identified at the instruction level.
+2. **One iteration is inherently multi-cycle** (not 1): `TRYWAIT` waits SB#1, then `NANOSLEEP`/`BRA` each
+   carry stall=5 + wait SB#3. This is the static origin of §17's measured ~5.8 CPI/iteration. So the trace
+   running the loop 2.84× (fwd) / 3.67× (bwd) more than HW multiplies a **multi-cycle** body — confirming
+   statically that "more branches" directly inflates the producer tail and thus the CTA finish / kernel
+   cycle. (The user's intuition is correct; issue-slot contention is irrelevant to this — the cost is that
+   the warp stays alive executing a multi-cycle loop body, not that it steals another warp's slot.)
+3. **The SB dependency is loop-LOCAL: it does not leak past the loop.** The entry TRYWAITs (93e0/9460/94a0)
+   arm an SB but have `wait_mask=0` (single check, branch on P0 only); the loop-exit `BSYNC` (9530) and
+   `EXIT` (9540) both have `wait_mask=0`. So SB#1/#3 are armed→waited→consumed entirely INSIDE the loop
+   body. There is no post-loop instruction still blocked on them.
+
+### Consequence for the fix (this is the new, actionable conclusion)
+Because the `wait_barrier` lives inside the spin-loop body and does not survive loop exit, **removing the
+redundant iterations removes their `wait_barrier` cycles with them.** The §17 worry ("removing one stall
+condition may just expose another") does NOT apply here: the `wait_barrier` is not a separate parallel
+axis, it is the per-iteration cost of the very iterations we would drop. Therefore:
+- ending the producer poll at the modeled-mbarrier-ready event (the §18 fix direction) should reduce the
+  tail by ~(redundant-iterations × ~5.8 CPI), i.e. it is expected to be a real cycle lever, not just an
+  instruction-count change.
+- this is consistent with the §16/§17 oracle sizing (fwd critical CTA 56: tail 24,760 vs HW-max 10,024 ⇒
+  ~89–91K cycles, 1.56× → ~1.34×), now with a mechanism-level reason to believe the wait_barrier portion
+  is recoverable rather than a floor.
+
+### bwd (K10) confirmed IDENTICAL (2026-07-31) — static decode of the bwd SASS image
+The bwd kernel's SASS is a separate image
+[flash_bwd_hdim64_bf16_softcapall_sm90.sm_90a.sass](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/hw_run/traces/device-0/12.8/flashattn-fa3-bf16-bwd-causal-b1-s2048-hd64-nh24/flashattn_fa3_bf16_bwd_causal_b1_s2048_hd64_nh24___warmup_0___iters_1/traces/extra_info/sass/flash_bwd_hdim64_bf16_softcapall_sm90.sm_90a.sass#L4049-L4055)
+(NOT the `flash_fwd_*` image). Decoded its tight spin loop 7e60-7e90:
+
+| PC | op | stall | write_bar | read_bar | wait_mask |
+|---|---|---|---|---|---|
+| 7e60 | `SYNCS.PHASECHK.TRANS64.TRYWAIT` | 2 | SB#3 | **SB#2** | **SB#2** |
+| 7e70 | `@!P0 NANOSLEEP.SYNCS` | 5 | none | none | SB#3 |
+| 7e80 | `@!P0 SYNCS.PHASECHK.TRANS64` | 2 | SB#3 | none | none |
+| 7e90 | `@!P0 BRA 0x7e60` | 5 | none | none | SB#3 |
+| 7ea0 | `BSYNC` (loop exit) | 5 | none | none | **0** |
+| 7eb0 | `EXIT` | 5 | none | none | **0** |
+
+Same structure as fwd (only the SB ids differ: fwd uses SB#1/#3, bwd uses SB#2/#3): the `TRYWAIT` arms a
+write+read SB and waits the read SB; `NANOSLEEP`/`BRA` carry stall=5 + wait the write SB; and the loop-exit
+`BSYNC`/`EXIT` have `wait_mask=0`, so the SB dependency is again **loop-local** and does not leak past exit.
+A second producer poll loop (7ed0-7f00, on a different mbarrier addr `+0x30c00`) shows the identical
+arm/wait/exit pattern, confirming it is the general per-mbarrier producer spin, not a one-off.
+
+⇒ **All three §19 findings hold for bwd identically.** The over-poll fix is therefore a SINGLE general
+mbarrier-polling mechanism that applies to both kernels (matches the §18 requirement "must not be a K5
+clamp"). fwd and bwd differ only in WHERE the spin lands (fwd: post-drain tail; bwd: main-loop-resident,
+§18), not in the loop's SB-dependency structure.
+
+### Still to verify (does not change the above, but tightens the number)
+- Confirm at the trace/replay level that the redundant (post-ready) iterations carry the SB wait in the
+  sim exactly as the static control bits imply (i.e. the sim's `are_wait_barriers_ready` is gating on
+  SB#1/#3 here) — the arm/disarm path is [subcore.cc:378-382](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/subcore.cc#L378-L382)
+  (arm on new read/write barrier) and [warp_dependency_state.cc:141-148](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/warp_dependency_state.cc#L141-L148)
+  (block at issue). Static bits already show this must be so; a targeted probe would only quantify it.
+
+
+## 20. Root cause of the trace over-poll + chosen fix plan (two-run NVBit calibration) (2026-07-31)
+
+### Why the tracer inflates the producer spin (code-confirmed, not speculation)
+Read-only audit of the NVBit tracer confirmed §18's hypothesis at the code level:
+- **Every instruction is instrumented, no opcode skip** — `nvbit_insert_call(instr, "instrument_inst",
+  IPOINT_BEFORE)` at [tracer_tool.cu:1957-1959](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/util/tracer_nvbit/tracer_tool/tracer_tool.cu#L1957); NANOSLEEP/PHASECHK/TRYWAIT/BRA are treated like any other op.
+- **Each instrumented op pays a heavy per-op cost** — a warp-wide `__shfl_sync` ×32 gather + a several-hundred-byte
+  `inst_trace_t` channel push + atomicAdd at [inject_funcs.cu:158-163](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/util/tracer_nvbit/tracer_tool/inject_funcs.cu#L158). Record struct is 32-lane arrays ([common.h:40-63](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/util/tracer_nvbit/tracer_tool/common.h#L40)).
+- **The inflation is a CLOCK SKEW, not redundant polling.** The consumer warps run many instrumented ops so their
+  wall-clock is dilated enormously; the producer's `NANOSLEEP 0x989680` is a fixed **real-time** hardware sleep
+  that instrumentation does NOT dilate. So per unit of consumer progress the producer polls far more often. Every
+  captured poll was genuinely not-ready **at that dilated instant** — the producer exits the loop immediately once
+  `TRYWAIT` returns P0=true (`@!P0 NANOSLEEP`/`@!P0 BRA` predicate-off). There is NO "post-ready redundant" poll on
+  the tracer/HW side; the §18 `ready_run_retries` is a SIM-frame statement (sim's own mbarrier model already ready),
+  not a claim that the producer spun after HW readiness. Do not conflate the two frames.
+- No existing tracer knob filters/caps/normalizes spin (confirmed by directory-wide search). The only lightweight
+  precedent is the `WARP_LIFETIME_ONLY` EXIT-only mode ([tracer_tool.cu:1771-1786](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/util/tracer_nvbit/tracer_tool/tracer_tool.cu#L1771)).
+
+Consequence: because the poll count N is purely a function of the capture-time consumer dilation, the tracer cannot
+know the "correct" poll count from within the heavy run — it has no HW-timing reference during capture.
+
+### CHOSEN PLAN (try first): two-run NVBit calibration — measure the correct poll count, don't estimate it
+Instead of scaling by a global ratio (÷2.84 fwd / ÷3.67 bwd — which would smear the §16 per-CTA structure), run
+NVBit **twice** and use the light run as ground truth for how many polls each spin burst should have:
+- **Run 1 (heavy, current):** full dynamic trace. Producer polls N times per burst (inflated by consumer dilation).
+- **Run 2 (light):** a new ultra-light NVBit mode that instruments ONLY the spin PCs (PHASECHK/TRYWAIT/BRA) and does
+  nothing but a per-(CTA,warp) atomic counter — no shfl gather, no `inst_trace_t` push. Minimal dilation ⇒ producer
+  poll count M ≈ real HW. Build it on the `WARP_LIFETIME_ONLY` skeleton.
+- **Go/no-go gate:** compare Run 2's poll/branch count against the NCU hardware branch counters (fwd 203,049 /
+  bwd 229,938, §18). If Run 2 ≈ NCU ⇒ the residual dilation is negligible and Run 2 is trustworthy. If not ⇒ Run 2
+  is still too heavy (or the approach doesn't hold) ⇒ fall back to the sim-side plan below.
+- **Trim:** post-process the Run 1 trace so each producer spin burst keeps only M iterations (Run 2 value for that
+  CTA/warp/burst), dropping the excess (N−M). §19 showed every spin iteration is identical (same control bits) and
+  the SB `wait_barrier` is loop-local, so dropping any interior iterations is exact; keep the final ready-exit
+  iteration. Then re-run the sim on the corrected trace and measure cycles.
+
+### Open design questions to resolve BEFORE spending a 12h run (investigate in code first)
+1. **Light-mode feasibility:** can we instrument only the spin PCs with just a counter, reusing the
+   `WARP_LIFETIME_ONLY` gating pattern? How are the spin PCs identified (opcode string PHASECHK/TRYWAIT + the
+   NANOSLEEP/BRA that follow, or the loop-back BRA target)?
+2. **Run1↔Run2 mapping:** the two runs are independent launches, so CTA→SM placement and per-run poll counts differ.
+   The mapping unit must be a **spin-burst instance** (producer waiting on one mbarrier at one loop PC), not a raw
+   poll index. Producer control flow is deterministic, so the NUMBER and ORDER of bursts should match across runs
+   even though the iteration count within each burst differs — **verify this determinism holds** (same burst count
+   per CTA/warp in both runs) before trusting the trim.
+3. **Trace-consistency after trim:** trimming changes `gpu_sim_insn` / branch / PHASECHK / NANOSLEEP counts. This
+   intentionally BREAKS the old bit-identical guardrail because the baseline itself is being corrected toward HW.
+   Record the corrected counts as the NEW reference; the HGMMA/MUFU/TMA counts (real compute) must stay unchanged —
+   only the spin opcodes change. Confirm the trim touches ONLY spin-PC ops.
+
+### Advantage over global scaling / over the sim-side fix
+- Per-CTA/warp measured counts directly target §16's structured K10 mismatch (some CTA populations over-modeled,
+  some under-modeled) instead of averaging it away.
+- The sim timing model is untouched — the sim just replays a corrected trace; no "when does the sim stop replaying"
+  logic needed.
+
+### FALLBACK (if the two-run calibration fails the go/no-go gate)
+Go to the sim-side approach: end the producer poll loop on the simulator's OWN modeled-mbarrier-ready event
+(the sim already knows when the barrier is satisfied — §18 `ready_run_retries`). Retire the captured spin ops
+(preserve `gpu_sim_insn` bit-identically) while removing only their stall/timing cost; §19 proved the spin
+`wait_barrier` is loop-local so removing it exposes no other stall. Must be a general mbarrier-polling mechanism
+(works for both K5 and K10, §19 bwd confirmed identical), gated + default-off, not a K5 clamp.
+
+Decision order: (1) build light mode + verify determinism → (2) Run 2 vs NCU gate → (3a) if pass, trim + measure;
+(3b) if fail, sim-side ready-based early-stop.
+
+
+## 21. Code investigation for the two-run plan — feasibility CONFIRMED + a simplification (2026-07-31)
+
+Read-only source audit of the tracer + trace format to answer the §20 "resolve before a 12h run" questions.
+All three are answered, and one finding materially simplifies the plan.
+
+### Q1 — Light-mode feasibility: YES, `WARP_LIFETIME_ONLY` is a ready-made skeleton
+The EXIT-only mode is exactly the template a spin-counter mode needs, end-to-end:
+- **Gating / instrument-skip:** [tracer_tool.cu:1747-1751](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/util/tracer_nvbit/tracer_tool/tracer_tool.cu#L1747) skips the normal per-inst
+  instrumentation when `warp_lifetime_only`; [tracer_tool.cu:1771-1780](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/util/tracer_nvbit/tracer_tool/tracer_tool.cu#L1771) instruments ONLY the
+  opcode of interest (there: `EXIT`) then `continue`s. A spin-counter mode would instead match the spin
+  opcodes and `continue`.
+- **Ultra-light device fn:** [inject_funcs.cu:170-203](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/util/tracer_nvbit/tracer_tool/inject_funcs.cu#L170) `record_warp_exit` takes only
+  `(pred, capture_ptr)`, uses `__ballot_sync` + first-active-lane, and writes one per-(cta,warp) slot. NO
+  `__shfl_sync ×32` gather and NO `inst_trace_t` channel push (the heavy parts, [inject_funcs.cu:158-163](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/util/tracer_nvbit/tracer_tool/inject_funcs.cu#L158)).
+  A spin counter is even lighter: replace `capture->exit_clock[slot]=clock64()` with
+  `atomicAdd(&capture->poll_count[slot],1)`.
+- **Buffer + host dump plumbing already exists:** managed alloc [tracer_tool.cu:3519-3525](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/util/tracer_nvbit/tracer_tool/tracer_tool.cu#L3519),
+  per-launch reset [tracer_tool.cu:2206-2238](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/util/tracer_nvbit/tracer_tool/tracer_tool.cu#L2206), CSV dump
+  [tracer_tool.cu:2250-2287](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/util/tracer_nvbit/tracer_tool/tracer_tool.cu#L2250); struct `warp_lifetime_capture_t`
+  [common.h:69-78](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/util/tracer_nvbit/tracer_tool/common.h#L69) (add a `poll_count[SLOTS]` field, or a parallel struct).
+
+### Q1b — spin PC identification: trivial via opcode prefix (pattern already in the tracer)
+The tracer already classifies sync ops by opcode-string prefix with `rfind(op,0)==0`
+([get_sync_runtime_capture_kind, tracer_tool.cu:371-390](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/util/tracer_nvbit/tracer_tool/tracer_tool.cu#L371): `SYNCS.PHASECHK`, etc.). The
+spin loop opcodes are `SYNCS.PHASECHK...TRYWAIT`, `NANOSLEEP.SYNCS`, `BRA` (§19). Simplest robust proxy:
+count the loop-back `BRA` (one per iteration, the §18 branch proxy) — but note a producer warp has many
+BRAs, so match the specific spin form (`@!P0 SYNCS.PHASECHK` immediately followed by `@!P0 BRA` to a
+backward target). Cleanest: count `SYNCS.PHASECHK.TRANS64.TRYWAIT` executions (one per poll iteration,
+directly comparable to the NCU/branch proxy).
+
+### Q2 — Run1↔Run2 mapping + determinism: strong code evidence, final check still empirical
+Trace layout is `threadblock -> warp -> repeated instruction{pc, active_mask, predicate_mask, ...}`
+([tracer_tool.cu:2792-2811](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/util/tracer_nvbit/tracer_tool/tracer_tool.cu#L2792)). So each spin iteration appears in the
+producer warp's stream as a recurrence of the spin loop-entry PC (fwd 0x94f0 / 0x9560 / ...; bwd 0x7e60
+/ 0x7ec0 / ..., §19). Different mbarrier loops = different PCs, so bursts are separable by PC.
+Determinism support already in the doc: §13 `gpu_sim_insn` bit-identical across scheduler changes (control
+flow deterministic); §16 per-CTA HW tails reproducible across 3 runs (r=0.903-0.916); §18 per-warp BRA
+counts are stable per CTA. The burst COUNT/ORDER is set by the workload's tile structure (how many tiles
+each producer waits on), which is data-independent here, so it should match across runs even though the
+iteration count within a burst differs. ⚠️ Still verify empirically: same burst count per (CTA,warp) in
+Run1 vs Run2 before trusting the trim.
+
+### ⭐ Simplification found: Run 2 may be UNNECESSARY — the trim target can come straight from NCU
+Because Run 1's trace ALREADY records every poll as a PC recurrence (Q2), we do not strictly need a second
+NVBit run to LOCATE the polls — only to know the correct COUNT. But the correct count already exists as a
+hardware counter: NCU `BRA` = fwd 203,049 / bwd 229,938 (§18), an un-perturbed HW measurement. Two options:
+- **(minimal) global-ratio trim from NCU only:** scale each burst's iteration count by
+  `NCU_branch / trace_branch` (fwd ÷2.84, bwd ÷3.67). No second run at all. Downside: applies one ratio to
+  all bursts/CTAs, smearing the §16 per-CTA structure — but it is a zero-extra-run first probe to size the
+  cycle effect.
+- **(precise) per-(CTA,warp) trim from Run 2:** the light run gives per-slot poll counts, so each burst is
+  trimmed to its own measured M. This is what preserves §16's per-CTA structure. Worth the (cheap, 20-30min)
+  extra trace run ONLY if the minimal global-ratio probe shows a meaningful cycle gain.
+
+Revised decision order:
+1. **(no new run)** Post-process the EXISTING Run 1 trace: count spin-PC recurrences per producer burst;
+   apply the NCU global ratio to trim; re-run sim; measure the cycle delta. This sizes the lever with zero
+   HW time.
+2. If the cycle gain is meaningful → build the light spin-counter NVBit mode (Q1 skeleton), do the cheap
+   Run 2, verify burst determinism (Q2), and do the precise per-CTA trim to also fix the §16 K10 structure.
+3. If even the precise trim underperforms or determinism fails → fall back to the §20 sim-side
+   ready-based early-stop.
+
+### Guardrail note for the trim (unchanged intent, restated)
+The trim changes only the spin opcodes (PHASECHK/TRYWAIT/NANOSLEEP/BRA); HGMMA/MUFU/TMA (real compute)
+counts must be byte-for-byte unchanged. The trimmed trace becomes the NEW HW-faithful baseline, so the old
+"bit-identical vs the untrimmed trace" guardrail is intentionally superseded for the spin ops only.
+
+
+## 22. NCU source-page gives a CLEAN per-PC HW spin count — the branch ratio was contaminated (2026-07-31)
+
+User pushback (correct): "is the NCU branch count trustworthy? other branches are mixed in." Answer: NO, the
+§18 branch ratio IS contaminated, and the NCU **Source page** (per-PC `Instructions Executed`, a HW
+perf-counter, not instrumentation) lets us replace it with an uncontaminated per-PC spin count.
+
+### Source of the §18 numbers, and why they are contaminated
+`Branch Instructions = 203,049 (fwd K5) / 229,938 (bwd K10)` is the `details` page metric — it counts
+**every BRA in the whole kernel** (consumer loop branches, setup, non-spin producer branches), not just the
+spin loop-back BRA. So the 2.84×/3.67× "branch" ratio mixes spin and non-spin branches; the true spin-only
+inflation is not that ratio. The report is `nv_reports/h100/flashattn-fa3-bf16-bwd-...full_rpt.ncu-rep`;
+`ncu` lives at `/usr/local/cuda/bin/ncu` inside the `gpu-sim` container (not on PATH by default).
+
+### The clean instrument: NCU Source page has per-PC `Instructions Executed`
+`ncu --import <rep> --page source --csv` yields, per SASS PC (`Address`): the `Source` (disassembly) and
+`Instructions Executed` (HW counter). This isolates the spin loop exactly. Blocks are per-kernel; the
+FlashAttn kernels of interest are `cutlass::device_kernel<flash::...FlashAttn...>`.
+
+### ⭐ Key finding: NANOSLEEP-exec ≠ TRYWAIT-exec — only NANOSLEEP counts a REAL wait
+Per-kernel totals, split by kernel TYPE (the bwd-workload report contains BOTH the fwd K5 and bwd K10
+FlashAttn kernels, since the bwd workload also runs the forward pass):
+| HW per-PC exec | FWD K5 (`FlashAttnFwdSm90`) | BWD K10 (`FlashAttnBwdSm90`) |
+|---|---:|---:|
+| `SYNCS.PHASECHK...TRYWAIT` (all PCs) | 40,885 | ~73,908† |
+| **`NANOSLEEP.SYNCS` (all PCs) = real spin** | **8,461** | **7,860** |
+| (contaminated §18 `Branch Instructions`) | 203,049 | 229,938 |
+
+† bwd TRYWAIT ~73,908 = the 147,816 total halved (see duplicate-block note below).
+(A `BwdPostprocessConvertdQ` helper kernel adds 6,144/6,144 — ignore for K5/K10.)
+
+⚠️ **NANOSLEEP is spread over MANY PCs, not one** (user's question). FWD K5 has **21 static NANOSLEEP PCs
+(9 nonzero)**, BWD K10 has **17 static NANOSLEEP PCs per block**. The producer waits on several different
+mbarriers, each in its own spin loop with its own predicate (P0/P1/P3/P4). So the spin count is the SUM
+over all NANOSLEEP PCs, and the trim must be applied per-PC — a single-PC view would undercount.
+
+⚠️ **Duplicate-block correction:** the NCU report contains the `FlashAttnBwdSm90` kernel block TWICE
+(identical PCs + identical exec, e.g. both 7,860; NCU profiled the K10 launch twice). They must NOT be
+summed. Correct bwd real-spin = **7,860** (an earlier pass here wrongly added the two → 15,720; corrected).
+FWD K5 has a single block (8,461, correct).
+
+The NANOSLEEP and TRYWAIT counts differ ~5-9×, and the difference is the whole point:
+- A `TRYWAIT` is executed **once on entry to every poll site** and, on the common fast path, returns
+  P0=true immediately → the guarded `@!P0 NANOSLEEP`/`@!P0 PHASECHK`/`@!P0 BRA` are predicated OFF and the
+  loop is NOT taken. So most TRYWAIT executions are a **single non-blocking check, not a spin**.
+- `NANOSLEEP` executes **only when the barrier was not ready** (`@!P0`), i.e. it counts the iterations where
+  the producer actually waited and looped. **`NANOSLEEP`-exec is the clean HW "real spin iteration" count.**
+- Confirmed at PC level: in a tight spin loop the three PCs `TRYWAIT / @!P0 NANOSLEEP / @!P0 PHASECHK`
+  share the SAME exec count (e.g. 3148/3148/3148, 2804/2804/2804), while standalone TRYWAIT PCs (no
+  NANOSLEEP after them) carry large single-check counts (3168, 7680, 23040 …) that are NOT spin.
+- ⚠️ Note the §18 branch numbers (203,049 / 229,938) are ~24× the real spin (8,461 / 15,720): the branch
+  metric is overwhelmingly NON-spin branches. This is concrete proof the branch ratio was the wrong yardstick.
+
+### Consequence — §21's "trim by the NCU branch ratio" is WITHDRAWN
+- The kernel-total BRA ratio (§18) is contaminated and must NOT be used as the trim factor.
+- The correct HW reference is **per-PC `NANOSLEEP`-exec from the Source page** (the real-wait count), matched
+  against the trace's per-PC spin count at the SAME loop PCs (§19: bwd 7e60/7ec0/…, fwd 94f0/9560/…). This is
+  a clean, definition-matched, per-loop comparison — exactly what the user's objection requires.
+- This ALSO removes the §21 "Run 2 may be unnecessary" simplification's weak leg: we no longer lean on the
+  contaminated NCU branch total. NANOSLEEP-exec IS the HW ground truth, already in the existing report — so a
+  second NVBit run may STILL be unnecessary, but now for a sound reason (clean per-PC HW counter exists),
+  not the contaminated branch ratio.
+
+### Revised trim target (supersedes §21's ratio approach)
+For each producer spin loop PC in the Run-1 trace, count its executed spin iterations (trace per-PC), and
+trim it toward the HW per-PC `NANOSLEEP`-exec for the corresponding loop. The mapping between a trace loop
+PC and a Source-page PC is by the SASS offset / mbarrier address operand (both are in the disassembly, e.g.
+`[R7+URZ+0x16800]`), giving a per-loop, per-mbarrier trim factor instead of one global ratio.
+
+### Is the NCU `Instructions Executed` metric exact or sampled? — EXACT (verified)
+User concern: NCU samples periodically, so does `Instructions Executed` equal the true full-run execution
+count of each NANOSLEEP? YES, it is exact, not the sampled column. The Source page has BOTH kinds side by
+side: `Warp Stall Sampling (All Samples)` / `# Samples` (cols 2-4) are the periodic PC-sampler; `Instructions
+Executed` (col 5) is the separate exact HW counter (`smsp__sass_inst_executed`). Proof at the loop level: the
+5 PCs of one tight spin loop `IMAD / TRYWAIT / @!P0 NANOSLEEP / @!P0 PHASECHK / @!P0 BRA(back)` ALL read
+`Instructions Executed = 3148` exactly, while their `# Samples = 0`. A sampler could not produce five
+identical exact values; the counter can. ⇒ NANOSLEEP-exec = true real-wait iteration count for that loop.
+
+### Each NANOSLEEP = one distinct loop (one mbarrier) — HW per-loop spin counts (deduped block)
+Confirmed structurally: one tight loop body contains exactly one NANOSLEEP; the loop-back BRA targets the
+loop head; distinct NANOSLEEP PCs are distinct loops waiting on distinct mbarriers (distinct address
+operand). HW real-spin per loop (nonzero loops only; bwd from a single deduped block):
+
+| FWD K5 loop PC | HW spin exec | mbarrier |     | BWD K10 loop PC | HW spin exec | mbarrier |
+|---|---:|---|---|---|---:|---|
+| 9c5850 | 132 | R11+URZ |   | 8ac590 | 384 | R7+URZ |
+| 9c58d0 | 3148 | R7+URZ+0x16800 |  | 8ac600 | 777 | R2+URZ+0x30c00 |
+| 9c5ca0 | 662 | R16+URZ+0x16820 |  | 8ac930 | 2017 | R18+URZ+0x30c28 |
+| 9c5de0 | 955 | R5+URZ+0x16840 |  | 8aca70 | 2804 | R18+URZ+0x30c20 |
+| 9c5e40 | 96 | R5+URZ+0x60 |  | 8acb30 | 390 | R18+URZ+0x30c28 |
+| 9c5ea0 | 1051 | R5+URZ+0x16840 |  | 8acbf0 | 720 | R7+URZ |
+| 9c5f00 | 100 | R5+URZ+0x60 |  | 8acc50 | 768 | R9+URZ |
+| 9c5f60 | 484 | R5+URZ+0x16860 |  | | | |
+| 9c5fc0 | 1833 | R15+URZ+0x16820 |  | | | |
+| **TOTAL** | **8461** | |  | **TOTAL** | **7860** | |
+
+⚠️ Mapping caveat for the trim: the HW loop is keyed by SASS PC + register-relative mbarrier operand
+(`R7+URZ+0x16800`), whose base register value is only known at runtime. The trace records the RESOLVED
+mbarrier address per dynamic instruction, so the trace-side burst must be matched to the HW loop by the
+static loop PC (offset), not by the symbolic operand. Some loops share a base+offset (e.g. two FWD loops
+both `R5+URZ+0x16840`) → they are DIFFERENT static PCs (9c5de0 vs 9c5ea0) i.e. genuinely different loops
+that happen to reuse the base register; key on PC.
+
+### Still to do (next, cheap) — the per-loop trace vs HW vs sim comparison the user asked for
+1. From the existing Run-1 protobuf, count each producer spin loop's iterations PER STATIC LOOP PC (match to
+   the HW loop PCs above by SASS offset). Tabulate, per loop: HW-spin (above) vs trace-spin. The per-loop
+   ratio is the true, uncontaminated inflation for THAT loop (expected ≫1 and possibly very different per loop).
+2. Also pull the sim run's per-loop spin count (sim replays the trace, so sim-spin ≈ trace-spin for op-count,
+   but capture the sim CYCLES those loops consume) to quantify HW-vs-sim wall difference per loop.
+3. Then size the trim: set each loop's trace iterations = HW NANOSLEEP-exec for that loop; re-run sim; measure
+   cycles. Per-loop (not global) because §16 showed the bwd structure is per-CTA/per-region, and the table
+   above already shows loops ranging 96…3148 (fwd) / 384…2804 (bwd) — a single ratio would misfit them.
+
+All numbers above are from the single bwd-workload report `flashattn-fa3-bf16-bwd-...full_rpt.ncu-rep`,
+which contains both the K5 (fwd) and K10 (bwd) FlashAttn kernels; the K10 block is duplicated and was
+deduped. These are the authoritative clean HW spin counts to trim against.
+
+
+## 23. (3) Trace-side spin count is STATIC (no sim needed) — parsing works; coordinate-mapping is the open step (2026-07-31)
+
+Answering "do we need to run the sim for (3)?": **NO for the trace axis.** The Run-1 trace protobufs are on
+disk and parse cleanly; per-loop trace iteration counts are obtained by static parsing alone. Only the
+"sim CYCLES per loop" sub-part needs the sim, and prior §16/§17 sim outputs already cover much of it.
+
+### Parsing verified (docker `gpu-sim`, pure-python protobuf)
+- proto schema compiled: `protoc --python_out=/tmp/pb2 *.proto` in the container's
+  `.../traces_enhanced/dynamic_trace`. Runtime protobuf is 7.35 vs old protoc → must set
+  `PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python`.
+- Each CTA `.pb` (e.g. `kernel_10/d_0_s_0_k_10_0,0,0.pb`) is a `threadblock` message; `warps` is a
+  `map<int32,warp>` (iterate `.warps` entries via `.key`/`.value`), each `warp.instructions` is a repeated
+  `instruction{pc, active_mask, predicate_mask, function_unique_id, addresses, sync, bar_runtime}`.
+- Sanity: CTA0 warp0 (producer) = **13,970 inst**, matching §18's producer inst count exactly ⇒ parse correct.
+
+### How to isolate spin in the trace WITHOUT opcode strings (the trace has no opcode text)
+`instruction.sync` (a `sync_runtime_info` with `valid`, `barrier_addr`) is populated for SYNCS/PHASECHK-class
+ops. So the spin polls are the sync-valid instructions. CTA0 warp0: **6,392 sync-valid insts across 40 PCs**;
+the hot spin PCs (0xb960:1421, 0xb980:1417, 0xb820:1184, 0xb840:1182, …) dominate. All of warp0 is
+`function_unique_id = 8`. A backward-transition (loop-iter) proxy over the hot PCs = **3,147** for CTA0 (near
+§18's CTA0 producer BRA 3,234). So the trace spin is directly countable per PC.
+
+### ⚠️ The open step: a 3-coordinate mapping is needed for an EXACT per-loop trace-vs-HW table
+Three different PC/address spaces must be linked, and they do NOT match directly:
+1. **NCU Source page** — absolute VA (`0x7f75...`) + mbarrier operand as `Rn+URZ+0xNNNN` (e.g. 0x30c00/0x30c28);
+   the HW real-spin per loop (§22 table).
+2. **Trace** — per-function offset PC (`function_unique_id=8`, pc like 0xb960) + RESOLVED `sync.barrier_addr`
+   whose smem low bits are 0x1020 / 0x1028 (NOT the NCU 0x30c00 form — different base/representation).
+3. **SASS dump** (`flash_bwd_..sass`, §19) — per-function offset (7e60 etc.), and the file concatenates
+   MULTIPLE functions so the same offset (e.g. 0xb820) recurs in different functions; must disambiguate by
+   function.
+Because these don't line up by raw value, an exact per-loop join requires establishing the map first
+(candidate keys: match trace `function_unique_id` → SASS function; match trace hot-PC order/structure to the
+SASS spin-loop sequence; or match by relative barrier-offset pattern). This is the one remaining
+non-trivial step before a clean per-loop trace-vs-HW ratio table.
+
+### What is already usable now (aggregate, no mapping needed)
+- HW total real-spin (NANOSLEEP): FWD 8,461 / BWD 7,860 (§22, whole kernel, all CTAs).
+- Trace CTA0-warp0 spin ≈ 3,147 iterations (one CTA). With 384 CTAs in bwd this is clearly ≫ the HW
+  per-kernel 7,860 — i.e. the trace over-spin is large and real, consistent with §18. (An exact ratio needs
+  the per-CTA HW split, which NCU aggregates; the mapping step above is what enables the precise trim.)
+
+### Next actions
+1. Establish the trace↔SASS↔NCU mapping (function_unique_id ↔ SASS function; loop PC ↔ NCU VA by offset).
+2. Build the per-loop table: HW NANOSLEEP-exec vs trace spin-iterations (summed over CTAs) → true per-loop
+   inflation.
+3. sim cycles per loop: reuse §17 `[PRODTAIL]` / §18 `[PRODSPIN]` outputs (already have per-CTA producer spin
+   + stall cycles) rather than a new 12h run; only re-run if a per-loop cycle attribution is missing.
+
+
+## 24. Mapping ESTABLISHED (trace ↔ NCU) + per-loop inflation is HIGHLY non-uniform (2026-07-31)
+
+The 3-coordinate mapping of §23 is now solved for both kernels. Method (all read-only, docker `gpu-sim`,
+pure-python protobuf; per-kernel sim runs via `-C H100_80GB-OnlyKernel5 / -OnlyKernel10`):
+
+### Link 1 — trace `function_unique_id` ↔ kernel (from the CTA0 `.pb`)
+- **kernel_5 (fwd K5) = `function_unique_id 3`**, producer = warp 0 (14,082 inst, matches §16).
+- **kernel_10 (bwd K10) = `function_unique_id 8`**, producer = warp 0 (13,970 inst).
+
+### Link 2 — NCU VA → function offset (subtract the kernel's base VA = its first Source-page row)
+- fwd base VA = 0x7f76309bac00; bwd base VA = 0x7f755f8a1100.
+- NANOSLEEP `offset = VA − base`. fwd loops: 0xac50/0xacd0/0xb0a0/0xb1e0/0xb240/0xb2a0/0xb300/0xb360/0xb3c0.
+  bwd loops: 0xb490/0xb500/0xb830/0xb970/0xba30/0xbaf0/0xbb50.
+
+### Link 3 — trace hot PC == the loop's TRYWAIT == (NANOSLEEP offset − 0x10)  ✓ VERIFIED
+The trace has no opcode text, but `instruction.sync.valid` marks the SYNCS/PHASECHK poll ops; the trace hot
+spin PC equals the loop's `TRYWAIT`, which sits exactly 0x10 before the NANOSLEEP. Confirmed: bwd NCU
+NANOSLEEP@0xb970 ⇒ TRYWAIT@0xb960, and the trace's #1 hot PC is 0xb960 (CTA0 count 1421). All 7 bwd loops
+line up by `NANOSLEEP_offset − 0x10 = trace TRYWAIT PC`. So a loop is keyed by (kernel funcid, TRYWAIT PC),
+joining HW NANOSLEEP-exec to trace poll count exactly.
+
+### ⭐ CTA0 sanity (bwd) — per-loop inflation varies WILDLY (kills any global ratio)
+`HW_all` = NANOSLEEP-exec over ALL 384 CTAs (§22); `trace_CTA0` = poll count in CTA 0 ALONE:
+| loop TRYWAIT PC | HW (all 384 CTA) | trace (CTA0 only) | note |
+|---|---:|---:|---|
+| 0xb480 | 384 | 1 | barely spins |
+| 0xb4f0 | 777 | 80 | |
+| 0xb820 | 2017 | **1184** | CTA0 alone ≈ 59% of the whole-kernel HW total |
+| 0xb960 | 2804 | **1421** | CTA0 alone ≈ 51% of the whole-kernel HW total |
+| 0xba20 | 390 | 185 | |
+| 0xbae0 | 720 | 169 | |
+| 0xbb40 | 768 | 202 | |
+
+Two loops (0xb820, 0xb960) have a SINGLE CTA's trace poll count already ~half of HW's entire 384-CTA total
+⇒ summed over CTAs the trace over-spin at those loops is enormous, while 0xb480 barely spins at all. **The
+inflation is per-loop, not a global 3.67× — confirming the trim MUST be per-loop (per TRYWAIT PC), exactly as
+the user insisted.**
+
+### Whole-kernel trace sum (all 384 CTAs) — running
+Per-CTA pure-python parsing is slow (~minutes/CTA-batch); a full-kernel sum of trace poll counts per loop PC
+is running to `/tmp/bwd_map.txt`. When done it yields the exact per-loop trace-total vs HW ratio (the trim
+factor per loop). The mapping above is what makes that table exact; the sum is mechanical.
+
+### ⭐⭐ RESULT — bwd K10 per-loop HW-vs-trace (all 384 CTAs summed) — true over-spin = 86×, NOT 3.67×
+| loop TRYWAIT PC | HW real spin (NANOSLEEP) | trace poll (replayed) | inflation |
+|---|---:|---:|---:|
+| 0xb480 | 384 | 384 | **1.00×** (never over-spins — first check always passes) |
+| 0xb4f0 | 777 | 21,548 | 27.7× |
+| 0xb820 | 2,017 | 200,707 | **99.5×** |
+| 0xb960 | 2,804 | 274,462 | **97.9×** |
+| 0xba20 | 390 | 32,267 | 82.7× |
+| 0xbae0 | 720 | 66,102 | 91.8× |
+| 0xbb40 | 768 | 83,298 | 108.5× |
+| **TOTAL** | **7,860** | **678,768** | **86.36×** |
+
+Findings:
+- **The real trace over-spin is 86×, not the §18 "branch ratio" 3.67×.** The branch metric was so
+  contaminated by non-spin branches that it understated the true spin inflation by ~23×. The sim replays
+  678,768 producer poll iterations where HW ran only 7,860.
+- **Per-loop inflation ranges 1.00× … 108×** — decisively non-uniform. Loop 0xb480 is perfectly faithful
+  (HW=trace=384: its TRYWAIT passes on the first check every time, so no NANOSLEEP/loop). Loops 0xb820 and
+  0xb960 alone are 200,707 + 274,462 = 70% of all trace spin. A single global ratio would over-trim 0xb480
+  to nothing-wrong and under-trim the hot loops — **the per-loop trim the user insisted on is required, and
+  the trim factor per loop is now known exactly (the table above).**
+- Each replayed excess iteration carries the loop-local `wait_barrier` (~5.8 CPI, §17/§19), so ~671K excess
+  poll iterations × their stall is the direct inflator of the producer tail / kernel cycles.
+
+### Remaining
+- Run the same all-CTA sum for fwd K5 (funcid=3; NANOSLEEP offsets 0xac50/0xacd0/0xb0a0/0xb1e0/0xb240/
+  0xb2a0/0xb300/0xb360/0xb3c0; trace TRYWAIT = offset−0x10). Expect similarly large, non-uniform inflation.
+- Build the trim: per loop PC, cap trace poll iterations at HW NANOSLEEP-exec (keeping the final ready-exit
+  iteration; preserve HGMMA/MUFU/TMA counts). Re-run sim per kernel (`OnlyKernel5/10`), measure cycles.
+
+### ⭐⭐ RESULT — fwd K5 per-loop HW-vs-trace (all 132 CTAs summed) — over-spin = 48×
+| loop TRYWAIT PC | HW real spin (NANOSLEEP) | trace poll (replayed) | inflation |
+|---|---:|---:|---:|
+| 0xac40 | 132 | 132 | **1.00×** (faithful) |
+| 0xacc0 | 3,148 | 1,499 | **0.48× (UNDER-spins!)** |
+| 0xb090 | 662 | 9,235 | 14.0× |
+| 0xb1d0 | 955 | 136,431 | **142.9×** |
+| 0xb230 | 96 | 9,909 | 103.2× |
+| 0xb290 | 1,051 | 157,418 | **149.8×** |
+| 0xb2f0 | 100 | 10,198 | 102.0× |
+| 0xb350 | 484 | 39,536 | 81.7× |
+| 0xb3b0 | 1,833 | 42,876 | 23.4× |
+| **TOTAL** | **8,461** | **407,234** | **48.13×** |
+
+Findings:
+- **fwd real over-spin = 48×** (not §18's branch 2.84×). Two loops 0xb1d0 + 0xb290 = 136,431 + 157,418 = 72%
+  of all fwd trace spin, at ~143×/150×. Again per-loop, hugely non-uniform (0.48× … 150×).
+- **⚠️ Loop 0xacc0 is 0.48× — trace UNDER-spins vs HW** (1,499 < 3,148). Not a mapping error: in CTA0 this
+  loop executes 0 times (it runs only in a subset of CTAs), and in those CTAs the trace spun LESS than HW.
+  This is the loop-level face of §16's structured per-CTA mismatch (some CTA populations are UNDER-modeled,
+  others over). So the trim is not purely "cut down": one loop must be handled as under-modeled — a global
+  or even per-loop-average factor would still misfit it; the correct target is the HW per-loop count itself
+  (cap the over ones, and note the under one cannot be fixed by trimming — it points to a separate
+  under-spin/timing question, consistent with §16's mixed-direction K10 result).
+- Mapping re-confirmed on fwd: hot trace PCs 0xb1d0/0xb290 = HW NANOSLEEP 0xb1e0/0xb2a0 minus 0x10. ✓
+
+### Summary of the calibration (both kernels)
+| kernel | HW real spin (Σ NANOSLEEP) | trace replayed poll | overall inflation | §18's wrong branch ratio |
+|---|---:|---:|---:|---:|
+| FWD K5 | 8,461 | 407,234 | **48.1×** | 2.84× |
+| BWD K10 | 7,860 | 678,768 | **86.4×** | 3.67× |
+
+The true producer over-spin is ~48-86×, an order of magnitude beyond the contaminated branch ratio, and is
+concentrated in 2 loops per kernel with per-loop factors spanning 0.48×…150×. The per-loop HW target counts
+(the two tables) are the exact trim references.
+
+### Remaining (unchanged)
+- Build the trim: per loop PC, cap trace poll iterations at the HW NANOSLEEP-exec above (keep the final
+  ready-exit iteration; preserve HGMMA/MUFU/TMA counts). Handle the fwd 0xacc0 under-spin loop as a separate
+  note (do not inflate it). Re-run sim per kernel (`OnlyKernel5/10`); measure cycles vs HW (fwd 67,696 /
+  bwd 132,901).
+
+
+## 25. Offline spin-trim tool `trim_spin_trace.py` — built + auto-mapping (2026-07-31)
+
+Decision (per user): trim OFFLINE (existing `.pb` → trimmed `.pb`, no GPU/NVBit re-capture), auto-derive the
+per-loop targets from the NCU report (no hardcoded PCs/counts), generalize to any kernel, and ASSERT on any
+mapping failure. Tool: `util/tracer_nvbit/trim_spin_trace.py` (runs in docker `gpu-sim`, pure-python protobuf,
+`PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python`).
+
+### Kernel mapping is EXACT 1:1 by name (NOT the earlier offset-pattern heuristic — user corrected this)
+The robust key is `extra_info/enhanced_execution_info.json`, which lists every kernel's
+`{unique_function_id → kernel_name (mangled)}`. Chain:
+trace instruction `function_unique_id` → JSON `kernel_name` → NCU Source-page `Kernel Name` block, matched by
+the FlashAttn class token (mangled trace name vs demangled NCU name both contain `FlashAttnFwdSm90` /
+`FlashAttnBwdSm90` / `FlashAttnBwdPreprocess` / `FlashAttnBwdPostprocessConvertdQ`). Exact-string first, then
+unique-token match; **assert on 0 or >1 (dedup identical NCU blocks by base-VA) with a descriptive message**.
+Verified: `funcid 3 = FlashAttnFwd (K5)`, `funcid 8 = FlashAttnBwdSm90 (K10)`. NCU kernel ORDER is NOT used
+(it differs from trace numbering and includes unrelated + duplicate blocks).
+
+### spin loop body in the trace (verified)
+One iteration = the recurring block from a loop-head `TRYWAIT_pc` up to just before the next `TRYWAIT_pc` of
+the same loop: `TRYWAIT(sync) → +0x10 NANOSLEEP → +0x20 PHASECHK(sync) → BRA(back)`, and sometimes a non-spin
+PC interleaves (e.g. bwd 0xb960 block is b960→b970→b2c0→b980→b990). The tool does NOT assume a fixed block
+size — it deletes the whole `[TRYWAIT .. next TRYWAIT)` span per excess iteration. The only structural
+constant is the +0x10 TRYWAIT→NANOSLEEP spacing (asserted).
+
+### Targets auto-extracted (validated against §22/§24)
+- NCU NANOSLEEP `Instructions Executed` per loop → target map `{trywait_off = nanosleep_off − 0x10 : hw_iters}`.
+- Column note: the "Instructions Executed" column index shifts per block (some blocks lack `# Samples`), so the
+  tool finds it by header name, not fixed index.
+- Validated totals: FWD 8,461 (9 loops), BWD 7,860 (7 loops); it also auto-found K11 BwdPostproc (3,072, 1 loop).
+  Preprocess (no NANOSLEEP) and non-flash kernels → passed through untrimmed (not an error).
+
+### Per-CTA distribution of the whole-kernel target
+NCU gives a whole-kernel NANOSLEEP total (all CTAs). The tool distributes it per-CTA proportionally to that
+CTA's own trace spin count: `cap_cta = round(hw_total · cta_iters / kernel_trace_total)`, clamped to
+[1 if the loop runs, cta_iters]. ⚠️ Limitation: this preserves the TRACE per-CTA shape, not HW's true per-CTA
+shape (§16 showed they differ). It is correct in aggregate (Σ = HW total) and a reasonable first cut; a later
+refinement could use per-CTA HW data if a source with per-CTA NANOSLEEP existed (NCU aggregates it).
+
+### Status / next
+- Tool built + light-validated (NCU extraction, name mapping, assert-on-no-match, single-CTA delete keeps
+  non-spin insts byte-identical). NOT yet run over all CTAs to emit a full trimmed trace.
+- Next: run the full trim (all CTAs, K5+K10) → new trimmed trace dir; verify per-loop trimmed totals ≈ HW
+  targets and HGMMA/MUFU/TMA unchanged; then sim `OnlyKernel5/10` on the trimmed trace and compare cycles vs
+  HW (fwd 67,696 / bwd 132,901). Also wire a `--trim-spin` path into run_hw_trace.py (offline post-step).
+- Note the fwd 0xacc0 under-spin loop (0.48×, §24): the cap won't raise it; it stays a separate under-model
+  item, not fixed by trimming.
+
+### ⚠️ Correctness: "what if the trimmed trace exits the loop but the sim scoreboard says NOT ready?" (user)
+Checked in code — the answer splits by WHICH wait, and both are safe IF the trim cuts whole iterations:
+- **mbarrier wait (PHASECHK/TRYWAIT = the spin condition) is NONBLOCKING in the sim**
+  ([sm.cc:2244-2245](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/sm.cc#L2244): "PHASECHK/TRYWAIT are modeled as nonblocking predicate tests; the traced
+  control flow performs any retry/fallback"). The sim records ready/not-ready but the LOOP EXIT is decided by
+  the TRACE control flow, not by the sim's mbarrier verdict. So a trimmed trace that "exits early" is simply
+  replayed as exiting — even if the sim's modeled mbarrier is still not-ready, there is NO deadlock on the
+  PHASECHK axis. The feared "trace says done, sim says not done" cannot stall the producer here, because the
+  sim never blocks the producer on the mbarrier in the first place. ARRIVE/EXCH likewise only update mbarrier
+  state, non-blocking ([sm.cc:2296-2331]).
+- **SASS scoreboard wait (`are_wait_barriers_ready`) DOES gate issue** (§14/§19) — this is the real risk. BUT
+  §19 proved the spin loop's SB is LOOP-LOCAL (armed→waited→consumed inside the loop body; the loop-exit
+  BSYNC/EXIT have wait_mask=0). So trimming whole iterations removes the SB arm AND its wait together; nothing
+  after the loop waits on it. Safe.
+- **⚠️ The one way to break it: cut a PARTIAL iteration.** If a trim left a TRYWAIT without its paired
+  ARRIVE/PHASECHK, or removed an ARRIVE that a downstream mbarrier count depends on, the mbarrier arrive_count
+  or an SB arm/disarm pair would be corrupted and the sim COULD get stuck. This is exactly why
+  `trim_spin_trace.py` deletes only whole `[TRYWAIT .. next TRYWAIT)` iteration spans and never a partial
+  block. Keep that invariant.
+- **First validation gate after the full trim:** confirm the sim runs to completion (produces `gpu_sim_cycle`,
+  no hang/deadlock) AND `gpu_sim_insn` drops by exactly the removed spin ops while HGMMA/MUFU/TMA are
+  unchanged. A hang would mean a partial-iteration cut or a non-loop-local barrier — investigate before
+  trusting cycles.
+
+
+## 26. Rethink — offline trim is too fragile; pursue LIGHTER NVBit instrumentation instead (2026-07-31)
+
+Decision (user): pause the offline-trim path and reconsider. Fixing the trace AFTER capture is turning out
+brittle; the cleaner fix is to make the CAPTURE itself less perturbing so the producer spin is near-HW to
+begin with (attack the clock-skew root cause, §20).
+
+### Why the offline trim (`trim_spin_trace.py`, §25) is fragile — code review of the implementation
+The tool works and maps kernels exactly (§24 name-based mapping), but the trimming has structural weaknesses
+that make its output hard to trust without extensive per-CTA validation:
+1. **Run-splitting vs target convergence.** `find_loop_runs` groups spin iterations into "runs" of
+   back-to-back `[TRYWAIT..next TRYWAIT)` blocks, and keeps ≥1 iteration + the final iteration PER RUN. FA3
+   re-enters each mbarrier spin once per tile, so a loop can have MANY runs; the per-run floor can hold the
+   trimmed count well ABOVE the HW target (e.g. cap 5 but 100 runs ⇒ ≥100 kept). Convergence to the NCU
+   target is therefore not guaranteed and depends on run structure that we have not measured.
+2. **Map-write reflection unverified on the real path.** The trim rewrites `entry.value.instructions` of a
+   `map<int32,warp>` entry, then re-serializes. Whether the pure-python protobuf map yields a live reference
+   (mutation persists) or a copy (mutation lost → silent no-op trim) was only checked via a standalone mini
+   function, NOT through `main()`'s actual write path.
+3. **single-CTA validation is structurally blind.** With `--only-cta`, `kernel_total` scopes to that one CTA,
+   so `cap = hw_total·(cta/cta) = hw_total` ⇒ nothing gets trimmed. So the real trim path can only be
+   validated on a full multi-CTA run — expensive (minutes) and not yet done.
+4. **per-CTA distribution ≠ HW's true per-CTA shape** (§25 limitation): proportional-to-trace split is only
+   aggregate-correct; §16 showed HW's per-CTA structure differs (some CTAs under-, some over-modeled), and
+   fwd loop 0xacc0 is even 0.48× (UNDER-spun) — a cap cannot fix an under-spun loop at all.
+5. **Multiple producer warps** (bwd has warps 0 AND 1, §16): the tool trims only the single highest-scoring
+   producer warp per CTA, missing any spin on the aux producer.
+Together these mean the offline trim needs heavy per-CTA validation and still can't repair under-spun loops
+or HW's per-CTA shape. Net: high effort, fragile fidelity.
+
+### The alternative to pursue: lighter NVBit capture (reduce the dilation at the source)
+Root cause (§20): every instruction pays a heavy per-op instrumentation cost (warp-wide `__shfl_sync ×32`
+gather + several-hundred-byte `inst_trace_t` channel push, [inject_funcs.cu:158-163]), which dilates the
+CONSUMER wall-clock enormously while the producer's fixed real-time `NANOSLEEP` does not dilate → the
+producer over-polls ~48-86× (§24). If the capture were much lighter, the consumer/producer wall-clock ratio
+would be closer to HW and the recorded spin would be near-correct WITHOUT any post-hoc trimming.
+
+Directions to investigate next session (record only; not yet chosen):
+- **(a) Cheaper per-instruction record.** Do we need the full 32-lane `inst_trace_t` (addresses + reg values)
+  for EVERY instruction? For the FA3 timing trace, memory addresses matter for LD/ST/TMA but the spin ops
+  (PHASECHK/NANOSLEEP/BRA) need no address/reg payload. A per-opcode-class record size (skip the shfl gather
+  + big push for control/sync ops) could cut the dominant overhead on exactly the consumer-heavy path.
+- **(b) Reduce channel/host round-trip pressure.** Larger channel, batched push, or on-device aggregation so
+  the device stalls less waiting for host consumption (backpressure = part of the dilation).
+- **(c) Make the tracer NANOSLEEP-aware.** Since the skew is specifically the producer's fixed real-time
+  sleep vs dilated consumers, one option is to not instrument (or to zero-cost) the producer's spin poll ops
+  so the producer's relative timing tracks the consumers — but this changes recorded counts, so must be
+  reconciled with work-invariance.
+- **(d) Sampling/skip for hot spin PCs at capture.** Detect the spin loop on device and record only 1 of N
+  iterations — but this is essentially the trim moved on-device and shares the fidelity questions.
+- ⚠️ Constraint: any lighter capture must still produce a trace the simulator can replay (same schema, same
+  non-spin op fidelity, addresses for memory ops intact). Validate by re-checking the §24 per-loop NANOSLEEP
+  counts move toward HW (8,461 / 7,860) instead of 407K / 679K.
+
+### Status
+- `trim_spin_trace.py` left in tree (works for mapping + NCU target extraction, which are reusable), but the
+  offline-trim path is PARKED, not adopted.
+- The exact HW spin targets (§22/§24) and the trace↔NCU name mapping (§24) remain valid and are the yardstick
+  for whichever lighter-capture approach is built: success = recorded producer spin ≈ HW NANOSLEEP counts.
