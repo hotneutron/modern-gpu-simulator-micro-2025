@@ -1323,3 +1323,42 @@ Still open: this is not yet shown to be a cycle lever. Redundant ready polls are
 redundant re-poll cycles overlap issue slots a co-eligible warp could have used,
 before proposing any polling-collapse timing fix (must preserve gpu_sim_insn,
 HGMMA, MUFU, TMA bit-identically and not regress K10).
+
+### Problem statement (confirmed) — trace-replay fidelity, not scheduling
+
+The root cause is now settled and is NOT a scheduler problem:
+
+- The simulator scheduler is not over-selecting the producer. The spin-displaces-
+  a-co-eligible-warp rate was ~0.2% (section prior), so a "deprioritize the
+  producer" scheduling change would fix a problem that does not exist. That
+  direction is rejected.
+- The real defect is a mismatch between two clocks:
+  - captured trace iteration count: during NVBit capture, full instrumentation
+    slowed the consumers, so the producer spun far more than on real HW, and those
+    inflated iterations are baked into the trace (fwd 2.84x, bwd 3.67x branches);
+  - the simulator's own mbarrier model, which knows exactly when the barrier is
+    satisfied.
+- `ready_run_retries` ~50% (K5 50.7%, K10 52.6%) is the direct evidence: half of
+  producer polls are issued AFTER the simulator's own mbarrier model already
+  reports the barrier satisfied. The simulator ignores what it knows (clock B)
+  and faithfully replays the polluted iteration count from the trace (clock A).
+
+Problem, stated precisely:
+
+> The simulator replays the captured trace's redundant producer spin
+> (PHASECHK/NANOSLEEP/BRA) even though its own Hopper mbarrier model has already
+> reported the barrier satisfied. This is a trace-replay fidelity defect
+> (garbage-in from instrumented capture), not a scheduling defect.
+
+Direction for the fix (design pending, not yet implemented):
+
+- End the producer poll loop on the simulator's own mbarrier-ready event rather
+  than on the trace's recorded iteration count; the extra polls recorded after
+  ready did not occur on real HW and should not carry timing cost.
+- Hard constraint: `gpu_sim_insn` must stay bit-identical, so redundant polls
+  cannot simply be deleted. The mechanism must retire the captured ops (preserve
+  counts) while removing only their timing/stall cost.
+- Two candidate fix sites to decide between: (1) tracer-side normalization of the
+  captured spin, vs (2) simulator replay-side loop termination on modeled
+  mbarrier-ready. Must be a general mbarrier-polling mechanism, not a K5 clamp,
+  and must not regress K10.
