@@ -1285,3 +1285,41 @@ This still does not by itself prove a cycle lever - lane-sparse ops are cheap pe
 "work matches at 1.00x" as a reason to dismiss the over-poll. The `[PRODSPIN]` `ready_run_retries`
 count remains the test for how much of the replayed spin is redundant (barrier already satisfied)
 rather than a genuine wait.
+
+### [PRODSPIN] result — half of producer polls are redundant re-checks
+
+Ran K5 (`.o65`, 132 CTAs) and K10 (`.o40`, 384 CTAs) with
+`-producer_spin_ready_instrument_enable`. Work invariants held bit-identically
+(K5 `gpu_sim_insn` 455,565,060 / `gpgpu_n_tot_w_icount` 16,064,281; K10
+629,211,348 / 22,626,216), confirming the probe is observe-only.
+
+| Producer PHASECHK/TRYWAIT | K5 fwd | K10 bwd |
+|---|---:|---:|
+| phasechk_total | 815,523 | 1,319,706 |
+| phasechk_ready | 415,558 (51.0%) | 696,463 (52.8%) |
+| phasechk_not_ready | 399,965 (49.0%) | 623,243 (47.2%) |
+| ready_run_retries | 413,659 (50.7%) | 694,407 (52.6%) |
+
+`ready_run_retries` counts polls issued while the modeled Hopper mbarrier was
+already satisfied and the warp had already tested ready in the same run - i.e.
+redundant re-checks of an already-passed barrier. Roughly half of all producer
+polls in both kernels are redundant.
+
+This cross-checks against the external NCU branch excess (independent measurement):
+
+| | NCU branch excess (trace - HW) | ready_run_retries | Ratio |
+|---|---:|---:|---:|
+| K5 fwd | 373,247 | 413,659 | 1.11 |
+| K10 bwd | 614,062 | 694,407 | 1.13 |
+
+The two independent signals agree in magnitude: the HW-vs-trace over-poll and
+the simulator's redundant-ready re-polls are the same phenomenon. bwd is
+confirmed as a real over-poll (main-loop-resident), matching the 3.67x branch
+ratio; the tail-only probe had missed it.
+
+Still open: this is not yet shown to be a cycle lever. Redundant ready polls are
+1-lane and cheap per issue, and the section 17 tail cost was dominated by SASS
+`wait_barrier` (~5.8 CPI/iteration), a separate axis. Next: test whether these
+redundant re-poll cycles overlap issue slots a co-eligible warp could have used,
+before proposing any polling-collapse timing fix (must preserve gpu_sim_insn,
+HGMMA, MUFU, TMA bit-identically and not regress K10).
