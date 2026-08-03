@@ -527,6 +527,35 @@ void trace_parser::get_next_threadblock_traces(
   input.close();
   unsigned int size_traced_instructions_num_used_vector = gpu == nullptr ? 32 : 1;
   std::cout << "thread block = " << tb_cur.block_id().x() << "," << tb_cur.block_id().y() << "," << tb_cur.block_id().z() << std::endl;
+  // [TRIMCHK] Trace-load evidence: total + per-warp instruction counts for this
+  // CTA. A spin-trimmed trace shows the producer warp's count drop by ~10x vs a
+  // full run (the producer's PHASECHK/NANOSLEEP/BRA spin was removed), so this
+  // one line per CTA lets a 12h run be verified as "trimmed trace consumed".
+  // Gated by -trimchk_percta_log_enable (verbose: one line per CTA); the
+  // per-kernel summary in gpu_print_stat is always on. Grep for "[TRIMCHK]".
+  bool trimchk_percta_log = (gpu != nullptr) &&
+      gpu->getShaderCoreConfig() != nullptr &&
+      gpu->getShaderCoreConfig()->trimchk_percta_log_enable;
+  if (trimchk_percta_log) {
+    unsigned long long trimchk_cta_total = 0;
+    unsigned trimchk_max_warp_insts = 0;
+    unsigned trimchk_max_warp_id = 0;
+    for (auto warp : tb_cur.warps()) {
+      unsigned wc = warp.second.instructions_size();
+      trimchk_cta_total += wc;
+      if (wc > trimchk_max_warp_insts) {
+        trimchk_max_warp_insts = wc;
+        trimchk_max_warp_id = warp.first;
+      }
+    }
+    std::cout << "[TRIMCHK] kernel=" << kernelid
+              << " cta=" << block_id_x << "," << block_id_y << "," << block_id_z
+              << " nwarps=" << tb_cur.warps().size()
+              << " cta_total_insts=" << trimchk_cta_total
+              << " max_warp=" << trimchk_max_warp_id
+              << " max_warp_insts=" << trimchk_max_warp_insts
+              << " path=" << tb_path << std::endl;
+  }
   for(auto warp : tb_cur.warps()) {
     previous_traced_pc = 0;
     inst_count = 0;

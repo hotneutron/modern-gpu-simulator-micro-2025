@@ -1068,6 +1068,14 @@ class gpgpu_sim : public gpgpu_t {
   unsigned long long gpu_tot_sim_insn;
   unsigned long long gpu_sim_insn_last_update;
   unsigned gpu_sim_insn_last_update_sid;
+  // [TRIMCHK] Always-on producer-spin issue accounting (no flag required), so a
+  // long run can be verified to have consumed a spin-trimmed trace and that the
+  // producer over-spin actually dropped. Counts spin ops (PHASECHK/TRYWAIT,
+  // NANOSLEEP) ISSUED by the simulator this kernel. Full run issues ~48-86x more
+  // than a trimmed run. Reset per kernel in gpu_print_stat after emission.
+  unsigned long long trimchk_spin_phasechk_issued = 0;
+  unsigned long long trimchk_spin_nanosleep_issued = 0;
+  unsigned long long trimchk_spin_branch_issued = 0;
   occupancy_stats gpu_occupancy;
   occupancy_stats gpu_tot_occupancy;
 

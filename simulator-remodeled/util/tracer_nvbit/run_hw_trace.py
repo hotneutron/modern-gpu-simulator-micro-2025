@@ -29,6 +29,21 @@ if warp_lifetime_only and warp_lifetime_sidecar:
     raise RuntimeError(
         "WARP_LIFETIME_ONLY and WARP_LIFETIME_SIDECAR are mutually exclusive"
     )
+# Spin-trim post-step: when TRIM_SPIN=1, after the normal full run + trace
+# post-processing, move the full trace aside to "<run>.fullrun" and write a
+# spin-trimmed copy back to the original "<run>" location (so the simulator
+# consumes the trimmed trace). Requires the matching NCU report as ground truth.
+trim_spin_enabled = os.getenv("TRIM_SPIN") == "1"
+trim_spin_ncu_rep = os.getenv("TRIM_SPIN_NCU_REP")
+trim_spin_ncu_bin = os.getenv("TRIM_SPIN_NCU_BIN", "ncu")
+if trim_spin_enabled and not trim_spin_ncu_rep:
+    raise RuntimeError(
+        "TRIM_SPIN=1 requires TRIM_SPIN_NCU_REP=<path to matching .ncu-rep>"
+    )
+if trim_spin_enabled and (warp_lifetime_only or warp_lifetime_sidecar):
+    raise RuntimeError(
+        "TRIM_SPIN is incompatible with WARP_LIFETIME_ONLY / WARP_LIFETIME_SIDECAR"
+    )
 # MOD. End. Improved tracer
 
 # We will look for the benchmarks 
@@ -128,6 +143,56 @@ def build_sync_operand_mapping_if_available(trace_folder):
         return
     sync_script = os.path.join(this_directory, "build_sync_operand_mapping.py")
     subprocess.run([sys.executable, sync_script, extra_info_dir], check=True)
+
+
+def spin_trim_run_dir(this_run_dir):
+    """TRIM_SPIN post-step. The full run has just completed at this_run_dir.
+    Move it aside to '<this_run_dir>.fullrun' (the untouched full trace) and
+    write a spin-trimmed copy back to this_run_dir so the simulator consumes the
+    trimmed trace. Uses trim_spin_from_ncu.py with the matching NCU report as HW
+    ground truth. Idempotent-ish: if '<...>.fullrun' already exists it is reused
+    as the source (so re-running does not lose the original full trace)."""
+    fullrun_dir = this_run_dir + ".fullrun"
+    if not os.path.isdir(fullrun_dir):
+        # first time: the full run currently lives at this_run_dir -> move aside
+        shutil.move(this_run_dir, fullrun_dir)
+    else:
+        # a previous full run is preserved; drop any stale trimmed dir
+        if os.path.isdir(this_run_dir):
+            shutil.rmtree(this_run_dir)
+
+    full_traces = os.path.join(fullrun_dir, "traces")
+    trimmed_traces = os.path.join(this_run_dir, "traces")
+
+    # recreate the run_dir shell and copy every non-'traces' artifact
+    # (run.sh, data symlinks, etc.) so the trimmed run_dir is self-contained.
+    os.makedirs(this_run_dir, exist_ok=True)
+    for name in os.listdir(fullrun_dir):
+        if name == "traces":
+            continue
+        src = os.path.join(fullrun_dir, name)
+        dst = os.path.join(this_run_dir, name)
+        if os.path.islink(src):
+            linkto = os.readlink(src)
+            if os.path.lexists(dst):
+                os.remove(dst)
+            os.symlink(linkto, dst)
+        elif os.path.isdir(src):
+            shutil.copytree(src, dst)
+        else:
+            shutil.copy2(src, dst)
+
+    trim_tool = os.path.join(this_directory, "trim_spin_from_ncu.py")
+    ncu_rep = os.path.abspath(os.path.expandvars(os.path.expanduser(trim_spin_ncu_rep)))
+    cmd = [sys.executable, trim_tool,
+           "--full-run", full_traces,
+           "--ncu-rep", ncu_rep,
+           "--out", trimmed_traces,
+           "--ncu-bin", trim_spin_ncu_bin]
+    print("Spin-trimming trace: %s -> %s (NCU %s)"
+          % (full_traces, trimmed_traces, ncu_rep))
+    subprocess.run(cmd, check=True)
+
 
 for bench in benchmarks:
     edir, ddir, exe, argslist = bench
@@ -235,3 +300,5 @@ for bench in benchmarks:
                 build_tma_descriptor_mapping_if_available(this_trace_folder)
                 build_tma_operand_mapping_if_available(this_trace_folder)
                 build_sync_operand_mapping_if_available(this_trace_folder)
+            if trim_spin_enabled:
+                spin_trim_run_dir(this_run_dir)

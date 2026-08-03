@@ -2012,6 +2012,14 @@ void shader_core_config::reg_options(class OptionParser *opp) {
                          "spin-loop opcode counts. Sizes fwd+bwd excess captured spin. Reads mbarrier "
                          "state only; never modifies it. (default=0)",
                          "0");
+  option_parser_register(opp, "-trimchk_percta_log_enable", OPT_BOOL,
+                         &trimchk_percta_log_enable,
+                         "[TRIMCHK] Emit one per-CTA trace-load line at threadblock parse "
+                         "(kernel, cta, nwarps, cta_total_insts, max_warp_insts, path). Lets a "
+                         "spin-trimmed trace be verified as consumed (producer warp insts drop ~10x). "
+                         "Verbose (one line per CTA) so gated off by default; the per-kernel "
+                         "producer-spin summary is always printed regardless. (default=0)",
+                         "0");
   option_parser_register(opp, "-headofline_instrument_enable", OPT_BOOL,
                          &headofline_instrument_enable,
                          "Enable observe-only head-of-line counters: on next_stage_not_available "
@@ -3670,6 +3678,24 @@ void gpgpu_sim::gpu_print_stat() {
   printf("gpu_sim_cycle = %lld\n", gpu_sim_cycle);
   m_gpu_per_sm_stats.m_stats_map["gpu_sim_insn"]->print(statfout);
   printf("gpu_ipc = %12.4f\n", (float)gpu_sim_insn / gpu_sim_cycle);
+  // [TRIMCHK] Per-kernel producer-spin issue summary (always on). If a trimmed
+  // trace was consumed these are ~48-86x lower than a full run; if they are still
+  // in the hundreds-of-thousands the sim ran the UNtrimmed trace (do not trust
+  // the cycle result). phasechk+nanosleep together == the modeled spin polls.
+  {
+    unsigned long long trimchk_spin_total =
+        trimchk_spin_phasechk_issued + trimchk_spin_nanosleep_issued;
+    printf("[TRIMCHK] spin_phasechk_issued = %llu\n", trimchk_spin_phasechk_issued);
+    printf("[TRIMCHK] spin_nanosleep_issued = %llu\n", trimchk_spin_nanosleep_issued);
+    printf("[TRIMCHK] spin_branch_issued = %llu\n", trimchk_spin_branch_issued);
+    printf("[TRIMCHK] spin_poll_total(phasechk+nanosleep) = %llu\n", trimchk_spin_total);
+    printf("[TRIMCHK] verdict = %s (full-run spin is O(1e5+); trimmed is O(1e3-1e4))\n",
+           trimchk_spin_total < 50000 ? "LIKELY-TRIMMED" : "LIKELY-FULL-RUN");
+    // reset for the next kernel so each kernel reports its own spin count
+    trimchk_spin_phasechk_issued = 0;
+    trimchk_spin_nanosleep_issued = 0;
+    trimchk_spin_branch_issued = 0;
+  }
   printf("gpu_tot_sim_cycle = %lld\n", gpu_tot_sim_cycle + gpu_sim_cycle);
   printf("gpu_tot_sim_insn = %lld\n", gpu_tot_sim_insn + gpu_sim_insn);
   printf("gpu_tot_ipc = %12.4f\n", (float)(gpu_tot_sim_insn + gpu_sim_insn) /

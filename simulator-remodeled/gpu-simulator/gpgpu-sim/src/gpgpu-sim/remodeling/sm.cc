@@ -1086,6 +1086,25 @@ void SM::issue_warp(register_set_uniptr &pipe_reg_set, warp_inst_t *next_inst,
                                              [warp_id]++;  // MOD. Custom
                                                            // powermodel stats
 
+  // [TRIMCHK] Always-on producer-spin issue accounting (no flag). Count the
+  // spin-loop ops the simulator actually issues so a trimmed vs full run is
+  // distinguishable in the log without re-running: PHASECHK/TRYWAIT (mbarrier
+  // poll), NANOSLEEP (spin sleep), and the loop-back BRA. A trimmed trace issues
+  // ~48-86x fewer of these. Emitted per kernel in gpu_print_stat.
+  {
+    if (pipe_reg->sync_kind == SyncInstructionKind::PHASECHK ||
+        pipe_reg->sync_kind == SyncInstructionKind::TRYWAIT) {
+      m_gpu->trimchk_spin_phasechk_issued++;
+    } else if (pipe_reg->has_extra_trace_instruction_info() &&
+               pipe_reg->get_extra_trace_instruction_info()
+                       .get_op_code()
+                       .rfind("NANOSLEEP", 0) == 0) {
+      m_gpu->trimchk_spin_nanosleep_issued++;
+    } else if (pipe_reg->op == BRANCH_OP) {
+      m_gpu->trimchk_spin_branch_issued++;
+    }
+  }
+
   if (pipe_reg->op == MBARRIER_OP) {
     handle_sync_instruction(*pipe_reg, warp_id);
   } else if (pipe_reg->op == BARRIER_OP) {
