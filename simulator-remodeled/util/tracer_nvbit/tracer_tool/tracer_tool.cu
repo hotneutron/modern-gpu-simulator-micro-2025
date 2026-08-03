@@ -136,6 +136,13 @@ bool active_region = true;
 /* Probe-only mode: instrument SASS EXIT and record one final clock64 timestamp
  * per CTA-local warp. Full instruction tracing stays unchanged when disabled. */
 int warp_lifetime_only = 0;
+/* Lighter_NVbit_Tracing.md (a): when set, route spin-class ops
+ * (SYNCS.PHASECHK/TRYWAIT) through the O(1) first-lane gather in instrument_inst
+ * instead of the O(32) per-lane gather. Reduces capture wall-clock dilation so
+ * the producer's fixed real-time NANOSLEEP over-polls the mbarrier less, moving
+ * the recorded producer spin toward the real-HW NANOSLEEP counts. Trace schema
+ * is unchanged; only redundant lanes the host never reads are skipped. */
+int tracer_light_spin = 0;
 /* Sidecar mode: keep the complete dynamic trace path enabled and additionally
  * timestamp SASS EXIT. This measures the lifetime perturbation of full tracing
  * itself, using the same capture/output buffer as WARP_LIFETIME_ONLY. */
@@ -1649,6 +1656,11 @@ void nvbit_at_init() {
             "exclusive\n");
     abort();
   }
+  GET_VAR_INT(
+      tracer_light_spin, "TRACER_LIGHT_SPIN", 0,
+      "Lighter capture: route spin-class ops (SYNCS.PHASECHK/TRYWAIT) through "
+      "the O(1) first-lane gather to reduce capture clock-skew / producer "
+      "mbarrier over-poll. Trace schema unchanged.");
   GET_VAR_INT(verbose, "TOOL_VERBOSE", 0, "Enable verbosity inside the tool");
   GET_VAR_INT(intermediate_extra_files_persistance, "INTERMEDIATE_EXTRA_FILES_PERSISTANCE", 0, "Enable to not delete intermediate files from the extra trace generation");
   GET_VAR_INT(print_core_id, "TOOL_TRACE_CORE", 0,
@@ -1954,6 +1966,28 @@ void instrument_function_if_needed(CUcontext ctx, CUfunction func, int device_id
         num_of_injects++;
       }
 
+      /* Lighter_NVbit_Tracing.md (a): decide whether this static op may use the
+       * O(1) first-lane gather in instrument_inst. Conservative allowlist: the
+       * producer spin loop ops only (NANOSLEEP, BRA, and SYNCS.PHASECHK/TRYWAIT).
+       * For SYNCS we additionally require an enabled sync-capture site (barrier +
+       * semantic scalar, the only payload the host reads) and at most the single
+       * barrier MREF, and we never light a TMA-desc-consumer or a BAR.* site — so
+       * memory/TMA/bar address serialization stays byte-for-byte unchanged (§3c).
+       * NANOSLEEP (@!P0 => PREDICATE) and BRA (NO_REGS) run no gather today, so
+       * lighting them is a harmless no-op that keeps the allowlist self-documenting. */
+      int light_this_inst = 0;
+      if (tracer_light_spin && !is_tma_desc_consumer_instruction &&
+          !bar_site_info.enabled) {
+        bool is_nanosleep = opcode_str.rfind("NANOSLEEP", 0) == 0;
+        bool is_bra = opcode_str.rfind("BRA", 0) == 0;
+        bool is_spin_syncs =
+            (opcode_str.rfind("SYNCS", 0) == 0) && sync_site_info.enabled &&
+            num_mref <= 1;
+        if (is_nanosleep || is_bra || is_spin_syncs) {
+          light_this_inst = 1;
+        }
+      }
+
       for(unsigned int i = 0; i < num_of_injects; i++) {
           /* insert call to the instrumentation function with its arguments */
           nvbit_insert_call(instr, "instrument_inst", IPOINT_BEFORE);
@@ -2079,6 +2113,9 @@ void instrument_function_if_needed(CUcontext ctx, CUfunction func, int device_id
           nvbit_add_call_arg_const_val64(instr,
                                         (uint64_t)&reported_dynamic_instr_counter);
           nvbit_add_call_arg_const_val64(instr, (uint64_t)&stop_report[device_id]);
+          /* Lighter_NVbit_Tracing.md (a): final arg selects the O(1) first-lane
+           * gather for spin-class ops; 0 keeps the original O(32) gather. */
+          nvbit_add_call_arg_const_val32(instr, light_this_inst);
       }
 
       /* Phase 0b (TMA_BASE_ADDR.md §2.13): instrument the entry
