@@ -37,66 +37,67 @@ To keep this file easy to extend, use the following update pattern whenever a ne
 | Opt 8 | L2 slice parallelism (admission-rate + balanced slice hash) | Part 1: `-gpgpu_l2_admit_sectors_per_cycle 2` (HW 64B/cycle/slice). Part 2: `-gpgpu_l2_slice_balanced_hash 1` (SplitMix64 hash removes the `ipoly%80` 2:1 spatial imbalance from the 40-channel non-2^n config). Timing-only (work invariant). | 137,053 cycles (102.5% error, **-1.4% vs Opt 7**). fwd `.o37`. `L2_TMA_true_hit_rate` 0.9453 (unchanged). Correctly a near no-op — fwd's TMA path was already at floor (ROP_DELAY 126≈fixed 100); its bottleneck is frontend tail + hit-rate over-model, not the TMA queue. | 234,665 cycles (**76.6% error**, **-13.1% vs Opt 7**). bwd `.o20`. `L2_TMA_true_hit_rate` 0.8688 (unchanged). **Part 2 did the heavy lifting**: slice imbalance removed (util p50≈max), ROP_DELAY 1,483→558 (-62%), `gpu_stall_dramfull` 137K→0. | Done. Placement bias fixed; residual bwd wall is per-transfer temporal-burst / fixed-overhead (see Ongoing). |
 | Opt 9 | L2 sub-partition drain widening (ROP-drain + DRAM-reply-drain) | Two symmetric 1-sector/tick L2 gates, each its own knob: `-gpgpu_l2_rop_drain_per_cycle 2` (Gate A, REQUEST: ROP delay-queue→m_icnt_L2_queue) + `-gpgpu_l2_dram_reply_drain_per_cycle 2` (Gate B, REPLY: m_dram_L2_queue→L2 fill/L2_icnt; fill port modeled M-wide). Fixed latencies unchanged; timing-only (work invariant). | 135,999 cycles (100.9% error, **-1.5% vs Opt 8**). fwd `.o38`. `L2_TMA_true_hit_rate` 0.9455 (unchanged). Small (fwd still frontend-tail bound). | 215,895 cycles (**62.4% error**, **-18.4% vs Opt 8**). bwd `.o21`. `L2_TMA_true_hit_rate` 0.8682 (unchanged). **Unlocked Opt 8**: `L2_admit_per_active_cycle` 1.00→**1.93** (the 2-wide bank was starved by the 1/tick ROP feed); ROP_DELAY 558→**164** (-71%), `averagemflatency` 692→369. | Done. Opt 8+9 were a matched pair. Residual now spread across ROP(45%)+inject(37%)+reply(12.5%); no single 1/tick gate dominates. |
 | Opt 10 | intra-SMSP warp-switch (SFU issue-gating) | `-intra_smsp_warpswitch_enable 1` (code + config). At issue time, also check `fu->can_issue()` for no-queue FUs (SFU), so a busy-SFU MUFU (deterministic II=8) is filtered BEFORE the 1-deep `ISSUE_CONTROL` latch and GTO warp-switches to a ready warp instead of stalling the whole subcore. Queue FUs (MEM/TMA/MISC) keep the deferred path. II/latency unchanged; timing-only (work invariant). | 105,464 cycles (**55.8% error**, **-44.7% vs Opt 9**). fwd `.o58`. `gpu_sim_insn` **bit-identical** to baseline (455,565,060); `issue_stage_issuing` bit-identical (16,064,281). Head-of-line `next_stage` 25.1%→**0.06%**, `blocked_by_sfu` 11.48M→**0**. | 178,856 cycles (**34.6% error**, **-44.6% vs Opt 9**). bwd `.o33`. `gpu_sim_insn` bit-identical (629,211,348). `next_stage` 21.3%→**1.6%**, `blocked_by_sfu` 15.36M→**0**. Warp-switch recovered slot (`other_warp_issued/sfu_filtered`) fwd 31.7% / bwd 26.3%. | Done. The compute-path issue-pipeline defect (SFU head-of-line) fixed; residual (fwd 1.56x) is **SFU-throughput bound** (`still_idle` ≡ `fu_occupied_sfu`, warps queue on the one HW-faithful SFU), not an occupancy floor — next candidate axis is warp-stagger/overlap. See [CONSUMER_COMPUTE_BOUND.md](file:///home/jihyun/modern-gpu-simulator-micro-2025/.plan/CONSUMER_COMPUTE_BOUND.md). |
+| Opt 11 | NCU-calibrated producer spin-trim (trace-fidelity fix) | Offline trim of the captured trace: cap each producer mbarrier spin loop (`SYNCS.PHASECHK/TRYWAIT → NANOSLEEP → BRA`) to the real HW NANOSLEEP-exec count from the NCU report, deleting only the fixed 4-pc spin body (deadlock-safe: no ARRIVE/EXCH/TMA/BAR touched). Attacks the NVBit capture clock-skew that baked ~48-86× producer over-spin into the trace the sim replays (see `.plan/HW_VS_SIM_SFU.md` §18-§26). Tool: `util/tracer_nvbit/trim_spin_from_ncu.py`; wired into `run_hw_trace.py` via `TRIM_SPIN=1`. Work is intentionally NOT invariant (the trace itself is corrected toward HW). | 96,614 cycles (**42.7% error**, **-8.4% vs Opt 10**, **1.56x → 1.43x vs HW**). fwd `.o67`. Producer over-spin removed: `gpgpu_n_tot_w_icount` 16,064,281 → **14,463,545** (per-loop trace spin 405,495 → 5,311, HW target 8,461). | 145,406 cycles (**9.4% error**, **-18.7% vs Opt 10**, **1.35x → 1.09x vs HW**). bwd `.o41`. `gpgpu_n_tot_w_icount` 22,626,216 → **20,028,456** (per-loop trace spin 656,500 → 7,060, HW target 7,860). Clean exit, no deadlock. | Done. Confirms the §18-§26 root cause: the captured trace's redundant producer spin was a real cycle inflator. bwd nearly closed (1.09x); fwd residual (1.43x) is a separate consumer tensor/math re-issue axis, not spin. |
 
 ### Simulator Cycle Breakdown
 
 #### FA3 fwd - top-level simulator breakdown
 
-| Class | Init | Opt 1 (`rop=100`) | Opt 2 (BAR impl) | Opt 3 (MEMBAR) | Opt 4 (prefetch, sb=4) | Opt 5 (eager-promote) | Opt 6 (TMA real base) | Opt 7 (queue calib) | Opt 8 (slice parallelism) | Opt 9 (drain widening) | Opt 10 (warp-switch) | Note |
-|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| `sim_cycle` | — | 220,024 | 162,582 | 158,990 | 155,765 | 149,727 | 145,855 | 138,021 | 137,053 | 135,999 | **105,464** | Opt 10 = `.o58` (SFU issue-gate; **-22.4% vs Opt 9**, 1.56x vs HW). |
-| `no_warps_ready` | — | 64.02% | 23.83% | 20.98% | 26.81% | 27.32% | 27.93% | 29.51% | 29.14% | 29.22% | 51.22% | Opt 10: the ex-`next_stage` cycles now surface here (warp present, blocked in-loop) instead of a whole-subcore skip. |
-| `issuing` | — | 14.56% | 21.17% | 24.05% | 31.18% | 31.19% | 32.30% | 34.75% | 34.77% | 34.96% | **38.00%** | Opt 10: rises (SM-active↑) as recovered slots issue. |
-| `next_stage_not_available` | — | 11.40% | 15.25% | 17.26% | 22.45% | 22.46% | 23.23% | 24.90% | 24.96% | 25.07% | **0.06%** | Opt 10: head-of-line collapsed (SFU no longer clogs the latch). |
-| `no_valid_instruction` | — | 9.52% | 39.12% | 37.01% | 18.63% | 18.11% | 15.59% | 9.81% | 10.10% | 9.72% | 9.60% | Frontend tail (`nv_ibuffer_empty` ~12%) is fwd's real residual. |
-| `issue_port_busy` | — | 0.50% | 0.63% | 0.71% | 0.92% | 0.92% | 0.95% | 1.02% | 1.02% | 1.03% | 1.12% | |
-| `sum` | — | 100.00% | 100.00% | 100.00% | 100.00% | 100.00% | 100.00% | 100.00% | 100.00% | 100.00% | 100.00% | |
+| Class | Init | Opt 1 (`rop=100`) | Opt 2 (BAR impl) | Opt 3 (MEMBAR) | Opt 4 (prefetch, sb=4) | Opt 5 (eager-promote) | Opt 6 (TMA real base) | Opt 7 (queue calib) | Opt 8 (slice parallelism) | Opt 9 (drain widening) | Opt 10 (warp-switch) | Opt 11 (spin-trim) | Note |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| `sim_cycle` | — | 220,024 | 162,582 | 158,990 | 155,765 | 149,727 | 145,855 | 138,021 | 137,053 | 135,999 | 105,464 | **96,614** | Opt 11 = `.o67` (NCU-calibrated spin-trim; **-8.4% vs Opt 10**, 1.43x vs HW). |
+| `no_warps_ready` | — | 64.02% | 23.83% | 20.98% | 26.81% | 27.32% | 27.93% | 29.51% | 29.14% | 29.22% | 51.22% | 45.86% | Opt 11: drops as the replayed producer spin (which sat in-loop) is removed. |
+| `issuing` | — | 14.56% | 21.17% | 24.05% | 31.18% | 31.19% | 32.30% | 34.75% | 34.77% | 34.96% | 38.00% | 31.49% | Opt 11: issue-slot count / evaluated cycles (fewer replayed spin cycles in the denominator). |
+| `next_stage_not_available` | — | 11.40% | 15.25% | 17.26% | 22.45% | 22.46% | 23.23% | 24.90% | 24.96% | 25.07% | 0.06% | 0.05% | Head-of-line stays collapsed. |
+| `no_valid_instruction` | — | 9.52% | 39.12% | 37.01% | 18.63% | 18.11% | 15.59% | 9.81% | 10.10% | 9.72% | 9.60% | 21.58% | Opt 11: frontend/drain tail is a larger share of the (smaller) cycle budget. |
+| `issue_port_busy` | — | 0.50% | 0.63% | 0.71% | 0.92% | 0.92% | 0.95% | 1.02% | 1.02% | 1.03% | 1.12% | 1.03% | |
+| `sum` | — | 100.00% | 100.00% | 100.00% | 100.00% | 100.00% | 100.00% | 100.00% | 100.00% | 100.00% | 100.00% | 100.01% | Rounding. |
 
 #### FA3 fwd - inner stall / wait breakdown
 
-| Wait reason | Init | Opt 1 (`rop=100`) | Opt 2 (BAR impl) | Opt 3 (MEMBAR) | Opt 4 (prefetch, sb=4) | Opt 5 (eager-promote) | Opt 6 (TMA real base) | Opt 7 (queue calib) | Opt 8 (slice parallelism) | Opt 9 (drain widening) | Opt 10 (warp-switch) | Note |
-|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| `inst_barrier` | — | 56.09% | 9.09% | 0.05% | 0.07% | 0.07% | 0.07% | 0.08% | 0.08% | 0.08% | 0.13% | Negligible. |
-| `wait_barrier` | — | 6.64% | 8.07% | 9.01% | 11.98% | 12.58% | 12.66% | 13.18% | 12.69% | 12.74% | 12.93% | mbarrier-style wait. |
-| `tma_axis` | — | 62.73% | 17.16% | 9.06% | 12.05% | 12.65% | 12.73% | 13.25% | 12.77% | 12.82% | 13.06% | Grouped TMA-side stall share. See note [1] below. |
-| `non_tma_axis` | — | 17.80% | 17.34% | 19.07% | 24.10% | 24.07% | 24.90% | 26.59% | 26.93% | 26.84% | 63.58% | Opt 10: `fu_occupied`+`stall_count` jump as the ex-head-of-line SFU stalls now count in-loop (not a whole-subcore skip). Overlap counter, sums >100% of `no_warps_ready`. |
-| `fu_occupied` | — | 11.83% | 9.91% | 10.91% | 13.53% | 13.50% | 13.99% | 14.98% | 15.13% | 15.10% | **42.89%** | Opt 10: SFU-busy now surfaces here as a per-warp skip (the block that used to clog the latch). |
-| `stall_count` | — | 5.00% | 5.97% | 6.56% | 8.47% | 8.48% | 8.75% | 9.31% | 9.45% | 9.42% | 15.59% | Present in `.o58`. |
-| `tma_flush` | — | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | fwd is load-only. |
-| `yield` | — | 0.92% | 1.21% | 1.30% | 1.69% | 1.69% | 1.74% | 1.83% | 1.89% | 1.85% | 4.70% | Present in `.o58`. |
-| `result_queue_full` | — | 0.05% | 0.25% | 0.29% | 0.40% | 0.40% | 0.41% | 0.45% | 0.45% | 0.46% | 0.40% | Present in `.o58`. |
-| `l1c` | — | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | 0.03% | 0.02% | 0.00% | 0.00% | Present in `.o58`. |
-| `scoreboard (memory)` | — | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | Present in `.o58`. |
+| Wait reason | Init | Opt 1 (`rop=100`) | Opt 2 (BAR impl) | Opt 3 (MEMBAR) | Opt 4 (prefetch, sb=4) | Opt 5 (eager-promote) | Opt 6 (TMA real base) | Opt 7 (queue calib) | Opt 8 (slice parallelism) | Opt 9 (drain widening) | Opt 10 (warp-switch) | Opt 11 (spin-trim) | Note |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| `inst_barrier` | — | 56.09% | 9.09% | 0.05% | 0.07% | 0.07% | 0.07% | 0.08% | 0.08% | 0.08% | 0.13% | 0.12% | Negligible. |
+| `wait_barrier` | — | 6.64% | 8.07% | 9.01% | 11.98% | 12.58% | 12.66% | 13.18% | 12.69% | 12.74% | 12.93% | 4.75% | mbarrier-style wait; drops with the trimmed producer spin. |
+| `tma_axis` | — | 62.73% | 17.16% | 9.06% | 12.05% | 12.65% | 12.73% | 13.25% | 12.77% | 12.82% | 13.06% | 4.87% | Grouped TMA-side share (`wait_barrier`+`inst_barrier`+`tma_flush`). See note [1]. |
+| `non_tma_axis` | — | 17.80% | 17.34% | 19.07% | 24.10% | 24.07% | 24.90% | 26.59% | 26.93% | 26.84% | 63.58% | 59.13% | Overlap counter, sums >100% of `no_warps_ready`. |
+| `fu_occupied` | — | 11.83% | 9.91% | 10.91% | 13.53% | 13.50% | 13.99% | 14.98% | 15.13% | 15.10% | 42.89% | 41.54% | fu split: tensor 8.80 / sfu 30.18 / sp_int_dp 13.63 / other 0.09. |
+| `stall_count` | — | 5.00% | 5.97% | 6.56% | 8.47% | 8.48% | 8.75% | 9.31% | 9.45% | 9.42% | 15.59% | 12.57% | |
+| `tma_flush` | — | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | fwd is load-only. |
+| `yield` | — | 0.92% | 1.21% | 1.30% | 1.69% | 1.69% | 1.74% | 1.83% | 1.89% | 1.85% | 4.70% | 4.71% | |
+| `result_queue_full` | — | 0.05% | 0.25% | 0.29% | 0.40% | 0.40% | 0.41% | 0.45% | 0.45% | 0.46% | 0.40% | 0.31% | |
+| `l1c` | — | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | 0.03% | 0.02% | 0.00% | 0.00% | 0.00% | |
+| `scoreboard (memory)` | — | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | |
 
 > **[1] On the Opt 1 `tma_axis = 62.73%`.** This is a correctly-recorded value, not an input error. `tma_axis` is the grouped sum `wait_barrier + inst_barrier + tma_flush`, and the **same formula is applied in every column** (e.g. Opt 1: 6.64+56.09+0.00=62.73; Opt 2: 8.07+9.09+0.00=17.16) — it is not split differently between columns. Opt 1 only looks large because the pre-BAR-fix `inst_barrier` (56.09%) is folded in; that is not a real TMA cost. It collapses to 17.16% in Opt 2 purely because `inst_barrier` itself drops (56.09% -> 9.09%) after the BAR implementation. The HW TMA axis is ~23.8%, so the Opt 1 value is an over-attribution driven by the unfixed barrier model.
 
 #### FA3 bwd - top-level simulator breakdown
 
-| Class | Init | Opt 1 (`rop=100`) | Opt 2 (BAR impl) | Opt 3 (MEMBAR) | Opt 4 (prefetch, sb=4) | Opt 5 (eager-promote) | Opt 6 (TMA real base) | Opt 7 (queue calib) | Opt 8 (slice parallelism) | Opt 9 (drain widening) | Opt 10 (warp-switch) | Note |
-|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| `sim_cycle` | 376,735 | 361,760 | 328,643 | 259,456 | 241,528 | 241,425 | 290,572 | 250,026 | 234,665 | 215,895 | **178,856** | Opt 10 = `.o33` (SFU issue-gate; **-16.7% vs Opt 9**, 1.35x vs HW). |
-| `no_warps_ready` | 66.40% | 66.64% | 58.27% | 29.80% | 36.56% | 36.45% | 41.51% | 34.00% | 34.35% | 36.49% | 52.45% | Opt 10: ex-`next_stage` cycles surface here (in-loop block, not a subcore skip). |
-| `issuing` | 12.12% | 12.71% | 14.06% | 20.93% | 26.18% | 25.70% | 17.76% | 21.94% | 23.63% | 29.49% | **32.32%** | Opt 10: rises (SM-active↑) as recovered slots issue. |
-| `next_stage_not_available` | 10.17% | 10.69% | 11.41% | 15.11% | 18.96% | 18.52% | 12.88% | 15.83% | 17.11% | 21.35% | **1.63%** | Opt 10: head-of-line collapsed (SFU no longer clogs the latch). |
-| `no_valid_instruction` | 10.37% | 8.96% | 15.02% | 33.59% | 17.59% | 18.63% | 27.37% | 27.63% | 24.28% | 11.87% | 12.73% | Frontend tail; drops as TMA axis shrinks. |
-| `issue_port_busy` | 0.95% | 1.01% | 1.24% | 0.57% | 0.71% | 0.70% | 0.48% | 0.59% | 0.64% | 0.80% | 0.87% | |
-| `sum` | 100.00% | 100.00% | 100.00% | 100.00% | 100.00% | 100.00% | 100.00% | 100.00% | 100.00% | 100.00% | 100.00% | Init columns sum to ~100% after rounding. |
+| Class | Init | Opt 1 (`rop=100`) | Opt 2 (BAR impl) | Opt 3 (MEMBAR) | Opt 4 (prefetch, sb=4) | Opt 5 (eager-promote) | Opt 6 (TMA real base) | Opt 7 (queue calib) | Opt 8 (slice parallelism) | Opt 9 (drain widening) | Opt 10 (warp-switch) | Opt 11 (spin-trim) | Note |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| `sim_cycle` | 376,735 | 361,760 | 328,643 | 259,456 | 241,528 | 241,425 | 290,572 | 250,026 | 234,665 | 215,895 | 178,856 | **145,406** | Opt 11 = `.o41` (NCU-calibrated spin-trim; **-18.7% vs Opt 10**, 1.09x vs HW). |
+| `no_warps_ready` | 66.40% | 66.64% | 58.27% | 29.80% | 36.56% | 36.45% | 41.51% | 34.00% | 34.35% | 36.49% | 52.45% | 48.29% | Opt 11: drops as the replayed producer spin is removed. |
+| `issuing` | 12.12% | 12.71% | 14.06% | 20.93% | 26.18% | 25.70% | 17.76% | 21.94% | 23.63% | 29.49% | 32.32% | 28.81% | Opt 11: issue-slot count / evaluated cycles. |
+| `next_stage_not_available` | 10.17% | 10.69% | 11.41% | 15.11% | 18.96% | 18.52% | 12.88% | 15.83% | 17.11% | 21.35% | 1.63% | 1.65% | Head-of-line stays collapsed. |
+| `no_valid_instruction` | 10.37% | 8.96% | 15.02% | 33.59% | 17.59% | 18.63% | 27.37% | 27.63% | 24.28% | 11.87% | 12.73% | 20.37% | Opt 11: frontend/drain tail is a larger share of the smaller budget. |
+| `issue_port_busy` | 0.95% | 1.01% | 1.24% | 0.57% | 0.71% | 0.70% | 0.48% | 0.59% | 0.64% | 0.80% | 0.87% | 0.88% | |
+| `sum` | 100.00% | 100.00% | 100.00% | 100.00% | 100.00% | 100.00% | 100.00% | 100.00% | 100.00% | 100.00% | 100.00% | 100.00% | Init columns sum to ~100% after rounding. |
 
 #### FA3 bwd - inner stall / wait breakdown
 
-| Wait reason | Init | Opt 1 (`rop=100`) | Opt 2 (BAR impl) | Opt 3 (MEMBAR) | Opt 4 (prefetch, sb=4) | Opt 5 (eager-promote) | Opt 6 (TMA real base) | Opt 7 (queue calib) | Opt 8 (slice parallelism) | Opt 9 (drain widening) | Opt 10 (warp-switch) | Note |
-|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| `inst_barrier` | — | 58.47% / 87.70% of `no_warps_ready` | 44.78% / 76.84% of `no_warps_ready` | 1.01% / 3.40% of `no_warps_ready` | 1.30% / 3.57% of `no_warps_ready` | 1.26% | 0.89% | 1.09% | 1.09% | 1.34% | 1.43% | Remains low after the MEMBAR fix. |
-| `tma_axis` | — | 67.28% / 90.90% of `no_warps_ready` | 58.09% | 17.13% / 57.49% of `no_warps_ready` | 21.96% / 60.06% of `no_warps_ready` | 22.17% | 31.91% | 21.60% | 21.02% | 19.74% | 22.11% | TMA-side stall share (`wait_barrier`+`inst_barrier`+`tma_flush`). |
-| `non_tma_axis` | — | 16.40% / 24.50% of `no_warps_ready` | 18.08% | 21.99% / 73.79% of `no_warps_ready` | 27.15% / 74.25% of `no_warps_ready` | 26.66% | 18.94% | 22.79% | 24.37% | 30.17% | 64.58% | Opt 10: `fu_occupied`+`stall_count` jump as ex-head-of-line SFU stalls now count in-loop. Overlap counter. |
-| `fu_occupied` | — | 11.55% / 17.30% of `no_warps_ready` | 12.63% | 14.67% / 49.21% of `no_warps_ready` | 18.09% / 49.47% of `no_warps_ready` | 17.75% | 12.58% | 15.18% | 16.25% | 20.21% | **38.26%** | Opt 10: SFU-busy now surfaces here (the block that used to clog the latch). |
-| `wait_barrier` | — | 7.98% / 12.00% of `no_warps_ready` | 8.62% | 11.76% / 39.46% of `no_warps_ready` | 14.66% / 40.12% of `no_warps_ready` | 14.71% | 11.80% | 12.09% | 11.82% | 13.82% | 14.81% | `DEPBAR` (SB phase wait = TMA mbarrier) |
-| `stall_count` | — | 4.11% / 6.20% of `no_warps_ready` | 4.63% | 6.18% / 20.73% of `no_warps_ready` | 7.55% / 20.65% of `no_warps_ready` | 7.40% | 5.30% | 6.33% | 6.74% | 8.31% | 10.73% | explicit stall cycles |
-| `tma_flush` | — | 0.83% / 1.20% of `no_warps_ready` | 4.69% | 4.36% / 14.62% of `no_warps_ready` | 5.99% / 16.38% of `no_warps_ready` | 6.20% | 19.22% | 8.42% | 8.11% | 4.58% | 5.87% | `UTMACMDFLUSH` store-drain. |
-| `yield` | — | 0.68% / 1.00% of `no_warps_ready` | 0.76% | 1.02% / 3.41% of `no_warps_ready` | 1.26% / 3.45% of `no_warps_ready` | 1.23% | 0.87% | 1.06% | 1.13% | 1.39% | 2.20% | `YIELD` |
-| `result_queue_full` | — | 0.03% / — | 0.03% | 0.09% / 0.30% of `no_warps_ready` | 0.12% / 0.33% of `no_warps_ready` | 0.12% | 0.08% | 0.10% | 0.11% | 0.14% | 0.16% | fixed-latency result queue |
-| `l1c` | — | 0.03% / — | 0.03% | 0.04% / 0.14% of `no_warps_ready` | 0.13% / 0.36% of `no_warps_ready` | 0.16% | 0.11% | 0.13% | 0.14% | 0.12% | 0.12% | L1 constant |
-| `scoreboard (memory)` | — | 0.00% / 0.00% of `no_warps_ready` | 0.00% | 0.00% / 0.00% of `no_warps_ready` | 0.00% / 0.00% of `no_warps_ready` | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | traditional scoreboard (unused here) |
+| Wait reason | Init | Opt 1 (`rop=100`) | Opt 2 (BAR impl) | Opt 3 (MEMBAR) | Opt 4 (prefetch, sb=4) | Opt 5 (eager-promote) | Opt 6 (TMA real base) | Opt 7 (queue calib) | Opt 8 (slice parallelism) | Opt 9 (drain widening) | Opt 10 (warp-switch) | Opt 11 (spin-trim) | Note |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| `inst_barrier` | — | 58.47% / 87.70% of `no_warps_ready` | 44.78% / 76.84% of `no_warps_ready` | 1.01% / 3.40% of `no_warps_ready` | 1.30% / 3.57% of `no_warps_ready` | 1.26% | 0.89% | 1.09% | 1.09% | 1.34% | 1.43% | 1.47% | Remains low. |
+| `tma_axis` | — | 67.28% / 90.90% of `no_warps_ready` | 58.09% | 17.13% / 57.49% of `no_warps_ready` | 21.96% / 60.06% of `no_warps_ready` | 22.17% | 31.91% | 21.60% | 21.02% | 19.74% | 22.11% | 15.38% | `wait_barrier`+`inst_barrier`+`tma_flush`. |
+| `non_tma_axis` | — | 16.40% / 24.50% of `no_warps_ready` | 18.08% | 21.99% / 73.79% of `no_warps_ready` | 27.15% / 74.25% of `no_warps_ready` | 26.66% | 18.94% | 22.79% | 24.37% | 30.17% | 64.58% | 50.17% | Overlap counter. |
+| `fu_occupied` | — | 11.55% / 17.30% of `no_warps_ready` | 12.63% | 14.67% / 49.21% of `no_warps_ready` | 18.09% / 49.47% of `no_warps_ready` | 17.75% | 12.58% | 15.18% | 16.25% | 20.21% | 38.26% | 39.92% | fu split: tensor 14.77 / sfu 23.90 / sp_int_dp 11.71 / other 0.19. |
+| `wait_barrier` | — | 7.98% / 12.00% of `no_warps_ready` | 8.62% | 11.76% / 39.46% of `no_warps_ready` | 14.66% / 40.12% of `no_warps_ready` | 14.71% | 11.80% | 12.09% | 11.82% | 13.82% | 14.81% | 5.42% | `DEPBAR` (SB phase wait = TMA mbarrier). |
+| `stall_count` | — | 4.11% / 6.20% of `no_warps_ready` | 4.63% | 6.18% / 20.73% of `no_warps_ready` | 7.55% / 20.65% of `no_warps_ready` | 7.40% | 5.30% | 6.33% | 6.74% | 8.31% | 10.73% | 7.66% | explicit stall cycles |
+| `tma_flush` | — | 0.83% / 1.20% of `no_warps_ready` | 4.69% | 4.36% / 14.62% of `no_warps_ready` | 5.99% / 16.38% of `no_warps_ready` | 6.20% | 19.22% | 8.42% | 8.11% | 4.58% | 5.87% | 8.49% | `UTMACMDFLUSH` store-drain. |
+| `yield` | — | 0.68% / 1.00% of `no_warps_ready` | 0.76% | 1.02% / 3.41% of `no_warps_ready` | 1.26% / 3.45% of `no_warps_ready` | 1.23% | 0.87% | 1.06% | 1.13% | 1.39% | 2.20% | 2.34% | `YIELD` |
+| `result_queue_full` | — | 0.03% / — | 0.03% | 0.09% / 0.30% of `no_warps_ready` | 0.12% / 0.33% of `no_warps_ready` | 0.12% | 0.08% | 0.10% | 0.11% | 0.14% | 0.16% | 0.14% | fixed-latency result queue |
+| `l1c` | — | 0.03% / — | 0.03% | 0.04% / 0.14% of `no_warps_ready` | 0.13% / 0.36% of `no_warps_ready` | 0.16% | 0.11% | 0.13% | 0.14% | 0.12% | 0.12% | 0.11% | L1 constant |
+| `scoreboard (memory)` | — | 0.00% / 0.00% of `no_warps_ready` | 0.00% | 0.00% / 0.00% of `no_warps_ready` | 0.00% / 0.00% of `no_warps_ready` | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | traditional scoreboard (unused here) |
 
 > **[2] On the bwd Opt 1 `tma_axis` / `non_tma_axis`.** These were not emitted as single grouped counters in the Opt 1 run (`.o307`), so the cells are **computed** from the per-reason rows in the same column (the later runs emit them directly):
 > - `tma_axis` = `wait_barrier + inst_barrier + tma_flush` = 7.98+58.47+0.83 = **67.28%** (of `no_warps_ready`: 12.00+87.70+1.20 = 90.90%).
@@ -202,6 +203,11 @@ FA3 fwd
     - Event / debug run: `H100_80GB-OnlyKernel5/flashattn-fa3-bf16-bwd-causal-b1-s2048-hd64-nh24-flashattn_fa3_bf16_bwd_causal_b1_s2048_hd64_nh24___warmup_-63a73d452237.e58`
     - Note: `-intra_smsp_warpswitch_enable 1` (boot-log confirmed). Final cycle = `105,464` (**-22.4% vs Opt 9**, **1.56x vs HW**). `gpu_sim_insn=455,565,060` + `issue_stage_issuing=16,064,281` bit-identical to baseline (work invariant). `next_stage` 25.1%→**0.06%**, `blocked_by_sfu` 11.48M→**0**, `issuing` 35.0%→38.0%. Warp-switch: `sfu_filtered=19,148,406`, `other_warp_issued=6,066,539` (31.7% recovered), `still_idle=13,081,867`.
 
+- Opt 11 (NCU-calibrated producer spin-trim)
+  - Stats run: `H100_80GB-OnlyKernel5/flashattn-fa3-bf16-bwd-causal-b1-s2048-hd64-nh24-flashattn_fa3_bf16_bwd_causal_b1_s2048_hd64_nh24___warmup_-63a73d452237.o67`
+  - Event / debug run: `H100_80GB-OnlyKernel5/flashattn-fa3-bf16-bwd-causal-b1-s2048-hd64-nh24-flashattn_fa3_bf16_bwd_causal_b1_s2048_hd64_nh24___warmup_-63a73d452237.e67`
+  - Note: trimmed trace consumed — `gpgpu_n_tot_w_icount=14,463,545` (full run 16,064,281). 96,614 cyc (**1.43x vs HW**, -8.4% vs Opt 10). Per-loop producer spin 405,495 → 5,311 (HW NANOSLEEP target 8,461).
+
 FA3 bwd
 
 - Init
@@ -263,6 +269,11 @@ FA3 bwd
     - Stats run: `H100_80GB-OnlyKernel10/flashattn-fa3-bf16-bwd-causal-b1-s2048-hd64-nh24-flashattn_fa3_bf16_bwd_causal_b1_s2048_hd64_nh24___warmup_-63a73d452237.o33`
     - Event / debug run: `H100_80GB-OnlyKernel10/flashattn-fa3-bf16-bwd-causal-b1-s2048-hd64-nh24-flashattn_fa3_bf16_bwd_causal_b1_s2048_hd64_nh24___warmup_-63a73d452237.e33`
     - Note: `-intra_smsp_warpswitch_enable 1` (boot-log confirmed). Final cycle = `178,856` (**-16.7% vs Opt 9**, **1.35x vs HW**). `gpu_sim_insn=629,211,348` + `issue_stage_issuing=22,626,216` bit-identical to baseline (work invariant). `next_stage` 21.3%→**1.6%**, `blocked_by_sfu` 15.36M→**0**. Warp-switch: `sfu_filtered=21,412,122`, `other_warp_issued=5,634,782` (26.3% recovered), `still_idle=15,777,340`.
+
+- Opt 11 (NCU-calibrated producer spin-trim)
+  - Stats run: `H100_80GB-OnlyKernel10/flashattn-fa3-bf16-bwd-causal-b1-s2048-hd64-nh24-flashattn_fa3_bf16_bwd_causal_b1_s2048_hd64_nh24___warmup_-63a73d452237.o41`
+  - Event / debug run: `H100_80GB-OnlyKernel10/flashattn-fa3-bf16-bwd-causal-b1-s2048-hd64-nh24-flashattn_fa3_bf16_bwd_causal_b1_s2048_hd64_nh24___warmup_-63a73d452237.e41`
+  - Note: trimmed trace consumed — `gpgpu_n_tot_w_icount=20,028,456` (full run 22,626,216). 145,406 cyc (**1.09x vs HW**, -18.7% vs Opt 10). Per-loop producer spin 656,500 → 7,060 (HW NANOSLEEP target 7,860). `[PRODSPIN]` producer-only issued_phasechk≈76/nanosleep≈26 per CTA (full was thousands). No deadlock.
 
 ### Ongoing — post-Opt-10 issue-density gap (lever A reframed: trace `stall_count` latency)
 
@@ -738,6 +749,49 @@ whether a slot was recovered.
   a per-warp head-op / concurrent-PC histogram) is the next candidate axis, an overlap/scheduling
   property, not the (now-fixed) issue-latch defect. Deferred/non-blocking fidelity check: mbarrier
   histogram / scoreboard unchanged (SFU rarely sets barriers, expected zero-impact).
+
+### Opt 11 - NCU-calibrated producer spin-trim (trace-fidelity fix)
+
+> First **trace-fidelity** optimization (Opt 1-9 memory, Opt 10 compute-issue). Full root-cause + tool
+> design in [HW_VS_SIM_SFU.md](file:///home/jihyun/modern-gpu-simulator-micro-2025/.plan/HW_VS_SIM_SFU.md) §18-§27; this is the implementation + result summary.
+
+#### Why this optimization
+
+The post-Opt-10 residual (fwd 1.56× / bwd 1.35×) is an issue-density gap. §18-§24 localized a concrete
+cause: during NVBit capture, every instruction pays a heavy per-op cost that dilates the CONSUMER warps'
+wall-clock while the producer's fixed real-time `NANOSLEEP` does not, so the producer over-polls its
+mbarrier and that inflated spin is baked into the trace the simulator replays. Measured per-loop over-spin
+(trace vs HW NANOSLEEP-exec) is **48× fwd / 86× bwd**; each replayed poll carries the loop-local
+`wait_barrier` (~5.8 CPI, §19), directly inflating the producer tail / kernel cycle.
+
+#### How to implement
+
+- New reusable tool `util/tracer_nvbit/trim_spin_from_ncu.py`: reads the NCU Source-page per-PC
+  `Instructions Executed` on each `NANOSLEEP` line (the real HW spin count), maps trace kernels to NCU
+  blocks by `function_unique_id → kernel_name → NCU block`, and each loop by `trywait_pc =
+  NANOSLEEP_offset − 0x10`. Per CTA it caps each spin loop to the HW count by deleting whole fixed 4-pc
+  spin-body iterations (`lp / lp+0x10 NANOSLEEP / lp+0x20 PHASECHK / lp+0x30 BRA`). Only those 4 PCs are
+  ever deleted — no ARRIVE/EXCH/TMA/BAR (deadlock-safe, statically verified). protobuf backend
+  auto-selects upb with a dependency-free varint fallback.
+- `run_hw_trace.py` gains `TRIM_SPIN=1` (+ `TRIM_SPIN_NCU_REP`): after the full run + post-processing it
+  moves the full trace aside to `<run>.fullrun` and writes the trimmed trace back to `<run>`.
+- Verification logging: per-kernel `[TRIMCHK]` producer-spin summary in `gpu_print_stat` (always on) and
+  a per-CTA trace-load line gated by `-trimchk_percta_log_enable` (on in the H100 config). Use
+  `gpgpu_n_tot_w_icount` + `[PRODSPIN]` producer-only counters as the authoritative trim evidence (the
+  summary `spin_poll_total` includes consumer polls too, so its `verdict` threshold is not reliable).
+
+#### Result
+
+- fwd `.o67`: 105,464 → **96,614** (-8.4% vs Opt 10, **1.56x → 1.43x vs HW**). `gpgpu_n_tot_w_icount`
+  16,064,281 → **14,463,545** (= trim-tool post-trim count → trimmed trace confirmed consumed). Per-loop
+  producer spin 405,495 → 5,311 (HW target 8,461).
+- bwd `.o41`: 178,856 → **145,406** (-18.7% vs Opt 10, **1.35x → 1.09x vs HW**). `gpgpu_n_tot_w_icount`
+  22,626,216 → **20,028,456**. Per-loop producer spin 656,500 → 7,060 (HW target 7,860). `[PRODSPIN]`
+  producer-only `issued_phasechk≈76 / issued_nanosleep≈26` per CTA. Clean exit, no deadlock.
+- **Interpretation:** confirms the §18-§26 root cause — the captured trace's redundant producer spin was a
+  real cycle inflator. bwd is nearly closed (1.09x). The fwd residual (1.43x) is a separate axis
+  (consumer tensor/math re-issue interval, §15 / `CONSUMER_COMPUTE_BOUND.md`), not producer spin. Known
+  non-issue: fwd loop `0xacc0` is under-spun in the trace (§24, 0.48×), so the cap cannot raise it.
 
 ## 3. Arch TODO
 

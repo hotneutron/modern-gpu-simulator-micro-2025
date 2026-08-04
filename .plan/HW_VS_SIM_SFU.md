@@ -1998,3 +1998,49 @@ Directions to investigate next session (record only; not yet chosen):
   offline-trim path is PARKED, not adopted.
 - The exact HW spin targets (§22/§24) and the trace↔NCU name mapping (§24) remain valid and are the yardstick
   for whichever lighter-capture approach is built: success = recorded producer spin ≈ HW NANOSLEEP counts.
+
+
+## 27. RESOLVED — offline spin-trim adopted, sim run confirms the root cause (2026-08-04)
+
+The §18-§26 root cause is now **confirmed by a full simulator run** on the trimmed trace. The offline
+trim (§25, rebuilt) was adopted over the lighter-capture path (§26): a fresh capture with the option-(a)
+lighter tracer (`TRACER_LIGHT_SPIN`) did NOT reduce the recorded producer spin (fwd 821K → 822K), exactly
+as `.plan/Lighter_NVbit_Tracing.md` §5b predicted (the dominant per-op cost is the ~700B channel push,
+not the shfl gather). So the skew cannot be cheaply removed at the source; the captured trace is corrected
+offline against HW instead.
+
+### Tool (reusable, server-independent): `util/tracer_nvbit/trim_spin_from_ncu.py`
+- Input: a FULL-run trace dir + the matching NCU report. Auto-extracts per-loop HW NANOSLEEP-exec (§22),
+  auto-maps trace kernels to NCU blocks by `function_unique_id → kernel_name → NCU block` (§24), maps each
+  loop by `trywait_pc = NANOSLEEP_offset − 0x10` (§24 Link 3).
+- Trim = the fixed 4-pc spin body (`lp / lp+0x10 NANOSLEEP / lp+0x20 PHASECHK / lp+0x30 BRA`), deleting
+  whole iterations down to the per-CTA HW target. **Only those 4 PCs are ever deleted** — a static
+  sync_kind check confirmed no ARRIVE/EXCH/TMA/BAR is touched (deadlock-safe; the deleted PHASECHK/TRYWAIT
+  are nonblocking polls, §25). This also fixes §26 fragility #1 (the old `[occ_k, occ_{k+1})` span swallowed
+  interleaved loops).
+- protobuf backend auto-selects upb with a dependency-free varint fallback (verified byte-identical).
+  Wired into `run_hw_trace.py` via `TRIM_SPIN=1` (+ `TRIM_SPIN_NCU_REP`): full → `<run>.fullrun`,
+  trimmed → `<run>`.
+
+### Per-loop trim (matches the §24 targets)
+| kernel | trace spin (full) | trimmed | HW NANOSLEEP target |
+|---|---:|---:|---:|
+| FWD K5 | 405,495 | 5,311 | 8,461 |
+| BWD K10 | 656,500 | 7,060 | 7,860 |
+
+### ⭐⭐ Simulator cycles on the trimmed trace (the number this doc was chasing)
+| kernel | baseline (Opt 10) | **trimmed (Opt 11)** | HW | sim/HW | gap change |
+|---|---:|---:|---:|---:|---|
+| **BWD K10** | 178,856 | **145,406** | 132,901 | **1.09×** | 1.35× → **1.09×** (nearly closed) |
+| **FWD K5** | 105,774 | **96,614** | 67,696 | **1.43×** | 1.56× → **1.43×** |
+
+- Trimmed trace confirmed consumed: `gpgpu_n_tot_w_icount` fwd 16,064,281 → 14,463,545, bwd 22,626,216 →
+  20,028,456 (both = the trim tool's post-trim counts). `[PRODSPIN]` producer-only counts dropped from
+  thousands/CTA to `issued_phasechk≈76 / issued_nanosleep≈26` per CTA. Clean exit, no deadlock.
+
+### Conclusion
+The captured trace's redundant producer spin (§18-§24) **was a real cycle inflator**, not a measurement
+artifact — removing it moves both kernels toward HW and **bwd is essentially closed (1.09×)**. The **fwd
+residual (1.43×)** is NOT producer spin (fwd spin is now HW-faithful); it is the separate consumer
+tensor/math re-issue-interval axis (§15, `CONSUMER_COMPUTE_BOUND.md`) — the next lever. Known non-issue:
+fwd loop `0xacc0` is under-spun in the trace (§24, 0.48×), so the cap cannot raise it.
