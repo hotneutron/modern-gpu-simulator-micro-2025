@@ -26,6 +26,7 @@
 // ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 // POSSIBILITY OF SUCH DAMAGE.
 
+#include <stddef.h>
 #include <stdint.h>
 
 static __managed__ uint64_t total_dynamic_instr_counter = 0;
@@ -37,6 +38,8 @@ static __managed__ uint64_t reported_dynamic_instr_counter = 0;
 enum MEM_TYPE { NONE = 0, STANDARD_MEM = 1, CONSTANT_MEM = 2, CALL_OR_RET = 3 };
 enum TRACED_REG_TYPE {NO_REGS = 0, MEMORY_REF = 1, REGULAR = 2, REGULAR_2_REGS = 3, REGULAR_4_REGS = 4, UNIFORM = 5, UNIFORM_2_REGS = 6, PREDICATE = 7, UNIFORM_PREDICATE = 8};
 
+/* Original fixed-size GPU-to-host record, retained for the
+ * TRACER_LIGHT_SPIN=0 baseline. */
 typedef struct {
   int cta_id_x;
   int cta_id_y;
@@ -60,7 +63,70 @@ typedef struct {
   uint32_t predicate_mask;
   uint32_t num_of_injects;
   uint32_t per_operand_type;
+} legacy_inst_trace_t;
+
+enum INST_TRACE_RECORD_FLAGS {
+  INST_TRACE_HAS_LANE_VALUES = 1u << 0,
+};
+
+#define INST_TRACE_RECORD_VERSION 1u
+
+/*
+ * GPU-to-host transport record.
+ *
+ * The old fixed record carried four 32-lane value arrays for every callback
+ * (712 bytes), although the final protobuf only consumes lane values for
+ * memory-like callbacks. Non-memory callbacks need the common metadata and at
+ * most one predicated-active lane's operand values. Keep those scalar values
+ * in the compact prefix and append the 32-lane payload only when
+ * INST_TRACE_HAS_LANE_VALUES is set.
+ *
+ * The host receiver expands either wire form into the same protobuf contract;
+ * this changes capture transport only, not the dynamic trace schema.
+ */
+typedef struct {
+  uint32_t record_size;
+  uint16_t record_version;
+  uint16_t record_flags;
+  int cta_id_x;
+  int cta_id_y;
+  int cta_id_z;
+  int warpid_tb;
+  int warpid_sm;
+  int sm_id;
+  uint32_t reg_id;
+  uint32_t vpc;
+  uint32_t unique_function_id;
+  MEM_TYPE mem_type;
+  int32_t width;
+  uint32_t ureg_desc_id;
+  uint32_t ureg_desc_value;
+  uint32_t ureg_desc_value_hi;
+  uint32_t active_mask;
+  uint32_t predicate_mask;
+  uint32_t num_of_injects;
+  uint32_t per_operand_type;
+  uint64_t scalar_value_0;
+  uint32_t scalar_value_1;
+  uint32_t scalar_value_2;
+  uint32_t scalar_value_3;
+  uint32_t reserved;
+  uint64_t lane_values[32];
 } inst_trace_t;
+
+#define INST_TRACE_COMPACT_SIZE \
+  ((uint32_t)offsetof(inst_trace_t, lane_values))
+#define INST_TRACE_MEMORY_SIZE ((uint32_t)sizeof(inst_trace_t))
+#define INST_TRACE_LEGACY_SIZE ((uint32_t)sizeof(legacy_inst_trace_t))
+
+#ifdef __cplusplus
+static_assert(INST_TRACE_LEGACY_SIZE == 712,
+              "unexpected legacy inst trace wire size");
+static_assert(INST_TRACE_COMPACT_SIZE == 104,
+              "unexpected compact inst trace wire size");
+static_assert(INST_TRACE_MEMORY_SIZE == 360,
+              "unexpected memory inst trace wire size");
+#endif
 
 /* EXIT timestamp capture for FA3 producer/consumer lifetime, shared by the
  * EXIT-only probe and the full-trace sidecar. The current workload uses at most

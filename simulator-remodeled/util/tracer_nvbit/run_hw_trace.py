@@ -36,6 +36,15 @@ if warp_lifetime_only and warp_lifetime_sidecar:
 trim_spin_enabled = os.getenv("TRIM_SPIN") == "1"
 trim_spin_ncu_rep = os.getenv("TRIM_SPIN_NCU_REP")
 trim_spin_ncu_bin = os.getenv("TRIM_SPIN_NCU_BIN", "ncu")
+tracer_light_spin_value = os.getenv("TRACER_LIGHT_SPIN", "0")
+if tracer_light_spin_value not in ("0", "1"):
+    raise RuntimeError("TRACER_LIGHT_SPIN must be 0 or 1")
+compact_full_capture_enabled = tracer_light_spin_value == "1"
+if trim_spin_enabled and compact_full_capture_enabled:
+    raise RuntimeError(
+        "TRIM_SPIN=1 and TRACER_LIGHT_SPIN=1 are mutually exclusive: "
+        "use compact full capture for Option 1, or trim/reorganization for Option 2"
+    )
 if trim_spin_enabled and not trim_spin_ncu_rep:
     raise RuntimeError(
         "TRIM_SPIN=1 requires TRIM_SPIN_NCU_REP=<path to matching .ncu-rep>"
@@ -246,6 +255,12 @@ for bench in benchmarks:
         env_exports = ""
         for key, value in extra_env.items():
             env_exports += "export {0}={1}; ".format(key, shlex.quote(str(value)))
+        # Persist the selected wire mode in run.sh so --norun/manual execution
+        # cannot silently fall back to the legacy transport. Append after the
+        # benchmark environment so this top-level experiment selection wins.
+        env_exports += "export TRACER_LIGHT_SPIN={0}; ".format(
+            tracer_light_spin_value
+        )
 
         if options.terminate_upon_limit:
             sh_contents += "export TERMINATE_UPON_LIMIT=1; "

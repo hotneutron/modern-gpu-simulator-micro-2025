@@ -136,12 +136,9 @@ bool active_region = true;
 /* Probe-only mode: instrument SASS EXIT and record one final clock64 timestamp
  * per CTA-local warp. Full instruction tracing stays unchanged when disabled. */
 int warp_lifetime_only = 0;
-/* Lighter_NVbit_Tracing.md (a): when set, route spin-class ops
- * (SYNCS.PHASECHK/TRYWAIT) through the O(1) first-lane gather in instrument_inst
- * instead of the O(32) per-lane gather. Reduces capture wall-clock dilation so
- * the producer's fixed real-time NANOSLEEP over-polls the mbarrier less, moving
- * the recorded producer spin toward the real-HW NANOSLEEP counts. Trace schema
- * is unchanged; only redundant lanes the host never reads are skipped. */
+/* Full-capture transport selector.
+ * 0: original fixed 712B record and full lane gathers.
+ * 1: compact 104B/360B records and scalar non-memory gathers. */
 int tracer_light_spin = 0;
 /* Sidecar mode: keep the complete dynamic trace path enabled and additionally
  * timestamp SASS EXIT. This measures the lifetime perturbation of full tracing
@@ -472,6 +469,99 @@ static int get_first_predicated_lane(uint32_t active_mask, uint32_t predicate_ma
     }
   }
   return -1;
+}
+
+static bool inst_trace_has_lane_values(const inst_trace_t *record) {
+  return (record->record_flags & INST_TRACE_HAS_LANE_VALUES) != 0;
+}
+
+static uint64_t inst_trace_value_0(const inst_trace_t *record, int lane) {
+  assert(lane >= 0 && lane < 32);
+  if (inst_trace_has_lane_values(record)) {
+    return record->lane_values[lane];
+  }
+  return record->scalar_value_0;
+}
+
+static int64_t inst_trace_operand_reg_id(const inst_trace_t *record) {
+  switch (record->per_operand_type) {
+    case TRACED_REG_TYPE::REGULAR:
+    case TRACED_REG_TYPE::REGULAR_2_REGS:
+    case TRACED_REG_TYPE::REGULAR_4_REGS:
+    case TRACED_REG_TYPE::UNIFORM:
+    case TRACED_REG_TYPE::UNIFORM_2_REGS:
+    case TRACED_REG_TYPE::PREDICATE:
+    case TRACED_REG_TYPE::UNIFORM_PREDICATE:
+      return static_cast<int64_t>(record->reg_id);
+    case TRACED_REG_TYPE::NO_REGS:
+    case TRACED_REG_TYPE::MEMORY_REF:
+    default:
+      return -1;
+  }
+}
+
+static void normalize_legacy_inst_trace(const legacy_inst_trace_t *legacy,
+                                        inst_trace_t *record) {
+  record->record_version = INST_TRACE_RECORD_VERSION;
+  record->record_flags = 0;
+  record->cta_id_x = legacy->cta_id_x;
+  if (legacy->cta_id_x == -1) {
+    record->record_size = INST_TRACE_COMPACT_SIZE;
+    record->mem_type = MEM_TYPE::NONE;
+    return;
+  }
+
+  record->cta_id_y = legacy->cta_id_y;
+  record->cta_id_z = legacy->cta_id_z;
+  record->warpid_tb = legacy->warpid_tb;
+  record->warpid_sm = legacy->warpid_sm;
+  record->sm_id = legacy->sm_id;
+  record->reg_id =
+      legacy->mem_type == MEM_TYPE::NONE
+          ? legacy->reg_id
+          : SECRET_UREG_DESC_NOT_USED;
+  record->vpc = legacy->vpc;
+  record->unique_function_id = legacy->unique_function_id;
+  record->mem_type = legacy->mem_type;
+  record->width = legacy->width;
+  record->ureg_desc_id = legacy->ureg_desc_id;
+  record->ureg_desc_value = legacy->ureg_desc_value;
+  record->ureg_desc_value_hi = legacy->ureg_desc_value_hi;
+  record->active_mask = legacy->active_mask;
+  record->predicate_mask = legacy->predicate_mask;
+  record->num_of_injects = legacy->num_of_injects;
+  record->per_operand_type = legacy->per_operand_type;
+  record->scalar_value_0 = 0;
+  record->scalar_value_1 = 0;
+  record->scalar_value_2 = 0;
+  record->scalar_value_3 = 0;
+  record->reserved = 0;
+
+  if (legacy->mem_type != MEM_TYPE::NONE) {
+    record->record_size = INST_TRACE_MEMORY_SIZE;
+    record->record_flags |= INST_TRACE_HAS_LANE_VALUES;
+    for (int lane = 0; lane < 32; ++lane) {
+      record->lane_values[lane] = legacy->addrs_or_reg_val_0[lane];
+    }
+    return;
+  }
+
+  record->record_size = INST_TRACE_COMPACT_SIZE;
+  int value_lane =
+      get_first_predicated_lane(legacy->active_mask, legacy->predicate_mask);
+  if (value_lane < 0) {
+    value_lane = 0;
+  }
+  if (legacy->per_operand_type != TRACED_REG_TYPE::NO_REGS) {
+    record->scalar_value_0 = legacy->addrs_or_reg_val_0[value_lane];
+  }
+  if (legacy->per_operand_type == TRACED_REG_TYPE::REGULAR_2_REGS ||
+      legacy->per_operand_type == TRACED_REG_TYPE::UNIFORM_2_REGS) {
+    record->scalar_value_1 = legacy->reg_val_1[value_lane];
+  } else if (legacy->per_operand_type == TRACED_REG_TYPE::REGULAR_4_REGS) {
+    record->scalar_value_2 = legacy->reg_val_2[value_lane];
+    record->scalar_value_3 = legacy->reg_val_3[value_lane];
+  }
 }
 
 static const char *traced_reg_type_to_string(TRACED_REG_TYPE reg_type) {
@@ -869,7 +959,7 @@ static void append_tma_desc_runtime_debug_event(
   std::bitset<32> mask(ma->active_mask & ma->predicate_mask);
   for (int lane = 0; lane < 32; ++lane) {
     if (mask.test(lane)) {
-      first_lane_addr = ma->addrs_or_reg_val_0[lane];
+      first_lane_addr = inst_trace_value_0(ma, lane);
       break;
     }
   }
@@ -908,7 +998,7 @@ static void append_tma_runtime_operand_debug_event(
   if (!ofs.is_open()) {
     return;
   }
-  uint64_t first_lane_addr = ma->addrs_or_reg_val_0[first_lane];
+  uint64_t first_lane_addr = inst_trace_value_0(ma, first_lane);
   // #region debug-point tracer-desc-validity
   const bool desc_valid = ma->ureg_desc_id != SECRET_UREG_DESC_NOT_USED;
   // #endregion debug-point tracer-desc-validity
@@ -924,11 +1014,11 @@ static void append_tma_runtime_operand_debug_event(
       << "\"callback_index\":" << callback_index << ","
       << "\"operand_type\":\"" << traced_reg_type_to_string(static_cast<TRACED_REG_TYPE>(ma->per_operand_type)) << "\","
       << "\"mem_type\":\"" << mem_type_to_string(ma->mem_type) << "\","
-      << "\"operand_reg_id\":" << ma->reg_id << ","
-      << "\"value_lo\":" << static_cast<uint64_t>(ma->addrs_or_reg_val_0[first_lane]) << ","
-      << "\"value_hi\":" << ma->reg_val_1[first_lane] << ","
-      << "\"value_2\":" << ma->reg_val_2[first_lane] << ","
-      << "\"value_3\":" << ma->reg_val_3[first_lane] << ","
+      << "\"operand_reg_id\":" << inst_trace_operand_reg_id(ma) << ","
+      << "\"value_lo\":" << inst_trace_value_0(ma, first_lane) << ","
+      << "\"value_hi\":" << ma->scalar_value_1 << ","
+      << "\"value_2\":" << ma->scalar_value_2 << ","
+      << "\"value_3\":" << ma->scalar_value_3 << ","
       << "\"first_lane_addr\":" << first_lane_addr << ","
       << "\"width\":" << ma->width << ","
       // #region debug-point tracer-desc-validity
@@ -1658,9 +1748,17 @@ void nvbit_at_init() {
   }
   GET_VAR_INT(
       tracer_light_spin, "TRACER_LIGHT_SPIN", 0,
-      "Lighter capture: route spin-class ops (SYNCS.PHASECHK/TRYWAIT) through "
-      "the O(1) first-lane gather to reduce capture clock-skew / producer "
-      "mbarrier over-poll. Trace schema unchanged.");
+      "Select compact full-capture transport: 0=legacy 712B records, "
+      "1=compact 104B/360B records.");
+  if (tracer_light_spin != 0 && tracer_light_spin != 1) {
+    fprintf(stderr, "TRACER_LIGHT_SPIN must be 0 or 1\n");
+    abort();
+  }
+  printf("[TRACE-WIRE] selected mode=%s legacy_size=%u compact_size=%u "
+         "memory_size=%u\n",
+         tracer_light_spin ? "compact" : "legacy",
+         INST_TRACE_LEGACY_SIZE, INST_TRACE_COMPACT_SIZE,
+         INST_TRACE_MEMORY_SIZE);
   GET_VAR_INT(verbose, "TOOL_VERBOSE", 0, "Enable verbosity inside the tool");
   GET_VAR_INT(intermediate_extra_files_persistance, "INTERMEDIATE_EXTRA_FILES_PERSISTANCE", 0, "Enable to not delete intermediate files from the extra trace generation");
   GET_VAR_INT(print_core_id, "TOOL_TRACE_CORE", 0,
@@ -1966,31 +2064,13 @@ void instrument_function_if_needed(CUcontext ctx, CUfunction func, int device_id
         num_of_injects++;
       }
 
-      /* Lighter_NVbit_Tracing.md (a): decide whether this static op may use the
-       * O(1) first-lane gather in instrument_inst. Conservative allowlist: the
-       * producer spin loop ops only (NANOSLEEP, BRA, and SYNCS.PHASECHK/TRYWAIT).
-       * For SYNCS we additionally require an enabled sync-capture site (barrier +
-       * semantic scalar, the only payload the host reads) and at most the single
-       * barrier MREF, and we never light a TMA-desc-consumer or a BAR.* site — so
-       * memory/TMA/bar address serialization stays byte-for-byte unchanged (§3c).
-       * NANOSLEEP (@!P0 => PREDICATE) and BRA (NO_REGS) run no gather today, so
-       * lighting them is a harmless no-op that keeps the allowlist self-documenting. */
-      int light_this_inst = 0;
-      if (tracer_light_spin && !is_tma_desc_consumer_instruction &&
-          !bar_site_info.enabled) {
-        bool is_nanosleep = opcode_str.rfind("NANOSLEEP", 0) == 0;
-        bool is_bra = opcode_str.rfind("BRA", 0) == 0;
-        bool is_spin_syncs =
-            (opcode_str.rfind("SYNCS", 0) == 0) && sync_site_info.enabled &&
-            num_mref <= 1;
-        if (is_nanosleep || is_bra || is_spin_syncs) {
-          light_this_inst = 1;
-        }
-      }
-
       for(unsigned int i = 0; i < num_of_injects; i++) {
           /* insert call to the instrumentation function with its arguments */
-          nvbit_insert_call(instr, "instrument_inst", IPOINT_BEFORE);
+          nvbit_insert_call(
+              instr,
+              tracer_light_spin ? "instrument_inst_compact"
+                                : "instrument_inst",
+              IPOINT_BEFORE);
           /* pass predicate value */
           nvbit_add_call_arg_guard_pred_val(instr);
           /* send Unique Function Identifier and PC */
@@ -2113,9 +2193,8 @@ void instrument_function_if_needed(CUcontext ctx, CUfunction func, int device_id
           nvbit_add_call_arg_const_val64(instr,
                                         (uint64_t)&reported_dynamic_instr_counter);
           nvbit_add_call_arg_const_val64(instr, (uint64_t)&stop_report[device_id]);
-          /* Lighter_NVbit_Tracing.md (a): final arg selects the O(1) first-lane
-           * gather for spin-class ops; 0 keeps the original O(32) gather. */
-          nvbit_add_call_arg_const_val32(instr, light_this_inst);
+          /* Retained ABI argument from the spin-only experiment. */
+          nvbit_add_call_arg_const_val32(instr, 0);
       }
 
       /* Phase 0b (TMA_BASE_ADDR.md §2.13): instrument the entry
@@ -2229,12 +2308,22 @@ void instrument_function_if_needed(CUcontext ctx, CUfunction func, int device_id
   }
 }
 
-__global__ void flush_channel(ChannelDev* ch_dev) {
+__global__ void flush_channel(ChannelDev* ch_dev, int compact_transport) {
   /* push memory access with negative cta id to communicate the kernel is
    * completed */
-  inst_trace_t ma;
-  ma.cta_id_x = -1;
-  ch_dev->push(&ma, sizeof(inst_trace_t));
+  if (compact_transport) {
+    inst_trace_t ma;
+    ma.record_size = INST_TRACE_COMPACT_SIZE;
+    ma.record_version = INST_TRACE_RECORD_VERSION;
+    ma.record_flags = 0;
+    ma.cta_id_x = -1;
+    ma.mem_type = MEM_TYPE::NONE;
+    ch_dev->push(&ma, ma.record_size);
+  } else {
+    legacy_inst_trace_t ma;
+    ma.cta_id_x = -1;
+    ch_dev->push(&ma, sizeof(legacy_inst_trace_t));
+  }
 
   /* flush channel */
   ch_dev->flush();
@@ -2600,7 +2689,7 @@ void nvbit_at_cuda_event(CUcontext ctx, int is_exit, nvbit_api_cuda_t cbid,
 
       /* issue flush of channel so we are sure all the memory accesses
        * have been pushed */
-      flush_channel<<<1, 1>>>(ctx_state->channel_dev);
+      flush_channel<<<1, 1>>>(ctx_state->channel_dev, tracer_light_spin);
       cudaDeviceSynchronize();
       assert(cudaGetLastError() == cudaSuccess);
 
@@ -2772,6 +2861,53 @@ void base_delta_compress(const uint64_t *addrs, const std::bitset<32> &mask,
   }
 }
 
+static uint32_t validated_inst_trace_record_size(const char *data,
+                                                 uint32_t available_bytes) {
+  if (available_bytes < INST_TRACE_COMPACT_SIZE) {
+    std::cerr << "[TRACE-WIRE] truncated compact record: available="
+              << available_bytes << " required=" << INST_TRACE_COMPACT_SIZE
+              << std::endl;
+    abort();
+  }
+
+  const inst_trace_t *record =
+      reinterpret_cast<const inst_trace_t *>(data);
+  if (record->record_version != INST_TRACE_RECORD_VERSION) {
+    std::cerr << "[TRACE-WIRE] unsupported record version "
+              << record->record_version << std::endl;
+    abort();
+  }
+
+  const uint16_t known_flags = INST_TRACE_HAS_LANE_VALUES;
+  if ((record->record_flags & ~known_flags) != 0) {
+    std::cerr << "[TRACE-WIRE] unknown record flags 0x" << std::hex
+              << record->record_flags << std::dec << std::endl;
+    abort();
+  }
+
+  const uint32_t expected_size =
+      inst_trace_has_lane_values(record) ? INST_TRACE_MEMORY_SIZE
+                                         : INST_TRACE_COMPACT_SIZE;
+  if (record->record_size != expected_size ||
+      record->record_size > available_bytes) {
+    std::cerr << "[TRACE-WIRE] invalid record size=" << record->record_size
+              << " expected=" << expected_size
+              << " available=" << available_bytes << std::endl;
+    abort();
+  }
+  if (record->cta_id_x != -1) {
+    const bool memory_record = record->mem_type != MEM_TYPE::NONE;
+    if (memory_record != inst_trace_has_lane_values(record)) {
+      std::cerr << "[TRACE-WIRE] payload/type mismatch: mem_type="
+                << static_cast<int>(record->mem_type)
+                << " flags=0x" << std::hex << record->record_flags
+                << std::dec << std::endl;
+      abort();
+    }
+  }
+  return record->record_size;
+}
+
 void *recv_thread_fun(void *args) {
   CUcontext ctx = (CUcontext)args;
   pthread_mutex_lock(&mutex);
@@ -2790,26 +2926,70 @@ void *recv_thread_fun(void *args) {
   pthread_mutex_unlock(&mutex);
 
   char *recv_buffer = (char *)malloc(CHANNEL_SIZE);
+  uint64_t legacy_records = 0;
+  uint64_t compact_records = 0;
+  uint64_t memory_records = 0;
+  uint64_t wire_bytes = 0;
 
   while (ctx_state->recv_thread_done == RecvThreadState::WORKING) {
     uint32_t num_recv_bytes = ch_host->recv(recv_buffer, CHANNEL_SIZE);
     if (num_recv_bytes > 0) {
       if (warp_lifetime_only) {
         uint32_t offset = 0;
-        while (offset + sizeof(inst_trace_t) <= num_recv_bytes) {
-          inst_trace_t *token =
-              reinterpret_cast<inst_trace_t *>(&recv_buffer[offset]);
-          if (token->cta_id_x == -1) {
+        while (offset < num_recv_bytes) {
+          uint32_t record_size = 0;
+          int cta_id_x = 0;
+          if (tracer_light_spin) {
+            record_size = validated_inst_trace_record_size(
+                &recv_buffer[offset], num_recv_bytes - offset);
+            const inst_trace_t *token =
+                reinterpret_cast<const inst_trace_t *>(&recv_buffer[offset]);
+            cta_id_x = token->cta_id_x;
+          } else {
+            if (num_recv_bytes - offset < INST_TRACE_LEGACY_SIZE) {
+              std::cerr << "[TRACE-WIRE] truncated legacy record"
+                        << std::endl;
+              abort();
+            }
+            record_size = INST_TRACE_LEGACY_SIZE;
+            const legacy_inst_trace_t *token =
+                reinterpret_cast<const legacy_inst_trace_t *>(
+                    &recv_buffer[offset]);
+            cta_id_x = token->cta_id_x;
+          }
+          if (cta_id_x == -1) {
             recv_thread_receiving[ctx] = false;
             break;
           }
-          offset += sizeof(inst_trace_t);
+          offset += record_size;
         }
         continue;
       }
       uint32_t num_processed_bytes = 0;
       while (num_processed_bytes < num_recv_bytes) {
-        inst_trace_t *ma = (inst_trace_t *)&recv_buffer[num_processed_bytes];
+        uint32_t record_size = 0;
+        inst_trace_t normalized_record;
+        inst_trace_t *ma = nullptr;
+        if (tracer_light_spin) {
+          record_size = validated_inst_trace_record_size(
+              &recv_buffer[num_processed_bytes],
+              num_recv_bytes - num_processed_bytes);
+          ma = reinterpret_cast<inst_trace_t *>(
+              &recv_buffer[num_processed_bytes]);
+        } else {
+          if (num_recv_bytes - num_processed_bytes <
+              INST_TRACE_LEGACY_SIZE) {
+            std::cerr << "[TRACE-WIRE] truncated legacy record"
+                      << std::endl;
+            abort();
+          }
+          const legacy_inst_trace_t *legacy =
+              reinterpret_cast<const legacy_inst_trace_t *>(
+                  &recv_buffer[num_processed_bytes]);
+          normalize_legacy_inst_trace(legacy, &normalized_record);
+          ma = &normalized_record;
+          record_size = INST_TRACE_LEGACY_SIZE;
+        }
 
         /* when we receive a CTA_id_x it means all the kernels
         * completed, this is the special token we receive from the
@@ -2818,6 +2998,14 @@ void *recv_thread_fun(void *args) {
         if (ma->cta_id_x == -1) {
           recv_thread_receiving[ctx] = false;
           break;
+        }
+        wire_bytes += record_size;
+        if (!tracer_light_spin) {
+          legacy_records++;
+        } else if (inst_trace_has_lane_values(ma)) {
+          memory_records++;
+        } else {
+          compact_records++;
         }
         while(!recv_thread_receiving[ctx]) {
           pthread_yield();
@@ -2870,7 +3058,8 @@ void *recv_thread_fun(void *args) {
                 dynamic_trace::instruction::sync_runtime_info *sync =
                     inst->mutable_sync();
                 sync->set_valid(true);
-                sync->set_barrier_addr(ma->addrs_or_reg_val_0[first_lane]);
+                sync->set_barrier_addr(
+                    inst_trace_value_0(ma, first_lane));
                 if (sync_site.semantic_is_zero_literal) {
                   sync->set_has_semantic_raw(true);
                   sync->set_semantic_raw(0);
@@ -2883,7 +3072,8 @@ void *recv_thread_fun(void *args) {
                     inst->mutable_sync();
                 sync->set_valid(true);
                 sync->set_has_semantic_raw(true);
-                sync->set_semantic_raw(ma->addrs_or_reg_val_0[first_lane]);
+                sync->set_semantic_raw(
+                    inst_trace_value_0(ma, first_lane));
               }
             }
           }
@@ -2895,7 +3085,7 @@ void *recv_thread_fun(void *args) {
           if (bar_pc_it != bar_function_it->second.end()) {
             const bar_runtime_capture_site_info &bar_site = bar_pc_it->second;
             // Register-form barrier operands take the REGULAR callback path, where the
-            // live register value lands in addrs_or_reg_val_0[lane] with mem_type==NONE.
+            // live register value lands in scalar_value_0 with mem_type==NONE.
             // Pick the first predicated-active lane: if the warp did not actually execute
             // this BAR (no active+predicated lane), nothing is captured for this instance.
             int first_lane =
@@ -2908,7 +3098,8 @@ void *recv_thread_fun(void *args) {
                     inst->mutable_bar_runtime();
                 bar->set_valid(true);
                 bar->set_has_id(true);
-                bar->set_id(static_cast<uint32_t>(ma->addrs_or_reg_val_0[first_lane]));
+                bar->set_id(static_cast<uint32_t>(
+                    inst_trace_value_0(ma, first_lane)));
               } else if (bar_site.count_callback_index >= 0 &&
                          callback_index ==
                              static_cast<unsigned int>(
@@ -2917,7 +3108,8 @@ void *recv_thread_fun(void *args) {
                     inst->mutable_bar_runtime();
                 bar->set_valid(true);
                 bar->set_has_count(true);
-                bar->set_count(static_cast<uint32_t>(ma->addrs_or_reg_val_0[first_lane]));
+                bar->set_count(static_cast<uint32_t>(
+                    inst_trace_value_0(ma, first_lane)));
               }
             }
           }
@@ -2941,10 +3133,12 @@ void *recv_thread_fun(void *args) {
               candidate.unique_function_id = ma->unique_function_id;
               candidate.pc = ma->vpc;
               candidate.dest_ureg_id = pc_it->second;
-              candidate.pre_value_lo = static_cast<uint32_t>(ma->addrs_or_reg_val_0[0]);
+              candidate.pre_value_lo =
+                  static_cast<uint32_t>(ma->scalar_value_0);
               candidate.pre_value_hi =
-                  (ma->per_operand_type == TRACED_REG_TYPE::UNIFORM_2_REGS) ? ma->reg_val_1[0]
-                                                                            : SECRET_UREG_DESC_NOT_USED;
+                  (ma->per_operand_type == TRACED_REG_TYPE::UNIFORM_2_REGS)
+                      ? ma->scalar_value_1
+                      : SECRET_UREG_DESC_NOT_USED;
               recent_queue.push_back(candidate);
               if (recent_queue.size() > 16) {
                 recent_queue.pop_front();
@@ -2978,10 +3172,11 @@ void *recv_thread_fun(void *args) {
           if (enable_compress) {
             // try base+stride format
             base_stride_success =
-                base_stride_compress(ma->addrs_or_reg_val_0, mask, base_addr, stride);
+                base_stride_compress(ma->lane_values, mask, base_addr,
+                                     stride);
             if (!base_stride_success) {
               // if base+stride fails, try base+delta format
-              base_delta_compress(ma->addrs_or_reg_val_0, mask, base_addr, deltas);
+              base_delta_compress(ma->lane_values, mask, base_addr, deltas);
             }
           }
 
@@ -3002,7 +3197,7 @@ void *recv_thread_fun(void *args) {
             addr->set_compression_format(address_format::list_all);
             for (int s = 0; s < 32; s++) {
               if (mask.test(s))
-                addr->add_addrs(ma->addrs_or_reg_val_0[s]);
+                addr->add_addrs(ma->lane_values[s]);
             }
           }
           if (ma->mem_type == MEM_TYPE::STANDARD_MEM && enable_tma_desc &&
@@ -3038,11 +3233,28 @@ void *recv_thread_fun(void *args) {
         }
         // =============================================================================
 
-        num_processed_bytes += sizeof(inst_trace_t);
+        num_processed_bytes += record_size;
       }
     }
   }
   free(recv_buffer);
+
+  const uint64_t total_records =
+      legacy_records + compact_records + memory_records;
+  const uint64_t legacy_bytes =
+      total_records * static_cast<uint64_t>(INST_TRACE_LEGACY_SIZE);
+  const double reduction_pct =
+      legacy_bytes == 0
+          ? 0.0
+          : 100.0 * (1.0 - static_cast<double>(wire_bytes) /
+                               static_cast<double>(legacy_bytes));
+  printf("[TRACE-WIRE] mode=%s legacy_records=%" PRIu64
+         " compact_records=%" PRIu64
+         " memory_records=%" PRIu64 " wire_bytes=%" PRIu64
+         " legacy_bytes=%" PRIu64 " reduction=%.2f%%\n",
+         tracer_light_spin ? "compact" : "legacy", legacy_records,
+         compact_records, memory_records, wire_bytes, legacy_bytes,
+         reduction_pct);
 
   // Print incremental flush stats at thread end
   if (incremental_flush_threshold > 0 && total_incremental_flushes > 0) {

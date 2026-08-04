@@ -55,18 +55,7 @@ extern "C" __device__ __noinline__ void instrument_inst(
   const int predicate_mask = __ballot_sync(__activemask(), pred);
   const int laneid = get_laneid();
   const int first_laneid = __ffs(active_mask) - 1;
-
-  /* Lighter_NVbit_Tracing.md (a): for spin-class ops (SYNCS.PHASECHK/TRYWAIT,
-   * NANOSLEEP, BRA) the host post-processing only ever reads the first-active
-   * lane's operand value (barrier_addr / semantic scalar), never the other 31
-   * lanes (see audit §1a/§1b). When `light` is set the tracer_tool.cu host loop
-   * has verified the op is one of these spin-class ops carrying no payload the
-   * sim needs per-lane, so we replace every O(32) __shfl_sync gather below with
-   * a single O(1) first-lane shuffle. The pushed record schema is byte-identical
-   * (same inst_trace_t, same size); only the redundant lanes are left unwritten.
-   * This cuts the per-op gather cost that dilates capture wall-clock and inflates
-   * the producer mbarrier over-poll baked into the trace. */
-  const bool spin_light = (light != 0);
+  (void)light;
 
   if ((*((bool *)pstop_report))) {
     if (first_laneid == laneid) {
@@ -75,22 +64,16 @@ extern "C" __device__ __noinline__ void instrument_inst(
     }
   }
 
-  inst_trace_t ma;
+  legacy_inst_trace_t ma;
   ma.ureg_desc_id = SECRET_UREG_DESC_NOT_USED;
   ma.ureg_desc_value = SECRET_UREG_DESC_NOT_USED;
   ma.ureg_desc_value_hi = SECRET_UREG_DESC_NOT_USED;
   ma.num_of_injects = num_of_injects;
   ma.per_operand_type = per_operand_type;
   if (memory_type == MEM_TYPE::STANDARD_MEM) {
-    /* collect memory address information */
-    if (spin_light) {
-      /* spin op barrier_addr MREF: host reads only [first_laneid] */
-      ma.addrs_or_reg_val_0[first_laneid] =
-          __shfl_sync(active_mask, addr_or_offset_or_reg_id, first_laneid);
-    } else {
-      for (int i = 0; i < 32; i++) {
-        ma.addrs_or_reg_val_0[i] = __shfl_sync(active_mask, addr_or_offset_or_reg_id, i);
-      }
+    for (int i = 0; i < 32; i++) {
+      ma.addrs_or_reg_val_0[i] =
+          __shfl_sync(active_mask, addr_or_offset_or_reg_id, i);
     }
     ma.width = mem_width_or_op_reg_val_0;
     ma.mem_type = MEM_TYPE::STANDARD_MEM;
@@ -108,7 +91,8 @@ extern "C" __device__ __noinline__ void instrument_inst(
     uint32_t reg_value = mem_width_or_op_reg_val_0;
     ma.width = 4;
     for (int tid = 0; tid < 32; tid++) {
-        ma.addrs_or_reg_val_0[tid] = __shfl_sync(active_mask, reg_value, tid);
+      ma.addrs_or_reg_val_0[tid] =
+          __shfl_sync(active_mask, reg_value, tid);
     }
   }else if(memory_type == MEM_TYPE::CALL_OR_RET) {
     ma.mem_type = MEM_TYPE::CALL_OR_RET;
@@ -116,44 +100,45 @@ extern "C" __device__ __noinline__ void instrument_inst(
     uint32_t reg_value_1 = mem_width_or_op_reg_val_0;
     uint32_t reg_value_2 = op_reg_val_1;
     for (int tid = 0; tid < 32; tid++) {
-        uint32_t th_reg_val1 = __shfl_sync(active_mask, reg_value_1, tid);
-        uint32_t th_reg_val2 = __shfl_sync(active_mask, reg_value_2, tid);
-        uint64_t final_addr = static_cast<uint64_t>(th_reg_val2) << 32;
-        final_addr += th_reg_val1 + addr_or_offset_or_reg_id;
-        ma.addrs_or_reg_val_0[tid] = final_addr;
+      uint32_t th_reg_val1 =
+          __shfl_sync(active_mask, reg_value_1, tid);
+      uint32_t th_reg_val2 =
+          __shfl_sync(active_mask, reg_value_2, tid);
+      uint64_t final_addr = static_cast<uint64_t>(th_reg_val2) << 32;
+      final_addr += th_reg_val1 + addr_or_offset_or_reg_id;
+      ma.addrs_or_reg_val_0[tid] = final_addr;
     }
   }else {
     ma.mem_type = MEM_TYPE::NONE;
     ma.width = 0;
     ma.reg_id = addr_or_offset_or_reg_id;
-    if((per_operand_type == TRACED_REG_TYPE::REGULAR) || (per_operand_type == TRACED_REG_TYPE::REGULAR_2_REGS) || 
-        (per_operand_type == TRACED_REG_TYPE::REGULAR_4_REGS) || (per_operand_type == TRACED_REG_TYPE::PREDICATE)) {
-      if (spin_light) {
-        /* spin op semantic scalar: host reads only [first_laneid]. Light path is
-         * only routed for the single-value REGULAR/PREDICATE case (never 2/4-reg,
-         * which no spin op uses) — see the tracer_tool.cu allowlist. */
-        ma.addrs_or_reg_val_0[first_laneid] =
-            __shfl_sync(active_mask, mem_width_or_op_reg_val_0, first_laneid);
-      } else {
+    if((per_operand_type == TRACED_REG_TYPE::REGULAR) ||
+       (per_operand_type == TRACED_REG_TYPE::REGULAR_2_REGS) ||
+       (per_operand_type == TRACED_REG_TYPE::REGULAR_4_REGS) ||
+       (per_operand_type == TRACED_REG_TYPE::PREDICATE)) {
       for (int tid = 0; tid < 32; tid++) {
-        ma.addrs_or_reg_val_0[tid] = __shfl_sync(active_mask, mem_width_or_op_reg_val_0, tid);
+        ma.addrs_or_reg_val_0[tid] =
+            __shfl_sync(active_mask, mem_width_or_op_reg_val_0, tid);
       }
       if(per_operand_type == TRACED_REG_TYPE::REGULAR_2_REGS) {
         for (int tid = 0; tid < 32; tid++) {
-          ma.reg_val_1[tid] = __shfl_sync(active_mask, op_reg_val_1, tid);
+          ma.reg_val_1[tid] =
+              __shfl_sync(active_mask, op_reg_val_1, tid);
         }
       }
       if(per_operand_type == TRACED_REG_TYPE::REGULAR_4_REGS) {
         for (int tid = 0; tid < 32; tid++) {
-          ma.reg_val_2[tid] = __shfl_sync(active_mask, op_reg_val_2, tid);
+          ma.reg_val_2[tid] =
+              __shfl_sync(active_mask, op_reg_val_2, tid);
         }
         for (int tid = 0; tid < 32; tid++) {
-          ma.reg_val_3[tid] = __shfl_sync(active_mask, op_reg_val_3, tid);
+          ma.reg_val_3[tid] =
+              __shfl_sync(active_mask, op_reg_val_3, tid);
         }
       }
-      }
-    }else if((per_operand_type == TRACED_REG_TYPE::UNIFORM) || (per_operand_type == TRACED_REG_TYPE::UNIFORM_2_REGS) ||
-        (per_operand_type == TRACED_REG_TYPE::UNIFORM_PREDICATE)) {
+    }else if((per_operand_type == TRACED_REG_TYPE::UNIFORM) ||
+             (per_operand_type == TRACED_REG_TYPE::UNIFORM_2_REGS) ||
+             (per_operand_type == TRACED_REG_TYPE::UNIFORM_PREDICATE)) {
       for (int tid = 0; tid < 32; tid++) {
         ma.addrs_or_reg_val_0[tid] = mem_width_or_op_reg_val_0;
       }
@@ -180,10 +165,144 @@ extern "C" __device__ __noinline__ void instrument_inst(
   ma.predicate_mask = predicate_mask;
   ma.sm_id = get_smid();
 
+  if (first_laneid == laneid) {
+    ChannelDev *channel_dev = (ChannelDev *)pchannel_dev;
+    channel_dev->push(&ma, sizeof(legacy_inst_trace_t));
+    atomicAdd((unsigned long long *)ptotal_dynamic_instr_counter, 1);
+    atomicAdd((unsigned long long *)preported_dynamic_instr_counter, 1);
+  }
+}
+
+extern "C" __device__ __noinline__ void instrument_inst_compact(
+    int32_t pred, uint32_t unique_function_id, uint32_t vpc, uint32_t num_of_injects,
+    uint32_t per_operand_type, uint32_t memory_type, uint64_t addr_or_offset_or_reg_id,
+    uint32_t mem_width_or_op_reg_val_0, uint32_t op_reg_val_1, uint32_t op_reg_val_2,
+    uint32_t op_reg_val_3, uint64_t pchannel_dev, uint64_t ptotal_dynamic_instr_counter,
+    uint64_t preported_dynamic_instr_counter, uint64_t pstop_report, int32_t light) {
+
+  const int active_mask = __ballot_sync(__activemask(), 1);
+  const int predicate_mask = __ballot_sync(__activemask(), pred);
+  const int laneid = get_laneid();
+  const int first_laneid = __ffs(active_mask) - 1;
+  const int value_mask = active_mask & predicate_mask;
+  const int first_value_laneid =
+      value_mask != 0 ? (__ffs(value_mask) - 1) : first_laneid;
+  (void)light;  // Compact transport subsumes the old spin-only gather shortcut.
+
+  if ((*((bool *)pstop_report))) {
+    if (first_laneid == laneid) {
+      atomicAdd((unsigned long long *)ptotal_dynamic_instr_counter, 1);
+      return;
+    }
+  }
+
+  inst_trace_t ma;
+  ma.record_size = INST_TRACE_COMPACT_SIZE;
+  ma.record_version = INST_TRACE_RECORD_VERSION;
+  ma.record_flags = 0;
+  ma.reg_id = SECRET_UREG_DESC_NOT_USED;
+  ma.ureg_desc_id = SECRET_UREG_DESC_NOT_USED;
+  ma.ureg_desc_value = SECRET_UREG_DESC_NOT_USED;
+  ma.ureg_desc_value_hi = SECRET_UREG_DESC_NOT_USED;
+  ma.num_of_injects = num_of_injects;
+  ma.per_operand_type = per_operand_type;
+  ma.scalar_value_0 = 0;
+  ma.scalar_value_1 = 0;
+  ma.scalar_value_2 = 0;
+  ma.scalar_value_3 = 0;
+  ma.reserved = 0;
+  if (memory_type == MEM_TYPE::STANDARD_MEM) {
+    /* collect memory address information */
+    ma.record_size = INST_TRACE_MEMORY_SIZE;
+    ma.record_flags |= INST_TRACE_HAS_LANE_VALUES;
+    for (int i = 0; i < 32; i++) {
+      ma.lane_values[i] =
+          __shfl_sync(active_mask, addr_or_offset_or_reg_id, i);
+    }
+    ma.width = mem_width_or_op_reg_val_0;
+    ma.mem_type = MEM_TYPE::STANDARD_MEM;
+    if(op_reg_val_1 != SECRET_UREG_DESC_NOT_USED) {
+      ma.ureg_desc_value = op_reg_val_1;
+    }
+    if(op_reg_val_2 != SECRET_UREG_DESC_NOT_USED) {
+      ma.ureg_desc_id = op_reg_val_2;
+    }
+    if(op_reg_val_3 != SECRET_UREG_DESC_NOT_USED) {
+      ma.ureg_desc_value_hi = op_reg_val_3;
+    }
+  }else if(memory_type == MEM_TYPE::CONSTANT_MEM) {
+    ma.record_size = INST_TRACE_MEMORY_SIZE;
+    ma.record_flags |= INST_TRACE_HAS_LANE_VALUES;
+    ma.mem_type = MEM_TYPE::CONSTANT_MEM;
+    uint32_t reg_value = mem_width_or_op_reg_val_0;
+    ma.width = 4;
+    for (int tid = 0; tid < 32; tid++) {
+        ma.lane_values[tid] =
+            __shfl_sync(active_mask, reg_value, tid);
+    }
+  }else if(memory_type == MEM_TYPE::CALL_OR_RET) {
+    ma.record_size = INST_TRACE_MEMORY_SIZE;
+    ma.record_flags |= INST_TRACE_HAS_LANE_VALUES;
+    ma.mem_type = MEM_TYPE::CALL_OR_RET;
+    ma.width = 1;
+    uint32_t reg_value_1 = mem_width_or_op_reg_val_0;
+    uint32_t reg_value_2 = op_reg_val_1;
+    for (int tid = 0; tid < 32; tid++) {
+        uint32_t th_reg_val1 = __shfl_sync(active_mask, reg_value_1, tid);
+        uint32_t th_reg_val2 = __shfl_sync(active_mask, reg_value_2, tid);
+        uint64_t final_addr = static_cast<uint64_t>(th_reg_val2) << 32;
+        final_addr += th_reg_val1 + addr_or_offset_or_reg_id;
+        ma.lane_values[tid] = final_addr;
+    }
+  }else {
+    ma.mem_type = MEM_TYPE::NONE;
+    ma.width = 0;
+    ma.reg_id = addr_or_offset_or_reg_id;
+    if((per_operand_type == TRACED_REG_TYPE::REGULAR) || (per_operand_type == TRACED_REG_TYPE::REGULAR_2_REGS) ||
+        (per_operand_type == TRACED_REG_TYPE::REGULAR_4_REGS) || (per_operand_type == TRACED_REG_TYPE::PREDICATE)) {
+      ma.scalar_value_0 =
+          __shfl_sync(active_mask, mem_width_or_op_reg_val_0,
+                      first_value_laneid);
+      if(per_operand_type == TRACED_REG_TYPE::REGULAR_2_REGS) {
+        ma.scalar_value_1 =
+            __shfl_sync(active_mask, op_reg_val_1, first_value_laneid);
+      }
+      if(per_operand_type == TRACED_REG_TYPE::REGULAR_4_REGS) {
+        ma.scalar_value_1 =
+            __shfl_sync(active_mask, op_reg_val_1, first_value_laneid);
+        ma.scalar_value_2 =
+            __shfl_sync(active_mask, op_reg_val_2, first_value_laneid);
+        ma.scalar_value_3 =
+            __shfl_sync(active_mask, op_reg_val_3, first_value_laneid);
+      }
+    }else if((per_operand_type == TRACED_REG_TYPE::UNIFORM) || (per_operand_type == TRACED_REG_TYPE::UNIFORM_2_REGS) ||
+        (per_operand_type == TRACED_REG_TYPE::UNIFORM_PREDICATE)) {
+      ma.scalar_value_0 = mem_width_or_op_reg_val_0;
+      if(per_operand_type == TRACED_REG_TYPE::UNIFORM_2_REGS) {
+        ma.scalar_value_1 = op_reg_val_1;
+      }
+    }
+  }
+
+  int4 cta = get_ctaid();
+  int uniqe_threadId = threadIdx.z * blockDim.y * blockDim.x +
+                       threadIdx.y * blockDim.x + threadIdx.x;
+  ma.warpid_tb = uniqe_threadId / 32;
+
+  ma.cta_id_x = cta.x;
+  ma.cta_id_y = cta.y;
+  ma.cta_id_z = cta.z;
+  ma.warpid_sm = get_warpid();
+  ma.vpc = vpc;
+  ma.unique_function_id = unique_function_id;
+  ma.active_mask = active_mask;
+  ma.predicate_mask = predicate_mask;
+  ma.sm_id = get_smid();
+
   /* first active lane pushes information on the channel */
   if (first_laneid == laneid) {
     ChannelDev *channel_dev = (ChannelDev *)pchannel_dev;
-    channel_dev->push(&ma, sizeof(inst_trace_t));
+    channel_dev->push(&ma, ma.record_size);
     atomicAdd((unsigned long long *)ptotal_dynamic_instr_counter, 1);
     atomicAdd((unsigned long long *)preported_dynamic_instr_counter, 1);
   }
