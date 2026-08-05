@@ -39,6 +39,9 @@ trim_spin_ncu_bin = os.getenv("TRIM_SPIN_NCU_BIN", "ncu")
 tracer_light_spin_value = os.getenv("TRACER_LIGHT_SPIN", "0")
 if tracer_light_spin_value not in ("0", "1"):
     raise RuntimeError("TRACER_LIGHT_SPIN must be 0 or 1")
+gather_registers_value = os.getenv("GATHER_REGISTERS", "0")
+if gather_registers_value not in ("0", "1"):
+    raise RuntimeError("GATHER_REGISTERS must be 0 or 1")
 compact_full_capture_enabled = tracer_light_spin_value == "1"
 if trim_spin_enabled and compact_full_capture_enabled:
     raise RuntimeError(
@@ -260,6 +263,9 @@ for bench in benchmarks:
         # benchmark environment so this top-level experiment selection wins.
         env_exports += "export TRACER_LIGHT_SPIN={0}; ".format(
             tracer_light_spin_value
+        )
+        env_exports += "export GATHER_REGISTERS={0}; ".format(
+            gather_registers_value
         )
 
         if options.terminate_upon_limit:

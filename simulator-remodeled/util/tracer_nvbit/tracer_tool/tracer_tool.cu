@@ -1769,7 +1769,13 @@ void nvbit_at_init() {
               "folder TRACES_FOLDER path environment");
   GET_VAR_INT(threshold_unique_kernel_checking, "THRESHOLD_UNIQUE_KERNEL_CHECKING", 10,
               "Number of instructions used to check if kernels with the same name are different");
-  GET_VAR_INT(gather_registers, "GATHER_REGISTERS", 0, "Enable gathering of GPU register values. Not available in this version.");
+  GET_VAR_INT(
+      gather_registers, "GATHER_REGISTERS", 0,
+      "Retain otherwise-unused REG/UREG/PRED operand callbacks in compact "
+      "mode. Runtime operands required by memory, sync, BAR, and TMA are "
+      "always preserved.");
+  printf("[TRACE-PRUNE] enabled=%d gather_registers=%d\n",
+         tracer_light_spin && !gather_registers, gather_registers);
   GET_VAR_INT(incremental_flush_threshold, "INCREMENTAL_FLUSH_THRESHOLD", 0,
               "Flush threadblocks to disk when instruction count exceeds this threshold. "
               "0 = disabled (default). Recommended: 50000-100000 for large kernels.");
@@ -1932,7 +1938,8 @@ void instrument_function_if_needed(CUcontext ctx, CUfunction func, int device_id
 
       map_func_addr_to_pc_to_sass_instr[addr_funct][vpc] = inst_str;
       
-      /* We only report memory addresses */
+      /* Build the original per-operand callback list first. Compact mode may
+       * prune callbacks after sync/BAR/TMA semantic roles have been identified. */
       int mem_oper_idx = -1;
       int num_mref = 0;
 
@@ -2047,6 +2054,74 @@ void instrument_function_if_needed(CUcontext ctx, CUfunction func, int device_id
           num_of_injects++;
         }
       }
+      /*
+       * The replay protobuf has no generic register-value field. In compact
+       * mode, keep only callbacks whose runtime values have a proven consumer:
+       *
+       *   - MEMORY_REF: replay addresses, sync barrier addresses, LDC/call
+       *   - sync semantic: PHASECHK/ARRIVE/EXCH runtime semantic or phase
+       *   - BAR register operands: runtime named-barrier id/count
+       *   - TMA family: every operand, because tma_runtime_operand_debug.jsonl
+       *     is consumed by strict TMA sidecar generation
+       *
+       * GATHER_REGISTERS=1 restores the original all-operand callback stream
+       * for diagnostics. The legacy transport is intentionally unchanged.
+       */
+      if (tracer_light_spin && !gather_registers &&
+          !is_tma_desc_consumer_instruction) {
+        std::map<uint32_t, traced_operand_instrument> retained_operands;
+        std::map<int, int> old_to_new_callback_index;
+
+        for (const auto &entry : per_operand_type) {
+          const int old_index = static_cast<int>(entry.first);
+          const bool is_memory =
+              entry.second.reg_type == TRACED_REG_TYPE::MEMORY_REF;
+          const bool is_sync_semantic =
+              sync_site_info.semantic_callback_index == old_index;
+          const bool is_bar_runtime =
+              bar_site_info.id_callback_index == old_index ||
+              bar_site_info.count_callback_index == old_index;
+          if (!is_memory && !is_sync_semantic && !is_bar_runtime) {
+            continue;
+          }
+
+          const int new_index =
+              static_cast<int>(retained_operands.size());
+          retained_operands[static_cast<uint32_t>(new_index)] = entry.second;
+          old_to_new_callback_index[old_index] = new_index;
+        }
+
+        auto remap_required_callback =
+            [&](int &callback_index, const char *role) {
+              if (callback_index < 0) {
+                return;
+              }
+              auto remap_it =
+                  old_to_new_callback_index.find(callback_index);
+              if (remap_it == old_to_new_callback_index.end()) {
+                fprintf(stderr,
+                        "[TRACE-PRUNE] required %s callback was pruned: "
+                        "function=%d pc=0x%x old_index=%d\n",
+                        role, next_candidate_unique_function_id, vpc,
+                        callback_index);
+                abort();
+              }
+              callback_index = remap_it->second;
+            };
+
+        remap_required_callback(sync_site_info.barrier_callback_index,
+                                "sync-barrier");
+        remap_required_callback(sync_site_info.semantic_callback_index,
+                                "sync-semantic");
+        remap_required_callback(bar_site_info.id_callback_index, "bar-id");
+        remap_required_callback(bar_site_info.count_callback_index,
+                                "bar-count");
+
+        per_operand_type.swap(retained_operands);
+        num_of_injects =
+            static_cast<uint32_t>(per_operand_type.size());
+      }
+
       if (is_tma_desc_consumer_instruction && tma_desc_ureg_id != SECRET_UREG_DESC_NOT_USED) {
         tma_desc_ureg_by_pc[next_candidate_unique_function_id][vpc] = tma_desc_ureg_id;
       }
