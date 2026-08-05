@@ -531,13 +531,25 @@ void trace_parser::get_next_threadblock_traces(
   // CTA. A spin-trimmed trace shows the producer warp's count drop by ~10x vs a
   // full run (the producer's PHASECHK/NANOSLEEP/BRA spin was removed), so this
   // one line per CTA lets a 12h run be verified as "trimmed trace consumed".
-  // Gated by -trimchk_percta_log_enable (verbose: one line per CTA); the
+  // Gated by -trimchk_percta_log_enable (verbose: two lines per CTA); the
   // per-kernel summary in gpu_print_stat is always on. Grep for "[TRIMCHK]".
   bool trimchk_percta_log = (gpu != nullptr) &&
       gpu->getShaderCoreConfig() != nullptr &&
       gpu->getShaderCoreConfig()->trimchk_percta_log_enable;
   if (trimchk_percta_log) {
     unsigned long long trimchk_cta_total = 0;
+    unsigned long long tracecheck_active_lane_insts = 0;
+    unsigned long long tracecheck_memref_records = 0;
+    unsigned long long tracecheck_memref_lane_uses = 0;
+    unsigned long long tracecheck_sync_runtime = 0;
+    unsigned long long tracecheck_sync_semantic = 0;
+    unsigned long long tracecheck_bar_runtime = 0;
+    unsigned long long tracecheck_bar_id = 0;
+    unsigned long long tracecheck_bar_count = 0;
+    unsigned long long tracecheck_zero_mask_insts = 0;
+    unsigned long long tracecheck_hgmma = 0;
+    unsigned long long tracecheck_mufu = 0;
+    unsigned long long tracecheck_tma_family = 0;
     unsigned trimchk_max_warp_insts = 0;
     unsigned trimchk_max_warp_id = 0;
     for (auto warp : tb_cur.warps()) {
@@ -547,6 +559,57 @@ void trace_parser::get_next_threadblock_traces(
         trimchk_max_warp_insts = wc;
         trimchk_max_warp_id = warp.first;
       }
+      for (const auto &pb_inst : warp.second.instructions()) {
+        const std::string opcode =
+            static_trace_info
+                .get_kernel_by_unique_function_id(
+                    pb_inst.function_unique_id())
+                .get_instruction(pb_inst.pc())
+                .get_op_code();
+        if (opcode.rfind("HGMMA", 0) == 0) {
+          tracecheck_hgmma++;
+        }
+        if (opcode.rfind("MUFU", 0) == 0) {
+          tracecheck_mufu++;
+        }
+        if (opcode.rfind("UTMALDG", 0) == 0 ||
+            opcode.rfind("UTMASTG", 0) == 0 ||
+            opcode.rfind("UBLKCP", 0) == 0 ||
+            opcode.rfind("UBLKPF", 0) == 0 ||
+            opcode.rfind("UBLKRED", 0) == 0 ||
+            opcode.rfind("UTMACCTL", 0) == 0 ||
+            opcode.rfind("UTMACMDFLUSH", 0) == 0 ||
+            opcode.rfind("UTMAPF", 0) == 0 ||
+            opcode.rfind("UTMAREDG", 0) == 0) {
+          tracecheck_tma_family++;
+        }
+        const uint32_t exec_mask =
+            pb_inst.active_mask() & pb_inst.predicate_mask();
+        const unsigned active_lanes = std::bitset<WARP_SIZE>(exec_mask).count();
+        tracecheck_active_lane_insts += active_lanes;
+        if (active_lanes == 0) {
+          tracecheck_zero_mask_insts++;
+        }
+        tracecheck_memref_records += pb_inst.addresses_size();
+        tracecheck_memref_lane_uses +=
+            static_cast<unsigned long long>(active_lanes) *
+            pb_inst.addresses_size();
+        if (pb_inst.has_sync() && pb_inst.sync().valid()) {
+          tracecheck_sync_runtime++;
+          if (pb_inst.sync().has_semantic_raw()) {
+            tracecheck_sync_semantic++;
+          }
+        }
+        if (pb_inst.has_bar_runtime() && pb_inst.bar_runtime().valid()) {
+          tracecheck_bar_runtime++;
+          if (pb_inst.bar_runtime().has_id()) {
+            tracecheck_bar_id++;
+          }
+          if (pb_inst.bar_runtime().has_count()) {
+            tracecheck_bar_count++;
+          }
+        }
+      }
     }
     std::cout << "[TRIMCHK] kernel=" << kernelid
               << " cta=" << block_id_x << "," << block_id_y << "," << block_id_z
@@ -555,6 +618,23 @@ void trace_parser::get_next_threadblock_traces(
               << " max_warp=" << trimchk_max_warp_id
               << " max_warp_insts=" << trimchk_max_warp_insts
               << " path=" << tb_path << std::endl;
+    std::cout << "[TRACECHECK] kernel=" << kernelid
+              << " cta=" << block_id_x << "," << block_id_y << ","
+              << block_id_z
+              << " warp_insts=" << trimchk_cta_total
+              << " active_lane_insts=" << tracecheck_active_lane_insts
+              << " memref_records=" << tracecheck_memref_records
+              << " memref_lane_uses=" << tracecheck_memref_lane_uses
+              << " sync_runtime=" << tracecheck_sync_runtime
+              << " sync_semantic=" << tracecheck_sync_semantic
+              << " bar_runtime=" << tracecheck_bar_runtime
+              << " bar_id=" << tracecheck_bar_id
+              << " bar_count=" << tracecheck_bar_count
+              << " zero_mask_insts=" << tracecheck_zero_mask_insts
+              << " hgmma=" << tracecheck_hgmma
+              << " mufu=" << tracecheck_mufu
+              << " tma_family=" << tracecheck_tma_family
+              << std::endl;
   }
   for(auto warp : tb_cur.warps()) {
     previous_traced_pc = 0;

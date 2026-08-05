@@ -1137,7 +1137,8 @@ void SM::issue_warp(register_set_uniptr &pipe_reg_set, warp_inst_t *next_inst,
       // FA3 bwd, where MEMBAR.ALL.CTA executes 55k+ times.
       membar_scope_t scope = fence_scope_of(*pipe_reg);
       m_physical_warp[warp_id]->set_membar(scope);
-      if (m_config->bar_debug_enable) {
+      if (m_config->bar_debug_enable &&
+          m_config->bar_debug_issue_budget > 0) {
         const std::string fop =
             pipe_reg->has_extra_trace_instruction_info()
                 ? pipe_reg->get_extra_trace_instruction_info().get_op_code()
@@ -2545,7 +2546,8 @@ bool SM::warp_waiting_at_mem_barrier(unsigned warp_id) {
     }
   }
   if(clear_membar) {
-    if (m_config->bar_debug_enable) {
+    if (m_config->bar_debug_enable &&
+        m_config->bar_debug_issue_budget > 0) {
       std::ostringstream oss;
       oss << "[MEMBARDBG][fence-release] sm=" << m_sm_id
           << " warp=" << warp_id
@@ -2992,7 +2994,8 @@ void SM::inc_fence_store(unsigned warp_id, int fence_vis_level, unsigned n) {
   } else if (fence_vis_level == mem_fetch::FENCE_VIS_GPU) {
     m_physical_warp[warp_id]->inc_pending_stores_gpu_visible(n);
   }
-  if (m_config->bar_debug_enable) {
+  if (m_config->bar_debug_enable &&
+      m_config->bar_debug_issue_budget > 0) {
     std::ostringstream oss;
     oss << "[MEMBARDBG][store++] sm=" << m_sm_id << " warp=" << warp_id
         << " level=" << fence_vis_level << " n=" << n
@@ -3009,7 +3012,8 @@ void SM::dec_fence_store(unsigned warp_id, int fence_vis_level, unsigned n) {
   } else if (fence_vis_level == mem_fetch::FENCE_VIS_GPU) {
     m_physical_warp[warp_id]->dec_pending_stores_gpu_visible(n);
   }
-  if (m_config->bar_debug_enable) {
+  if (m_config->bar_debug_enable &&
+      m_config->bar_debug_issue_budget > 0) {
     std::ostringstream oss;
     oss << "[MEMBARDBG][store--] sm=" << m_sm_id << " warp=" << warp_id
         << " level=" << fence_vis_level << " n=" << n

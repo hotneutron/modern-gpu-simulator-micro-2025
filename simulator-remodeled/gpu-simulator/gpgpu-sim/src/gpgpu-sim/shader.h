@@ -2271,10 +2271,10 @@ class shader_core_config : public core_config {
   // Reads mbarrier state only; never modifies it. Default 0.
   bool producer_spin_ready_instrument_enable;
 
-  // [TRIMCHK] Gate the verbose per-CTA trace-load line emitted when each
-  // threadblock .pb is parsed (cta_total_insts / max_warp_insts / path). Off by
-  // default because it prints one line per CTA (hundreds per kernel). The
-  // per-kernel producer-spin summary in gpu_print_stat is always on regardless.
+  // [TRIMCHK]/[TRACECHECK] Gate verbose per-CTA trace-load contract lines:
+  // path/warp counts plus active-lane, memory, sync, BAR, and opcode-work
+  // counts. Off by default because it prints two lines per CTA. The
+  // per-kernel producer-spin summary is always on regardless.
   bool trimchk_percta_log_enable;
 
   // [Head-of-line lever] Observe-only counters for the issue-pipeline head-of-line blocking test.

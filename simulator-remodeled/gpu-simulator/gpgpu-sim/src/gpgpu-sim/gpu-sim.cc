@@ -696,7 +696,8 @@ void gpgpu_sim::parse_extra_trace_info(std::string filepath, bool is_extra_trace
                 << " base_records="
                 << m_tma_sidecar_db.base_records.size() << std::endl;
     }
-    if (m_shader_config->sync_debug_enable) {
+    if (m_shader_config->sync_debug_enable ||
+        m_shader_config->trimchk_percta_log_enable) {
       std::cerr << "[SYNC] loaded operand_sites="
                 << m_sync_sidecar_db.site_records.size() << std::endl;
     }
@@ -2014,11 +2015,12 @@ void shader_core_config::reg_options(class OptionParser *opp) {
                          "0");
   option_parser_register(opp, "-trimchk_percta_log_enable", OPT_BOOL,
                          &trimchk_percta_log_enable,
-                         "[TRIMCHK] Emit one per-CTA trace-load line at threadblock parse "
-                         "(kernel, cta, nwarps, cta_total_insts, max_warp_insts, path). Lets a "
-                         "spin-trimmed trace be verified as consumed (producer warp insts drop ~10x). "
-                         "Verbose (one line per CTA) so gated off by default; the per-kernel "
-                         "producer-spin summary is always printed regardless. (default=0)",
+                         "[TRIMCHK]/[TRACECHECK] Emit per-CTA trace-load contract lines: "
+                         "path/warp instruction counts plus active-lane instructions, memory "
+                         "records/lane uses, sync runtime/semantic payloads, BAR runtime "
+                         "id/count payloads, zero-mask instructions, and HGMMA/MUFU/TMA "
+                         "work. Verbose (two lines per CTA), so gated off by default. "
+                         "(default=0)",
                          "0");
   option_parser_register(opp, "-headofline_instrument_enable", OPT_BOOL,
                          &headofline_instrument_enable,
@@ -2123,7 +2125,9 @@ void shader_core_config::reg_options(class OptionParser *opp) {
   option_parser_register(opp, "-bar_debug_issue_budget", OPT_UINT32,
                          &bar_debug_issue_budget,
                          "Maximum number of BARDBG per-issue decode lines to print "
-                         "(global) when bar_debug_enable is set. (default=2000000)",
+                         "(global) when bar_debug_enable is set. 0 also suppresses "
+                         "MEMBARDBG detail while retaining BAR release/summary/leak "
+                         "logs. (default=2000000)",
                          "2000000");
   option_parser_register(opp, "-is_rf_cache_enabled", OPT_BOOL,
                          &is_rf_cache_enabled,

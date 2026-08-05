@@ -337,6 +337,61 @@ Only after Guards 0-2 pass:
 - verify memory/TMA/sync work counts;
 - compare K5/K10 cycles and Producer/Consumer lifetime against HW.
 
+Functional-gate logging uses:
+
+```text
+-trimchk_percta_log_enable 1
+-sync_debug_enable 0
+-tma_debug_enable 0
+-bar_debug_enable 1
+-bar_debug_issue_budget 0
+```
+
+`TRIMCHK/TRACECHECK` provide per-CTA load and protobuf-contract evidence.
+SYNCDBG and TMA Phase2 summaries are emitted without enabling their per-event
+logs. BARDBG keeps release/CTA summary/leak validation while budget 0
+suppresses BAR issue and MEMBAR detail lines.
+
+The sum of all `[TRACECHECK]` CTA rows must equal:
+
+| Contract metric | K5 expected | K10 expected |
+|---|---:|---:|
+| CTA rows | 132 | 384 |
+| Warp instructions | 14,847,194 | 21,007,397 |
+| Active-lane instructions | 450,627,804 | 624,799,542 |
+| Memory-reference records | 342,688 | 1,396,238 |
+| Memory-reference lane uses | 3,180,354 | 25,289,459 |
+| Sync runtime payloads | 258,342 | 682,925 |
+| Sync semantic payloads | 258,342 | 682,925 |
+| BAR runtime payloads | 51,840 | 52,992 |
+| BAR runtime IDs | 51,840 | 52,992 |
+| BAR runtime counts | 0 | 0 |
+| Zero-mask instructions | 250,964 | 93,738 |
+| HGMMA instructions | 349,056 | 835,584 |
+| MUFU instructions | 1,926,144 | 1,671,168 |
+| TMA-family instructions | 6,432 | 30,336 |
+
+`BAR runtime counts == 0` is expected: this workload captures register-form
+BAR IDs dynamically while BAR counts are immediate and decoded statically.
+
+Additional runtime gates:
+
+- `gpgpu_n_tot_w_icount` equals the expected warp-instruction total;
+- `gpu_sim_insn` equals the expected active-lane-instruction total;
+- sidecar bootstrap reports `descriptor_configs=3`, `operand_sites=77`,
+  `base_records=48`, and `[SYNC] loaded operand_sites=187`;
+- K5 TMA Phase2 reports `commands total=6,432`, `unresolved=0`,
+  `real_base_commands=6,168`, `synthetic_commands=264`;
+- K10 TMA Phase2 reports `commands total=30,336`, `unresolved=0`,
+  `real_base_commands=23,424`, `synthetic_commands=6,912`;
+- no deadlock, assertion, missing trace file, or protobuf parse failure;
+- any `[BARDBG][leak]` must be compared with the prior valid trace before the
+  run is accepted.
+
+Do not require `SYNCDBG missing_runtime=0`; the existing model intentionally
+skips unsupported static sync sites. The gate is preservation of the aggregate
+runtime/semantic payload counts above and clean completion.
+
 ## 6. Compact full-capture result
 
 The first compact trace was captured from the same FA3 workload as the saved
@@ -455,6 +510,104 @@ inflation. Remaining skew is dominated by the approximately 191.8M injected
 callbacks, per-callback channel synchronization, and Consumer instrumentation,
 not by additional removable bytes in the compact record.
 
+### Option 1B callback-pruning result
+
+The pruned trace was captured with:
+
+```text
+TRACER_LIGHT_SPIN=1
+GATHER_REGISTERS=0
+TRIM_SPIN=0
+```
+
+The saved Option 1A trace is the all-operand compact baseline.
+
+| Callback metric | Option 1A | Option 1B | Change |
+|---|---:|---:|---:|
+| Whole workload | 191,786,420 | 64,775,615 | -66.2% |
+| K5 | 45,993,757 | 15,102,306 | -67.2% |
+| K10 | 59,730,650 | 21,666,115 | -63.7% |
+| K5 callbacks / warp instruction | 2.99 | 1.017 | -66.0% |
+| K10 callbacks / warp instruction | 2.78 | 1.031 | -62.9% |
+
+The callback-count target passes. K5/K10 are now close to one callback per
+dynamic warp instruction; the remaining excess is the expected retained
+memory, sync/BAR, and TMA operand payload.
+
+Option 1B wire result:
+
+| Wire metric | Option 1A | Option 1B | Change |
+|---|---:|---:|---:|
+| Compact non-memory records | 188,663,153 | 62,139,404 | -67.1% |
+| Memory records | 3,123,267 | 2,636,211 | -15.6% |
+| Total callback records | 191,786,420 | 64,775,615 | -66.2% |
+| Actual wire bytes | 20,745,344,032 | 7,411,533,976 | -64.3% |
+| Equivalent legacy bytes | 136,551,931,040 | 46,120,237,880 | -66.2% |
+| Per-record byte reduction | 84.81% | 83.93% | -0.88pp |
+
+Option 1B sends 7.41GB, 18.4x less than the original 136.55GB
+all-operand/fixed-record baseline. This is a 94.6% end-to-end traffic
+reduction after composing callback pruning with compact records.
+
+Spin result:
+
+| Kernel | HW target | Option 1A | Option 1B | Change vs 1A | Option 1B / HW |
+|---|---:|---:|---:|---:|---:|
+| FWD K5 | 8,461 | 230,433 | 102,296 | -55.6% | 12.1x |
+| BWD K10 | 7,860 | 393,110 | 278,107 | -29.3% | 35.4x |
+
+K5 per-loop:
+
+| TRYWAIT PC | HW | Option 1A | Option 1B | Option 1B / HW |
+|---|---:|---:|---:|---:|
+| `0xac40` | 132 | 132 | 132 | 1.0x |
+| `0xacc0` | 3,148 | 2,418 | 3,928 | 1.2x |
+| `0xb090` | 662 | 6,228 | 3,371 | 5.1x |
+| `0xb1d0` | 955 | 74,974 | 30,722 | 32.2x |
+| `0xb230` | 96 | 5,344 | 1,715 | 17.9x |
+| `0xb290` | 1,051 | 85,952 | 35,673 | 33.9x |
+| `0xb2f0` | 100 | 5,144 | 1,742 | 17.4x |
+| `0xb350` | 484 | 21,721 | 9,410 | 19.4x |
+| `0xb3b0` | 1,833 | 28,520 | 15,603 | 8.5x |
+
+K10 per-loop:
+
+| TRYWAIT PC | HW | Option 1A | Option 1B | Option 1B / HW |
+|---|---:|---:|---:|---:|
+| `0xb480` | 384 | 384 | 384 | 1.0x |
+| `0xb4f0` | 777 | 10,349 | 3,804 | 4.9x |
+| `0xb820` | 2,017 | 111,057 | 83,667 | 41.5x |
+| `0xb960` | 2,804 | 152,160 | 112,285 | 40.0x |
+| `0xba20` | 390 | 18,090 | 13,482 | 34.6x |
+| `0xbae0` | 720 | 37,854 | 26,102 | 36.3x |
+| `0xbb40` | 768 | 63,216 | 38,383 | 50.0x |
+
+Replay and post-processing preservation:
+
+| Preserved data | Option 1A K5 | Option 1B K5 | Option 1A K10 | Option 1B K10 |
+|---|---:|---:|---:|---:|
+| HGMMA | 349,056 | 349,056 | 835,584 | 835,584 |
+| MUFU | 1,926,144 | 1,926,144 | 1,671,168 | 1,671,168 |
+| TMA | 6,432 | 6,432 | 17,280 | 17,280 |
+| BAR runtime payload | 51,840 | 51,840 | 52,992 | 52,992 |
+| Decoded memory-address lanes | 435,840 | 435,840 | 13,713,408 | 13,713,408 |
+| Zero decoded addresses | 0 | 0 | 0 | 0 |
+
+Additional gates:
+
+- both traces contain the same 11 kernels and 10,982 threadblock protobufs;
+- normalized enhanced SASS is identical;
+- `sync_operand_resolver.json`, TMA descriptor configs, and descriptor offsets
+  are byte-identical;
+- TMA runtime operand rows are identical at 77,736;
+- the TMA resolver static projection and normalized PC base-map structure are
+  identical;
+- `tma_desc_producer_debug.csv` is header-only under pruning, as expected; no
+  simulator or post-processing consumer reads it.
+
+Option 1B therefore passes callback reduction and data-preservation gates, but
+still fails the HW spin-fidelity gate.
+
 ## 7. Decision after the run
 
 Option 1A is a partial success:
@@ -463,17 +616,12 @@ Option 1A is a partial success:
 - K5/K10 spin falls by approximately 42-43%;
 - the remaining 27-50x HW inflation fails the timing-fidelity gate.
 
-Run Option 1B before Option 2:
+Option 1B passes the callback and payload gates but still leaves K5/K10 spin at
+12.1x/35.4x HW. The next sequence is:
 
-1. the user builds the tracer and captures with
-   `TRACER_LIGHT_SPIN=1 GATHER_REGISTERS=0 TRIM_SPIN=0`;
-2. verify `[TRACE-PRUNE] enabled=1` and collect `[TRACE-WIRE]`;
-3. compare all replay and TMA sidecar payloads against the Option 1A trace;
-4. verify callback count approaches the dynamic instruction count;
-5. measure K5/K10 per-PC spin against the H100 targets;
-6. only after trace parity passes, run the compact trace through the simulator
-   functional gate;
-7. if residual spin remains materially above HW, proceed to Option 2.
+1. run the Option 1B compact trace through the simulator functional gate;
+2. verify clean completion and replay work counts;
+3. proceed to Option 2 for the remaining timing-dependent spin distortion.
 
 Option 2 remains:
 
@@ -522,7 +670,12 @@ the reorganizer as a separate offline stage using the ultra-light sidecar.
 - Compact spin reduction measured at 43.4% for K5 and 42.0% for K10.
 - HW timing-fidelity gate failed at 27.2x K5 and 50.0x K10 residual spin.
 - Capture wall time remains to be collected from the GPU-server log.
-- Option 1B build, GPU capture, callback-count reduction, and protobuf parity
-  are pending.
+- Option 1B build and GPU capture completed.
+- Option 1B callback reduction passed at 66.2% workload-wide.
+- Option 1B wire traffic is 7.41GB, 64.3% below Option 1A and 94.6% below
+  the original all-operand/fixed-record equivalent.
+- Option 1B replay/TMA/sync payload parity passed.
+- Option 1B spin is 12.1x HW for K5 and 35.4x HW for K10.
+- Option 1B simulator functional run is pending.
 - Option 2 per-burst ultra-light capture and reorganization are not yet
   implemented.
