@@ -1009,6 +1009,42 @@ For every active kernel, `final_instructions` must equal an independent
 protobuf instruction count. K5/K10 reconstructed traces must retain exact
 HGMMA, MUFU, TMA-family, memory, sync, and BAR totals before simulator use.
 
+GPU capture result:
+
+| Metric | Option 1B reference | `sparse_reconstruct` | Change |
+|---|---:|---:|---:|
+| K5 callback records | 15,100,456 | 1,035,744 | -93.14% |
+| K10 callback records | 21,662,167 | 1,753,871 | -91.90% |
+| K5 reconstructed warp instructions | 14,846,098 | 14,494,325 | -2.37% (timing-dependent spin) |
+| K10 reconstructed warp instructions | 21,004,633 | 20,019,180 | -4.69% (timing-dependent spin) |
+| K5 reconstructed active-lane instructions | 450,641,690 | 449,055,368 | -0.35% |
+| K10 reconstructed active-lane instructions | 624,787,464 | 625,678,016 | +0.14% |
+| K5 NANOSLEEP | 102,159 | 11,125 | -89.11% |
+| K10 NANOSLEEP | 278,211 | 28,491 | -89.76% |
+| K5 NANOSLEEP / HW | 12.08x | 1.31x | major improvement |
+| K10 NANOSLEEP / HW | 35.40x | 3.62x | major improvement |
+
+Capture-level payload gates pass:
+
+- all 10,982 threadblock protobufs are present (K5 132, K10 384);
+- HGMMA/MUFU/TMA-family counts remain exact at
+  `349,056/1,926,144/6,432` K5 and
+  `835,584/1,671,168/30,336` K10;
+- BAR runtime/id counts remain exact at 51,840 K5 and 52,992 K10;
+- TMA runtime rows remain 77,736, TMA PC-base/resolver/discovery/offset row
+  counts match, and sync resolver plus descriptor configs are byte-identical;
+- the apparent memory-record reduction is spin sync traffic:
+  non-sync memory records are 84,388 -> 85,742 K5 and
+  713,289 -> 713,834 K10, while sync records fall with NANOSLEEP.
+
+The sparse artifact bundle does not contain the original process log, so
+function-level `cfg_misses` and emitted `[TRACE-SPARSE]` count equality remain
+a GPU-server log check. The capture is ready for the simulator functional gate,
+where `gpgpu_n_tot_w_icount/gpu_sim_insn` must equal
+`14,494,325/449,055,368` K5 and `20,019,180/625,678,016` K10.
+`sparse_reconstruct` must remain outside `all` until that run confirms those
+protobuf contract totals and clean completion.
+
 #### Stage 1C-B - dedicated metadata-only record
 
 Option 1B is already near one callback per dynamic instruction, but most
@@ -1777,9 +1813,11 @@ end-to-end manifest and validation report
   outside `all`.
 - `sparse_reconstruct` device filtering and host protobuf expansion are
   implemented. A conservative offline proof reconstructs 92.54% K5 / 88.40%
-  K10 dynamic instructions with zero active-mask, predicate-mask, payload, or
-  trailing-span mismatches. CUDA/NVBit build and GPU capture are pending; the
-  feature remains outside `all`.
+  K10 dynamic instructions with zero active-mask, predicate-mask, function-ID,
+  payload, or trailing-span mismatches. GPU capture then reduces callbacks by
+  93.14% K5 / 91.90% K10 and NANOSLEEP by 89.11% / 89.76%, while fixed
+  HGMMA/MUFU/TMA/BAR work remains exact. Capture payload gates pass; simulator
+  functional validation is pending, so the feature remains outside `all`.
 - Lighter runs use configuration-suffixed argument folders containing a
   `lighter_tracer_config.json` manifest; existing lighter run directories are
   not overwritten.
