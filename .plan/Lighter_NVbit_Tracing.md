@@ -853,6 +853,7 @@ Required capture-log extraction:
 ```bash
 grep -a -n -F '[TRACE-COUNT]' /tmp/flashattn.log
 grep -a -n -F '[TRACE-WIRE]' /tmp/flashattn.log
+grep -a -n -F '[TRACE-SPARSE]' /tmp/flashattn.log
 grep -a -n -F '[TRACE-BATCH]' /tmp/flashattn.log
 ```
 
@@ -908,12 +909,38 @@ Acceptance:
 - no record or protobuf field changes are attributable to the counter path;
 - K5/K10 spin and capture wall time are measured before proceeding.
 
+Measured result:
+
+| Metric | Option 1B reference | `host_count` | Change |
+|---|---:|---:|---:|
+| K5 callback records | 15,100,456 | 15,099,660 | -796 (-0.0053%) |
+| K10 callback records | 21,662,167 | 21,661,497 | -670 (-0.0031%) |
+| K5 NANOSLEEP | 102,159 | 102,088 | -71 (-0.0695%) |
+| K10 NANOSLEEP | 278,211 | 278,058 | -153 (-0.0550%) |
+| K5 NANOSLEEP / HW | 12.08x | 12.07x | negligible |
+| K10 NANOSLEEP / HW | 35.40x | 35.38x | negligible |
+
+Structural gates pass: both captures contain 10,982 threadblock protobufs,
+including 132 K5 and 384 K10 CTAs; TMA runtime rows remain 77,736; TMA PC-base,
+operand-resolver, discovery, and descriptor-offset row counts match; and
+`sync_operand_resolver.json` plus `tma_descriptor_configs.json` are
+byte-identical. The copied bundle does not contain the original
+`[TRACE-COUNT]` process log, so that log equality remains a server-log check.
+
+The reference and candidate were captured from different tracer commits
+(`57d706a` versus `3e651b3`), but the measured differences are already two to
+three orders of magnitude below what would be needed to close the timing gap.
+Stage 1C-A is therefore retained as a valid accounting optimization but rejected
+as a capture-timing lever. Do not promote `host_count` into `all`; proceed to
+Stage 1C-S.
+
 #### Stage 1C-S - sparse semantic capture and static reconstruction
 
 Option 1B still injects one `NO_REGS` callback for ordinary dynamic
 instructions that need no runtime payload. The host can reconstruct a safe
 subset from the enhanced static SASS and CFG while preserving the final
-per-instruction protobuf contract.
+per-instruction protobuf contract. The device filtering and host reconstruction
+paths are implemented; CUDA/NVBit build and GPU capture are pending.
 
 The initial direct-capture set is conservative:
 
@@ -950,9 +977,37 @@ Before a GPU capture, perform an offline proof using the `.opt1b` artifact:
 4. Require exact HGMMA, MUFU, TMA-family, memory, sync, and BAR totals.
 5. Abort on an ambiguous path; do not guess or choose a shortest CFG path.
 
-The GPU implementation is attempted only after this offline round trip is
-exact. The sparse capture still produces a complete full trace after host
-reconstruction; it does not trim, clone, or reorganize dynamic instructions.
+The offline gate passed before the GPU implementation was added. The sparse
+capture still produces a complete full trace after host reconstruction; it does
+not trim, clone, or reorganize dynamic instructions.
+
+Offline round-trip proof result on the saved Option 1B trace:
+
+| Kernel | Dynamic instructions | Conservative retained | Reconstructable | Reduction | Mask/function/payload mismatches | Trailing span |
+|---|---:|---:|---:|---:|---:|---:|
+| K5 FWD | 14,846,098 | 1,107,178 | 13,738,920 | 92.54% | 0 | 0 |
+| K10 BWD | 21,004,633 | 2,435,779 | 18,568,854 | 88.40% | 0 | 0 |
+
+This proof deliberately uses fewer anchors than the implementation. The actual
+implementation additionally retains every CFG basic-block entry and exit, so
+its callback reduction may be slightly smaller but its reconstruction boundary
+is stricter. Across all omitted instructions, active mask, predicate mask,
+function ID, and payload mismatches are zero. Degenerate CFGs and instructions
+absent from a non-degenerate CFG fall back to direct capture.
+
+Required runtime evidence:
+
+```text
+[TRACE-SPARSE] function=... static_retained=... static_omitted=...
+               cfg_misses=...
+[TRACE-SPARSE] kernel=... received_records=...
+               retained_instructions=... reconstructed_instructions=...
+               final_instructions=... stop_report=...
+```
+
+For every active kernel, `final_instructions` must equal an independent
+protobuf instruction count. K5/K10 reconstructed traces must retain exact
+HGMMA, MUFU, TMA-family, memory, sync, and BAR totals before simulator use.
 
 #### Stage 1C-B - dedicated metadata-only record
 
@@ -1104,11 +1159,10 @@ For every stage:
 Suggested first next-session scope:
 
 ```text
-user builds once
-capture "compact_wire,prune_operands" baseline
-capture "compact_wire,prune_operands,host_count" candidate with the same binary
-evaluate TRACE-COUNT + TRACE-WIRE + spin
-then perform the offline Stage 1C-S round-trip proof
+user builds the sparse implementation
+capture "compact_wire,prune_operands,sparse_reconstruct"
+evaluate TRACE-SPARSE + TRACE-WIRE + per-PC NANOSLEEP
+verify reconstructed protobuf payload parity
 ```
 
 #### Independent simulator pacing track
@@ -1718,7 +1772,14 @@ end-to-end manifest and validation report
   callbacks skip the two device statistic atomics, the receiver publishes a
   per-kernel record count, and active-capture `stats.csv` rows use that count.
   Suppressed `stop_report` kernels retain their historical device total
-  counter. GPU A/B validation is pending, so `host_count` is not in `all`.
+  counter. Capture validation passed structurally, but NANOSLEEP changed by
+  only -0.07% K5 / -0.05% K10, so it is rejected as a timing lever and remains
+  outside `all`.
+- `sparse_reconstruct` device filtering and host protobuf expansion are
+  implemented. A conservative offline proof reconstructs 92.54% K5 / 88.40%
+  K10 dynamic instructions with zero active-mask, predicate-mask, payload, or
+  trailing-span mismatches. CUDA/NVBit build and GPU capture are pending; the
+  feature remains outside `all`.
 - Lighter runs use configuration-suffixed argument folders containing a
   `lighter_tracer_config.json` manifest; existing lighter run directories are
   not overwritten.

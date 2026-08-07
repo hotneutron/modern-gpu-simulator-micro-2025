@@ -34,7 +34,7 @@ LIGHTER_TRACER_FEATURE_ORDER = (
 )
 
 LIGHTER_TRACER_IMPLEMENTED_FEATURES = frozenset(
-    ("compact_wire", "prune_operands", "host_count")
+    ("compact_wire", "prune_operands", "host_count", "sparse_reconstruct")
 )
 
 LIGHTER_TRACER_PRODUCTION_FEATURES = frozenset(

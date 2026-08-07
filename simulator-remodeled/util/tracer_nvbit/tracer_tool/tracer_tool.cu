@@ -46,6 +46,7 @@
 #include <string>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 #include <regex>
@@ -112,6 +113,8 @@ struct CTXstate {
 
   /* Published by the receiver when it consumes the end-of-kernel token. */
   std::atomic<uint64_t> received_records_per_kernel{0};
+  std::atomic<uint64_t> sparse_retained_instructions_per_kernel{0};
+  std::atomic<uint64_t> sparse_reconstructed_instructions_per_kernel{0};
 };
 
 /* lock */
@@ -145,6 +148,7 @@ int warp_lifetime_only = 0;
 int compact_wire_enabled = 0;
 int prune_operands_enabled = 0;
 int lighter_tracer_host_count = 0;
+int lighter_tracer_sparse_reconstruct = 0;
 std::string lighter_tracer_canonical = "off";
 /* Sidecar mode: keep the complete dynamic trace path enabled and additionally
  * timestamp SASS EXIT. This measures the lifetime perturbation of full tracing
@@ -241,6 +245,7 @@ static void resolve_lighter_tracer_config() {
       "compact_wire",
       "prune_operands",
       "host_count",
+      "sparse_reconstruct",
   };
   static const std::unordered_set<std::string> production_features = {
       "compact_wire",
@@ -325,11 +330,13 @@ static void resolve_lighter_tracer_config() {
   compact_wire_enabled = features.count("compact_wire") != 0;
   prune_operands_enabled = features.count("prune_operands") != 0;
   lighter_tracer_host_count = features.count("host_count") != 0;
+  lighter_tracer_sparse_reconstruct =
+      features.count("sparse_reconstruct") != 0;
 
   printf("[LIGHTER-TRACER] requested=%s canonical=%s source=%s "
-         "host_count=%d\n",
+         "host_count=%d sparse_reconstruct=%d\n",
          requested.c_str(), lighter_tracer_canonical.c_str(), source,
-         lighter_tracer_host_count);
+         lighter_tracer_host_count, lighter_tracer_sparse_reconstruct);
 }
 
 /* opcode to id map and reverse map  */
@@ -1921,6 +1928,19 @@ void nvbit_at_init() {
     abort();
   }
   resolve_lighter_tracer_config();
+  if (lighter_tracer_sparse_reconstruct &&
+      (instr_begin_interval != 0 || instr_end_interval != UINT32_MAX)) {
+    fprintf(stderr,
+            "[TRACE-SPARSE] sparse_reconstruct requires the full instruction "
+            "interval\n");
+    abort();
+  }
+  if (lighter_tracer_sparse_reconstruct && warp_lifetime_only) {
+    fprintf(stderr,
+            "[TRACE-SPARSE] sparse_reconstruct is incompatible with "
+            "WARP_LIFETIME_ONLY\n");
+    abort();
+  }
   printf("[TRACE-WIRE] selected mode=%s legacy_size=%u compact_size=%u "
          "memory_size=%u\n",
          compact_wire_enabled ? "compact" : "legacy",
@@ -1982,6 +2002,27 @@ void nvbit_at_init() {
 // Key is unique function ID. The next key is PC and finally the Value is the datawidh of the opcode ID of the instruction.
 std::map<int,std::map<int, int>>  pc_to_opcode;
 
+/* For each retained instruction, the static unpredicated/payload-free
+ * instructions immediately preceding it in the same basic block. */
+std::map<int, std::map<int, std::vector<uint32_t>>>
+    sparse_prefix_pcs_by_function;
+
+static bool sparse_semantic_anchor(const std::string &opcode) {
+  static const std::vector<std::string> prefixes = {
+      "BAR",       "BSSY",      "BSYNC",    "BRA",
+      "BREAK",     "BRX",       "CALL",     "DEPBAR",
+      "EXIT",      "JMP",       "LDGDEPBAR", "MEMBAR",
+      "NANOSLEEP", "RET",       "SYNCS",    "UTMA",
+      "UBLK",      "WARPSYNC",  "YIELD",    "ULDC",
+  };
+  for (const auto &prefix : prefixes) {
+    if (opcode.rfind(prefix, 0) == 0) {
+      return true;
+    }
+  }
+  return false;
+}
+
 /* Set used to avoid re-instrumenting the same functions multiple times */
 std::unordered_set<CUfunction> already_instrumented;
 
@@ -2013,11 +2054,45 @@ void instrument_function_if_needed(CUcontext ctx, CUfunction func, int device_id
     next_candidate_unique_function_id++;
 
     const std::vector<Instr *> &instrs = nvbit_get_instrs(ctx, f);
+    const CFG_t &cfg = nvbit_get_CFG(ctx, f);
+    std::unordered_set<Instr *> sparse_block_entries;
+    std::unordered_set<Instr *> sparse_block_exits;
+    std::unordered_map<Instr *, size_t> sparse_block_index;
+    std::vector<std::vector<uint32_t>> sparse_pending_pcs(cfg.bbs.size());
+    if (lighter_tracer_sparse_reconstruct && !cfg.is_degenerate) {
+      for (size_t bb_index = 0; bb_index < cfg.bbs.size(); bb_index++) {
+        const auto &instructions = cfg.bbs[bb_index]->instrs;
+        if (instructions.empty()) {
+          continue;
+        }
+        sparse_block_entries.insert(instructions.front());
+        sparse_block_exits.insert(instructions.back());
+        for (Instr *bb_instruction : instructions) {
+          auto inserted =
+              sparse_block_index.emplace(bb_instruction, bb_index);
+          if (!inserted.second) {
+            fprintf(stderr,
+                    "[TRACE-SPARSE] instruction belongs to multiple basic "
+                    "blocks: function=%s pc=0x%x\n",
+                    current_kernel_name.c_str(),
+                    static_cast<unsigned int>(
+                        bb_instruction->getOffset()));
+            abort();
+          }
+        }
+      }
+    } else if (lighter_tracer_sparse_reconstruct) {
+      printf("[TRACE-SPARSE] function=%s mode=direct reason=degenerate_cfg\n",
+             current_kernel_name.c_str());
+    }
     if (verbose) {
       printf("Inspecting function %s at address 0x%lx\n", nvbit_get_func_name(ctx, f), addr_funct);
     }
 
     uint32_t cnt = 0;
+    uint64_t sparse_static_retained = 0;
+    uint64_t sparse_static_omitted = 0;
+    uint64_t sparse_static_cfg_misses = 0;
     /* iterate on all the static instructions in the function */
     for (auto instr : instrs) {
 
@@ -2296,6 +2371,49 @@ void instrument_function_if_needed(CUcontext ctx, CUfunction func, int device_id
             bar_site_info;
       }
 
+      if (lighter_tracer_sparse_reconstruct) {
+        bool retain_directly = true;
+        auto bb_it = sparse_block_index.find(instr);
+        if (!cfg.is_degenerate && bb_it != sparse_block_index.end()) {
+          const bool is_block_entry =
+              sparse_block_entries.count(instr) != 0;
+          const bool is_block_exit =
+              sparse_block_exits.count(instr) != 0;
+          const bool has_runtime_payload = num_of_injects != 0;
+          retain_directly =
+              is_block_entry || is_block_exit || instr->hasPred() ||
+              has_runtime_payload || sync_site_info.enabled ||
+              bar_site_info.enabled || is_tma_desc_consumer_instruction ||
+              is_call_or_ret || sparse_semantic_anchor(opcode_str);
+
+          std::vector<uint32_t> &pending =
+              sparse_pending_pcs[bb_it->second];
+          if (!retain_directly) {
+            pending.push_back(static_cast<uint32_t>(vpc));
+            sparse_static_omitted++;
+            cnt++;
+            continue;
+          }
+          if (!pending.empty()) {
+            auto &function_spans =
+                sparse_prefix_pcs_by_function[
+                    next_candidate_unique_function_id];
+            if (function_spans.count(vpc) != 0) {
+              fprintf(stderr,
+                      "[TRACE-SPARSE] duplicate retained PC span: "
+                      "function=%s pc=0x%x\n",
+                      current_kernel_name.c_str(), vpc);
+              abort();
+            }
+            function_spans[vpc] = pending;
+            pending.clear();
+          }
+        } else if (!cfg.is_degenerate) {
+          sparse_static_cfg_misses++;
+        }
+        sparse_static_retained++;
+      }
+
       if(num_of_injects == 0) {
         per_operand_type[0] = traced_operand_instrument(TRACED_REG_TYPE::NO_REGS, 0, 0);
         num_of_injects++;
@@ -2506,6 +2624,24 @@ void instrument_function_if_needed(CUcontext ctx, CUfunction func, int device_id
         }
       }
       cnt++;
+    }
+
+    if (lighter_tracer_sparse_reconstruct) {
+      for (const auto &pending : sparse_pending_pcs) {
+        if (!pending.empty()) {
+          fprintf(stderr,
+                  "[TRACE-SPARSE] unterminated basic-block span: "
+                  "function=%s omitted=%zu\n",
+                  current_kernel_name.c_str(), pending.size());
+          abort();
+        }
+      }
+      printf("[TRACE-SPARSE] function=%s static_retained=%llu "
+             "static_omitted=%llu cfg_misses=%llu\n",
+             current_kernel_name.c_str(),
+             static_cast<unsigned long long>(sparse_static_retained),
+             static_cast<unsigned long long>(sparse_static_omitted),
+             static_cast<unsigned long long>(sparse_static_cfg_misses));
     }
 
     pthread_mutex_lock(&mutex);
@@ -2796,6 +2932,10 @@ void nvbit_at_cuda_event(CUcontext ctx, int is_exit, nvbit_api_cuda_t cbid,
       cuCtxGetDevice(&device_id);
       ctx_state->received_records_per_kernel.store(
           0, std::memory_order_relaxed);
+      ctx_state->sparse_retained_instructions_per_kernel.store(
+          0, std::memory_order_relaxed);
+      ctx_state->sparse_reconstructed_instructions_per_kernel.store(
+          0, std::memory_order_relaxed);
       if (active_from_start && dynamic_kernel_limit_start && kernel_id[device_id] == dynamic_kernel_limit_start)
         active_region = true;
 
@@ -2978,6 +3118,24 @@ void nvbit_at_cuda_event(CUcontext ctx, int is_exit, nvbit_api_cuda_t cbid,
                static_cast<unsigned long long>(reported_insts_per_kernel),
                stop_report[device_id] ? 1 : 0,
                stop_report[device_id] ? "device-suppressed" : "host");
+      }
+      if (lighter_tracer_sparse_reconstruct) {
+        uint64_t retained_instructions =
+            ctx_state->sparse_retained_instructions_per_kernel.load(
+                std::memory_order_acquire);
+        uint64_t reconstructed_instructions =
+            ctx_state->sparse_reconstructed_instructions_per_kernel.load(
+                std::memory_order_acquire);
+        printf("[TRACE-SPARSE] kernel=%d received_records=%llu "
+               "retained_instructions=%llu reconstructed_instructions=%llu "
+               "final_instructions=%llu stop_report=%d\n",
+               kernel_id[device_id] - 1,
+               static_cast<unsigned long long>(received_records),
+               static_cast<unsigned long long>(retained_instructions),
+               static_cast<unsigned long long>(reconstructed_instructions),
+               static_cast<unsigned long long>(
+                   retained_instructions + reconstructed_instructions),
+               stop_report[device_id] ? 1 : 0);
       }
 
       statsFile = fopen(stats_location.c_str(), "a");
@@ -3192,6 +3350,8 @@ void *recv_thread_fun(void *args) {
   uint64_t memory_records = 0;
   uint64_t wire_bytes = 0;
   uint64_t kernel_received_records = 0;
+  uint64_t kernel_sparse_retained_instructions = 0;
+  uint64_t kernel_sparse_reconstructed_instructions = 0;
 
   while (ctx_state->recv_thread_done == RecvThreadState::WORKING) {
     uint32_t num_recv_bytes = ch_host->recv(recv_buffer, CHANNEL_SIZE);
@@ -3221,6 +3381,10 @@ void *recv_thread_fun(void *args) {
           }
           if (cta_id_x == -1) {
             ctx_state->received_records_per_kernel.store(
+                0, std::memory_order_release);
+            ctx_state->sparse_retained_instructions_per_kernel.store(
+                0, std::memory_order_release);
+            ctx_state->sparse_reconstructed_instructions_per_kernel.store(
                 0, std::memory_order_release);
             recv_thread_receiving[ctx] = false;
             break;
@@ -3262,11 +3426,20 @@ void *recv_thread_fun(void *args) {
         if (ma->cta_id_x == -1) {
           ctx_state->received_records_per_kernel.store(
               kernel_received_records, std::memory_order_release);
+          ctx_state->sparse_retained_instructions_per_kernel.store(
+              kernel_sparse_retained_instructions,
+              std::memory_order_release);
+          ctx_state->sparse_reconstructed_instructions_per_kernel.store(
+              kernel_sparse_reconstructed_instructions,
+              std::memory_order_release);
           kernel_received_records = 0;
+          kernel_sparse_retained_instructions = 0;
+          kernel_sparse_reconstructed_instructions = 0;
           recv_thread_receiving[ctx] = false;
           break;
         }
-        if (lighter_tracer_host_count) {
+        if (lighter_tracer_host_count ||
+            lighter_tracer_sparse_reconstruct) {
           kernel_received_records++;
         }
         wire_bytes += record_size;
@@ -3300,6 +3473,28 @@ void *recv_thread_fun(void *args) {
         unsigned int &remaining_injects = get_remaining_injects_to_current_instruction(tb_string_id, warp_id_tb);
         dynamic_trace::instruction *inst;
         if(remaining_injects == 0) {
+          if (lighter_tracer_sparse_reconstruct) {
+            auto function_it =
+                sparse_prefix_pcs_by_function.find(
+                    ma->unique_function_id);
+            if (function_it != sparse_prefix_pcs_by_function.end()) {
+              auto span_it = function_it->second.find(ma->vpc);
+              if (span_it != function_it->second.end()) {
+                for (uint32_t omitted_pc : span_it->second) {
+                  dynamic_trace::instruction *reconstructed =
+                      wp.add_instructions();
+                  reconstructed->set_pc(omitted_pc);
+                  reconstructed->set_active_mask(ma->active_mask);
+                  reconstructed->set_predicate_mask(ma->active_mask);
+                  reconstructed->set_function_unique_id(
+                      ma->unique_function_id);
+                }
+                kernel_sparse_reconstructed_instructions +=
+                    span_it->second.size();
+              }
+            }
+            kernel_sparse_retained_instructions++;
+          }
           inst = wp.add_instructions();
           inst->set_pc(ma->vpc);
           inst->set_active_mask(ma->active_mask);
