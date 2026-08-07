@@ -2,7 +2,7 @@
 
 This document replaces the original spin-only optimization plan. It first
 summarizes that experiment, then defines the adopted full-capture transport
-change and the decision gate for a later two-run trace reorganization.
+change, the next single-run tracer stages, and the parked two-run fallback.
 
 The root problem is capture clock skew:
 
@@ -108,7 +108,7 @@ Produce one full, untrimmed trace whose Producer/Consumer timing distortion is
 small enough that the recorded spin count approaches uninstrumented H100,
 without deleting spin instructions offline.
 
-### Why this is the next decision point
+### Why this remains the primary path
 
 The failed spin-only experiment did not reduce the dominant fixed-size channel
 copy or Consumer instrumentation cost. Compact full capture attacks both:
@@ -608,45 +608,972 @@ Additional gates:
 Option 1B therefore passes callback reduction and data-preservation gates, but
 still fails the HW spin-fidelity gate.
 
-## 7. Decision after the run
+## 7. Decision after the simulator functional run
 
-Option 1A is a partial success:
+Option 1B completed the simulator functional gate:
 
-- the wire representation preserves simulator-visible data;
-- K5/K10 spin falls by approximately 42-43%;
-- the remaining 27-50x HW inflation fails the timing-fidelity gate.
+| Result | K5 fwd `.o68/.e68` | K10 bwd `.o42/.e42` |
+|---|---:|---:|
+| Cycles | 83,308 | 136,898 |
+| Error versus HW | 23.1% | 3.0% |
+| Change versus Opt 10 | -21.0% | -23.5% |
+| Warp instructions | 14,847,194 | 21,007,397 |
+| Active-lane instructions | 450,627,804 | 624,799,542 |
+| TMA-family instructions | 6,432 | 30,336 |
+| TMA unresolved / BAR leak / fatal | 0 / 0 / 0 | 0 / 0 / 0 |
 
-Option 1B passes the callback and payload gates but still leaves K5/K10 spin at
-12.1x/35.4x HW. The next sequence is:
+### Payload/functional gate - PASS
 
-1. run the Option 1B compact trace through the simulator functional gate;
-2. verify clean completion and replay work counts;
-3. proceed to Option 2 for the remaining timing-dependent spin distortion.
+- All 132 K5 and 384 K10 `[TRACECHECK]` rows sum exactly to the expected
+  protobuf contract.
+- `gpgpu_n_tot_w_icount` and `gpu_sim_insn` exactly match the loaded Option 1B
+  trace.
+- Memory-reference records/lane uses, sync runtime/semantic payloads, BAR IDs,
+  HGMMA, MUFU, and TMA-family work all match their independently decoded
+  totals.
+- Sidecars load as `descriptor_configs=3`, `operand_sites=77`,
+  `base_records=48`, and sync sites `187`.
+- TMA Phase2 reports `unresolved=0`; BAR reports no leak; both kernels exit
+  cleanly.
 
-Option 2 remains:
+### Timing-fidelity gate - FAIL
 
-1. use the compact full trace as the complete-data source because its dynamic
-   payload is preserved and its timing distortion is smaller;
-2. keep the saved legacy `.fullrun` only as the parity and rollback baseline;
-3. implement a Producer-only ultra-light run with no per-instruction host
-   channel traffic;
-4. record each spin burst by
-   `(kernel, CTA, warp, loop PC, occurrence index)`;
-5. replace the current aggregate NCU-proportional behavior behind
-   `TRIM_SPIN=1` with strict per-burst reorganization;
-6. copy all non-spin instructions and dynamic payloads from the compact full
-   run;
-7. use the ultra-light run only to select spin count and timing per burst;
-8. abort on CTA/warp/burst count, order, barrier address, or phase mismatch.
+| Role lifetime | K5 | K10 |
+|---|---:|---:|
+| Producer mean completion | 39,084.7 | 97,190.7 |
+| Consumer mean completion | 77,017.8 | 109,147.8 |
+| Producer - Consumer | **-37,933.1** | **-11,957.0** |
 
-Do not repeat the current aggregate NCU-proportional trim. It corrects total
-spin count without restoring per-burst Producer/Consumer pacing.
+Real K5 HW has an approximately `+7,950.9-cycle` Producer tail, not a negative
+tail. Runtime NANOSLEEP also remains 102,535 K5 / 278,827 K10 versus HW
+8,461 / 7,860, or 12.1x / 35.5x.
 
-`TRACER_LIGHT_SPIN=1` and `TRIM_SPIN=1` remain mutually exclusive within one
-capture invocation. Option 2 first captures the compact full trace, then runs
-the reorganizer as a separate offline stage using the ultra-light sidecar.
+The K10 3.0% aggregate cycle error is therefore not full timing validation.
+Excess captured spin and premature simulated Producer completion can partially
+cancel.
 
-## 8. Status
+### Revised direction
+
+The previous aggregate count-trim and the proposed dual-run merge are not the
+primary next step.
+
+1. Continue reducing single-run tracer observer effect until the untrimmed full
+   trace approaches HW spin counts. The next concrete levers are removal of
+   per-callback device statistic atomics, a smaller metadata-only callback, and
+   per-warp device buffering that avoids one `ChannelDev::push` per dynamic
+   instruction.
+2. Investigate simulated Producer/Consumer lifetime as an independent timing
+   model problem. A dynamic full trace preserves instruction order and payload,
+   but it does not contain the original HW inter-warp timestamps. The simulator
+   must reconstruct timing through scheduling, PHASECHK/mbarrier handling, and
+   TMA completion.
+3. The fact that the simulator finishes the Producer early despite replaying
+   12.1x/35.5x excess NANOSLEEP is strong evidence that role pacing is wrong in
+   the simulator independently of the remaining capture pollution.
+4. Do not add modeled-ready blocking without first measuring per-burst
+   PHASECHK readiness, Consumer ARRIVE/TMA completion, Producer TMA issue, and
+   role-exit ordering. That path still carries the deadlock risk identified
+   earlier.
+5. Keep Option 2 as a fallback if further single-run tracer reduction cannot
+   approach HW and the two-run scheduler/mapping gates can be satisfied.
+
+The current `TRACER_LIGHT_SPIN=1` / `TRIM_SPIN=1` mutual-exclusion guard remains
+in place. Do not repeat the current aggregate NCU-proportional trim: it corrects
+total spin count without preserving Producer/Consumer timing.
+
+### Next-session implementation handoff
+
+This section is the executable handoff for the next tracer iteration. The work
+must remain a single-run, untrimmed full capture. Implement and measure one
+stage at a time so a spin reduction can be attributed to a specific source of
+observer effect.
+
+#### Starting point
+
+Code baseline:
+
+```text
+ed6e519  compact 104B/360B full-trace transport
+c797d49  unused operand callback pruning
+d06df70  simulator compact-trace functional contract logging
+```
+
+Current accepted capture mode:
+
+```text
+TRACER_LIGHT_SPIN=1
+GATHER_REGISTERS=0
+TRIM_SPIN=0
+```
+
+Reference artifacts:
+
+```text
+Option 1B:
+simulator-remodeled/hw_run/traces/device-0/12.8/
+  flashattn-fa3-bf16-bwd-causal-b1-s2048-hd64-nh24/
+  flashattn_fa3_bf16_bwd_causal_b1_s2048_hd64_nh24___warmup_0___iters_1
+
+Option 1A:
+same path with suffix .opt1a
+
+Legacy full capture:
+same path with suffix .fullrun
+
+Option 1B simulator:
+H100_80GB-OnlyKernel5/*.o68 and *.e68
+H100_80GB-OnlyKernel10/*.o42 and *.e42
+```
+
+The user performs the NVBit build, GPU capture, and long simulator runs. Do not
+launch those experiments locally.
+
+#### Non-negotiable contract
+
+- Keep at least one callback-derived record for every dynamic instruction,
+  including instructions whose retained operand list is empty.
+- Preserve CTA/warp identity, PC/function ID, active/predicate masks, all
+  memory lane addresses, sync barrier/semantic values, BAR ID/count, and all
+  TMA-family runtime operands.
+- Keep the final protobuf schema unchanged.
+- Keep `TRIM_SPIN=0`; do not delete, clone, or reorganize dynamic instructions.
+- A new wire representation must be versioned and strictly validated before
+  protobuf construction.
+- Any buffer overflow, malformed record, missing callback, or incomplete flush
+  is fatal.
+- Simulator `gpu_sim_insn` and `gpgpu_n_tot_w_icount` must equal the newly
+  loaded trace exactly. They are not required to equal Option 1B because a
+  lighter capture is expected to change timing-dependent spin control flow.
+
+#### Proposed A/B selectors
+
+Add independent selectors and persist them in generated `run.sh`:
+
+| Selector | Baseline value | Candidate meaning |
+|---|---:|---|
+| `TRACER_DEVICE_COUNTERS` | `1` | `0` removes active-capture device statistic atomics |
+| `TRACER_METADATA_RECORD` | `0` | `1` emits the dedicated metadata-only wire record |
+| `TRACER_WARP_BUFFER_BYTES` | `0` | Nonzero enables per-warp batching with the requested byte capacity |
+
+The defaults reproduce Option 1B. These are experiment selectors, not tuning
+knobs in the simulator.
+
+First Stage 1C-A capture after the user builds the tracer:
+
+```bash
+nohup env \
+  TRACER_LIGHT_SPIN=1 \
+  GATHER_REGISTERS=0 \
+  TRIM_SPIN=0 \
+  TRACER_DEVICE_COUNTERS=0 \
+  TRACER_METADATA_RECORD=0 \
+  TRACER_WARP_BUFFER_BYTES=0 \
+  ./util/tracer_nvbit/run_hw_trace.py \
+  -B flashattn:flashattn-fa3-bf16-bwd-causal-b1-s2048-hd64-nh24 \
+  -D 0 \
+  > /tmp/flashattn.log 2>&1 &
+```
+
+Required capture-log extraction:
+
+```bash
+grep -a -n -F '[TRACE-COUNT]' /tmp/flashattn.log
+grep -a -n -F '[TRACE-WIRE]' /tmp/flashattn.log
+grep -a -n -F '[TRACE-BATCH]' /tmp/flashattn.log
+```
+
+`[TRACE-BATCH]` is expected only after Stage 1C-C is enabled.
+
+#### Stage 1C-A - remove active-capture statistic atomics
+
+This is the first implementation because it changes no trace payload and no
+wire bytes.
+
+Current overhead:
+
+- `common.h` defines managed `total_dynamic_instr_counter` and
+  `reported_dynamic_instr_counter`.
+- `instrument_inst_compact` performs two globally contended `atomicAdd`
+  operations after every successful `ChannelDev::push`.
+- The same function performs one `atomicAdd` when `stop_report` suppresses a
+  callback.
+- `tracer_tool.cu` reads cumulative deltas into the historical
+  `stats.csv total_insts,total_reported_insts` columns.
+
+Implementation:
+
+1. Leave legacy `instrument_inst` unchanged.
+2. With compact capture and `TRACER_DEVICE_COUNTERS=0`, remove the two atomics
+   after a successful push.
+3. Count received records per kernel in `recv_thread_fun`, before operand
+   callbacks are grouped into one protobuf instruction.
+4. Publish the count when the end-of-kernel channel token is consumed. The
+   launch callback already waits for `recv_thread_receiving[ctx]` to clear, so
+   it can write the published count to `stats.csv`.
+5. For an actively captured compact kernel, set both historical columns to the
+   received callback-record count. Do not relabel this as a warp-instruction
+   count.
+6. Preserve or separately account for the suppressed-kernel
+   `stop_report=true` behavior; the receiver cannot count records that were
+   never pushed. Do not silently change those rows to the active-capture
+   meaning.
+7. Add a per-kernel line:
+
+   ```text
+   [TRACE-COUNT] kernel=... received_records=... stats_total=...
+                 stats_reported=... stop_report=0|1
+   ```
+
+Acceptance:
+
+- direct-push record count and wire bytes are unchanged except for legitimate
+  timing-dependent spin changes;
+- for every captured kernel, `received_records == stats_total ==
+  stats_reported`;
+- no record or protobuf field changes are attributable to the counter path;
+- K5/K10 spin and capture wall time are measured before proceeding.
+
+#### Stage 1C-B - dedicated metadata-only record
+
+Option 1B is already near one callback per dynamic instruction, but most
+ordinary instructions still send the 104B compact prefix even though they need
+only execution identity. Use a separate record only when:
+
+```text
+per_operand_type == NO_REGS
+num_of_injects == 1
+mem_type == NONE
+```
+
+Define a versioned approximately 48B record containing:
+
+```text
+record size/version/flags
+CTA x/y/z
+CTA-local warp, SM-local warp, SM ID
+PC and function ID
+active mask and predicate mask
+```
+
+The host normalizes it to:
+
+```text
+num_of_injects = 1
+per_operand_type = NO_REGS
+mem_type = NONE
+```
+
+No scalar value, descriptor field, width, or lane array is needed for this
+record. Retained sync/BAR/TMA scalar callbacks continue to use 104B records;
+memory-like callbacks continue to use 360B records.
+
+Required changes:
+
+- add a dedicated flag/record type and size assertion in `common.h`;
+- add the `NO_REGS` fast path in `instrument_inst_compact`;
+- make `validated_inst_trace_record_size` accept exactly the metadata, compact,
+  or memory size allowed by its flags;
+- normalize the metadata record before the existing host protobuf path;
+- keep the flush token in an existing validated format;
+- add `metadata_records` to `[TRACE-WIRE]`.
+
+The absolute lower bound, if all 62.14M Option 1B non-memory records were
+metadata-only, would be approximately 3.93GB:
+
+```text
+62,139,404 * 48B + 2,636,211 * 360B = 3,931,727,352B
+```
+
+The real result will be larger because retained scalar callbacks remain 104B.
+Measure the record-class distribution instead of treating 3.93GB as a target.
+
+Acceptance:
+
+- total record count is unchanged except for legitimate spin changes;
+- every metadata record becomes exactly one protobuf instruction;
+- compact scalar and memory record counts remain internally consistent;
+- protobuf/TMA/sync/BAR preservation gates remain clean.
+
+#### Stage 1C-C - per-warp ChannelDev batching
+
+This is the highest-impact and highest-risk tracer change. Start only after
+Stages 1C-A and 1C-B have separate measurements.
+
+Design:
+
+1. Allocate the staging area in device memory, not managed memory and not
+   shared memory. Managed writes can fault/migrate; shared-memory reservation
+   would change occupancy.
+2. Give each active warp a byte buffer and cursor. Only the first active lane
+   writes the already serialized wire record, so no per-record atomic is
+   required within a proven-unique warp slot.
+3. Never split a variable-size record across batches. If the next record does
+   not fit, push the current contiguous batch once, reset the cursor, then
+   append the record.
+4. After the application kernel completes, launch a flush kernel that pushes
+   every non-empty partial buffer before the existing end-of-kernel token.
+5. Preserve record order within each warp. Cross-warp arrival order is not a
+   protobuf contract because the receiver stores separate CTA/warp streams.
+6. Report:
+
+   ```text
+   [TRACE-BATCH] records=... push_calls=... mean_records_per_push=...
+                 partial_flushes=... oversized=... overflow=...
+   ```
+
+Slot identity is a prerequisite, not an assumption. Prefer physical
+`(sm_id, warpid_sm)` only after proving that it uniquely identifies concurrently
+resident warps and that slot reuse cannot race with a prior flush. Otherwise
+use logical `(blockIdx.x,y,z, warpid_tb)` with an explicit per-launch capacity
+bound. Abort if the grid exceeds that bound.
+
+Start with direct push (`0`) versus 1KB, 2KB, and 4KB batches. Record total
+device-memory footprint and reject a size that changes application occupancy
+or causes allocation pressure. A batch implementation that silently falls
+back, drops a partial buffer, or uses a managed high-frequency ring is invalid.
+
+Acceptance:
+
+- `push_calls` falls by the measured batching factor;
+- concatenating all batches yields the same validated record stream per warp;
+- `records`, wire bytes, protobuf payload, and sidecars are unchanged except
+  for legitimate timing-dependent spin;
+- overflow and oversized-record counts are zero;
+- K5/K10 spin and capture wall time improve or the stage is reverted.
+
+#### Deferred tracer ideas
+
+- Do not start with callback fusion. Option 1B already measures only 1.017 K5
+  and 1.031 K10 callbacks per warp instruction, so the theoretical callback
+  reduction is small while sync/TMA grouping risk is high.
+- Do not compress memory lane addresses first. Memory records account for only
+  about 0.95GB of the 7.41GB Option 1B wire traffic, and compression work in the
+  injected callback can increase observer effect.
+- Do not combine any of these stages in one first measurement. Keep each stage
+  independently disableable until its capture result passes.
+
+#### Capture acceptance matrix
+
+| Stage | Record count | Wire bytes | `ChannelDev::push` count | Primary evidence |
+|---|---|---|---|---|
+| 1C-A atomics | Same class mix | Same bytes | Same | Lower contention / wall time / spin |
+| 1C-B metadata | Same callbacks | Lower | Same | `metadata_records`, lower bytes |
+| 1C-C batching | Same callbacks | Same serialized bytes | Much lower | `mean_records_per_push` |
+
+For every stage:
+
+- inspect `[TRACE-WIRE]`, `[TRACE-COUNT]`, and when applicable
+  `[TRACE-BATCH]`;
+- compare per-PC K5/K10 NANOSLEEP with HW targets 8,461 / 7,860;
+- preserve HGMMA, MUFU, TMA-family, memory, BAR, and non-spin control-flow
+  work;
+- require TMA resolver/base-map generation with no missing operands;
+- run the simulator functional gate only after the capture gates pass;
+- in that simulator run, compare the simulator against the new trace contract,
+  not against Option 1B's timing-dependent instruction total.
+
+Suggested first next-session scope:
+
+```text
+implement Stage 1C-A only
+static/source review
+user build and capture
+evaluate TRACE-COUNT + TRACE-WIRE + spin
+then decide whether to keep 1C-A and start 1C-B
+```
+
+#### Independent simulator pacing track
+
+Do not wait for perfect capture before collecting observe-only simulator
+evidence, but do not alter scheduling or barrier eligibility yet.
+
+Existing implementation anchors:
+
+- PHASECHK/TRYWAIT execution and mbarrier state:
+  `remodeling/sm.cc` around `2142-2432`;
+- Producer ready/retry probe:
+  `remodeling/sm.cc` around `847-880`;
+- TMA completion credit:
+  `SM::notify_tma_completion` and
+  `remodeling/tma_unit_sm.cc` around `1024-1041`;
+- warp completion:
+  `remodeling/sm.cc` around `1282-1303`.
+
+Add one bounded per-CTA/per-barrier-phase lifecycle summary containing:
+
+```text
+first and last Producer PHASECHK cycle
+first modeled-ready cycle and ready cause
+Consumer ARRIVE/EXCH cycle
+Producer TMA issue cycle
+TMA completion-credit cycle
+Producer EXIT and maximum Consumer EXIT cycle
+```
+
+The probe must only observe existing state. Probe on/off must produce
+bit-identical `gpu_sim_insn`, `gpgpu_n_tot_w_icount`, and total cycles. Use the
+result to decide whether early Producer completion originates in scheduler
+pacing, mbarrier phase/arrival timing, TMA completion timing, or EXIT handling.
+Do not add modeled-ready blocking until this causal ordering is known.
+
+## 8. Fallback Option 2 - dual-capture sync-timeline reorganization
+
+### Details
+
+Option 2 is parked as a fallback rather than the immediate next implementation.
+If activated, it uses the Option 1B trace for complete replay data and a
+second, ultra-light run for HW synchronization timing. It does not use modeled
+mbarrier-ready as a release condition.
+
+#### Directory contract
+
+One `run_hw_trace.py` invocation creates all three directories:
+
+```text
+<run_dir>/
+  traces_fullrun/
+    dynamic_trace.pb
+    threadblocks/
+    extra_info/
+    stats.csv
+    capture_manifest.json
+
+  traces_ultralight/
+    sync_oracle_events.bin
+    sync_oracle_summary.csv
+    oracle_manifest.json
+
+  traces/
+    dynamic_trace.pb
+    threadblocks/
+    extra_info/
+      spin_timing_oracle.json
+      spin_reorg_manifest.json
+    stats.csv
+```
+
+Directory ownership:
+
+- `traces_fullrun` is an immutable Option 1B complete-data source.
+- `traces_ultralight` is an immutable timing-oracle bundle, not a simulator
+  dynamic trace.
+- `traces` is the reorganized simulator input and may be regenerated from the
+  two source directories.
+- Merge writes to `traces.merge.tmp`, validates the complete result, and only
+  then publishes it as `traces`. If `traces` already exists, the publisher
+  first renames it to `traces.previous`, renames the validated temporary
+  directory to `traces`, and removes `traces.previous` only after publication
+  succeeds.
+- Merge never modifies either source directory.
+
+Each manifest records:
+
+```text
+git SHA
+benchmark arguments
+GPU/CUDA version
+kernel launch sequence
+grid/block dimensions
+CUBIN hash
+per-function SASS hash
+tracer mode and environment
+event-buffer capacity/overflow
+```
+
+The full child run uses:
+
+```text
+TRACER_LIGHT_SPIN=1
+GATHER_REGISTERS=0
+TRIM_SPIN=0
+```
+
+The ultra-light child run uses a new dedicated oracle mode. It disables normal
+dynamic protobuf capture, TMA descriptor dumping, and `ChannelDev`.
+
+#### Ultra-light event contract
+
+The oracle instruments six SASS semantic families plus one CTA timeline probe.
+These are semantic families, not six literal opcode strings.
+
+| Event family | Actual coverage | Purpose |
+|---|---|---|
+| `CTA_BEGIN` | One first-event timestamp per CTA | CTA-relative HW timeline |
+| Barrier arrival | `SYNCS.ARRIVE.TRANS64*`, `SYNCS.EXCH.64` | Actual barrier-ready cause |
+| Wait check | `SYNCS.PHASECHK.TRANS64*` | Barrier key/phase and burst start |
+| Sleep | `NANOSLEEP.SYNCS` | Executed repeat count |
+| Back edge | Only validated spin-loop `BRA` sites | Repeat versus final exit |
+| Async issue anchor | `UTMALDG`, `UTMASTG`, `UTMAPF`, `UTMACCTL`, `UTMACMDFLUSH`, `UBLKCP`, `UBLKRED`, `UTMAREDG` | Producer pacing and logical-work signature |
+| Warp exit | Predicated SASS `EXIT` | Producer/Consumer lifetime |
+
+`CTA_BEGIN` is inserted at the kernel entry site. Multiple warps may execute
+the probe, so the per-CTA slot publishes the minimum `globaltimer` timestamp
+with a one-time atomic update. It does not instrument the rest of the entry
+basic block.
+
+No HGMMA, MUFU, ALU, LDGSTS, or generic memory instruction is instrumented.
+Those instructions and their payloads come from `traces_fullrun`.
+
+The ultra-light device record contains:
+
+```text
+kernel launch ordinal
+stable function/SASS hash
+logical block_id (blockIdx.x,y,z) and CTA-local warp
+event kind and relative PC
+normalized barrier offset
+semantic/phase raw value
+guard-predicate outcome
+globaltimer timestamp
+TMA site and normalized logical-address signature
+```
+
+The oracle also emits one summary per spin burst:
+
+```text
+TRYWAIT loop ID
+occurrence index
+burst start timestamp
+burst final-exit timestamp
+executed NANOSLEEP count
+barrier offset/phase
+static loop-descriptor ID and expected fallthrough
+next TMA-family anchor
+```
+
+Records are written to a preallocated per-CTA/per-warp device buffer. There is
+no per-event host channel push. The host copies the buffer once after kernel
+completion. Any buffer overflow is fatal.
+
+Use `globaltimer`, not SM-local `clock64`, for cross-SM timestamps. Both absolute
+timestamps and CTA-relative offsets are stored.
+
+#### Static loop descriptor
+
+Loop sites are discovered from the uninstrumented CUBIN/SASS rather than a
+hardcoded PC table:
+
+```text
+function SASS hash
+TRYWAIT PC
+NANOSLEEP PC
+PHASECHK PC
+back-edge BRA PC and target
+fallthrough PC
+optional preheader PC
+barrier operand index
+semantic/phase operand index
+```
+
+The current strict four-consecutive-PC matcher is insufficient:
+
+- K5 `0xacc0` and K10 `0xb4f0` can include a preheader between iterations.
+- Some calibrated loops execute in warps other than the single selected
+  Producer warp.
+- Option 2 therefore scans every warp and uses a control-flow state machine,
+  not `TRYWAIT,+0x10,+0x20,+0x30` alone.
+
+### Mapping
+
+Mapping has four stages.
+
+#### Stage 1 - launch and static identity
+
+The two runs must have identical:
+
+```text
+kernel launch count/order
+kernel name and grid/block dimensions
+CUBIN hash
+function SASS hashes
+static loop descriptors
+```
+
+Capture-local `unique_function_id` is not a stable cross-run key. The mapper
+uses function SASS hash plus relative PC and records the full-to-ultra function
+ID translation in the merge manifest.
+
+#### Stage 2 - full-trace burst extraction
+
+For every CTA and every warp, the mapper walks the dynamic PC stream and
+extracts maximal spin bursts. A burst begins at a validated TRYWAIT site and
+ends at the final back-edge BRA whose predicate does not repeat the loop.
+
+Each full burst records:
+
+```text
+kernel/CTA/warp
+loop descriptor ID
+occurrence ordinal
+repeat-iteration ranges
+final-exit iteration range
+barrier offset/phase from dynamic sync payload
+previous/fallthrough anchor PCs
+next TMA-family site and normalized address signature
+```
+
+#### Stage 3 - oracle burst extraction
+
+The device-side oracle finalizes a burst when the validated back-edge BRA does
+not repeat. It assigns the occurrence ordinal within
+`(kernel, CTA, warp, loop descriptor)`.
+
+#### Stage 4 - strict join
+
+Primary join key:
+
+```text
+(kernel launch ordinal,
+ function SASS hash,
+ logical block_id (blockIdx.x, blockIdx.y, blockIdx.z),   # NOT a physical CTA/SM slot
+ warp ID,
+ TRYWAIT relative PC,
+ occurrence ordinal)
+```
+
+The join key is the logical `blockIdx`, not a physical CTA/SM slot. NVBit records
+each threadblock protobuf under its logical `blockIdx`, and the simulator replays
+one protobuf per logical `blockIdx` (`trace_parser.cc:509-514`). Under a dynamic
+tile scheduler the same logical `blockIdx` may still change which tile it
+processes across two runs; see the empirical result below for why this key holds
+for K6 but not for K5.
+
+Required equality checks:
+
+```text
+normalized barrier offset
+phase/semantic raw
+next TMA-family site
+logical TMA address signature, when available
+```
+
+The full trace's previous/fallthrough anchors are checked against the static
+loop descriptor. They are not compared with a dynamic ultra-light event:
+generic non-spin instructions are deliberately not instrumented in the
+ultra-light run.
+
+There is no fuzzy match in the first implementation. Missing, duplicated, or
+reordered bursts abort the merge.
+
+Dynamic tile scheduling is the largest mapping risk, and it is confirmed present
+in this workload (see "Empirical scheduler determinism" below). The relevant
+question is not whether the same *physical* CTA gets a different logical tile
+(the trace is keyed by logical `blockIdx`, so physical placement is irrelevant),
+but whether the same *logical* `blockIdx` processes the same tile across two
+runs. Measurement shows this holds for K6 but fails for K5. The first
+implementation therefore joins on logical `blockIdx`, cross-checks each burst
+with the TMA site plus normalized logical-address signature, and aborts on any
+mismatch rather than silently remapping. Logical-tile remapping is a separate
+follow-up only if the mismatch is proven deterministic and one-to-one.
+
+#### Empirical scheduler determinism (measured)
+
+The two existing compact captures (`.opt1a` all-operand vs Option 1B pruned)
+are physically different runs with different capture overhead and therefore
+different spin counts. Decoding every threadblock protobuf and comparing, per
+logical `blockIdx` and warp, the instruction stream with differing-PC (spin/poll)
+instructions removed gives:
+
+| Kernel | Scheduler (from mangled name) | block_ids | spin-removed stream mismatches | real-mem (addresses>0 & sync==0) grand total | block_ids with differing real-mem | Verdict |
+|---|---|---:|---:|---|---:|---|
+| K6 (FWD) | `DynamicPersistentTileScheduler` | 384 | 32 / 6144 | 111,997 == 111,997 (conserved) | 2 / 384 (one tile pair swapped: `(0,265,0)`↔`(0,270,0)`) | logical keying holds for 382/384 |
+| K5 (BWD) | `SingleTileBwdLPTScheduler` (LPT work-stealing) | 132 | 533 / 2112 | 79,150 → 78,706 | 131 / 132 (symmetric ±156 shifts, e.g. block 7↔47) | logical keying FAILS |
+
+Consequences for Option 2:
+
+- K6 tiles are almost perfectly pinned to logical `blockIdx`; the strict join
+  succeeds for 382/384 CTAs and only two swapped tiles need handling.
+- K5 uses a longest-processing-time work-stealing scheduler: nearly every
+  logical `blockIdx` processes a different tile set across runs, so the strict
+  join aborts for almost every K5 CTA even with logical-`blockIdx` keying.
+- The `traces_fullrun` (Option 1B) and `traces_ultralight` runs are two more
+  physically different runs and will exhibit the same K5 non-determinism.
+  Option 2 as specified therefore cannot merge K5 without a scheduler-aware
+  step. This is an open problem, tracked in Section 8.x below, and must be
+  resolved before implementing the K5 merge path.
+
+### Reorganization
+
+Each full-trace burst is split into:
+
+```text
+repeat iteration 0
+repeat iteration 1
+...
+repeat iteration N-1
+final exit iteration
+```
+
+The final iteration is identified by the back-edge BRA predicate outcome, not
+only by PC order.
+
+For an oracle target of `P` executed repeat iterations:
+
+1. Keep the first `P` repeat iterations from the Option 1B full trace.
+2. Keep the original final-exit iteration.
+3. Delete only excess repeat iterations between them.
+4. Preserve every retained instruction message byte-for-byte.
+5. Preserve every non-spin instruction and every other warp byte-for-byte.
+6. Attach the matching ultra-light event timestamp to every retained
+   TRYWAIT/NANOSLEEP/PHASECHK/BRA instruction.
+7. Attach the matching timestamp to the next validated TMA-family anchor.
+8. Write all changed/deleted indices, timing joins, and hashes to
+   `spin_reorg_manifest.json`.
+
+`P` is the number of predicated-executed `NANOSLEEP.SYNCS` repeat iterations.
+The retained dynamic loop therefore contains `P` repeat bodies plus one final
+exit body. If `P == 0`, only the original final-exit body remains.
+
+If `P` is greater than the repeat count available in the full trace, merge
+fails. The initial implementation does not clone or synthesize a missing
+iteration because predicate masks, barrier payloads, and phase may be wrong.
+
+NCU per-PC NANOSLEEP counts remain an independent aggregate gate. If the
+ultra-light per-PC total differs materially from NCU, the oracle run is
+rejected. A later calibrated mode may allocate the exact NCU total among
+bursts using ultra-light counts and largest-remainder rounding, but this is not
+the initial path.
+
+The merged `dynamic_trace.pb` and all non-spin `extra_info` come from
+`traces_fullrun`. The merged `stats.csv` must not reuse callback counts as
+instruction counts; reorganization emits separate capture and final-trace
+statistics.
+
+#### Instruction-count invariants (two distinct counts)
+
+Reorganization and pacing touch two different counts that must not be conflated
+with the project's bit-identical `gpu_sim_insn` rule.
+
+- Trace-level count (changes by construction): the merged trace intentionally
+  contains fewer spin records than `traces_fullrun`, because excess repeat
+  iterations are deleted. `gpu_sim_insn` and `gpgpu_n_tot_w_icount` are
+  accumulated one-to-one from retired records (`sm.cc:2942`, `sm.cc:2949`), so
+  they drop by exactly the deleted spin records. The Section 5 fixed totals
+  (14,847,194 warp-insts, 450,627,804 active-lane insts, ...) apply to the
+  Option 1B full trace and are NOT the expected totals for the merged Option 2
+  trace. The expected merged totals must instead be predicted from the manifest:
+
+  ```text
+  gpu_sim_insn(merged) ==
+      gpu_sim_insn(fullrun) - sum(active lanes of every deleted spin record)
+  gpgpu_n_tot_w_icount(merged) ==
+      gpgpu_n_tot_w_icount(fullrun) - (number of deleted spin records)
+  ```
+
+  The `spin_reorg_manifest.json` deleted-index list must make both right-hand
+  sides exactly computable, and the merged run is checked against them.
+
+- Sidecar-level count (must be invariant): given one fixed merged trace, turning
+  oracle pacing on or off must not change `gpu_sim_insn` or
+  `gpgpu_n_tot_w_icount`. Pacing only delays eligibility; it never deletes,
+  clones, or ghost-retires a record and it consumes the real issue slot. This
+  pacing-on-equals-pacing-off equality is the constraint-compliant analogue of
+  the project's bit-identical rule and is a required simulator gate (added
+  below).
+
+#### Simulator timing semantics
+
+The ultra-light run records a CTA start timestamp and CTA-relative timestamps
+for every retained spin event and TMA anchor. The simulator converts each HW
+event timestamp to an earliest issue cycle:
+
+```text
+HW_CTA_relative_event_ns  = event_globaltimer_ns - CTA_begin_globaltimer_ns
+HW_CTA_relative_event_cycle = round(HW_CTA_relative_event_ns * core_clock_GHz)
+
+target_issue_cycle(event) =
+    simulated_CTA_start_cycle + HW_CTA_relative_event_cycle
+```
+
+The two operands are in different clock domains and must be reconciled
+explicitly:
+
+- `globaltimer` is a nanosecond wall clock (fixed ~1 GHz), not core cycles;
+- `simulated_CTA_start_cycle` is an SM core cycle (H100 core ~1.755 GHz);
+- `core_clock_GHz` is the modeled core frequency, recorded in the merge manifest
+  and the sidecar, not silently hardcoded;
+- the conversion factor is a modeling assumption, so the raw `globaltimer` ns
+  and the factor are both stored, and CTA/warp lifetime is validated against HW
+  after conversion (see the timestamp-conversion risk row).
+
+For each timing-annotated instruction:
+
+- if current cycle is earlier than its target, the warp is ineligible until
+  that target;
+- if current cycle is already later, the instruction issues normally without
+  an additional stall;
+- the instruction executes through the normal issue/FU/scoreboard path and
+  consumes its real issue slot;
+- modeled mbarrier-ready is sampled but never gates oracle release.
+
+This distributes the HW wait across the actual retained polls instead of
+placing one large stall at burst entry. It preserves poll issue-slot
+contention, warp/thread instruction statistics, normal sync reads, and the
+final-exit instruction. There is no zero-cycle ghost-retirement path.
+
+Required runtime log:
+
+```text
+[SPINORACLE]
+kernel/CTA/warp/loop/occurrence
+target_release_cycle
+actual_release_cycle
+model_ready_at_release
+ready_delta
+retained_repeat_iterations
+paced_instruction_count
+late_arrival_cycles
+```
+
+The oracle can delay an early simulated Producer but cannot accelerate a warp
+that reaches the burst after the HW target. `late_arrival_cycles` quantifies
+that limitation. A large late-arrival population means the residual is outside
+the spin-pacing model.
+
+#### Implementation order
+
+0. Per-kernel scheduler determinism gate FIRST. Using the two existing captures
+   (or any two physically different runs), verify per logical `blockIdx` that the
+   spin-removed instruction stream matches. This is already measured: K6 passes
+   (382/384), K5 fails (131/132 differ). Only kernels that pass this gate enter
+   the strict-merge path; failing kernels are routed to the open-problem path and
+   are not merged by the initial implementation.
+1. Implement directory orchestration and raw ultra-light capture only.
+2. Capture twice and validate oracle overhead/counts against NCU.
+3. Implement the all-warp burst extractor and strict mapping dry run.
+4. Proceed only if logical-`blockIdx` mapping coverage is 100% for that kernel.
+5. Implement reorganization and byte/hash validation without simulator timing.
+6. Add sidecar loading and per-event earliest-issue pacing last.
+
+This order prevents simulator work from being built on an oracle or mapping
+scheme that does not survive real FA3 dynamic tile scheduling.
+
+### Goal
+
+Preserve the Option 1B complete-data contract while replacing capture-induced
+spin count and Producer pacing with a low-perturbation HW synchronization
+timeline.
+
+### Why this fallback remains
+
+Option 1B proves that a lightweight full trace can preserve the complete replay
+payload, but it does not yet recover HW spin or Producer/Consumer lifetime.
+Further single-run tracer reduction and simulator pacing diagnosis remain the
+primary path. If that path reaches an observer-effect floor, Option 2 remains a
+fallback that must preserve both poll work and CTA-relative release timing,
+unlike the earlier aggregate count-only trim.
+
+### Measurement
+
+Ultra-light capture gates:
+
+- per-PC NANOSLEEP totals agree with NCU;
+- all expected CTA/warp EXIT records are present;
+- no oracle-buffer overflow;
+- Producer/Consumer lifetime agrees with HW;
+- event count and capture time are stable across repeated runs.
+
+Mapping/reorganization gates:
+
+- 100% burst-key coverage;
+- zero duplicate or ambiguous joins;
+- exact barrier offset/phase and anchor agreement;
+- non-spin serialized hash is identical before/after;
+- HGMMA, MUFU, TMA, memory, sync, and BAR work is unchanged;
+- only validated excess spin-repeat records are deleted;
+- every retained spin event and TMA anchor has exactly one timing join.
+
+Simulator gates:
+
+- clean exit with no deadlock;
+- merged-trace `gpu_sim_insn` and `gpgpu_n_tot_w_icount` equal the manifest
+  prediction (fullrun total minus deleted spin records);
+- pacing-on and pacing-off produce identical `gpu_sim_insn` and
+  `gpgpu_n_tot_w_icount` on the same merged trace (sidecar is timing-only);
+- TMA Phase2 coverage remains unchanged;
+- `[SPINORACLE]` has zero missing records;
+- Producer-only tail and total cycles move toward HW;
+- modeled-ready mismatch and late-arrival distributions are reported.
+
+### Risks and mitigations
+
+| Risk | Failure mode | Mitigation |
+|---|---|---|
+| Ultra-light observer effect | Sync callbacks change poll count/release timestamp | No ChannelDev; device slots; compare per-PC counts with NCU; repeat run |
+| Dynamic tile non-determinism (CONFIRMED) | Same logical `blockIdx` processes a different tile across runs; K5 fails, K6 mostly holds (measured) | Join on logical `blockIdx`; TMA logical signature; strict abort; per-kernel go/no-go; K5 needs a scheduler-aware step (open problem) |
+| Non-canonical loop shape | Four-PC matcher misses preheader/interleaving | Static CFG descriptor plus all-warp state machine |
+| Full trace under-spins | Oracle requires iterations absent from full | Fatal merge; no synthetic cloning in initial version |
+| Timestamp conversion | `globaltimer` ns vs core-cycle domain mismatch or wrong `core_clock_GHz` | Store raw ns and `core_clock_GHz`; convert explicitly; validate CTA/warp lifetime |
+| Timestamp resolution vs per-poll pacing | `globaltimer` tick coarser than spin period collapses adjacent polls to one timestamp, degrading per-poll pacing to per-burst | Measure `globaltimer` tick on target; if coarser than burst period use `clock64` for intra-CTA relative timing and `globaltimer` only for cross-SM `CTA_BEGIN` anchor |
+| Oracle device-buffer memory kind | High-frequency stores to managed memory fault/migrate and distort timing | Device-resident buffer (`cudaMalloc`), never `cuMemAllocManaged`; single post-kernel copy |
+| Device-buffer overflow / sizing | Fixed capacity sized to HW spin (~8k) overflows under still-inflated bring-up spin | Size to observed Option 1B max burst length plus headroom; overflow counter is fatal, not silent truncation |
+| Simulator arrives late | Oracle can delay but cannot accelerate | Report `late_arrival_cycles`; reject if dominant |
+| Modeled mbarrier divergence | Ready state differs at oracle release | Diagnostic only; never block release; report ready delta |
+| Event publication race | Burst/TMA patch records are partially visible | Per-warp sequence numbers; publish-valid last; kernel sync before host copy |
+| NCU count semantics | Callback count and predicated-executed NANOSLEEP differ | Count only nonzero guard masks; use identical per-PC aggregation |
+| TMA signature overhead | Capturing logical coordinates perturbs Producer timing | First predicated lane/uniform operands only; compare oracle with/without signature |
+| Poll pacing distortion | One bulk wait removes HW poll issue-slot contention | Earliest-issue timestamp per retained poll; normal pipeline execution |
+| Cross-run launch drift | Kernel ordinal/function identity mismatch | Launch/CUBIN/SASS manifest equality required |
+| Allocation-address drift | Raw pointer comparison fails across runs | Compare normalized shared offsets and logical TMA signatures |
+| Partial output publication | Failed merge leaves simulator-visible trace | Temporary output plus atomic rename after all gates |
+
+### Decision after the run
+
+- If ultra-light counts disagree with NCU, reduce oracle instrumentation before
+  implementing merge.
+- If strict logical-`blockIdx` mapping fails for a kernel (measured: K5),
+  diagnose tile assignment before considering logical remapping; do not merge
+  that kernel in the initial implementation.
+- If mapping and work gates pass but simulated Producers are mostly late, do
+  not tune spin timing further; the bottleneck is elsewhere in the simulator.
+- If oracle pacing restores role lifetime and lowers cycle error, adopt
+  `traces` as the simulator input and retain both source directories for audit.
+
+### Open problems (resolve one at a time, in order)
+
+These are the unresolved items surfaced by review and the empirical scheduler
+measurement. Each is independently actionable and gated before the dependent
+implementation step.
+
+1. K5 dynamic-tile join (blocks Stage 4 for K5). LPT work-stealing makes logical
+   `blockIdx` unstable across runs (131/132 blocks differ). Decide one of:
+   (a) merge only K6 in the initial version and treat K5 as out of scope;
+   (b) build a tile-identity join (match on TMA logical-address signature and
+   per-tile work fingerprint instead of `blockIdx`) and prove it is
+   deterministic one-to-one before use. Do not implement K5 pacing until this
+   is decided.
+2. `globaltimer` resolution (blocks per-poll pacing design). Measure the tick on
+   the target H100. If it is coarser than the spin-burst period, adopt the
+   `clock64` intra-CTA + `globaltimer` cross-SM hybrid; otherwise keep
+   `globaltimer` everywhere. Record the measured tick in the manifest.
+3. Clock-domain conversion (blocks simulator pacing). Fix `core_clock_GHz`,
+   store it and raw ns in the sidecar, and validate converted CTA/warp lifetime
+   against HW before enabling eligibility gating.
+4. Oracle buffer memory kind and sizing (blocks ultra-light capture). Choose a
+   device-resident (`cudaMalloc`) per-CTA/per-warp buffer, size it from the
+   observed Option 1B max burst length plus headroom, and make overflow fatal.
+   The existing `warp_lifetime_capture_t` CTA×warp indexing is the template, but
+   it is managed memory and must not be copied verbatim for high-frequency
+   stores.
+5. Two-count bookkeeping (blocks acceptance gates). Emit the manifest prediction
+   for merged `gpu_sim_insn`/`gpgpu_n_tot_w_icount` and add the pacing-on ==
+   pacing-off equality check to the simulator gates.
+
+### Expected deliverable
+
+```text
+per-kernel scheduler-determinism gate + report
+ultra-light device capture implementation
+raw oracle event format and converter
+static loop-descriptor generator
+strict burst matcher and dry-run report
+timing-aware trace reorganizer
+spin timing sidecar loader
+simulator per-event earliest-issue pacing path
+end-to-end manifest and validation report
+```
+
+## 9. Status
 
 - Compact wire layout implemented.
 - `TRACER_LIGHT_SPIN=0/1` selects legacy/compact full capture.
@@ -668,14 +1595,38 @@ the reorganizer as a separate offline stage using the ultra-light sidecar.
 - `[TRACE-WIRE]` measured 20.75GB compact traffic versus 136.55GB legacy
   equivalent, an 84.81% reduction.
 - Compact spin reduction measured at 43.4% for K5 and 42.0% for K10.
-- HW timing-fidelity gate failed at 27.2x K5 and 50.0x K10 residual spin.
+- Option 1A HW timing-fidelity gate failed at 27.2x K5 and 50.0x K10 residual
+  spin.
 - Capture wall time remains to be collected from the GPU-server log.
 - Option 1B build and GPU capture completed.
 - Option 1B callback reduction passed at 66.2% workload-wide.
 - Option 1B wire traffic is 7.41GB, 64.3% below Option 1A and 94.6% below
   the original all-operand/fixed-record equivalent.
 - Option 1B replay/TMA/sync payload parity passed.
-- Option 1B spin is 12.1x HW for K5 and 35.4x HW for K10.
-- Option 1B simulator functional run is pending.
-- Option 2 per-burst ultra-light capture and reorganization are not yet
-  implemented.
+- Option 1B captured-trace spin is 12.1x HW for K5 and 35.4x HW for K10;
+  simulator runtime NANOSLEEP is 12.1x and 35.5x, respectively.
+- Option 1B simulator functional run completed: K5 83,308 cycles (23.1% error)
+  and K10 136,898 cycles (3.0% error).
+- Option 1B payload/functional gate passed: exact warp/active-lane instruction
+  totals, exact memory/sync/BAR/HGMMA/MUFU/TMA contract totals, TMA
+  `unresolved=0`, BAR leak=0, fatal=0, and clean exit.
+- Option 1B timing-fidelity gate failed: Producer completes 37.9K cycles before
+  Consumer in K5 and 12.0K before Consumer in K10; K5 HW instead has an
+  approximately +8.0K Producer tail.
+- Primary next direction is further single-run tracer lightening plus an
+  independent simulator Producer/Consumer pacing investigation.
+- The next-session handoff now defines staged Option 1C-A/B/C implementations,
+  proposed A/B selectors, source anchors, acceptance gates, reference artifacts,
+  and the separate observe-only simulator lifecycle probe. None is implemented
+  yet.
+- Option 2 per-burst ultra-light capture and reorganization remain unimplemented
+  and are parked as a fallback.
+- FA3 tile scheduler identified from mangled kernel names and SASS: K6 (FWD) is
+  `DynamicPersistentTileScheduler` (grid 384) with a `VOTEU/ATOMG.E.ADD/SHFL`
+  work-counter; K5 (BWD) is `SingleTileBwdLPTScheduler` (grid 132 = SM count).
+  Both are dynamic, not static.
+- Scheduler-determinism measured on the two existing captures (`.opt1a` vs
+  Option 1B): K6 logical-`blockIdx` keying holds (382/384; real-mem grand total
+  conserved 111,997; one tile pair swapped), K5 fails (131/132 differ; symmetric
+  work redistribution). Option 2 join key changed to logical `blockIdx`; K5
+  merge is an open problem.
