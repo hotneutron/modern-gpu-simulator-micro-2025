@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 
 from optparse import OptionParser
+import hashlib
+import json
 import os
 import subprocess
 import os
@@ -17,6 +19,198 @@ import yaml
 import common
 import re
 import datetime
+
+
+LIGHTER_TRACER_FEATURE_ORDER = (
+    "compact_wire",
+    "prune_operands",
+    "host_count",
+    "metadata_record",
+    "sparse_reconstruct",
+    "warp_batch_1k",
+    "warp_batch_2k",
+    "warp_batch_4k",
+    "spin_fusion",
+)
+
+LIGHTER_TRACER_IMPLEMENTED_FEATURES = frozenset(
+    ("compact_wire", "prune_operands")
+)
+
+LIGHTER_TRACER_PRODUCTION_FEATURES = frozenset(
+    ("compact_wire", "prune_operands")
+)
+
+LIGHTER_TRACER_FEATURE_DEPENDENCIES = {
+    "prune_operands": frozenset(("compact_wire",)),
+    "host_count": frozenset(("compact_wire",)),
+    "metadata_record": frozenset(("compact_wire",)),
+    "sparse_reconstruct": frozenset(
+        ("compact_wire", "prune_operands")
+    ),
+    "warp_batch_1k": frozenset(("compact_wire",)),
+    "warp_batch_2k": frozenset(("compact_wire",)),
+    "warp_batch_4k": frozenset(("compact_wire",)),
+    "spin_fusion": frozenset(
+        ("compact_wire", "prune_operands", "sparse_reconstruct")
+    ),
+}
+
+LIGHTER_TRACER_WARP_BATCH_FEATURES = frozenset(
+    ("warp_batch_1k", "warp_batch_2k", "warp_batch_4k")
+)
+
+
+class LighterTracerConfig:
+    def __init__(self, requested, features, source, publish_default=False):
+        self.requested = requested
+        self.features = tuple(features)
+        self.source = source
+        self.publish_default = publish_default
+        self.canonical = ",".join(self.features) if self.features else "off"
+        self.config_hash = hashlib.sha256(
+            self.canonical.encode("ascii")
+        ).hexdigest()[:8]
+
+    def enabled(self, feature):
+        return feature in self.features
+
+    @property
+    def compact_wire_enabled(self):
+        return self.enabled("compact_wire")
+
+    @property
+    def artifact_suffix(self):
+        if not self.features or self.publish_default:
+            return ""
+        readable = "+".join(self.features)
+        return "_lighter-{0}-{1}".format(readable, self.config_hash)
+
+
+def parse_lighter_tracer_bool(name, value, default):
+    if value is None:
+        return default
+    if value not in ("0", "1"):
+        raise ValueError("{0} must be 0 or 1".format(name))
+    return value == "1"
+
+
+def parse_lighter_tracer_feature_set(raw_value):
+    if raw_value is None:
+        return ()
+
+    stripped = raw_value.strip()
+    if not stripped:
+        raise ValueError("LIGHTER_TRACER must not be empty; use 'off'")
+    if stripped == "off":
+        return ()
+    if stripped == "all":
+        return tuple(
+            feature
+            for feature in LIGHTER_TRACER_FEATURE_ORDER
+            if feature in LIGHTER_TRACER_PRODUCTION_FEATURES
+        )
+
+    requested_tokens = stripped.split(",")
+    tokens = []
+    seen = set()
+    for requested_token in requested_tokens:
+        token = requested_token.strip()
+        if not token:
+            raise ValueError("LIGHTER_TRACER contains an empty feature token")
+        if token in ("off", "all"):
+            raise ValueError(
+                "LIGHTER_TRACER token '{0}' cannot be combined".format(token)
+            )
+        if token not in LIGHTER_TRACER_FEATURE_ORDER:
+            raise ValueError(
+                "unknown LIGHTER_TRACER feature '{0}'".format(token)
+            )
+        if token in seen:
+            raise ValueError(
+                "duplicate LIGHTER_TRACER feature '{0}'".format(token)
+            )
+        seen.add(token)
+        tokens.append(token)
+
+    selected = frozenset(tokens)
+    selected_batches = selected & LIGHTER_TRACER_WARP_BATCH_FEATURES
+    if len(selected_batches) > 1:
+        raise ValueError(
+            "LIGHTER_TRACER warp_batch_1k/2k/4k features are mutually exclusive"
+        )
+
+    for feature in tokens:
+        missing = (
+            LIGHTER_TRACER_FEATURE_DEPENDENCIES.get(
+                feature, frozenset()
+            )
+            - selected
+        )
+        if missing:
+            raise ValueError(
+                "LIGHTER_TRACER feature '{0}' requires: {1}".format(
+                    feature, ",".join(sorted(missing))
+                )
+            )
+
+    unimplemented = selected - LIGHTER_TRACER_IMPLEMENTED_FEATURES
+    if unimplemented:
+        raise ValueError(
+            "LIGHTER_TRACER features are recognized but not implemented: "
+            "{0}".format(",".join(sorted(unimplemented)))
+        )
+
+    return tuple(
+        feature
+        for feature in LIGHTER_TRACER_FEATURE_ORDER
+        if feature in selected
+    )
+
+
+def resolve_lighter_tracer(
+    lighter_tracer_value,
+    legacy_light_spin_value=None,
+    legacy_gather_registers_value=None,
+):
+    if lighter_tracer_value is not None:
+        if (
+            legacy_light_spin_value is not None
+            or legacy_gather_registers_value is not None
+        ):
+            raise ValueError(
+                "LIGHTER_TRACER cannot be combined with deprecated "
+                "TRACER_LIGHT_SPIN or GATHER_REGISTERS"
+            )
+        stripped_value = lighter_tracer_value.strip()
+        features = parse_lighter_tracer_feature_set(lighter_tracer_value)
+        return LighterTracerConfig(
+            requested=lighter_tracer_value,
+            features=features,
+            source="LIGHTER_TRACER",
+            publish_default=stripped_value == "all",
+        )
+
+    light_spin = parse_lighter_tracer_bool(
+        "TRACER_LIGHT_SPIN", legacy_light_spin_value, False
+    )
+    gather_registers = parse_lighter_tracer_bool(
+        "GATHER_REGISTERS", legacy_gather_registers_value, False
+    )
+    features = ()
+    if light_spin:
+        features = ("compact_wire",)
+        if not gather_registers:
+            features += ("prune_operands",)
+
+    requested = "TRACER_LIGHT_SPIN={0},GATHER_REGISTERS={1}".format(
+        int(light_spin), int(gather_registers)
+    )
+    return LighterTracerConfig(
+        requested=requested,
+        features=features,
+        source="legacy",
+    )
 
 # MOD. Begin. Improved tracer
 import psutil
@@ -36,16 +230,29 @@ if warp_lifetime_only and warp_lifetime_sidecar:
 trim_spin_enabled = os.getenv("TRIM_SPIN") == "1"
 trim_spin_ncu_rep = os.getenv("TRIM_SPIN_NCU_REP")
 trim_spin_ncu_bin = os.getenv("TRIM_SPIN_NCU_BIN", "ncu")
-tracer_light_spin_value = os.getenv("TRACER_LIGHT_SPIN", "0")
-if tracer_light_spin_value not in ("0", "1"):
-    raise RuntimeError("TRACER_LIGHT_SPIN must be 0 or 1")
-gather_registers_value = os.getenv("GATHER_REGISTERS", "0")
-if gather_registers_value not in ("0", "1"):
-    raise RuntimeError("GATHER_REGISTERS must be 0 or 1")
-compact_full_capture_enabled = tracer_light_spin_value == "1"
+try:
+    lighter_tracer_config = resolve_lighter_tracer(
+        os.getenv("LIGHTER_TRACER"),
+        os.environ.get("TRACER_LIGHT_SPIN"),
+        os.environ.get("GATHER_REGISTERS"),
+    )
+except ValueError as error:
+    raise RuntimeError(str(error))
+compact_full_capture_enabled = (
+    lighter_tracer_config.compact_wire_enabled
+)
+print(
+    "[LIGHTER-TRACER] requested={0} canonical={1} config_hash={2} "
+    "artifact_suffix={3}".format(
+        lighter_tracer_config.requested,
+        lighter_tracer_config.canonical,
+        lighter_tracer_config.config_hash,
+        lighter_tracer_config.artifact_suffix or "<none>",
+    )
+)
 if trim_spin_enabled and compact_full_capture_enabled:
     raise RuntimeError(
-        "TRIM_SPIN=1 and TRACER_LIGHT_SPIN=1 are mutually exclusive: "
+        "TRIM_SPIN=1 and LIGHTER_TRACER compact capture are mutually exclusive: "
         "use compact full capture for Option 1, or trim/reorganization for Option 2"
     )
 if trim_spin_enabled and not trim_spin_ncu_rep:
@@ -211,29 +418,84 @@ for bench in benchmarks:
     for argpair in argslist:
         args = argpair["args"]
         extra_env = argpair.get("env", {})
+        conflicting_config_keys = {
+            "LIGHTER_TRACER",
+            "TRACER_LIGHT_SPIN",
+            "GATHER_REGISTERS",
+        } & set(extra_env)
+        if conflicting_config_keys:
+            raise RuntimeError(
+                "benchmark environment cannot override tracer selection: {0}".format(
+                    ",".join(sorted(conflicting_config_keys))
+                )
+            )
         benchmark_name = argpair.get("benchmark_name", exe)
-        run_name = os.path.join( benchmark_name, common.get_argfoldername( args ) )
+        argument_folder = common.get_argfoldername(args)
         if warp_lifetime_only:
             lifetime_kernel = os.getenv("DYNAMIC_KERNEL_LIMIT_START", "all")
-            run_name += "-warp-lifetime-k" + lifetime_kernel
+            argument_folder += "-warp-lifetime-k" + lifetime_kernel
         elif warp_lifetime_sidecar:
             lifetime_kernel = os.getenv("DYNAMIC_KERNEL_LIMIT_START", "all")
-            run_name += "-fulltrace-lifetime-k" + lifetime_kernel
+            argument_folder += "-fulltrace-lifetime-k" + lifetime_kernel
+        argument_folder += lighter_tracer_config.artifact_suffix
+        run_name = os.path.join(benchmark_name, argument_folder)
 
         # MOD. Begin. Improved tracer
         if(options.compressed == "0"):
-            this_run_dir = os.path.abspath(os.path.expandvars(
-                os.path.join(this_directory, "..", "..", "hw_run","traces","device-" + options.device_num, cuda_version, run_name)))
+            trace_version_root = os.path.join(
+                this_directory, "..", "..", "hw_run", "traces",
+                "device-" + options.device_num, cuda_version
+            )
         else:
-            this_run_dir = os.path.abspath(os.path.expandvars(
-                os.path.join(this_directory, traces_root_dir, "hw_run","traces","device-" + options.device_num, cuda_version, run_name)))
+            trace_version_root = os.path.join(
+                this_directory, traces_root_dir, "hw_run", "traces",
+                "device-" + options.device_num, cuda_version
+            )
+        this_run_dir = os.path.abspath(
+            os.path.expandvars(os.path.join(trace_version_root, run_name))
+        )
         # MOD. End. Improved tracer
 
         this_trace_folder = os.path.join(this_run_dir, "traces")
-        if not os.path.exists(this_run_dir):
+        if os.path.exists(this_run_dir):
+            if lighter_tracer_config.features:
+                raise RuntimeError(
+                    "refusing to overwrite existing lighter trace directory: "
+                    "{0}".format(this_run_dir)
+                )
+        else:
             os.makedirs(this_run_dir)
         if not os.path.exists(this_trace_folder):
             os.makedirs(this_trace_folder)
+
+        try:
+            git_sha = subprocess.check_output(
+                ["git", "-C", this_directory, "rev-parse", "HEAD"],
+                universal_newlines=True,
+            ).strip()
+        except (OSError, subprocess.CalledProcessError):
+            git_sha = "unknown"
+        config_manifest = {
+            "requested": lighter_tracer_config.requested,
+            "canonical": lighter_tracer_config.canonical,
+            "features": list(lighter_tracer_config.features),
+            "source": lighter_tracer_config.source,
+            "publish_default": lighter_tracer_config.publish_default,
+            "config_hash": lighter_tracer_config.config_hash,
+            "artifact_suffix": lighter_tracer_config.artifact_suffix,
+            "git_sha": git_sha,
+        }
+        with open(
+            os.path.join(this_run_dir, "lighter_tracer_config.json"),
+            "w",
+        ) as manifest_file:
+            json.dump(
+                config_manifest,
+                manifest_file,
+                indent=2,
+                sort_keys=True,
+            )
+            manifest_file.write("\n")
 
         # link the data directory
         try:
@@ -258,14 +520,13 @@ for bench in benchmarks:
         env_exports = ""
         for key, value in extra_env.items():
             env_exports += "export {0}={1}; ".format(key, shlex.quote(str(value)))
-        # Persist the selected wire mode in run.sh so --norun/manual execution
-        # cannot silently fall back to the legacy transport. Append after the
-        # benchmark environment so this top-level experiment selection wins.
-        env_exports += "export TRACER_LIGHT_SPIN={0}; ".format(
-            tracer_light_spin_value
-        )
-        env_exports += "export GATHER_REGISTERS={0}; ".format(
-            gather_registers_value
+        # Persist the canonical feature set so --norun/manual execution cannot
+        # silently select a different tracer configuration. A legacy input may
+        # still exist in the parent shell, so remove it before exporting the
+        # canonical replacement.
+        env_exports += "unset TRACER_LIGHT_SPIN GATHER_REGISTERS; "
+        env_exports += "export LIGHTER_TRACER={0}; ".format(
+            shlex.quote(lighter_tracer_config.canonical)
         )
 
         if options.terminate_upon_limit:

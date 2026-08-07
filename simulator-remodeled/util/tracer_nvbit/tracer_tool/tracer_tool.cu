@@ -31,8 +31,11 @@
 #include <assert.h>
 #include <bitset>
 #include <cctype>
+#include <cstdlib>
 #include <cstdio>
+#include <cstring>
 #include <deque>
+#include <initializer_list>
 #include <inttypes.h>
 #include <iostream>
 #include <iterator>
@@ -136,10 +139,11 @@ bool active_region = true;
 /* Probe-only mode: instrument SASS EXIT and record one final clock64 timestamp
  * per CTA-local warp. Full instruction tracing stays unchanged when disabled. */
 int warp_lifetime_only = 0;
-/* Full-capture transport selector.
+/* Resolved LIGHTER_TRACER compact transport state.
  * 0: original fixed 712B record and full lane gathers.
  * 1: compact 104B/360B records and scalar non-memory gathers. */
 int tracer_light_spin = 0;
+std::string lighter_tracer_canonical = "off";
 /* Sidecar mode: keep the complete dynamic trace path enabled and additionally
  * timestamp SASS EXIT. This measures the lifetime perturbation of full tracing
  * itself, using the same capture/output buffer as WARP_LIFETIME_ONLY. */
@@ -157,6 +161,212 @@ std::string warp_lifetime_kernel_name;
 /* Should we terminate the program once we are done tracing? */
 int terminate_after_limit_number_of_kernels_reached = 0;
 int user_defined_folders = 0;
+
+static std::string trim_config_token(const std::string &value) {
+  size_t begin = 0;
+  while (begin < value.size() &&
+         std::isspace(static_cast<unsigned char>(value[begin]))) {
+    begin++;
+  }
+  size_t end = value.size();
+  while (end > begin &&
+         std::isspace(static_cast<unsigned char>(value[end - 1]))) {
+    end--;
+  }
+  return value.substr(begin, end - begin);
+}
+
+[[noreturn]] static void lighter_tracer_config_error(
+    const std::string &message) {
+  fprintf(stderr, "[LIGHTER-TRACER] %s\n", message.c_str());
+  abort();
+}
+
+static int parse_legacy_bool(const char *name, const char *value,
+                             int default_value) {
+  if (value == nullptr) {
+    return default_value;
+  }
+  if (std::strcmp(value, "0") == 0) {
+    return 0;
+  }
+  if (std::strcmp(value, "1") == 0) {
+    return 1;
+  }
+  lighter_tracer_config_error(std::string(name) + " must be 0 or 1");
+}
+
+static void validate_lighter_tracer_dependencies(
+    const std::unordered_set<std::string> &features) {
+  auto require = [&](const char *feature,
+                     std::initializer_list<const char *> dependencies) {
+    if (features.count(feature) == 0) {
+      return;
+    }
+    std::vector<std::string> missing;
+    for (const char *dependency : dependencies) {
+      if (features.count(dependency) == 0) {
+        missing.emplace_back(dependency);
+      }
+    }
+    if (!missing.empty()) {
+      std::ostringstream message;
+      message << "feature '" << feature << "' requires: ";
+      for (size_t i = 0; i < missing.size(); i++) {
+        if (i != 0) {
+          message << ",";
+        }
+        message << missing[i];
+      }
+      lighter_tracer_config_error(message.str());
+    }
+  };
+
+  require("prune_operands", {"compact_wire"});
+  require("host_count", {"compact_wire"});
+  require("metadata_record", {"compact_wire"});
+  require("sparse_reconstruct", {"compact_wire", "prune_operands"});
+  require("warp_batch_1k", {"compact_wire"});
+  require("warp_batch_2k", {"compact_wire"});
+  require("warp_batch_4k", {"compact_wire"});
+  require("spin_fusion",
+          {"compact_wire", "prune_operands", "sparse_reconstruct"});
+
+  int batch_features = 0;
+  batch_features += features.count("warp_batch_1k") != 0;
+  batch_features += features.count("warp_batch_2k") != 0;
+  batch_features += features.count("warp_batch_4k") != 0;
+  if (batch_features > 1) {
+    lighter_tracer_config_error(
+        "warp_batch_1k/2k/4k features are mutually exclusive");
+  }
+}
+
+static void resolve_lighter_tracer_config() {
+  static const std::vector<std::string> feature_order = {
+      "compact_wire",      "prune_operands", "host_count",
+      "metadata_record",   "sparse_reconstruct",
+      "warp_batch_1k",     "warp_batch_2k",  "warp_batch_4k",
+      "spin_fusion",
+  };
+  static const std::unordered_set<std::string> implemented_features = {
+      "compact_wire",
+      "prune_operands",
+  };
+  static const std::unordered_set<std::string> production_features = {
+      "compact_wire",
+      "prune_operands",
+  };
+
+  const char *lighter_value = getenv("LIGHTER_TRACER");
+  const char *legacy_light_value = getenv("TRACER_LIGHT_SPIN");
+  const char *legacy_gather_value = getenv("GATHER_REGISTERS");
+  std::unordered_set<std::string> features;
+  std::string requested;
+  const char *source = nullptr;
+
+  if (lighter_value != nullptr) {
+    if (legacy_light_value != nullptr || legacy_gather_value != nullptr) {
+      lighter_tracer_config_error(
+          "LIGHTER_TRACER cannot be combined with deprecated "
+          "TRACER_LIGHT_SPIN or GATHER_REGISTERS");
+    }
+    requested = lighter_value;
+    source = "LIGHTER_TRACER";
+    std::string raw = trim_config_token(lighter_value);
+    if (raw.empty()) {
+      lighter_tracer_config_error(
+          "LIGHTER_TRACER must not be empty; use 'off'");
+    }
+    if (raw == "all") {
+      features.insert(production_features.begin(), production_features.end());
+    } else if (raw != "off") {
+      size_t begin = 0;
+      while (begin <= raw.size()) {
+        size_t comma = raw.find(',', begin);
+        size_t end = comma == std::string::npos ? raw.size() : comma;
+        std::string token =
+            trim_config_token(raw.substr(begin, end - begin));
+        if (token.empty()) {
+          lighter_tracer_config_error(
+              "LIGHTER_TRACER contains an empty feature token");
+        }
+        if (token == "off" || token == "all") {
+          lighter_tracer_config_error("feature '" + token +
+                                      "' cannot be combined");
+        }
+        if (std::find(feature_order.begin(), feature_order.end(), token) ==
+            feature_order.end()) {
+          lighter_tracer_config_error("unknown feature '" + token + "'");
+        }
+        if (!features.insert(token).second) {
+          lighter_tracer_config_error("duplicate feature '" + token + "'");
+        }
+        if (comma == std::string::npos) {
+          break;
+        }
+        begin = comma + 1;
+      }
+    }
+  } else {
+    int legacy_light =
+        parse_legacy_bool("TRACER_LIGHT_SPIN", legacy_light_value, 0);
+    int legacy_gather =
+        parse_legacy_bool("GATHER_REGISTERS", legacy_gather_value, 0);
+    std::ostringstream legacy_requested;
+    legacy_requested << "TRACER_LIGHT_SPIN=" << legacy_light
+                     << ",GATHER_REGISTERS=" << legacy_gather;
+    requested = legacy_requested.str();
+    source = "legacy";
+    if (legacy_light) {
+      features.insert("compact_wire");
+      if (!legacy_gather) {
+        features.insert("prune_operands");
+      }
+    }
+  }
+
+  validate_lighter_tracer_dependencies(features);
+  std::vector<std::string> unimplemented;
+  for (const auto &feature : features) {
+    if (implemented_features.count(feature) == 0) {
+      unimplemented.push_back(feature);
+    }
+  }
+  if (!unimplemented.empty()) {
+    std::sort(unimplemented.begin(), unimplemented.end());
+    std::ostringstream message;
+    message << "features are recognized but not implemented: ";
+    for (size_t i = 0; i < unimplemented.size(); i++) {
+      if (i != 0) {
+        message << ",";
+      }
+      message << unimplemented[i];
+    }
+    lighter_tracer_config_error(message.str());
+  }
+
+  std::ostringstream canonical;
+  bool first_feature = true;
+  for (const auto &feature : feature_order) {
+    if (features.count(feature) == 0) {
+      continue;
+    }
+    if (!first_feature) {
+      canonical << ",";
+    }
+    canonical << feature;
+    first_feature = false;
+  }
+  lighter_tracer_canonical =
+      features.empty() ? "off" : canonical.str();
+  tracer_light_spin = features.count("compact_wire") != 0;
+  gather_registers =
+      tracer_light_spin && features.count("prune_operands") == 0;
+
+  printf("[LIGHTER-TRACER] requested=%s canonical=%s source=%s\n",
+         requested.c_str(), lighter_tracer_canonical.c_str(), source);
+}
 
 /* opcode to id map and reverse map  */
 std::map<std::string, int> opcode_to_id_map;
@@ -1746,14 +1956,7 @@ void nvbit_at_init() {
             "exclusive\n");
     abort();
   }
-  GET_VAR_INT(
-      tracer_light_spin, "TRACER_LIGHT_SPIN", 0,
-      "Select compact full-capture transport: 0=legacy 712B records, "
-      "1=compact 104B/360B records.");
-  if (tracer_light_spin != 0 && tracer_light_spin != 1) {
-    fprintf(stderr, "TRACER_LIGHT_SPIN must be 0 or 1\n");
-    abort();
-  }
+  resolve_lighter_tracer_config();
   printf("[TRACE-WIRE] selected mode=%s legacy_size=%u compact_size=%u "
          "memory_size=%u\n",
          tracer_light_spin ? "compact" : "legacy",
@@ -1769,11 +1972,6 @@ void nvbit_at_init() {
               "folder TRACES_FOLDER path environment");
   GET_VAR_INT(threshold_unique_kernel_checking, "THRESHOLD_UNIQUE_KERNEL_CHECKING", 10,
               "Number of instructions used to check if kernels with the same name are different");
-  GET_VAR_INT(
-      gather_registers, "GATHER_REGISTERS", 0,
-      "Retain otherwise-unused REG/UREG/PRED operand callbacks in compact "
-      "mode. Runtime operands required by memory, sync, BAR, and TMA are "
-      "always preserved.");
   printf("[TRACE-PRUNE] enabled=%d gather_registers=%d\n",
          tracer_light_spin && !gather_registers, gather_registers);
   GET_VAR_INT(incremental_flush_threshold, "INCREMENTAL_FLUSH_THRESHOLD", 0,
@@ -2064,8 +2262,9 @@ void instrument_function_if_needed(CUcontext ctx, CUfunction func, int device_id
        *   - TMA family: every operand, because tma_runtime_operand_debug.jsonl
        *     is consumed by strict TMA sidecar generation
        *
-       * GATHER_REGISTERS=1 restores the original all-operand callback stream
-       * for diagnostics. The legacy transport is intentionally unchanged.
+       * Omitting prune_operands restores the all-operand compact callback
+       * stream for diagnostics. The legacy transport is intentionally
+       * unchanged.
        */
       if (tracer_light_spin && !gather_registers &&
           !is_tma_desc_consumer_instruction) {

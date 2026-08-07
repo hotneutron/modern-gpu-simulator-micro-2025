@@ -43,8 +43,9 @@ Conclusion:
 
 - The spin-only path was safe but ineffective.
 - The old spin-only behavior is removed.
-- The existing `TRACER_LIGHT_SPIN` configuration name is reused as the
-  full-capture transport selector described below.
+- `TRACER_LIGHT_SPIN` was reused for the first compact implementation and is
+  now retained only as a deprecated compatibility input for
+  `LIGHTER_TRACER`.
 
 ## 2. Adopted implementation - compact full capture
 
@@ -75,19 +76,18 @@ compact scalar prefix and an optional lane payload.
 
 | Configuration | Device callback | Wire format |
 |---|---|---|
-| `TRACER_LIGHT_SPIN=0` | `instrument_inst` | Original fixed 712B legacy record |
-| `TRACER_LIGHT_SPIN=1` | `instrument_inst_compact` | New 104B/360B compact record |
+| `LIGHTER_TRACER=off` | `instrument_inst` | Original fixed 712B legacy record |
+| `LIGHTER_TRACER=compact_wire` | `instrument_inst_compact` | New 104B/360B compact record |
 
 Current Option 1B configuration:
 
 ```text
-TRACER_LIGHT_SPIN=1
-GATHER_REGISTERS=0
+LIGHTER_TRACER=compact_wire,prune_operands
 TRIM_SPIN=0
 ```
 
-`GATHER_REGISTERS=1` disables pruning and restores Option 1A's all-operand
-compact callback stream for debugging and A/B comparison.
+Omitting `prune_operands` restores Option 1A's all-operand compact callback
+stream for debugging and A/B comparison.
 
 | Wire record | Size | Payload |
 |---|---:|---|
@@ -204,10 +204,11 @@ Absent TMA debug operands are represented explicitly:
 The instrumentation site first classifies the original operands, then selects
 the compact callback set:
 
-1. `TRACER_LIGHT_SPIN=0` inserts the original `instrument_inst` callback;
-2. `TRACER_LIGHT_SPIN=1` inserts `instrument_inst_compact`;
-3. legacy mode and `GATHER_REGISTERS=1` retain the original operand list;
-4. compact mode with `GATHER_REGISTERS=0` keeps only the semantic allowlist
+1. `LIGHTER_TRACER=off` inserts the original `instrument_inst` callback;
+2. `compact_wire` inserts `instrument_inst_compact`;
+3. legacy mode and compact mode without `prune_operands` retain the original
+   operand list;
+4. `compact_wire,prune_operands` keeps only the semantic allowlist
    above and remaps sync/BAR callback indices to the retained list;
 5. if the allowlist is empty, one `NO_REGS` callback preserves PC/function and
    active/predicate masks;
@@ -223,13 +224,16 @@ continues to produce exactly one protobuf instruction.
 
 `run_hw_trace.py` persists the mode in generated artifacts:
 
-- generated `run.sh` explicitly exports the selected
-  `TRACER_LIGHT_SPIN=0/1` value;
-- generated `run.sh` explicitly exports `GATHER_REGISTERS=0/1`;
-- compact capture intentionally uses the original full-trace run directory so
-  the simulator consumes the same path;
-- the user backs up the previous trace externally before capture, and the new
-  compact trace overwrites the working trace location.
+- generated `run.sh` unsets deprecated selectors and exports the canonical
+  `LIGHTER_TRACER` string;
+- `lighter_tracer_config.json` records the requested/canonical configuration,
+  feature list, configuration hash, artifact suffix, and git SHA;
+- lighter captures append a readable configuration suffix plus an
+  eight-character hash to the original argument-folder name and refuse to
+  overwrite an existing run directory;
+- the selected `<benchmark>/<argument-folder>_<config>` run directory can be
+  passed directly to `run_simulations.py -T`;
+- `LIGHTER_TRACER=off` retains the legacy unsuffixed argument-folder behavior.
 
 ### Host receiver
 
@@ -264,6 +268,8 @@ Channel transport statistics are emitted as:
 - `simulator-remodeled/util/tracer_nvbit/tracer_tool/common.h`
 - `simulator-remodeled/util/tracer_nvbit/tracer_tool/inject_funcs.cu`
 - `simulator-remodeled/util/tracer_nvbit/tracer_tool/tracer_tool.cu`
+- `simulator-remodeled/util/tracer_nvbit/run_hw_trace.py`
+- `simulator-remodeled/util/job_launching/run_simulations.py`
 
 ## 5. Validation
 
@@ -281,9 +287,9 @@ The user performs the build and GPU runs.
 For Option 1B, compare two captures from the pruning-capable binary:
 
 - all-operand compact baseline:
-  `TRACER_LIGHT_SPIN=1 GATHER_REGISTERS=1`;
+  `LIGHTER_TRACER=compact_wire`;
 - pruned compact candidate:
-  `TRACER_LIGHT_SPIN=1 GATHER_REGISTERS=0`.
+  `LIGHTER_TRACER=compact_wire,prune_operands`.
 
 Compare all fields not expected to change due to capture timing:
 
@@ -677,9 +683,9 @@ primary next step.
 5. Keep Option 2 as a fallback if further single-run tracer reduction cannot
    approach HW and the two-run scheduler/mapping gates can be satisfied.
 
-The current `TRACER_LIGHT_SPIN=1` / `TRIM_SPIN=1` mutual-exclusion guard remains
-in place. Do not repeat the current aggregate NCU-proportional trim: it corrects
-total spin count without preserving Producer/Consumer timing.
+The current compact `LIGHTER_TRACER` / `TRIM_SPIN=1` mutual-exclusion guard
+remains in place. Do not repeat the current aggregate NCU-proportional trim: it
+corrects total spin count without preserving Producer/Consumer timing.
 
 ### Next-session implementation handoff
 
@@ -701,8 +707,7 @@ d06df70  simulator compact-trace functional contract logging
 Current accepted capture mode:
 
 ```text
-TRACER_LIGHT_SPIN=1
-GATHER_REGISTERS=0
+LIGHTER_TRACER=compact_wire,prune_operands
 TRIM_SPIN=0
 ```
 
@@ -712,7 +717,7 @@ Reference artifacts:
 Option 1B:
 simulator-remodeled/hw_run/traces/device-0/12.8/
   flashattn-fa3-bf16-bwd-causal-b1-s2048-hd64-nh24/
-  flashattn_fa3_bf16_bwd_causal_b1_s2048_hd64_nh24___warmup_0___iters_1
+  flashattn_fa3_bf16_bwd_causal_b1_s2048_hd64_nh24___warmup_0___iters_1.opt1b
 
 Option 1A:
 same path with suffix .opt1a
@@ -745,29 +750,104 @@ launch those experiments locally.
   loaded trace exactly. They are not required to equal Option 1B because a
   lighter capture is expected to change timing-dependent spin control flow.
 
-#### Proposed A/B selectors
+#### Composable A/B feature configuration
 
-Add independent selectors and persist them in generated `run.sh`:
+The new public configuration is one comma-separated feature set:
 
-| Selector | Baseline value | Candidate meaning |
-|---|---:|---|
-| `TRACER_DEVICE_COUNTERS` | `1` | `0` removes active-capture device statistic atomics |
-| `TRACER_METADATA_RECORD` | `0` | `1` emits the dedicated metadata-only wire record |
-| `TRACER_WARP_BUFFER_BYTES` | `0` | Nonzero enables per-warp batching with the requested byte capacity |
+```text
+LIGHTER_TRACER="compact_wire,prune_operands"
+```
 
-The defaults reproduce Option 1B. These are experiment selectors, not tuning
-knobs in the simulator.
+Do not expose implementation history such as `opt1a` and `opt1b` as composable
+tokens. Option 1B contains Option 1A, so `"opt1a,opt1b"` would be redundant and
+would not identify which behavior is independently enabled. Use feature names
+whose effects are orthogonal:
+
+| Feature token | Behavior | Required features |
+|---|---|---|
+| `compact_wire` | Use versioned 104B/360B compact wire records | None |
+| `prune_operands` | Remove generic REG/UREG/PRED callbacks with no consumer | `compact_wire` |
+| `host_count` | Count received records on the host and remove active-capture device statistic atomics | `compact_wire` |
+| `metadata_record` | Use the dedicated approximately 48B metadata-only record | `compact_wire` |
+| `sparse_reconstruct` | Capture only dynamic anchors/payloads and reconstruct safe straight-line instructions from static SASS/CFG | `compact_wire,prune_operands` |
+| `warp_batch_1k` | Batch serialized records in a 1KB per-warp device buffer | `compact_wire` |
+| `warp_batch_2k` | Batch serialized records in a 2KB per-warp device buffer | `compact_wire` |
+| `warp_batch_4k` | Batch serialized records in a 4KB per-warp device buffer | `compact_wire` |
+| `spin_fusion` | Emit the separately validated combined spin-iteration event | `compact_wire,prune_operands,sparse_reconstruct` |
+
+`warp_batch_1k`, `warp_batch_2k`, and `warp_batch_4k` are mutually exclusive.
+The parser trims surrounding whitespace, rejects empty/unknown/duplicate
+tokens, validates dependencies, and canonicalizes the set in the table order.
+Input order never changes behavior. Missing dependencies are fatal; the parser
+does not silently add them.
+
+Configuration equivalents and isolated A/B pairs:
+
+| Purpose | Baseline | Candidate |
+|---|---|---|
+| Historical Option 1A | `off` | `compact_wire` |
+| Historical Option 1B | `compact_wire` | `compact_wire,prune_operands` |
+| Stage 1C-A host counting | `compact_wire,prune_operands` | `compact_wire,prune_operands,host_count` |
+| Stage 1C-B metadata record | `compact_wire,prune_operands` | `compact_wire,prune_operands,metadata_record` |
+| Stage 1C-S sparse reconstruction | `compact_wire,prune_operands` | `compact_wire,prune_operands,sparse_reconstruct` |
+| Stage 1C-C 2KB batching example | `compact_wire,prune_operands` | `compact_wire,prune_operands,warp_batch_2k` |
+| Stage 1C-F spin fusion | `compact_wire,prune_operands,sparse_reconstruct` | `compact_wire,prune_operands,sparse_reconstruct,spin_fusion` |
+
+Every candidate is compared with its listed baseline captured from the same
+binary, git SHA, benchmark arguments, and GPU. A source change requires a new
+baseline capture even when an older equivalent artifact exists.
+
+`LIGHTER_TRACER` unset or `LIGHTER_TRACER=off` selects the legacy tracer.
+`LIGHTER_TRACER=all` resolves to a separate production feature set containing
+only independently validated features. The current production set is
+`compact_wire,prune_operands`. Implementing a new feature does not add it to
+`all`; promotion occurs only after its A/B and payload/timing gates pass. The
+resolved canonical set is persisted, so the meaning of an old artifact does
+not depend on a later source version.
+
+`all` is the production publication mode:
+
+- explicit feature lists keep their configuration suffixes for A/B isolation;
+- `LIGHTER_TRACER=all` writes the validated result to the original unsuffixed
+  `<CUDA>/<benchmark>/<argument-folder>/traces` location;
+- publication still refuses to overwrite an existing unsuffixed run, so the
+  prior default artifact must be archived or removed explicitly;
+- simulation uses the standard CUDA-version trace root, for example
+  `-T ./hw_run/traces/device-0/12.8/`;
+- `-T` remains required because it selects trace-driven simulation mode.
+  Omitting `-T` selects application/binary simulation and does not auto-discover
+  the default HW trace directory.
+
+`TRACER_LIGHT_SPIN` and `GATHER_REGISTERS` become deprecated compatibility
+inputs:
+
+- if `LIGHTER_TRACER` is set, setting either legacy selector is fatal;
+- legacy `TRACER_LIGHT_SPIN=0` maps to `off`;
+- legacy `TRACER_LIGHT_SPIN=1,GATHER_REGISTERS=1` maps to `compact_wire`;
+- legacy `TRACER_LIGHT_SPIN=1,GATHER_REGISTERS=0` maps to
+  `compact_wire,prune_operands`;
+- newly generated `run.sh` files use only `LIGHTER_TRACER`.
+
+Any non-`off` `LIGHTER_TRACER` configuration requires `TRIM_SPIN=0`; a trim
+request is fatal rather than combined with lighter capture.
+
+`run_hw_trace.py` derives a readable suffix from the canonical feature set and
+short configuration hash and appends it to the original argument-folder name.
+Generated `run.sh` and the capture manifest persist the requested string,
+canonical set, config hash, git SHA, and artifact suffix. Startup emits:
+
+```text
+[LIGHTER-TRACER] requested=...
+                 canonical=...
+                 config_hash=...
+                 artifact_suffix=...
+```
 
 First Stage 1C-A capture after the user builds the tracer:
 
 ```bash
 nohup env \
-  TRACER_LIGHT_SPIN=1 \
-  GATHER_REGISTERS=0 \
-  TRIM_SPIN=0 \
-  TRACER_DEVICE_COUNTERS=0 \
-  TRACER_METADATA_RECORD=0 \
-  TRACER_WARP_BUFFER_BYTES=0 \
+  LIGHTER_TRACER="compact_wire,prune_operands,host_count" \
   ./util/tracer_nvbit/run_hw_trace.py \
   -B flashattn:flashattn-fa3-bf16-bwd-causal-b1-s2048-hd64-nh24 \
   -D 0 \
@@ -833,6 +913,52 @@ Acceptance:
 - no record or protobuf field changes are attributable to the counter path;
 - K5/K10 spin and capture wall time are measured before proceeding.
 
+#### Stage 1C-S - sparse semantic capture and static reconstruction
+
+Option 1B still injects one `NO_REGS` callback for ordinary dynamic
+instructions that need no runtime payload. The host can reconstruct a safe
+subset from the enhanced static SASS and CFG while preserving the final
+per-instruction protobuf contract.
+
+The initial direct-capture set is conservative:
+
+- every instruction with a memory address, sync, BAR, or TMA runtime payload;
+- every predicated instruction;
+- every CFG control-transfer, call, return, reconvergence, and exit site;
+- a function/warp entry anchor when needed to make the first span explicit;
+- every instruction in a degenerate or ambiguous CFG region.
+
+Only unpredicated, payload-free, straight-line instructions may be omitted from
+device instrumentation. For each reconstructed instruction the host emits the
+static function/PC and sets `predicate_mask == active_mask` from the enclosing
+dynamic span. The implementation classifier must use NVBit CFG/instruction
+metadata plus the existing semantic allowlist, not an opcode-prefix heuristic.
+
+Read-only analysis of the saved Option 1B protobuf gives the initial ceiling:
+
+| Kernel | Dynamic instructions | Reconstructable | Fraction |
+|---|---:|---:|---:|
+| K5 FWD | 14,847,194 | 13,789,067 | 92.87% |
+| K10 BWD | 21,007,397 | 18,675,774 | 88.90% |
+
+Across those reconstructable instructions,
+`active_mask != predicate_mask` occurs zero times. This is a feasibility
+measurement, not yet an acceptance result.
+
+Before a GPU capture, perform an offline proof using the `.opt1b` artifact:
+
+1. Remove exactly the records the proposed classifier would omit.
+2. Reconstruct them from the saved static SASS/CFG and retained dynamic
+   anchors.
+3. Require exact per-warp PC order, function ID, active/predicate masks,
+   address/sync/BAR payloads, and serialized protobuf hash.
+4. Require exact HGMMA, MUFU, TMA-family, memory, sync, and BAR totals.
+5. Abort on an ambiguous path; do not guess or choose a shortest CFG path.
+
+The GPU implementation is attempted only after this offline round trip is
+exact. The sparse capture still produces a complete full trace after host
+reconstruction; it does not trim, clone, or reorganize dynamic instructions.
+
 #### Stage 1C-B - dedicated metadata-only record
 
 Option 1B is already near one callback per dynamic instruction, but most
@@ -896,8 +1022,12 @@ Acceptance:
 
 #### Stage 1C-C - per-warp ChannelDev batching
 
-This is the highest-impact and highest-risk tracer change. Start only after
-Stages 1C-A and 1C-B have separate measurements.
+This is the highest-risk transport change. Start only after Stage 1C-A has a
+separate measurement and Stage 1C-S has passed its offline round-trip proof.
+Stage 1C-B is an independent byte-size experiment, not a batching prerequisite.
+First test one `warp_batch_*` feature alone on top of
+`compact_wire,prune_operands`; test sparse plus batching only after both
+individual features pass.
 
 Design:
 
@@ -943,9 +1073,12 @@ Acceptance:
 
 #### Deferred tracer ideas
 
-- Do not start with callback fusion. Option 1B already measures only 1.017 K5
-  and 1.031 K10 callbacks per warp instruction, so the theoretical callback
-  reduction is small while sync/TMA grouping risk is high.
+- Do not start with operand-callback fusion within one instruction. Option 1B
+  already measures only 1.017 K5 and 1.031 K10 callbacks per warp instruction,
+  so that fusion has a small theoretical reduction while sync/TMA grouping
+  risk is high. This does not apply to Stage 1C-S, which removes callbacks for
+  reconstructable dynamic instructions, or to the separately gated
+  `spin_fusion` feature.
 - Do not compress memory lane addresses first. Memory records account for only
   about 0.95GB of the 7.41GB Option 1B wire traffic, and compression work in the
   injected callback can increase observer effect.
@@ -957,6 +1090,7 @@ Acceptance:
 | Stage | Record count | Wire bytes | `ChannelDev::push` count | Primary evidence |
 |---|---|---|---|---|
 | 1C-A atomics | Same class mix | Same bytes | Same | Lower contention / wall time / spin |
+| 1C-S sparse | Much lower device records; same reconstructed instructions | Much lower | Much lower | Offline exact round trip, reconstructed protobuf parity |
 | 1C-B metadata | Same callbacks | Lower | Same | `metadata_records`, lower bytes |
 | 1C-C batching | Same callbacks | Same serialized bytes | Much lower | `mean_records_per_push` |
 
@@ -977,9 +1111,11 @@ Suggested first next-session scope:
 ```text
 implement Stage 1C-A only
 static/source review
-user build and capture
+user builds once
+capture "compact_wire,prune_operands" baseline
+capture "compact_wire,prune_operands,host_count" candidate with the same binary
 evaluate TRACE-COUNT + TRACE-WIRE + spin
-then decide whether to keep 1C-A and start 1C-B
+then perform the offline Stage 1C-S round-trip proof
 ```
 
 #### Independent simulator pacing track
@@ -1083,8 +1219,7 @@ event-buffer capacity/overflow
 The full child run uses:
 
 ```text
-TRACER_LIGHT_SPIN=1
-GATHER_REGISTERS=0
+LIGHTER_TRACER=compact_wire,prune_operands
 TRIM_SPIN=0
 ```
 
@@ -1576,17 +1711,32 @@ end-to-end manifest and validation report
 ## 9. Status
 
 - Compact wire layout implemented.
-- `TRACER_LIGHT_SPIN=0/1` selects legacy/compact full capture.
-- Compact runs reuse the original trace directory and self-contained `run.sh`.
+- `LIGHTER_TRACER=off|<comma-separated features>` parsing, canonicalization,
+  dependency validation, legacy-input mapping, and unimplemented-feature
+  rejection are implemented in both `run_hw_trace.py` and the NVBit tool.
+- Configuration parser validation passed with Python syntax/config checks and a
+  host-only C++17 extraction/smoke test of the NVBit-side parser.
+- The renamed configuration has not yet been built with CUDA/NVBit or exercised
+  in a GPU capture; those remain user-run validation gates.
+- `compact_wire` selects compact full capture; `prune_operands` selects
+  semantic callback pruning.
+- Lighter runs use configuration-suffixed argument folders containing a
+  `lighter_tracer_config.json` manifest; existing lighter run directories are
+  not overwritten.
+- `run_simulations.py -T <selected-run-directory>` accepts an exact
+  benchmark/argument run directory after validating its benchmark and argument
+  prefix, while preserving legacy trace-root discovery.
+- `LIGHTER_TRACER=all` currently resolves to the validated
+  `compact_wire,prune_operands` set and publishes to the unsuffixed default
+  argument directory for use with the standard CUDA-version `-T` root.
 - Device non-memory scalar path implemented.
 - Host mixed-record parser and validation implemented.
 - TMA absent-value sentinel filtering implemented.
-- Semantic-role callback pruning implemented for compact
-  `GATHER_REGISTERS=0`.
+- Semantic-role callback pruning implemented for `prune_operands`.
 - Memory, sync semantic, BAR runtime, and all TMA-family operand callbacks are
   explicitly retained.
-- `GATHER_REGISTERS=1` restores the all-operand compact fallback.
-- Generated `run.sh` persists the pruning selector.
+- Omitting `prune_operands` restores the all-operand compact fallback.
+- Generated `run.sh` persists only the canonical `LIGHTER_TRACER` selector.
 - `[TRACE-WIRE]` accounting implemented.
 - `TRIM_SPIN=1` mutual-exclusion guard implemented.
 - Static source and diff checks passed.
@@ -1615,10 +1765,12 @@ end-to-end manifest and validation report
   approximately +8.0K Producer tail.
 - Primary next direction is further single-run tracer lightening plus an
   independent simulator Producer/Consumer pacing investigation.
-- The next-session handoff now defines staged Option 1C-A/B/C implementations,
-  proposed A/B selectors, source anchors, acceptance gates, reference artifacts,
-  and the separate observe-only simulator lifecycle probe. None is implemented
-  yet.
+- The next-session handoff now defines the composable `LIGHTER_TRACER` feature
+  set, strict dependency/conflict validation, isolated A/B configurations,
+  staged Option 1C-A/S/B/C implementations, the reserved `spin_fusion` and
+  `all` configurations, artifact-suffix isolation, acceptance gates, and the
+  separate observe-only simulator lifecycle probe. The configuration layer is
+  implemented; the new Option 1C optimization features are not implemented yet.
 - Option 2 per-burst ultra-light capture and reorganization remain unimplemented
   and are parked as a fallback.
 - FA3 tile scheduler identified from mangled kernel names and SASS: K6 (FWD) is

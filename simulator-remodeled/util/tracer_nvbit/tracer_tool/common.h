@@ -38,8 +38,8 @@ static __managed__ uint64_t reported_dynamic_instr_counter = 0;
 enum MEM_TYPE { NONE = 0, STANDARD_MEM = 1, CONSTANT_MEM = 2, CALL_OR_RET = 3 };
 enum TRACED_REG_TYPE {NO_REGS = 0, MEMORY_REF = 1, REGULAR = 2, REGULAR_2_REGS = 3, REGULAR_4_REGS = 4, UNIFORM = 5, UNIFORM_2_REGS = 6, PREDICATE = 7, UNIFORM_PREDICATE = 8};
 
-/* Original fixed-size GPU-to-host record, retained for the
- * TRACER_LIGHT_SPIN=0 baseline. */
+/* Original fixed-size GPU-to-host record, retained for
+ * LIGHTER_TRACER=off and legacy compatibility. */
 typedef struct {
   int cta_id_x;
   int cta_id_y;
