@@ -34,7 +34,7 @@ LIGHTER_TRACER_FEATURE_ORDER = (
 )
 
 LIGHTER_TRACER_IMPLEMENTED_FEATURES = frozenset(
-    ("compact_wire", "prune_operands")
+    ("compact_wire", "prune_operands", "host_count")
 )
 
 LIGHTER_TRACER_PRODUCTION_FEATURES = frozenset(
@@ -84,15 +84,7 @@ class LighterTracerConfig:
         if not self.features or self.publish_default:
             return ""
         readable = "+".join(self.features)
-        return "_lighter-{0}-{1}".format(readable, self.config_hash)
-
-
-def parse_lighter_tracer_bool(name, value, default):
-    if value is None:
-        return default
-    if value not in ("0", "1"):
-        raise ValueError("{0} must be 0 or 1".format(name))
-    return value == "1"
+        return "_lighter-{0}".format(readable)
 
 
 def parse_lighter_tracer_feature_set(raw_value):
@@ -168,48 +160,21 @@ def parse_lighter_tracer_feature_set(raw_value):
     )
 
 
-def resolve_lighter_tracer(
-    lighter_tracer_value,
-    legacy_light_spin_value=None,
-    legacy_gather_registers_value=None,
-):
-    if lighter_tracer_value is not None:
-        if (
-            legacy_light_spin_value is not None
-            or legacy_gather_registers_value is not None
-        ):
-            raise ValueError(
-                "LIGHTER_TRACER cannot be combined with deprecated "
-                "TRACER_LIGHT_SPIN or GATHER_REGISTERS"
-            )
-        stripped_value = lighter_tracer_value.strip()
-        features = parse_lighter_tracer_feature_set(lighter_tracer_value)
+def resolve_lighter_tracer(lighter_tracer_value):
+    if lighter_tracer_value is None:
         return LighterTracerConfig(
-            requested=lighter_tracer_value,
-            features=features,
-            source="LIGHTER_TRACER",
-            publish_default=stripped_value == "all",
+            requested="off",
+            features=(),
+            source="default",
         )
 
-    light_spin = parse_lighter_tracer_bool(
-        "TRACER_LIGHT_SPIN", legacy_light_spin_value, False
-    )
-    gather_registers = parse_lighter_tracer_bool(
-        "GATHER_REGISTERS", legacy_gather_registers_value, False
-    )
-    features = ()
-    if light_spin:
-        features = ("compact_wire",)
-        if not gather_registers:
-            features += ("prune_operands",)
-
-    requested = "TRACER_LIGHT_SPIN={0},GATHER_REGISTERS={1}".format(
-        int(light_spin), int(gather_registers)
-    )
+    stripped_value = lighter_tracer_value.strip()
+    features = parse_lighter_tracer_feature_set(lighter_tracer_value)
     return LighterTracerConfig(
-        requested=requested,
+        requested=lighter_tracer_value,
         features=features,
-        source="legacy",
+        source="LIGHTER_TRACER",
+        publish_default=stripped_value == "all",
     )
 
 # MOD. Begin. Improved tracer
@@ -231,11 +196,7 @@ trim_spin_enabled = os.getenv("TRIM_SPIN") == "1"
 trim_spin_ncu_rep = os.getenv("TRIM_SPIN_NCU_REP")
 trim_spin_ncu_bin = os.getenv("TRIM_SPIN_NCU_BIN", "ncu")
 try:
-    lighter_tracer_config = resolve_lighter_tracer(
-        os.getenv("LIGHTER_TRACER"),
-        os.environ.get("TRACER_LIGHT_SPIN"),
-        os.environ.get("GATHER_REGISTERS"),
-    )
+    lighter_tracer_config = resolve_lighter_tracer(os.getenv("LIGHTER_TRACER"))
 except ValueError as error:
     raise RuntimeError(str(error))
 compact_full_capture_enabled = (
@@ -418,11 +379,7 @@ for bench in benchmarks:
     for argpair in argslist:
         args = argpair["args"]
         extra_env = argpair.get("env", {})
-        conflicting_config_keys = {
-            "LIGHTER_TRACER",
-            "TRACER_LIGHT_SPIN",
-            "GATHER_REGISTERS",
-        } & set(extra_env)
+        conflicting_config_keys = {"LIGHTER_TRACER"} & set(extra_env)
         if conflicting_config_keys:
             raise RuntimeError(
                 "benchmark environment cannot override tracer selection: {0}".format(
@@ -521,10 +478,7 @@ for bench in benchmarks:
         for key, value in extra_env.items():
             env_exports += "export {0}={1}; ".format(key, shlex.quote(str(value)))
         # Persist the canonical feature set so --norun/manual execution cannot
-        # silently select a different tracer configuration. A legacy input may
-        # still exist in the parent shell, so remove it before exporting the
-        # canonical replacement.
-        env_exports += "unset TRACER_LIGHT_SPIN GATHER_REGISTERS; "
+        # silently select a different tracer configuration.
         env_exports += "export LIGHTER_TRACER={0}; ".format(
             shlex.quote(lighter_tracer_config.canonical)
         )

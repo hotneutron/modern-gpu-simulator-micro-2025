@@ -28,12 +28,12 @@
 
 
 #include <algorithm>
+#include <atomic>
 #include <assert.h>
 #include <bitset>
 #include <cctype>
 #include <cstdlib>
 #include <cstdio>
-#include <cstring>
 #include <deque>
 #include <initializer_list>
 #include <inttypes.h>
@@ -109,6 +109,9 @@ struct CTXstate {
   // recv thread sets it to FINISHED when it cleans up.
   // parent thread should wait until the state becomes FINISHED to clean up.
   volatile RecvThreadState recv_thread_done = RecvThreadState::STOP;
+
+  /* Published by the receiver when it consumes the end-of-kernel token. */
+  std::atomic<uint64_t> received_records_per_kernel{0};
 };
 
 /* lock */
@@ -129,7 +132,6 @@ uint32_t instr_begin_interval = 0;
 uint32_t instr_end_interval = UINT32_MAX;
 int verbose = 0;
 int intermediate_extra_files_persistance = 0;
-int gather_registers = 0;
 int enable_compress = 1;
 int print_core_id = 0;
 int exclude_pred_off = 1;
@@ -139,10 +141,10 @@ bool active_region = true;
 /* Probe-only mode: instrument SASS EXIT and record one final clock64 timestamp
  * per CTA-local warp. Full instruction tracing stays unchanged when disabled. */
 int warp_lifetime_only = 0;
-/* Resolved LIGHTER_TRACER compact transport state.
- * 0: original fixed 712B record and full lane gathers.
- * 1: compact 104B/360B records and scalar non-memory gathers. */
-int tracer_light_spin = 0;
+/* Resolved LIGHTER_TRACER feature state. */
+int compact_wire_enabled = 0;
+int prune_operands_enabled = 0;
+int lighter_tracer_host_count = 0;
 std::string lighter_tracer_canonical = "off";
 /* Sidecar mode: keep the complete dynamic trace path enabled and additionally
  * timestamp SASS EXIT. This measures the lifetime perturbation of full tracing
@@ -180,20 +182,6 @@ static std::string trim_config_token(const std::string &value) {
     const std::string &message) {
   fprintf(stderr, "[LIGHTER-TRACER] %s\n", message.c_str());
   abort();
-}
-
-static int parse_legacy_bool(const char *name, const char *value,
-                             int default_value) {
-  if (value == nullptr) {
-    return default_value;
-  }
-  if (std::strcmp(value, "0") == 0) {
-    return 0;
-  }
-  if (std::strcmp(value, "1") == 0) {
-    return 1;
-  }
-  lighter_tracer_config_error(std::string(name) + " must be 0 or 1");
 }
 
 static void validate_lighter_tracer_dependencies(
@@ -252,6 +240,7 @@ static void resolve_lighter_tracer_config() {
   static const std::unordered_set<std::string> implemented_features = {
       "compact_wire",
       "prune_operands",
+      "host_count",
   };
   static const std::unordered_set<std::string> production_features = {
       "compact_wire",
@@ -259,70 +248,43 @@ static void resolve_lighter_tracer_config() {
   };
 
   const char *lighter_value = getenv("LIGHTER_TRACER");
-  const char *legacy_light_value = getenv("TRACER_LIGHT_SPIN");
-  const char *legacy_gather_value = getenv("GATHER_REGISTERS");
   std::unordered_set<std::string> features;
-  std::string requested;
-  const char *source = nullptr;
-
-  if (lighter_value != nullptr) {
-    if (legacy_light_value != nullptr || legacy_gather_value != nullptr) {
-      lighter_tracer_config_error(
-          "LIGHTER_TRACER cannot be combined with deprecated "
-          "TRACER_LIGHT_SPIN or GATHER_REGISTERS");
-    }
-    requested = lighter_value;
-    source = "LIGHTER_TRACER";
-    std::string raw = trim_config_token(lighter_value);
-    if (raw.empty()) {
-      lighter_tracer_config_error(
-          "LIGHTER_TRACER must not be empty; use 'off'");
-    }
-    if (raw == "all") {
-      features.insert(production_features.begin(), production_features.end());
-    } else if (raw != "off") {
-      size_t begin = 0;
-      while (begin <= raw.size()) {
-        size_t comma = raw.find(',', begin);
-        size_t end = comma == std::string::npos ? raw.size() : comma;
-        std::string token =
-            trim_config_token(raw.substr(begin, end - begin));
-        if (token.empty()) {
-          lighter_tracer_config_error(
-              "LIGHTER_TRACER contains an empty feature token");
-        }
-        if (token == "off" || token == "all") {
-          lighter_tracer_config_error("feature '" + token +
-                                      "' cannot be combined");
-        }
-        if (std::find(feature_order.begin(), feature_order.end(), token) ==
-            feature_order.end()) {
-          lighter_tracer_config_error("unknown feature '" + token + "'");
-        }
-        if (!features.insert(token).second) {
-          lighter_tracer_config_error("duplicate feature '" + token + "'");
-        }
-        if (comma == std::string::npos) {
-          break;
-        }
-        begin = comma + 1;
+  std::string requested = lighter_value == nullptr ? "off" : lighter_value;
+  const char *source = lighter_value == nullptr ? "default" : "LIGHTER_TRACER";
+  std::string raw =
+      lighter_value == nullptr ? "off" : trim_config_token(lighter_value);
+  if (raw.empty()) {
+    lighter_tracer_config_error(
+        "LIGHTER_TRACER must not be empty; use 'off'");
+  }
+  if (raw == "all") {
+    features.insert(production_features.begin(), production_features.end());
+  } else if (raw != "off") {
+    size_t begin = 0;
+    while (begin <= raw.size()) {
+      size_t comma = raw.find(',', begin);
+      size_t end = comma == std::string::npos ? raw.size() : comma;
+      std::string token =
+          trim_config_token(raw.substr(begin, end - begin));
+      if (token.empty()) {
+        lighter_tracer_config_error(
+            "LIGHTER_TRACER contains an empty feature token");
       }
-    }
-  } else {
-    int legacy_light =
-        parse_legacy_bool("TRACER_LIGHT_SPIN", legacy_light_value, 0);
-    int legacy_gather =
-        parse_legacy_bool("GATHER_REGISTERS", legacy_gather_value, 0);
-    std::ostringstream legacy_requested;
-    legacy_requested << "TRACER_LIGHT_SPIN=" << legacy_light
-                     << ",GATHER_REGISTERS=" << legacy_gather;
-    requested = legacy_requested.str();
-    source = "legacy";
-    if (legacy_light) {
-      features.insert("compact_wire");
-      if (!legacy_gather) {
-        features.insert("prune_operands");
+      if (token == "off" || token == "all") {
+        lighter_tracer_config_error("feature '" + token +
+                                    "' cannot be combined");
       }
+      if (std::find(feature_order.begin(), feature_order.end(), token) ==
+          feature_order.end()) {
+        lighter_tracer_config_error("unknown feature '" + token + "'");
+      }
+      if (!features.insert(token).second) {
+        lighter_tracer_config_error("duplicate feature '" + token + "'");
+      }
+      if (comma == std::string::npos) {
+        break;
+      }
+      begin = comma + 1;
     }
   }
 
@@ -360,12 +322,14 @@ static void resolve_lighter_tracer_config() {
   }
   lighter_tracer_canonical =
       features.empty() ? "off" : canonical.str();
-  tracer_light_spin = features.count("compact_wire") != 0;
-  gather_registers =
-      tracer_light_spin && features.count("prune_operands") == 0;
+  compact_wire_enabled = features.count("compact_wire") != 0;
+  prune_operands_enabled = features.count("prune_operands") != 0;
+  lighter_tracer_host_count = features.count("host_count") != 0;
 
-  printf("[LIGHTER-TRACER] requested=%s canonical=%s source=%s\n",
-         requested.c_str(), lighter_tracer_canonical.c_str(), source);
+  printf("[LIGHTER-TRACER] requested=%s canonical=%s source=%s "
+         "host_count=%d\n",
+         requested.c_str(), lighter_tracer_canonical.c_str(), source,
+         lighter_tracer_host_count);
 }
 
 /* opcode to id map and reverse map  */
@@ -1959,7 +1923,7 @@ void nvbit_at_init() {
   resolve_lighter_tracer_config();
   printf("[TRACE-WIRE] selected mode=%s legacy_size=%u compact_size=%u "
          "memory_size=%u\n",
-         tracer_light_spin ? "compact" : "legacy",
+         compact_wire_enabled ? "compact" : "legacy",
          INST_TRACE_LEGACY_SIZE, INST_TRACE_COMPACT_SIZE,
          INST_TRACE_MEMORY_SIZE);
   GET_VAR_INT(verbose, "TOOL_VERBOSE", 0, "Enable verbosity inside the tool");
@@ -1972,8 +1936,7 @@ void nvbit_at_init() {
               "folder TRACES_FOLDER path environment");
   GET_VAR_INT(threshold_unique_kernel_checking, "THRESHOLD_UNIQUE_KERNEL_CHECKING", 10,
               "Number of instructions used to check if kernels with the same name are different");
-  printf("[TRACE-PRUNE] enabled=%d gather_registers=%d\n",
-         tracer_light_spin && !gather_registers, gather_registers);
+  printf("[TRACE-PRUNE] enabled=%d\n", prune_operands_enabled);
   GET_VAR_INT(incremental_flush_threshold, "INCREMENTAL_FLUSH_THRESHOLD", 0,
               "Flush threadblocks to disk when instruction count exceeds this threshold. "
               "0 = disabled (default). Recommended: 50000-100000 for large kernels.");
@@ -2266,7 +2229,7 @@ void instrument_function_if_needed(CUcontext ctx, CUfunction func, int device_id
        * stream for diagnostics. The legacy transport is intentionally
        * unchanged.
        */
-      if (tracer_light_spin && !gather_registers &&
+      if (compact_wire_enabled && prune_operands_enabled &&
           !is_tma_desc_consumer_instruction) {
         std::map<uint32_t, traced_operand_instrument> retained_operands;
         std::map<int, int> old_to_new_callback_index;
@@ -2342,8 +2305,8 @@ void instrument_function_if_needed(CUcontext ctx, CUfunction func, int device_id
           /* insert call to the instrumentation function with its arguments */
           nvbit_insert_call(
               instr,
-              tracer_light_spin ? "instrument_inst_compact"
-                                : "instrument_inst",
+              compact_wire_enabled ? "instrument_inst_compact"
+                                   : "instrument_inst",
               IPOINT_BEFORE);
           /* pass predicate value */
           nvbit_add_call_arg_guard_pred_val(instr);
@@ -2467,8 +2430,10 @@ void instrument_function_if_needed(CUcontext ctx, CUfunction func, int device_id
           nvbit_add_call_arg_const_val64(instr,
                                         (uint64_t)&reported_dynamic_instr_counter);
           nvbit_add_call_arg_const_val64(instr, (uint64_t)&stop_report[device_id]);
-          /* Retained ABI argument from the spin-only experiment. */
-          nvbit_add_call_arg_const_val32(instr, 0);
+          /* host_count replaces successful compact-callback device atomics
+           * with receiver-side per-kernel accounting. */
+          nvbit_add_call_arg_const_val32(
+              instr, lighter_tracer_host_count ? 0 : 1);
       }
 
       /* Phase 0b (TMA_BASE_ADDR.md §2.13): instrument the entry
@@ -2829,6 +2794,8 @@ void nvbit_at_cuda_event(CUcontext ctx, int is_exit, nvbit_api_cuda_t cbid,
     if (!is_exit) {
       int device_id;
       cuCtxGetDevice(&device_id);
+      ctx_state->received_records_per_kernel.store(
+          0, std::memory_order_relaxed);
       if (active_from_start && dynamic_kernel_limit_start && kernel_id[device_id] == dynamic_kernel_limit_start)
         active_region = true;
 
@@ -2963,7 +2930,7 @@ void nvbit_at_cuda_event(CUcontext ctx, int is_exit, nvbit_api_cuda_t cbid,
 
       /* issue flush of channel so we are sure all the memory accesses
        * have been pushed */
-      flush_channel<<<1, 1>>>(ctx_state->channel_dev, tracer_light_spin);
+      flush_channel<<<1, 1>>>(ctx_state->channel_dev, compact_wire_enabled);
       cudaDeviceSynchronize();
       assert(cudaGetLastError() == cudaSuccess);
 
@@ -2986,17 +2953,37 @@ void nvbit_at_cuda_event(CUcontext ctx, int is_exit, nvbit_api_cuda_t cbid,
         append_tma_desc_factcheck_event(device_id, kernel_id[device_id] - 1);
       }
 
-      unsigned total_insts_per_kernel =
+      uint64_t total_insts_per_kernel =
           total_dynamic_instr_counter - old_total_insts;
       old_total_insts = total_dynamic_instr_counter;
 
-      unsigned reported_insts_per_kernel =
+      uint64_t reported_insts_per_kernel =
           reported_dynamic_instr_counter - old_total_reported_insts;
       old_total_reported_insts = reported_dynamic_instr_counter;
 
+      uint64_t received_records =
+          ctx_state->received_records_per_kernel.load(
+              std::memory_order_acquire);
+      if (lighter_tracer_host_count && !stop_report[device_id]) {
+        total_insts_per_kernel = received_records;
+        reported_insts_per_kernel = received_records;
+      }
+      if (lighter_tracer_host_count) {
+        printf("[TRACE-COUNT] kernel=%d received_records=%llu "
+               "stats_total=%llu stats_reported=%llu stop_report=%d "
+               "source=%s\n",
+               kernel_id[device_id] - 1,
+               static_cast<unsigned long long>(received_records),
+               static_cast<unsigned long long>(total_insts_per_kernel),
+               static_cast<unsigned long long>(reported_insts_per_kernel),
+               stop_report[device_id] ? 1 : 0,
+               stop_report[device_id] ? "device-suppressed" : "host");
+      }
+
       statsFile = fopen(stats_location.c_str(), "a");
-      fprintf(statsFile, "%d,%d", total_insts_per_kernel,
-              reported_insts_per_kernel);
+      fprintf(statsFile, "%llu,%llu",
+              static_cast<unsigned long long>(total_insts_per_kernel),
+              static_cast<unsigned long long>(reported_insts_per_kernel));
       fprintf(statsFile, "\n");
       fclose(statsFile);
       
@@ -3204,6 +3191,7 @@ void *recv_thread_fun(void *args) {
   uint64_t compact_records = 0;
   uint64_t memory_records = 0;
   uint64_t wire_bytes = 0;
+  uint64_t kernel_received_records = 0;
 
   while (ctx_state->recv_thread_done == RecvThreadState::WORKING) {
     uint32_t num_recv_bytes = ch_host->recv(recv_buffer, CHANNEL_SIZE);
@@ -3213,7 +3201,7 @@ void *recv_thread_fun(void *args) {
         while (offset < num_recv_bytes) {
           uint32_t record_size = 0;
           int cta_id_x = 0;
-          if (tracer_light_spin) {
+          if (compact_wire_enabled) {
             record_size = validated_inst_trace_record_size(
                 &recv_buffer[offset], num_recv_bytes - offset);
             const inst_trace_t *token =
@@ -3232,6 +3220,8 @@ void *recv_thread_fun(void *args) {
             cta_id_x = token->cta_id_x;
           }
           if (cta_id_x == -1) {
+            ctx_state->received_records_per_kernel.store(
+                0, std::memory_order_release);
             recv_thread_receiving[ctx] = false;
             break;
           }
@@ -3244,7 +3234,7 @@ void *recv_thread_fun(void *args) {
         uint32_t record_size = 0;
         inst_trace_t normalized_record;
         inst_trace_t *ma = nullptr;
-        if (tracer_light_spin) {
+        if (compact_wire_enabled) {
           record_size = validated_inst_trace_record_size(
               &recv_buffer[num_processed_bytes],
               num_recv_bytes - num_processed_bytes);
@@ -3270,11 +3260,17 @@ void *recv_thread_fun(void *args) {
         * flush channel kernel that is issues at the end of the
         * context */
         if (ma->cta_id_x == -1) {
+          ctx_state->received_records_per_kernel.store(
+              kernel_received_records, std::memory_order_release);
+          kernel_received_records = 0;
           recv_thread_receiving[ctx] = false;
           break;
         }
+        if (lighter_tracer_host_count) {
+          kernel_received_records++;
+        }
         wire_bytes += record_size;
-        if (!tracer_light_spin) {
+        if (!compact_wire_enabled) {
           legacy_records++;
         } else if (inst_trace_has_lane_values(ma)) {
           memory_records++;
@@ -3526,7 +3522,7 @@ void *recv_thread_fun(void *args) {
          " compact_records=%" PRIu64
          " memory_records=%" PRIu64 " wire_bytes=%" PRIu64
          " legacy_bytes=%" PRIu64 " reduction=%.2f%%\n",
-         tracer_light_spin ? "compact" : "legacy", legacy_records,
+         compact_wire_enabled ? "compact" : "legacy", legacy_records,
          compact_records, memory_records, wire_bytes, legacy_bytes,
          reduction_pct);
 
@@ -4094,7 +4090,8 @@ void nvbit_at_ctx_term(CUcontext ctx) {
   if(pending_devices_to_finish == 0 && !warp_lifetime_only) {
     dyn_trace.set_nvbit_version(NVBIT_VERSION);
     dyn_trace.set_accelsim_version(TRACER_VERSION);
-    dyn_trace.set_is_gathered_registers_values(static_cast<bool>(gather_registers));
+    dyn_trace.set_is_gathered_registers_values(
+        compact_wire_enabled && !prune_operands_enabled);
     std::string program_name = get_program_path();
     std::size_t found = program_name.find_last_of("/");
     if(found != std::string::npos) {

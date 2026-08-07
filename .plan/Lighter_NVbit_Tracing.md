@@ -43,9 +43,8 @@ Conclusion:
 
 - The spin-only path was safe but ineffective.
 - The old spin-only behavior is removed.
-- `TRACER_LIGHT_SPIN` was reused for the first compact implementation and is
-  now retained only as a deprecated compatibility input for
-  `LIGHTER_TRACER`.
+- `TRACER_LIGHT_SPIN` was reused for the first compact implementation and was
+  later removed when `LIGHTER_TRACER` became the single feature selector.
 
 ## 2. Adopted implementation - compact full capture
 
@@ -224,13 +223,13 @@ continues to produce exactly one protobuf instruction.
 
 `run_hw_trace.py` persists the mode in generated artifacts:
 
-- generated `run.sh` unsets deprecated selectors and exports the canonical
-  `LIGHTER_TRACER` string;
+- generated `run.sh` exports the canonical `LIGHTER_TRACER` string;
 - `lighter_tracer_config.json` records the requested/canonical configuration,
   feature list, configuration hash, artifact suffix, and git SHA;
-- lighter captures append a readable configuration suffix plus an
-  eight-character hash to the original argument-folder name and refuse to
-  overwrite an existing run directory;
+- lighter captures append a readable feature-name suffix to the original
+  argument-folder name and refuse to overwrite an existing run directory;
+- configuration hash and git SHA remain in the manifest and logs rather than
+  the directory name;
 - the selected `<benchmark>/<argument-folder>_<config>` run directory can be
   passed directly to `run_simulations.py -T`;
 - `LIGHTER_TRACER=off` retains the legacy unsuffixed argument-folder behavior.
@@ -818,15 +817,10 @@ not depend on a later source version.
   Omitting `-T` selects application/binary simulation and does not auto-discover
   the default HW trace directory.
 
-`TRACER_LIGHT_SPIN` and `GATHER_REGISTERS` become deprecated compatibility
-inputs:
-
-- if `LIGHTER_TRACER` is set, setting either legacy selector is fatal;
-- legacy `TRACER_LIGHT_SPIN=0` maps to `off`;
-- legacy `TRACER_LIGHT_SPIN=1,GATHER_REGISTERS=1` maps to `compact_wire`;
-- legacy `TRACER_LIGHT_SPIN=1,GATHER_REGISTERS=0` maps to
-  `compact_wire,prune_operands`;
-- newly generated `run.sh` files use only `LIGHTER_TRACER`.
+`LIGHTER_TRACER` is the only supported lighter-trace selector. The former
+`TRACER_LIGHT_SPIN` and `GATHER_REGISTERS` environment inputs are no longer
+read or mapped by either `run_hw_trace.py` or the NVBit tool. Generated
+`run.sh` files persist only the canonical `LIGHTER_TRACER` value.
 
 Any non-`off` `LIGHTER_TRACER` configuration requires `TRIM_SPIN=0`; a trim
 request is fatal rather than combined with lighter capture.
@@ -866,8 +860,9 @@ grep -a -n -F '[TRACE-BATCH]' /tmp/flashattn.log
 
 #### Stage 1C-A - remove active-capture statistic atomics
 
-This is the first implementation because it changes no trace payload and no
-wire bytes.
+This is the first implemented Option 1C feature because it changes no trace
+payload and no wire bytes. Static validation is complete; GPU A/B validation
+is pending.
 
 Current overhead:
 
@@ -883,7 +878,7 @@ Current overhead:
 Implementation:
 
 1. Leave legacy `instrument_inst` unchanged.
-2. With compact capture and `TRACER_DEVICE_COUNTERS=0`, remove the two atomics
+2. With compact capture and the `host_count` feature, remove the two atomics
    after a successful push.
 3. Count received records per kernel in `recv_thread_fun`, before operand
    callbacks are grouped into one protobuf instruction.
@@ -1109,8 +1104,6 @@ For every stage:
 Suggested first next-session scope:
 
 ```text
-implement Stage 1C-A only
-static/source review
 user builds once
 capture "compact_wire,prune_operands" baseline
 capture "compact_wire,prune_operands,host_count" candidate with the same binary
@@ -1712,14 +1705,20 @@ end-to-end manifest and validation report
 
 - Compact wire layout implemented.
 - `LIGHTER_TRACER=off|<comma-separated features>` parsing, canonicalization,
-  dependency validation, legacy-input mapping, and unimplemented-feature
-  rejection are implemented in both `run_hw_trace.py` and the NVBit tool.
+  dependency validation, and unimplemented-feature rejection are implemented
+  in both `run_hw_trace.py` and the NVBit tool. Legacy selector inputs have
+  been removed.
 - Configuration parser validation passed with Python syntax/config checks and a
   host-only C++17 extraction/smoke test of the NVBit-side parser.
 - The renamed configuration has not yet been built with CUDA/NVBit or exercised
   in a GPU capture; those remain user-run validation gates.
 - `compact_wire` selects compact full capture; `prune_operands` selects
   semantic callback pruning.
+- `host_count` is implemented as an experimental feature: successful compact
+  callbacks skip the two device statistic atomics, the receiver publishes a
+  per-kernel record count, and active-capture `stats.csv` rows use that count.
+  Suppressed `stop_report` kernels retain their historical device total
+  counter. GPU A/B validation is pending, so `host_count` is not in `all`.
 - Lighter runs use configuration-suffixed argument folders containing a
   `lighter_tracer_config.json` manifest; existing lighter run directories are
   not overwritten.
@@ -1767,10 +1766,11 @@ end-to-end manifest and validation report
   independent simulator Producer/Consumer pacing investigation.
 - The next-session handoff now defines the composable `LIGHTER_TRACER` feature
   set, strict dependency/conflict validation, isolated A/B configurations,
-  staged Option 1C-A/S/B/C implementations, the reserved `spin_fusion` and
-  `all` configurations, artifact-suffix isolation, acceptance gates, and the
-  separate observe-only simulator lifecycle probe. The configuration layer is
-  implemented; the new Option 1C optimization features are not implemented yet.
+  staged Option 1C-A/S/B/C implementations, the production `all` alias,
+  reserved `spin_fusion`, artifact-suffix isolation, acceptance gates, and the
+  separate observe-only simulator lifecycle probe. The configuration layer and
+  Stage 1C-A code are implemented; 1C-A GPU validation and the remaining Option
+  1C features are pending.
 - Option 2 per-burst ultra-light capture and reorganization remain unimplemented
   and are parked as a fallback.
 - FA3 tile scheduler identified from mangled kernel names and SASS: K6 (FWD) is

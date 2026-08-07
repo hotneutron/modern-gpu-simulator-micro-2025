@@ -178,7 +178,8 @@ extern "C" __device__ __noinline__ void instrument_inst_compact(
     uint32_t per_operand_type, uint32_t memory_type, uint64_t addr_or_offset_or_reg_id,
     uint32_t mem_width_or_op_reg_val_0, uint32_t op_reg_val_1, uint32_t op_reg_val_2,
     uint32_t op_reg_val_3, uint64_t pchannel_dev, uint64_t ptotal_dynamic_instr_counter,
-    uint64_t preported_dynamic_instr_counter, uint64_t pstop_report, int32_t light) {
+    uint64_t preported_dynamic_instr_counter, uint64_t pstop_report,
+    int32_t device_counters_enabled) {
 
   const int active_mask = __ballot_sync(__activemask(), 1);
   const int predicate_mask = __ballot_sync(__activemask(), pred);
@@ -187,9 +188,10 @@ extern "C" __device__ __noinline__ void instrument_inst_compact(
   const int value_mask = active_mask & predicate_mask;
   const int first_value_laneid =
       value_mask != 0 ? (__ffs(value_mask) - 1) : first_laneid;
-  (void)light;  // Compact transport subsumes the old spin-only gather shortcut.
 
   if ((*((bool *)pstop_report))) {
+    /* Suppressed callbacks never reach the host, so retain the historical
+     * device total counter for stop_report kernels in every mode. */
     if (first_laneid == laneid) {
       atomicAdd((unsigned long long *)ptotal_dynamic_instr_counter, 1);
       return;
@@ -303,8 +305,10 @@ extern "C" __device__ __noinline__ void instrument_inst_compact(
   if (first_laneid == laneid) {
     ChannelDev *channel_dev = (ChannelDev *)pchannel_dev;
     channel_dev->push(&ma, ma.record_size);
-    atomicAdd((unsigned long long *)ptotal_dynamic_instr_counter, 1);
-    atomicAdd((unsigned long long *)preported_dynamic_instr_counter, 1);
+    if (device_counters_enabled) {
+      atomicAdd((unsigned long long *)ptotal_dynamic_instr_counter, 1);
+      atomicAdd((unsigned long long *)preported_dynamic_instr_counter, 1);
+    }
   }
 }
 
