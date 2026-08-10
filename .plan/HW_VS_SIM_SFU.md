@@ -2028,8 +2028,8 @@ offline against HW instead.
 | FWD K5 | 405,495 | 5,311 | 8,461 |
 | BWD K10 | 656,500 | 7,060 | 7,860 |
 
-### ⭐⭐ Simulator cycles on the trimmed trace (the number this doc was chasing)
-| kernel | baseline (Opt 10) | **trimmed (Opt 11)** | HW | sim/HW | gap change |
+### ⭐⭐ Simulator cycles on the trimmed trace (historical diagnostic)
+| kernel | baseline (Opt 10) | **count-trim diagnostic** | HW | sim/HW | gap change |
 |---|---:|---:|---:|---:|---|
 | **BWD K10** | 178,856 | **145,406** | 132,901 | **1.09×** | 1.35× → **1.09×** (nearly closed) |
 | **FWD K5** | 105,774 | **96,614** | 67,696 | **1.43×** | 1.56× → **1.43×** |

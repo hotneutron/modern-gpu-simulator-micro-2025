@@ -657,30 +657,30 @@ The K10 3.0% aggregate cycle error is therefore not full timing validation.
 Excess captured spin and premature simulated Producer completion can partially
 cancel.
 
-### Revised direction
+### Revised direction after Option 1B
 
 The previous aggregate count-trim and the proposed dual-run merge are not the
-primary next step.
+primary next step. Stage 1C-S has now completed the single-run reduction part
+of this direction and changed the active priority:
 
-1. Continue reducing single-run tracer observer effect until the untrimmed full
-   trace approaches HW spin counts. The next concrete levers are removal of
-   per-callback device statistic atomics, a smaller metadata-only callback, and
-   per-warp device buffering that avoids one `ChannelDev::push` per dynamic
-   instruction.
-2. Investigate simulated Producer/Consumer lifetime as an independent timing
-   model problem. A dynamic full trace preserves instruction order and payload,
-   but it does not contain the original HW inter-warp timestamps. The simulator
-   must reconstruct timing through scheduling, PHASECHK/mbarrier handling, and
-   TMA completion.
+1. Completed: sparse reconstruction reduces callback count by 93.14% K5 /
+   91.90% K10 and capture NANOSLEEP by 89.11% / 89.76% while preserving a
+   complete replayable protobuf.
+2. Primary now: preserve same-run CTA-relative timestamps at retained semantic
+   anchors and enforce earliest-issue pacing during replay. A dynamic full
+   trace preserves instruction order and payload, but not original HW
+   inter-warp timing.
 3. The fact that the simulator finishes the Producer early despite replaying
-   12.1x/35.5x excess NANOSLEEP is strong evidence that role pacing is wrong in
-   the simulator independently of the remaining capture pollution.
+   the lower-spin sparse trace, while TMA issue becomes substantially more
+   bursty, is direct evidence that role pacing is wrong independently of trace
+   completeness.
 4. Do not add modeled-ready blocking without first measuring per-burst
    PHASECHK readiness, Consumer ARRIVE/TMA completion, Producer TMA issue, and
    role-exit ordering. That path still carries the deadlock risk identified
    earlier.
-5. Keep Option 2 as a fallback if further single-run tracer reduction cannot
-   approach HW and the two-run scheduler/mapping gates can be satisfied.
+5. Keep metadata-only records, batching, and spin fusion as secondary transport
+   optimizations. Keep Option 2 as a fallback only if same-run pacing cannot
+   supply the required timeline.
 
 The current compact `LIGHTER_TRACER` / `TRIM_SPIN=1` mutual-exclusion guard
 remains in place. Do not repeat the current aggregate NCU-proportional trim: it
@@ -862,8 +862,8 @@ grep -a -n -F '[TRACE-BATCH]' /tmp/flashattn.log
 #### Stage 1C-A - remove active-capture statistic atomics
 
 This is the first implemented Option 1C feature because it changes no trace
-payload and no wire bytes. Static validation is complete; GPU A/B validation
-is pending.
+payload and no wire bytes. Static validation and GPU A/B capture are complete;
+the measured result below rejects it as a timing lever.
 
 Current overhead:
 
@@ -940,7 +940,8 @@ Option 1B still injects one `NO_REGS` callback for ordinary dynamic
 instructions that need no runtime payload. The host can reconstruct a safe
 subset from the enhanced static SASS and CFG while preserving the final
 per-instruction protobuf contract. The device filtering and host reconstruction
-paths are implemented; CUDA/NVBit build and GPU capture are pending.
+paths, CUDA/NVBit build, GPU capture, and simulator functional validation are
+complete. Capture/replay contracts pass; timing fidelity remains open.
 
 The initial direct-capture set is conservative:
 
@@ -965,7 +966,7 @@ Read-only analysis of the saved Option 1B protobuf gives the initial ceiling:
 
 Across those reconstructable instructions,
 `active_mask != predicate_mask` occurs zero times. This is a feasibility
-measurement, not yet an acceptance result.
+measurement; the GPU and simulator acceptance results are recorded below.
 
 Before a GPU capture, perform an offline proof using the `.opt1b` artifact:
 
@@ -1039,11 +1040,53 @@ Capture-level payload gates pass:
 
 The sparse artifact bundle does not contain the original process log, so
 function-level `cfg_misses` and emitted `[TRACE-SPARSE]` count equality remain
-a GPU-server log check. The capture is ready for the simulator functional gate,
-where `gpgpu_n_tot_w_icount/gpu_sim_insn` must equal
-`14,494,325/449,055,368` K5 and `20,019,180/625,678,016` K10.
-`sparse_reconstruct` must remain outside `all` until that run confirms those
-protobuf contract totals and clean completion.
+a GPU-server log check.
+
+Simulator functional result:
+
+| Metric | K5 fwd `.o69/.e69` | K10 bwd `.o43/.e43` |
+|---|---:|---:|
+| `gpgpu_n_tot_w_icount` expected / actual | 14,494,325 / 14,494,325 | 20,019,180 / 20,019,180 |
+| `gpu_sim_insn` expected / actual | 449,055,368 / 449,055,368 | 625,678,016 / 625,678,016 |
+| `[TRACECHECK]` CTA rows | 132 | 384 |
+| TMA commands / unresolved | 6,432 / 0 | 30,336 / 0 |
+| BAR summaries / nonzero leaks | 132 / 0 | 384 / 0 |
+| TMA request issued / completed | 2,887,680 / 2,887,680 | 10,917,888 / 10,917,888 |
+| Simulator cycles | 92,530 | 143,560 |
+| Cycle error versus HW | +36.7% | +8.0% |
+| Cycle change versus Option 1B | +11.1% | +4.9% |
+| Producer mean completion | 26,035.9 | 88,220.7 |
+| Consumer mean completion | 87,429.8 | 115,352.6 |
+| Producer-minus-Consumer tail | -61,393.9 | -27,131.8 |
+| Fatal / deadlock / clean exit | 0 / 0 / yes | 0 / 0 / yes |
+
+The simulator functional gate passes completely: reconstructed instruction
+totals are exact, every CTA contract row loads, TMA traffic drains
+symmetrically, BAR state has no leaks, and both kernels exit cleanly.
+
+The timing-fidelity gate still fails. Option 1B already ended the Producer
+37.9K K5 / 12.0K K10 cycles before the Consumer; the sparse capture widens
+those inversions to 61.4K / 27.1K. Real K5 HW instead has an approximately
+`+7,950.9`-cycle Producer tail. Removing capture-induced poll work therefore
+exposes, rather than creates, the simulator's missing inter-warp pacing: the
+shorter and more faithful Producer stream is issued too early, while the
+Consumer finishes later. The Option 1B spin had supplied accidental delay and
+partially hidden this model error.
+
+This mechanism is visible in TMA timing without a work or locality change.
+K5/K10 TMA command totals remain exact and `L2_TMA_true_hit_rate` is stable,
+but weighted TMA issue-active cycles increase `131.7 -> 1,319.7` K5 and
+`311.7 -> 750.0` K10. Weighted interconnect-full cycles increase
+`3.7 -> 1,191.7` / `222.1 -> 660.3`, while `averagemflatency` increases
+`240 -> 1,046` / `459 -> 710`. The sparse Producer therefore creates a
+temporal TMA burst because replay has no HW timestamp constraint.
+
+`sparse_reconstruct` is validated as a complete trace transport and replay
+feature, but remains outside `all` until the production timing policy is
+settled. The next fidelity step should preserve same-run CTA-relative timing
+at retained sparse semantic anchors and apply earliest-issue pacing during
+replay. This avoids Option 2's cross-run dynamic-scheduler join problem while
+retaining the sparse trace's low observer effect.
 
 #### Stage 1C-B - dedicated metadata-only record
 
@@ -1676,10 +1719,12 @@ timeline.
 
 Option 1B proves that a lightweight full trace can preserve the complete replay
 payload, but it does not yet recover HW spin or Producer/Consumer lifetime.
-Further single-run tracer reduction and simulator pacing diagnosis remain the
-primary path. If that path reaches an observer-effect floor, Option 2 remains a
-fallback that must preserve both poll work and CTA-relative release timing,
-unlike the earlier aggregate count-only trim.
+Sparse reconstruction subsequently reaches 1.31x/3.62x HW spin and proves
+complete replay, but exposes missing Producer pacing and temporal TMA bursts.
+Same-run semantic-anchor timestamps plus simulator earliest-issue pacing are
+therefore the primary path. Option 2 remains a fallback that must preserve both
+poll work and CTA-relative release timing, unlike the earlier aggregate
+count-only trim.
 
 ### Measurement
 
@@ -1800,8 +1845,8 @@ end-to-end manifest and validation report
   been removed.
 - Configuration parser validation passed with Python syntax/config checks and a
   host-only C++17 extraction/smoke test of the NVBit-side parser.
-- The renamed configuration has not yet been built with CUDA/NVBit or exercised
-  in a GPU capture; those remain user-run validation gates.
+- The renamed configuration and implemented feature combinations have been
+  built with CUDA/NVBit and exercised in GPU captures.
 - `compact_wire` selects compact full capture; `prune_operands` selects
   semantic callback pruning.
 - `host_count` is implemented as an experimental feature: successful compact
@@ -1816,8 +1861,11 @@ end-to-end manifest and validation report
   K10 dynamic instructions with zero active-mask, predicate-mask, function-ID,
   payload, or trailing-span mismatches. GPU capture then reduces callbacks by
   93.14% K5 / 91.90% K10 and NANOSLEEP by 89.11% / 89.76%, while fixed
-  HGMMA/MUFU/TMA/BAR work remains exact. Capture payload gates pass; simulator
-  functional validation is pending, so the feature remains outside `all`.
+  HGMMA/MUFU/TMA/BAR work remains exact. Simulator replay passes exact
+  warp/active-lane instruction contracts, all CTA/TMA/BAR gates, and clean
+  completion. Timing fidelity still fails: cycles are 92,530 K5 / 143,560 K10,
+  while Producer-minus-Consumer tails widen to -61.4K / -27.1K. The feature is
+  replay-safe but remains outside `all` pending the timing policy.
 - Lighter runs use configuration-suffixed argument folders containing a
   `lighter_tracer_config.json` manifest; existing lighter run directories are
   not overwritten.
@@ -1861,15 +1909,17 @@ end-to-end manifest and validation report
 - Option 1B timing-fidelity gate failed: Producer completes 37.9K cycles before
   Consumer in K5 and 12.0K before Consumer in K10; K5 HW instead has an
   approximately +8.0K Producer tail.
-- Primary next direction is further single-run tracer lightening plus an
-  independent simulator Producer/Consumer pacing investigation.
+- Primary next direction is same-run CTA-relative semantic-anchor timestamps
+  plus simulator earliest-issue pacing. Further callback/byte reduction is
+  secondary because sparse replay already exposes the pacing defect.
 - The next-session handoff now defines the composable `LIGHTER_TRACER` feature
   set, strict dependency/conflict validation, isolated A/B configurations,
   staged Option 1C-A/S/B/C implementations, the production `all` alias,
   reserved `spin_fusion`, artifact-suffix isolation, acceptance gates, and the
-  separate observe-only simulator lifecycle probe. The configuration layer and
-  Stage 1C-A code are implemented; 1C-A GPU validation and the remaining Option
-  1C features are pending.
+  separate observe-only simulator lifecycle probe. The configuration layer,
+  Stage 1C-A, and Stage 1C-S are implemented and GPU-validated; Stage 1C-S also
+  passes simulator functional validation. Metadata-only records, batching,
+  spin fusion, and timing pacing remain pending.
 - Option 2 per-burst ultra-light capture and reorganization remain unimplemented
   and are parked as a fallback.
 - FA3 tile scheduler identified from mangled kernel names and SASS: K6 (FWD) is
