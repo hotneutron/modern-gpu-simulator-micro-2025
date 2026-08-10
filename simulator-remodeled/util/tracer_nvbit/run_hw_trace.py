@@ -328,6 +328,26 @@ def build_sync_operand_mapping_if_available(trace_folder):
     subprocess.run([sys.executable, sync_script, extra_info_dir], check=True)
 
 
+def build_spin_wait_sidecar_if_available(trace_folder):
+    # Static producer spin-wait sidecar (payload untouched). Needs the sync
+    # resolver + disassembly, so it runs after build_sync_operand_mapping. The
+    # simulator consumes this to block a producer at each mbarrier spin loop
+    # until the modeled barrier is ready, instead of replaying the capture-time
+    # poll count. Also runnable standalone on a CPU server.
+    extra_info_dir = os.path.join(trace_folder, "extra_info")
+    inputs = [
+        os.path.join(extra_info_dir, "enhanced_execution_info.json"),
+        os.path.join(extra_info_dir, "sync_operand_resolver.json"),
+    ]
+    if not all(os.path.exists(path) for path in inputs):
+        return
+    sidecar_script = os.path.join(this_directory, "build_spin_wait_sidecar.py")
+    subprocess.run(
+        [sys.executable, sidecar_script, "--traces", trace_folder],
+        check=True,
+    )
+
+
 def spin_trim_run_dir(this_run_dir):
     """TRIM_SPIN post-step. The full run has just completed at this_run_dir.
     Move it aside to '<this_run_dir>.fullrun' (the untouched full trace) and
@@ -539,5 +559,6 @@ for bench in benchmarks:
                 build_tma_descriptor_mapping_if_available(this_trace_folder)
                 build_tma_operand_mapping_if_available(this_trace_folder)
                 build_sync_operand_mapping_if_available(this_trace_folder)
+                build_spin_wait_sidecar_if_available(this_trace_folder)
             if trim_spin_enabled:
                 spin_trim_run_dir(this_run_dir)
