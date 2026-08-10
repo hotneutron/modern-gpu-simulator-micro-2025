@@ -590,6 +590,38 @@ class SM : public core_t, public shader_core_ctx_wrapper {
   // Per-warp last-PHASECHK-was-ready flag, for consecutive-ready run detection.
   bool m_producer_spin_prev_ready[MAX_WARP_PER_SHADER] = {false};
   bool m_producer_spin_in_ready_run[MAX_WARP_PER_SHADER] = {false};
+
+  // [Spin-wait observe] Observe-only measurement of the would-be park time if the
+  // producer spin-wait collapse feature were enabled. For each (warp,region)
+  // episode we remember the cycle of the FIRST not-ready poll and, when the same
+  // warp next polls the same region ready, bucket the elapsed cycles PER REGION
+  // (keyed by primary_wait_pc). This never changes control flow; it only sizes
+  // park latency, attributes it to a specific spin region, and flags never-flip
+  // barriers via a deadlock watchdog. Gated by -spin_wait_observe_enable.
+  struct SpinWaitObserveState {
+    uint64_t active_wait_pc = 0;        // primary_wait_pc of the in-progress episode
+    uint64_t active_barrier_addr = 0;   // barrier being polled (for watchdog dump)
+    unsigned active_cta = 0;            // cta owning the episode (for watchdog dump)
+    unsigned long long first_not_ready_cycle = 0;  // cycle of first not-ready poll
+    bool episode_open = false;          // a not-ready episode is in progress
+    bool watchdog_fired = false;        // deadlock watchdog already reported this episode
+  };
+  SpinWaitObserveState m_spin_wait_observe_by_warp[MAX_WARP_PER_SHADER];
+  // Per-region (keyed by primary_wait_pc) would-be-park accounting.
+  struct SpinWaitRegionObserve {
+    uint64_t primary_wait_pc = 0;
+    unsigned long long episodes = 0;              // completed not-ready->ready episodes
+    unsigned long long park_cycles_total = 0;     // summed would-be park cycles
+    unsigned long long park_cycles_max = 0;       // longest single would-be park
+    unsigned long long immediate_ready_polls = 0; // ready with no open episode
+    unsigned long long watchdog_hits = 0;         // episodes that crossed the deadlock threshold
+    unsigned long long park_hist[6] = {0, 0, 0, 0, 0, 0};  // 0,1-16,17-64,65-256,257-1024,>1024
+  };
+  std::map<uint64_t, SpinWaitRegionObserve> m_spin_wait_observe_by_region;
+  // Deadlock watchdog threshold: a single would-be park longer than this many
+  // cycles is reported immediately as a deadlock candidate for collapse. 0 uses
+  // the built-in default in record_spin_wait_observe.
+  unsigned long long m_spin_wait_watchdog_threshold = 0;
  public:
   // Increment the tensor-op count for the CTA slot that owns hardware warp wid.
   void inc_tensor_ops_for_warp(unsigned wid) {
@@ -608,4 +640,9 @@ class SM : public core_t, public shader_core_ctx_wrapper {
   // [Producer-spin ready-retry probe] whole-lifetime hooks (not tail-gated).
   void record_producer_spin_issue(unsigned wid, const warp_inst_t *inst);
   void record_producer_spin_phasechk_result(unsigned wid, bool ready);
+  // [Spin-wait observe] observe-only would-be-park measurement (never blocks).
+  void record_spin_wait_observe(unsigned wid, uint64_t wait_pc,
+                                uint64_t barrier_addr, unsigned cta_id,
+                                bool ready);
+  void print_spin_wait_observe_summary() const;
 };

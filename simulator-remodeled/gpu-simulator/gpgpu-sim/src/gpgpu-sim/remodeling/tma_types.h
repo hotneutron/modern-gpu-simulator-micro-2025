@@ -226,6 +226,32 @@ struct SyncSidecarMetadataDB {
   bool empty() const { return site_records.empty(); }
 };
 
+// ---- Producer spin-wait sidecar (spin_wait_sidecar.json) --------------------
+// A producer mbarrier spin loop, described statically by PC so the simulator can
+// (behind a gate) block the warp at the loop's primary wait until the modeled
+// barrier is ready, instead of replaying the capture-time poll count. See
+// build_spin_wait_sidecar.py and .plan/SPIN_WAIT_SIDECAR.md.
+struct SpinWaitRegionRecord {
+  uint64_t loop_head_pc = 0;
+  uint64_t primary_wait_pc = 0;   // the poll whose barrier readiness gates the loop
+  uint64_t loopback_bra_pc = 0;   // backward BRA that closes the loop
+  uint64_t exit_pc = 0;           // fall-through target when the loop is left
+  SyncInstructionKind primary_wait_kind = SyncInstructionKind::NONE;
+  bool semantic_free_body = false;  // body has no TMA/GMMA/MUFU/arrive/memory op
+  bool is_spin_loop = false;        // observed to iterate > 1 (not a single-shot wait)
+};
+
+// Keyed by (funcid, primary_wait_pc): the simulator matches a PHASECHK/TRYWAIT at
+// issue time against this to know it is inside a collapsible spin loop.
+struct SpinWaitSidecarDB {
+  std::map<SyncOperandLookupKey, SpinWaitRegionRecord> regions_by_wait_pc;
+
+  void clear() { regions_by_wait_pc.clear(); }
+
+  bool empty() const { return regions_by_wait_pc.empty(); }
+};
+
+
 struct HopperMBarrierKey {
   uint32_t trace_kernel_id = 0;
   uint32_t cta_id = 0;

@@ -918,6 +918,12 @@ class gpgpu_sim : public gpgpu_t {
                                  address_type pc,
                                  SyncResolvedSiteMetadata &metadata) const;
 
+  // Producer spin-wait sidecar lookup: returns true and fills `region` if the
+  // (funcid, pc) is the primary wait of a detected mbarrier spin loop. Used by
+  // the (gated) producer spin-wait collapse feature. See .plan/SPIN_WAIT_SIDECAR.md.
+  bool lookup_spin_wait_region(unsigned int unique_function_id, address_type pc,
+                               SpinWaitRegionRecord &region) const;
+
   void record_l1i_prefetch_miss_observation(new_addr_type block_addr,
                                             unsigned int unique_function_id,
                                             unsigned int set_idx,
@@ -995,6 +1001,7 @@ class gpgpu_sim : public gpgpu_t {
   traced_execution m_extra_trace_info;  // MOD. Improved tracer
   TMASidecarMetadataDB m_tma_sidecar_db;
   SyncSidecarMetadataDB m_sync_sidecar_db;
+  SpinWaitSidecarDB m_spin_wait_sidecar_db;
   std::map<new_addr_type, unsigned long long> m_l1i_prefetch_miss_block_histogram;
   std::map<new_addr_type, unsigned int> m_l1i_prefetch_miss_block_unique_function_id;
   std::map<unsigned int, unsigned long long> m_l1i_prefetch_miss_set_histogram;

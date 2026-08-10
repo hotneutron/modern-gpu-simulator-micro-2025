@@ -418,7 +418,12 @@ void SM::debug_log_sync_event(const std::string &message) {
   if (m_sync_debug_print_budget == 0) {
     return;
   }
-  std::cerr << "[SYNCDBG][SM" << m_sm_id << "] " << message << std::endl;
+  // cyc= prefix makes every sync event a point on a reconstructable timeline
+  // (needed to correlate a not-ready wait with the later phase flip / tma
+  // completion that releases it -- i.e. to size or diagnose a would-be collapse
+  // park and spot a barrier that never flips). See .plan/SPIN_WAIT_SIDECAR.md.
+  std::cerr << "[SYNCDBG][SM" << m_sm_id << "] cyc="
+            << get_current_gpu_cycle() << " " << message << std::endl;
   --m_sync_debug_print_budget;
 }
 
@@ -439,7 +444,8 @@ void SM::debug_log_tma_event(const std::string &message) {
   if (m_tma_debug_print_budget == 0) {
     return;
   }
-  std::cerr << "[TMADBG][SM" << m_sm_id << "] " << message << std::endl;
+  std::cerr << "[TMADBG][SM" << m_sm_id << "] cyc="
+            << get_current_gpu_cycle() << " " << message << std::endl;
   --m_tma_debug_print_budget;
 }
 
@@ -873,6 +879,117 @@ void SM::record_producer_spin_phasechk_result(unsigned wid, bool ready) {
     m_producer_spin_in_ready_run[wid] = false;
   }
   m_producer_spin_prev_ready[wid] = ready;
+}
+
+// [Spin-wait observe] Observe-only. Called on every PHASECHK/TRYWAIT that maps to
+// a spin_wait_sidecar primary_wait_pc. Measures, PER REGION, how long the modeled
+// mbarrier stays not-ready after the first not-ready poll of an episode (= the
+// cycles the warp WOULD be parked under collapse), buckets them, and runs a
+// deadlock watchdog: if a single would-be park crosses the threshold, it emits a
+// [SPINWAITDEADLOCK] line immediately (once per episode) with the barrier state so
+// a never-flipping / pathologically-long wait is caught in the SAME 12h run.
+// It never blocks, never advances the trace, and never touches
+// m_pending_sync_waits. See .plan/SPIN_WAIT_SIDECAR.md.
+void SM::record_spin_wait_observe(unsigned wid, uint64_t wait_pc,
+                                  uint64_t barrier_addr, unsigned cta_id,
+                                  bool ready) {
+  if (!m_config->spin_wait_observe_enable || wid >= MAX_WARP_PER_SHADER) {
+    return;
+  }
+  SpinWaitObserveState &st = m_spin_wait_observe_by_warp[wid];
+  SpinWaitRegionObserve &reg = m_spin_wait_observe_by_region[wait_pc];
+  reg.primary_wait_pc = wait_pc;
+  const unsigned long long now = get_current_gpu_cycle();
+  // Deadlock watchdog threshold: default to a generous multiple of the largest
+  // FA3 HW target (~133K cycles) so only a pathological wait trips it.
+  const unsigned long long threshold =
+      m_spin_wait_watchdog_threshold ? m_spin_wait_watchdog_threshold : 400000ULL;
+  if (!ready) {
+    // Open a new episode on the first not-ready poll for this warp+region, or
+    // keep the earliest not-ready cycle if an episode for this region is open.
+    if (!st.episode_open || st.active_wait_pc != wait_pc) {
+      st.episode_open = true;
+      st.active_wait_pc = wait_pc;
+      st.active_barrier_addr = barrier_addr;
+      st.active_cta = cta_id;
+      st.first_not_ready_cycle = now;
+      st.watchdog_fired = false;
+    } else {
+      // Episode continues: check the deadlock watchdog once per episode.
+      const unsigned long long parked = now - st.first_not_ready_cycle;
+      if (!st.watchdog_fired && parked >= threshold) {
+        st.watchdog_fired = true;
+        reg.watchdog_hits++;
+        fprintf(stdout,
+                "[SPINWAITDEADLOCK] sm=%u cta=%u warp=%u wait_pc=0x%llx "
+                "barrier=0x%llx parked_cyc=%llu first_not_ready_cyc=%llu "
+                "now=%llu threshold=%llu (would-be collapse park exceeded "
+                "threshold: deadlock candidate)\n",
+                m_sm_id, st.active_cta, wid,
+                (unsigned long long)wait_pc,
+                (unsigned long long)st.active_barrier_addr, parked,
+                st.first_not_ready_cycle, now, threshold);
+      }
+    }
+    return;
+  }
+  // ready:
+  if (st.episode_open && st.active_wait_pc == wait_pc) {
+    const unsigned long long delta =
+        now >= st.first_not_ready_cycle ? now - st.first_not_ready_cycle : 0;
+    reg.episodes++;
+    reg.park_cycles_total += delta;
+    if (delta > reg.park_cycles_max) {
+      reg.park_cycles_max = delta;
+    }
+    const unsigned b = (delta == 0)     ? 0
+                     : (delta <= 16)    ? 1
+                     : (delta <= 64)    ? 2
+                     : (delta <= 256)   ? 3
+                     : (delta <= 1024)  ? 4
+                                        : 5;
+    reg.park_hist[b]++;
+    st.episode_open = false;
+    st.watchdog_fired = false;
+  } else {
+    // ready with no open not-ready episode for this region: the barrier was
+    // already satisfied at the first poll (would-be park = 0).
+    reg.immediate_ready_polls++;
+  }
+}
+
+void SM::print_spin_wait_observe_summary() const {
+  if (!m_config->spin_wait_observe_enable) {
+    return;
+  }
+  // Per-region would-be-park summary: attributes park latency to a specific spin
+  // region so collapse can be applied/diagnosed region by region.
+  for (const auto &kv : m_spin_wait_observe_by_region) {
+    const SpinWaitRegionObserve &r = kv.second;
+    const double avg = r.episodes ? (double)r.park_cycles_total / r.episodes : 0.0;
+    fprintf(stdout,
+            "[SPINWAITOBS] sm=%u wait_pc=0x%llx episodes=%llu avg_park=%.1f "
+            "max_park=%llu total_park=%llu immediate_ready=%llu watchdog_hits=%llu "
+            "hist[0/1-16/17-64/65-256/257-1024/>1024]=%llu/%llu/%llu/%llu/%llu/%llu\n",
+            m_sm_id, (unsigned long long)r.primary_wait_pc, r.episodes, avg,
+            r.park_cycles_max, r.park_cycles_total, r.immediate_ready_polls,
+            r.watchdog_hits, r.park_hist[0], r.park_hist[1], r.park_hist[2],
+            r.park_hist[3], r.park_hist[4], r.park_hist[5]);
+  }
+  // Residual open episodes at print time: a producer wait whose modeled barrier
+  // never flipped for the remainder of the run -- the strongest deadlock signal.
+  for (unsigned w = 0; w < MAX_WARP_PER_SHADER; ++w) {
+    const SpinWaitObserveState &st = m_spin_wait_observe_by_warp[w];
+    if (st.episode_open) {
+      fprintf(stdout,
+              "[SPINWAITOPEN] sm=%u cta=%u warp=%u wait_pc=0x%llx barrier=0x%llx "
+              "first_not_ready_cyc=%llu (episode never released: never-flip "
+              "deadlock candidate)\n",
+              m_sm_id, st.active_cta, w, (unsigned long long)st.active_wait_pc,
+              (unsigned long long)st.active_barrier_addr,
+              st.first_not_ready_cycle);
+    }
+  }
 }
 
 void SM::account_producer_tail_cycle() {
@@ -1815,6 +1932,13 @@ void SM::register_cta_thread_exit(unsigned cta_num, kernel_info_t *kernel) {
       }
     }
 
+    // [Spin-wait observe] Emit the SM-global cumulative would-be-park summary.
+    // Counters accumulate across the whole SM, so the final CTA-exit print holds
+    // the complete totals; a post-processing pass takes the last/max per SM.
+    if (m_config->spin_wait_observe_enable) {
+      print_spin_wait_observe_summary();
+    }
+
     // [CTA-imbalance diag] Emit this CTA's finish cycle, elapsed cycles, and raw
     // tensor-op (WGMMA) count so tail-drain can be correlated with tensor density
     // AND per-CTA duration. Keyed by hardware CTA slot so multi-wave SMs (bwd)
@@ -2222,6 +2346,17 @@ void SM::handle_sync_instruction(warp_inst_t &inst, unsigned int warp_id) {
       }
       if (m_config->producer_spin_ready_instrument_enable) {
         record_producer_spin_phasechk_result(warp_id, wait_ready);
+      }
+      // [Spin-wait observe] observe-only would-be-park measurement: only for
+      // polls that are the primary_wait_pc of a detected collapsible spin loop.
+      if (m_config->spin_wait_observe_enable) {
+        SpinWaitRegionRecord region;
+        if (m_gpu->lookup_spin_wait_region(inst.unique_function_id, inst.pc,
+                                            region) &&
+            region.semantic_free_body && region.is_spin_loop) {
+          record_spin_wait_observe(warp_id, inst.pc, key.barrier_addr,
+                                   key.cta_id, wait_ready);
+        }
       }
       if (wait_ready) {
         m_sync_debug_wait_released++;

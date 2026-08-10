@@ -254,3 +254,105 @@ The simulator, behind a default-off flag, should:
   fall.
 - **Gate 4 — no fake win**: no widened interconnect, no reinserted fake spins, no
   trace trimming, no HW-timestamp-based issue delay, no total-cycle-only match.
+
+## 9. Observe-only stage (implemented; runs before collapse)
+
+Before any control-flow change, an **observe-only** pass measures what collapse
+*would* do, so a single (12h) run decides whether collapse is safe and where it
+helps. It is gated by `-spin_wait_observe_enable` (default 0) and **never blocks,
+advances the trace, or changes timing** — it only reads the modeled mbarrier
+result already computed for each `PHASECHK`/`TRYWAIT`.
+
+Scope: only polls whose `(funcid, pc)` matches a sidecar `primary_wait_pc` that
+is `is_spin_loop && semantic_free_body`. For each `(warp, region)` episode it
+records the cycle of the first not-ready poll and, when the same region next
+polls ready, buckets the elapsed cycles = the cycles the warp **would** be parked
+under collapse.
+
+### Log lines (stdout)
+
+- `[SPINWAITOBS] sm=.. wait_pc=0x.. episodes=.. avg_park=.. max_park=.. total_park=.. immediate_ready=.. watchdog_hits=.. hist[0/1-16/17-64/65-256/257-1024/>1024]=..`
+  Per-region (per `primary_wait_pc`) would-be-park summary, emitted per SM. Cumulative;
+  the last CTA-exit print for an SM holds the totals. Attributes park latency to a
+  specific spin region so collapse can be applied/diagnosed region by region.
+- `[SPINWAITDEADLOCK] sm=.. cta=.. warp=.. wait_pc=0x.. barrier=0x.. parked_cyc=.. first_not_ready_cyc=.. now=.. threshold=..`
+  Emitted **immediately** (once per episode) when a single would-be park crosses the
+  watchdog threshold (default 400,000 cycles, ~3x the K10 HW target). This is the
+  primary deadlock-candidate signal and does not depend on any print budget.
+- `[SPINWAITOPEN] sm=.. cta=.. warp=.. wait_pc=0x.. barrier=0x.. first_not_ready_cyc=..`
+  Emitted at summary time for an episode still open at kernel end — a wait whose
+  modeled barrier never flipped (strongest never-flip signal).
+
+### Deadlock decision rule
+
+Collapse is safe to implement iff, across the run, there are **no
+`[SPINWAITDEADLOCK]` and no `[SPINWAITOPEN]` lines**. If any appear, the modeled
+mbarrier for that `wait_pc`/`barrier` never becomes ready in a bounded window;
+fix that barrier's accounting (phase parity, expected-arrive, expect-tx credit)
+BEFORE enabling collapse, because collapse would turn that unbounded wait into a
+real hang.
+
+### Correlating with existing sync/TMA logs
+
+`debug_log_sync_event` (`[SYNCDBG]`, gated by `-sync_debug_enable`, budget
+`-sync_debug_print_budget`) and `debug_log_tma_event` (`[TMADBG]`, gated by
+`-tma_debug_enable`) now prefix every line with `cyc=<gpu_sim_cycle>`. A
+`[SPINWAITDEADLOCK]`/`[SPINWAITOPEN]` `barrier=0x..` can be traced on the same
+cycle timeline through the existing `arrive_expect_tx` / `phase flip` /
+`tma_complete` / `wait miss nonblocking` events (which already carry
+arrive/expected/tx/phase/ready) to see exactly which credit never arrived.
+
+### Config
+
+`gpgpusim.config` sets `-spin_wait_observe_enable 1`. For a deadlock-diagnosis
+run also raise `-sync_debug_enable 1` (and optionally `-tma_debug_enable 1`) so
+the `barrier=0x..` from a watchdog line can be followed on the `cyc=`-stamped
+`[SYNCDBG]`/`[TMADBG]` timeline. Set the observe flag back to 0 for normal runs.
+
+`[BARDBG][issue]` / `[MEMBARDBG]` per-event lines (named barrier + memory fence,
+also `cyc=`-stamped) are enabled via `-bar_debug_enable 1 -bar_debug_issue_budget
+20000000`, so a deadlock candidate that involves a named barrier or a pending
+fence (not just an mbarrier) is visible on the same timeline.
+
+Budget sizing (checked): the sync/tma budgets are **per SM** and K10 schedules at
+most ~3 CTAs per SM (384 CTAs / 132 SMs), so a busy SM emits only ~9K sync and
+~2K TMA events — thousands of times under the 40M / 20M caps. `bar_debug`'s budget
+is a single **process-global** static (~53K named-barrier events for all of K10),
+still ~80x under 20M. No budget needs raising for a full K10 run.
+
+### What this can and cannot prove (limits)
+
+The observe pass is a strong but not complete safety check. Be explicit about the
+boundary before trusting a GO decision:
+
+- **Proves:** absence of never-flip / pathologically-long waits under the observed
+  schedule (`[SPINWAITOPEN]` / `[SPINWAITDEADLOCK]`); the per-region park
+  magnitude; and whether waits are mostly immediate-ready (collapse would be a
+  no-op) vs genuinely blocking.
+- **Does NOT prove — mutual collapse interaction:** the sidecar detects BOTH the
+  producer's "buffer-empty" wait and the consumer's "buffer-full" wait, and
+  collapse applies to both. Observe measures each wait independently under the
+  *non-collapsed* schedule, so it cannot rule out a circular-wait deadlock that
+  only appears when both sides are collapsed at once (double-buffering normally
+  breaks the cycle, but a wrong modeled buffer depth could not).
+- **Does NOT prove — exact timing:** in observe the producer still issues its spin
+  polls and consumes issue slots. Under collapse those freed slots let the
+  consumer run faster, flip the barrier earlier, and shorten the park. So the
+  measured park is a *pessimistic upper bound*, not the collapsed timing.
+- **Residual risk is covered at runtime:** the collapse implementation MUST carry
+  the §8.4 watchdog (assert/log on unbounded park, never silently hang). That is
+  the real safety net for the two gaps above.
+
+## 10. How to proceed from the observe-only results (decision tree)
+
+A single (12h) observe run selects the next step:
+
+| Observed result | Decision | Action |
+|---|---|---|
+| No `[SPINWAITDEADLOCK]` / `[SPINWAITOPEN]`, and park histogram has real weight in the `65-256` / `257-1024` / `>1024` buckets | **GO** | Implement collapse (cursor jump) WITH the runtime watchdog. Validate the K5 tail moves from `-61.4K` toward HW `+7.95K` and TMA burst metrics fall. |
+| No deadlock signals, but episodes are overwhelmingly `immediate_ready` / park ≈ 0 | **PIVOT** | Collapse is a near no-op: the producer is not actually blocked (barriers are ready when polled), so it races ahead for a different reason. Investigate barrier flip timing / expected-tx / arrive credit instead of collapse. Note this is consistent with the current "producer ends ~61K before consumer" symptom, so treat it as a live possibility. |
+| Any `[SPINWAITDEADLOCK]` or `[SPINWAITOPEN]` | **NO-GO (as-is)** | Take the reported `barrier=0x..` and follow it on the `cyc=` timeline through `arrive_expect_tx` / `phase flip` / `tma_complete` / named-barrier events to find the credit that never arrives. Fix that barrier's accounting, re-run observe, then re-decide. |
+| Some regions clean, others flagged | **SELECTIVE** | Enable collapse only for regions with `semantic_free_body && is_spin_loop && watchdog_hits==0`; leave flagged regions nonblocking until their barrier accounting is fixed. |
+
+The GO path's collapse work is specified in §8. The watchdog there is mandatory,
+not optional, because it is the only mechanism that covers the two limits in §9.

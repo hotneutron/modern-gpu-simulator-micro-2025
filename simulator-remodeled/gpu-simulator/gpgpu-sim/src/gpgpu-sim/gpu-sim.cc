@@ -650,12 +650,62 @@ void load_sync_operand_resolver(const std::filesystem::path &extra_info_dir,
   }
 }
 
+// Producer spin-wait sidecar: map (funcid, primary_wait_pc) -> region so the
+// simulator can recognize an mbarrier spin loop at issue time. Payload untouched;
+// see build_spin_wait_sidecar.py and .plan/SPIN_WAIT_SIDECAR.md.
+void load_spin_wait_sidecar(const std::filesystem::path &extra_info_dir,
+                            SpinWaitSidecarDB &db) {
+  rapidjson::Document doc;
+  if (!load_tma_json_document(extra_info_dir / "spin_wait_sidecar.json", doc)) {
+    return;
+  }
+  if (!doc.HasMember("kernels") || !doc["kernels"].IsArray()) {
+    return;
+  }
+  for (const auto &kernel : doc["kernels"].GetArray()) {
+    if (!kernel.IsObject() || !kernel.HasMember("unique_function_id") ||
+        kernel["unique_function_id"].IsNull() ||
+        !kernel.HasMember("spin_regions") || !kernel["spin_regions"].IsArray()) {
+      continue;
+    }
+    unsigned int unique_function_id = static_cast<unsigned int>(
+        parse_tma_json_uint(kernel["unique_function_id"]));
+    for (const auto &region : kernel["spin_regions"].GetArray()) {
+      if (!region.IsObject() || !region.HasMember("primary_wait_pc")) {
+        continue;
+      }
+      SpinWaitRegionRecord record;
+      record.loop_head_pc = parse_tma_json_uint(region["loop_head_pc"]);
+      record.primary_wait_pc = parse_tma_json_uint(region["primary_wait_pc"]);
+      record.loopback_bra_pc = parse_tma_json_uint(region["loopback_bra_pc"]);
+      record.exit_pc = parse_tma_json_uint(region["exit_pc"]);
+      if (region.HasMember("primary_wait_kind") &&
+          region["primary_wait_kind"].IsString()) {
+        record.primary_wait_kind =
+            parse_sync_instruction_kind_string(region["primary_wait_kind"].GetString());
+      }
+      if (region.HasMember("semantic_free_body") &&
+          region["semantic_free_body"].IsBool()) {
+        record.semantic_free_body = region["semantic_free_body"].GetBool();
+      }
+      if (region.HasMember("dynamic") && region["dynamic"].IsObject() &&
+          region["dynamic"].HasMember("is_spin_loop") &&
+          region["dynamic"]["is_spin_loop"].IsBool()) {
+        record.is_spin_loop = region["dynamic"]["is_spin_loop"].GetBool();
+      }
+      db.regions_by_wait_pc[SyncOperandLookupKey{unique_function_id,
+                                                 record.primary_wait_pc}] = record;
+    }
+  }
+}
+
 }
 
 // MOD. Begin. Improved tracer
 void gpgpu_sim::parse_extra_trace_info(std::string filepath, bool is_extra_trace_enabled) {
   m_tma_sidecar_db.clear();
   m_sync_sidecar_db.clear();
+  m_spin_wait_sidecar_db.clear();
   if(is_extra_trace_enabled) {
     m_extra_trace_info.DeserializeFromFile(filepath.c_str());
     std::filesystem::path metadata_path(filepath);
@@ -667,6 +717,7 @@ void gpgpu_sim::parse_extra_trace_info(std::string filepath, bool is_extra_trace
     // flow through the operand resolver's linked_config_id -> descriptor_configs join.
     load_tma_operand_resolver(extra_info_dir, m_tma_sidecar_db);
     load_sync_operand_resolver(extra_info_dir, m_sync_sidecar_db);
+    load_spin_wait_sidecar(extra_info_dir, m_spin_wait_sidecar_db);
     // BASE-MAP LOAD-FAILURE ASSERT (M4): real-base addressing is on by default. An empty
     // base_records map means tma_pc_base_map.json was missing, unparsable, or had no
     // descriptor sites. We deliberately FAIL here rather than silently falling back to the
@@ -700,6 +751,8 @@ void gpgpu_sim::parse_extra_trace_info(std::string filepath, bool is_extra_trace
         m_shader_config->trimchk_percta_log_enable) {
       std::cerr << "[SYNC] loaded operand_sites="
                 << m_sync_sidecar_db.site_records.size() << std::endl;
+      std::cerr << "[SPINWAIT] loaded spin_wait_regions="
+                << m_spin_wait_sidecar_db.regions_by_wait_pc.size() << std::endl;
     }
   }
 }
@@ -769,6 +822,18 @@ bool gpgpu_sim::lookup_sync_site_metadata(unsigned int unique_function_id,
   metadata.semantic_operand_role = record.semantic_operand_role;
   metadata.barrier_operand_text = record.barrier_operand_text;
   metadata.semantic_operand_text = record.semantic_operand_text;
+  return true;
+}
+
+bool gpgpu_sim::lookup_spin_wait_region(unsigned int unique_function_id,
+                                        address_type pc,
+                                        SpinWaitRegionRecord &region) const {
+  auto it = m_spin_wait_sidecar_db.regions_by_wait_pc.find(
+      SyncOperandLookupKey{unique_function_id, static_cast<uint64_t>(pc)});
+  if (it == m_spin_wait_sidecar_db.regions_by_wait_pc.end()) {
+    return false;
+  }
+  region = it->second;
   return true;
 }
 
@@ -2012,6 +2077,17 @@ void shader_core_config::reg_options(class OptionParser *opp) {
                          "ready (already satisfied, captured trace keeps polling) vs not-ready, plus "
                          "spin-loop opcode counts. Sizes fwd+bwd excess captured spin. Reads mbarrier "
                          "state only; never modifies it. (default=0)",
+                         "0");
+  option_parser_register(opp, "-spin_wait_observe_enable", OPT_BOOL,
+                         &spin_wait_observe_enable,
+                         "Observe-only measurement for the producer spin-wait collapse design. "
+                         "For every PHASECHK/TRYWAIT matching a spin_wait_sidecar.json "
+                         "primary_wait_pc, record how long the modeled mbarrier stays not-ready "
+                         "after the first not-ready poll of each (cta,warp,region) episode (the "
+                         "would-be park time under collapse) and whether the barrier ever flips "
+                         "(never-flip = deadlock candidate). Reads mbarrier state only; never "
+                         "blocks or advances the trace. Requires spin_wait_sidecar.json. "
+                         "(default=0)",
                          "0");
   option_parser_register(opp, "-trimchk_percta_log_enable", OPT_BOOL,
                          &trimchk_percta_log_enable,

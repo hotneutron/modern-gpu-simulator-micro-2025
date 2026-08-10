@@ -2271,6 +2271,16 @@ class shader_core_config : public core_config {
   // Reads mbarrier state only; never modifies it. Default 0.
   bool producer_spin_ready_instrument_enable;
 
+  // [Spin-wait observe] Observe-only measurement for the producer spin-wait
+  // collapse design (.plan/SPIN_WAIT_SIDECAR.md). For every PHASECHK/TRYWAIT that
+  // matches a spin_wait_sidecar.json primary_wait_pc, record — WITHOUT changing
+  // control flow — how long the modeled mbarrier stays not-ready after the FIRST
+  // not-ready poll of each (cta,warp,region) episode, i.e. how long the warp
+  // WOULD have been parked if collapse were on, and whether the barrier ever
+  // flips at all (never-flip = deadlock candidate). Reads mbarrier state only;
+  // never blocks or advances the trace. Default 0.
+  bool spin_wait_observe_enable;
+
   // [TRIMCHK]/[TRACECHECK] Gate verbose per-CTA trace-load contract lines:
   // path/warp counts plus active-lane, memory, sync, BAR, and opcode-work
   // counts. Off by default because it prints two lines per CTA. The
