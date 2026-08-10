@@ -800,13 +800,15 @@ baseline capture even when an older equivalent artifact exists.
 `LIGHTER_TRACER=off` explicitly selects the legacy full tracer.
 `LIGHTER_TRACER=all` resolves to the production feature set containing only
 independently validated features. The current production set is
-`compact_wire,prune_operands,sparse_reconstruct`. Implementing a new feature
-does not add it to `all`; promotion occurs only after its A/B capture,
-payload-preservation, and simulator functional gates pass. Opt 11-B satisfies
-those tracer/replay gates and is therefore promoted. Its Producer/Consumer
-timing failure is tracked separately as a simulator pacing problem and is not
-treated as trace incompleteness. The resolved canonical set is persisted, so
-the meaning of an old artifact does not depend on a later source version.
+`compact_wire,prune_operands` (Opt 11-A). Implementing a new feature does not
+add it to `all`; promotion occurs only after its A/B capture, payload
+preservation, dynamic opcode-order preservation, and simulator functional gates
+pass. Opt 11-B previously passed aggregate count/payload gates, but a later
+audit found that `sparse_reconstruct` can change opcode order. Its promotion is
+therefore withdrawn and the feature remains available only through an explicit
+feature set while that defect is unresolved. The resolved canonical set is
+persisted, so the meaning of an old artifact does not depend on a later source
+version.
 
 `all` is the production publication mode:
 
@@ -1035,7 +1037,7 @@ GPU capture result:
 | K5 NANOSLEEP / HW | 12.08x | 1.31x | major improvement |
 | K10 NANOSLEEP / HW | 35.40x | 3.62x | major improvement |
 
-Capture-level payload gates pass:
+The original aggregate capture-level payload gates passed:
 
 - all 10,982 threadblock protobufs are present (K5 132, K10 384);
 - HGMMA/MUFU/TMA-family counts remain exact at
@@ -1052,7 +1054,12 @@ The sparse artifact bundle does not contain the original process log, so
 function-level `cfg_misses` and emitted `[TRACE-SPARSE]` count equality remain
 a GPU-server log check.
 
-Simulator functional result:
+These gates did not compare the dynamic opcode sequence. A later audit found
+that `sparse_reconstruct` can change opcode order during host reconstruction.
+Therefore matching instruction totals, payload totals, and simulator clean
+exit are insufficient to establish a replay-safe trace.
+
+Historical simulator result from the affected sparse traces:
 
 | Metric | K5 fwd `.o69/.e69` | K10 bwd `.o43/.e43` |
 |---|---:|---:|
@@ -1070,34 +1077,33 @@ Simulator functional result:
 | Producer-minus-Consumer tail | -61,393.9 | -27,131.8 |
 | Fatal / deadlock / clean exit | 0 / 0 / yes | 0 / 0 / yes |
 
-The simulator functional gate passes completely: reconstructed instruction
-totals are exact, every CTA contract row loads, TMA traffic drains
-symmetrically, BAR state has no leaks, and both kernels exit cleanly.
+The reconstructed instruction totals, CTA rows, TMA traffic, BAR state, and
+clean exit matched the then-current aggregate gates. The opcode-ordering defect
+invalidates the stronger conclusion that the trace is functionally equivalent
+to the captured execution. These simulator values are retained only as
+historical measurements of the affected trace and must not be used for timing
+calibration or Producer/Consumer root-cause claims.
 
-The timing-fidelity gate still fails. Option 1B already ended the Producer
-37.9K K5 / 12.0K K10 cycles before the Consumer; the sparse capture widens
-those inversions to 61.4K / 27.1K. Real K5 HW instead has an approximately
-`+7,950.9`-cycle Producer tail. Removing capture-induced poll work therefore
-exposes, rather than creates, the simulator's missing inter-warp pacing: the
-shorter and more faithful Producer stream is issued too early, while the
-Consumer finishes later. The Option 1B spin had supplied accidental delay and
-partially hidden this model error.
-
-This mechanism is visible in TMA timing without a work or locality change.
+The affected run showed the following TMA timing changes without an aggregate
+work or locality change.
 K5/K10 TMA command totals remain exact and `L2_TMA_true_hit_rate` is stable,
 but weighted TMA issue-active cycles increase `131.7 -> 1,319.7` K5 and
 `311.7 -> 750.0` K10. Weighted interconnect-full cycles increase
 `3.7 -> 1,191.7` / `222.1 -> 660.3`, while `averagemflatency` increases
-`240 -> 1,046` / `459 -> 710`. The sparse Producer therefore creates a
-temporal TMA burst because replay has no HW timestamp constraint.
+`240 -> 1,046` / `459 -> 710`. Because opcode order is not preserved, these
+changes cannot currently be attributed to a simulator pacing defect.
 
-`sparse_reconstruct` is validated as a complete trace transport and replay
-feature and is promoted into `LIGHTER_TRACER=all`. This promotion does not
-declare simulator timing correct. The next fidelity step should preserve
-same-run CTA-relative timing at retained sparse semantic anchors and apply
-earliest-issue pacing during replay. This avoids Option 2's cross-run
-dynamic-scheduler join problem while retaining the sparse trace's low observer
-effect.
+`sparse_reconstruct` is removed from `LIGHTER_TRACER=all`. The production alias
+and unset default now resolve to Opt 11-A:
+
+```text
+compact_wire,prune_operands
+```
+
+Before reconsidering promotion, validation must compare the per-warp dynamic
+opcode/PC sequence against a non-sparse capture, identify and fix the first
+ordering divergence, and then rerun all payload, simulator functional, and
+timing gates.
 
 #### Stage 1C-B - dedicated metadata-only record
 
@@ -1872,22 +1878,19 @@ end-to-end manifest and validation report
   K10 dynamic instructions with zero active-mask, predicate-mask, function-ID,
   payload, or trailing-span mismatches. GPU capture then reduces callbacks by
   93.14% K5 / 91.90% K10 and NANOSLEEP by 89.11% / 89.76%, while fixed
-  HGMMA/MUFU/TMA/BAR work remains exact. Simulator replay passes exact
-  warp/active-lane instruction contracts, all CTA/TMA/BAR gates, and clean
-  completion. Timing fidelity still fails: cycles are 92,530 K5 / 143,560 K10,
-  while Producer-minus-Consumer tails widen to -61.4K / -27.1K. The feature is
-  replay-safe and is included in `all`; simulator pacing remains a separate
-  open problem.
+  HGMMA/MUFU/TMA/BAR aggregate work remains exact. A later audit found that
+  host reconstruction can change opcode order, which the aggregate gates did
+  not detect. The feature is not replay-safe and remains explicit-only until
+  per-warp opcode/PC sequence preservation is fixed and revalidated.
 - Lighter runs use configuration-suffixed argument folders containing a
   `lighter_tracer_config.json` manifest; existing lighter run directories are
   not overwritten.
 - `run_simulations.py -T <selected-run-directory>` accepts an exact
   benchmark/argument run directory after validating its benchmark and argument
   prefix, while preserving legacy trace-root discovery.
-- `LIGHTER_TRACER=all` currently resolves to the validated
-  `compact_wire,prune_operands,sparse_reconstruct` set and publishes to the
-  unsuffixed default argument directory for use with the standard CUDA-version
-  `-T` root.
+- `LIGHTER_TRACER=all` currently resolves to the Opt 11-A
+  `compact_wire,prune_operands` set and publishes to the unsuffixed default
+  argument directory for use with the standard CUDA-version `-T` root.
 - Device non-memory scalar path implemented.
 - Host mixed-record parser and validation implemented.
 - TMA absent-value sentinel filtering implemented.

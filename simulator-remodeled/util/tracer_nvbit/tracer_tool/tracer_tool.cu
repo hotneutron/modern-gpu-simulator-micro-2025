@@ -247,10 +247,10 @@ static void resolve_lighter_tracer_config() {
       "host_count",
       "sparse_reconstruct",
   };
+  // sparse_reconstruct remains explicit-only until opcode ordering is fixed.
   static const std::unordered_set<std::string> production_features = {
       "compact_wire",
       "prune_operands",
-      "sparse_reconstruct",
   };
 
   const char *lighter_value = getenv("LIGHTER_TRACER");

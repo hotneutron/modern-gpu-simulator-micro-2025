@@ -38,16 +38,20 @@ To keep this file easy to extend, use the following update pattern whenever a ne
 | Opt 9 | L2 sub-partition drain widening (ROP-drain + DRAM-reply-drain) | Two symmetric 1-sector/tick L2 gates, each its own knob: `-gpgpu_l2_rop_drain_per_cycle 2` (Gate A, REQUEST: ROP delay-queue→m_icnt_L2_queue) + `-gpgpu_l2_dram_reply_drain_per_cycle 2` (Gate B, REPLY: m_dram_L2_queue→L2 fill/L2_icnt; fill port modeled M-wide). Fixed latencies unchanged; timing-only (work invariant). | 135,999 cycles (100.9% error, **-1.5% vs Opt 8**). fwd `.o38`. `L2_TMA_true_hit_rate` 0.9455 (unchanged). Small (fwd still frontend-tail bound). | 215,895 cycles (**62.4% error**, **-18.4% vs Opt 8**). bwd `.o21`. `L2_TMA_true_hit_rate` 0.8682 (unchanged). **Unlocked Opt 8**: `L2_admit_per_active_cycle` 1.00→**1.93** (the 2-wide bank was starved by the 1/tick ROP feed); ROP_DELAY 558→**164** (-71%), `averagemflatency` 692→369. | Done. Opt 8+9 were a matched pair. Residual now spread across ROP(45%)+inject(37%)+reply(12.5%); no single 1/tick gate dominates. |
 | Opt 10 | intra-SMSP warp-switch (SFU issue-gating) | `-intra_smsp_warpswitch_enable 1` (code + config). At issue time, also check `fu->can_issue()` for no-queue FUs (SFU), so a busy-SFU MUFU (deterministic II=8) is filtered BEFORE the 1-deep `ISSUE_CONTROL` latch and GTO warp-switches to a ready warp instead of stalling the whole subcore. Queue FUs (MEM/TMA/MISC) keep the deferred path. II/latency unchanged; timing-only (work invariant). | 105,464 cycles (**55.8% error**, **-44.7% vs Opt 9**). fwd `.o58`. `gpu_sim_insn` **bit-identical** to baseline (455,565,060); `issue_stage_issuing` bit-identical (16,064,281). Head-of-line `next_stage` 25.1%→**0.06%**, `blocked_by_sfu` 11.48M→**0**. | 178,856 cycles (**34.6% error**, **-44.6% vs Opt 9**). bwd `.o33`. `gpu_sim_insn` bit-identical (629,211,348). `next_stage` 21.3%→**1.6%**, `blocked_by_sfu` 15.36M→**0**. Warp-switch recovered slot (`other_warp_issued/sfu_filtered`) fwd 31.7% / bwd 26.3%. | Done. The compute-path issue-pipeline defect (SFU head-of-line) fixed; residual (fwd 1.56x) is **SFU-throughput bound** (`still_idle` ≡ `fu_occupied_sfu`, warps queue on the one HW-faithful SFU), not an occupancy floor — next candidate axis is warp-stagger/overlap. See [CONSUMER_COMPUTE_BOUND.md](file:///home/jihyun/modern-gpu-simulator-micro-2025/.plan/CONSUMER_COMPUTE_BOUND.md). |
 | Opt 11-A | Lightweight NVBit full trace (Option 1B) | One untrimmed full capture with compact 104B/360B wire records and semantic callback pruning (`LIGHTER_TRACER="compact_wire,prune_operands"`, `TRIM_SPIN=0`). Transport falls from the original 136.55GB equivalent to 7.41GB (**-94.6%, 18.4x smaller**) and callback records fall 191.79M→64.78M (**-66.2%**), while all replay-visible memory/sync/BAR/TMA payload is retained. | **83,308 cycles (23.1% error, -62.1% vs first measured fwd baseline, -21.0% vs Opt 10)**. fwd `.o68`. `gpgpu_n_tot_w_icount=14,847,194`, `gpu_sim_insn=450,627,804`; both exactly equal the loaded Option 1B trace contract. | **136,898 cycles (3.0% error, -63.7% vs Init, -23.5% vs Opt 10)**. bwd `.o42`. `gpgpu_n_tot_w_icount=21,007,397`, `gpu_sim_insn=624,799,542`; both exactly equal the trace contract. | **Payload/functional gate PASS; timing-fidelity gate FAIL.** Clean exit, TMA unresolved=0, BAR leaks=0, and all HGMMA/MUFU/TMA/memory/sync/BAR totals match. However Producer ends 37.9K/12.0K cycles before Consumer (K5/K10), while K5 HW has a +8.0K Producer tail. K10's 3.0% aggregate error is therefore not proof of correct role timing. |
-| Opt 11-B | Sparse full-trace reconstruction | `LIGHTER_TRACER="compact_wire,prune_operands,sparse_reconstruct"`. Retain CFG boundaries and every predicated/memory/sync/BAR/TMA/control instruction, omit callback-only straight-line instructions, then reconstruct the complete protobuf on the host. K5/K10 callbacks fall 93.14%/91.90% and captured NANOSLEEP falls 89.11%/89.76%. | **92,530 cycles (36.7% error, +11.1% vs Opt 11-A)**. fwd `.o69/.e69`. `gpgpu_n_tot_w_icount=14,494,325`, `gpu_sim_insn=449,055,368`; exact sparse trace contract. Producer/Consumer mean completion = 26,035.9/87,429.8, tail **-61,393.9**. | **143,560 cycles (8.0% error, +4.9% vs Opt 11-A)**. bwd `.o43/.e43`. `gpgpu_n_tot_w_icount=20,019,180`, `gpu_sim_insn=625,678,016`; exact sparse trace contract. Producer/Consumer mean completion = 88,220.7/115,352.6, tail **-27,131.8**. | **Tracer/replay gates PASS; promoted to `LIGHTER_TRACER=all`. Simulator timing gate remains FAIL.** All CTA contracts load, TMA unresolved=0, BAR leaks=0, TMA requests/bytes drain exactly, and both runs exit cleanly. More accurate low-spin capture exposes a separate simulator inter-warp pacing problem. |
+| Opt 11-B | Sparse full-trace reconstruction | `LIGHTER_TRACER="compact_wire,prune_operands,sparse_reconstruct"`. Retain CFG boundaries and every predicated/memory/sync/BAR/TMA/control instruction, omit callback-only straight-line instructions, then reconstruct the complete protobuf on the host. K5/K10 callbacks fall 93.14%/91.90% and captured NANOSLEEP falls 89.11%/89.76%. | **Historical affected-trace result: 92,530 cycles (36.7% error, +11.1% vs Opt 11-A)**. fwd `.o69/.e69`. `gpgpu_n_tot_w_icount=14,494,325`, `gpu_sim_insn=449,055,368`; aggregate sparse trace contract matched, but opcode order was not preserved. Producer/Consumer mean completion = 26,035.9/87,429.8, tail **-61,393.9**. | **Historical affected-trace result: 143,560 cycles (8.0% error, +4.9% vs Opt 11-A)**. bwd `.o43/.e43`. `gpgpu_n_tot_w_icount=20,019,180`, `gpu_sim_insn=625,678,016`; aggregate sparse trace contract matched, but opcode order was not preserved. Producer/Consumer mean completion = 88,220.7/115,352.6, tail **-27,131.8**. | **Opcode-order integrity gate FAIL; production promotion withdrawn.** Aggregate counts, TMA/BAR drain, and clean exit did not detect reordered opcodes. `LIGHTER_TRACER=all` and the unset default now resolve to Opt 11-A (`compact_wire,prune_operands`); Opt 11-B remains explicit-only until fixed and revalidated. |
 
 ### Simulator Cycle Breakdown
+
+> **Opt 11-B columns are historical affected-trace data.** They are retained
+> for provenance but are not valid for architectural timing conclusions because
+> sparse reconstruction changed opcode order.
 
 #### FA3 fwd - top-level simulator breakdown
 
 | Class | Init | Opt 1 (`rop=100`) | Opt 2 (BAR impl) | Opt 3 (MEMBAR) | Opt 4 (prefetch, sb=4) | Opt 5 (eager-promote) | Opt 6 (TMA real base) | Opt 7 (queue calib) | Opt 8 (slice parallelism) | Opt 9 (drain widening) | Opt 10 (warp-switch) | Opt 11-A (light full trace) | Opt 11-B (sparse full trace) | Note |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| `sim_cycle` | — | 220,024 | 162,582 | 158,990 | 155,765 | 149,727 | 145,855 | 138,021 | 137,053 | 135,999 | 105,464 | **83,308** | **92,530** | Opt 11-B = `.o69` (**+11.1% vs Opt 11-A**, 1.37x HW). |
-| `no_warps_ready` | — | 64.02% | 23.83% | 20.98% | 26.81% | 27.32% | 27.93% | 29.51% | 29.14% | 29.22% | 51.22% | 51.20% | 45.49% | Sparse replay removes poll work but exposes missing Producer pacing. |
+| `sim_cycle` | — | 220,024 | 162,582 | 158,990 | 155,765 | 149,727 | 145,855 | 138,021 | 137,053 | 135,999 | 105,464 | **83,308** | **92,530** | Opt 11-B = `.o69`; historical affected-trace result. |
+| `no_warps_ready` | — | 64.02% | 23.83% | 20.98% | 26.81% | 27.32% | 27.93% | 29.51% | 29.14% | 29.22% | 51.22% | 51.20% | 45.49% | Opt 11-B timing interpretation withdrawn. |
 | `issuing` | — | 14.56% | 21.17% | 24.05% | 31.18% | 31.19% | 32.30% | 34.75% | 34.77% | 34.96% | 38.00% | 37.63% | 32.30% | |
 | `next_stage_not_available` | — | 11.40% | 15.25% | 17.26% | 22.45% | 22.46% | 23.23% | 24.90% | 24.96% | 25.07% | 0.06% | 0.06% | 0.05% | Head-of-line stays collapsed. |
 | `no_valid_instruction` | — | 9.52% | 39.12% | 37.01% | 18.63% | 18.11% | 15.59% | 9.81% | 10.10% | 9.72% | 9.60% | 9.91% | 21.08% | |
@@ -76,7 +80,7 @@ To keep this file easy to extend, use the following update pattern whenever a ne
 
 | Class | Init | Opt 1 (`rop=100`) | Opt 2 (BAR impl) | Opt 3 (MEMBAR) | Opt 4 (prefetch, sb=4) | Opt 5 (eager-promote) | Opt 6 (TMA real base) | Opt 7 (queue calib) | Opt 8 (slice parallelism) | Opt 9 (drain widening) | Opt 10 (warp-switch) | Opt 11-A (light full trace) | Opt 11-B (sparse full trace) | Note |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| `sim_cycle` | 376,735 | 361,760 | 328,643 | 259,456 | 241,528 | 241,425 | 290,572 | 250,026 | 234,665 | 215,895 | 178,856 | **136,898** | **143,560** | Opt 11-B = `.o43` (**+4.9% vs Opt 11-A**, 1.08x HW). |
+| `sim_cycle` | 376,735 | 361,760 | 328,643 | 259,456 | 241,528 | 241,425 | 290,572 | 250,026 | 234,665 | 215,895 | 178,856 | **136,898** | **143,560** | Opt 11-B = `.o43`; historical affected-trace result. |
 | `no_warps_ready` | 66.40% | 66.64% | 58.27% | 29.80% | 36.56% | 36.45% | 41.51% | 34.00% | 34.35% | 36.49% | 52.45% | 51.19% | 49.09% | Aggregate cycle remains misleading because Producer timing is inverted. |
 | `issuing` | 12.12% | 12.71% | 14.06% | 20.93% | 26.18% | 25.70% | 17.76% | 21.94% | 23.63% | 29.49% | 32.32% | 32.04% | 29.24% | |
 | `next_stage_not_available` | 10.17% | 10.69% | 11.41% | 15.11% | 18.96% | 18.52% | 12.88% | 15.83% | 17.11% | 21.35% | 1.63% | 1.72% | 1.68% | Head-of-line stays collapsed. |
@@ -212,7 +216,7 @@ FA3 fwd
 - Opt 11-B (sparse full-trace reconstruction)
   - Stats run: `H100_80GB-OnlyKernel5/flashattn-fa3-bf16-bwd-causal-b1-s2048-hd64-nh24-flashattn_fa3_bf16_bwd_causal_b1_s2048_hd64_nh24___warmup_-63a73d452237.o69`
   - Event / debug run: `H100_80GB-OnlyKernel5/flashattn-fa3-bf16-bwd-causal-b1-s2048-hd64-nh24-flashattn_fa3_bf16_bwd_causal_b1_s2048_hd64_nh24___warmup_-63a73d452237.e69`
-  - Note: `LIGHTER_TRACER="compact_wire,prune_operands,sparse_reconstruct"` trace consumed. `gpgpu_n_tot_w_icount=14,494,325` and `gpu_sim_insn=449,055,368` exactly match the reconstructed trace. Final cycle = **92,530** (**36.7% error**, **+11.1% vs Opt 11-A**). TMA unresolved=0, BAR leaks=0, clean exit; Producer-minus-Consumer tail = **-61,393.9 cycles**.
+  - Note: historical affected trace. Aggregate counts, TMA/BAR drain, and clean exit passed, but opcode order was not preserved. Final cycle **92,530** and Producer-minus-Consumer tail **-61,393.9 cycles** are not valid timing evidence.
 
 FA3 bwd
 
@@ -284,14 +288,15 @@ FA3 bwd
 - Opt 11-B (sparse full-trace reconstruction)
   - Stats run: `H100_80GB-OnlyKernel10/flashattn-fa3-bf16-bwd-causal-b1-s2048-hd64-nh24-flashattn_fa3_bf16_bwd_causal_b1_s2048_hd64_nh24___warmup_-63a73d452237.o43`
   - Event / debug run: `H100_80GB-OnlyKernel10/flashattn-fa3-bf16-bwd-causal-b1-s2048-hd64-nh24-flashattn_fa3_bf16_bwd_causal_b1_s2048_hd64_nh24___warmup_-63a73d452237.e43`
-  - Note: `LIGHTER_TRACER="compact_wire,prune_operands,sparse_reconstruct"` trace consumed. `gpgpu_n_tot_w_icount=20,019,180` and `gpu_sim_insn=625,678,016` exactly match the reconstructed trace. Final cycle = **143,560** (**8.0% error**, **+4.9% vs Opt 11-A**). TMA unresolved=0, BAR leaks=0, clean exit; Producer-minus-Consumer tail = **-27,131.8 cycles**.
+  - Note: historical affected trace. Aggregate counts, TMA/BAR drain, and clean exit passed, but opcode order was not preserved. Final cycle **143,560** and Producer-minus-Consumer tail **-27,131.8 cycles** are not valid timing evidence.
 
 ### Secondary / historical — post-Opt-10 issue-density gap
 
 > This section records the pre-Opt-11-A/B compute-path investigation and remains
-> useful as architectural background. It is no longer the primary next step:
-> Opt 11-B shows that the active trace-timing blocker is missing same-run
-> Producer pacing, which creates temporal TMA bursts during replay.
+> useful as architectural background. Opt 11-B cannot be used to reprioritize
+> this work because sparse reconstruction was later found to change opcode
+> order. Any further simulator timing analysis must use the Opt 11-A production
+> trace until Opt 11-B is fixed and recaptured.
 
 The dominant post-Opt-10 compute-path residual. **No cycle claim.** Multiple leads were investigated and
 closed (stagger dead; `stall_count`-latency refuted; tensor over-model refuted by raw-count re-profile —
@@ -838,12 +843,12 @@ Transport result:
   scheduler, mbarrier, and TMA models. Therefore K10's 3.0% aggregate cycle
   error is not complete validation: excess trace spin and premature Producer
   completion can partially cancel.
-- **Follow-up completed by Opt 11-B.** Sparse reconstruction reduces K5/K10
-  callbacks by 93.14%/91.90% and capture NANOSLEEP by 89.11%/89.76% while
-  preserving the complete replay contract. The remaining primary direction is
-  same-run CTA-relative semantic-anchor timestamps plus simulator
-  earliest-issue pacing. Offline count trim and dual-run reorganization remain
-  fallback mechanisms. The staged implementation and validation handoff is in
+- **Opt 11-B follow-up invalidated.** Sparse reconstruction reduces K5/K10
+  callbacks by 93.14%/91.90% and capture NANOSLEEP by 89.11%/89.76%, but a
+  later audit found that host reconstruction can change opcode order. Aggregate
+  counts and payload totals did not detect this failure. `LIGHTER_TRACER=all`
+  is therefore restored to Opt 11-A until sparse opcode/PC sequence preservation
+  is fixed and revalidated. The staged implementation record is in
   [Lighter_NVbit_Tracing.md](../.plan/Lighter_NVbit_Tracing.md#next-session-implementation-handoff).
 
 ### Opt 11-B - sparse full-trace reconstruction
@@ -867,10 +872,12 @@ from static SASS before writing the existing complete protobuf format.
 | K5 NANOSLEEP | 102,159 | 11,125 (-89.11%, 1.31x HW) |
 | K10 NANOSLEEP | 278,211 | 28,491 (-89.76%, 3.62x HW) |
 
-Fixed HGMMA/MUFU/TMA/BAR work remains exact, all 10,982 threadblock files are
-present, and TMA/sync descriptor sidecars match the Option 1B reference.
+Fixed HGMMA/MUFU/TMA/BAR aggregate work remains exact, all 10,982 threadblock
+files are present, and TMA/sync descriptor sidecars match the Option 1B
+reference. These aggregate checks do not prove dynamic opcode-order
+preservation.
 
-#### Simulator result
+#### Historical simulator result from affected traces
 
 | Result | K5 fwd `.o69/.e69` | K10 bwd `.o43/.e43` |
 |---|---:|---:|
@@ -886,32 +893,24 @@ present, and TMA/sync descriptor sidecars match the Option 1B reference.
 | Consumer mean completion | 87,429.8 | 115,352.6 |
 | Producer-minus-Consumer tail | -61,393.9 | -27,131.8 |
 
-- **Functional gate: PASS.** Both kernels reproduce the complete sparse
-  protobuf contracts exactly, all TMA requests and bytes complete, no BAR
-  state leaks, no fatal/deadlock signal appears, and both simulations exit
-  cleanly.
-- **Production promotion: PASS.** Opt 11-B is the validated tracer/replay
-  configuration behind `LIGHTER_TRACER=all`, and unset `LIGHTER_TRACER`
-  defaults to this production set. `LIGHTER_TRACER=off` is the explicit legacy
-  full-trace opt-out. Both production `all` and legacy `off` use the original
-  unsuffixed argument directory; explicit feature sets retain `_lighter-...`
-  suffixes. Promotion does not mark simulator timing as correct.
-- **Timing gate: FAIL.** The Producer/Consumer inversion grows from Option
-  1B's -37.9K/-12.0K to -61.4K/-27.1K. Real K5 HW instead has an approximately
-  +8.0K Producer tail.
-- **Interpretation.** Sparse capture successfully removes observer-induced
-  polling, but the full protobuf still has no HW inter-warp timestamps. The
-  reduced Producer instruction stream is replayed too early, and the excess
-  Option 1B spin is no longer present to act as accidental delay. The next
-  fidelity step is same-run CTA-relative semantic-anchor timestamps plus
-  earliest-issue pacing, not restoring fake spin or relying on aggregate cycle
-  cancellation.
+- **Aggregate replay gates: PASS but insufficient.** Both kernels match total
+  instruction/payload counts, drain TMA requests and bytes, leak no BAR state,
+  and exit cleanly.
+- **Opcode-order integrity gate: FAIL.** Host reconstruction can reorder
+  opcodes, so matching totals and clean exit do not establish functional
+  equivalence to the captured execution.
+- **Production promotion: WITHDRAWN.** `LIGHTER_TRACER=all` and the unset
+  default now resolve to Opt 11-A (`compact_wire,prune_operands`).
+  `sparse_reconstruct` remains explicit-only until fixed and revalidated.
+- **Timing conclusion: INVALID.** The -61.4K/-27.1K role tails and associated
+  TMA burst measurements come from order-corrupted traces. They remain
+  historical measurements but cannot isolate a simulator timing defect.
 
-The cycle increase is a temporal-burst effect, not additional work or a changed
-address stream. K5/K10 TMA command counts remain exact and
+The affected traces show a cycle increase without additional aggregate work or
+a changed address stream. K5/K10 TMA command counts remain exact and
 `L2_TMA_true_hit_rate` stays effectively unchanged
-(`0.9444 -> 0.9461` / `0.8677 -> 0.8676`), but removing poll work lets the
-Producer reach TMA commands much earlier:
+(`0.9444 -> 0.9461` / `0.8677 -> 0.8676`). Their recorded TMA timing deltas
+were:
 
 | TMA timing metric | K5 Option 1B -> Sparse | K10 Option 1B -> Sparse |
 |---|---:|---:|
@@ -922,11 +921,10 @@ Producer reach TMA commands much earlier:
 | Interconnect backpressure events | 685 -> 4,050 | 12,729 -> 17,188 |
 | `averagemflatency` | 240 -> 1,046 | 459 -> 710 |
 
-Consequently, Producer mean completion moves earlier by 13.0K K5 / 9.0K K10
-cycles while Consumer completion moves later by 10.4K / 6.2K. Option 1B's
-excess spin had unintentionally rate-limited TMA issue. Sparse capture removes
-that accidental throttle, so the simulator's missing Producer pacing turns
-into TMA bursts and a longer Consumer critical path.
+Producer mean completion moved earlier by 13.0K K5 / 9.0K K10 cycles while
+Consumer completion moved later by 10.4K / 6.2K. Because the sparse traces
+changed opcode order, these deltas cannot be causally attributed to removed
+spin, TMA pacing, or another simulator timing mechanism.
 
 ## 3. Arch TODO
 
