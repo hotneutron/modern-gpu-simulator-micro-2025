@@ -38,7 +38,7 @@ LIGHTER_TRACER_IMPLEMENTED_FEATURES = frozenset(
 )
 
 LIGHTER_TRACER_PRODUCTION_FEATURES = frozenset(
-    ("compact_wire", "prune_operands")
+    ("compact_wire", "prune_operands", "sparse_reconstruct")
 )
 
 LIGHTER_TRACER_FEATURE_DEPENDENCIES = {
@@ -162,10 +162,12 @@ def parse_lighter_tracer_feature_set(raw_value):
 
 def resolve_lighter_tracer(lighter_tracer_value):
     if lighter_tracer_value is None:
+        features = parse_lighter_tracer_feature_set("all")
         return LighterTracerConfig(
-            requested="off",
-            features=(),
+            requested="all",
+            features=features,
             source="default",
+            publish_default=True,
         )
 
     stripped_value = lighter_tracer_value.strip()

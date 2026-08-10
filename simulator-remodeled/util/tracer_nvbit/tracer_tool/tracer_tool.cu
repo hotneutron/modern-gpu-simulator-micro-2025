@@ -250,14 +250,15 @@ static void resolve_lighter_tracer_config() {
   static const std::unordered_set<std::string> production_features = {
       "compact_wire",
       "prune_operands",
+      "sparse_reconstruct",
   };
 
   const char *lighter_value = getenv("LIGHTER_TRACER");
   std::unordered_set<std::string> features;
-  std::string requested = lighter_value == nullptr ? "off" : lighter_value;
+  std::string requested = lighter_value == nullptr ? "all" : lighter_value;
   const char *source = lighter_value == nullptr ? "default" : "LIGHTER_TRACER";
   std::string raw =
-      lighter_value == nullptr ? "off" : trim_config_token(lighter_value);
+      lighter_value == nullptr ? "all" : trim_config_token(lighter_value);
   if (raw.empty()) {
     lighter_tracer_config_error(
         "LIGHTER_TRACER must not be empty; use 'off'");

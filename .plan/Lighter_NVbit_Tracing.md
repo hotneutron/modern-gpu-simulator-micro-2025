@@ -796,21 +796,31 @@ Every candidate is compared with its listed baseline captured from the same
 binary, git SHA, benchmark arguments, and GPU. A source change requires a new
 baseline capture even when an older equivalent artifact exists.
 
-`LIGHTER_TRACER` unset or `LIGHTER_TRACER=off` selects the legacy tracer.
-`LIGHTER_TRACER=all` resolves to a separate production feature set containing
-only independently validated features. The current production set is
-`compact_wire,prune_operands`. Implementing a new feature does not add it to
-`all`; promotion occurs only after its A/B and payload/timing gates pass. The
-resolved canonical set is persisted, so the meaning of an old artifact does
-not depend on a later source version.
+`LIGHTER_TRACER` unset defaults to `LIGHTER_TRACER=all`.
+`LIGHTER_TRACER=off` explicitly selects the legacy full tracer.
+`LIGHTER_TRACER=all` resolves to the production feature set containing only
+independently validated features. The current production set is
+`compact_wire,prune_operands,sparse_reconstruct`. Implementing a new feature
+does not add it to `all`; promotion occurs only after its A/B capture,
+payload-preservation, and simulator functional gates pass. Opt 11-B satisfies
+those tracer/replay gates and is therefore promoted. Its Producer/Consumer
+timing failure is tracked separately as a simulator pacing problem and is not
+treated as trace incompleteness. The resolved canonical set is persisted, so
+the meaning of an old artifact does not depend on a later source version.
 
 `all` is the production publication mode:
 
 - explicit feature lists keep their configuration suffixes for A/B isolation;
+- unset `LIGHTER_TRACER` and explicit `LIGHTER_TRACER=all` both select the
+  production set;
 - `LIGHTER_TRACER=all` writes the validated result to the original unsuffixed
   `<CUDA>/<benchmark>/<argument-folder>/traces` location;
-- publication still refuses to overwrite an existing unsuffixed run, so the
-  prior default artifact must be archived or removed explicitly;
+- `LIGHTER_TRACER=off` also uses that original unsuffixed location for the
+  legacy full trace, so `off` and `all` artifacts cannot coexist in one trace
+  root; archive the existing argument folder before switching modes;
+- `all` publication refuses to overwrite an existing unsuffixed run. Legacy
+  `off` retains the historical directory behavior, so archive the existing
+  argument folder before either mode switch to avoid mixed artifacts;
 - simulation uses the standard CUDA-version trace root, for example
   `-T ./hw_run/traces/device-0/12.8/`;
 - `-T` remains required because it selects trace-driven simulation mode.
@@ -1082,11 +1092,12 @@ but weighted TMA issue-active cycles increase `131.7 -> 1,319.7` K5 and
 temporal TMA burst because replay has no HW timestamp constraint.
 
 `sparse_reconstruct` is validated as a complete trace transport and replay
-feature, but remains outside `all` until the production timing policy is
-settled. The next fidelity step should preserve same-run CTA-relative timing
-at retained sparse semantic anchors and apply earliest-issue pacing during
-replay. This avoids Option 2's cross-run dynamic-scheduler join problem while
-retaining the sparse trace's low observer effect.
+feature and is promoted into `LIGHTER_TRACER=all`. This promotion does not
+declare simulator timing correct. The next fidelity step should preserve
+same-run CTA-relative timing at retained sparse semantic anchors and apply
+earliest-issue pacing during replay. This avoids Option 2's cross-run
+dynamic-scheduler join problem while retaining the sparse trace's low observer
+effect.
 
 #### Stage 1C-B - dedicated metadata-only record
 
@@ -1865,7 +1876,8 @@ end-to-end manifest and validation report
   warp/active-lane instruction contracts, all CTA/TMA/BAR gates, and clean
   completion. Timing fidelity still fails: cycles are 92,530 K5 / 143,560 K10,
   while Producer-minus-Consumer tails widen to -61.4K / -27.1K. The feature is
-  replay-safe but remains outside `all` pending the timing policy.
+  replay-safe and is included in `all`; simulator pacing remains a separate
+  open problem.
 - Lighter runs use configuration-suffixed argument folders containing a
   `lighter_tracer_config.json` manifest; existing lighter run directories are
   not overwritten.
@@ -1873,8 +1885,9 @@ end-to-end manifest and validation report
   benchmark/argument run directory after validating its benchmark and argument
   prefix, while preserving legacy trace-root discovery.
 - `LIGHTER_TRACER=all` currently resolves to the validated
-  `compact_wire,prune_operands` set and publishes to the unsuffixed default
-  argument directory for use with the standard CUDA-version `-T` root.
+  `compact_wire,prune_operands,sparse_reconstruct` set and publishes to the
+  unsuffixed default argument directory for use with the standard CUDA-version
+  `-T` root.
 - Device non-memory scalar path implemented.
 - Host mixed-record parser and validation implemented.
 - TMA absent-value sentinel filtering implemented.
