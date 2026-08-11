@@ -87,6 +87,69 @@ def is_local_mem(op):
     return any(op.startswith(p) for p in LOCAL_MEM_PREFIXES)
 
 
+# Async producers whose SASS scoreboard barrier release is DECOUPLED from issue
+# (the barrier is released by a later async completion, not at the arming
+# instruction's own pipeline stage). If one sits inside a spin body, whole-loop
+# skip would drop an arm whose release lives outside the body and corrupt the
+# scoreboard. Distinct from SEMANTIC_PREFIXES (overlaps, but this list is the
+# barrier-safety gate specifically). See .plan/SPIN_WAIT_COLLAPSE_DESIGN.md 12.7.
+ASYNC_PRODUCER_PREFIXES = (
+    "HGMMA", "IGMMA", "QGMMA", "BGMMA", "OGMMA", "MMA", "WGMMA",
+    "UTMALDG", "UTMASTG", "UTMACMDFLUSH", "UBLKCP", "UBLKPF", "UTMAPF",
+    "UTMAREDG", "UBLKRED", "UTMACCTL",
+    "LDGSTS", "LDG", "STG", "LDS", "STS", "ATOM", "ATOMS", "RED",
+    "DEPBAR", "LDGDEPBAR",
+)
+
+
+def is_async_producer(op):
+    return any(op == p or op.startswith(p + ".") or op.startswith(p)
+               for p in ASYNC_PRODUCER_PREFIXES)
+
+
+def _cb(inst):
+    return inst.get("control_bits", {}) or {}
+
+
+def compute_barrier_self_tied(body_pcs, byp):
+    """A spin body is barrier-self-tied iff whole-loop skip cannot corrupt the SASS
+    scoreboard wait-barrier state. In this model a wait-barrier armed by an
+    instruction is released by that SAME instruction's own pipeline stage (write
+    barrier at WB, read barrier at read-stage), so an arm INSIDE the body is
+    released INSIDE the body -> skipping is net-zero. The two ways it breaks:
+      (1) a body instruction WAITS on a barrier id that is NOT armed inside the
+          body (its arming instruction is outside the skip set), or
+      (2) a body op is an async producer whose barrier release is decoupled from
+          issue (GMMA/TMA/LDGSTS/DEPBAR/global-shared memory).
+    Returns (self_tied: bool, reason_fields: dict) for logging.
+    """
+    armed_ids = set()
+    waited_ids = set()
+    async_ops = []
+    for p in body_pcs:
+        inst = byp[p]
+        op = inst["op_code"]
+        cb = _cb(inst)
+        if cb.get("is_new_read_barrier"):
+            armed_ids.add(int(cb.get("id_new_read_barrier", -1)))
+        if cb.get("is_new_write_barrier"):
+            armed_ids.add(int(cb.get("id_new_write_barrier", -1)))
+        mask = int(cb.get("wait_barrier_bits", 0) or 0)
+        for bit in range(6):
+            if mask & (1 << bit):
+                waited_ids.add(bit)
+        if is_async_producer(op):
+            async_ops.append((hex(p), op))
+    wait_on_external = sorted(waited_ids - armed_ids)
+    self_tied = (not wait_on_external) and (not async_ops)
+    return self_tied, {
+        "armed_ids": sorted(armed_ids),
+        "waited_ids": sorted(waited_ids),
+        "wait_on_externally_armed_ids": wait_on_external,
+        "async_producer_ops": async_ops,
+    }
+
+
 def bra_target(inst):
     if inst["op_code"].split(".")[0] != "BRA":
         return None
@@ -152,6 +215,7 @@ def detect_regions(fid, byp, sync_sites):
                     if sync_sites[(fid, p)]["sync_kind"] == "PHASECHK"]
         primary_wait = (phasechk[-1] if phasechk else wait_pcs[-1])
         wsite = sync_sites[(fid, primary_wait)]
+        self_tied, bar_reason = compute_barrier_self_tied(body_pcs, byp)
         regions.append({
             "region_id": "k_fid%d_h0x%x" % (fid, tgt),
             "loop_head_pc": tgt,
@@ -167,6 +231,8 @@ def detect_regions(fid, byp, sync_sites):
             "semantic_free_body": len(sem_ops) == 0,
             "semantic_ops_in_body": sem_ops,
             "local_mem_ops_in_body": local_ops,
+            "barrier_self_tied": self_tied,
+            "barrier_reason": bar_reason,
         })
     return regions
 
@@ -278,8 +344,17 @@ def main():
             st = stats[r["region_id"]]
             r_out = dict(r)
             r_out["dynamic"] = st
+            # The simulator collapses a region ONLY if all three gates hold:
+            # it is an actual spin loop, its body has no semantic work, and its
+            # SASS wait-barriers are self-tied (whole-loop skip is scoreboard
+            # net-zero). See .plan/SPIN_WAIT_COLLAPSE_DESIGN.md 12.7.
+            r_out["collapsible"] = bool(
+                st["is_spin_loop"] and r["semantic_free_body"]
+                and r["barrier_self_tied"])
             clean.append(r_out)
             if not r["semantic_free_body"]:
+                strict_violation = True
+            if st["is_spin_loop"] and not r["barrier_self_tied"]:
                 strict_violation = True
         out_kernels.append({
             "kernel_id": kid,
@@ -290,33 +365,47 @@ def main():
             "spin_regions": clean,
         })
         n_sem = sum(0 if r["semantic_free_body"] else 1 for r in regions)
+        n_collapsible = sum(1 for r in clean if r["collapsible"])
+        n_bar_unsafe = sum(1 for r in regions
+                           if not r["barrier_self_tied"]
+                           and stats[r["region_id"]]["is_spin_loop"])
         print("[spin-sidecar] kernel_%d funcid=%d: %d spin regions "
-              "(semantic-free=%d, WITH-semantic=%d), validated %d CTAs"
-              % (kid, fid, len(regions), len(regions) - n_sem, n_sem, n_ctas))
+              "(collapsible=%d, semantic-in-body=%d, spin+barrier-unsafe=%d), "
+              "validated %d CTAs"
+              % (kid, fid, len(regions), n_collapsible, n_sem, n_bar_unsafe, n_ctas))
         for r in clean:
             st = r["dynamic"]
-            flag = "" if r["semantic_free_body"] else "  [!! SEMANTIC IN BODY]"
             kind = "spin" if st["is_spin_loop"] else "single-shot"
+            flags = ""
+            if not r["semantic_free_body"]:
+                flags += "  [!! SEMANTIC IN BODY]"
+            if st["is_spin_loop"] and not r["barrier_self_tied"]:
+                flags += "  [!! BARRIER NOT SELF-TIED %s]" % (
+                    r["barrier_reason"]["wait_on_externally_armed_ids"]
+                    or [o for _, o in r["barrier_reason"]["async_producer_ops"]])
             note = ""
             if r["local_mem_ops_in_body"]:
                 note = "  local_mem=%d" % len(r["local_mem_ops_in_body"])
             print("    %-16s [%-11s] head=0x%-5x wait=0x%-5x(%s) exit=0x%-5x "
-                  "iters[min/max/tot]=%s/%s/%s warp_visits=%d%s%s"
+                  "iters[min/max/tot]=%s/%s/%s warp_visits=%d collapsible=%d%s%s"
                   % (r["region_id"], kind, r["loop_head_pc"], r["primary_wait_pc"],
                      r["primary_wait_kind"], r["exit_pc"],
                      st["min_iters"], st["max_iters"], st["total_iters"],
-                     st["warp_visits"], note, flag))
+                     st["warp_visits"], int(r["collapsible"]), note, flags))
 
     sidecar = {
-        "version": 1,
+        "version": 2,
         "schema": "spin_wait_sidecar",
         "source_traces_dir": os.path.abspath(traces),
         "isize_bytes": ISIZE,
-        "note": ("PC-anchored producer spin-wait regions. The simulator should, "
-                 "at each region, block the warp until the modeled mbarrier at "
-                 "the captured barrier_addr of primary_wait_pc is ready, then set "
-                 "used_insts to the next exit_pc occurrence, instead of replaying "
-                 "the recorded poll count. Barrier address is runtime-only."),
+        "note": ("PC-anchored producer/consumer spin-wait regions. The simulator "
+                 "collapses a region ONLY if collapsible=true (is_spin_loop && "
+                 "semantic_free_body && barrier_self_tied): block the warp until "
+                 "the modeled mbarrier at the runtime barrier_addr of "
+                 "primary_wait_pc is ready, then advance the trace cursor to the "
+                 "next exit_pc instead of replaying the recorded poll count. "
+                 "barrier_self_tied guarantees whole-loop skip is scoreboard "
+                 "net-zero. Barrier address is runtime-only."),
         "kernels": out_kernels,
     }
     out_path = args.out or os.path.join(extra, "spin_wait_sidecar.json")
@@ -324,7 +413,8 @@ def main():
         json.dump(sidecar, fh, indent=2)
     print("[spin-sidecar] wrote %s (%d kernels)" % (out_path, len(out_kernels)))
     if args.strict and strict_violation:
-        sys.exit("[spin-sidecar] STRICT: a detected region has semantic ops in its body")
+        sys.exit("[spin-sidecar] STRICT: a spin region has semantic ops in its "
+                 "body or a non-self-tied SASS wait-barrier (not collapse-safe)")
 
 
 if __name__ == "__main__":
