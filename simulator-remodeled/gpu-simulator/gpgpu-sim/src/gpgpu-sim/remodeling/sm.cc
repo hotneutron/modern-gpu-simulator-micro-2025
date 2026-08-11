@@ -933,14 +933,26 @@ void SM::record_spin_wait_observe(unsigned wid, uint64_t wait_pc,
     }
     return;
   }
-  // ready:
-  if (st.episode_open && st.active_wait_pc == wait_pc) {
+  // ready: close the open episode iff it is waiting on THIS barrier (the barrier
+  // flip is the real spin-loop exit). Keying close on the BARRIER, not the
+  // wait_pc/wait_state, is essential: a producer leaves its spin loop as soon as
+  // the barrier flips, and on the next poll the phase parity has changed, so the
+  // same wait_pc is re-polled with a DIFFERENT wait_state and never matched the
+  // open episode -- leaving it falsely "open" even though the barrier flipped
+  // normally (K5 SM27 barrier 0x16c00 flips at cyc 10049/30658 yet produced 1371
+  // false [SPINWAITOPEN] under the old wait_pc-keyed close). Closing on
+  // "same barrier observed ready" tracks the real exit and equals the would-be
+  // collapse park (park ends when the barrier is ready).
+  if (st.episode_open && st.active_barrier_addr == barrier_addr) {
+    SpinWaitRegionObserve &open_reg =
+        m_spin_wait_observe_by_region[st.active_wait_pc];
+    open_reg.primary_wait_pc = st.active_wait_pc;
     const unsigned long long delta =
         now >= st.first_not_ready_cycle ? now - st.first_not_ready_cycle : 0;
-    reg.episodes++;
-    reg.park_cycles_total += delta;
-    if (delta > reg.park_cycles_max) {
-      reg.park_cycles_max = delta;
+    open_reg.episodes++;
+    open_reg.park_cycles_total += delta;
+    if (delta > open_reg.park_cycles_max) {
+      open_reg.park_cycles_max = delta;
     }
     const unsigned b = (delta == 0)     ? 0
                      : (delta <= 16)    ? 1
@@ -948,14 +960,16 @@ void SM::record_spin_wait_observe(unsigned wid, uint64_t wait_pc,
                      : (delta <= 256)   ? 3
                      : (delta <= 1024)  ? 4
                                         : 5;
-    reg.park_hist[b]++;
+    open_reg.park_hist[b]++;
     st.episode_open = false;
     st.watchdog_fired = false;
-  } else {
-    // ready with no open not-ready episode for this region: the barrier was
-    // already satisfied at the first poll (would-be park = 0).
+  } else if (!st.episode_open) {
+    // ready with no open episode: the barrier was already satisfied at the first
+    // poll of this region (would-be park = 0).
     reg.immediate_ready_polls++;
   }
+  // (ready while an episode is open on a DIFFERENT barrier: leave that episode
+  // open; it closes when its own barrier flips.)
 }
 
 void SM::print_spin_wait_observe_summary() const {

@@ -356,3 +356,36 @@ A single (12h) observe run selects the next step:
 
 The GO path's collapse work is specified in §8. The watchdog there is mandatory,
 not optional, because it is the only mechanism that covers the two limits in §9.
+
+## 11. First observe-only run results (Opt 11-A, K5 `.o70` / K10 `.o44`)
+
+Verdict: **GO** (no deadlock; real park exists). Detail:
+
+| Signal | K5 | K10 | Meaning |
+|---|---:|---:|---|
+| `watchdog_hits` (park > 400K) | 0 | 0 | no unbounded wait |
+| `[SPINWAITDEADLOCK]` | 0 | 0 | no over-threshold park |
+| closed-episode `total_park` | 0.63M | 3.10M | real would-be pacing exists |
+| hottest region | `0xb2b0` 403K | `0xb980` 1.33M | most park weight in `>1024` bucket |
+
+- **No deadlock.** Every barrier flips normally. Verified directly on the `cyc=`
+  timeline: K5 SM27 barrier `0x16c00` flips at `cyc=10049` and `30658`
+  (`arrive_expect_tx` -> two `tma_complete` -> `phase flip`), and the kernel ends
+  cleanly at `gpu_sim_cycle=83705`.
+- **Large park confirms collapse is worth doing** (not a PIVOT): the closed
+  episodes carry hundreds of thousands (K5) to millions (K10) of would-be park
+  cycles, mostly in the `>1024`-cycle bucket.
+
+### Measurement artifact found and fixed (episode close)
+
+The first run also printed many `[SPINWAITOPEN]` lines (K5 1471, K10 2539), which
+initially looked like never-flip deadlocks. They were **not**: 93% were a single
+consumer wait (`wait_pc=0xace0`, `episodes=0` — never closed). Root cause was an
+observe bug, not a simulator deadlock: the episode was closed only when the same
+`wait_pc` was re-polled ready, but once the barrier flips the phase parity
+changes, so the next poll of that `wait_pc` uses a different `wait_state` and
+never matched. `record_spin_wait_observe` now closes an episode when the **same
+`barrier_addr`** is observed ready (the real spin-loop exit), and the residual
+`[SPINWAITOPEN]` count reflects true never-flip only. The fix is committed but the
+12h run was **not** re-executed — the GO decision already holds from the barrier
+flips confirmed on the timeline and the non-zero closed-episode park.
