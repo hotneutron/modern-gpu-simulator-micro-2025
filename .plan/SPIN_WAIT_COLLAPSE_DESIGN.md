@@ -181,6 +181,26 @@ flush/rollback the loop already uses every iteration.
   It does NOT call `flush`'s redirect (that only moves the fetch PC, not the
   cursors — the B1 hazard). The bound `used_insts < traced_pcs.size()` protects
   the `get_pc()` assert at trace_driven.cc:172.
+
+  **CRITICAL — stop on `exit_pc`, not on "leaving body_pcs".** `body_pcs` is
+  `loop_head .. up to but EXCLUDING loopback_bra_pc`, so the loopback BRA
+  (`loopback_bra_pc`, e.g. 0xacf0) is NOT in `body_pcs`. The set of PCs the walk
+  actually consumes each iteration is `body_pcs ∪ {loopback_bra_pc}` =
+  {0xacb0,0xacc0,0xacd0,0xace0,0xacf0}. If the walk instead stopped as soon as it
+  saw a PC not in `body_pcs`, it would halt at the FIRST loopback BRA and land the
+  cursor on 0xacf0 instead of the exit — corrupting the collapse. The condition
+  MUST be the positive `traced_pcs[used_insts] != exit_pc`, advancing over
+  whatever PCs appear (verified contiguous, no foreign interleave), which
+  naturally consumes the loopback BRA occurrences too.
+
+  **Landing: stop AT exit_pc, then ISSUE it normally — do NOT jump to its target.**
+  exit_pc (e.g. 0xad00) is itself a BRA to the semantic block (0x1380). Leave
+  `used_insts` pointing AT the exit BRA occurrence and let it issue: its captured
+  `next_traced_pc` (=0x1380) differs from `pc+isize`, so the existing
+  `IBuffer::issued()` redirect flushes and re-fetches at 0x1380 — the standard
+  taken-branch path, no special fetch surgery. Landing directly on 0x1380 instead
+  would leave the exit BRA's occurrence cursor unincremented and force a manual
+  fetch redirect; do not do that.
 - **Not reused (rejected):** the `m_next_pc_to_fetch_request = next_traced_pc`
   redirect alone (B1) — leaves per-pc cursors behind, re-binds stale phase-parity
   payload (Investigation 1).
@@ -235,6 +255,30 @@ bit-identical to today.
 - Only arm this for polls that match a sidecar region with
   `semantic_free_body && is_spin_loop`. All other PHASECHK/TRYWAIT stay nonblocking
   (unchanged).
+
+### 5.1 Exact park point and pre-poll semantics (resolved)
+
+The park is armed at the region's `primary_wait_pc` (the last PHASECHK, e.g.
+0xace0), NOT at the earlier TRYWAIT (0xacc0). Evidence: the TRYWAIT and the
+PHASECHK have byte-identical operands — same barrier address `[R7+URZ+0x16800]`,
+same phase-parity reg R15 — so they test the SAME barrier at the SAME phase; the
+PHASECHK's `!P0` result is what gates the loopback BRA, and the sidecar binds the
+resolved runtime `barrier_addr` to `primary_wait_pc`.
+
+An iteration issues IMAD(0xacb0)+TRYWAIT(0xacc0)+NANOSLEEP(0xacd0) BEFORE reaching
+the parking poll. Issuing those once is harmless and in fact scoreboard-faithful:
+- IMAD writes only R7, a scratch base recomputed each iteration and redefined at
+  0x13a0 before its next read on the exit path (dead across exit).
+- TRYWAIT writes only P0 (scratch, overwritten by every poll); NANOSLEEP has no
+  destination register and a dedicated latency knob.
+- The RD1/WR2 scoreboards armed by this iteration's TRYWAIT/PHASECHK are exactly
+  those a real (untrimmed) exit iteration arms; WR2's only consumer is the
+  skipped loopback BRA, RD1's later consumer (0x13a0) sees the identical lifecycle
+  — matching `barrier_self_tied=true`.
+
+Implementation rule: issue the pre-poll trio ONCE when first reaching the parking
+iteration; on a not-ready poll at primary_wait_pc, hold the warp ineligible (do
+NOT re-issue the trio each retry); on ready, run `skip_spin_to_exit`.
 
 ## 6. Runtime watchdog (mandatory)
 
@@ -372,26 +416,34 @@ Cross-checks these logs enable on the same run:
   (nonblocking), `issued()` unchanged, no cursor edits → bit-identical.
 - Feature-on but a region not collapsible → also unchanged.
 
-## 8. Open questions for review
+## 8. Open questions for review — status
 
-1. **B1 vs B2**: is the poll PC guaranteed to carry no per-occurrence payload, so
-   B1's un-advanced occurrence cursor is safe? (Need to confirm PHASECHK/TRYWAIT
-   never bind addresses/sync-runtime that a later same-PC poll would consume.)
-2. **exit_pc trust**: the sidecar `exit_pc` is the static fall-through of the
-   loopback BRA. Under collapse we jump there directly. Is that always the correct
-   post-loop PC, including the K10 regions whose first iteration differs
-   (leading WARPSYNC.ALL / STL-LDL)? First iteration is already executed before we
-   reach the primary_wait, so exit_pc should be uniform — confirm on one K10 case.
-3. **Multi-region producer**: a producer polls several regions on possibly the
-   same barrier. When we jump out of region R, are we sure the next semantic block
-   is R.exit_pc and not another region's head? (The observe close keyed on barrier
-   already showed producers reuse barriers across regions.)
-4. **Watchdog on abort vs fallback**: hard abort (surface model bug) or soft
-   fallback to replay (finish the run, mark warp inaccurate)? Recommend hard abort
-   for the first bring-up so no silent wrong-timing slips through.
-5. **Consumer-side collapse**: the sidecar also flags consumer waits (e.g. K5
-   0xace0). Do we collapse both producer and consumer waits, or restrict to
-   producer regions for the first version to shrink the mutual-deadlock surface?
+1. **B1 vs B2** — RESOLVED (§4): B2 (explicit dual-cursor skip), because poll
+   occurrences carry a per-occurrence phase-parity `semantic_raw` that B1 would
+   desync.
+2. **exit_pc trust** — RESOLVED (§12.5): every collapsible exit_pc is a mid-stream
+   unconditional BRA; never terminal, never at stream end (K5 8 / K10 6 checked).
+3. **Multi-region producer** — RESOLVED: no collapsible region's exit_pc lands on
+   another region's loop_head or inside another region's body (checked on the
+   generated sidecar for K5 and K10). Each region exits to its own unique
+   post-loop PC.
+4. **Watchdog abort vs fallback** — DECIDED (§6, §12.5): hard abort for bring-up
+   (surface model bug loudly); soft fallback only later, behind a sub-flag, and
+   never masking a failed assert in v1.
+5. **Consumer-side collapse** — RESOLVED (§9): collapse BOTH producer and consumer
+   waits (FA3 handshake is symmetric); the runtime watchdog is the mutual-deadlock
+   net. Gate is `collapsible` (role-agnostic).
+6. **Skip-walk stop condition / landing** — RESOLVED (§4b): stop on `exit_pc`
+   (not on "left body_pcs"), consume `body_pcs ∪ {loopback_bra_pc}`, land AT
+   exit_pc and issue it so the existing taken-branch redirect reaches the semantic
+   block.
+7. **Park point** — RESOLVED (§5.1): arm at `primary_wait_pc`; issue the pre-poll
+   trio once, hold ineligible on retry.
+
+No open blockers remain for a v1 implementation. Remaining watch-items are
+bring-up validations (feature-off bit-identity, park==release balance,
+skipped-insts == gpu_sim_insn delta, post-jump head == exit_pc) covered by the
+§6.7 debug logs.
 
 ## 9. Producer vs consumer waits — decision (resolved from observe logs)
 
