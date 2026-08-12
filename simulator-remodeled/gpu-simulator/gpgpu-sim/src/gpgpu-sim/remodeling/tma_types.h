@@ -283,6 +283,11 @@ struct HopperMBarrierObject {
   // cannot make on a low-flip cross-warp barrier. See
   // .plan/SPIN_WAIT_SIM_MODELING.md 13.4/13.5.
   uint64_t gen = 0;
+  // Last two flip coordinates are diagnostic-only. They make a poison audit
+  // self-contained: expected/current generations can be correlated with the
+  // exact gen1/gen2 window without replaying the full SYNCDBG stream.
+  uint64_t prev_flip_cycle = 0;
+  uint64_t last_flip_cycle = 0;
 };
 
 struct HopperMBarrierPendingWait {
@@ -295,13 +300,15 @@ struct HopperMBarrierPendingWait {
   // spin region, carry the info the release path needs to fast-forward the trace
   // cursor to the loop exit. See .plan/SPIN_WAIT_SIM_MODELING.md 5.1/6.5.1.
   bool fold_needs_skip = false;  // armed by a foldable poll
+  uint64_t fold_wait_pc = 0;     // primary_wait_pc that armed this episode
   uint64_t fold_exit_pc = 0;     // SpinWaitRegionRecord.exit_pc to land on
   unsigned int fold_uid = 0;     // unique_function_id (assert/log only)
   // [Spin-wait fold audit] The absolute barrier generation this wait is
   // paired with (the flip whose data it consumes). Computed parity-aware at park
   // time from the per-(warp,barrier) consumed-gen progress. The release path
   // audits barrier.gen vs this: ==expected -> release+skip; <expected -> keep
-  // parked; >expected -> the paired flip already passed (poison) -> assert.
+  // parked; >expected -> report poison (temporary diagnostic build late-releases
+  // and continues folding; production/validation must restore assert).
   uint64_t fold_expected_gen = 0;
 };
 

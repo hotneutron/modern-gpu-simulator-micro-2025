@@ -2300,30 +2300,64 @@ void SM::service_fold_release(unsigned warp_id) {
   // [Gen audit] Release/park/poison is decided on the ABSOLUTE generation, not the
   // 1-bit parity: parity cannot tell "my paired flip already passed" (poison) from
   // "it has not happened yet" (keep parked). cur_gen == expected -> release; <  ->
-  // keep parked; > -> the paired consumer edge already passed on a low-flip barrier
-  // -> surface as an accuracy defect (assert), NEVER force-release past it.
+  // keep parked; > -> the paired consumer edge already passed on a low-flip
+  // barrier -> report the accuracy defect, treat the edge as late-satisfied, and
+  // execute the normal fold release+skip so subsequent waits continue folding.
+  // This late-release is TEMPORARY diagnostic-run behavior; see the plan doc.
   // See .plan/SPIN_WAIT_SIM_MODELING.md 13.4/13.5/14.
   const uint64_t cur_gen = sync_barrier_gen(pending_wait.key);
   const uint64_t exp_gen = pending_wait.fold_expected_gen;
-  if (cur_gen > exp_gen) {
+  const bool late_release = cur_gen > exp_gen;
+  if (late_release) {
     unsigned long long parked_cyc = 0;
     if (warp_id < m_fold_park_start_cycle.size() &&
         m_fold_park_start_cycle[warp_id] != 0) {
       parked_cyc = get_current_gpu_cycle() - m_fold_park_start_cycle[warp_id];
     }
+    uint64_t prev_flip_cycle = 0;
+    uint64_t last_flip_cycle = 0;
+    auto barrier_it = m_hopper_mbarriers.find(pending_wait.key);
+    if (barrier_it != m_hopper_mbarriers.end()) {
+      prev_flip_cycle = barrier_it->second.prev_flip_cycle;
+      last_flip_cycle = barrier_it->second.last_flip_cycle;
+    }
+    const uint64_t flip_window =
+        last_flip_cycle >= prev_flip_cycle
+            ? last_flip_cycle - prev_flip_cycle
+            : 0;
+    const uint64_t expected_flip_cycle =
+        exp_gen + 1 == cur_gen ? prev_flip_cycle : 0;
+    const uint64_t arrival_after_last_flip =
+        get_current_gpu_cycle() >= last_flip_cycle
+            ? get_current_gpu_cycle() - last_flip_cycle
+            : 0;
     std::cerr << "[FOLDAUDIT][SM" << m_sm_id << "] cyc="
               << get_current_gpu_cycle() << " warp=" << warp_id
-              << " cta=" << pending_wait.key.cta_id << " barrier=0x"
+              << " role="
+              << (m_warp_is_producer[warp_id]
+                      ? "producer"
+                      : (m_warp_is_consumer[warp_id] ? "consumer" : "unknown"))
+              << " cta=" << pending_wait.key.cta_id << " global_cta="
+              << m_local_to_global_cta_id[pending_wait.key.cta_id]
+              << " barrier=0x"
               << format_hex_u64(pending_wait.key.barrier_addr)
+              << " wait_pc=0x" << format_hex_u64(pending_wait.fold_wait_pc)
               << " exit_pc=0x" << format_hex_u64(pending_wait.fold_exit_pc)
               << " expected_gen=" << exp_gen << " barrier_gen=" << cur_gen
-              << " parked_cyc=" << parked_cyc
+              << " expected_flip_cyc=" << expected_flip_cycle
+              << " prev_flip_gen=" << (cur_gen ? cur_gen - 1 : 0)
+              << " prev_flip_cyc=" << prev_flip_cycle
+              << " current_flip_gen=" << cur_gen
+              << " current_flip_cyc=" << last_flip_cycle
+              << " flip_window_cyc=" << flip_window
+              << " arrival_after_current_flip_cyc="
+              << arrival_after_last_flip << " parked_cyc=" << parked_cyc
+              << " action=late_fold_release"
               << " : paired consumer flip already passed (double-flip). The"
                  " folded producer reached this wait too late; this is a"
                  " simulator-accuracy/pacing defect, not a fold-bookkeeping"
                  " bug. See .plan/SPIN_WAIT_SIM_MODELING.md 13/14."
               << std::endl;
-    abort();
   }
   if (cur_gen < exp_gen) {
     // Paired flip has not happened yet — keep parked. Watchdog: a park that lasts
@@ -2337,12 +2371,30 @@ void SM::service_fold_release(unsigned warp_id) {
       unsigned long long parked =
           get_current_gpu_cycle() - m_fold_park_start_cycle[warp_id];
       if (parked > threshold) {
+        uint64_t prev_flip_cycle = 0;
+        uint64_t last_flip_cycle = 0;
+        auto barrier_it = m_hopper_mbarriers.find(pending_wait.key);
+        if (barrier_it != m_hopper_mbarriers.end()) {
+          prev_flip_cycle = barrier_it->second.prev_flip_cycle;
+          last_flip_cycle = barrier_it->second.last_flip_cycle;
+        }
         std::cerr << "[FOLDAUDIT][SM" << m_sm_id << "] cyc="
                   << get_current_gpu_cycle() << " warp=" << warp_id
-                  << " cta=" << pending_wait.key.cta_id << " barrier=0x"
+                  << " role="
+                  << (m_warp_is_producer[warp_id]
+                          ? "producer"
+                          : (m_warp_is_consumer[warp_id] ? "consumer"
+                                                        : "unknown"))
+                  << " cta=" << pending_wait.key.cta_id << " global_cta="
+                  << m_local_to_global_cta_id[pending_wait.key.cta_id]
+                  << " barrier=0x"
                   << format_hex_u64(pending_wait.key.barrier_addr)
+                  << " wait_pc=0x"
+                  << format_hex_u64(pending_wait.fold_wait_pc)
                   << " exit_pc=0x" << format_hex_u64(pending_wait.fold_exit_pc)
                   << " expected_gen=" << exp_gen << " barrier_gen=" << cur_gen
+                  << " prev_flip_cyc=" << prev_flip_cycle
+                  << " current_flip_cyc=" << last_flip_cycle
                   << " parked_cyc=" << parked << " threshold=" << threshold
                   << " : paired consumer flip never arrived within the watchdog"
                      " window — model gap (never force-release). See"
@@ -2354,10 +2406,9 @@ void SM::service_fold_release(unsigned warp_id) {
     }
     return;
   }
-  // cur_gen == exp_gen: the paired flip just landed. Release + fold. Roll the
-  // IBuffer back to the first unissued instruction (rewinds used_insts to
-  // issued_count), then fast-forward the trace cursor to the loop exit so the
-  // recorded residual polls are consumed (cursors advanced) but never issued.
+  // cur_gen >= exp_gen: release + fold. Equality is an on-time edge; greater is
+  // the temporary diagnostic late-release path reported above. Both advance to
+  // the loop exit so folding continues at subsequent waits.
   trace_shd_warp_t *tw =
       static_cast<trace_shd_warp_t *>(m_physical_warp[warp_id]);
   tw->get_IBuffer_remodeled()->flush(false);
@@ -2380,6 +2431,25 @@ void SM::service_fold_release(unsigned warp_id) {
     parked_cyc = get_current_gpu_cycle() - m_fold_park_start_cycle[warp_id];
     m_fold_park_start_cycle[warp_id] = 0;
   }
+  if (m_fold_pace_by_warp.size() <= warp_id) {
+    m_fold_pace_by_warp.resize(MAX_WARP_PER_SHADER);
+  }
+  FoldPaceStats &pace =
+      m_fold_pace_by_warp[warp_id]
+                         [FoldPaceKey(pending_wait.key,
+                                      pending_wait.fold_wait_pc)];
+  pace.releases++;
+  if (late_release) {
+    pace.late_releases++;
+    m_fold_late_releases_total++;
+  }
+  pace.park_cycles_total += parked_cyc;
+  if (parked_cyc > pace.park_cycles_max) {
+    pace.park_cycles_max = parked_cyc;
+  }
+  pace.last_end_cycle = get_current_gpu_cycle();
+  pace.last_expected_gen = exp_gen;
+  pace.last_barrier_gen = cur_gen;
   m_fold_releases_total++;
   m_fold_skipped_insts_total += skipped;
   m_fold_park_cycles_total += parked_cyc;
@@ -2390,9 +2460,12 @@ void SM::service_fold_release(unsigned warp_id) {
     debug_log_fold_event(
         "release+skip warp=" + std::to_string(warp_id) + " cta=" +
         std::to_string(pending_wait.key.cta_id) + " barrier=0x" +
-        format_hex_u64(pending_wait.key.barrier_addr) + " exit_pc=0x" +
+        format_hex_u64(pending_wait.key.barrier_addr) + " wait_pc=0x" +
+        format_hex_u64(pending_wait.fold_wait_pc) + " exit_pc=0x" +
         format_hex_u64(exit_pc) + " skipped=" + std::to_string(skipped) +
-        " gen=" + std::to_string(exp_gen) +
+        " expected_gen=" + std::to_string(exp_gen) +
+        " barrier_gen=" + std::to_string(cur_gen) +
+        " late_release=" + std::to_string(late_release ? 1 : 0) +
         " parked_cyc=" + std::to_string(parked_cyc));
   }
   pending_wait = HopperMBarrierPendingWait();
@@ -2406,15 +2479,51 @@ void SM::print_spin_wait_fold_summary() const {
                          ? (double)m_fold_park_cycles_total /
                                m_fold_releases_total
                          : 0.0;
-  // parks_total should equal releases_total at a clean exit (every park released);
-  // a gap means a warp is still parked (watchdog territory). skipped_insts_total
-  // should equal the drop in gpu_sim_insn vs the fold-off baseline (Gate 1).
+  // At a clean diagnostic exit:
+  // parks_total == releases_total at a clean exit. late_releases is a diagnostic
+  // subset of releases whose expected edge had already passed.
   fprintf(stdout,
           "[FOLDSUM] sm=%u parks=%llu releases=%llu skipped_insts=%llu "
-          "avg_park=%.1f max_park=%llu watchdog_hits=%llu\n",
+          "late_releases=%llu avg_park=%.1f max_park=%llu "
+          "watchdog_hits=%llu\n",
           m_sm_id, m_fold_parks_total, m_fold_releases_total,
-          m_fold_skipped_insts_total, avg, m_fold_park_cycles_max,
+          m_fold_skipped_insts_total, m_fold_late_releases_total, avg,
+          m_fold_park_cycles_max,
           m_fold_watchdog_hits);
+  for (unsigned warp_id = 0; warp_id < m_fold_pace_by_warp.size();
+       ++warp_id) {
+    const char *role =
+        warp_id < MAX_WARP_PER_SHADER && m_warp_is_producer[warp_id]
+            ? "producer"
+            : (warp_id < MAX_WARP_PER_SHADER &&
+                       m_warp_is_consumer[warp_id]
+                   ? "consumer"
+                   : "unknown");
+    for (const auto &entry : m_fold_pace_by_warp[warp_id]) {
+      const HopperMBarrierKey &barrier = entry.first.first;
+      const uint64_t wait_pc = entry.first.second;
+      const FoldPaceStats &pace = entry.second;
+      const unsigned long long completed = pace.releases;
+      const double pace_avg =
+          completed ? (double)pace.park_cycles_total / completed : 0.0;
+      fprintf(stdout,
+              "[FOLDPACE] sm=%u warp=%u role=%s trace_kernel=%u cta=%u "
+              "global_cta=%u "
+              "barrier=0x%s wait_pc=0x%s parks=%llu releases=%llu "
+              "late_releases=%llu total_park=%llu avg_park=%.1f "
+              "max_park=%llu first_park_cyc=%llu last_end_cyc=%llu "
+              "last_expected_gen=%llu last_barrier_gen=%llu\n",
+              m_sm_id, warp_id, role, barrier.trace_kernel_id,
+              barrier.cta_id, m_local_to_global_cta_id[barrier.cta_id],
+              format_hex_u64(barrier.barrier_addr).c_str(),
+              format_hex_u64(wait_pc).c_str(), pace.parks, pace.releases,
+              pace.late_releases, pace.park_cycles_total, pace_avg,
+              pace.park_cycles_max, pace.first_park_cycle,
+              pace.last_end_cycle,
+              (unsigned long long)pace.last_expected_gen,
+              (unsigned long long)pace.last_barrier_gen);
+    }
+  }
 }
 
 
@@ -2450,7 +2559,11 @@ void SM::recompute_sync_barrier_ready_and_maybe_flip_phase(
       std::to_string(barrier.arrive_count) + "/" +
       std::to_string(barrier.expected_arrive_count) + " tx=" +
       std::to_string(barrier.completed_tx_bytes) + "/" +
-      std::to_string(barrier.expected_tx_bytes));
+      std::to_string(barrier.expected_tx_bytes) + " gen=" +
+      std::to_string(barrier.gen) + "->" + std::to_string(barrier.gen + 1) +
+      " prev_flip_cyc=" + std::to_string(barrier.last_flip_cycle));
+  barrier.prev_flip_cycle = barrier.last_flip_cycle;
+  barrier.last_flip_cycle = get_current_gpu_cycle();
   barrier.phase ^= 1;
   // [Spin-wait fold audit] Monotonic generation, incremented on every flip
   // in lockstep with `phase`, never reset. Read only by the fold-path gen
@@ -2655,6 +2768,7 @@ void SM::handle_sync_instruction(warp_inst_t &inst, unsigned int warp_id) {
             parked.key = key;
             parked.wait_state_raw = inst.sync_semantic_raw;
             parked.fold_needs_skip = true;
+            parked.fold_wait_pc = inst.pc;
             parked.fold_exit_pc = region.exit_pc;
             parked.fold_uid = inst.unique_function_id;
             // [Gen audit] Pin the absolute generation this wait pairs with, from
@@ -2677,6 +2791,17 @@ void SM::handle_sync_instruction(warp_inst_t &inst, unsigned int warp_id) {
             if (m_fold_park_start_cycle[warp_id] == 0) {
               m_fold_park_start_cycle[warp_id] = get_current_gpu_cycle();
               m_fold_parks_total++;
+              if (m_fold_pace_by_warp.size() <= warp_id) {
+                m_fold_pace_by_warp.resize(MAX_WARP_PER_SHADER);
+              }
+              FoldPaceStats &pace =
+                  m_fold_pace_by_warp[warp_id][FoldPaceKey(key, inst.pc)];
+              pace.parks++;
+              if (pace.first_park_cycle == 0) {
+                pace.first_park_cycle = get_current_gpu_cycle();
+              }
+              pace.last_expected_gen = parked.fold_expected_gen;
+              pace.last_barrier_gen = sync_barrier_gen(key);
             }
             if (m_config->spin_wait_fold_debug) {
               debug_log_fold_event(
@@ -2684,7 +2809,9 @@ void SM::handle_sync_instruction(warp_inst_t &inst, unsigned int warp_id) {
                   std::to_string(key.cta_id) + " barrier=0x" +
                   format_hex_u64(key.barrier_addr) + " wait_pc=0x" +
                   format_hex_u64(inst.pc) + " exit_pc=0x" +
-                  format_hex_u64(region.exit_pc));
+                  format_hex_u64(region.exit_pc) + " expected_gen=" +
+                  std::to_string(parked.fold_expected_gen) + " barrier_gen=" +
+                  std::to_string(sync_barrier_gen(key)));
             }
           }
         }
@@ -2776,7 +2903,9 @@ void SM::handle_sync_instruction(warp_inst_t &inst, unsigned int warp_id) {
       debug_log_sync_event(
           "arrive warp=" + std::to_string(warp_id) + " cta=" +
           std::to_string(key.cta_id) + " barrier=0x" +
-          format_hex_u64(key.barrier_addr) + " +active=" +
+          format_hex_u64(key.barrier_addr) + " pc=0x" +
+          format_hex_u64(inst.pc) + " gen=" + std::to_string(barrier.gen) +
+          " phase=" + std::to_string(barrier.phase) + " +active=" +
           std::to_string(active_threads) + "(mask=0x" + active_mask_hex +
           ") arrive=" + std::to_string(barrier.arrive_count) + "/" +
           std::to_string(barrier.expected_arrive_count));
@@ -2792,7 +2921,9 @@ void SM::handle_sync_instruction(warp_inst_t &inst, unsigned int warp_id) {
       debug_log_sync_event(
           "arrive_counted warp=" + std::to_string(warp_id) + " cta=" +
           std::to_string(key.cta_id) + " barrier=0x" +
-          format_hex_u64(key.barrier_addr) + " +active=" +
+          format_hex_u64(key.barrier_addr) + " pc=0x" +
+          format_hex_u64(inst.pc) + " gen=" + std::to_string(barrier.gen) +
+          " phase=" + std::to_string(barrier.phase) + " +active=" +
           std::to_string(active_threads) + "(mask=0x" + active_mask_hex +
           ") arrive=" + std::to_string(barrier.arrive_count) + "/" +
           std::to_string(barrier.expected_arrive_count));
@@ -2818,7 +2949,9 @@ void SM::handle_sync_instruction(warp_inst_t &inst, unsigned int warp_id) {
         debug_log_sync_event(
             "arrive_expect_tx warp=" + std::to_string(warp_id) + " cta=" +
             std::to_string(key.cta_id) + " barrier=0x" +
-            format_hex_u64(key.barrier_addr) + " +active=" +
+            format_hex_u64(key.barrier_addr) + " pc=0x" +
+            format_hex_u64(inst.pc) + " gen=" + std::to_string(barrier.gen) +
+            " phase=" + std::to_string(barrier.phase) + " +active=" +
             std::to_string(active_threads) + "(mask=0x" + active_mask_hex +
             ") arrive=" + std::to_string(barrier.arrive_count) + "/" +
             std::to_string(barrier.expected_arrive_count) + " +tx=" +
@@ -2830,7 +2963,9 @@ void SM::handle_sync_instruction(warp_inst_t &inst, unsigned int warp_id) {
         debug_log_sync_event(
             "arrive warp=" + std::to_string(warp_id) + " cta=" +
             std::to_string(key.cta_id) + " barrier=0x" +
-            format_hex_u64(key.barrier_addr) + " +active=" +
+            format_hex_u64(key.barrier_addr) + " pc=0x" +
+            format_hex_u64(inst.pc) + " gen=" + std::to_string(barrier.gen) +
+            " phase=" + std::to_string(barrier.phase) + " +active=" +
             std::to_string(active_threads) + "(mask=0x" + active_mask_hex +
             ") arrive=" + std::to_string(barrier.arrive_count) + "/" +
             std::to_string(barrier.expected_arrive_count));
@@ -2865,6 +3000,18 @@ void SM::clear_sync_barrier_state_for_cta(unsigned int cta_id) {
   for (auto &per_warp : m_fold_last_gen) {
     for (auto it = per_warp.begin(); it != per_warp.end();) {
       if (it->first.cta_id == cta_id) {
+        it = per_warp.erase(it);
+      } else {
+        ++it;
+      }
+    }
+  }
+  // FOLDPACE is emitted immediately before this cleanup at CTA exit. Drop the
+  // just-printed CTA-slot entries so a later CTA reusing the slot gets an
+  // independent pacing record rather than a cross-wave aggregate.
+  for (auto &per_warp : m_fold_pace_by_warp) {
+    for (auto it = per_warp.begin(); it != per_warp.end();) {
+      if (it->first.first.cta_id == cta_id) {
         it = per_warp.erase(it);
       } else {
         ++it;
@@ -2923,7 +3070,9 @@ void SM::notify_tma_completion(unsigned int warp_id,
     debug_log_sync_event(
         "tma_complete warp=" + std::to_string(warp_id) + " cta=" +
         std::to_string(binding.key.cta_id) + " barrier=0x" +
-        format_hex_u64(binding.key.barrier_addr) + " applied=" +
+        format_hex_u64(binding.key.barrier_addr) + " gen=" +
+        std::to_string(barrier.gen) + " phase=" +
+        std::to_string(barrier.phase) + " applied=" +
         std::to_string(applied_bytes) + " completed_tx=" +
         std::to_string(barrier.completed_tx_bytes) + "/" +
         std::to_string(barrier.expected_tx_bytes));

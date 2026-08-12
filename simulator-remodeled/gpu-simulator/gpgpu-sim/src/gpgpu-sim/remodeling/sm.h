@@ -34,6 +34,7 @@
 #include <queue>
 #include <set>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 #include <stack>
 #include <deque>
@@ -655,17 +656,32 @@ class SM : public core_t, public shader_core_ctx_wrapper {
   // Only written on the fold issue path; empty when fold is disabled, so
   // feature-off is bit-identical. Used to compute the parity-aware expected_gen.
   std::vector<std::map<HopperMBarrierKey, uint64_t>> m_fold_last_gen;
+  struct FoldPaceStats {
+    unsigned long long parks = 0;
+    unsigned long long releases = 0;
+    unsigned long long late_releases = 0;
+    unsigned long long park_cycles_total = 0;
+    unsigned long long park_cycles_max = 0;
+    unsigned long long first_park_cycle = 0;
+    unsigned long long last_end_cycle = 0;
+    uint64_t last_expected_gen = 0;
+    uint64_t last_barrier_gen = 0;
+  };
+  // Per-(warp, barrier, wait_pc) pacing decomposition. wait_pc is included
+  // because multiple logical waits (e.g. 0xb0b0/0xb3d0) may share one barrier.
+  using FoldPaceKey = std::pair<HopperMBarrierKey, uint64_t>;
+  std::vector<std::map<FoldPaceKey, FoldPaceStats>> m_fold_pace_by_warp;
   // [Spin-wait fold] SM-global validation counters (only move when
-  // -spin_wait_fold_enable). park==release confirms every park was released;
-  // parks_total vs releases_total and skipped_insts_total let a single run check
-  // the Gate-1 invariant (skipped == gpu_sim_insn delta vs baseline). Emitted by
-  // print_spin_wait_fold_summary at each CTA exit (cumulative).
+  // -spin_wait_fold_enable). At a clean diagnostic exit,
+  // parks == releases; late_releases is the diagnostic subset whose paired flip
+  // had already passed. Emitted at each CTA exit.
   unsigned long long m_fold_parks_total = 0;
   unsigned long long m_fold_releases_total = 0;
   unsigned long long m_fold_skipped_insts_total = 0;
   unsigned long long m_fold_park_cycles_total = 0;
   unsigned long long m_fold_park_cycles_max = 0;
   unsigned long long m_fold_watchdog_hits = 0;
+  unsigned long long m_fold_late_releases_total = 0;
  public:
   // Increment the tensor-op count for the CTA slot that owns hardware warp wid.
   void inc_tensor_ops_for_warp(unsigned wid) {

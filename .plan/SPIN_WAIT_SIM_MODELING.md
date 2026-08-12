@@ -1275,11 +1275,24 @@ verdict is re-grounded on sim-internal evidence.
 
 The §13.4/§13.5 **generation-counter audit + assert** does not depend on any HW
 number: it deterministically pins the poison (a wait whose `barrier.gen >
-expected_gen`) and stops the run at that exact coordinate. Implement it as specified
-in §13.5. Acceptance: feature-off bit-identity (Gate 0) holds; with fold on, K5
-aborts with a `[FOLDAUDIT]` line at `wait_pc=0xb0b0` on the 21 poison CTAs
-(instead of a silent 12h hang), and K10 still finishes clean. This converts the bug
-from "silent deadlock" to "loud, located accuracy fault" and is valuable on its own.
+expected_gen`). The normal/acceptance behavior is to stop at that exact coordinate.
+Feature-off bit-identity (Gate 0) must hold; with fold on, poison must emit a
+`[FOLDAUDIT]` line with `wait_pc`, expected/current generation, and flip cycles.
+
+> **TEMPORARY 12H DIAGNOSTIC-RUN OVERRIDE (must be reverted after this run).**
+> To collect all poison CTAs, K10 completion, and per-barrier pacing data in one
+> expensive run, the current debug build does **not** abort on
+> `barrier.gen > expected_gen`. It records `[FOLDAUDIT]`, performs the normal
+> fold release+skip for that already-passed edge (`action=late_fold_release`), and
+> continues folding at subsequent waits. Only a true never-arriving edge
+> (watchdog threshold exceeded while `barrier.gen < expected_gen`) aborts.
+>
+> **MANDATORY RESTORE GATE:** immediately after the diagnostic logs are collected,
+> change the poison branch back to **assert/abort** before implementing or
+> validating any pacing fix. The temporary late-release must never be accepted as
+> the pacing fix and must not remain in a production result. A pacing fix passes
+> only when the restored assert sees **zero poison events** (no
+> `[FOLDAUDIT] action=late_fold_release`) while K5/K10 complete normally.
 
 ### 14.2 Step 2 — re-ground the pacing verdict on sim-internal evidence (replaces the §13.8 HW decision table)
 
