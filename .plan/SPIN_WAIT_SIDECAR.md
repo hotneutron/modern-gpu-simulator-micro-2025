@@ -389,3 +389,308 @@ never matched. `record_spin_wait_observe` now closes an episode when the **same
 `[SPINWAITOPEN]` count reflects true never-flip only. The fix is committed but the
 12h run was **not** re-executed — the GO decision already holds from the barrier
 flips confirmed on the timeline and the non-zero closed-episode park.
+
+## 12. First COLLAPSE run results + K5 deadlock root cause (2026-08-12)
+
+The first collapse-ON experiment (`-spin_wait_collapse_enable 1`,
+`-spin_wait_collapse_debug 1`) was run on K5 and K10 simultaneously. **K10 passed;
+K5 deadlocked.** This section is the self-contained handoff for the next session:
+the log paths, the confirmed root cause, and the redefined direction. Everything
+below is re-derived from the final logs (not the earlier live-streaming reads,
+which were wrong — see §12.6).
+
+> **Direction was redefined on 2026-08-12 (§12.4).** The earlier proposal
+> (generation-counter-as-release + watchdog force-release, so K5 would "complete"
+> by skipping the missed flip) has been **removed**. Reasoning: a producer that
+> misses a consumer phase edge is a **simulator-accuracy bug**, not something to
+> paper over with a skip. If collapse were done correctly the producer/consumer
+> handshake would line up exactly as it does on real (tracer-free) hardware, so a
+> missed edge must be **surfaced as a model defect (assert), never force-released**.
+> The generation counter is retained but repurposed as a **consistency auditor**,
+> not a release mechanism. See §12.4 for the confirmed root cause and the redefined
+> plan.
+
+### 12.1 Run outcome
+
+| Kernel | stdout / stderr | Result | Final cycle | vs target |
+|---|---|---|---:|---|
+| **K10** bwd | `.o45` / `.e45` | ✅ clean `exit detected` | **135,352** | target 132,901 → **+1.84%** |
+| **K5** fwd | `.o71` / `.e71` | ❌ `deadlock detected @ cyc 85333` | — (hang) | — |
+
+- K10 collapse-ON 135,352 vs collapse-OFF (Opt 11-A) 136,898 = **−1,546 cyc
+  (−1.13%)** → collapse moved K10 **toward** the HW target. Direction is correct.
+- Full log dir base:
+  `simulator-remodeled/sim_run_12.8/flashattn-fa3-bf16-bwd-causal-b1-s2048-hd64-nh24/flashattn_fa3_bf16_bwd_causal_b1_s2048_hd64_nh24___warmup_0___iters_1/`
+  - K5: `H100_80GB-OnlyKernel5/...-63a73d452237.{o71,e71}`
+  - K10: `H100_80GB-OnlyKernel10/...-63a73d452237.{o45,e45}`
+  - `[COLLAPSESUM]` (per-SM summary) is on **stdout** (`.o*`); per-event
+    `[COLLAPSE][SMx] ... park/release+skip` is on **stderr** (`.e*`, K5 has 7,259).
+
+### 12.2 Confirmed root cause — realized phase double-flip on a low-flip cross-warp barrier
+
+The deadlock is **not** in the collapse bookkeeping (that is internally
+consistent). It is a single poison park site, proven by set-equality:
+
+- **The 21 SMs that parked at `wait_pc=0xb0b0` are EXACTLY the 21 deadlocked SMs**
+  (`diff` of the two sets is empty). The GPGPU-Sim deadlock dump's stuck-core list
+  (`6 8 9 16 23 24 25 27 ...`) equals the set of SMs that never printed a
+  `[COLLAPSESUM]`.
+- Park/release balance **by barrier** (all SMs, from `.e71`): every barrier is
+  perfectly balanced **except one**:
+
+  | barrier | parks | releases | dangling | how it is advanced (on SM6) |
+  |---|---:|---:|---:|---|
+  | 0x16c00 | 1370 | 1371 | 0 | **TMA-credited** (`tma_complete`, issue-independent) |
+  | 0x16c30 | — | — | 0 | **TMA-credited** |
+  | 0x16c40 | 979 | 979 | 0 | consumer `arrive` (warp-arrived) |
+  | 0x16c48 | 907 | 907 | 0 | consumer `arrive` |
+  | 0x16c60 | 228 | 228 | 0 | consumer `arrive` |
+  | 0x16c68 | 126 | 126 | 0 | consumer `arrive` |
+  | **0x16c20** | **29** | **8** | **21** | **warp15 `arrive` ONLY** (`tma_complete`=0) |
+
+- **Two distinct wait sites share barrier `0x16c20`** (both `collapsible=True` in
+  the sidecar):
+  - dangling: `wait_pc=0xb0b0 exit_pc=0xb0d0` → **0/21 released** (poison)
+  - successful: `wait_pc=0xb3d0 exit_pc=0xb3f0` → **8/8 released**
+- The mechanism (`.e71`, barrier `0x16c20` only flips **twice** the whole kernel —
+  warp15 arrives exactly 2×):
+  - **Success (SM26):** producer reaches `0xb0b0` **while phase is still 1** (its
+    prior generation) → **immediate-hit, never parks** → sails to `0xb3d0`, parks,
+    and warp15's 2nd arrive (`@60782`) releases it. Clean 1:1.
+  - **Dangling (SM6):** warp15 has **already done both arrives** (flip `0→1 @52212`,
+    `1→0 @58477`) before the producer even polls `0xb0b0` (`@59786`). Phase is back
+    to 0; the producer waits for `0→1`, but that flip **already passed** and no 3rd
+    arrive exists → parks `@59821` **forever**. warp15 then blocks on downstream
+    data the parked producer owes → circular wait closes → whole SM hangs.
+  - A 1-bit parity cannot tell "my flip already passed" from "my flip has not
+    happened yet", so the producer parks on an edge that will never recur.
+
+### 12.2.1 Root cause quantified — this run only (`.e71`), poison vs success margin
+
+**This is derived entirely from the collapse-ON run `.e71`.** The earlier
+observe/collapse-OFF logs (`.o70`/`.e70`) are **not** a valid reference here: that
+pass is observe-only, so the mbarrier does not drive timing at all and every wait
+is walked past by construction — it is the first time mbarrier is actually in the
+timing model that matters, and that is exactly this `.e71` run. The root cause must
+be (and is) established inside `.e71`.
+
+Splitting all 132 SMs by outcome (parked at `0xb0b0` = poison, immediate-hit at
+`0xb0b0` = success) and measuring where the producer reaches `0xb0b0` relative to
+the two flips of its own barrier:
+
+| quantity (per SM, `.e71`) | POISON (21 SMs) | SUCCESS (111 SMs) |
+|---|---|---|
+| producer arrival − **gen2** flip | **+1 … +5,648** (always AFTER) | **−711 … −20,445** (always BEFORE) |
+| gen1 flip cycle | med **50,697** (late) | med **45,779** (early) |
+| gen2 − gen1 gap (the gen1 window) | med **7,085** (narrow) | med **13,474** (wide) |
+| producer total collapse-park | med **40,055** | med **47,653** |
+
+Reading:
+
+- **Clean separator:** success iff the producer reaches `0xb0b0` **before gen2**;
+  poison iff **after gen2**. SM16 fails by **+1 cycle** — this is a *timing-margin*
+  fault, not a structural one.
+- **It is NOT "poison producers park more".** The opposite is true (poison med
+  40,055 < success med 47,653 collapse-park cycles). So the fault is not the
+  absolute amount of collapse-injected park; it is the **relative** placement of
+  the producer against the consumer-driven flip timeline.
+- **The discriminating variable is the gen1 window width.** Poison SMs have gen1
+  arriving *late* AND a *narrow* gen1→gen2 gap (~7K); the two consumer flips are
+  bunched, so the window in which the producer's `0xb0b0` (a gen-1 wait) can land
+  is short and the producer — paced by its own collapse parks on the empty barriers
+  `0x16c40/48/68` — misses it. Success SMs open gen1 early and hold a wide (~13K)
+  window.
+- **Where the gen1/gen2 flip timing comes from:** `0x16c20` is flipped only by
+  warp15's two arrives, and warp15 is itself gated between them by TMA/consumer
+  barriers (`0x16c00/30/58`) whose timing is set by the modeled consumer-compute
+  and TMA-fill cadence. So the accuracy fault that produces a too-narrow gen1
+  window is in **that consumer/TMA pacing**, not in the collapse bookkeeping.
+
+### 12.3 Why the design review missed it (corrections to SPIN_WAIT_COLLAPSE_DESIGN.md)
+
+- **§12.8 "circular wait precluded (TMA completion is issue-independent)"** — true
+  ONLY for TMA-credited barriers (0x16c00/0x16c30). `0x16c20` is **warp15-arrived**,
+  so this safeguard does not apply to it.
+- **§6.1 "double-flip precluded"** — assumed the parked barrier flips at most once
+  between polls. A **cross-warp, low-flip barrier** (only 2 flips per kernel) can
+  flip twice before the producer even reaches its poll — and §12.2.1 shows this is
+  a *timing-margin* miss (poison SMs have a narrow ~7K gen1→gen2 window vs ~13K on
+  success SMs), not a rare corner case: it happens on 21 of 132 CTAs.
+- **Detector `collapsible` gate** (`is_spin_loop && semantic_free_body &&
+  barrier_self_tied`) marked `0xb0b0` collapsible. `barrier_self_tied` is a
+  **scoreboard** property; it does not capture **who advances the mbarrier** or
+  **how few times it flips**.
+- **Watchdog never fired** (`COLLAPSEDEADLOCK=0`): threshold 400K ≫ K5's ~85K
+  cycles, and GPGPU-Sim's global detector (114K window) fired first. Max
+  *legitimate* park across all SMs is only **8,104 cyc** (from `[COLLAPSESUM]
+  max_park`). The watchdog currently only **logs then `return`**
+  ([sm.cc:2294-2319](../simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/sm.cc#L2294-L2319)).
+  Note (per the redefined direction §12.4): the watchdog must **assert/abort**, not
+  force-release — an unbounded park is an accuracy-bug signal to surface, not to
+  paper over.
+
+### 12.4 Redefined direction — collapse is an accuracy audit, generation is the auditor (2026-08-12)
+
+**Framing (decided with the user).** The reason collapse exists is to remove the
+*tracer-induced* spin count so the sim paces the producer/consumer handshake the
+way tracer-free **hardware** does. It follows that **if collapse were done
+correctly, the producer would reach each wait while its matching consumer edge is
+still the current phase — exactly as on HW — and every wait would line up 1:1 with
+a flip.** A producer that arrives *after* its edge already passed (the SM6 poison)
+is therefore **evidence of a simulator-accuracy defect somewhere in the timing
+model**, not a situation collapse should "recover" from by skipping.
+
+This inverts the earlier proposal. The generation counter is **kept**, but its job
+changes from *release mechanism* to *consistency auditor*:
+
+- **Collapse honors the mbarrier for real.** At a collapsible `primary_wait_pc`:
+  not-ready → park; ready → `skip_spin_to_exit`. (Unchanged from the current
+  implementation; this is the correct, HW-faithful behavior.)
+- **Generation counter audits the 1:1 pairing and ASSERTS on violation — it never
+  force-releases.**
+  - Add a monotonically-increasing `gen` per barrier: `gen++` on every phase flip
+    in `recompute_sync_barrier_ready_and_maybe_flip_phase`
+    ([sm.cc:2391-2421](../simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/sm.cc#L2391-L2421)),
+    **never reset**. Keep the existing 1-bit `phase` untouched → Gate 0
+    (feature-off bit-identity) preserved.
+  - Each collapsible wait carries the **absolute generation it is supposed to pair
+    with** (`expected_gen`; see the formula caveat below). At wait entry, compare
+    `barrier.gen` to `expected_gen`:
+    - `barrier.gen < expected_gen` → the edge has not happened yet → **park**
+      (normal, correct wait).
+    - `barrier.gen == expected_gen` → the edge just landed → **release + skip**
+      (normal, correct release).
+    - `barrier.gen > expected_gen` → **the producer's edge already passed** → this
+      is the poison. **ASSERT/abort with a full diagnostic** (sm/cta/warp/wait_pc/
+      barrier/`expected_gen`/`barrier.gen`/first-flip-cyc/now). Do **NOT** skip,
+      do **NOT** park-forever. The run stops loudly at the exact accuracy fault.
+- **Watchdog = assert, not force-release.** The `service_collapse_release`
+  over-threshold path
+  ([sm.cc:2294-2319](../simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/sm.cc#L2294-L2319))
+  becomes a hard assert/abort as well (threshold right-sized to ~16–32K, above the
+  8.1K legitimate max, below the 114K global detector). An unbounded park is, by
+  the same logic, an accuracy defect to surface — never something to `skip` past.
+
+**Why not just skip the missed edge (the rejected earlier plan).** Skipping makes
+K5 "complete", but it launders an accuracy bug into a green run: the producer would
+be advanced past a consumer edge it never actually observed, so the reported cycle
+count would be a fiction. The user's explicit priority is correctness over a
+passing run — "한번의 run으로 맞지 않더라도 반드시 풀어야 한다." The assert makes
+the defect impossible to ignore and pins it to a coordinate.
+
+**`expected_gen` formula — must be parity-aware, NOT `waits_completed + 1`.** The
+earlier `target_gen = waits_completed + 1` is off-by-one for the producer's first
+wait. Confirmed on the logs: the producer's very first wait on `0x16c20`
+(`@7780`, parity=1) is an **immediate-hit at gen 0** (no flip yet), i.e. wait #1 ↔
+gen 0, not flip #1. Because the barrier starts at `phase=0, gen=0` and keeps
+`phase == gen & 1`, a parity-`p` wait is satisfied at the smallest `gen` with
+`(gen & 1) != p`. So:
+
+```
+expected_gen(p) = smallest g >= (last consumed gen for this warp+barrier)+1
+                  such that (g & 1) != p        # p = bit31 of wait_state_raw
+# with the very first wait allowed to match g = 0 when phase already differs
+```
+
+This must be **validated offline** (no GPU) against the captured traces before any
+coding: confirm, per barrier, that each warp's successive collapsible waits map to
+strictly increasing generations and that the parity alternation holds. The CTA
+structure is already confirmed identical (see §12.4.1), which is what makes an
+absolute `expected_gen` well-defined.
+
+**What the assert will most likely reveal (the real root cause to chase).** Per
+§12.2.1 (this run, `.e71`), the discriminator is **not** the absolute amount of
+producer collapse-park (poison SMs actually park *less*), but the **relative**
+placement: poison SMs open gen1 late and keep a **narrow gen1→gen2 window (~7K
+cyc)**, so the producer's `0xb0b0` gen-1 wait misses it. `0x16c20` is flipped only
+by warp15's two arrives, and warp15 is gated between them by TMA/consumer barriers
+(`0x16c00/30/58`) whose timing is set by modeled consumer-compute (WGMMA/MUFU) and
+TMA-fill cadence. So the accuracy fault the assert pins is almost certainly **"the
+modeled consumer/TMA pacing that sets the gen1→gen2 window is off relative to HW,"**
+not the collapse bookkeeping. The assert coordinate (which barrier, `expected_gen`
+vs `barrier.gen`, the gen1/gen2 flip cycles, first-not-ready cycle) is the lead for
+that investigation.
+
+### 12.4.1 CTA-consistency of the handshake (validated, all 132 CTAs)
+
+The `0x16c20` handshake is structurally identical across every CTA, which is what
+licenses an absolute-generation audit:
+
+| property | value | scope |
+|---|---|---|
+| `EXCH` expected_arrive | `= 1` | 132/132 CTAs |
+| flips per CTA on `0x16c20` | **exactly 2** | 132/132 SMs |
+| arrive owner | **warp15 only** | 264/264 arrives |
+| `wait_pc=0xb0b0` waits on | **parity 0** (→ 1st flip `0→1`) | 21/21 parks |
+| `wait_pc=0xb3d0` waits on | **parity 1** (→ 2nd flip `1→0`) | 8/8 parks |
+
+So `0xb0b0 ↔ generation 1` and `0xb3d0 ↔ generation 2` is a stable, per-CTA
+invariant. The poison is purely a *timing* misorder (producer arrives at
+generation 2 for a generation-1 wait), never a structural ambiguity.
+
+### 12.5 Where the fix touches code (for next session)
+
+Implementation is **audit-only** additions plus the assert; the collapse
+park/skip logic itself is already correct and stays as-is.
+
+- `tma_types.h` `HopperMBarrierObject` (~line 272): add `uint64_t gen = 0;`.
+- `sm.cc::recompute_sync_barrier_ready_and_maybe_flip_phase` (2391-2421):
+  `gen++` alongside `phase ^= 1` (never reset).
+- `HopperMBarrierPendingWait` (tma_types.h): carry `expected_gen`.
+- park-set branch in `handle_sync_instruction` (~2466-2534): compute
+  `expected_gen` from a new per-`(warp,barrier)` generation-progress map (parity-
+  aware formula, §12.4); then **audit**: `gen > expected_gen` → assert/abort with
+  the diagnostic; `gen == expected_gen` → release+skip; `gen < expected_gen` →
+  park. Do **not** replace the parity path used by the non-collapse issue logic
+  (Gate 0).
+- `sm.cc::service_collapse_release` (2285-2355): the over-threshold `else`/`return`
+  (2294-2319) becomes an **assert/abort** (not `skip_spin_to_exit`), threshold
+  lowered to ~16–32K.
+- Add a `[COLLAPSEAUDIT]` diagnostic line (cyc-stamped) at the assert site so a
+  future run's fault is greppable on the same timeline as `[SYNCDBG]`/`[TMADBG]`.
+
+### 12.6 Corrections to the earlier (live-streaming) analysis — do NOT trust these
+
+The mid-run notes were from partial logs and are **refuted** by the final logs:
+
+- ❌ "20 unreleased parks" → ✅ actually **21**, all at `wait_pc=0xb0b0` on
+  barrier `0x16c20`.
+- ❌ "all collapse activity is warp=0 only; consumers never park" → ✅ consumers
+  **do** park (park events show warp=12/13/14 on 0x16c00; 0x16c40/48/60/68 are
+  consumer barriers with thousands of balanced parks). The dangling park happens
+  to be producer warp0, but that is site-specific, not warp-role-specific.
+- ❌ "watchdog too small" confusion → ✅ watchdog was too **large** (400K vs ~85K
+  kernel) AND only logs, so it never fired.
+- ❌ earlier proposed fix "exclude warp-arrived barriers" → ✅ wrong; see §12.4.
+- ❌ earlier proposed fix "generation counter as edge-triggered **release** +
+  watchdog **force-release**" (so K5 completes by skipping the missed edge) →
+  ✅ **removed** on 2026-08-12. A missed edge is an accuracy defect to **assert**
+  on, not to skip. The generation counter is kept only as the audit that raises
+  that assert. See §12.4.
+
+### 12.7 Quick re-verification commands (next session)
+
+```bash
+DIR=simulator-remodeled/sim_run_12.8/flashattn-fa3-bf16-bwd-causal-b1-s2048-hd64-nh24/flashattn_fa3_bf16_bwd_causal_b1_s2048_hd64_nh24___warmup_0___iters_1
+K5E=$DIR/H100_80GB-OnlyKernel5/*-63a73d452237.e71   # collapse-ON run — the ONLY valid reference
+# park/release balance per barrier (expect only 0x16c20 imbalanced):
+grep -aoE "cyc=[0-9]+ park .*barrier=0x[0-9a-f]+ "    $K5E | grep -oE "barrier=0x[0-9a-f]+" | sort | uniq -c
+grep -aoE "cyc=[0-9]+ release.*barrier=0x[0-9a-f]+ "  $K5E | grep -oE "barrier=0x[0-9a-f]+" | sort | uniq -c
+# the two wait sites sharing 0x16c20 (0xb0b0 poison vs 0xb3d0 ok):
+grep -aoE "park .*barrier=0x16c20 wait_pc=0x[0-9a-f]+ exit_pc=0x[0-9a-f]+" $K5E | sed -E 's/warp=[0-9]+ cta=[0-9]+ //' | sort | uniq -c
+# ROOT CAUSE (§12.2.1) — poison=producer reaches 0xb0b0 AFTER gen2; success=BEFORE gen2.
+# On a poison SM (e.g. SM6): the two 0x16c20 flips (gen1,gen2) both precede the 0xb0b0 park:
+grep -aE "\[SM6\].*phase flip barrier=0x16c20" $K5E          # gen1 @52212 (0->1), gen2 @58477 (1->0)
+grep -aE "\[SM6\] cyc=[0-9]+ park warp=0 cta=0 barrier=0x16c20 wait_pc=0xb0b0" $K5E   # @59821 (> gen2)
+# On a success SM (e.g. SM26): producer immediate-hits 0xb0b0 BEFORE gen2:
+grep -aE "\[SM26\].*wait immediate-hit warp=0 cta=0 barrier=0x16c20 .*parity=0" $K5E | head -1  # < gen2
+# NOTE: do NOT use .o70/.e70 (observe/collapse-OFF) as a baseline for this wait —
+# that pass does not put mbarrier in the timing model, so walking past the wait there
+# is by construction, not evidence about the collapse-ON handshake.
+```
+
+Sidecar of record (both wait sites are `collapsible=True`, `barrier_self_tied=True`):
+`simulator-remodeled/hw_run/traces/device-0/12.8/flashattn-fa3-bf16-bwd-causal-b1-s2048-hd64-nh24/flashattn_fa3_bf16_bwd_causal_b1_s2048_hd64_nh24___warmup_0___iters_1_lighter-compact_wire+prune_operands-69a20aed/traces/extra_info/spin_wait_sidecar.json`
+(schema v2, K5 = kernel_id 5, funcid 3, 21 spin_regions; the poison region is
+`region_id=k_fid3_h0xb090`, `primary_wait_pc=0xb0b0`, only **2** dynamic flips of
+its barrier per kernel).
