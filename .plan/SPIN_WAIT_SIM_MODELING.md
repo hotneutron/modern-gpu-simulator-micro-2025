@@ -1204,3 +1204,53 @@ doc: "HW gen1→gen2 window = N cyc (method M)", plus which row of the decision 
 it selects. That determines whether the follow-up fix targets the **window
 generator** (TMA-fill spacing) or the **producer path latency** — and only then does
 the §13.5 audit implementation get paired with the correct pacing fix.
+
+### 13.8.1 NCU cross-check attempt — RESULT: NOT MEASURABLE FROM NCU (2026-08-12)
+
+**HW gen1→gen2 window = UNKNOWN (method: not resolvable from NCU on this GPU/CUDA
+setup).** The §13.8 handover **cannot be closed with NCU**. No row of the decision
+table is selected. Two NCU experiments were run/inspected on an H100 (device 2,
+CUDA 12.8, `ncu`), FA3 K5 = `FlashAttnFwdSm90`:
+
+**Experiment 1 — existing reports** (`nv_reports/h100/flashattn-..._full_rpt.ncu-rep`,
+`fa3_pipe_rawcounts.ncu-rep`). The two producer wait PCs were positively located by
+operand in the K5 SASS source page:
+- gen1 wait `[R16+URZ+0x16820]` (parity P4) → `@!P4 SYNCS.PHASECHK.TRANS64 P4,[R16+URZ+0x16820]`
+- gen2 wait `[R15+URZ+0x16820]` (parity P0) → `@!P0 SYNCS.PHASECHK.TRANS64 P0,[R15+URZ+0x16820]`
+Their warp-stall samples were ≈0; kernel-wide only **3,942** PC samples. No signal.
+
+**Experiment 2 — targeted high-density warp sampling** (K5 only:
+`--launch-skip 4 --launch-count 1`, `--section WarpStateStats --section
+SourceCounters`, `--warp-sampling-interval 0 --warp-sampling-max-passes 30`; report
+`nv_reports/h100/fa3_k5_warpsampling.ncu-rep`, script
+`simulator-remodeled/fa3_k5_warpsampling_window.sh`). Sample count rose 8× to
+**31,495** (buffer_overflow=0, dropped=0, kernel 68,364 cyc @ 1.98 GHz). Even so:
+- The producer spin's PHASECHK PCs still carry ~0 samples; the warp actually stalls
+  in the following **NANOSLEEP** (`0x989680` = 10,000,000 ns backoff), and those
+  NANOSLEEP samples classify mostly as **`long_scoreboard`**, not `barrier`.
+- Whole-kernel NANOSLEEP (21 PCs) = **88 samples (0.3%)**; PHASECHK = 335 (1.1%).
+  The two target wait loops carry only tens of samples.
+
+**Why NCU fundamentally cannot answer this (confirmed, not a density problem).**
+§13.8 asks for the *elapsed cycles between two specific events* (the two
+`0x16c58`-gating arrives on `0x16c20`, which flips exactly 2×/CTA). NCU standard
+profiling stores only **per-kernel aggregates** and **cumulative PC-stall sample
+counts** — there is **no timestamp/trace axis**, so an instant-to-instant interval
+of a **low-frequency event (2 flips/CTA)** cannot be recovered. The 8× density
+experiment proves the limit is the *data type* (statistical, no time axis), not the
+sample rate. The §13.8 fallback (bound the interval via `stall_barrier` span) also
+fails: the producer's stall is `long_scoreboard`/NANOSLEEP-backoff, not `barrier`,
+and is still per-PC-cumulative rather than per-episode.
+
+**Consequence for the plan.**
+- The §13.4/§13.5 **audit (generation counter + assert)** does NOT depend on the HW
+  window — implement it as specified; it pins the poison deterministically.
+- The *pairing* pacing fix (§13.8 decision table: window-generator vs producer-path)
+  stays **blocked on a timestamped HW measurement**. NCU is ruled out. The only
+  remaining ways to get a per-CTA window are: (a) **in-kernel `clock64()`
+  instrumentation** of the two `0x16c58` producer arrives — but flash-attn here is a
+  **pip-installed prebuilt `flash_attn_3` `.so`** (no kernel source in the repo, no
+  recompile path), so this needs an external flash_attn_3 source rebuild; or
+  (b) **Nsight Systems / CUPTI SASS-level trace** (unproven for an event this
+  low-frequency). Sim-side reference for the eventual compare (from `.e71`): success
+  window med ~13,474 cyc, poison med ~7,085 cyc, poison miss margin ~1.3K.
