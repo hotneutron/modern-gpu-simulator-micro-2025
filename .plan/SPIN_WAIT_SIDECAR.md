@@ -628,6 +628,63 @@ So `0xb0b0 ↔ generation 1` and `0xb3d0 ↔ generation 2` is a stable, per-CTA
 invariant. The poison is purely a *timing* misorder (producer arrives at
 generation 2 for a generation-1 wait), never a structural ambiguity.
 
+### 12.4.2 Root-cause investigation — the gen1→gen2 window is set by producer TMA-fill spacing (`.e71`, 2026-08-12)
+
+Following the §12.4 lead, the accuracy fault was traced to a concrete
+causal chain, all measured inside the collapse-ON run `.e71`.
+
+**The failure is a race between two quantities, decomposed over all 132 SMs:**
+
+| quantity (median) | POISON (21) | SUCCESS (111) |
+|---|---|---|
+| producer `0xb0b0` arrival − gen1 open | **+8,398** | (arrives inside window) |
+| gen1→gen2 window width | **7,085** | **13,474** |
+| producer arrival − gen2 (the verdict) | **+1,104 (miss)** | **−9,113 (hit)** |
+
+So poison happens when **producer needs ~8.4K after gen1 to reach `0xb0b0`, but the
+window is only ~7.1K** → it overshoots by ~1.3K. Both blades of the scissors move
+the wrong way on poison SMs: producer arrives later (+8,443 vs success) **and** the
+window is narrower (7,085 vs 13,474).
+
+**What sets the window width — the key finding.** `0x16c20` is flipped only by
+warp15's two arrives, and each warp15 arrive is gated by the **TMA-credited barrier
+`0x16c58`** (`tx=16384/16384`, flips 8×/CTA — one per tile). The interval between
+the two `0x16c58` flips that release warp15's gen1 and gen2 arrives tracks the
+window almost exactly:
+
+| | two-`0x16c58`-flip interval | resulting gen1→gen2 window |
+|---|---|---|
+| POISON | med **7,553** | med **7,085** |
+| SUCCESS | med **12,140** | med **13,474** |
+
+And each `0x16c58` flip is the TMA completion of a **producer `arrive_expect_tx`**
+(confirmed on SM6: producer `arrive_expect_tx@56237` → TMA fill → `0x16c58`
+flip@58132 → warp15 gen2 arrive@58477). Therefore:
+
+> **The gen1→gen2 window width is the spacing between the two TMA fills the producer
+> issues into `0x16c58`. That spacing is the producer's own execution pacing —
+> which collapse changed by converting the producer's empty-barrier spins
+> (`0x16c40/48/68`) into real parks.**
+
+**Why this is a self-consistent (not paradoxical) loop.** The producer both (a)
+feeds `0x16c58`, whose two fills define the window, and (b) must itself land inside
+that window at `0xb0b0`. When collapse re-paces the producer, it perturbs BOTH the
+window it creates AND its own arrival into that window. On the 21 poison SMs the two
+perturbations land on the wrong side of the ~1.3K margin. This is exactly the class
+of second-order scheduling interaction §9 warned observe could not rule out.
+
+**What this means for the fix direction.** The audit (§12.4) is still correct: the
+missed edge is a real accuracy defect and must assert, not skip. The *underlying*
+inaccuracy to chase is **the producer's inter-fill pacing on `0x16c58` under
+collapse** — i.e. whether the modeled latencies that space the producer's two TMA
+fills (its parks on `0x16c40/48/68`, and the WGMMA/MUFU/TMA costs between them)
+match HW. Open item: obtain the HW reference gen1→gen2 spacing (NCU / trace
+timestamps) to decide whether the true window is ~7K (then the producer path is too
+slow) or ~13K+ (then the window-narrowing pacing is the bug). The assert's
+coordinate (gen1/gen2 flip cycles + first-not-ready) is exactly the per-SM data this
+comparison needs.
+
+
 ### 12.5 Where the fix touches code (for next session)
 
 Implementation is **audit-only** additions plus the assert; the collapse
@@ -694,3 +751,80 @@ Sidecar of record (both wait sites are `collapsible=True`, `barrier_self_tied=Tr
 (schema v2, K5 = kernel_id 5, funcid 3, 21 spin_regions; the poison region is
 `region_id=k_fid3_h0xb090`, `primary_wait_pc=0xb0b0`, only **2** dynamic flips of
 its barrier per kernel).
+
+### 12.8 HANDOVER — NCU cross-check on another server (self-contained)
+
+This is the next action item and can be done independently on a GPU/NCU server.
+Everything needed to run it and to interpret it is here; no prior context required.
+
+**The one question to answer.** On real hardware, what is the elapsed time between
+the two arrives on the K5 coarse barrier `0x16c20` (equivalently: the spacing of the
+two producer TMA fills into `0x16c58` that gate them)? Call it the **HW gen1→gen2
+window**. The simulator (`.e71`, collapse-ON) produces:
+
+- window on the 111 **success** CTAs: median **~13,474 cyc** (range 6,849–22,508)
+- window on the 21 **poison** CTAs: median **~7,085 cyc** (range 5,578–9,042)
+
+**Decision rule (what the HW number tells us):**
+
+| HW gen1→gen2 window | Verdict | Meaning / next fix |
+|---|---|---|
+| **≈ 13K+** (matches success) | window-narrowing is the bug | The sim is *shrinking* the window on 21 CTAs. Chase why collapse re-pacing bunches the producer's two `0x16c58` TMA fills too close — the parks on empty barriers `0x16c40/48/68` and/or the TMA-fill latency model. Fix the pacing so the window stays ~13K; the producer then lands inside it and no edge is missed. |
+| **≈ 7K** (matches poison) | producer path is too slow | The true window really is narrow; then the accuracy fault is that the **producer takes ~8.4K after gen1 to reach `0xb0b0`** when HW takes < window. Chase the producer's inter-fill latency (WGMMA/MUFU/TMA between the two fills) being too high under collapse. |
+| **bimodal / tile-dependent** | both regimes are real | Some tiles legitimately have a short window (e.g. causal-mask tail tiles do less work). Then the audit assert must be reconciled with which tile-index each CTA is on; record tile index alongside the assert coordinate. |
+
+**Why NCU is needed (sim cannot self-answer this).** The sim's own window is the
+very quantity under suspicion (collapse perturbs it), so it cannot be its own
+reference. Only HW/NCU gives the ground-truth spacing.
+
+**What to pull from NCU / HW trace (concrete):**
+
+- Kernel: **K5** = the FA3-bwd **forward-of-backward** kernel, `kernel_id 5`,
+  `unique_function_id 3` (BF16, bwd, causal, `b1-s2048-hd64-nh24`). Same launch as
+  the trace dir named below.
+- Barrier addresses are shared-memory offsets; on HW you cannot grep `0x16c20`
+  directly, so anchor on the **SASS PCs** instead (stable across HW/sim):
+  - producer wait `wait_pc=0xb0b0` (region `k_fid3_h0xb090`, operand
+    `[R16+URZ+0x16820]`) ↔ generation 1 wait.
+  - producer wait `wait_pc=0xb3d0` (region `k_fid3_h0xb3b0`, operand
+    `[R15+URZ+0x16820]`) ↔ generation 2 wait. (Both wait operands resolve at
+    runtime to barrier `0x16c20`; the `+0x16820` is the static base+offset text.)
+  - the two producer `arrive_expect_tx` that fill `0x16c58` are the events that
+    bound the window. Get their PCs from the sim log directly — grep
+    `arrive_expect_tx warp=0 .*barrier=0x16c58` in `.e71` and read back the
+    `wait_pc`/site, or cross-map via `sync_operand_resolver.json` (funcid 3) by the
+    resolved runtime `barrier_addr=0x16c58`, not by a static offset guess.
+- Preferred HW signal, in order of usefulness:
+  1. **NCU `SourceCounters` / warp-state sampling** on those PCs to get cycles-between
+     the two producer TMA-fill arrives (the window) per scheduler.
+  2. If per-arrive timing is not resolvable, use **`smsp__average_warps_issue_stalled_barrier`**
+     and the **`long_scoreboard`/`tma`** stall spans around the producer warp to bound
+     the inter-fill interval.
+  3. Coarse fallback: the NCU `NANOSLEEP` totals already on record
+     (K5 HW `NANOSLEEP` = **8,461**) confirm the producer *does* spin-wait on HW,
+     i.e. the window is not zero; but this alone does not give its width.
+- Also record **whether the window depends on tile index** (causal → later tiles do
+  less work). If yes, the two regimes above are both physical and the sim must not
+  assume a single window.
+
+**Sim-side numbers to compare against (already measured, `.e71`):**
+
+- producer `0xb0b0` arrival − gen1 open: poison med **+8,398** (this is the producer
+  path latency after its window opens — compare to HW producer path).
+- two-`0x16c58`-flip interval: poison med **7,553** / success med **12,140** (this is
+  the sim window generator — compare to HW TMA-fill spacing).
+- 21 poison CTAs miss by only ~1.3K median → a **small** pacing correction may
+  suffice; this is not a gross error.
+
+**How to regenerate the sim evidence (CPU-only, if the `.e71` logs are gone).**
+Re-run K5 with `-spin_wait_collapse_enable 1 -spin_wait_collapse_debug 1
+-sync_debug_enable 1` (K5 hangs ~85K cyc, so the global deadlock detector ends it;
+that is expected and fine for harvesting the pre-hang timeline). Then the §12.7
+commands reproduce every number above from the new `.e71`. The trace dir is:
+`simulator-remodeled/hw_run/traces/device-0/12.8/flashattn-fa3-bf16-bwd-causal-b1-s2048-hd64-nh24/flashattn_fa3_bf16_bwd_causal_b1_s2048_hd64_nh24___warmup_0___iters_1_lighter-compact_wire+prune_operands-69a20aed/`.
+
+**Definition of done for this handover step.** A single line recorded back into this
+doc: "HW gen1→gen2 window = N cyc (method M)", plus which row of the decision table
+it selects. That determines whether the follow-up fix targets the **window
+generator** (TMA-fill spacing) or the **producer path latency** — and only then does
+the §12.5 audit implementation get paired with the correct pacing fix.
