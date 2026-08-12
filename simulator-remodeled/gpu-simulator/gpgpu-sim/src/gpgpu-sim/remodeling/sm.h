@@ -241,6 +241,16 @@ class SM : public core_t, public shader_core_ctx_wrapper {
   bool ldst_unit_response_buffer_full() const override;
   bool are_all_wait_barrier_ready(unsigned int warp_id);
   bool warp_waiting_at_barrier(unsigned warp_id) const override;
+  // [Spin-wait collapse] Non-mutating peek of the same park condition as
+  // warp_waiting_at_barrier, but with NO clear and NO counter bump. Used off the
+  // authoritative issue-eligibility path (sort comparator, stall scans) so the
+  // release side effect fires exactly once. See design doc 6.5.1.
+  bool warp_parked_on_mbarrier_spin(unsigned warp_id) const;
+  // [Spin-wait collapse] Once-per-warp-per-cycle service on the issue path: if a
+  // collapsible park is now satisfied, flush the IBuffer, fast-forward the trace
+  // cursor to the region exit_pc, and clear the pending wait. No-op unless
+  // -spin_wait_collapse_enable. See design doc 5.1/6.5.1.
+  void service_collapse_release(unsigned warp_id);
   bool check_if_non_released_reduction_barrier(warp_inst_t &inst);
   bool warp_waiting_at_mem_barrier(unsigned warp_id) override;
   // True when `pI` is a UTMACMDFLUSH (cp.async.bulk.wait_group 0) and the
@@ -373,6 +383,7 @@ class SM : public core_t, public shader_core_ctx_wrapper {
   void notify_tma_completion(unsigned int warp_id, uint32_t completed_tx_bytes);
   void debug_log_sync_event(const std::string &message);
   void debug_log_tma_event(const std::string &message);
+  void debug_log_collapse_event(const std::string &message);
   void debug_dump_sync_counters() const;
 
   InterWarp_Coalescing_Waiting_Dep_Counters *m_interwarp_coal_warps_waiting_dep_counter;
@@ -438,6 +449,8 @@ class SM : public core_t, public shader_core_ctx_wrapper {
   uint64_t m_sync_debug_skip_runtime_budget = 0;
   // Independent budget for TMA-only stderr logs (TMADBG); 0 disables.
   uint64_t m_tma_debug_print_budget = 0;
+  // Independent budget for spin-wait collapse logs (COLLAPSE); 0 disables.
+  uint64_t m_collapse_debug_print_budget = 20000000;
   uint64_t m_sync_debug_sync_insts = 0;
   uint64_t m_sync_debug_exch = 0;
   uint64_t m_sync_debug_arrive = 0;
@@ -622,6 +635,22 @@ class SM : public core_t, public shader_core_ctx_wrapper {
   // cycles is reported immediately as a deadlock candidate for collapse. 0 uses
   // the built-in default in record_spin_wait_observe.
   unsigned long long m_spin_wait_watchdog_threshold = 0;
+  // [Spin-wait collapse] Per-warp cycle at which the current collapse park began
+  // (0 = not parked). Used by service_collapse_release to fire a deadlock
+  // watchdog if a real park exceeds m_spin_wait_watchdog_threshold. Sized at
+  // first use to MAX_WARP_PER_SHADER.
+  std::vector<unsigned long long> m_collapse_park_start_cycle;
+  // [Spin-wait collapse] SM-global validation counters (only move when
+  // -spin_wait_collapse_enable). park==release confirms every park was released;
+  // parks_total vs releases_total and skipped_insts_total let a single run check
+  // the Gate-1 invariant (skipped == gpu_sim_insn delta vs baseline). Emitted by
+  // print_spin_wait_collapse_summary at each CTA exit (cumulative).
+  unsigned long long m_collapse_parks_total = 0;
+  unsigned long long m_collapse_releases_total = 0;
+  unsigned long long m_collapse_skipped_insts_total = 0;
+  unsigned long long m_collapse_park_cycles_total = 0;
+  unsigned long long m_collapse_park_cycles_max = 0;
+  unsigned long long m_collapse_watchdog_hits = 0;
  public:
   // Increment the tensor-op count for the CTA slot that owns hardware warp wid.
   void inc_tensor_ops_for_warp(unsigned wid) {
@@ -645,4 +674,7 @@ class SM : public core_t, public shader_core_ctx_wrapper {
                                 uint64_t barrier_addr, unsigned cta_id,
                                 bool ready);
   void print_spin_wait_observe_summary() const;
+  // [Spin-wait collapse] SM-global validation summary ([COLLAPSESUM]): parks,
+  // releases, skipped insts, avg/max real park, watchdog hits. Emitted per SM.
+  void print_spin_wait_collapse_summary() const;
 };

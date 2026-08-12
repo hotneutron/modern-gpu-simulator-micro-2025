@@ -535,8 +535,13 @@ void Subcore::issue(SM *shared_sm) {
   //   non-TMA axis : fu_occupied (gmma/math pipe) + stall_count (wait) + l1c (short scoreboard)
   //                  + scoreboard (traditional RAW/WAR) + yield
   bool is_any_waiting_in_inst_barrier = false;   // named barrier / ldgdepbar (TMA)
-  bool is_any_waiting_in_stall_count = false;    // fixed-latency dep -> NCU "wait" (non-TMA)
+  // [Spin-wait collapse] mbarrier-spin park (m_pending_sync_waits) split out of
+  // inst_barrier so a collapsed producer/consumer wait is attributed to the
+  // mbarrier axis, not the named-barrier axis. See design doc 6.5. Only ever set
+  // when -spin_wait_collapse_enable (park is otherwise never armed).
+  bool is_any_waiting_in_mbarrier_spin = false;
   bool is_any_waiting_in_wait_barrier = false;   // mbarrier -> NCU "barrier/long_scoreboard" (TMA)
+  bool is_any_waiting_in_stall_count = false;    // fixed-latency dep -> NCU "wait" (non-TMA)
   bool is_any_waiting_in_tma_flush = false;      // cp.async.bulk.wait_group drain (TMA)
   bool is_any_waiting_in_yield = false;          // YIELD control bit (non-TMA)
   bool is_any_waiting_in_fu_occupied = false;    // FU busy -> NCU "gmma/math_pipe_throttle" (non-TMA)
@@ -987,7 +992,15 @@ void Subcore::issue(SM *shared_sm) {
               } // m_config->wgmma_step0_instrument_enable
             }
             if(!is_not_warp_waiting_in_programmer_barrier || !is_not_warp_waiting_ldgdepbar) {
-              is_any_waiting_in_inst_barrier = true;
+              // [Spin-wait collapse] Attribute an mbarrier-spin park to its own
+              // bucket instead of the named-barrier bucket. The non-mutating peek
+              // avoids re-triggering the release side effect from this scan.
+              if(m_config->spin_wait_collapse_enable && !tail_readonly &&
+                 shared_sm->warp_parked_on_mbarrier_spin(sm_warp_id)) {
+                is_any_waiting_in_mbarrier_spin = true;
+              } else {
+                is_any_waiting_in_inst_barrier = true;
+              }
             }
             if(!is_not_warp_waiting_tma_flush) {
               is_any_waiting_in_tma_flush = true;
@@ -1120,6 +1133,7 @@ void Subcore::issue(SM *shared_sm) {
     // no_warps_ready; compare relative shape against NCU stall decomposition.
     shared_sm->m_sm_stats.m_stats_map["total_num_cycles_issue_stage_stall_at_least_one_warp_with_fu_occupied"]->increment_with_integer(is_any_waiting_in_fu_occupied);
     shared_sm->m_sm_stats.m_stats_map["total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_inst_barrier"]->increment_with_integer(is_any_waiting_in_inst_barrier);
+    shared_sm->m_sm_stats.m_stats_map["total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_mbarrier_spin"]->increment_with_integer(is_any_waiting_in_mbarrier_spin);
     shared_sm->m_sm_stats.m_stats_map["total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_tma_flush"]->increment_with_integer(is_any_waiting_in_tma_flush);
     shared_sm->m_sm_stats.m_stats_map["total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_yield"]->increment_with_integer(is_any_waiting_in_yield);
     shared_sm->m_sm_stats.m_stats_map["total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_stall_count"]->increment_with_integer(is_any_waiting_in_stall_count);
@@ -1206,6 +1220,15 @@ void Subcore::issue(SM *shared_sm) {
 void Subcore::modify_warp_state() {
   for (auto warp : m_warps_of_subcore) {
     warp->get_dependency_state()->cycle();
+    // [Spin-wait collapse] Once-per-warp-per-cycle release service, at the top of
+    // issue() (subcore.cc:593) so it runs BEFORE this cycle's decode()/fetch()
+    // re-prime get_pc(). No-op unless -spin_wait_collapse_enable. If a collapsible
+    // park is now satisfied, this flushes the IBuffer and fast-forwards the trace
+    // cursor to the loop exit. See .plan/SPIN_WAIT_COLLAPSE_DESIGN.md 6.5.1.
+    if (m_config->spin_wait_collapse_enable && warp != NULL &&
+        !warp->done_exit()) {
+      m_sm->service_collapse_release(warp->get_warp_id());
+    }
     if(m_config->is_interwarp_coalescing_enabled && ((m_config->interwarp_coalescing_selection_policy == DEP_COUNT_WAIT_OLDEST_INST_IBUFFER_GENERIC) ||
         (m_config->interwarp_coalescing_selection_policy == DEP_COUNT_WAIT_OLDEST_INST_IBUFFER_CHECKING_WARP_ID)))  {
       if (warp == NULL || warp->done_exit()) {

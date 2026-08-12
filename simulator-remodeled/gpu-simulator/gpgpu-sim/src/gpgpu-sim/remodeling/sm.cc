@@ -449,6 +449,19 @@ void SM::debug_log_tma_event(const std::string &message) {
   --m_tma_debug_print_budget;
 }
 
+// [Spin-wait collapse] per-event log, gated by -spin_wait_collapse_debug, with
+// its own budget so it can be enabled without SYNCDBG/TMADBG noise. cyc= prefix
+// lets a park/release/skip be correlated with the SYNCDBG phase-flip timeline.
+void SM::debug_log_collapse_event(const std::string &message) {
+  if (!m_config->spin_wait_collapse_debug ||
+      m_collapse_debug_print_budget == 0) {
+    return;
+  }
+  std::cerr << "[COLLAPSE][SM" << m_sm_id << "] cyc="
+            << get_current_gpu_cycle() << " " << message << std::endl;
+  --m_collapse_debug_print_budget;
+}
+
 void SM::debug_dump_sync_counters() const {
   if (m_sync_debug_sync_insts == 0 && m_sync_debug_tma_completions == 0 &&
       m_sync_debug_missing_runtime == 0) {
@@ -1952,6 +1965,11 @@ void SM::register_cta_thread_exit(unsigned cta_num, kernel_info_t *kernel) {
     if (m_config->spin_wait_observe_enable) {
       print_spin_wait_observe_summary();
     }
+    // [Spin-wait collapse] SM-global cumulative validation summary. Like observe,
+    // the last CTA-exit print per SM holds the complete totals.
+    if (m_config->spin_wait_collapse_enable) {
+      print_spin_wait_collapse_summary();
+    }
 
     // [CTA-imbalance diag] Emit this CTA's finish cycle, elapsed cycles, and raw
     // tensor-op (WGMMA) count so tail-drain can be correlated with tensor density
@@ -2250,18 +2268,111 @@ bool SM::warp_waiting_at_barrier(unsigned warp_id) const {
   if (!pending_wait.valid) {
     return false;
   }
-  if (is_sync_wait_satisfied(pending_wait)) {
-    const_cast<SM *>(this)->m_sync_debug_wait_released++;
-    const_cast<SM *>(this)->debug_log_sync_event(
-        "wait released warp=" + std::to_string(warp_id) + " cta=" +
-        std::to_string(pending_wait.key.cta_id) + " barrier=0x" +
-        format_hex_u64(pending_wait.key.barrier_addr) + " wait_state=" +
-        std::to_string(pending_wait.wait_state_raw));
-    pending_wait = HopperMBarrierPendingWait();
-    return false;
-  }
-  return true;
+  // Pure peek: report park state, do NOT clear here. The clear + "wait released"
+  // accounting and the collapse cursor skip happen exactly once on the issue
+  // path in service_collapse_release(), never from this query (which is called
+  // from a std::sort comparator). See design doc 6.5.1.
+  return !is_sync_wait_satisfied(pending_wait);
 }
+
+// Non-mutating alias used off the issue path (comparator, stall scans). Same
+// value as warp_waiting_at_barrier; kept as a distinct name so callers document
+// that they must not rely on any side effect.
+bool SM::warp_parked_on_mbarrier_spin(unsigned warp_id) const {
+  return warp_waiting_at_barrier(warp_id);
+}
+
+void SM::service_collapse_release(unsigned warp_id) {
+  if (!m_config->spin_wait_collapse_enable ||
+      warp_id >= m_pending_sync_waits.size()) {
+    return;
+  }
+  HopperMBarrierPendingWait &pending_wait = m_pending_sync_waits[warp_id];
+  if (!pending_wait.valid || !pending_wait.collapse_needs_skip) {
+    return;
+  }
+  if (!is_sync_wait_satisfied(pending_wait)) {
+    // Still parked. Deadlock watchdog: a real park longer than the threshold is
+    // surfaced loudly (the HW trace guarantees the loop DID exit, so an unbounded
+    // park is a model bug, never a silent hang). See design doc 6 / 12.8.
+    if (warp_id < m_collapse_park_start_cycle.size() &&
+        m_collapse_park_start_cycle[warp_id] != 0) {
+      unsigned long long threshold =
+          m_spin_wait_watchdog_threshold ? m_spin_wait_watchdog_threshold
+                                         : 400000ULL;
+      unsigned long long parked =
+          get_current_gpu_cycle() - m_collapse_park_start_cycle[warp_id];
+      if (parked > threshold) {
+        std::cerr << "[COLLAPSEDEADLOCK][SM" << m_sm_id << "] cyc="
+                  << get_current_gpu_cycle() << " warp=" << warp_id
+                  << " cta=" << pending_wait.key.cta_id << " barrier=0x"
+                  << format_hex_u64(pending_wait.key.barrier_addr)
+                  << " exit_pc=0x" << format_hex_u64(pending_wait.collapse_exit_pc)
+                  << " parked_cyc=" << parked << " threshold=" << threshold
+                  << std::endl;
+        m_collapse_watchdog_hits++;
+        // Report once per episode; keep the start non-zero so we do not spam but
+        // advance it so a persistently stuck warp re-reports each threshold span.
+        m_collapse_park_start_cycle[warp_id] = get_current_gpu_cycle();
+      }
+    }
+    return;
+  }
+  // Barrier flipped: release + collapse. Roll the IBuffer back to the first
+  // unissued instruction (rewinds used_insts to issued_count), then fast-forward
+  // the trace cursor to the loop exit so the recorded residual polls are consumed
+  // (cursors advanced) but never issued.
+  trace_shd_warp_t *tw =
+      static_cast<trace_shd_warp_t *>(m_physical_warp[warp_id]);
+  tw->get_IBuffer_remodeled()->flush(false);
+  const uint64_t exit_pc = pending_wait.collapse_exit_pc;
+  const unsigned skipped = tw->skip_spin_to_exit(exit_pc);
+
+  m_sync_debug_wait_released++;
+  // SM-global validation counters + actual park duration (compared against the
+  // observe run's would-be park to confirm the model matches expectation).
+  unsigned long long parked_cyc = 0;
+  if (warp_id < m_collapse_park_start_cycle.size() &&
+      m_collapse_park_start_cycle[warp_id] != 0) {
+    parked_cyc = get_current_gpu_cycle() - m_collapse_park_start_cycle[warp_id];
+    m_collapse_park_start_cycle[warp_id] = 0;
+  }
+  m_collapse_releases_total++;
+  m_collapse_skipped_insts_total += skipped;
+  m_collapse_park_cycles_total += parked_cyc;
+  if (parked_cyc > m_collapse_park_cycles_max) {
+    m_collapse_park_cycles_max = parked_cyc;
+  }
+  if (m_config->spin_wait_collapse_debug) {
+    debug_log_collapse_event(
+        "release+skip warp=" + std::to_string(warp_id) + " cta=" +
+        std::to_string(pending_wait.key.cta_id) + " barrier=0x" +
+        format_hex_u64(pending_wait.key.barrier_addr) + " exit_pc=0x" +
+        format_hex_u64(exit_pc) + " skipped=" + std::to_string(skipped) +
+        " parked_cyc=" + std::to_string(parked_cyc));
+  }
+  pending_wait = HopperMBarrierPendingWait();
+}
+
+void SM::print_spin_wait_collapse_summary() const {
+  if (!m_config->spin_wait_collapse_enable) {
+    return;
+  }
+  const double avg = m_collapse_releases_total
+                         ? (double)m_collapse_park_cycles_total /
+                               m_collapse_releases_total
+                         : 0.0;
+  // parks_total should equal releases_total at a clean exit (every park released);
+  // a gap means a warp is still parked (watchdog territory). skipped_insts_total
+  // should equal the drop in gpu_sim_insn vs the collapse-off baseline (Gate 1).
+  fprintf(stdout,
+          "[COLLAPSESUM] sm=%u parks=%llu releases=%llu skipped_insts=%llu "
+          "avg_park=%.1f max_park=%llu watchdog_hits=%llu\n",
+          m_sm_id, m_collapse_parks_total, m_collapse_releases_total,
+          m_collapse_skipped_insts_total, avg, m_collapse_park_cycles_max,
+          m_collapse_watchdog_hits);
+}
+
 
 HopperMBarrierKey SM::build_sync_barrier_key(const warp_inst_t &inst,
                                              unsigned int warp_id) const {
@@ -2427,7 +2538,51 @@ void SM::handle_sync_instruction(warp_inst_t &inst, unsigned int warp_id) {
             m_sync_first_miss_cycle[warp_id] = get_current_gpu_cycle();
           }
         }
-        m_pending_sync_waits[warp_id] = HopperMBarrierPendingWait();
+        // [Spin-wait collapse] By default (feature off) PHASECHK/TRYWAIT stay
+        // nonblocking: reset the pending wait to invalid so warp_waiting_at_barrier
+        // never parks on it (the traced control flow replays the poll count). When
+        // -spin_wait_collapse_enable AND this poll is the primary_wait_pc of a
+        // COLLAPSIBLE spin region, PARK instead: set valid=true and carry the exit
+        // so the release path can fast-forward the cursor. See design doc 5.1.
+        bool collapse_parked = false;
+        if (m_config->spin_wait_collapse_enable) {
+          SpinWaitRegionRecord region;
+          if (m_gpu->lookup_spin_wait_region(inst.unique_function_id, inst.pc,
+                                             region) &&
+              region.collapsible) {
+            HopperMBarrierPendingWait parked;
+            parked.valid = true;
+            parked.is_trywait = is_trywait;
+            parked.key = key;
+            parked.wait_state_raw = inst.sync_semantic_raw;
+            parked.collapse_needs_skip = true;
+            parked.collapse_exit_pc = region.exit_pc;
+            parked.collapse_uid = inst.unique_function_id;
+            m_pending_sync_waits[warp_id] = parked;
+            collapse_parked = true;
+            // Record park-start for the deadlock watchdog only on the FIRST poll
+            // that parks this warp (a re-poll of an already-parked warp keeps the
+            // earliest start). service_collapse_release clears it on release.
+            if (m_collapse_park_start_cycle.size() <= warp_id) {
+              m_collapse_park_start_cycle.resize(MAX_WARP_PER_SHADER, 0);
+            }
+            if (m_collapse_park_start_cycle[warp_id] == 0) {
+              m_collapse_park_start_cycle[warp_id] = get_current_gpu_cycle();
+              m_collapse_parks_total++;
+            }
+            if (m_config->spin_wait_collapse_debug) {
+              debug_log_collapse_event(
+                  "park warp=" + std::to_string(warp_id) + " cta=" +
+                  std::to_string(key.cta_id) + " barrier=0x" +
+                  format_hex_u64(key.barrier_addr) + " wait_pc=0x" +
+                  format_hex_u64(inst.pc) + " exit_pc=0x" +
+                  format_hex_u64(region.exit_pc));
+            }
+          }
+        }
+        if (!collapse_parked) {
+          m_pending_sync_waits[warp_id] = HopperMBarrierPendingWait();
+        }
         // Deadlock diagnosis: dump the current barrier counters so a barrier
         // that never becomes ready (arrive_count < expected, or tx bytes short)
         // is visible even late in a long run.

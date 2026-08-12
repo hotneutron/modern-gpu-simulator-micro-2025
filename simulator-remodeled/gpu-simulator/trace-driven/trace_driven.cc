@@ -143,6 +143,32 @@ void trace_shd_warp_t::decrease_num_used_inst(address_type pc){
   used_insts--;
 }
 
+// [Spin-wait collapse] Advance the trace cursor from its current position to the
+// spin-loop exit, mirroring get_next_trace_inst's two increments (per-pc
+// occurrence counter + linear used_insts) for every skipped pc, but WITHOUT
+// building/issuing those instructions. Stop condition is the positive
+// traced_pcs[used_insts] == exit_pc (NOT "left the body pc set"): the loopback
+// BRA is deliberately not in body_pcs, so a body-membership test would halt on
+// the first loopback BRA and land short of the exit. See design doc 4b.
+unsigned int trace_shd_warp_t::skip_spin_to_exit(address_type exit_pc) {
+  unsigned int skipped = 0;
+  while (used_insts < traced_pcs.size() && traced_pcs[used_insts] != exit_pc) {
+    address_type pc = traced_pcs[used_insts];
+    auto it_inst_trace = map_warp_traces.find(pc);
+    if (it_inst_trace != map_warp_traces.end() &&
+        it_inst_trace->second.num_used_instructions[0] <
+            it_inst_trace->second.num_traced_instructions) {
+      it_inst_trace->second.num_used_instructions[0]++;  // mirror get_next_trace_inst
+    }
+    used_insts++;
+    ++skipped;
+  }
+  // exit_pc must exist ahead of the cursor; the sidecar guarantees a mid-stream
+  // BRA (never terminal). If not found the region was mis-detected -> fail loud.
+  assert(used_insts < traced_pcs.size() && traced_pcs[used_insts] == exit_pc);
+  return skipped;
+}
+
 // MOD. Begin. VPREG. Not totally compatible now.
 void trace_shd_warp_t::decrement_trace_pc() {
   if(used_insts > 0)

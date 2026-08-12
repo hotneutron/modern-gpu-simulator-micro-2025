@@ -1345,6 +1345,7 @@ void shader_core_stats::print_remodeling_stats(FILE *fout) {
   // Per-reason no_warps_ready breakdown (for NCU warp-issue stall comparison).
   unsigned long long total_num_cycles_issue_stage_stall_at_least_one_warp_with_fu_occupied = m_gpu-> m_gpu_per_sm_stats.m_stats_map["total_num_cycles_issue_stage_stall_at_least_one_warp_with_fu_occupied"]->get_value();
   unsigned long long total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_inst_barrier = m_gpu-> m_gpu_per_sm_stats.m_stats_map["total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_inst_barrier"]->get_value();
+  unsigned long long total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_mbarrier_spin = m_gpu-> m_gpu_per_sm_stats.m_stats_map["total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_mbarrier_spin"]->get_value();
   unsigned long long total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_tma_flush = m_gpu-> m_gpu_per_sm_stats.m_stats_map["total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_tma_flush"]->get_value();
   unsigned long long total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_yield = m_gpu-> m_gpu_per_sm_stats.m_stats_map["total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_yield"]->get_value();
   unsigned long long total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_stall_count = m_gpu-> m_gpu_per_sm_stats.m_stats_map["total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_stall_count"]->get_value();
@@ -1531,6 +1532,7 @@ void shader_core_stats::print_remodeling_stats(FILE *fout) {
   // --- no_warps_ready per-reason breakdown (counts) ; grouped TMA vs non-TMA ---
   fprintf(fout, "total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_wait_barrier = %llu\n", total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_wait_barrier);
   fprintf(fout, "total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_inst_barrier = %llu\n", total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_inst_barrier);
+  fprintf(fout, "total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_mbarrier_spin = %llu\n", total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_mbarrier_spin);
   fprintf(fout, "total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_tma_flush = %llu\n", total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_tma_flush);
   fprintf(fout, "total_num_cycles_issue_stage_stall_at_least_one_warp_with_fu_occupied = %llu\n", total_num_cycles_issue_stage_stall_at_least_one_warp_with_fu_occupied);
   fprintf(fout, "total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_stall_count = %llu\n", total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_stall_count);
@@ -1590,6 +1592,7 @@ void shader_core_stats::print_remodeling_stats(FILE *fout) {
     long double denom = total_num_cycles_issue_stage_evaluated ? (long double) total_num_cycles_issue_stage_evaluated : 1;
     unsigned long long tma_axis = total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_wait_barrier
                                 + total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_inst_barrier
+                                + total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_mbarrier_spin
                                 + total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_tma_flush;
     unsigned long long non_tma_axis = total_num_cycles_issue_stage_stall_at_least_one_warp_with_fu_occupied
                                 + total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_stall_count
@@ -1601,6 +1604,7 @@ void shader_core_stats::print_remodeling_stats(FILE *fout) {
     fprintf(fout, "total_percentage_cycles_issue_stage_stall_non_tma_axis = %.4Lf\n", ((long double) non_tma_axis / denom) * 100);
     fprintf(fout, "total_percentage_cycles_issue_stage_stall_at_least_one_warp_waiting_wait_barrier = %.4Lf\n", ((long double) total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_wait_barrier / denom) * 100);
     fprintf(fout, "total_percentage_cycles_issue_stage_stall_at_least_one_warp_waiting_inst_barrier = %.4Lf\n", ((long double) total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_inst_barrier / denom) * 100);
+    fprintf(fout, "total_percentage_cycles_issue_stage_stall_at_least_one_warp_waiting_mbarrier_spin = %.4Lf\n", ((long double) total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_mbarrier_spin / denom) * 100);
     fprintf(fout, "total_percentage_cycles_issue_stage_stall_at_least_one_warp_waiting_tma_flush = %.4Lf\n", ((long double) total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_tma_flush / denom) * 100);
     fprintf(fout, "total_percentage_cycles_issue_stage_stall_at_least_one_warp_with_fu_occupied = %.4Lf\n", ((long double) total_num_cycles_issue_stage_stall_at_least_one_warp_with_fu_occupied / denom) * 100);
     fprintf(fout, "total_percentage_cycles_issue_stage_stall_at_least_one_warp_waiting_stall_count = %.4Lf\n", ((long double) total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_stall_count / denom) * 100);
@@ -1690,7 +1694,8 @@ void shader_core_stats::print_remodeling_stats(FILE *fout) {
     NCU_LINE("warpgroup_arrive",   ncu_wg_arrive);                                                             // NEW (subset of wait_barrier)
     NCU_LINE("long_scoreboard",    ncu_long_sb);                                                               // fold
     NCU_LINE("short_scoreboard",   ncu_short_sb);                                                              // fold
-    NCU_LINE("barrier",            total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_inst_barrier); // MAP
+    NCU_LINE("barrier",            total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_inst_barrier
+                                 + total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_mbarrier_spin); // MAP (mbarrier_spin split kept in same NCU line)
     NCU_LINE("wait",               total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_stall_count);   // MAP
     NCU_LINE("mio_throttle",       total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_result_queue_full); // MAP
     NCU_LINE("math_pipe_throttle", ncu_math_pipe);                                                             // MAP

@@ -688,10 +688,22 @@ void load_spin_wait_sidecar(const std::filesystem::path &extra_info_dir,
           region["semantic_free_body"].IsBool()) {
         record.semantic_free_body = region["semantic_free_body"].GetBool();
       }
+      if (region.HasMember("barrier_self_tied") &&
+          region["barrier_self_tied"].IsBool()) {
+        record.barrier_self_tied = region["barrier_self_tied"].GetBool();
+      }
       if (region.HasMember("dynamic") && region["dynamic"].IsObject() &&
           region["dynamic"].HasMember("is_spin_loop") &&
           region["dynamic"]["is_spin_loop"].IsBool()) {
         record.is_spin_loop = region["dynamic"]["is_spin_loop"].GetBool();
+      }
+      // Prefer the sidecar's authoritative collapsible flag (v2); fall back to
+      // recomputing it from the parts so an older sidecar still gates safely.
+      if (region.HasMember("collapsible") && region["collapsible"].IsBool()) {
+        record.collapsible = region["collapsible"].GetBool();
+      } else {
+        record.collapsible = record.is_spin_loop && record.semantic_free_body &&
+                             record.barrier_self_tied;
       }
       db.regions_by_wait_pc[SyncOperandLookupKey{unique_function_id,
                                                  record.primary_wait_pc}] = record;
@@ -2089,6 +2101,22 @@ void shader_core_config::reg_options(class OptionParser *opp) {
                          "blocks or advances the trace. Requires spin_wait_sidecar.json. "
                          "(default=0)",
                          "0");
+  option_parser_register(opp, "-spin_wait_collapse_enable", OPT_BOOL,
+                         &spin_wait_collapse_enable,
+                         "Producer/consumer spin-wait collapse. When on, a PHASECHK/TRYWAIT "
+                         "matching a COLLAPSIBLE spin_wait_sidecar.json region parks the warp "
+                         "while the modeled mbarrier is not ready and, on ready, fast-forwards "
+                         "the trace cursor to the region exit_pc (regenerating the poll count "
+                         "instead of replaying it). Only collapsible regions "
+                         "(is_spin_loop && semantic_free_body && barrier_self_tied) are affected; "
+                         "off = bit-identical replay baseline. Requires spin_wait_sidecar.json. "
+                         "(default=0)",
+                         "0");
+  option_parser_register(opp, "-spin_wait_collapse_debug", OPT_BOOL,
+                         &spin_wait_collapse_debug,
+                         "Emit cycle-stamped, budget-limited [COLLAPSE][park/release/skip/summary] "
+                         "lines to validate spin-wait collapse. (default=0)",
+                         "0");
   option_parser_register(opp, "-trimchk_percta_log_enable", OPT_BOOL,
                          &trimchk_percta_log_enable,
                          "[TRIMCHK]/[TRACECHECK] Emit per-CTA trace-load contract lines: "
@@ -2983,6 +3011,7 @@ void gpgpu_sim::create_gpu_per_sm_stats() {
   // Per-reason no_warps_ready breakdown (compared against NCU warp-issue stall decomposition).
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_issue_stage_stall_at_least_one_warp_with_fu_occupied", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_inst_barrier", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_mbarrier_spin", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_tma_flush", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_yield", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_stall_count", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);

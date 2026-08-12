@@ -239,6 +239,11 @@ struct SpinWaitRegionRecord {
   SyncInstructionKind primary_wait_kind = SyncInstructionKind::NONE;
   bool semantic_free_body = false;  // body has no TMA/GMMA/MUFU/arrive/memory op
   bool is_spin_loop = false;        // observed to iterate > 1 (not a single-shot wait)
+  bool barrier_self_tied = false;   // whole-loop skip is SASS scoreboard net-zero
+  // The single authoritative collapse gate (sidecar v2): the simulator collapses
+  // a region ONLY when this is true = is_spin_loop && semantic_free_body &&
+  // barrier_self_tied. See .plan/SPIN_WAIT_COLLAPSE_DESIGN.md 6.6/12.7.
+  bool collapsible = false;
 };
 
 // Keyed by (funcid, primary_wait_pc): the simulator matches a PHASECHK/TRYWAIT at
@@ -277,6 +282,13 @@ struct HopperMBarrierPendingWait {
   bool is_trywait = false;
   HopperMBarrierKey key;
   uint64_t wait_state_raw = 0;
+  // --- spin-wait collapse (only set when -spin_wait_collapse_enable) ---
+  // When the poll that armed this wait was the primary_wait_pc of a collapsible
+  // spin region, carry the info the release path needs to fast-forward the trace
+  // cursor to the loop exit. See .plan/SPIN_WAIT_COLLAPSE_DESIGN.md 5.1/6.5.1.
+  bool collapse_needs_skip = false;  // armed by a collapsible poll
+  uint64_t collapse_exit_pc = 0;     // SpinWaitRegionRecord.exit_pc to land on
+  unsigned int collapse_uid = 0;     // unique_function_id (assert/log only)
 };
 
 struct HopperMBarrierPendingTxBinding {
