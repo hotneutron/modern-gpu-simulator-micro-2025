@@ -39,6 +39,7 @@ To keep this file easy to extend, use the following update pattern whenever a ne
 | Opt 10 | intra-SMSP warp-switch (SFU issue-gating) | `-intra_smsp_warpswitch_enable 1` (code + config). At issue time, also check `fu->can_issue()` for no-queue FUs (SFU), so a busy-SFU MUFU (deterministic II=8) is filtered BEFORE the 1-deep `ISSUE_CONTROL` latch and GTO warp-switches to a ready warp instead of stalling the whole subcore. Queue FUs (MEM/TMA/MISC) keep the deferred path. II/latency unchanged; timing-only (work invariant). | 105,464 cycles (**55.8% error**, **-44.7% vs Opt 9**). fwd `.o58`. `gpu_sim_insn` **bit-identical** to baseline (455,565,060); `issue_stage_issuing` bit-identical (16,064,281). Head-of-line `next_stage` 25.1%→**0.06%**, `blocked_by_sfu` 11.48M→**0**. | 178,856 cycles (**34.6% error**, **-44.6% vs Opt 9**). bwd `.o33`. `gpu_sim_insn` bit-identical (629,211,348). `next_stage` 21.3%→**1.6%**, `blocked_by_sfu` 15.36M→**0**. Warp-switch recovered slot (`other_warp_issued/sfu_filtered`) fwd 31.7% / bwd 26.3%. | Done. The compute-path issue-pipeline defect (SFU head-of-line) fixed; residual (fwd 1.56x) is **SFU-throughput bound** (`still_idle` ≡ `fu_occupied_sfu`, warps queue on the one HW-faithful SFU), not an occupancy floor — next candidate axis is warp-stagger/overlap. See [CONSUMER_COMPUTE_BOUND.md](file:///home/jihyun/modern-gpu-simulator-micro-2025/.plan/CONSUMER_COMPUTE_BOUND.md). |
 | Opt 11-A | Lightweight NVBit full trace (Option 1B) | One untrimmed full capture with compact 104B/360B wire records and semantic callback pruning (`LIGHTER_TRACER="compact_wire,prune_operands"`, `TRIM_SPIN=0`). Transport falls from the original 136.55GB equivalent to 7.41GB (**-94.6%, 18.4x smaller**) and callback records fall 191.79M→64.78M (**-66.2%**), while all replay-visible memory/sync/BAR/TMA payload is retained. | **83,308 cycles (23.1% error, -62.1% vs first measured fwd baseline, -21.0% vs Opt 10)**. fwd `.o68`. `gpgpu_n_tot_w_icount=14,847,194`, `gpu_sim_insn=450,627,804`; both exactly equal the loaded Option 1B trace contract. | **136,898 cycles (3.0% error, -63.7% vs Init, -23.5% vs Opt 10)**. bwd `.o42`. `gpgpu_n_tot_w_icount=21,007,397`, `gpu_sim_insn=624,799,542`; both exactly equal the trace contract. | **Payload/functional gate PASS; timing-fidelity gate FAIL.** Clean exit, TMA unresolved=0, BAR leaks=0, and all HGMMA/MUFU/TMA/memory/sync/BAR totals match. However Producer ends 37.9K/12.0K cycles before Consumer (K5/K10), while K5 HW has a +8.0K Producer tail. K10's 3.0% aggregate error is therefore not proof of correct role timing. |
 | Opt 11-B | Sparse full-trace reconstruction | `LIGHTER_TRACER="compact_wire,prune_operands,sparse_reconstruct"`. Retain CFG boundaries and every predicated/memory/sync/BAR/TMA/control instruction, omit callback-only straight-line instructions, then reconstruct the complete protobuf on the host. K5/K10 callbacks fall 93.14%/91.90% and captured NANOSLEEP falls 89.11%/89.76%. | **Historical affected-trace result: 92,530 cycles (36.7% error, +11.1% vs Opt 11-A)**. fwd `.o69/.e69`. `gpgpu_n_tot_w_icount=14,494,325`, `gpu_sim_insn=449,055,368`; aggregate sparse trace contract matched, but opcode order was not preserved. Producer/Consumer mean completion = 26,035.9/87,429.8, tail **-61,393.9**. | **Historical affected-trace result: 143,560 cycles (8.0% error, +4.9% vs Opt 11-A)**. bwd `.o43/.e43`. `gpgpu_n_tot_w_icount=20,019,180`, `gpu_sim_insn=625,678,016`; aggregate sparse trace contract matched, but opcode order was not preserved. Producer/Consumer mean completion = 88,220.7/115,352.6, tail **-27,131.8**. | **Opcode-order integrity gate FAIL; production promotion withdrawn.** Aggregate counts, TMA/BAR drain, and clean exit did not detect reordered opcodes. `LIGHTER_TRACER=all` and the unset default now resolve to Opt 11-A (`compact_wire,prune_operands`); Opt 11-B remains explicit-only until fixed and revalidated. |
+| Opt 12 | Producer spin-wait collapse (post-process sidecar + sim modeling) | On the Opt 11-A trace: a post-processing sidecar detects producer spin regions (`build_spin_wait_sidecar.py`), and the simulator (gated `-spin_wait_collapse_enable`) blocks the warp at a collapsible `primary_wait_pc` until the modeled mbarrier flips, then skips residual polls to `exit_pc`. Three linked docs: [Lighter_NVbit_Tracing.md](../.plan/Lighter_NVbit_Tracing.md) (tracer), [SPIN_WAIT_POSTPROCESS.md](../.plan/SPIN_WAIT_POSTPROCESS.md) (post-process), [SPIN_WAIT_SIM_MODELING.md](../.plan/SPIN_WAIT_SIM_MODELING.md) (sim, §13). | ❌ **deadlock @ 85,333** on first collapse-ON run. Root cause: low-flip cross-warp barrier `0x16c20` (2 flips/kernel) double-flips before the collapsed producer reaches `0xb0b0` on 21/132 CTAs; 1-bit parity cannot detect the missed edge. Discriminator = gen1→gen2 window (poison ~7.1K vs success ~13.5K), set by producer TMA-fill spacing into `0x16c58`. | ✅ **135,352 cycles (+1.84% vs target 132,901; −1,546 vs Opt 11-A)** — collapse moved K10 toward HW. Clean exit, TMA unresolved 0, BAR leak 0. | **Redirected to accuracy-audit; NCU cross-check pending.** Collapse honors the mbarrier for real; generation counter repurposed as an **assert-only audit** of the 1:1 wait↔flip pairing (never force-release). Next: HW gen1→gen2 window via NCU decides window-narrowing vs slow-producer (handover in SIM_MODELING §13.8). |
 
 ### Simulator Cycle Breakdown
 
@@ -925,6 +926,72 @@ Producer mean completion moved earlier by 13.0K K5 / 9.0K K10 cycles while
 Consumer completion moved later by 10.4K / 6.2K. Because the sparse traces
 changed opcode order, these deltas cannot be causally attributed to removed
 spin, TMA pacing, or another simulator timing mechanism.
+
+### Opt 12 - producer spin-wait collapse (post-processing sidecar + sim modeling)
+
+> Opt 12 is a three-stage chain built on the Opt 11-A trace, each stage a
+> separate design doc:
+> - **tracer (Opt 11-A)**: [Lighter_NVbit_Tracing.md](../.plan/Lighter_NVbit_Tracing.md)
+>   — the compact full-capture trace.
+> - **post-processing**: [SPIN_WAIT_POSTPROCESS.md](../.plan/SPIN_WAIT_POSTPROCESS.md)
+>   — static spin-region detection + `collapsible` gate (`build_spin_wait_sidecar.py`).
+> - **sim modeling**: [SPIN_WAIT_SIM_MODELING.md](../.plan/SPIN_WAIT_SIM_MODELING.md)
+>   — collapse block/skip, stall taxonomy, and the generation-counter audit (§13).
+
+#### Why this optimization
+
+Opt 11-A passed the payload/functional gate but **failed the timing-fidelity
+gate**: with the tracer-induced spin removed, the simulator replays each producer
+mbarrier spin loop exactly as many times as it happened to spin during capture (a
+capture artifact, not real work), so the Producer finishes far ahead of the
+Consumer (K5 −37.9K, K10 −12.0K) instead of the +8.0K HW Producer tail. The
+correct poll count depends on when the *modeled* mbarrier flips, which only the
+simulator can decide at replay time. Opt 12 makes the simulator model that
+handshake instead of replaying the artifact.
+
+#### How to implement
+
+- **Post-processing** annotates, per kernel, each producer spin region by PC
+  (`primary_wait_pc`, `exit_pc`, `body_pcs`) and a `collapsible` gate
+  (`is_spin_loop && semantic_free_body && barrier_self_tied`), written to
+  `spin_wait_sidecar.json`. Read-only wrt the trace; CPU-only.
+- **Sim modeling**, gated by `-spin_wait_collapse_enable` (default 0): at a
+  collapsible `primary_wait_pc`, block the warp until the modeled mbarrier is
+  ready, then fast-forward the trace cursor to `exit_pc` (B2 dual-cursor skip),
+  consuming the residual recorded polls without issuing them. An observe-only
+  pre-stage (`-spin_wait_observe_enable`) measures would-be park with no
+  control-flow change.
+
+#### Result
+
+**Stage status: observe PASS (GO); first collapse run K10 PASS / K5 deadlock;
+direction redirected to accuracy-audit; NCU cross-check pending.**
+
+| Stage | K5 fwd | K10 bwd | Verdict |
+|---|---:|---:|---|
+| Observe-only (would-be park) | closed-episode park 0.63M, watchdog_hits 0 | 3.10M, 0 | GO (no never-flip) |
+| First collapse-ON | ❌ `deadlock @ 85,333` | ✅ 135,352 (target 132,901, **+1.84%**; −1,546 vs Opt 11-A, toward HW) | K10 correct-direction; K5 blocked |
+
+- **K5 deadlock root cause (established in the collapse-ON run only).** A low-flip
+  cross-warp barrier (`0x16c20`, warp-arrived, **2 flips/kernel**) hosts two
+  producer waits (`0xb0b0`↔gen1, `0xb3d0`↔gen2). On 21/132 CTAs the collapsed
+  producer reaches `0xb0b0` **after** both flips already passed, and a 1-bit phase
+  parity cannot tell "my flip already passed" from "not yet" → permanent park. The
+  discriminator is the **gen1→gen2 window width** (poison med ~7.1K vs success
+  ~13.5K), which equals the spacing of the two producer TMA fills into the
+  TMA-credited barrier `0x16c58` — i.e. **collapse re-paced the producer and
+  perturbed the very window it must land in** (a second-order scheduling
+  interaction). Full detail: [SPIN_WAIT_SIM_MODELING.md](../.plan/SPIN_WAIT_SIM_MODELING.md) §13.2–§13.4.2.
+- **Direction (decided 2026-08-12): collapse is an accuracy audit.** A missed
+  consumer edge is a simulator-accuracy defect, not something to skip past. Keep
+  collapse honoring the mbarrier for real; add a per-barrier monotonic generation
+  counter used **only to audit** the 1:1 wait↔flip pairing and **assert/abort** on
+  a violation (never force-release). The watchdog likewise becomes assert, not
+  force-release. See §13.4/§13.5.
+- **Open item (NCU, another server).** Measure the HW gen1→gen2 window to decide
+  whether the fault is window-narrowing (~13K HW ⇒ collapse pacing shrinks it) or a
+  too-slow producer path (~7K HW). Self-contained handover in
+  [SPIN_WAIT_SIM_MODELING.md](../.plan/SPIN_WAIT_SIM_MODELING.md) §13.8.
 
 ## 3. Arch TODO
 

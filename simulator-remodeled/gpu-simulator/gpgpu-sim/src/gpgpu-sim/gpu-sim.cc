@@ -652,7 +652,7 @@ void load_sync_operand_resolver(const std::filesystem::path &extra_info_dir,
 
 // Producer spin-wait sidecar: map (funcid, primary_wait_pc) -> region so the
 // simulator can recognize an mbarrier spin loop at issue time. Payload untouched;
-// see build_spin_wait_sidecar.py and .plan/SPIN_WAIT_SIDECAR.md.
+// see build_spin_wait_sidecar.py and .plan/SPIN_WAIT_POSTPROCESS.md.
 void load_spin_wait_sidecar(const std::filesystem::path &extra_info_dir,
                             SpinWaitSidecarDB &db) {
   rapidjson::Document doc;

@@ -421,7 +421,7 @@ void SM::debug_log_sync_event(const std::string &message) {
   // cyc= prefix makes every sync event a point on a reconstructable timeline
   // (needed to correlate a not-ready wait with the later phase flip / tma
   // completion that releases it -- i.e. to size or diagnose a would-be collapse
-  // park and spot a barrier that never flips). See .plan/SPIN_WAIT_SIDECAR.md.
+  // park and spot a barrier that never flips). See .plan/SPIN_WAIT_POSTPROCESS.md.
   std::cerr << "[SYNCDBG][SM" << m_sm_id << "] cyc="
             << get_current_gpu_cycle() << " " << message << std::endl;
   --m_sync_debug_print_budget;
@@ -902,7 +902,7 @@ void SM::record_producer_spin_phasechk_result(unsigned wid, bool ready) {
 // [SPINWAITDEADLOCK] line immediately (once per episode) with the barrier state so
 // a never-flipping / pathologically-long wait is caught in the SAME 12h run.
 // It never blocks, never advances the trace, and never touches
-// m_pending_sync_waits. See .plan/SPIN_WAIT_SIDECAR.md.
+// m_pending_sync_waits. See .plan/SPIN_WAIT_POSTPROCESS.md.
 void SM::record_spin_wait_observe(unsigned wid, uint64_t wait_pc,
                                   uint64_t barrier_addr, unsigned cta_id,
                                   bool ready) {

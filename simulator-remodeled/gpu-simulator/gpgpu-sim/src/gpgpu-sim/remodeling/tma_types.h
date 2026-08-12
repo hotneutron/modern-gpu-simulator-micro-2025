@@ -230,7 +230,7 @@ struct SyncSidecarMetadataDB {
 // A producer mbarrier spin loop, described statically by PC so the simulator can
 // (behind a gate) block the warp at the loop's primary wait until the modeled
 // barrier is ready, instead of replaying the capture-time poll count. See
-// build_spin_wait_sidecar.py and .plan/SPIN_WAIT_SIDECAR.md.
+// build_spin_wait_sidecar.py and .plan/SPIN_WAIT_POSTPROCESS.md.
 struct SpinWaitRegionRecord {
   uint64_t loop_head_pc = 0;
   uint64_t primary_wait_pc = 0;   // the poll whose barrier readiness gates the loop
@@ -242,7 +242,7 @@ struct SpinWaitRegionRecord {
   bool barrier_self_tied = false;   // whole-loop skip is SASS scoreboard net-zero
   // The single authoritative collapse gate (sidecar v2): the simulator collapses
   // a region ONLY when this is true = is_spin_loop && semantic_free_body &&
-  // barrier_self_tied. See .plan/SPIN_WAIT_COLLAPSE_DESIGN.md 6.6/12.7.
+  // barrier_self_tied. See .plan/SPIN_WAIT_SIM_MODELING.md 6.6/12.7.
   bool collapsible = false;
 };
 
@@ -285,7 +285,7 @@ struct HopperMBarrierPendingWait {
   // --- spin-wait collapse (only set when -spin_wait_collapse_enable) ---
   // When the poll that armed this wait was the primary_wait_pc of a collapsible
   // spin region, carry the info the release path needs to fast-forward the trace
-  // cursor to the loop exit. See .plan/SPIN_WAIT_COLLAPSE_DESIGN.md 5.1/6.5.1.
+  // cursor to the loop exit. See .plan/SPIN_WAIT_SIM_MODELING.md 5.1/6.5.1.
   bool collapse_needs_skip = false;  // armed by a collapsible poll
   uint64_t collapse_exit_pc = 0;     // SpinWaitRegionRecord.exit_pc to land on
   unsigned int collapse_uid = 0;     // unique_function_id (assert/log only)

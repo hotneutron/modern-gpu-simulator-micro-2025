@@ -255,7 +255,7 @@ class trace_shd_warp_t : public shd_warp_t {
   // counter until traced_pcs[used_insts] == exit_pc, WITHOUT issuing the skipped
   // instructions. Lands the cursor AT exit_pc (so the exit BRA issues normally).
   // Returns the number of skipped instructions. Only used by the collapse path;
-  // see .plan/SPIN_WAIT_COLLAPSE_DESIGN.md 4b.
+  // see .plan/SPIN_WAIT_SIM_MODELING.md 4b.
   unsigned int skip_spin_to_exit(address_type exit_pc);
   void clear();
   bool trace_done();

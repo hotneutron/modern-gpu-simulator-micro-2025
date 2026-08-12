@@ -92,7 +92,7 @@ def is_local_mem(op):
 # instruction's own pipeline stage). If one sits inside a spin body, whole-loop
 # skip would drop an arm whose release lives outside the body and corrupt the
 # scoreboard. Distinct from SEMANTIC_PREFIXES (overlaps, but this list is the
-# barrier-safety gate specifically). See .plan/SPIN_WAIT_COLLAPSE_DESIGN.md 12.7.
+# barrier-safety gate specifically). See .plan/SPIN_WAIT_SIM_MODELING.md 12.7.
 ASYNC_PRODUCER_PREFIXES = (
     "HGMMA", "IGMMA", "QGMMA", "BGMMA", "OGMMA", "MMA", "WGMMA",
     "UTMALDG", "UTMASTG", "UTMACMDFLUSH", "UBLKCP", "UBLKPF", "UTMAPF",
@@ -347,7 +347,7 @@ def main():
             # The simulator collapses a region ONLY if all three gates hold:
             # it is an actual spin loop, its body has no semantic work, and its
             # SASS wait-barriers are self-tied (whole-loop skip is scoreboard
-            # net-zero). See .plan/SPIN_WAIT_COLLAPSE_DESIGN.md 12.7.
+            # net-zero). See .plan/SPIN_WAIT_SIM_MODELING.md 12.7.
             r_out["collapsible"] = bool(
                 st["is_spin_loop"] and r["semantic_free_body"]
                 and r["barrier_self_tied"])

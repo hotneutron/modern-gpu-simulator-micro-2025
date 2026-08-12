@@ -1224,7 +1224,7 @@ void Subcore::modify_warp_state() {
     // issue() (subcore.cc:593) so it runs BEFORE this cycle's decode()/fetch()
     // re-prime get_pc(). No-op unless -spin_wait_collapse_enable. If a collapsible
     // park is now satisfied, this flushes the IBuffer and fast-forwards the trace
-    // cursor to the loop exit. See .plan/SPIN_WAIT_COLLAPSE_DESIGN.md 6.5.1.
+    // cursor to the loop exit. See .plan/SPIN_WAIT_SIM_MODELING.md 6.5.1.
     if (m_config->spin_wait_collapse_enable && warp != NULL &&
         !warp->done_exit()) {
       m_sm->service_collapse_release(warp->get_warp_id());

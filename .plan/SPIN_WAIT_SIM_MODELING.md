@@ -1,8 +1,27 @@
-# Producer Spin-Wait Collapse — Implementation Design (for review)
+# Producer Spin-Wait Collapse — Simulator Modeling Design
 
-Status: DESIGN REVIEW. Observe stage returned GO (see SPIN_WAIT_SIDECAR.md §11).
-This document is for design review BEFORE writing the collapse feature. Nothing
-here is implemented yet.
+**Role.** This is the **simulator-modeling** design doc for spin-wait collapse: how
+the simulator *consumes* the spin-wait sidecar and models the producer/consumer
+mbarrier handshake at replay time. It is one of three linked docs in the Opt 12
+"lightweight-trace → post-process → sim-model" chain:
+
+- **tracer** (Opt 11): [`Lighter_NVbit_Tracing.md`](Lighter_NVbit_Tracing.md) —
+  the compact full-capture trace this all runs on.
+- **post-processing**: [`SPIN_WAIT_POSTPROCESS.md`](SPIN_WAIT_POSTPROCESS.md) —
+  the static spin-wait sidecar (region detection, `collapsible` gate). Read-only
+  wrt the trace.
+- **simulator modeling** (this doc): the collapse block/skip mechanics, stall
+  taxonomy, and the runtime generation-counter **audit**.
+
+> **STATUS (2026-08-12): IMPLEMENTED, then redirected.** §1–§12 are the original
+> pre-implementation design review (kept as the record of *why* each mechanic is
+> shaped the way it is). Collapse was then implemented and run; **K5 deadlocked on a
+> low-flip cross-warp barrier double-flip.** The root cause, and the resulting
+> **change of direction (collapse = accuracy audit, generation = assert-only, never
+> force-release)**, are in **§13**. §13 SUPERSEDES the earlier decisions in **§6.1**
+> (“keep 1-bit parity, no epoch counter”), **§6** (watchdog framing), and **§12.8**
+> (“circular wait precluded”) wherever they conflict. Read §13 first; treat §1–§12
+> as background.
 
 ## 1. Goal restated
 
@@ -287,9 +306,17 @@ same barrier for > threshold cycles, do NOT hang — emit a fatal diagnostic
 (sm/cta/warp/wait_pc/barrier/arrive/expected/tx/phase) and abort (or, behind a
 sub-flag, release the park and fall back to trace replay for that warp so the run
 completes). This covers the two observe blind spots (mutual-collapse interaction,
-2nd-order scheduling) called out in §9 of SPIN_WAIT_SIDECAR.md.
+2nd-order scheduling) called out in §9 of SPIN_WAIT_POSTPROCESS.md.
 
 ### 6.1 Phase-parity double-flip — keep the 1-bit model (reviewed, not a hazard)
+
+> ⚠️ **SUPERSEDED by §13.2/§13.3 (2026-08-12).** This section concluded a
+> double-flip cannot strand a parked warp. That is false for a **low-flip
+> cross-warp barrier** (`0x16c20`, 2 flips/kernel): it flipped twice before the
+> collapsed producer even reached its poll, on 21/132 CTAs. The 1-bit model is
+> kept for the non-collapse issue path, but the collapse path now needs the §13.4
+> generation **audit** to detect this. Read the reasoning below as the (refuted)
+> original argument.
 
 `is_sync_wait_satisfied` releases when `barrier.phase != wait_parity` (1-bit
 parity, bit 31 of wait_state_raw). A theoretical concern: if the barrier flips
@@ -522,7 +549,7 @@ them. Confirmed on K5 SM27:
   sim. Blocking the producer's wait directly targets that direction.
 - Leaving consumer waits nonblocking keeps them exactly as today, so collapse
   cannot introduce a NEW deadlock from the consumer side — it shrinks the
-  mutual-collapse blind spot from §9 of SPIN_WAIT_SIDECAR.md to zero for v1.
+  mutual-collapse blind spot from §9 of SPIN_WAIT_POSTPROCESS.md to zero for v1.
 - Consumer-side collapse would matter only if the consumer raced ahead, which is
   the opposite of the current symptom.
 
@@ -688,6 +715,13 @@ are safe by construction, and unsafe regions are auto-excluded."
 
 ### 12.8 Producer+consumer both-collapsed circular wait — precluded (RESOLVED)
 
+> ⚠️ **PARTIALLY SUPERSEDED by §13.2/§13.3 (2026-08-12).** The "issue-independent
+> TMA completion precludes a circular wait" argument holds **only for TMA-credited
+> barriers** (`0x16c00`/`0x16c30`). It does **not** cover the **warp-arrived**
+> barrier `0x16c20`, which has no TMA credit and flips only twice per kernel — that
+> is exactly where K5 deadlocked. The depth-4 reasoning below is still correct for
+> the buffer barriers; it simply did not apply to the low-flip cross-warp handshake.
+
 The biggest un-verified risk of the §9 "collapse both roles" decision: could
 parking BOTH the producer's buffer-empty wait AND the consumers' buffer-full wait
 create a circular wait that did not exist under nonblocking replay? Analyzed
@@ -725,3 +759,448 @@ Residual: only a degenerate depth-1 (effectively single-buffer) scheme could clo
 the cycle; FA3 is depth-4 so it cannot arise. Any future pathological trace/config
 that did would be caught by the §6 runtime watchdog ([SPINWAITDEADLOCK] mid-run,
 [SPINWAITOPEN] at exit), never a silent hang.
+
+---
+
+## 13. First COLLAPSE run results + K5 deadlock root cause (2026-08-12)
+
+The first collapse-ON experiment (`-spin_wait_collapse_enable 1`,
+`-spin_wait_collapse_debug 1`) was run on K5 and K10 simultaneously. **K10 passed;
+K5 deadlocked.** This section is the self-contained handoff for the next session:
+the log paths, the confirmed root cause, and the redefined direction. Everything
+below is re-derived from the final logs (not the earlier live-streaming reads,
+which were wrong — see §13.6).
+
+> **Direction was redefined on 2026-08-12 (§13.4), and it SUPERSEDES the earlier
+> design decisions in this doc (§6.1 "keep 1-bit parity", §6 watchdog framing,
+> §12.8 "circular wait precluded").** The earlier proposal (generation-counter-as-
+> release + watchdog force-release, so K5 would "complete" by skipping the missed
+> flip) has been **removed**. Reasoning: a producer that misses a consumer phase
+> edge is a **simulator-accuracy bug**, not something to paper over with a skip. If
+> collapse were done correctly the producer/consumer handshake would line up
+> exactly as it does on real (tracer-free) hardware, so a missed edge must be
+> **surfaced as a model defect (assert), never force-released**. The generation
+> counter is retained but repurposed as a **consistency auditor**, not a release
+> mechanism. See §13.4.
+
+### 13.1 Run outcome
+
+| Kernel | stdout / stderr | Result | Final cycle | vs target |
+|---|---|---|---:|---|
+| **K10** bwd | `.o45` / `.e45` | ✅ clean `exit detected` | **135,352** | target 132,901 → **+1.84%** |
+| **K5** fwd | `.o71` / `.e71` | ❌ `deadlock detected @ cyc 85333` | — (hang) | — |
+
+- K10 collapse-ON 135,352 vs collapse-OFF (Opt 11-A) 136,898 = **−1,546 cyc
+  (−1.13%)** → collapse moved K10 **toward** the HW target. Direction is correct.
+- Full log dir base:
+  `simulator-remodeled/sim_run_12.8/flashattn-fa3-bf16-bwd-causal-b1-s2048-hd64-nh24/flashattn_fa3_bf16_bwd_causal_b1_s2048_hd64_nh24___warmup_0___iters_1/`
+  - K5: `H100_80GB-OnlyKernel5/...-63a73d452237.{o71,e71}`
+  - K10: `H100_80GB-OnlyKernel10/...-63a73d452237.{o45,e45}`
+  - `[COLLAPSESUM]` (per-SM summary) is on **stdout** (`.o*`); per-event
+    `[COLLAPSE][SMx] ... park/release+skip` is on **stderr** (`.e*`, K5 has 7,259).
+
+### 13.2 Confirmed root cause — realized phase double-flip on a low-flip cross-warp barrier
+
+The deadlock is **not** in the collapse bookkeeping (that is internally
+consistent). It is a single poison park site, proven by set-equality:
+
+- **The 21 SMs that parked at `wait_pc=0xb0b0` are EXACTLY the 21 deadlocked SMs**
+  (`diff` of the two sets is empty). The GPGPU-Sim deadlock dump's stuck-core list
+  (`6 8 9 16 23 24 25 27 ...`) equals the set of SMs that never printed a
+  `[COLLAPSESUM]`.
+- Park/release balance **by barrier** (all SMs, from `.e71`): every barrier is
+  perfectly balanced **except one**:
+
+  | barrier | parks | releases | dangling | how it is advanced (on SM6) |
+  |---|---:|---:|---:|---|
+  | 0x16c00 | 1370 | 1371 | 0 | **TMA-credited** (`tma_complete`, issue-independent) |
+  | 0x16c30 | — | — | 0 | **TMA-credited** |
+  | 0x16c40 | 979 | 979 | 0 | consumer `arrive` (warp-arrived) |
+  | 0x16c48 | 907 | 907 | 0 | consumer `arrive` |
+  | 0x16c60 | 228 | 228 | 0 | consumer `arrive` |
+  | 0x16c68 | 126 | 126 | 0 | consumer `arrive` |
+  | **0x16c20** | **29** | **8** | **21** | **warp15 `arrive` ONLY** (`tma_complete`=0) |
+
+- **Two distinct wait sites share barrier `0x16c20`** (both `collapsible=True` in
+  the sidecar):
+  - dangling: `wait_pc=0xb0b0 exit_pc=0xb0d0` → **0/21 released** (poison)
+  - successful: `wait_pc=0xb3d0 exit_pc=0xb3f0` → **8/8 released**
+- The mechanism (`.e71`, barrier `0x16c20` only flips **twice** the whole kernel —
+  warp15 arrives exactly 2×):
+  - **Success (SM26):** producer reaches `0xb0b0` **while phase is still 1** (its
+    prior generation) → **immediate-hit, never parks** → sails to `0xb3d0`, parks,
+    and warp15's 2nd arrive (`@60782`) releases it. Clean 1:1.
+  - **Dangling (SM6):** warp15 has **already done both arrives** (flip `0→1 @52212`,
+    `1→0 @58477`) before the producer even polls `0xb0b0` (`@59786`). Phase is back
+    to 0; the producer waits for `0→1`, but that flip **already passed** and no 3rd
+    arrive exists → parks `@59821` **forever**. warp15 then blocks on downstream
+    data the parked producer owes → circular wait closes → whole SM hangs.
+  - A 1-bit parity cannot tell "my flip already passed" from "my flip has not
+    happened yet", so the producer parks on an edge that will never recur.
+
+### 13.2.1 Root cause quantified — this run only (`.e71`), poison vs success margin
+
+**This is derived entirely from the collapse-ON run `.e71`.** The earlier
+observe/collapse-OFF logs (`.o70`/`.e70`) are **not** a valid reference here: that
+pass is observe-only, so the mbarrier does not drive timing at all and every wait
+is walked past by construction — it is the first time mbarrier is actually in the
+timing model that matters, and that is exactly this `.e71` run. The root cause must
+be (and is) established inside `.e71`.
+
+Splitting all 132 SMs by outcome (parked at `0xb0b0` = poison, immediate-hit at
+`0xb0b0` = success) and measuring where the producer reaches `0xb0b0` relative to
+the two flips of its own barrier:
+
+| quantity (per SM, `.e71`) | POISON (21 SMs) | SUCCESS (111 SMs) |
+|---|---|---|
+| producer arrival − **gen2** flip | **+1 … +5,648** (always AFTER) | **−711 … −20,445** (always BEFORE) |
+| gen1 flip cycle | med **50,697** (late) | med **45,779** (early) |
+| gen2 − gen1 gap (the gen1 window) | med **7,085** (narrow) | med **13,474** (wide) |
+| producer total collapse-park | med **40,055** | med **47,653** |
+
+Reading:
+
+- **Clean separator:** success iff the producer reaches `0xb0b0` **before gen2**;
+  poison iff **after gen2**. SM16 fails by **+1 cycle** — this is a *timing-margin*
+  fault, not a structural one.
+- **It is NOT "poison producers park more".** The opposite is true (poison med
+  40,055 < success med 47,653 collapse-park cycles). So the fault is not the
+  absolute amount of collapse-injected park; it is the **relative** placement of
+  the producer against the consumer-driven flip timeline.
+- **The discriminating variable is the gen1 window width.** Poison SMs have gen1
+  arriving *late* AND a *narrow* gen1→gen2 gap (~7K); the two consumer flips are
+  bunched, so the window in which the producer's `0xb0b0` (a gen-1 wait) can land
+  is short and the producer — paced by its own collapse parks on the empty barriers
+  `0x16c40/48/68` — misses it. Success SMs open gen1 early and hold a wide (~13K)
+  window.
+- **Where the gen1/gen2 flip timing comes from:** `0x16c20` is flipped only by
+  warp15's two arrives, and warp15 is itself gated between them by TMA/consumer
+  barriers (`0x16c00/30/58`) whose timing is set by the modeled consumer-compute
+  and TMA-fill cadence. So the accuracy fault that produces a too-narrow gen1
+  window is in **that consumer/TMA pacing**, not in the collapse bookkeeping.
+
+### 13.3 Why the design review missed it (corrections to earlier sections of this doc)
+
+- **§12.8 "circular wait precluded (TMA completion is issue-independent)"** — true
+  ONLY for TMA-credited barriers (0x16c00/0x16c30). `0x16c20` is **warp15-arrived**,
+  so this safeguard does not apply to it.
+- **§6.1 "double-flip precluded"** — assumed the parked barrier flips at most once
+  between polls. A **cross-warp, low-flip barrier** (only 2 flips per kernel) can
+  flip twice before the producer even reaches its poll — and §13.2.1 shows this is
+  a *timing-margin* miss (poison SMs have a narrow ~7K gen1→gen2 window vs ~13K on
+  success SMs), not a rare corner case: it happens on 21 of 132 CTAs.
+- **Detector `collapsible` gate** (`is_spin_loop && semantic_free_body &&
+  barrier_self_tied`) marked `0xb0b0` collapsible. `barrier_self_tied` is a
+  **scoreboard** property; it does not capture **who advances the mbarrier** or
+  **how few times it flips**. (The gate is produced by the post-processing detector;
+  see SPIN_WAIT_POSTPROCESS.md.)
+- **Watchdog never fired** (`COLLAPSEDEADLOCK=0`): threshold 400K ≫ K5's ~85K
+  cycles, and GPGPU-Sim's global detector (114K window) fired first. Max
+  *legitimate* park across all SMs is only **8,104 cyc** (from `[COLLAPSESUM]
+  max_park`). The watchdog currently only **logs then `return`**
+  ([sm.cc:2294-2319](../simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/sm.cc#L2294-L2319)).
+  Note (per the redefined direction §13.4): the watchdog must **assert/abort**, not
+  force-release — an unbounded park is an accuracy-bug signal to surface, not to
+  paper over.
+
+### 13.4 Redefined direction — collapse is an accuracy audit, generation is the auditor (2026-08-12)
+
+**Framing (decided with the user).** The reason collapse exists is to remove the
+*tracer-induced* spin count so the sim paces the producer/consumer handshake the
+way tracer-free **hardware** does. It follows that **if collapse were done
+correctly, the producer would reach each wait while its matching consumer edge is
+still the current phase — exactly as on HW — and every wait would line up 1:1 with
+a flip.** A producer that arrives *after* its edge already passed (the SM6 poison)
+is therefore **evidence of a simulator-accuracy defect somewhere in the timing
+model**, not a situation collapse should "recover" from by skipping.
+
+This inverts the earlier proposal. The generation counter is **kept**, but its job
+changes from *release mechanism* to *consistency auditor*:
+
+- **Collapse honors the mbarrier for real.** At a collapsible `primary_wait_pc`:
+  not-ready → park; ready → `skip_spin_to_exit`. (Unchanged from the current
+  implementation; this is the correct, HW-faithful behavior.)
+- **Generation counter audits the 1:1 pairing and ASSERTS on violation — it never
+  force-releases.**
+  - Add a monotonically-increasing `gen` per barrier: `gen++` on every phase flip
+    in `recompute_sync_barrier_ready_and_maybe_flip_phase`
+    ([sm.cc:2391-2421](../simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/sm.cc#L2391-L2421)),
+    **never reset**. Keep the existing 1-bit `phase` untouched → Gate 0
+    (feature-off bit-identity) preserved.
+  - Each collapsible wait carries the **absolute generation it is supposed to pair
+    with** (`expected_gen`; see the formula caveat below). At wait entry, compare
+    `barrier.gen` to `expected_gen`:
+    - `barrier.gen < expected_gen` → the edge has not happened yet → **park**
+      (normal, correct wait).
+    - `barrier.gen == expected_gen` → the edge just landed → **release + skip**
+      (normal, correct release).
+    - `barrier.gen > expected_gen` → **the producer's edge already passed** → this
+      is the poison. **ASSERT/abort with a full diagnostic** (sm/cta/warp/wait_pc/
+      barrier/`expected_gen`/`barrier.gen`/first-flip-cyc/now). Do **NOT** skip,
+      do **NOT** park-forever. The run stops loudly at the exact accuracy fault.
+- **Watchdog = assert, not force-release.** The `service_collapse_release`
+  over-threshold path
+  ([sm.cc:2294-2319](../simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/sm.cc#L2294-L2319))
+  becomes a hard assert/abort as well (threshold right-sized to ~16–32K, above the
+  8.1K legitimate max, below the 114K global detector). An unbounded park is, by
+  the same logic, an accuracy defect to surface — never something to `skip` past.
+
+**Why not just skip the missed edge (the rejected earlier plan).** Skipping makes
+K5 "complete", but it launders an accuracy bug into a green run: the producer would
+be advanced past a consumer edge it never actually observed, so the reported cycle
+count would be a fiction. The user's explicit priority is correctness over a
+passing run — "한번의 run으로 맞지 않더라도 반드시 풀어야 한다." The assert makes
+the defect impossible to ignore and pins it to a coordinate.
+
+**`expected_gen` formula — must be parity-aware, NOT `waits_completed + 1`.** The
+earlier `target_gen = waits_completed + 1` is off-by-one for the producer's first
+wait. Confirmed on the logs: the producer's very first wait on `0x16c20`
+(`@7780`, parity=1) is an **immediate-hit at gen 0** (no flip yet), i.e. wait #1 ↔
+gen 0, not flip #1. Because the barrier starts at `phase=0, gen=0` and keeps
+`phase == gen & 1`, a parity-`p` wait is satisfied at the smallest `gen` with
+`(gen & 1) != p`. So:
+
+```
+expected_gen(p) = smallest g >= (last consumed gen for this warp+barrier)+1
+                  such that (g & 1) != p        # p = bit31 of wait_state_raw
+# with the very first wait allowed to match g = 0 when phase already differs
+```
+
+This must be **validated offline** (no GPU) against the captured traces before any
+coding: confirm, per barrier, that each warp's successive collapsible waits map to
+strictly increasing generations and that the parity alternation holds. The CTA
+structure is already confirmed identical (see §13.4.1), which is what makes an
+absolute `expected_gen` well-defined.
+
+**What the assert will most likely reveal (the real root cause to chase).** Per
+§13.2.1 (this run, `.e71`), the discriminator is **not** the absolute amount of
+producer collapse-park (poison SMs actually park *less*), but the **relative**
+placement: poison SMs open gen1 late and keep a **narrow gen1→gen2 window (~7K
+cyc)**, so the producer's `0xb0b0` gen-1 wait misses it. `0x16c20` is flipped only
+by warp15's two arrives, and warp15 is gated between them by TMA/consumer barriers
+(`0x16c00/30/58`) whose timing is set by modeled consumer-compute (WGMMA/MUFU) and
+TMA-fill cadence. So the accuracy fault the assert pins is almost certainly **"the
+modeled consumer/TMA pacing that sets the gen1→gen2 window is off relative to HW,"**
+not the collapse bookkeeping. The assert coordinate (which barrier, `expected_gen`
+vs `barrier.gen`, the gen1/gen2 flip cycles, first-not-ready cycle) is the lead for
+that investigation.
+
+### 13.4.1 CTA-consistency of the handshake (validated, all 132 CTAs)
+
+The `0x16c20` handshake is structurally identical across every CTA, which is what
+licenses an absolute-generation audit:
+
+| property | value | scope |
+|---|---|---|
+| `EXCH` expected_arrive | `= 1` | 132/132 CTAs |
+| flips per CTA on `0x16c20` | **exactly 2** | 132/132 SMs |
+| arrive owner | **warp15 only** | 264/264 arrives |
+| `wait_pc=0xb0b0` waits on | **parity 0** (→ 1st flip `0→1`) | 21/21 parks |
+| `wait_pc=0xb3d0` waits on | **parity 1** (→ 2nd flip `1→0`) | 8/8 parks |
+
+So `0xb0b0 ↔ generation 1` and `0xb3d0 ↔ generation 2` is a stable, per-CTA
+invariant. The poison is purely a *timing* misorder (producer arrives at
+generation 2 for a generation-1 wait), never a structural ambiguity. (The wait_pc↔
+region mapping is emitted by the post-processing detector; see
+SPIN_WAIT_POSTPROCESS.md.)
+
+### 13.4.2 Root-cause investigation — the gen1→gen2 window is set by producer TMA-fill spacing (`.e71`, 2026-08-12)
+
+Following the §13.4 lead, the accuracy fault was traced to a concrete
+causal chain, all measured inside the collapse-ON run `.e71`.
+
+**The failure is a race between two quantities, decomposed over all 132 SMs:**
+
+| quantity (median) | POISON (21) | SUCCESS (111) |
+|---|---|---|
+| producer `0xb0b0` arrival − gen1 open | **+8,398** | (arrives inside window) |
+| gen1→gen2 window width | **7,085** | **13,474** |
+| producer arrival − gen2 (the verdict) | **+1,104 (miss)** | **−9,113 (hit)** |
+
+So poison happens when **producer needs ~8.4K after gen1 to reach `0xb0b0`, but the
+window is only ~7.1K** → it overshoots by ~1.3K. Both blades of the scissors move
+the wrong way on poison SMs: producer arrives later (+8,443 vs success) **and** the
+window is narrower (7,085 vs 13,474).
+
+**What sets the window width — the key finding.** `0x16c20` is flipped only by
+warp15's two arrives, and each warp15 arrive is gated by the **TMA-credited barrier
+`0x16c58`** (`tx=16384/16384`, flips 8×/CTA — one per tile). The interval between
+the two `0x16c58` flips that release warp15's gen1 and gen2 arrives tracks the
+window almost exactly:
+
+| | two-`0x16c58`-flip interval | resulting gen1→gen2 window |
+|---|---|---|
+| POISON | med **7,553** | med **7,085** |
+| SUCCESS | med **12,140** | med **13,474** |
+
+And each `0x16c58` flip is the TMA completion of a **producer `arrive_expect_tx`**
+(confirmed on SM6: producer `arrive_expect_tx@56237` → TMA fill → `0x16c58`
+flip@58132 → warp15 gen2 arrive@58477). Therefore:
+
+> **The gen1→gen2 window width is the spacing between the two TMA fills the producer
+> issues into `0x16c58`. That spacing is the producer's own execution pacing —
+> which collapse changed by converting the producer's empty-barrier spins
+> (`0x16c40/48/68`) into real parks.**
+
+**Why this is a self-consistent (not paradoxical) loop.** The producer both (a)
+feeds `0x16c58`, whose two fills define the window, and (b) must itself land inside
+that window at `0xb0b0`. When collapse re-paces the producer, it perturbs BOTH the
+window it creates AND its own arrival into that window. On the 21 poison SMs the two
+perturbations land on the wrong side of the ~1.3K margin. This is exactly the class
+of second-order scheduling interaction §9 warned observe could not rule out.
+
+**What this means for the fix direction.** The audit (§13.4) is still correct: the
+missed edge is a real accuracy defect and must assert, not skip. The *underlying*
+inaccuracy to chase is **the producer's inter-fill pacing on `0x16c58` under
+collapse** — i.e. whether the modeled latencies that space the producer's two TMA
+fills (its parks on `0x16c40/48/68`, and the WGMMA/MUFU/TMA costs between them)
+match HW. Open item: obtain the HW reference gen1→gen2 spacing (NCU / trace
+timestamps) to decide whether the true window is ~7K (then the producer path is too
+slow) or ~13K+ (then the window-narrowing pacing is the bug). The assert's
+coordinate (gen1/gen2 flip cycles + first-not-ready) is exactly the per-SM data this
+comparison needs.
+
+### 13.5 Where the fix touches code (for next session)
+
+Implementation is **audit-only** additions plus the assert; the collapse
+park/skip logic itself is already correct and stays as-is.
+
+- `tma_types.h` `HopperMBarrierObject` (~line 272): add `uint64_t gen = 0;`.
+- `sm.cc::recompute_sync_barrier_ready_and_maybe_flip_phase` (2391-2421):
+  `gen++` alongside `phase ^= 1` (never reset).
+- `HopperMBarrierPendingWait` (tma_types.h): carry `expected_gen`.
+- park-set branch in `handle_sync_instruction` (~2466-2534): compute
+  `expected_gen` from a new per-`(warp,barrier)` generation-progress map (parity-
+  aware formula, §13.4); then **audit**: `gen > expected_gen` → assert/abort with
+  the diagnostic; `gen == expected_gen` → release+skip; `gen < expected_gen` →
+  park. Do **not** replace the parity path used by the non-collapse issue logic
+  (Gate 0).
+- `sm.cc::service_collapse_release` (2285-2355): the over-threshold `else`/`return`
+  (2294-2319) becomes an **assert/abort** (not `skip_spin_to_exit`), threshold
+  lowered to ~16–32K.
+- Add a `[COLLAPSEAUDIT]` diagnostic line (cyc-stamped) at the assert site so a
+  future run's fault is greppable on the same timeline as `[SYNCDBG]`/`[TMADBG]`.
+
+### 13.6 Corrections to the earlier (live-streaming) analysis — do NOT trust these
+
+The mid-run notes were from partial logs and are **refuted** by the final logs:
+
+- ❌ "20 unreleased parks" → ✅ actually **21**, all at `wait_pc=0xb0b0` on
+  barrier `0x16c20`.
+- ❌ "all collapse activity is warp=0 only; consumers never park" → ✅ consumers
+  **do** park (park events show warp=12/13/14 on 0x16c00; 0x16c40/48/60/68 are
+  consumer barriers with thousands of balanced parks). The dangling park happens
+  to be producer warp0, but that is site-specific, not warp-role-specific.
+- ❌ "watchdog too small" confusion → ✅ watchdog was too **large** (400K vs ~85K
+  kernel) AND only logs, so it never fired.
+- ❌ earlier proposed fix "exclude warp-arrived barriers" → ✅ wrong; see §13.4.
+- ❌ earlier proposed fix "generation counter as edge-triggered **release** +
+  watchdog **force-release**" (so K5 completes by skipping the missed edge) →
+  ✅ **removed** on 2026-08-12. A missed edge is an accuracy defect to **assert**
+  on, not to skip. The generation counter is kept only as the audit that raises
+  that assert. See §13.4.
+
+### 13.7 Quick re-verification commands (next session)
+
+```bash
+DIR=simulator-remodeled/sim_run_12.8/flashattn-fa3-bf16-bwd-causal-b1-s2048-hd64-nh24/flashattn_fa3_bf16_bwd_causal_b1_s2048_hd64_nh24___warmup_0___iters_1
+K5E=$DIR/H100_80GB-OnlyKernel5/*-63a73d452237.e71   # collapse-ON run — the ONLY valid reference
+# park/release balance per barrier (expect only 0x16c20 imbalanced):
+grep -aoE "cyc=[0-9]+ park .*barrier=0x[0-9a-f]+ "    $K5E | grep -oE "barrier=0x[0-9a-f]+" | sort | uniq -c
+grep -aoE "cyc=[0-9]+ release.*barrier=0x[0-9a-f]+ "  $K5E | grep -oE "barrier=0x[0-9a-f]+" | sort | uniq -c
+# the two wait sites sharing 0x16c20 (0xb0b0 poison vs 0xb3d0 ok):
+grep -aoE "park .*barrier=0x16c20 wait_pc=0x[0-9a-f]+ exit_pc=0x[0-9a-f]+" $K5E | sed -E 's/warp=[0-9]+ cta=[0-9]+ //' | sort | uniq -c
+# ROOT CAUSE (§13.2.1) — poison=producer reaches 0xb0b0 AFTER gen2; success=BEFORE gen2.
+# On a poison SM (e.g. SM6): the two 0x16c20 flips (gen1,gen2) both precede the 0xb0b0 park:
+grep -aE "\[SM6\].*phase flip barrier=0x16c20" $K5E          # gen1 @52212 (0->1), gen2 @58477 (1->0)
+grep -aE "\[SM6\] cyc=[0-9]+ park warp=0 cta=0 barrier=0x16c20 wait_pc=0xb0b0" $K5E   # @59821 (> gen2)
+# On a success SM (e.g. SM26): producer immediate-hits 0xb0b0 BEFORE gen2:
+grep -aE "\[SM26\].*wait immediate-hit warp=0 cta=0 barrier=0x16c20 .*parity=0" $K5E | head -1  # < gen2
+# NOTE: do NOT use .o70/.e70 (observe/collapse-OFF) as a baseline for this wait —
+# that pass does not put mbarrier in the timing model, so walking past the wait there
+# is by construction, not evidence about the collapse-ON handshake.
+```
+
+Sidecar of record (both wait sites are `collapsible=True`, `barrier_self_tied=True`;
+produced by the post-processing detector, see SPIN_WAIT_POSTPROCESS.md):
+`simulator-remodeled/hw_run/traces/device-0/12.8/flashattn-fa3-bf16-bwd-causal-b1-s2048-hd64-nh24/flashattn_fa3_bf16_bwd_causal_b1_s2048_hd64_nh24___warmup_0___iters_1_lighter-compact_wire+prune_operands-69a20aed/traces/extra_info/spin_wait_sidecar.json`
+(schema v2, K5 = kernel_id 5, funcid 3, 21 spin_regions; the poison region is
+`region_id=k_fid3_h0xb090`, `primary_wait_pc=0xb0b0`, only **2** dynamic flips of
+its barrier per kernel).
+
+### 13.8 HANDOVER — NCU cross-check on another server (self-contained)
+
+This is the next action item and can be done independently on a GPU/NCU server.
+Everything needed to run it and to interpret it is here; no prior context required.
+
+**The one question to answer.** On real hardware, what is the elapsed time between
+the two arrives on the K5 coarse barrier `0x16c20` (equivalently: the spacing of the
+two producer TMA fills into `0x16c58` that gate them)? Call it the **HW gen1→gen2
+window**. The simulator (`.e71`, collapse-ON) produces:
+
+- window on the 111 **success** CTAs: median **~13,474 cyc** (range 6,849–22,508)
+- window on the 21 **poison** CTAs: median **~7,085 cyc** (range 5,578–9,042)
+
+**Decision rule (what the HW number tells us):**
+
+| HW gen1→gen2 window | Verdict | Meaning / next fix |
+|---|---|---|
+| **≈ 13K+** (matches success) | window-narrowing is the bug | The sim is *shrinking* the window on 21 CTAs. Chase why collapse re-pacing bunches the producer's two `0x16c58` TMA fills too close — the parks on empty barriers `0x16c40/48/68` and/or the TMA-fill latency model. Fix the pacing so the window stays ~13K; the producer then lands inside it and no edge is missed. |
+| **≈ 7K** (matches poison) | producer path is too slow | The true window really is narrow; then the accuracy fault is that the **producer takes ~8.4K after gen1 to reach `0xb0b0`** when HW takes < window. Chase the producer's inter-fill latency (WGMMA/MUFU/TMA between the two fills) being too high under collapse. |
+| **bimodal / tile-dependent** | both regimes are real | Some tiles legitimately have a short window (e.g. causal-mask tail tiles do less work). Then the audit assert must be reconciled with which tile-index each CTA is on; record tile index alongside the assert coordinate. |
+
+**Why NCU is needed (sim cannot self-answer this).** The sim's own window is the
+very quantity under suspicion (collapse perturbs it), so it cannot be its own
+reference. Only HW/NCU gives the ground-truth spacing.
+
+**What to pull from NCU / HW trace (concrete):**
+
+- Kernel: **K5** = the FA3-bwd **forward-of-backward** kernel, `kernel_id 5`,
+  `unique_function_id 3` (BF16, bwd, causal, `b1-s2048-hd64-nh24`). Same launch as
+  the trace dir named below.
+- Barrier addresses are shared-memory offsets; on HW you cannot grep `0x16c20`
+  directly, so anchor on the **SASS PCs** instead (stable across HW/sim):
+  - producer wait `wait_pc=0xb0b0` (region `k_fid3_h0xb090`, operand
+    `[R16+URZ+0x16820]`) ↔ generation 1 wait.
+  - producer wait `wait_pc=0xb3d0` (region `k_fid3_h0xb3b0`, operand
+    `[R15+URZ+0x16820]`) ↔ generation 2 wait. (Both wait operands resolve at
+    runtime to barrier `0x16c20`; the `+0x16820` is the static base+offset text.)
+  - the two producer `arrive_expect_tx` that fill `0x16c58` are the events that
+    bound the window. Get their PCs from the sim log directly — grep
+    `arrive_expect_tx warp=0 .*barrier=0x16c58` in `.e71` and read back the
+    `wait_pc`/site, or cross-map via `sync_operand_resolver.json` (funcid 3) by the
+    resolved runtime `barrier_addr=0x16c58`, not by a static offset guess.
+- Preferred HW signal, in order of usefulness:
+  1. **NCU `SourceCounters` / warp-state sampling** on those PCs to get cycles-between
+     the two producer TMA-fill arrives (the window) per scheduler.
+  2. If per-arrive timing is not resolvable, use **`smsp__average_warps_issue_stalled_barrier`**
+     and the **`long_scoreboard`/`tma`** stall spans around the producer warp to bound
+     the inter-fill interval.
+  3. Coarse fallback: the NCU `NANOSLEEP` totals already on record
+     (K5 HW `NANOSLEEP` = **8,461**) confirm the producer *does* spin-wait on HW,
+     i.e. the window is not zero; but this alone does not give its width.
+- Also record **whether the window depends on tile index** (causal → later tiles do
+  less work). If yes, the two regimes above are both physical and the sim must not
+  assume a single window.
+
+**Sim-side numbers to compare against (already measured, `.e71`):**
+
+- producer `0xb0b0` arrival − gen1 open: poison med **+8,398** (this is the producer
+  path latency after its window opens — compare to HW producer path).
+- two-`0x16c58`-flip interval: poison med **7,553** / success med **12,140** (this is
+  the sim window generator — compare to HW TMA-fill spacing).
+- 21 poison CTAs miss by only ~1.3K median → a **small** pacing correction may
+  suffice; this is not a gross error.
+
+**How to regenerate the sim evidence (CPU-only, if the `.e71` logs are gone).**
+Re-run K5 with `-spin_wait_collapse_enable 1 -spin_wait_collapse_debug 1
+-sync_debug_enable 1` (K5 hangs ~85K cyc, so the global deadlock detector ends it;
+that is expected and fine for harvesting the pre-hang timeline). Then the §13.7
+commands reproduce every number above from the new `.e71`. The trace dir is:
+`simulator-remodeled/hw_run/traces/device-0/12.8/flashattn-fa3-bf16-bwd-causal-b1-s2048-hd64-nh24/flashattn_fa3_bf16_bwd_causal_b1_s2048_hd64_nh24___warmup_0___iters_1_lighter-compact_wire+prune_operands-69a20aed/`.
+
+**Definition of done for this handover step.** A single line recorded back into this
+doc: "HW gen1→gen2 window = N cyc (method M)", plus which row of the decision table
+it selects. That determines whether the follow-up fix targets the **window
+generator** (TMA-fill spacing) or the **producer path latency** — and only then does
+the §13.5 audit implementation get paired with the correct pacing fix.
