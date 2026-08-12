@@ -1130,6 +1130,14 @@ its barrier per kernel).
 
 ### 13.8 HANDOVER — NCU cross-check on another server (self-contained)
 
+> ⚠️ **CLOSED — NCU CANNOT ANSWER THIS (see §13.8.1, 2026-08-12).** The NCU
+> cross-check below was attempted and is **ruled out**: NCU stores only per-kernel
+> aggregates and cumulative PC-stall samples with **no time axis**, so the
+> instant-to-instant interval of a 2-flips/CTA event is unrecoverable. Do **not**
+> re-attempt the NCU path. The forward plan that does **not** depend on a HW window
+> is **§13.9**. The text below is kept only as the record of what was tried and why
+> it fails.
+
 This is the next action item and can be done independently on a GPU/NCU server.
 Everything needed to run it and to interpret it is here; no prior context required.
 
@@ -1254,3 +1262,68 @@ and is still per-PC-cumulative rather than per-episode.
   (b) **Nsight Systems / CUPTI SASS-level trace** (unproven for an event this
   low-frequency). Sim-side reference for the eventual compare (from `.e71`): success
   window med ~13,474 cyc, poison med ~7,085 cyc, poison miss margin ~1.3K.
+
+## 14. Plan of record — proceed WITHOUT a HW window measurement (2026-08-12)
+
+The §13.8 NCU path is closed (§13.8.1) and there is no in-repo flash_attn_3 kernel
+source to add `clock64()` to (verified: the repo holds only traces/logs, no `.cu`/
+`.cuh` for `FlashAttnFwdSm90`). So the plan does **not** wait on a ground-truth HW
+gen1→gen2 window. It splits into a part that never needed HW and a part whose
+verdict is re-grounded on sim-internal evidence.
+
+### 14.1 Step 1 — implement the audit now (unblocked, HW-independent)
+
+The §13.4/§13.5 **generation-counter audit + assert** does not depend on any HW
+number: it deterministically pins the poison (a wait whose `barrier.gen >
+expected_gen`) and stops the run at that exact coordinate. Implement it as specified
+in §13.5. Acceptance: feature-off bit-identity (Gate 0) holds; with collapse on, K5
+aborts with a `[COLLAPSEAUDIT]` line at `wait_pc=0xb0b0` on the 21 poison CTAs
+(instead of a silent 12h hang), and K10 still finishes clean. This converts the bug
+from "silent deadlock" to "loud, located accuracy fault" and is valuable on its own.
+
+### 14.2 Step 2 — re-ground the pacing verdict on sim-internal evidence (replaces the §13.8 HW decision table)
+
+The §13.8 decision table asked HW to say whether the true window is ~7K (producer
+too slow) or ~13K (window wrongly narrowed). Since HW is unavailable, decide it from
+signals already inside the runs — the point is that these two hypotheses make
+**different, checkable predictions** without an absolute HW number:
+
+- **Anchor A — K10 is the in-hand "pacing is ~right" reference.** K10 collapse-ON
+  finishes clean at **135,352 (+1.84% vs HW target)** and moved *toward* HW (−1,546
+  vs Opt 11-A). So the collapse pacing is not grossly wrong in general; K5's poison
+  is a *margin* failure on a specific low-flip barrier, consistent with §13.2.1
+  (SM16 misses by +1 cyc; poison median miss ~1.3K).
+- **Anchor B — within K5, poison vs success SMs are a natural A/B.** Both run the
+  same kernel on the same trace; they differ only in scheduling. §13.4.2 already
+  shows the discriminator is the **two-`0x16c58`-flip interval** (poison med 7,553
+  vs success med 12,140) — i.e. the producer's own inter-fill spacing, which
+  collapse re-paced. If the fault were "producer path intrinsically too slow" it
+  would slow the producer on success SMs too; it does not. This points at
+  **window-narrowing under collapse re-pacing**, not a uniformly slow producer.
+- **Anchor C — feature-off vs collapse-on `0x16c58` fill cadence.** The one clean,
+  HW-free check still to run: compare the producer's inter-fill interval on
+  `0x16c58` between collapse-OFF replay and collapse-ON, per SM. Collapse must not
+  change *semantic* spacing (only spin polls are removed), so a systematic
+  narrowing on the poison SMs would localize the defect to how collapse's park/skip
+  interacts with the empty-barrier (`0x16c40/48/68`) pacing. This is a sim-only
+  measurement (both logs already exist / are cheaply regenerable) and needs no GPU.
+
+**Verdict rule (HW-free):** if Anchors B+C show the poison SMs' `0x16c58` fill
+interval is narrowed *by collapse* (vs their own feature-off cadence and vs success
+SMs), treat it as the **window-generator pacing** defect and fix that; the producer
+path is exonerated by Anchor A. Only if B+C fail to show collapse-induced narrowing
+do we escalate to the (hard) external HW-rebuild route in §13.8.1.
+
+### 14.3 What stays genuinely open (do not overclaim)
+
+Without a HW timestamp we **cannot** prove the *absolute* HW window is 7K vs 13K, so
+we cannot claim the collapsed timing equals HW to the cycle. What we CAN establish
+HW-free: (a) the audit makes the fault non-silent and located; (b) K10 shows the
+pacing is directionally correct; (c) the poison is a collapse-induced *relative*
+narrowing, not a structural error. That is sufficient to implement and validate a
+pacing fix whose success criterion is **"K5 completes with every gen-1 wait landing
+before its gen2 under collapse, with no `[COLLAPSEAUDIT]` abort, and K10 stays
+within its current +1.84%"** — an internal-consistency bar, not a HW-window match.
+If a future engagement gets an external flash_attn_3 source build, the §13.8.1
+`clock64()` route can upgrade this from internal-consistency to HW-absolute; until
+then that upgrade is explicitly out of scope, not forgotten.
