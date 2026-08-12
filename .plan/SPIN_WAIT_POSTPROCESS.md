@@ -6,10 +6,10 @@ built from a captured trace. It is one of three linked docs in the Opt 12
 
 - **tracer** (Opt 11): [`Lighter_NVbit_Tracing.md`](Lighter_NVbit_Tracing.md) —
   the compact full-capture trace this sidecar is built from.
-- **post-processing** (this doc): static spin-region detection + the `collapsible`
+- **post-processing** (this doc): static spin-region detection + the `foldable`
   gate. Read-only wrt the trace; CPU-only; safe to regenerate anytime.
 - **simulator modeling**: [`SPIN_WAIT_SIM_MODELING.md`](SPIN_WAIT_SIM_MODELING.md)
-  — how the simulator consumes this sidecar (collapse block/skip, generation-
+  — how the simulator consumes this sidecar (fold block/skip, generation-
   counter audit, K5 root cause, NCU handover). See its **§13** for the current
   direction.
 
@@ -77,7 +77,7 @@ The sidecar is generated from **Opt 11-A**
 4. **fullrun is the most inflated** (48x / 86x more polls than the real HW NCU
    `NANOSLEEP` totals of 8,461 / 7,860) and is a slow-tracer artifact, not a
    hardware reference. Opt 11-A is lighter and, because the poll count is
-   discarded, its reduced spin is irrelevant to the collapsed result.
+   discarded, its reduced spin is irrelevant to the folded result.
 
 Opt 11-A is thus the least-processed trace that keeps everything the fix needs.
 
@@ -125,8 +125,8 @@ any server with no protobuf toolchain.
    - `semantic_free_body = True` iff the body has no tensor (`*GMMA`), `MUFU`,
      TMA (`UTMA*` / `UBLK*`), global/shared memory (`LDG/STG/LDGSTS/LDS/STS/
      ATOM/RED`), `SYNCS.ARRIVE`, `SYNCS.EXCH`, or `BAR` op. Only such regions may
-     be collapsed; a region with semantic ops is emitted with the flag `False`
-     so the simulator can refuse to collapse it.
+     be folded; a region with semantic ops is emitted with the flag `False`
+     so the simulator can refuse to fold it.
    - thread-local stack ops (`STL` / `LDL`) are allowed (warp-local side effect)
      and reported in `local_mem_ops_in_body`.
 5. **Pick the primary wait**: the last `PHASECHK` in the body if present, else
@@ -199,7 +199,7 @@ Key design choices:
   register-formed (`[R5+URZ+0x16840]`); the real address is known only from the
   instruction's captured `sync.barrier_addr` payload at replay time.
   `barrier_operand_text` is recorded for cross-checking/debugging only.
-- **`semantic_free_body` gates collapse.** The simulator must never collapse a
+- **`semantic_free_body` gates fold.** The simulator must never fold a
   region whose body carries real work.
 
 ## 6. Validation results (Opt 11-A, all CTAs)
@@ -245,7 +245,7 @@ The simulator, behind a default-off flag, should:
    - **ready**: advance `used_insts` to the next `exit_pc` occurrence, consuming
      the remaining recorded poll iterations without issuing them, then continue
      into the semantic block.
-3. Only collapse regions with `semantic_free_body = true` and
+3. Only fold regions with `semantic_free_body = true` and
    `is_spin_loop = true`.
 4. Guard against a modeled barrier that never flips: after a threshold of parked
    cycles, surface it as a model bug (assert/log), never silently hang. The HW
@@ -268,10 +268,10 @@ The simulator, behind a default-off flag, should:
 - **Gate 4 — no fake win**: no widened interconnect, no reinserted fake spins, no
   trace trimming, no HW-timestamp-based issue delay, no total-cycle-only match.
 
-## 9. Observe-only stage (implemented; runs before collapse)
+## 9. Observe-only stage (implemented; runs before fold)
 
-Before any control-flow change, an **observe-only** pass measures what collapse
-*would* do, so a single (12h) run decides whether collapse is safe and where it
+Before any control-flow change, an **observe-only** pass measures what fold
+*would* do, so a single (12h) run decides whether fold is safe and where it
 helps. It is gated by `-spin_wait_observe_enable` (default 0) and **never blocks,
 advances the trace, or changes timing** — it only reads the modeled mbarrier
 result already computed for each `PHASECHK`/`TRYWAIT`.
@@ -280,14 +280,14 @@ Scope: only polls whose `(funcid, pc)` matches a sidecar `primary_wait_pc` that
 is `is_spin_loop && semantic_free_body`. For each `(warp, region)` episode it
 records the cycle of the first not-ready poll and, when the same region next
 polls ready, buckets the elapsed cycles = the cycles the warp **would** be parked
-under collapse.
+under fold.
 
 ### Log lines (stdout)
 
 - `[SPINWAITOBS] sm=.. wait_pc=0x.. episodes=.. avg_park=.. max_park=.. total_park=.. immediate_ready=.. watchdog_hits=.. hist[0/1-16/17-64/65-256/257-1024/>1024]=..`
   Per-region (per `primary_wait_pc`) would-be-park summary, emitted per SM. Cumulative;
   the last CTA-exit print for an SM holds the totals. Attributes park latency to a
-  specific spin region so collapse can be applied/diagnosed region by region.
+  specific spin region so fold can be applied/diagnosed region by region.
 - `[SPINWAITDEADLOCK] sm=.. cta=.. warp=.. wait_pc=0x.. barrier=0x.. parked_cyc=.. first_not_ready_cyc=.. now=.. threshold=..`
   Emitted **immediately** (once per episode) when a single would-be park crosses the
   watchdog threshold (default 400,000 cycles, ~3x the K10 HW target). This is the
@@ -298,11 +298,11 @@ under collapse.
 
 ### Deadlock decision rule
 
-Collapse is safe to implement iff, across the run, there are **no
+Fold is safe to implement iff, across the run, there are **no
 `[SPINWAITDEADLOCK]` and no `[SPINWAITOPEN]` lines**. If any appear, the modeled
 mbarrier for that `wait_pc`/`barrier` never becomes ready in a bounded window;
 fix that barrier's accounting (phase parity, expected-arrive, expect-tx credit)
-BEFORE enabling collapse, because collapse would turn that unbounded wait into a
+BEFORE enabling fold, because fold would turn that unbounded wait into a
 real hang.
 
 ### Correlating with existing sync/TMA logs
@@ -340,19 +340,19 @@ boundary before trusting a GO decision:
 
 - **Proves:** absence of never-flip / pathologically-long waits under the observed
   schedule (`[SPINWAITOPEN]` / `[SPINWAITDEADLOCK]`); the per-region park
-  magnitude; and whether waits are mostly immediate-ready (collapse would be a
+  magnitude; and whether waits are mostly immediate-ready (fold would be a
   no-op) vs genuinely blocking.
-- **Does NOT prove — mutual collapse interaction:** the sidecar detects BOTH the
+- **Does NOT prove — mutual fold interaction:** the sidecar detects BOTH the
   producer's "buffer-empty" wait and the consumer's "buffer-full" wait, and
-  collapse applies to both. Observe measures each wait independently under the
-  *non-collapsed* schedule, so it cannot rule out a circular-wait deadlock that
-  only appears when both sides are collapsed at once (double-buffering normally
+  fold applies to both. Observe measures each wait independently under the
+  *non-folded* schedule, so it cannot rule out a circular-wait deadlock that
+  only appears when both sides are folded at once (double-buffering normally
   breaks the cycle, but a wrong modeled buffer depth could not).
 - **Does NOT prove — exact timing:** in observe the producer still issues its spin
-  polls and consumes issue slots. Under collapse those freed slots let the
+  polls and consumes issue slots. Under fold those freed slots let the
   consumer run faster, flip the barrier earlier, and shorten the park. So the
-  measured park is a *pessimistic upper bound*, not the collapsed timing.
-- **Residual risk is covered at runtime:** the collapse implementation MUST carry
+  measured park is a *pessimistic upper bound*, not the folded timing.
+- **Residual risk is covered at runtime:** the fold implementation MUST carry
   the §8.4 watchdog (assert/log on unbounded park, never silently hang). That is
   the real safety net for the two gaps above.
 
@@ -362,12 +362,12 @@ A single (12h) observe run selects the next step:
 
 | Observed result | Decision | Action |
 |---|---|---|
-| No `[SPINWAITDEADLOCK]` / `[SPINWAITOPEN]`, and park histogram has real weight in the `65-256` / `257-1024` / `>1024` buckets | **GO** | Implement collapse (cursor jump) WITH the runtime watchdog. Validate the K5 tail moves from `-61.4K` toward HW `+7.95K` and TMA burst metrics fall. |
-| No deadlock signals, but episodes are overwhelmingly `immediate_ready` / park ≈ 0 | **PIVOT** | Collapse is a near no-op: the producer is not actually blocked (barriers are ready when polled), so it races ahead for a different reason. Investigate barrier flip timing / expected-tx / arrive credit instead of collapse. Note this is consistent with the current "producer ends ~61K before consumer" symptom, so treat it as a live possibility. |
+| No `[SPINWAITDEADLOCK]` / `[SPINWAITOPEN]`, and park histogram has real weight in the `65-256` / `257-1024` / `>1024` buckets | **GO** | Implement fold (cursor jump) WITH the runtime watchdog. Validate the K5 tail moves from `-61.4K` toward HW `+7.95K` and TMA burst metrics fall. |
+| No deadlock signals, but episodes are overwhelmingly `immediate_ready` / park ≈ 0 | **PIVOT** | Fold is a near no-op: the producer is not actually blocked (barriers are ready when polled), so it races ahead for a different reason. Investigate barrier flip timing / expected-tx / arrive credit instead of fold. Note this is consistent with the current "producer ends ~61K before consumer" symptom, so treat it as a live possibility. |
 | Any `[SPINWAITDEADLOCK]` or `[SPINWAITOPEN]` | **NO-GO (as-is)** | Take the reported `barrier=0x..` and follow it on the `cyc=` timeline through `arrive_expect_tx` / `phase flip` / `tma_complete` / named-barrier events to find the credit that never arrives. Fix that barrier's accounting, re-run observe, then re-decide. |
-| Some regions clean, others flagged | **SELECTIVE** | Enable collapse only for regions with `semantic_free_body && is_spin_loop && watchdog_hits==0`; leave flagged regions nonblocking until their barrier accounting is fixed. |
+| Some regions clean, others flagged | **SELECTIVE** | Enable fold only for regions with `semantic_free_body && is_spin_loop && watchdog_hits==0`; leave flagged regions nonblocking until their barrier accounting is fixed. |
 
-The GO path's collapse work is specified in §8. The watchdog there is mandatory,
+The GO path's fold work is specified in §8. The watchdog there is mandatory,
 not optional, because it is the only mechanism that covers the two limits in §9.
 
 ## 11. First observe-only run results (Opt 11-A, K5 `.o70` / K10 `.o44`)
@@ -385,7 +385,7 @@ Verdict: **GO** (no deadlock; real park exists). Detail:
   timeline: K5 SM27 barrier `0x16c00` flips at `cyc=10049` and `30658`
   (`arrive_expect_tx` -> two `tma_complete` -> `phase flip`), and the kernel ends
   cleanly at `gpu_sim_cycle=83705`.
-- **Large park confirms collapse is worth doing** (not a PIVOT): the closed
+- **Large park confirms fold is worth doing** (not a PIVOT): the closed
   episodes carry hundreds of thousands (K5) to millions (K10) of would-be park
   cycles, mostly in the `>1024`-cycle bucket.
 
@@ -406,23 +406,23 @@ flips confirmed on the timeline and the non-zero closed-episode park.
 ## 12. Downstream: how the simulator consumes this sidecar (pointer)
 
 The sidecar produced here is **post-processing / static analysis only** — it
-annotates spin regions (PCs, primary_wait, exit, `collapsible` gate) and does not
-change the trace. How the simulator *consumes* it (the collapse block/skip, the
+annotates spin regions (PCs, primary_wait, exit, `foldable` gate) and does not
+change the trace. How the simulator *consumes* it (the fold block/skip, the
 generation-counter audit, the K5 double-flip finding, the root-cause investigation,
 and the NCU handover) lives in the **simulator-modeling** design doc:
 
 - **`SPIN_WAIT_SIM_MODELING.md`** — Option A/B mechanics, park/skip, stall-taxonomy,
-  and **§13** (first collapse run result, K5 deadlock root cause, the redefined
+  and **§13** (first fold run result, K5 deadlock root cause, the redefined
   *audit-and-assert* direction, and the NCU cross-check handover).
 
 Feedback loop into this doc (post-processing): the sim-side §13.3 flagged that the
-`collapsible` gate here (`is_spin_loop && semantic_free_body && barrier_self_tied`)
+`foldable` gate here (`is_spin_loop && semantic_free_body && barrier_self_tied`)
 does **not** capture *who advances the mbarrier* or *how few times it flips*. A
 low-flip cross-warp barrier (`0x16c20`, warp-arrived, 2 flips/kernel) was marked
-`collapsible=True` and became the poison site. If a future revision wants the
+`foldable=True` and became the poison site. If a future revision wants the
 detector to carry that information (e.g. an advisory `low_flip_cross_warp` or
 `advanced_by` field), it would be added in
 [`build_spin_wait_sidecar.py`](../simulator-remodeled/util/tracer_nvbit/build_spin_wait_sidecar.py)
-— but note the current decision (§13.4) is to keep collapse working for all
+— but note the current decision (§13.4) is to keep fold working for all
 barriers and **audit** violations in the simulator, not to pre-exclude regions in
 the sidecar. So no sidecar schema change is required for the audit-and-assert plan.

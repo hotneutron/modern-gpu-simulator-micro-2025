@@ -62,7 +62,7 @@ ISIZE = 0x10          # every FA3 SM90 SASS instruction is 16 bytes
 MAX_LOOP_SPAN = 0x100  # a spin loop is short; guards against matching big loops
 
 # Opcodes whose presence in a loop body makes it NOT a pure wait (would drop real
-# work if the poll count were collapsed). Global/shared memory + tensor + async.
+# work if the poll count were folded). Global/shared memory + tensor + async.
 SEMANTIC_PREFIXES = (
     "HGMMA", "IGMMA", "QGMMA", "BGMMA", "OGMMA", "MMA",
     "MUFU",
@@ -72,7 +72,7 @@ SEMANTIC_PREFIXES = (
     "SYNCS.ARRIVE", "SYNCS.EXCH", "BAR",
 )
 # Thread-local stack ops that are warp-local side effects only — safe inside a
-# collapsed wait region, but recorded so the simulator/reviewer can see them.
+# folded wait region, but recorded so the simulator/reviewer can see them.
 LOCAL_MEM_PREFIXES = ("STL", "LDL")
 
 WAIT_KINDS = ("PHASECHK", "TRYWAIT")
@@ -344,11 +344,11 @@ def main():
             st = stats[r["region_id"]]
             r_out = dict(r)
             r_out["dynamic"] = st
-            # The simulator collapses a region ONLY if all three gates hold:
+            # The simulator folds a region ONLY if all three gates hold:
             # it is an actual spin loop, its body has no semantic work, and its
             # SASS wait-barriers are self-tied (whole-loop skip is scoreboard
             # net-zero). See .plan/SPIN_WAIT_SIM_MODELING.md 12.7.
-            r_out["collapsible"] = bool(
+            r_out["foldable"] = bool(
                 st["is_spin_loop"] and r["semantic_free_body"]
                 and r["barrier_self_tied"])
             clean.append(r_out)
@@ -365,14 +365,14 @@ def main():
             "spin_regions": clean,
         })
         n_sem = sum(0 if r["semantic_free_body"] else 1 for r in regions)
-        n_collapsible = sum(1 for r in clean if r["collapsible"])
+        n_foldable = sum(1 for r in clean if r["foldable"])
         n_bar_unsafe = sum(1 for r in regions
                            if not r["barrier_self_tied"]
                            and stats[r["region_id"]]["is_spin_loop"])
         print("[spin-sidecar] kernel_%d funcid=%d: %d spin regions "
-              "(collapsible=%d, semantic-in-body=%d, spin+barrier-unsafe=%d), "
+              "(foldable=%d, semantic-in-body=%d, spin+barrier-unsafe=%d), "
               "validated %d CTAs"
-              % (kid, fid, len(regions), n_collapsible, n_sem, n_bar_unsafe, n_ctas))
+              % (kid, fid, len(regions), n_foldable, n_sem, n_bar_unsafe, n_ctas))
         for r in clean:
             st = r["dynamic"]
             kind = "spin" if st["is_spin_loop"] else "single-shot"
@@ -387,11 +387,11 @@ def main():
             if r["local_mem_ops_in_body"]:
                 note = "  local_mem=%d" % len(r["local_mem_ops_in_body"])
             print("    %-16s [%-11s] head=0x%-5x wait=0x%-5x(%s) exit=0x%-5x "
-                  "iters[min/max/tot]=%s/%s/%s warp_visits=%d collapsible=%d%s%s"
+                  "iters[min/max/tot]=%s/%s/%s warp_visits=%d foldable=%d%s%s"
                   % (r["region_id"], kind, r["loop_head_pc"], r["primary_wait_pc"],
                      r["primary_wait_kind"], r["exit_pc"],
                      st["min_iters"], st["max_iters"], st["total_iters"],
-                     st["warp_visits"], int(r["collapsible"]), note, flags))
+                     st["warp_visits"], int(r["foldable"]), note, flags))
 
     sidecar = {
         "version": 2,
@@ -399,7 +399,7 @@ def main():
         "source_traces_dir": os.path.abspath(traces),
         "isize_bytes": ISIZE,
         "note": ("PC-anchored producer/consumer spin-wait regions. The simulator "
-                 "collapses a region ONLY if collapsible=true (is_spin_loop && "
+                 "folds a region ONLY if foldable=true (is_spin_loop && "
                  "semantic_free_body && barrier_self_tied): block the warp until "
                  "the modeled mbarrier at the runtime barrier_addr of "
                  "primary_wait_pc is ready, then advance the trace cursor to the "
@@ -414,7 +414,7 @@ def main():
     print("[spin-sidecar] wrote %s (%d kernels)" % (out_path, len(out_kernels)))
     if args.strict and strict_violation:
         sys.exit("[spin-sidecar] STRICT: a spin region has semantic ops in its "
-                 "body or a non-self-tied SASS wait-barrier (not collapse-safe)")
+                 "body or a non-self-tied SASS wait-barrier (not fold-safe)")
 
 
 if __name__ == "__main__":

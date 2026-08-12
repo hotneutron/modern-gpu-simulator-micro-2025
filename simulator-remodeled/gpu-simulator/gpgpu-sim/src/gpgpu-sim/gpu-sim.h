@@ -920,7 +920,7 @@ class gpgpu_sim : public gpgpu_t {
 
   // Producer spin-wait sidecar lookup: returns true and fills `region` if the
   // (funcid, pc) is the primary wait of a detected mbarrier spin loop. Used by
-  // the (gated) producer spin-wait collapse feature. See .plan/SPIN_WAIT_POSTPROCESS.md.
+  // the (gated) producer spin-wait fold feature. See .plan/SPIN_WAIT_POSTPROCESS.md.
   bool lookup_spin_wait_region(unsigned int unique_function_id, address_type pc,
                                SpinWaitRegionRecord &region) const;
 

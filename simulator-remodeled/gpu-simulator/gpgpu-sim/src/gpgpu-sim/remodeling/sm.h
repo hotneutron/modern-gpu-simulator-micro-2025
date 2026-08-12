@@ -241,16 +241,16 @@ class SM : public core_t, public shader_core_ctx_wrapper {
   bool ldst_unit_response_buffer_full() const override;
   bool are_all_wait_barrier_ready(unsigned int warp_id);
   bool warp_waiting_at_barrier(unsigned warp_id) const override;
-  // [Spin-wait collapse] Non-mutating peek of the same park condition as
+  // [Spin-wait fold] Non-mutating peek of the same park condition as
   // warp_waiting_at_barrier, but with NO clear and NO counter bump. Used off the
   // authoritative issue-eligibility path (sort comparator, stall scans) so the
   // release side effect fires exactly once. See design doc 6.5.1.
   bool warp_parked_on_mbarrier_spin(unsigned warp_id) const;
-  // [Spin-wait collapse] Once-per-warp-per-cycle service on the issue path: if a
-  // collapsible park is now satisfied, flush the IBuffer, fast-forward the trace
+  // [Spin-wait fold] Once-per-warp-per-cycle service on the issue path: if a
+  // foldable park is now satisfied, flush the IBuffer, fast-forward the trace
   // cursor to the region exit_pc, and clear the pending wait. No-op unless
-  // -spin_wait_collapse_enable. See design doc 5.1/6.5.1.
-  void service_collapse_release(unsigned warp_id);
+  // -spin_wait_fold_enable. See design doc 5.1/6.5.1.
+  void service_fold_release(unsigned warp_id);
   bool check_if_non_released_reduction_barrier(warp_inst_t &inst);
   bool warp_waiting_at_mem_barrier(unsigned warp_id) override;
   // True when `pI` is a UTMACMDFLUSH (cp.async.bulk.wait_group 0) and the
@@ -376,6 +376,15 @@ class SM : public core_t, public shader_core_ctx_wrapper {
       HopperMBarrierObject &barrier, uint64_t barrier_addr);
   bool is_sync_wait_satisfied(
       const HopperMBarrierPendingWait &pending_wait) const;
+  // [Spin-wait fold audit] Parity-aware expected generation for a foldable
+  // wait: the smallest gen > last-consumed (this warp+barrier) whose parity flips
+  // the waited-on phase, i.e. (gen & 1) != wait_parity. The barrier starts
+  // phase=0/gen=0 with phase == gen&1, so the very first wait may pair with gen 0.
+  uint64_t fold_expected_gen_for_wait(unsigned int warp_id,
+                                          const HopperMBarrierKey &key,
+                                          uint64_t wait_state_raw) const;
+  // Current monotonic generation of a barrier (0 if the object does not exist).
+  uint64_t sync_barrier_gen(const HopperMBarrierKey &key) const;
   void clear_sync_barrier_state_for_cta(unsigned int cta_id);
   void bind_tma_completion_to_sync_barrier(unsigned int warp_id,
                                            const HopperMBarrierKey &key,
@@ -383,7 +392,7 @@ class SM : public core_t, public shader_core_ctx_wrapper {
   void notify_tma_completion(unsigned int warp_id, uint32_t completed_tx_bytes);
   void debug_log_sync_event(const std::string &message);
   void debug_log_tma_event(const std::string &message);
-  void debug_log_collapse_event(const std::string &message);
+  void debug_log_fold_event(const std::string &message);
   void debug_dump_sync_counters() const;
 
   InterWarp_Coalescing_Waiting_Dep_Counters *m_interwarp_coal_warps_waiting_dep_counter;
@@ -449,8 +458,8 @@ class SM : public core_t, public shader_core_ctx_wrapper {
   uint64_t m_sync_debug_skip_runtime_budget = 0;
   // Independent budget for TMA-only stderr logs (TMADBG); 0 disables.
   uint64_t m_tma_debug_print_budget = 0;
-  // Independent budget for spin-wait collapse logs (COLLAPSE); 0 disables.
-  uint64_t m_collapse_debug_print_budget = 20000000;
+  // Independent budget for spin-wait fold logs (FOLD); 0 disables.
+  uint64_t m_fold_debug_print_budget = 20000000;
   uint64_t m_sync_debug_sync_insts = 0;
   uint64_t m_sync_debug_exch = 0;
   uint64_t m_sync_debug_arrive = 0;
@@ -605,7 +614,7 @@ class SM : public core_t, public shader_core_ctx_wrapper {
   bool m_producer_spin_in_ready_run[MAX_WARP_PER_SHADER] = {false};
 
   // [Spin-wait observe] Observe-only measurement of the would-be park time if the
-  // producer spin-wait collapse feature were enabled. For each (warp,region)
+  // producer spin-wait fold feature were enabled. For each (warp,region)
   // episode we remember the cycle of the FIRST not-ready poll and, when the same
   // warp next polls the same region ready, bucket the elapsed cycles PER REGION
   // (keyed by primary_wait_pc). This never changes control flow; it only sizes
@@ -632,25 +641,31 @@ class SM : public core_t, public shader_core_ctx_wrapper {
   };
   std::map<uint64_t, SpinWaitRegionObserve> m_spin_wait_observe_by_region;
   // Deadlock watchdog threshold: a single would-be park longer than this many
-  // cycles is reported immediately as a deadlock candidate for collapse. 0 uses
+  // cycles is reported immediately as a deadlock candidate for fold. 0 uses
   // the built-in default in record_spin_wait_observe.
   unsigned long long m_spin_wait_watchdog_threshold = 0;
-  // [Spin-wait collapse] Per-warp cycle at which the current collapse park began
-  // (0 = not parked). Used by service_collapse_release to fire a deadlock
+  // [Spin-wait fold] Per-warp cycle at which the current fold park began
+  // (0 = not parked). Used by service_fold_release to fire a deadlock
   // watchdog if a real park exceeds m_spin_wait_watchdog_threshold. Sized at
   // first use to MAX_WARP_PER_SHADER.
-  std::vector<unsigned long long> m_collapse_park_start_cycle;
-  // [Spin-wait collapse] SM-global validation counters (only move when
-  // -spin_wait_collapse_enable). park==release confirms every park was released;
+  std::vector<unsigned long long> m_fold_park_start_cycle;
+  // [Spin-wait fold audit] Per-warp, per-barrier last consumed generation
+  // (the gen a prior foldable wait of this warp on this barrier resolved to).
+  // Sentinel: absent key = "none consumed yet" (first wait may pair with gen 0).
+  // Only written on the fold issue path; empty when fold is disabled, so
+  // feature-off is bit-identical. Used to compute the parity-aware expected_gen.
+  std::vector<std::map<HopperMBarrierKey, uint64_t>> m_fold_last_gen;
+  // [Spin-wait fold] SM-global validation counters (only move when
+  // -spin_wait_fold_enable). park==release confirms every park was released;
   // parks_total vs releases_total and skipped_insts_total let a single run check
   // the Gate-1 invariant (skipped == gpu_sim_insn delta vs baseline). Emitted by
-  // print_spin_wait_collapse_summary at each CTA exit (cumulative).
-  unsigned long long m_collapse_parks_total = 0;
-  unsigned long long m_collapse_releases_total = 0;
-  unsigned long long m_collapse_skipped_insts_total = 0;
-  unsigned long long m_collapse_park_cycles_total = 0;
-  unsigned long long m_collapse_park_cycles_max = 0;
-  unsigned long long m_collapse_watchdog_hits = 0;
+  // print_spin_wait_fold_summary at each CTA exit (cumulative).
+  unsigned long long m_fold_parks_total = 0;
+  unsigned long long m_fold_releases_total = 0;
+  unsigned long long m_fold_skipped_insts_total = 0;
+  unsigned long long m_fold_park_cycles_total = 0;
+  unsigned long long m_fold_park_cycles_max = 0;
+  unsigned long long m_fold_watchdog_hits = 0;
  public:
   // Increment the tensor-op count for the CTA slot that owns hardware warp wid.
   void inc_tensor_ops_for_warp(unsigned wid) {
@@ -674,7 +689,7 @@ class SM : public core_t, public shader_core_ctx_wrapper {
                                 uint64_t barrier_addr, unsigned cta_id,
                                 bool ready);
   void print_spin_wait_observe_summary() const;
-  // [Spin-wait collapse] SM-global validation summary ([COLLAPSESUM]): parks,
+  // [Spin-wait fold] SM-global validation summary ([FOLDSUM]): parks,
   // releases, skipped insts, avg/max real park, watchdog hits. Emitted per SM.
-  void print_spin_wait_collapse_summary() const;
+  void print_spin_wait_fold_summary() const;
 };

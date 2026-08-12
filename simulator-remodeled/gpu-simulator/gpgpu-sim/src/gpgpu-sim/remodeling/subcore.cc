@@ -535,10 +535,10 @@ void Subcore::issue(SM *shared_sm) {
   //   non-TMA axis : fu_occupied (gmma/math pipe) + stall_count (wait) + l1c (short scoreboard)
   //                  + scoreboard (traditional RAW/WAR) + yield
   bool is_any_waiting_in_inst_barrier = false;   // named barrier / ldgdepbar (TMA)
-  // [Spin-wait collapse] mbarrier-spin park (m_pending_sync_waits) split out of
-  // inst_barrier so a collapsed producer/consumer wait is attributed to the
+  // [Spin-wait fold] mbarrier-spin park (m_pending_sync_waits) split out of
+  // inst_barrier so a folded producer/consumer wait is attributed to the
   // mbarrier axis, not the named-barrier axis. See design doc 6.5. Only ever set
-  // when -spin_wait_collapse_enable (park is otherwise never armed).
+  // when -spin_wait_fold_enable (park is otherwise never armed).
   bool is_any_waiting_in_mbarrier_spin = false;
   bool is_any_waiting_in_wait_barrier = false;   // mbarrier -> NCU "barrier/long_scoreboard" (TMA)
   bool is_any_waiting_in_stall_count = false;    // fixed-latency dep -> NCU "wait" (non-TMA)
@@ -992,10 +992,10 @@ void Subcore::issue(SM *shared_sm) {
               } // m_config->wgmma_step0_instrument_enable
             }
             if(!is_not_warp_waiting_in_programmer_barrier || !is_not_warp_waiting_ldgdepbar) {
-              // [Spin-wait collapse] Attribute an mbarrier-spin park to its own
+              // [Spin-wait fold] Attribute an mbarrier-spin park to its own
               // bucket instead of the named-barrier bucket. The non-mutating peek
               // avoids re-triggering the release side effect from this scan.
-              if(m_config->spin_wait_collapse_enable && !tail_readonly &&
+              if(m_config->spin_wait_fold_enable && !tail_readonly &&
                  shared_sm->warp_parked_on_mbarrier_spin(sm_warp_id)) {
                 is_any_waiting_in_mbarrier_spin = true;
               } else {
@@ -1220,14 +1220,14 @@ void Subcore::issue(SM *shared_sm) {
 void Subcore::modify_warp_state() {
   for (auto warp : m_warps_of_subcore) {
     warp->get_dependency_state()->cycle();
-    // [Spin-wait collapse] Once-per-warp-per-cycle release service, at the top of
+    // [Spin-wait fold] Once-per-warp-per-cycle release service, at the top of
     // issue() (subcore.cc:593) so it runs BEFORE this cycle's decode()/fetch()
-    // re-prime get_pc(). No-op unless -spin_wait_collapse_enable. If a collapsible
+    // re-prime get_pc(). No-op unless -spin_wait_fold_enable. If a foldable
     // park is now satisfied, this flushes the IBuffer and fast-forwards the trace
     // cursor to the loop exit. See .plan/SPIN_WAIT_SIM_MODELING.md 6.5.1.
-    if (m_config->spin_wait_collapse_enable && warp != NULL &&
+    if (m_config->spin_wait_fold_enable && warp != NULL &&
         !warp->done_exit()) {
-      m_sm->service_collapse_release(warp->get_warp_id());
+      m_sm->service_fold_release(warp->get_warp_id());
     }
     if(m_config->is_interwarp_coalescing_enabled && ((m_config->interwarp_coalescing_selection_policy == DEP_COUNT_WAIT_OLDEST_INST_IBUFFER_GENERIC) ||
         (m_config->interwarp_coalescing_selection_policy == DEP_COUNT_WAIT_OLDEST_INST_IBUFFER_CHECKING_WARP_ID)))  {

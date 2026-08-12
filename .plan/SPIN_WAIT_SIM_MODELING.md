@@ -1,6 +1,6 @@
-# Producer Spin-Wait Collapse — Simulator Modeling Design
+# Producer Spin-Wait Fold — Simulator Modeling Design
 
-**Role.** This is the **simulator-modeling** design doc for spin-wait collapse: how
+**Role.** This is the **simulator-modeling** design doc for spin-wait fold: how
 the simulator *consumes* the spin-wait sidecar and models the producer/consumer
 mbarrier handshake at replay time. It is one of three linked docs in the Opt 12
 "lightweight-trace → post-process → sim-model" chain:
@@ -8,16 +8,16 @@ mbarrier handshake at replay time. It is one of three linked docs in the Opt 12
 - **tracer** (Opt 11): [`Lighter_NVbit_Tracing.md`](Lighter_NVbit_Tracing.md) —
   the compact full-capture trace this all runs on.
 - **post-processing**: [`SPIN_WAIT_POSTPROCESS.md`](SPIN_WAIT_POSTPROCESS.md) —
-  the static spin-wait sidecar (region detection, `collapsible` gate). Read-only
+  the static spin-wait sidecar (region detection, `foldable` gate). Read-only
   wrt the trace.
-- **simulator modeling** (this doc): the collapse block/skip mechanics, stall
+- **simulator modeling** (this doc): the fold block/skip mechanics, stall
   taxonomy, and the runtime generation-counter **audit**.
 
 > **STATUS (2026-08-12): IMPLEMENTED, then redirected.** §1–§12 are the original
 > pre-implementation design review (kept as the record of *why* each mechanic is
-> shaped the way it is). Collapse was then implemented and run; **K5 deadlocked on a
+> shaped the way it is). Fold was then implemented and run; **K5 deadlocked on a
 > low-flip cross-warp barrier double-flip.** The root cause, and the resulting
-> **change of direction (collapse = accuracy audit, generation = assert-only, never
+> **change of direction (fold = accuracy audit, generation = assert-only, never
 > force-release)**, are in **§13**. §13 SUPERSEDES the earlier decisions in **§6.1**
 > (“keep 1-bit parity, no epoch counter”), **§6** (watchdog framing), and **§12.8**
 > (“circular wait precluded”) wherever they conflict. Read §13 first; treat §1–§12
@@ -125,7 +125,7 @@ Two investigations settled this:
 **Investigation 1 — poll payload per occurrence (trace_parser.cc:316-321).** Each
 dynamic poll occurrence carries its own `sync_barrier_addr` and `sync_semantic_raw`
 parsed from protobuf and stored in `map_warp_traces[pc].instructions[occurrence]`.
-Measured on K5 CTA0 collapsible wait_pcs:
+Measured on K5 CTA0 foldable wait_pcs:
 - `barrier_addr` is CONSTANT per wait_pc (good — B1 could not mis-bind the barrier).
 - but `semantic_raw` takes TWO values on some regions (`0xb1f0`, `0xb2b0`: `0x0`
   and `0x80000000`) — bit31 is the phase-parity of the wait. So consecutive
@@ -139,14 +139,14 @@ is unaffected, but the mis-bound phase parity could corrupt a subsequent
 `is_sync_wait_satisfied` on that barrier. B1 is therefore unsafe here.
 
 **Investigation 2 — exit_pc uniformity (K10 producer regions).** For every
-collapsible region the loopback BRA's successor is ONLY {loop_head, sidecar
+foldable region the loopback BRA's successor is ONLY {loop_head, sidecar
 exit_pc} — no third target. Verified on K10 `0xb960`/`0xb820`/`0xbb40` (551/469/100
 loop-backs vs 7/6/1 exits, exit pc matches the sidecar exactly). The
 first-iteration-different regions (leading WARPSYNC.ALL / STL-LDL) exit to the
 same pc because the first-iteration prologue is consumed before the primary_wait
 is reached. So the sidecar `exit_pc` is a trustworthy jump target.
 
-**Decision: B2.** Add a `trace_shd_warp_t` method that, on a ready collapse, walks
+**Decision: B2.** Add a `trace_shd_warp_t` method that, on a ready fold, walks
 the linear cursor forward from the current position to the next `exit_pc`,
 advancing BOTH `used_insts` and each traversed body PC's `num_used_instructions`
 exactly as `get_next_trace_inst` would, so payload cursors stay consistent and
@@ -156,7 +156,7 @@ rather than jump over them (B1). The only residual risk is off-by-one in
 mirroring `get_next_trace_inst`'s increment — covered by a feature-off bit-identity
 test and an assert that the post-skip head pc equals `exit_pc`.
 
-### 4a. Relationship to fetch prefetch (why collapse doesn't fight it)
+### 4a. Relationship to fetch prefetch (why fold doesn't fight it)
 
 The remodeled IBuffer prefetches on a FALL-THROUGH assumption. `get_next_pc_to_
 fetch_request()` (ibuffer_remodeled.cc:81-96) pushes empty entries for
@@ -174,11 +174,11 @@ advanced. A producer spin loop's `BRA -> loop_head` is a backward taken branch, 
 loop is not a quiet fall-through, it is a fetch that mis-predicts and is corrected
 each turn.
 
-Implication for collapse: at the moment we decide to leave the loop, the IBuffer
+Implication for fold: at the moment we decide to leave the loop, the IBuffer
 may hold mis-prefetched loop entries. We do NOT need new machinery to clean them —
-the existing `flush()` already discards them and rolls their cursor back. Collapse
+the existing `flush()` already discards them and rolls their cursor back. Fold
 then advances the (now-consistent) linear+per-pc cursors to `exit_pc` and lets the
-next fetch start there. So collapse composes with prefetch by reusing the exact
+next fetch start there. So fold composes with prefetch by reusing the exact
 flush/rollback the loop already uses every iteration.
 
 ### 4b. Reused vs new code (explicit)
@@ -207,7 +207,7 @@ flush/rollback the loop already uses every iteration.
   actually consumes each iteration is `body_pcs ∪ {loopback_bra_pc}` =
   {0xacb0,0xacc0,0xacd0,0xace0,0xacf0}. If the walk instead stopped as soon as it
   saw a PC not in `body_pcs`, it would halt at the FIRST loopback BRA and land the
-  cursor on 0xacf0 instead of the exit — corrupting the collapse. The condition
+  cursor on 0xacf0 instead of the exit — corrupting the fold. The condition
   MUST be the positive `traced_pcs[used_insts] != exit_pc`, advancing over
   whatever PCs appear (verified contiguous, no foreign interleave), which
   naturally consumes the loopback BRA occurrences too.
@@ -224,7 +224,7 @@ flush/rollback the loop already uses every iteration.
   redirect alone (B1) — leaves per-pc cursors behind, re-binds stale phase-parity
   payload (Investigation 1).
 
-Sequence at a ready collapse: (1) issue/observe the primary_wait poll, decide
+Sequence at a ready fold: (1) issue/observe the primary_wait poll, decide
 ready; (2) `flush(false)` the warp's IBuffer; (3) `skip_spin_to_exit(exit_pc)`;
 (4) next fetch naturally starts at `exit_pc`.
 
@@ -236,7 +236,7 @@ executes/completes, in `SM::warp_inst_complete` (sm.cc:3073-3112):
 icount), and the SP/SFU/MEM committed counters. Opcode-family work (HGMMA / MUFU /
 TMA / BAR) is likewise counted on execution, not on fetch.
 
-Collapse skips instructions by advancing cursors WITHOUT issuing/completing them,
+Fold skips instructions by advancing cursors WITHOUT issuing/completing them,
 so:
 - Skipped spin polls (PHASECHK / NANOSLEEP / loopback BRA) never reach
   `warp_inst_complete` → they drop out of `gpu_sim_insn` and icount. This is the
@@ -247,11 +247,11 @@ so:
 
 Two metrics to keep in mind (not blockers):
 - `[TRIMCHK]` issue counters (trimchk_spin_phasechk_issued, etc.) count at issue,
-  so they fall under collapse. That is the desired signal (fewer spins issued),
+  so they fall under fold. That is the desired signal (fewer spins issued),
   not an error.
 - `[TRACECHECK]` expected warp/active-lane instruction contract is computed at
   trace LOAD time from `traced_pcs.size()`, so `expected` is unchanged while
-  `actual` (executed) drops. Under collapse-on, expected != actual is EXPECTED and
+  `actual` (executed) drops. Under fold-on, expected != actual is EXPECTED and
   consistent with the relaxed Gate 1. Confirmed `[TRACECHECK]` is a print, not an
   assert (trace_parser.cc:621); the only hard invariant on the cursor is
   `get_pc()`'s `assert(used_insts < traced_pcs.size())` (trace_driven.cc:172),
@@ -262,7 +262,7 @@ bit-identical to today.
 
 ## 5. Blocking mechanism (shared by A and B)
 
-- On a not-ready primary_wait poll of a collapsible region, set
+- On a not-ready primary_wait poll of a foldable region, set
   `m_pending_sync_waits[warp_id] = {valid=true, is_trywait, key, wait_state_raw}`
   (currently this path is dead because handle_sync_instruction always resets it).
 - `SM::warp_waiting_at_barrier()` already consults `m_pending_sync_waits` and
@@ -305,7 +305,7 @@ Reuse the observe threshold idea in the live path: if a warp stays parked on the
 same barrier for > threshold cycles, do NOT hang — emit a fatal diagnostic
 (sm/cta/warp/wait_pc/barrier/arrive/expected/tx/phase) and abort (or, behind a
 sub-flag, release the park and fall back to trace replay for that warp so the run
-completes). This covers the two observe blind spots (mutual-collapse interaction,
+completes). This covers the two observe blind spots (mutual-fold interaction,
 2nd-order scheduling) called out in §9 of SPIN_WAIT_POSTPROCESS.md.
 
 ### 6.1 Phase-parity double-flip — keep the 1-bit model (reviewed, not a hazard)
@@ -313,8 +313,8 @@ completes). This covers the two observe blind spots (mutual-collapse interaction
 > ⚠️ **SUPERSEDED by §13.2/§13.3 (2026-08-12).** This section concluded a
 > double-flip cannot strand a parked warp. That is false for a **low-flip
 > cross-warp barrier** (`0x16c20`, 2 flips/kernel): it flipped twice before the
-> collapsed producer even reached its poll, on 21/132 CTAs. The 1-bit model is
-> kept for the non-collapse issue path, but the collapse path now needs the §13.4
+> folded producer even reached its poll, on 21/132 CTAs. The 1-bit model is
+> kept for the non-fold issue path, but the fold path now needs the §13.4
 > generation **audit** to detect this. Read the reasoning below as the (refuted)
 > original argument.
 
@@ -342,13 +342,13 @@ sync model); do NOT add an epoch counter for v1.
 
 ## 6.5 Stall-reason taxonomy must be corrected for the new park (REQUIRED)
 
-Collapse introduces a NEW reason a warp is not eligible: it is parked on an
+Fold introduces a NEW reason a warp is not eligible: it is parked on an
 mbarrier via `m_pending_sync_waits`. Today that path is dead, so no mbarrier stall
 is ever attributed. The subcore's per-cycle stall classifier currently folds our
 park into the WRONG bucket, which would corrupt exactly the analysis this whole
 effort depends on.
 
-The bug: the collapse park routes through `c_warp->waiting()` →
+The bug: the fold park routes through `c_warp->waiting()` →
 `SM::warp_waiting_at_barrier()` → `m_pending_sync_waits`. But `waiting()` also
 covers NAMED barriers (`m_barriers`), and the classifier at subcore.cc:989 does:
 ```
@@ -364,7 +364,7 @@ Why it matters (subcore.cc:534-539 taxonomy):
 - `is_any_waiting_in_inst_barrier` = named barrier + ldgdepbar, TMA axis
 Both sum into the TMA axis so the AXIS total stays right, but the sub-reason is
 wrong. The producer-parked-on-mbarrier cycles are precisely what Gate 3 needs to
-read ("did collapse convert producer race-ahead into mbarrier-wait pacing?"). If
+read ("did fold convert producer race-ahead into mbarrier-wait pacing?"). If
 they hide inside named-barrier stalls, the timing story is unreadable. Note also
 that `wait_barrier` today means the SASS control-bit WGMMA/DEPBAR wait
 (`are_wait_barriers_ready`), a DIFFERENT mechanism — so we should not blindly
@@ -373,18 +373,18 @@ reuse it either.
 Required change (gated, so feature-off stays bit-identical):
 1. Add a dedicated query, e.g. `SM::warp_parked_on_mbarrier_spin(warp_id)`, that
    returns true only when the warp is parked via `m_pending_sync_waits` (the
-   collapse path), distinct from named-barrier `m_barriers` waiting.
+   fold path), distinct from named-barrier `m_barriers` waiting.
 2. Add a dedicated stall flag/counter, e.g. `is_any_waiting_in_mbarrier_spin`
    (+ `total_num_warpcyc_stalled_mbarrier_spin` in the per-warp-cycle block near
-   subcore.cc:835), and attribute the collapse park to it instead of
+   subcore.cc:835), and attribute the fold park to it instead of
    `inst_barrier`.
 3. Keep it inside the TMA axis grouping so axis totals are unchanged, but make the
    mbarrier-spin sub-reason separately visible.
-4. Feature-off (`-spin_wait_collapse_enable 0`): `m_pending_sync_waits` stays
+4. Feature-off (`-spin_wait_fold_enable 0`): `m_pending_sync_waits` stays
    always-invalid as today, so the new flag is never set and every existing stall
    counter is bit-identical.
 
-This is the only stall-metric change collapse needs; the execution-count metrics
+This is the only stall-metric change fold needs; the execution-count metrics
 (§4c) require none.
 
 ### 6.5.1 The park query used off the issue path MUST be non-mutating (REQUIRED)
@@ -392,7 +392,7 @@ This is the only stall-metric change collapse needs; the execution-count metrics
 `SM::warp_waiting_at_barrier` has a SIDE EFFECT: when the mbarrier wait is
 satisfied it clears `m_pending_sync_waits[warp_id]` and bumps a debug counter
 (sm.cc:2253-2260). Today that clear never fires for an mbarrier (the slot is
-always invalid), but under collapse it becomes a real state mutation — and
+always invalid), but under fold it becomes a real state mutation — and
 `shd_warp_t::waiting()` (which routes to it) is called from a `std::sort`
 comparator `sort_warps_by_highest_id_dynamic_id` (subcore.cc:1472-1485, invoked
 from BOTH `issue()` and `fetch()` every cycle).
@@ -425,7 +425,7 @@ attributed. Only the remodeled SM path needs this; the baseline
 ## 6.6 Full metric audit (all instrument flags) and required fixes
 
 A sweep of every `*_instrument_enable` / debug flag classifies each counter by how
-collapse's two behaviors touch it: PARK (a warp is now ineligible on an mbarrier
+fold's two behaviors touch it: PARK (a warp is now ineligible on an mbarrier
 via `m_pending_sync_waits`) and SKIP (spin polls are no longer issued/executed).
 Verdicts:
 
@@ -434,10 +434,10 @@ Verdicts:
 | headofline_instrument_enable | **MUST-FIX (park)** | read-only re-scan `scan_head_of_line_when_blocked` (subcore.cc:424-502) does NOT consult `waiting()`, only `are_wait_barriers_ready` (SB dep-state). A warp parked on an mbarrier passes `warp_side_ready` and is counted in `n_ready` → reports a parked (non-issuable) warp as recoverable head-of-line. |
 | overlap_instrument_enable | **MUST-FIX (park)** | pipe-overlap part UNAFFECTED (spin ops touch no tensor/SFU pipe), but the warpcyc sub-probe increments `total_num_warpcyc_stalled_any` (subcore.cc:871) for a parked warp while matching NONE of the reason checks → inflates the denominator with unattributed cycles. |
 | mufu_lockstep_instrument_enable | **MUST-FIX (park)** | a parked PHASECHK stays a valid head (op=MBARRIER_OP) counted in `mufu_ls_valid_head`/`_other` (subcore.cc:813-825) and turns issue cycles into `still_idle` cycles that pass the finalize gate (subcore.cc:1077-1086). |
-| producer_tail_instrument_enable | **MUST-FIX (park) + skip** | park bucketed `stall_inst_barrier` not `stall_wait_barrier` (sm.cc:1080 via subcore.cc:989); plus `issued_*`/`phasechk_*` tail loses collapsed polls. |
-| cta_stall_breakdown_instrument_enable | SKIP (info-loss) | `m_wait_released_by_cta_slot`/`m_wait_pending_by_cta_slot` are per-poll (sm.cc:2377,2416); collapse removes intermediate/closing polls → undercount. |
-| spin_instrument_enable | SKIP (by design) | counts issued spin winners (subcore.cc:1053); spins no longer issued → collapses toward 0. |
-| producer_spin_ready_instrument_enable | SKIP (by design) | per-poll counters (sm.cc:824,857); `ready_run_retries` self-nullifies (it measures exactly the redundant re-polls collapse removes). |
+| producer_tail_instrument_enable | **MUST-FIX (park) + skip** | park bucketed `stall_inst_barrier` not `stall_wait_barrier` (sm.cc:1080 via subcore.cc:989); plus `issued_*`/`phasechk_*` tail loses folded polls. |
+| cta_stall_breakdown_instrument_enable | SKIP (info-loss) | `m_wait_released_by_cta_slot`/`m_wait_pending_by_cta_slot` are per-poll (sm.cc:2377,2416); fold removes intermediate/closing polls → undercount. |
+| spin_instrument_enable | SKIP (by design) | counts issued spin winners (subcore.cc:1053); spins no longer issued → folds toward 0. |
+| producer_spin_ready_instrument_enable | SKIP (by design) | per-poll counters (sm.cc:824,857); `ready_run_retries` self-nullifies (it measures exactly the redundant re-polls fold removes). |
 | sync_wait_hist_instrument_enable | SKIP (array park-safe) | dedicated first-miss arrays are NOT touched by park (intended), but the closing ready poll is skipped so the episode never closes → long-wait buckets dropped (sm.cc:2384-2396). |
 
 Two classes, two treatments:
@@ -445,45 +445,45 @@ Two classes, two treatments:
 - **MUST-FIX (park mis-attribution)** — headofline, overlap-warpcyc, mufu_lockstep,
   producer_tail stall bucket. These make a PARKED warp look READY or drop its
   cycles into an unlabeled/wrong bucket, which corrupts the very timing analysis
-  collapse exists to produce. Fix pattern: add a read-only park predicate
+  fold exists to produce. Fix pattern: add a read-only park predicate
   `SM::warp_parked_on_mbarrier_spin(warp_id)` (non-clearing peek) and (a) exclude
   parked warps from any "ready/valid-head/eligible" population, (b) attribute
   parked warp-cycles to the new `mbarrier_spin` bucket (§6.5) instead of `_any` /
-  `inst_barrier`. All gated: with collapse off the predicate is always false and
+  `inst_barrier`. All gated: with fold off the predicate is always false and
   every counter is bit-identical.
 
 - **SKIP (info-loss, mostly intended)** — cta_stall_breakdown, spin, producer_spin_
   ready, sync_wait_hist, producer_tail opcode tail. These lose the spin polls that
-  collapse deliberately removes; that is the point, not a bug. Treatment: do NOT
+  fold deliberately removes; that is the point, not a bug. Treatment: do NOT
   try to reconstruct the old per-poll counts. Instead, (a) document them as
-  "meaningful with collapse OFF", and (b) where a duration signal is still wanted
+  "meaningful with fold OFF", and (b) where a duration signal is still wanted
   (sync_wait_hist), bucket `now - first_miss_cycle` at the PARK-RELEASE site
   (`warp_waiting_at_barrier` when satisfied) so wait duration survives even though
   the closing poll is skipped. The park itself is the more faithful signal than the
   old issued-poll count anyway.
 
-## 6.7 Debugging logs to add (verify collapse actually works)
+## 6.7 Debugging logs to add (verify fold actually works)
 
-Collapse is a control-flow change on a 12h run, so it needs first-class,
+Fold is a control-flow change on a 12h run, so it needs first-class,
 low-volume, cyc-stamped logs (like the observe stage) to prove it behaves. Add
-under a `-spin_wait_collapse_debug` sub-flag (or reuse `sync_debug_enable` budget),
+under a `-spin_wait_fold_debug` sub-flag (or reuse `sync_debug_enable` budget),
 default off, and keep them per-event with a budget so they cannot explode:
 
-1. `[COLLAPSE][park]` — when a producer/consumer poll parks: `cyc sm cta warp
+1. `[FOLD][park]` — when a producer/consumer poll parks: `cyc sm cta warp
    wait_pc barrier arrive/expected tx/expected phase`. Confirms the block fires on
    the intended regions only.
-2. `[COLLAPSE][release]` — when the barrier flips and the park clears: `cyc sm cta
-   warp wait_pc barrier parked_cycles`. `parked_cycles` here is the REAL collapse
+2. `[FOLD][release]` — when the barrier flips and the park clears: `cyc sm cta
+   warp wait_pc barrier parked_cycles`. `parked_cycles` here is the REAL fold
    park (contrast with the observe would-be park).
-3. `[COLLAPSE][skip]` — when the cursor jumps to exit: `cyc sm warp wait_pc
+3. `[FOLD][skip]` — when the cursor jumps to exit: `cyc sm warp wait_pc
    loop_head exit_pc skipped_insts used_insts_before/after`. The single most
    important correctness log: `skipped_insts` = poll iterations removed, and the
    post-jump head PC MUST equal `exit_pc` (assert + log).
-4. `[COLLAPSE][summary]` per SM at kernel end: regions collapsed, total parks,
+4. `[FOLD][summary]` per SM at kernel end: regions folded, total parks,
    total skipped polls, min/avg/max real park, and a reconciliation line
-   `gpu_sim_insn_delta` = (baseline icount − collapsed icount) attributable to
+   `gpu_sim_insn_delta` = (baseline icount − folded icount) attributable to
    skips, so a run can be checked against Gate 1 in one grep.
-5. Watchdog `[COLLAPSE][DEADLOCK]` (from §6) already covers the pathological case.
+5. Watchdog `[FOLD][DEADLOCK]` (from §6) already covers the pathological case.
 
 Cross-checks these logs enable on the same run:
 - park count (log 1) vs release count (log 2) must balance (every park releases,
@@ -496,29 +496,29 @@ Cross-checks these logs enable on the same run:
 
 ## 7. Gating and bit-identity
 
-- New flag `-spin_wait_collapse_enable` (default 0), separate from
+- New flag `-spin_wait_fold_enable` (default 0), separate from
   `-spin_wait_observe_enable`.
 - Feature-off: `handle_sync_instruction` takes exactly today's path
   (nonblocking), `issued()` unchanged, no cursor edits → bit-identical.
-- Feature-on but a region not collapsible → also unchanged.
+- Feature-on but a region not foldable → also unchanged.
 
 ## 8. Open questions for review — status
 
 1. **B1 vs B2** — RESOLVED (§4): B2 (explicit dual-cursor skip), because poll
    occurrences carry a per-occurrence phase-parity `semantic_raw` that B1 would
    desync.
-2. **exit_pc trust** — RESOLVED (§12.5): every collapsible exit_pc is a mid-stream
+2. **exit_pc trust** — RESOLVED (§12.5): every foldable exit_pc is a mid-stream
    unconditional BRA; never terminal, never at stream end (K5 8 / K10 6 checked).
-3. **Multi-region producer** — RESOLVED: no collapsible region's exit_pc lands on
+3. **Multi-region producer** — RESOLVED: no foldable region's exit_pc lands on
    another region's loop_head or inside another region's body (checked on the
    generated sidecar for K5 and K10). Each region exits to its own unique
    post-loop PC.
 4. **Watchdog abort vs fallback** — DECIDED (§6, §12.5): hard abort for bring-up
    (surface model bug loudly); soft fallback only later, behind a sub-flag, and
    never masking a failed assert in v1.
-5. **Consumer-side collapse** — RESOLVED (§9): collapse BOTH producer and consumer
+5. **Consumer-side fold** — RESOLVED (§9): fold BOTH producer and consumer
    waits (FA3 handshake is symmetric); the runtime watchdog is the mutual-deadlock
-   net. Gate is `collapsible` (role-agnostic).
+   net. Gate is `foldable` (role-agnostic).
 6. **Skip-walk stop condition / landing** — RESOLVED (§4b): stop on `exit_pc`
    (not on "left body_pcs"), consume `body_pcs ∪ {loopback_bra_pc}`, land AT
    exit_pc and issue it so the existing taken-branch redirect reaches the semantic
@@ -542,36 +542,36 @@ them. Confirmed on K5 SM27:
 | Producer (warp 0) | buffer **empty** (consumers finished reading) | barrier `0x16c40`, `expected_arrive=3`, warp 0 polls 473x `arrive=0/3` | only warp 0 does `arrive_expect_tx` (36x) |
 | Consumer (warps 4-15) | buffer **full** (TMA landed) | barrier `0x16c00`, warps 4-15 poll | `0xace0` region, the 1371 false-open waits |
 
-**Decision: first version collapses PRODUCER waits only.** Rationale:
+**Decision: first version folds PRODUCER waits only.** Rationale:
 
 - The symptom being fixed is "Producer ends ~61K cycles BEFORE Consumer" — i.e.
   the producer races ahead because its buffer-empty wait is under-enforced in the
   sim. Blocking the producer's wait directly targets that direction.
-- Leaving consumer waits nonblocking keeps them exactly as today, so collapse
+- Leaving consumer waits nonblocking keeps them exactly as today, so fold
   cannot introduce a NEW deadlock from the consumer side — it shrinks the
-  mutual-collapse blind spot from §9 of SPIN_WAIT_POSTPROCESS.md to zero for v1.
-- Consumer-side collapse would matter only if the consumer raced ahead, which is
+  mutual-fold blind spot from §9 of SPIN_WAIT_POSTPROCESS.md to zero for v1.
+- Consumer-side fold would matter only if the consumer raced ahead, which is
   the opposite of the current symptom.
 
-**UPDATE (decided with the user): collapse BOTH producer and consumer waits.**
+**UPDATE (decided with the user): fold BOTH producer and consumer waits.**
 FA3 is a symmetric bidirectional handshake — both roles genuinely spin (verified:
 K5 consumers warps 4-15 spin on `0x16c00`, producer warp 0 spins on `0x16c40`).
 Collapsing only one side would model half the handshake and is architecturally
 inconsistent. The mutual-deadlock risk this reintroduces is exactly what the §6
 runtime watchdog covers (it turns any unbounded mutual wait into a surfaced model
-bug instead of a silent hang). So v1 collapses any region with
+bug instead of a silent hang). So v1 folds any region with
 `semantic_free_body && is_spin_loop`, regardless of role, and relies on the
 watchdog as the safety net. Role tagging is therefore NOT required for v1; it is
 kept only as optional diagnostic metadata.
 
-**Required change:** none for role gating (both roles collapse). (Earlier this
+**Required change:** none for role gating (both roles fold). (Earlier this
 section required producer/consumer classification for a producer-only v1; that is
-no longer needed. If a future version wants role-selective collapse, classify via
+no longer needed. If a future version wants role-selective fold, classify via
 the existing `mark_producer_warp` runtime mark.)
 
 ## 10. Scheduler guarantee — a parked warp does NOT stall the core (verified)
 
-Collapse depends on: while warp A is parked at its wait, other warps on the same
+Fold depends on: while warp A is parked at its wait, other warps on the same
 subcore must keep issuing so the barrier A waits on can be flipped by them. This
 is confirmed both statically and dynamically.
 
@@ -580,7 +580,7 @@ Static (subcore.cc issue scan): the per-cycle scan iterates
 next warp. The eligibility predicate `are_switch_warp_conditions_ready` includes
 `is_not_warp_waiting_in_programmer_barrier = !c_warp->waiting()`, and
 `waiting()` routes to `warp_waiting_at_barrier()` → `m_pending_sync_waits` — the
-exact path collapse arms. The in-code comment is explicit: "the warp is simply
+exact path fold arms. The in-code comment is explicit: "the warp is simply
 skipped this cycle and the scheduler tries another warp ... never the whole core."
 All former `break`s on the scan were converted to `tail_readonly=true; continue`,
 so a parked warp never halts the scan.
@@ -593,7 +593,7 @@ So multiple warps interleave freely while others wait.
 Caveat — subcore locality: the skip-and-try-next is WITHIN a subcore. A parked
 producer is only rescued by warps in the SAME subcore. FA3's warp specialization
 places producer + consumers together (SM27 hosts warp 0 producer and 4-15
-consumers), so this holds here, but the collapse bring-up must re-confirm the
+consumers), so this holds here, but the fold bring-up must re-confirm the
 subcore assignment of the specialized warps (a producer alone in a subcore with
 all-parked peers would idle that subcore — correct behavior, but worth logging).
 
@@ -624,9 +624,9 @@ identically with or without the skip.
 ### 12.2 Do not cancel the already-issued primary_wait poll — CRITICAL
 
 The one poll that DID issue (the one that observed ready) must self-release its
-own read/write barrier normally. If collapse tried to retroactively cancel it, the
+own read/write barrier normally. If fold tried to retroactively cancel it, the
 pending decrement would either underflow (`assert(m_counter>0)`,
-warp_dependency_state.cc:57) or leave an id permanently armed. Rule: collapse only
+warp_dependency_state.cc:57) or leave an id permanently armed. Rule: fold only
 skips NOT-YET-ISSUED trace entries via the cursor; it never un-issues the poll in
 flight. A cursor jump satisfies this by construction.
 
@@ -657,7 +657,7 @@ would reach `traced_pcs.size()` (silent early `trace_done`) and the next
 `get_pc()` would trip `assert(used_insts < traced_pcs.size())`
 (trace_driven.cc:172).
 
-Checked statically: across ALL collapsible regions (K5 8, K10 6) `exit_pc` is
+Checked statically: across ALL foldable regions (K5 8, K10 6) `exit_pc` is
 never terminal — every one is a mid-stream UNCONDITIONAL `BRA`, none is EXIT/RET,
 none is the kernel's max pc, none is BRA-to-self; the next static instructions are
 always real work or the next wait. So "the spin loop is the warp's last op" does
@@ -686,9 +686,9 @@ added later once stable, but should not mask a failed assert in v1.
 
 ### 12.7 Non-self-tied barrier — not present now, but MUST be gated (design rule)
 
-12.1 showed collapse is safe only because every wait-barrier armed in the body is
+12.1 showed fold is safe only because every wait-barrier armed in the body is
 self-tied (armed and released by the same instruction) and no async producer
-(GMMA/TMA/LDGSTS/DEPBAR) sits in the body. Audited across all 14 collapsible
+(GMMA/TMA/LDGSTS/DEPBAR) sits in the body. Audited across all 14 foldable
 regions (K5+K10): `waited_ids == armed_ids` in every body (ids {1,2}, or {2,3} for
 one K10 region), and the only opcodes are PHASECHK/TRYWAIT/NANOSLEEP/IMAD/BRA — so
 zero non-self-tied cases TODAY.
@@ -699,7 +699,7 @@ scoreboard would be corrupted (an arm inside the body whose release is an
 out-of-body async completion would be dropped, permanently blocking or wrongly
 releasing a downstream consumer). This must not be left to chance.
 
-**Design rule (enforce, do not assume):** collapse eligibility is
+**Design rule (enforce, do not assume):** fold eligibility is
 `is_spin_loop && semantic_free_body && barrier_self_tied`, where
 `barrier_self_tied` is a NEW sidecar flag computed offline in
 `build_spin_wait_sidecar.py`:
@@ -707,13 +707,13 @@ releasing a downstream consumer). This must not be left to chance.
   the body (waited-on-externally-armed), OR
 - FALSE if any body op is an async producer (`*GMMA`, `UTMA*`, `UBLK*`, `LDGSTS`,
   `LDG/STG/LDS/STS`, `ATOM/RED`, `DEPBAR/LDGDEPBAR`).
-A region failing this is emitted with `collapsible=false` and the simulator leaves
+A region failing this is emitted with `foldable=false` and the simulator leaves
 it fully nonblocking (today's replay). The simulator ALSO asserts the flag at the
 skip site as defense-in-depth, so a mislabeled region fails loudly instead of
 silently corrupting the scoreboard. This turns "we happened to be safe" into "we
 are safe by construction, and unsafe regions are auto-excluded."
 
-### 12.8 Producer+consumer both-collapsed circular wait — precluded (RESOLVED)
+### 12.8 Producer+consumer both-folded circular wait — precluded (RESOLVED)
 
 > ⚠️ **PARTIALLY SUPERSEDED by §13.2/§13.3 (2026-08-12).** The "issue-independent
 > TMA completion precludes a circular wait" argument holds **only for TMA-credited
@@ -722,7 +722,7 @@ are safe by construction, and unsafe regions are auto-excluded."
 > is exactly where K5 deadlocked. The depth-4 reasoning below is still correct for
 > the buffer barriers; it simply did not apply to the low-flip cross-warp handshake.
 
-The biggest un-verified risk of the §9 "collapse both roles" decision: could
+The biggest un-verified risk of the §9 "fold both roles" decision: could
 parking BOTH the producer's buffer-empty wait AND the consumers' buffer-full wait
 create a circular wait that did not exist under nonblocking replay? Analyzed
 against the K5 SM27 cta0 SYNCDBG timeline; answer is NO, precluded by three
@@ -744,7 +744,7 @@ Why no cycle:
    buffers BEHIND its fill frontier, so the empty(m) it waits on is freed by
    consumers draining ALREADY-LANDED earlier buffers, never depending on the
    parked producer's next fill.
-3. Collapse preserves trace ORDER (only timing changes) — the parked producer
+3. Fold preserves trace ORDER (only timing changes) — the parked producer
    resumes at the same wait instruction and issues the same next UTMALDG once its
    empty frees.
 
@@ -762,10 +762,10 @@ that did would be caught by the §6 runtime watchdog ([SPINWAITDEADLOCK] mid-run
 
 ---
 
-## 13. First COLLAPSE run results + K5 deadlock root cause (2026-08-12)
+## 13. First FOLD run results + K5 deadlock root cause (2026-08-12)
 
-The first collapse-ON experiment (`-spin_wait_collapse_enable 1`,
-`-spin_wait_collapse_debug 1`) was run on K5 and K10 simultaneously. **K10 passed;
+The first fold-ON experiment (`-spin_wait_fold_enable 1`,
+`-spin_wait_fold_debug 1`) was run on K5 and K10 simultaneously. **K10 passed;
 K5 deadlocked.** This section is the self-contained handoff for the next session:
 the log paths, the confirmed root cause, and the redefined direction. Everything
 below is re-derived from the final logs (not the earlier live-streaming reads,
@@ -777,7 +777,7 @@ which were wrong — see §13.6).
 > release + watchdog force-release, so K5 would "complete" by skipping the missed
 > flip) has been **removed**. Reasoning: a producer that misses a consumer phase
 > edge is a **simulator-accuracy bug**, not something to paper over with a skip. If
-> collapse were done correctly the producer/consumer handshake would line up
+> fold were done correctly the producer/consumer handshake would line up
 > exactly as it does on real (tracer-free) hardware, so a missed edge must be
 > **surfaced as a model defect (assert), never force-released**. The generation
 > counter is retained but repurposed as a **consistency auditor**, not a release
@@ -790,24 +790,24 @@ which were wrong — see §13.6).
 | **K10** bwd | `.o45` / `.e45` | ✅ clean `exit detected` | **135,352** | target 132,901 → **+1.84%** |
 | **K5** fwd | `.o71` / `.e71` | ❌ `deadlock detected @ cyc 85333` | — (hang) | — |
 
-- K10 collapse-ON 135,352 vs collapse-OFF (Opt 11-A) 136,898 = **−1,546 cyc
-  (−1.13%)** → collapse moved K10 **toward** the HW target. Direction is correct.
+- K10 fold-ON 135,352 vs fold-OFF (Opt 11-A) 136,898 = **−1,546 cyc
+  (−1.13%)** → fold moved K10 **toward** the HW target. Direction is correct.
 - Full log dir base:
   `simulator-remodeled/sim_run_12.8/flashattn-fa3-bf16-bwd-causal-b1-s2048-hd64-nh24/flashattn_fa3_bf16_bwd_causal_b1_s2048_hd64_nh24___warmup_0___iters_1/`
   - K5: `H100_80GB-OnlyKernel5/...-63a73d452237.{o71,e71}`
   - K10: `H100_80GB-OnlyKernel10/...-63a73d452237.{o45,e45}`
-  - `[COLLAPSESUM]` (per-SM summary) is on **stdout** (`.o*`); per-event
-    `[COLLAPSE][SMx] ... park/release+skip` is on **stderr** (`.e*`, K5 has 7,259).
+  - `[FOLDSUM]` (per-SM summary) is on **stdout** (`.o*`); per-event
+    `[FOLD][SMx] ... park/release+skip` is on **stderr** (`.e*`, K5 has 7,259).
 
 ### 13.2 Confirmed root cause — realized phase double-flip on a low-flip cross-warp barrier
 
-The deadlock is **not** in the collapse bookkeeping (that is internally
+The deadlock is **not** in the fold bookkeeping (that is internally
 consistent). It is a single poison park site, proven by set-equality:
 
 - **The 21 SMs that parked at `wait_pc=0xb0b0` are EXACTLY the 21 deadlocked SMs**
   (`diff` of the two sets is empty). The GPGPU-Sim deadlock dump's stuck-core list
   (`6 8 9 16 23 24 25 27 ...`) equals the set of SMs that never printed a
-  `[COLLAPSESUM]`.
+  `[FOLDSUM]`.
 - Park/release balance **by barrier** (all SMs, from `.e71`): every barrier is
   perfectly balanced **except one**:
 
@@ -821,7 +821,7 @@ consistent). It is a single poison park site, proven by set-equality:
   | 0x16c68 | 126 | 126 | 0 | consumer `arrive` |
   | **0x16c20** | **29** | **8** | **21** | **warp15 `arrive` ONLY** (`tma_complete`=0) |
 
-- **Two distinct wait sites share barrier `0x16c20`** (both `collapsible=True` in
+- **Two distinct wait sites share barrier `0x16c20`** (both `foldable=True` in
   the sidecar):
   - dangling: `wait_pc=0xb0b0 exit_pc=0xb0d0` → **0/21 released** (poison)
   - successful: `wait_pc=0xb3d0 exit_pc=0xb3f0` → **8/8 released**
@@ -840,8 +840,8 @@ consistent). It is a single poison park site, proven by set-equality:
 
 ### 13.2.1 Root cause quantified — this run only (`.e71`), poison vs success margin
 
-**This is derived entirely from the collapse-ON run `.e71`.** The earlier
-observe/collapse-OFF logs (`.o70`/`.e70`) are **not** a valid reference here: that
+**This is derived entirely from the fold-ON run `.e71`.** The earlier
+observe/fold-OFF logs (`.o70`/`.e70`) are **not** a valid reference here: that
 pass is observe-only, so the mbarrier does not drive timing at all and every wait
 is walked past by construction — it is the first time mbarrier is actually in the
 timing model that matters, and that is exactly this `.e71` run. The root cause must
@@ -856,7 +856,7 @@ the two flips of its own barrier:
 | producer arrival − **gen2** flip | **+1 … +5,648** (always AFTER) | **−711 … −20,445** (always BEFORE) |
 | gen1 flip cycle | med **50,697** (late) | med **45,779** (early) |
 | gen2 − gen1 gap (the gen1 window) | med **7,085** (narrow) | med **13,474** (wide) |
-| producer total collapse-park | med **40,055** | med **47,653** |
+| producer total fold-park | med **40,055** | med **47,653** |
 
 Reading:
 
@@ -864,20 +864,20 @@ Reading:
   poison iff **after gen2**. SM16 fails by **+1 cycle** — this is a *timing-margin*
   fault, not a structural one.
 - **It is NOT "poison producers park more".** The opposite is true (poison med
-  40,055 < success med 47,653 collapse-park cycles). So the fault is not the
-  absolute amount of collapse-injected park; it is the **relative** placement of
+  40,055 < success med 47,653 fold-park cycles). So the fault is not the
+  absolute amount of fold-injected park; it is the **relative** placement of
   the producer against the consumer-driven flip timeline.
 - **The discriminating variable is the gen1 window width.** Poison SMs have gen1
   arriving *late* AND a *narrow* gen1→gen2 gap (~7K); the two consumer flips are
   bunched, so the window in which the producer's `0xb0b0` (a gen-1 wait) can land
-  is short and the producer — paced by its own collapse parks on the empty barriers
+  is short and the producer — paced by its own fold parks on the empty barriers
   `0x16c40/48/68` — misses it. Success SMs open gen1 early and hold a wide (~13K)
   window.
 - **Where the gen1/gen2 flip timing comes from:** `0x16c20` is flipped only by
   warp15's two arrives, and warp15 is itself gated between them by TMA/consumer
   barriers (`0x16c00/30/58`) whose timing is set by the modeled consumer-compute
   and TMA-fill cadence. So the accuracy fault that produces a too-narrow gen1
-  window is in **that consumer/TMA pacing**, not in the collapse bookkeeping.
+  window is in **that consumer/TMA pacing**, not in the fold bookkeeping.
 
 ### 13.3 Why the design review missed it (corrections to earlier sections of this doc)
 
@@ -889,35 +889,35 @@ Reading:
   flip twice before the producer even reaches its poll — and §13.2.1 shows this is
   a *timing-margin* miss (poison SMs have a narrow ~7K gen1→gen2 window vs ~13K on
   success SMs), not a rare corner case: it happens on 21 of 132 CTAs.
-- **Detector `collapsible` gate** (`is_spin_loop && semantic_free_body &&
-  barrier_self_tied`) marked `0xb0b0` collapsible. `barrier_self_tied` is a
+- **Detector `foldable` gate** (`is_spin_loop && semantic_free_body &&
+  barrier_self_tied`) marked `0xb0b0` foldable. `barrier_self_tied` is a
   **scoreboard** property; it does not capture **who advances the mbarrier** or
   **how few times it flips**. (The gate is produced by the post-processing detector;
   see SPIN_WAIT_POSTPROCESS.md.)
-- **Watchdog never fired** (`COLLAPSEDEADLOCK=0`): threshold 400K ≫ K5's ~85K
+- **Watchdog never fired** (`FOLDDEADLOCK=0`): threshold 400K ≫ K5's ~85K
   cycles, and GPGPU-Sim's global detector (114K window) fired first. Max
-  *legitimate* park across all SMs is only **8,104 cyc** (from `[COLLAPSESUM]
+  *legitimate* park across all SMs is only **8,104 cyc** (from `[FOLDSUM]
   max_park`). The watchdog currently only **logs then `return`**
   ([sm.cc:2294-2319](../simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/sm.cc#L2294-L2319)).
   Note (per the redefined direction §13.4): the watchdog must **assert/abort**, not
   force-release — an unbounded park is an accuracy-bug signal to surface, not to
   paper over.
 
-### 13.4 Redefined direction — collapse is an accuracy audit, generation is the auditor (2026-08-12)
+### 13.4 Redefined direction — fold is an accuracy audit, generation is the auditor (2026-08-12)
 
-**Framing (decided with the user).** The reason collapse exists is to remove the
+**Framing (decided with the user).** The reason fold exists is to remove the
 *tracer-induced* spin count so the sim paces the producer/consumer handshake the
-way tracer-free **hardware** does. It follows that **if collapse were done
+way tracer-free **hardware** does. It follows that **if fold were done
 correctly, the producer would reach each wait while its matching consumer edge is
 still the current phase — exactly as on HW — and every wait would line up 1:1 with
 a flip.** A producer that arrives *after* its edge already passed (the SM6 poison)
 is therefore **evidence of a simulator-accuracy defect somewhere in the timing
-model**, not a situation collapse should "recover" from by skipping.
+model**, not a situation fold should "recover" from by skipping.
 
 This inverts the earlier proposal. The generation counter is **kept**, but its job
 changes from *release mechanism* to *consistency auditor*:
 
-- **Collapse honors the mbarrier for real.** At a collapsible `primary_wait_pc`:
+- **Fold honors the mbarrier for real.** At a foldable `primary_wait_pc`:
   not-ready → park; ready → `skip_spin_to_exit`. (Unchanged from the current
   implementation; this is the correct, HW-faithful behavior.)
 - **Generation counter audits the 1:1 pairing and ASSERTS on violation — it never
@@ -927,7 +927,7 @@ changes from *release mechanism* to *consistency auditor*:
     ([sm.cc:2391-2421](../simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/sm.cc#L2391-L2421)),
     **never reset**. Keep the existing 1-bit `phase` untouched → Gate 0
     (feature-off bit-identity) preserved.
-  - Each collapsible wait carries the **absolute generation it is supposed to pair
+  - Each foldable wait carries the **absolute generation it is supposed to pair
     with** (`expected_gen`; see the formula caveat below). At wait entry, compare
     `barrier.gen` to `expected_gen`:
     - `barrier.gen < expected_gen` → the edge has not happened yet → **park**
@@ -938,7 +938,7 @@ changes from *release mechanism* to *consistency auditor*:
       is the poison. **ASSERT/abort with a full diagnostic** (sm/cta/warp/wait_pc/
       barrier/`expected_gen`/`barrier.gen`/first-flip-cyc/now). Do **NOT** skip,
       do **NOT** park-forever. The run stops loudly at the exact accuracy fault.
-- **Watchdog = assert, not force-release.** The `service_collapse_release`
+- **Watchdog = assert, not force-release.** The `service_fold_release`
   over-threshold path
   ([sm.cc:2294-2319](../simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/sm.cc#L2294-L2319))
   becomes a hard assert/abort as well (threshold right-sized to ~16–32K, above the
@@ -967,21 +967,21 @@ expected_gen(p) = smallest g >= (last consumed gen for this warp+barrier)+1
 ```
 
 This must be **validated offline** (no GPU) against the captured traces before any
-coding: confirm, per barrier, that each warp's successive collapsible waits map to
+coding: confirm, per barrier, that each warp's successive foldable waits map to
 strictly increasing generations and that the parity alternation holds. The CTA
 structure is already confirmed identical (see §13.4.1), which is what makes an
 absolute `expected_gen` well-defined.
 
 **What the assert will most likely reveal (the real root cause to chase).** Per
 §13.2.1 (this run, `.e71`), the discriminator is **not** the absolute amount of
-producer collapse-park (poison SMs actually park *less*), but the **relative**
+producer fold-park (poison SMs actually park *less*), but the **relative**
 placement: poison SMs open gen1 late and keep a **narrow gen1→gen2 window (~7K
 cyc)**, so the producer's `0xb0b0` gen-1 wait misses it. `0x16c20` is flipped only
 by warp15's two arrives, and warp15 is gated between them by TMA/consumer barriers
 (`0x16c00/30/58`) whose timing is set by modeled consumer-compute (WGMMA/MUFU) and
 TMA-fill cadence. So the accuracy fault the assert pins is almost certainly **"the
 modeled consumer/TMA pacing that sets the gen1→gen2 window is off relative to HW,"**
-not the collapse bookkeeping. The assert coordinate (which barrier, `expected_gen`
+not the fold bookkeeping. The assert coordinate (which barrier, `expected_gen`
 vs `barrier.gen`, the gen1/gen2 flip cycles, first-not-ready cycle) is the lead for
 that investigation.
 
@@ -1007,7 +1007,7 @@ SPIN_WAIT_POSTPROCESS.md.)
 ### 13.4.2 Root-cause investigation — the gen1→gen2 window is set by producer TMA-fill spacing (`.e71`, 2026-08-12)
 
 Following the §13.4 lead, the accuracy fault was traced to a concrete
-causal chain, all measured inside the collapse-ON run `.e71`.
+causal chain, all measured inside the fold-ON run `.e71`.
 
 **The failure is a race between two quantities, decomposed over all 132 SMs:**
 
@@ -1039,12 +1039,12 @@ flip@58132 → warp15 gen2 arrive@58477). Therefore:
 
 > **The gen1→gen2 window width is the spacing between the two TMA fills the producer
 > issues into `0x16c58`. That spacing is the producer's own execution pacing —
-> which collapse changed by converting the producer's empty-barrier spins
+> which fold changed by converting the producer's empty-barrier spins
 > (`0x16c40/48/68`) into real parks.**
 
 **Why this is a self-consistent (not paradoxical) loop.** The producer both (a)
 feeds `0x16c58`, whose two fills define the window, and (b) must itself land inside
-that window at `0xb0b0`. When collapse re-paces the producer, it perturbs BOTH the
+that window at `0xb0b0`. When fold re-paces the producer, it perturbs BOTH the
 window it creates AND its own arrival into that window. On the 21 poison SMs the two
 perturbations land on the wrong side of the ~1.3K margin. This is exactly the class
 of second-order scheduling interaction §9 warned observe could not rule out.
@@ -1052,7 +1052,7 @@ of second-order scheduling interaction §9 warned observe could not rule out.
 **What this means for the fix direction.** The audit (§13.4) is still correct: the
 missed edge is a real accuracy defect and must assert, not skip. The *underlying*
 inaccuracy to chase is **the producer's inter-fill pacing on `0x16c58` under
-collapse** — i.e. whether the modeled latencies that space the producer's two TMA
+fold** — i.e. whether the modeled latencies that space the producer's two TMA
 fills (its parks on `0x16c40/48/68`, and the WGMMA/MUFU/TMA costs between them)
 match HW. Open item: obtain the HW reference gen1→gen2 spacing (NCU / trace
 timestamps) to decide whether the true window is ~7K (then the producer path is too
@@ -1062,7 +1062,7 @@ comparison needs.
 
 ### 13.5 Where the fix touches code (for next session)
 
-Implementation is **audit-only** additions plus the assert; the collapse
+Implementation is **audit-only** additions plus the assert; the fold
 park/skip logic itself is already correct and stays as-is.
 
 - `tma_types.h` `HopperMBarrierObject` (~line 272): add `uint64_t gen = 0;`.
@@ -1073,12 +1073,12 @@ park/skip logic itself is already correct and stays as-is.
   `expected_gen` from a new per-`(warp,barrier)` generation-progress map (parity-
   aware formula, §13.4); then **audit**: `gen > expected_gen` → assert/abort with
   the diagnostic; `gen == expected_gen` → release+skip; `gen < expected_gen` →
-  park. Do **not** replace the parity path used by the non-collapse issue logic
+  park. Do **not** replace the parity path used by the non-fold issue logic
   (Gate 0).
-- `sm.cc::service_collapse_release` (2285-2355): the over-threshold `else`/`return`
+- `sm.cc::service_fold_release` (2285-2355): the over-threshold `else`/`return`
   (2294-2319) becomes an **assert/abort** (not `skip_spin_to_exit`), threshold
   lowered to ~16–32K.
-- Add a `[COLLAPSEAUDIT]` diagnostic line (cyc-stamped) at the assert site so a
+- Add a `[FOLDAUDIT]` diagnostic line (cyc-stamped) at the assert site so a
   future run's fault is greppable on the same timeline as `[SYNCDBG]`/`[TMADBG]`.
 
 ### 13.6 Corrections to the earlier (live-streaming) analysis — do NOT trust these
@@ -1087,7 +1087,7 @@ The mid-run notes were from partial logs and are **refuted** by the final logs:
 
 - ❌ "20 unreleased parks" → ✅ actually **21**, all at `wait_pc=0xb0b0` on
   barrier `0x16c20`.
-- ❌ "all collapse activity is warp=0 only; consumers never park" → ✅ consumers
+- ❌ "all fold activity is warp=0 only; consumers never park" → ✅ consumers
   **do** park (park events show warp=12/13/14 on 0x16c00; 0x16c40/48/60/68 are
   consumer barriers with thousands of balanced parks). The dangling park happens
   to be producer warp0, but that is site-specific, not warp-role-specific.
@@ -1104,7 +1104,7 @@ The mid-run notes were from partial logs and are **refuted** by the final logs:
 
 ```bash
 DIR=simulator-remodeled/sim_run_12.8/flashattn-fa3-bf16-bwd-causal-b1-s2048-hd64-nh24/flashattn_fa3_bf16_bwd_causal_b1_s2048_hd64_nh24___warmup_0___iters_1
-K5E=$DIR/H100_80GB-OnlyKernel5/*-63a73d452237.e71   # collapse-ON run — the ONLY valid reference
+K5E=$DIR/H100_80GB-OnlyKernel5/*-63a73d452237.e71   # fold-ON run — the ONLY valid reference
 # park/release balance per barrier (expect only 0x16c20 imbalanced):
 grep -aoE "cyc=[0-9]+ park .*barrier=0x[0-9a-f]+ "    $K5E | grep -oE "barrier=0x[0-9a-f]+" | sort | uniq -c
 grep -aoE "cyc=[0-9]+ release.*barrier=0x[0-9a-f]+ "  $K5E | grep -oE "barrier=0x[0-9a-f]+" | sort | uniq -c
@@ -1116,12 +1116,12 @@ grep -aE "\[SM6\].*phase flip barrier=0x16c20" $K5E          # gen1 @52212 (0->1
 grep -aE "\[SM6\] cyc=[0-9]+ park warp=0 cta=0 barrier=0x16c20 wait_pc=0xb0b0" $K5E   # @59821 (> gen2)
 # On a success SM (e.g. SM26): producer immediate-hits 0xb0b0 BEFORE gen2:
 grep -aE "\[SM26\].*wait immediate-hit warp=0 cta=0 barrier=0x16c20 .*parity=0" $K5E | head -1  # < gen2
-# NOTE: do NOT use .o70/.e70 (observe/collapse-OFF) as a baseline for this wait —
+# NOTE: do NOT use .o70/.e70 (observe/fold-OFF) as a baseline for this wait —
 # that pass does not put mbarrier in the timing model, so walking past the wait there
-# is by construction, not evidence about the collapse-ON handshake.
+# is by construction, not evidence about the fold-ON handshake.
 ```
 
-Sidecar of record (both wait sites are `collapsible=True`, `barrier_self_tied=True`;
+Sidecar of record (both wait sites are `foldable=True`, `barrier_self_tied=True`;
 produced by the post-processing detector, see SPIN_WAIT_POSTPROCESS.md):
 `simulator-remodeled/hw_run/traces/device-0/12.8/flashattn-fa3-bf16-bwd-causal-b1-s2048-hd64-nh24/flashattn_fa3_bf16_bwd_causal_b1_s2048_hd64_nh24___warmup_0___iters_1_lighter-compact_wire+prune_operands-69a20aed/traces/extra_info/spin_wait_sidecar.json`
 (schema v2, K5 = kernel_id 5, funcid 3, 21 spin_regions; the poison region is
@@ -1144,7 +1144,7 @@ Everything needed to run it and to interpret it is here; no prior context requir
 **The one question to answer.** On real hardware, what is the elapsed time between
 the two arrives on the K5 coarse barrier `0x16c20` (equivalently: the spacing of the
 two producer TMA fills into `0x16c58` that gate them)? Call it the **HW gen1→gen2
-window**. The simulator (`.e71`, collapse-ON) produces:
+window**. The simulator (`.e71`, fold-ON) produces:
 
 - window on the 111 **success** CTAs: median **~13,474 cyc** (range 6,849–22,508)
 - window on the 21 **poison** CTAs: median **~7,085 cyc** (range 5,578–9,042)
@@ -1153,12 +1153,12 @@ window**. The simulator (`.e71`, collapse-ON) produces:
 
 | HW gen1→gen2 window | Verdict | Meaning / next fix |
 |---|---|---|
-| **≈ 13K+** (matches success) | window-narrowing is the bug | The sim is *shrinking* the window on 21 CTAs. Chase why collapse re-pacing bunches the producer's two `0x16c58` TMA fills too close — the parks on empty barriers `0x16c40/48/68` and/or the TMA-fill latency model. Fix the pacing so the window stays ~13K; the producer then lands inside it and no edge is missed. |
-| **≈ 7K** (matches poison) | producer path is too slow | The true window really is narrow; then the accuracy fault is that the **producer takes ~8.4K after gen1 to reach `0xb0b0`** when HW takes < window. Chase the producer's inter-fill latency (WGMMA/MUFU/TMA between the two fills) being too high under collapse. |
+| **≈ 13K+** (matches success) | window-narrowing is the bug | The sim is *shrinking* the window on 21 CTAs. Chase why fold re-pacing bunches the producer's two `0x16c58` TMA fills too close — the parks on empty barriers `0x16c40/48/68` and/or the TMA-fill latency model. Fix the pacing so the window stays ~13K; the producer then lands inside it and no edge is missed. |
+| **≈ 7K** (matches poison) | producer path is too slow | The true window really is narrow; then the accuracy fault is that the **producer takes ~8.4K after gen1 to reach `0xb0b0`** when HW takes < window. Chase the producer's inter-fill latency (WGMMA/MUFU/TMA between the two fills) being too high under fold. |
 | **bimodal / tile-dependent** | both regimes are real | Some tiles legitimately have a short window (e.g. causal-mask tail tiles do less work). Then the audit assert must be reconciled with which tile-index each CTA is on; record tile index alongside the assert coordinate. |
 
 **Why NCU is needed (sim cannot self-answer this).** The sim's own window is the
-very quantity under suspicion (collapse perturbs it), so it cannot be its own
+very quantity under suspicion (fold perturbs it), so it cannot be its own
 reference. Only HW/NCU gives the ground-truth spacing.
 
 **What to pull from NCU / HW trace (concrete):**
@@ -1201,7 +1201,7 @@ reference. Only HW/NCU gives the ground-truth spacing.
   suffice; this is not a gross error.
 
 **How to regenerate the sim evidence (CPU-only, if the `.e71` logs are gone).**
-Re-run K5 with `-spin_wait_collapse_enable 1 -spin_wait_collapse_debug 1
+Re-run K5 with `-spin_wait_fold_enable 1 -spin_wait_fold_debug 1
 -sync_debug_enable 1` (K5 hangs ~85K cyc, so the global deadlock detector ends it;
 that is expected and fine for harvesting the pre-hang timeline). Then the §13.7
 commands reproduce every number above from the new `.e71`. The trace dir is:
@@ -1276,8 +1276,8 @@ verdict is re-grounded on sim-internal evidence.
 The §13.4/§13.5 **generation-counter audit + assert** does not depend on any HW
 number: it deterministically pins the poison (a wait whose `barrier.gen >
 expected_gen`) and stops the run at that exact coordinate. Implement it as specified
-in §13.5. Acceptance: feature-off bit-identity (Gate 0) holds; with collapse on, K5
-aborts with a `[COLLAPSEAUDIT]` line at `wait_pc=0xb0b0` on the 21 poison CTAs
+in §13.5. Acceptance: feature-off bit-identity (Gate 0) holds; with fold on, K5
+aborts with a `[FOLDAUDIT]` line at `wait_pc=0xb0b0` on the 21 poison CTAs
 (instead of a silent 12h hang), and K10 still finishes clean. This converts the bug
 from "silent deadlock" to "loud, located accuracy fault" and is valuable on its own.
 
@@ -1288,41 +1288,41 @@ too slow) or ~13K (window wrongly narrowed). Since HW is unavailable, decide it 
 signals already inside the runs — the point is that these two hypotheses make
 **different, checkable predictions** without an absolute HW number:
 
-- **Anchor A — K10 is the in-hand "pacing is ~right" reference.** K10 collapse-ON
+- **Anchor A — K10 is the in-hand "pacing is ~right" reference.** K10 fold-ON
   finishes clean at **135,352 (+1.84% vs HW target)** and moved *toward* HW (−1,546
-  vs Opt 11-A). So the collapse pacing is not grossly wrong in general; K5's poison
+  vs Opt 11-A). So the fold pacing is not grossly wrong in general; K5's poison
   is a *margin* failure on a specific low-flip barrier, consistent with §13.2.1
   (SM16 misses by +1 cyc; poison median miss ~1.3K).
 - **Anchor B — within K5, poison vs success SMs are a natural A/B.** Both run the
   same kernel on the same trace; they differ only in scheduling. §13.4.2 already
   shows the discriminator is the **two-`0x16c58`-flip interval** (poison med 7,553
   vs success med 12,140) — i.e. the producer's own inter-fill spacing, which
-  collapse re-paced. If the fault were "producer path intrinsically too slow" it
+  fold re-paced. If the fault were "producer path intrinsically too slow" it
   would slow the producer on success SMs too; it does not. This points at
-  **window-narrowing under collapse re-pacing**, not a uniformly slow producer.
-- **Anchor C — feature-off vs collapse-on `0x16c58` fill cadence.** The one clean,
+  **window-narrowing under fold re-pacing**, not a uniformly slow producer.
+- **Anchor C — feature-off vs fold-on `0x16c58` fill cadence.** The one clean,
   HW-free check still to run: compare the producer's inter-fill interval on
-  `0x16c58` between collapse-OFF replay and collapse-ON, per SM. Collapse must not
+  `0x16c58` between fold-OFF replay and fold-ON, per SM. Fold must not
   change *semantic* spacing (only spin polls are removed), so a systematic
-  narrowing on the poison SMs would localize the defect to how collapse's park/skip
+  narrowing on the poison SMs would localize the defect to how fold's park/skip
   interacts with the empty-barrier (`0x16c40/48/68`) pacing. This is a sim-only
   measurement (both logs already exist / are cheaply regenerable) and needs no GPU.
 
 **Verdict rule (HW-free):** if Anchors B+C show the poison SMs' `0x16c58` fill
-interval is narrowed *by collapse* (vs their own feature-off cadence and vs success
+interval is narrowed *by fold* (vs their own feature-off cadence and vs success
 SMs), treat it as the **window-generator pacing** defect and fix that; the producer
-path is exonerated by Anchor A. Only if B+C fail to show collapse-induced narrowing
+path is exonerated by Anchor A. Only if B+C fail to show fold-induced narrowing
 do we escalate to the (hard) external HW-rebuild route in §13.8.1.
 
 ### 14.3 What stays genuinely open (do not overclaim)
 
 Without a HW timestamp we **cannot** prove the *absolute* HW window is 7K vs 13K, so
-we cannot claim the collapsed timing equals HW to the cycle. What we CAN establish
+we cannot claim the folded timing equals HW to the cycle. What we CAN establish
 HW-free: (a) the audit makes the fault non-silent and located; (b) K10 shows the
-pacing is directionally correct; (c) the poison is a collapse-induced *relative*
+pacing is directionally correct; (c) the poison is a fold-induced *relative*
 narrowing, not a structural error. That is sufficient to implement and validate a
 pacing fix whose success criterion is **"K5 completes with every gen-1 wait landing
-before its gen2 under collapse, with no `[COLLAPSEAUDIT]` abort, and K10 stays
+before its gen2 under fold, with no `[FOLDAUDIT]` abort, and K10 stays
 within its current +1.84%"** — an internal-consistency bar, not a HW-window match.
 If a future engagement gets an external flash_attn_3 source build, the §13.8.1
 `clock64()` route can upgrade this from internal-consistency to HW-absolute; until

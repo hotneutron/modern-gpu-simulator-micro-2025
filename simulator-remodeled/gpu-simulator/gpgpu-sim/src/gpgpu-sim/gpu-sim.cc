@@ -697,12 +697,12 @@ void load_spin_wait_sidecar(const std::filesystem::path &extra_info_dir,
           region["dynamic"]["is_spin_loop"].IsBool()) {
         record.is_spin_loop = region["dynamic"]["is_spin_loop"].GetBool();
       }
-      // Prefer the sidecar's authoritative collapsible flag (v2); fall back to
+      // Prefer the sidecar's authoritative foldable flag (v2); fall back to
       // recomputing it from the parts so an older sidecar still gates safely.
-      if (region.HasMember("collapsible") && region["collapsible"].IsBool()) {
-        record.collapsible = region["collapsible"].GetBool();
+      if (region.HasMember("foldable") && region["foldable"].IsBool()) {
+        record.foldable = region["foldable"].GetBool();
       } else {
-        record.collapsible = record.is_spin_loop && record.semantic_free_body &&
+        record.foldable = record.is_spin_loop && record.semantic_free_body &&
                              record.barrier_self_tied;
       }
       db.regions_by_wait_pc[SyncOperandLookupKey{unique_function_id,
@@ -2092,30 +2092,30 @@ void shader_core_config::reg_options(class OptionParser *opp) {
                          "0");
   option_parser_register(opp, "-spin_wait_observe_enable", OPT_BOOL,
                          &spin_wait_observe_enable,
-                         "Observe-only measurement for the producer spin-wait collapse design. "
+                         "Observe-only measurement for the producer spin-wait fold design. "
                          "For every PHASECHK/TRYWAIT matching a spin_wait_sidecar.json "
                          "primary_wait_pc, record how long the modeled mbarrier stays not-ready "
                          "after the first not-ready poll of each (cta,warp,region) episode (the "
-                         "would-be park time under collapse) and whether the barrier ever flips "
+                         "would-be park time under fold) and whether the barrier ever flips "
                          "(never-flip = deadlock candidate). Reads mbarrier state only; never "
                          "blocks or advances the trace. Requires spin_wait_sidecar.json. "
                          "(default=0)",
                          "0");
-  option_parser_register(opp, "-spin_wait_collapse_enable", OPT_BOOL,
-                         &spin_wait_collapse_enable,
-                         "Producer/consumer spin-wait collapse. When on, a PHASECHK/TRYWAIT "
+  option_parser_register(opp, "-spin_wait_fold_enable", OPT_BOOL,
+                         &spin_wait_fold_enable,
+                         "Producer/consumer spin-wait fold. When on, a PHASECHK/TRYWAIT "
                          "matching a COLLAPSIBLE spin_wait_sidecar.json region parks the warp "
                          "while the modeled mbarrier is not ready and, on ready, fast-forwards "
                          "the trace cursor to the region exit_pc (regenerating the poll count "
-                         "instead of replaying it). Only collapsible regions "
+                         "instead of replaying it). Only foldable regions "
                          "(is_spin_loop && semantic_free_body && barrier_self_tied) are affected; "
                          "off = bit-identical replay baseline. Requires spin_wait_sidecar.json. "
                          "(default=0)",
                          "0");
-  option_parser_register(opp, "-spin_wait_collapse_debug", OPT_BOOL,
-                         &spin_wait_collapse_debug,
-                         "Emit cycle-stamped, budget-limited [COLLAPSE][park/release/skip/summary] "
-                         "lines to validate spin-wait collapse. (default=0)",
+  option_parser_register(opp, "-spin_wait_fold_debug", OPT_BOOL,
+                         &spin_wait_fold_debug,
+                         "Emit cycle-stamped, budget-limited [FOLD][park/release/skip/summary] "
+                         "lines to validate spin-wait fold. (default=0)",
                          "0");
   option_parser_register(opp, "-trimchk_percta_log_enable", OPT_BOOL,
                          &trimchk_percta_log_enable,

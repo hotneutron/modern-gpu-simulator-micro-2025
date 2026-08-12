@@ -240,14 +240,14 @@ struct SpinWaitRegionRecord {
   bool semantic_free_body = false;  // body has no TMA/GMMA/MUFU/arrive/memory op
   bool is_spin_loop = false;        // observed to iterate > 1 (not a single-shot wait)
   bool barrier_self_tied = false;   // whole-loop skip is SASS scoreboard net-zero
-  // The single authoritative collapse gate (sidecar v2): the simulator collapses
+  // The single authoritative fold gate (sidecar v2): the simulator folds
   // a region ONLY when this is true = is_spin_loop && semantic_free_body &&
   // barrier_self_tied. See .plan/SPIN_WAIT_SIM_MODELING.md 6.6/12.7.
-  bool collapsible = false;
+  bool foldable = false;
 };
 
 // Keyed by (funcid, primary_wait_pc): the simulator matches a PHASECHK/TRYWAIT at
-// issue time against this to know it is inside a collapsible spin loop.
+// issue time against this to know it is inside a foldable spin loop.
 struct SpinWaitSidecarDB {
   std::map<SyncOperandLookupKey, SpinWaitRegionRecord> regions_by_wait_pc;
 
@@ -275,6 +275,14 @@ struct HopperMBarrierObject {
   uint32_t completed_tx_bytes = 0;
   uint32_t phase = 0;
   bool ready = false;
+  // [Spin-wait fold audit] Monotonically-increasing generation: gen++ on
+  // every phase flip, NEVER reset. The 1-bit `phase` above stays the sole driver
+  // of the (bit-identical) non-fold issue logic; `gen` is read ONLY by the
+  // fold-path generation audit, which needs to tell "my flip already passed"
+  // (gen > expected) from "not yet" (gen < expected) — a distinction 1-bit parity
+  // cannot make on a low-flip cross-warp barrier. See
+  // .plan/SPIN_WAIT_SIM_MODELING.md 13.4/13.5.
+  uint64_t gen = 0;
 };
 
 struct HopperMBarrierPendingWait {
@@ -282,13 +290,19 @@ struct HopperMBarrierPendingWait {
   bool is_trywait = false;
   HopperMBarrierKey key;
   uint64_t wait_state_raw = 0;
-  // --- spin-wait collapse (only set when -spin_wait_collapse_enable) ---
-  // When the poll that armed this wait was the primary_wait_pc of a collapsible
+  // --- spin-wait fold (only set when -spin_wait_fold_enable) ---
+  // When the poll that armed this wait was the primary_wait_pc of a foldable
   // spin region, carry the info the release path needs to fast-forward the trace
   // cursor to the loop exit. See .plan/SPIN_WAIT_SIM_MODELING.md 5.1/6.5.1.
-  bool collapse_needs_skip = false;  // armed by a collapsible poll
-  uint64_t collapse_exit_pc = 0;     // SpinWaitRegionRecord.exit_pc to land on
-  unsigned int collapse_uid = 0;     // unique_function_id (assert/log only)
+  bool fold_needs_skip = false;  // armed by a foldable poll
+  uint64_t fold_exit_pc = 0;     // SpinWaitRegionRecord.exit_pc to land on
+  unsigned int fold_uid = 0;     // unique_function_id (assert/log only)
+  // [Spin-wait fold audit] The absolute barrier generation this wait is
+  // paired with (the flip whose data it consumes). Computed parity-aware at park
+  // time from the per-(warp,barrier) consumed-gen progress. The release path
+  // audits barrier.gen vs this: ==expected -> release+skip; <expected -> keep
+  // parked; >expected -> the paired flip already passed (poison) -> assert.
+  uint64_t fold_expected_gen = 0;
 };
 
 struct HopperMBarrierPendingTxBinding {
@@ -330,7 +344,7 @@ struct TMACommand {
   bool has_real_base = false;
   // M2 (visit-counter tile spread): per-tensor tile this transfer targets, so the
   // mover adds tile_idx*tile_bytes to spread transfers across the tensor's tiles
-  // (restores the cold-miss of first-touch that base-only collapses away). Set in
+  // (restores the cold-miss of first-touch that base-only folds away). Set in
   // build_tma_command from the per-base visit counter; only meaningful when
   // has_real_base is true. tile_bytes = Πbox_dim·element_size (one tile's byte span).
   uint64_t tile_offset_bytes = 0;

@@ -39,7 +39,7 @@ To keep this file easy to extend, use the following update pattern whenever a ne
 | Opt 10 | intra-SMSP warp-switch (SFU issue-gating) | `-intra_smsp_warpswitch_enable 1` (code + config). At issue time, also check `fu->can_issue()` for no-queue FUs (SFU), so a busy-SFU MUFU (deterministic II=8) is filtered BEFORE the 1-deep `ISSUE_CONTROL` latch and GTO warp-switches to a ready warp instead of stalling the whole subcore. Queue FUs (MEM/TMA/MISC) keep the deferred path. II/latency unchanged; timing-only (work invariant). | 105,464 cycles (**55.8% error**, **-44.7% vs Opt 9**). fwd `.o58`. `gpu_sim_insn` **bit-identical** to baseline (455,565,060); `issue_stage_issuing` bit-identical (16,064,281). Head-of-line `next_stage` 25.1%→**0.06%**, `blocked_by_sfu` 11.48M→**0**. | 178,856 cycles (**34.6% error**, **-44.6% vs Opt 9**). bwd `.o33`. `gpu_sim_insn` bit-identical (629,211,348). `next_stage` 21.3%→**1.6%**, `blocked_by_sfu` 15.36M→**0**. Warp-switch recovered slot (`other_warp_issued/sfu_filtered`) fwd 31.7% / bwd 26.3%. | Done. The compute-path issue-pipeline defect (SFU head-of-line) fixed; residual (fwd 1.56x) is **SFU-throughput bound** (`still_idle` ≡ `fu_occupied_sfu`, warps queue on the one HW-faithful SFU), not an occupancy floor — next candidate axis is warp-stagger/overlap. See [CONSUMER_COMPUTE_BOUND.md](file:///home/jihyun/modern-gpu-simulator-micro-2025/.plan/CONSUMER_COMPUTE_BOUND.md). |
 | Opt 11-A | Lightweight NVBit full trace (Option 1B) | One untrimmed full capture with compact 104B/360B wire records and semantic callback pruning (`LIGHTER_TRACER="compact_wire,prune_operands"`, `TRIM_SPIN=0`). Transport falls from the original 136.55GB equivalent to 7.41GB (**-94.6%, 18.4x smaller**) and callback records fall 191.79M→64.78M (**-66.2%**), while all replay-visible memory/sync/BAR/TMA payload is retained. | **83,308 cycles (23.1% error, -62.1% vs first measured fwd baseline, -21.0% vs Opt 10)**. fwd `.o68`. `gpgpu_n_tot_w_icount=14,847,194`, `gpu_sim_insn=450,627,804`; both exactly equal the loaded Option 1B trace contract. | **136,898 cycles (3.0% error, -63.7% vs Init, -23.5% vs Opt 10)**. bwd `.o42`. `gpgpu_n_tot_w_icount=21,007,397`, `gpu_sim_insn=624,799,542`; both exactly equal the trace contract. | **Payload/functional gate PASS; timing-fidelity gate FAIL.** Clean exit, TMA unresolved=0, BAR leaks=0, and all HGMMA/MUFU/TMA/memory/sync/BAR totals match. However Producer ends 37.9K/12.0K cycles before Consumer (K5/K10), while K5 HW has a +8.0K Producer tail. K10's 3.0% aggregate error is therefore not proof of correct role timing. |
 | Opt 11-B | Sparse full-trace reconstruction | `LIGHTER_TRACER="compact_wire,prune_operands,sparse_reconstruct"`. Retain CFG boundaries and every predicated/memory/sync/BAR/TMA/control instruction, omit callback-only straight-line instructions, then reconstruct the complete protobuf on the host. K5/K10 callbacks fall 93.14%/91.90% and captured NANOSLEEP falls 89.11%/89.76%. | **Historical affected-trace result: 92,530 cycles (36.7% error, +11.1% vs Opt 11-A)**. fwd `.o69/.e69`. `gpgpu_n_tot_w_icount=14,494,325`, `gpu_sim_insn=449,055,368`; aggregate sparse trace contract matched, but opcode order was not preserved. Producer/Consumer mean completion = 26,035.9/87,429.8, tail **-61,393.9**. | **Historical affected-trace result: 143,560 cycles (8.0% error, +4.9% vs Opt 11-A)**. bwd `.o43/.e43`. `gpgpu_n_tot_w_icount=20,019,180`, `gpu_sim_insn=625,678,016`; aggregate sparse trace contract matched, but opcode order was not preserved. Producer/Consumer mean completion = 88,220.7/115,352.6, tail **-27,131.8**. | **Opcode-order integrity gate FAIL; production promotion withdrawn.** Aggregate counts, TMA/BAR drain, and clean exit did not detect reordered opcodes. `LIGHTER_TRACER=all` and the unset default now resolve to Opt 11-A (`compact_wire,prune_operands`); Opt 11-B remains explicit-only until fixed and revalidated. |
-| Opt 12 | Producer spin-wait collapse (post-process sidecar + sim modeling) | On the Opt 11-A trace: a post-processing sidecar detects producer spin regions (`build_spin_wait_sidecar.py`), and the simulator (gated `-spin_wait_collapse_enable`) blocks the warp at a collapsible `primary_wait_pc` until the modeled mbarrier flips, then skips residual polls to `exit_pc`. Three linked docs: [Lighter_NVbit_Tracing.md](../.plan/Lighter_NVbit_Tracing.md) (tracer), [SPIN_WAIT_POSTPROCESS.md](../.plan/SPIN_WAIT_POSTPROCESS.md) (post-process), [SPIN_WAIT_SIM_MODELING.md](../.plan/SPIN_WAIT_SIM_MODELING.md) (sim, §13). | ❌ **deadlock @ 85,333** on first collapse-ON run. Root cause: low-flip cross-warp barrier `0x16c20` (2 flips/kernel) double-flips before the collapsed producer reaches `0xb0b0` on 21/132 CTAs; 1-bit parity cannot detect the missed edge. Discriminator = gen1→gen2 window (poison ~7.1K vs success ~13.5K), set by producer TMA-fill spacing into `0x16c58`. | ✅ **135,352 cycles (+1.84% vs target 132,901; −1,546 vs Opt 11-A)** — collapse moved K10 toward HW. Clean exit, TMA unresolved 0, BAR leak 0. | **Redirected to accuracy-audit; NCU cross-check pending.** Collapse honors the mbarrier for real; generation counter repurposed as an **assert-only audit** of the 1:1 wait↔flip pairing (never force-release). Next: HW gen1→gen2 window via NCU decides window-narrowing vs slow-producer (handover in SIM_MODELING §13.8). |
+| Opt 12 | Producer spin-wait fold (post-process sidecar + sim modeling) | On the Opt 11-A trace: a post-processing sidecar detects producer spin regions (`build_spin_wait_sidecar.py`), and the simulator (gated `-spin_wait_fold_enable`) blocks the warp at a foldable `primary_wait_pc` until the modeled mbarrier flips, then skips residual polls to `exit_pc`. Three linked docs: [Lighter_NVbit_Tracing.md](../.plan/Lighter_NVbit_Tracing.md) (tracer), [SPIN_WAIT_POSTPROCESS.md](../.plan/SPIN_WAIT_POSTPROCESS.md) (post-process), [SPIN_WAIT_SIM_MODELING.md](../.plan/SPIN_WAIT_SIM_MODELING.md) (sim, §13). | ❌ **deadlock @ 85,333** on first fold-ON run. Root cause: low-flip cross-warp barrier `0x16c20` (2 flips/kernel) double-flips before the folded producer reaches `0xb0b0` on 21/132 CTAs; 1-bit parity cannot detect the missed edge. Discriminator = gen1→gen2 window (poison ~7.1K vs success ~13.5K), set by producer TMA-fill spacing into `0x16c58`. | ✅ **135,352 cycles (+1.84% vs target 132,901; −1,546 vs Opt 11-A)** — fold moved K10 toward HW. Clean exit, TMA unresolved 0, BAR leak 0. | **Redirected to accuracy-audit; NCU cross-check pending.** Fold honors the mbarrier for real; generation counter repurposed as an **assert-only audit** of the 1:1 wait↔flip pairing (never force-release). Next: HW gen1→gen2 window via NCU decides window-narrowing vs slow-producer (handover in SIM_MODELING §13.8). |
 
 ### Simulator Cycle Breakdown
 
@@ -54,7 +54,7 @@ To keep this file easy to extend, use the following update pattern whenever a ne
 | `sim_cycle` | — | 220,024 | 162,582 | 158,990 | 155,765 | 149,727 | 145,855 | 138,021 | 137,053 | 135,999 | 105,464 | **83,308** | **92,530** | Opt 11-B = `.o69`; historical affected-trace result. |
 | `no_warps_ready` | — | 64.02% | 23.83% | 20.98% | 26.81% | 27.32% | 27.93% | 29.51% | 29.14% | 29.22% | 51.22% | 51.20% | 45.49% | Opt 11-B timing interpretation withdrawn. |
 | `issuing` | — | 14.56% | 21.17% | 24.05% | 31.18% | 31.19% | 32.30% | 34.75% | 34.77% | 34.96% | 38.00% | 37.63% | 32.30% | |
-| `next_stage_not_available` | — | 11.40% | 15.25% | 17.26% | 22.45% | 22.46% | 23.23% | 24.90% | 24.96% | 25.07% | 0.06% | 0.06% | 0.05% | Head-of-line stays collapsed. |
+| `next_stage_not_available` | — | 11.40% | 15.25% | 17.26% | 22.45% | 22.46% | 23.23% | 24.90% | 24.96% | 25.07% | 0.06% | 0.06% | 0.05% | Head-of-line stays folded. |
 | `no_valid_instruction` | — | 9.52% | 39.12% | 37.01% | 18.63% | 18.11% | 15.59% | 9.81% | 10.10% | 9.72% | 9.60% | 9.91% | 21.08% | |
 | `issue_port_busy` | — | 0.50% | 0.63% | 0.71% | 0.92% | 0.92% | 0.95% | 1.02% | 1.02% | 1.03% | 1.12% | 1.20% | 1.08% | |
 | `sum` | — | 100.00% | 100.00% | 100.00% | 100.00% | 100.00% | 100.00% | 100.00% | 100.00% | 100.00% | 100.00% | 100.00% | 100.00% | Rounding. |
@@ -75,7 +75,7 @@ To keep this file easy to extend, use the following update pattern whenever a ne
 | `l1c` | — | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | 0.03% | 0.02% | 0.00% | 0.00% | 0.00% | 0.00% | |
 | `scoreboard (memory)` | — | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | |
 
-> **[1] On the Opt 1 `tma_axis = 62.73%`.** This is a correctly-recorded value, not an input error. `tma_axis` is the grouped sum `wait_barrier + inst_barrier + tma_flush`, and the **same formula is applied in every column** (e.g. Opt 1: 6.64+56.09+0.00=62.73; Opt 2: 8.07+9.09+0.00=17.16) — it is not split differently between columns. Opt 1 only looks large because the pre-BAR-fix `inst_barrier` (56.09%) is folded in; that is not a real TMA cost. It collapses to 17.16% in Opt 2 purely because `inst_barrier` itself drops (56.09% -> 9.09%) after the BAR implementation. The HW TMA axis is ~23.8%, so the Opt 1 value is an over-attribution driven by the unfixed barrier model.
+> **[1] On the Opt 1 `tma_axis = 62.73%`.** This is a correctly-recorded value, not an input error. `tma_axis` is the grouped sum `wait_barrier + inst_barrier + tma_flush`, and the **same formula is applied in every column** (e.g. Opt 1: 6.64+56.09+0.00=62.73; Opt 2: 8.07+9.09+0.00=17.16) — it is not split differently between columns. Opt 1 only looks large because the pre-BAR-fix `inst_barrier` (56.09%) is folded in; that is not a real TMA cost. It folds to 17.16% in Opt 2 purely because `inst_barrier` itself drops (56.09% -> 9.09%) after the BAR implementation. The HW TMA axis is ~23.8%, so the Opt 1 value is an over-attribution driven by the unfixed barrier model.
 
 #### FA3 bwd - top-level simulator breakdown
 
@@ -84,7 +84,7 @@ To keep this file easy to extend, use the following update pattern whenever a ne
 | `sim_cycle` | 376,735 | 361,760 | 328,643 | 259,456 | 241,528 | 241,425 | 290,572 | 250,026 | 234,665 | 215,895 | 178,856 | **136,898** | **143,560** | Opt 11-B = `.o43`; historical affected-trace result. |
 | `no_warps_ready` | 66.40% | 66.64% | 58.27% | 29.80% | 36.56% | 36.45% | 41.51% | 34.00% | 34.35% | 36.49% | 52.45% | 51.19% | 49.09% | Aggregate cycle remains misleading because Producer timing is inverted. |
 | `issuing` | 12.12% | 12.71% | 14.06% | 20.93% | 26.18% | 25.70% | 17.76% | 21.94% | 23.63% | 29.49% | 32.32% | 32.04% | 29.24% | |
-| `next_stage_not_available` | 10.17% | 10.69% | 11.41% | 15.11% | 18.96% | 18.52% | 12.88% | 15.83% | 17.11% | 21.35% | 1.63% | 1.72% | 1.68% | Head-of-line stays collapsed. |
+| `next_stage_not_available` | 10.17% | 10.69% | 11.41% | 15.11% | 18.96% | 18.52% | 12.88% | 15.83% | 17.11% | 21.35% | 1.63% | 1.72% | 1.68% | Head-of-line stays folded. |
 | `no_valid_instruction` | 10.37% | 8.96% | 15.02% | 33.59% | 17.59% | 18.63% | 27.37% | 27.63% | 24.28% | 11.87% | 12.73% | 14.15% | 19.11% | |
 | `issue_port_busy` | 0.95% | 1.01% | 1.24% | 0.57% | 0.71% | 0.70% | 0.48% | 0.59% | 0.64% | 0.80% | 0.87% | 0.91% | 0.89% | |
 | `sum` | 100.00% | 100.00% | 100.00% | 100.00% | 100.00% | 100.00% | 100.00% | 100.00% | 100.00% | 100.00% | 100.00% | 100.00% | 100.00% | Init columns sum to ~100% after rounding. |
@@ -614,7 +614,7 @@ HITs in L1I.
 #### How to implement
 
 - **Real base (M1):** recover each descriptor op's exact GMEM base offline into `tma_pc_base_map.json` (23/23 descriptor sites, `pool=0`, via direct SMEM-window offset + UTMACCTL.PF prefetch chain). Load it in `gpu-sim.cc`, look it up in `build_tma_command` by `(uid,pc)`, carry `global_base` + box/element_size on `TMACommand`, and drive the mover from the real base. Gated by `-tma_real_base_addr_enable`.
-- **CTA-indexed tile spread (M2):** base-only collapses all of a tensor's tiles to one address (over-hit). The first fix (per-SM visit counter) **failed** — FA3 runs 1 CTA/SM with only ~24 transfers/tensor/SM, so every SM restarted at tile 0 (fwd stayed 0.9854). Fixed by seeding `tile_idx = (global_blockIdx + visit) % num_tiles` from `SM::get_global_cta_id()` (getter exposing the existing local→global CTA map), so distinct CTAs hit distinct tiles grid-wide while same-CTA revisits still hit.
+- **CTA-indexed tile spread (M2):** base-only folds all of a tensor's tiles to one address (over-hit). The first fix (per-SM visit counter) **failed** — FA3 runs 1 CTA/SM with only ~24 transfers/tensor/SM, so every SM restarted at tile 0 (fwd stayed 0.9854). Fixed by seeding `tile_idx = (global_blockIdx + visit) % num_tiles` from `SM::get_global_cta_id()` (getter exposing the existing local→global CTA map), so distinct CTAs hit distinct tiles grid-wide while same-CTA revisits still hit.
 - **M2.5 (UBLKRED/UBLKCP):** raw-pointer ops (not tensormaps); their real base is read offline from the by-value param struct (`launch_param_blobs/*.bin`) and given the same CTA-indexed tiling with `tile_bytes=covered_bytes`. Gated by `-tma_operand_addr_tiling_enable`.
 - Files: `sm.h`/`sm.cc` (getter), `tma_unit_sm.{h,cc}` (lookup + mover + tile spread), `tma_types.h`, `gpu-sim.cc` (loader + flags). Commits `6893954` (code) + `0ddaec9` (docs).
 
@@ -756,7 +756,7 @@ whether a slot was recovered.
 - **Work-invariant (not a fake win):** `gpu_sim_insn` bit-identical (fwd 455,565,060 / bwd 629,211,348)
   AND `issue_stage_issuing` bit-identical (fwd 16,064,281 / bwd 22,626,216) on both sides — same
   instructions issued, only the issue-*stall* removed.
-- **Head-of-line collapsed:** fwd `next_stage_not_available` 25.1% → **0.06%**, `blocked_by_sfu` 11.48M
+- **Head-of-line folded:** fwd `next_stage_not_available` 25.1% → **0.06%**, `blocked_by_sfu` 11.48M
   → **0**; bwd 21.3% → **1.6%**, `blocked_by_sfu` 15.36M → **0**. `issuing` (SM-active proxy) fwd 35.0%
   → 38.0%, bwd 29.5% → 32.3%.
 - **Warp-switch fired (direct causal proof):** `other_warp_issued / sfu_filtered` = fwd 6.07M/19.15M
@@ -927,16 +927,16 @@ Consumer completion moved later by 10.4K / 6.2K. Because the sparse traces
 changed opcode order, these deltas cannot be causally attributed to removed
 spin, TMA pacing, or another simulator timing mechanism.
 
-### Opt 12 - producer spin-wait collapse (post-processing sidecar + sim modeling)
+### Opt 12 - producer spin-wait fold (post-processing sidecar + sim modeling)
 
 > Opt 12 is a three-stage chain built on the Opt 11-A trace, each stage a
 > separate design doc:
 > - **tracer (Opt 11-A)**: [Lighter_NVbit_Tracing.md](../.plan/Lighter_NVbit_Tracing.md)
 >   — the compact full-capture trace.
 > - **post-processing**: [SPIN_WAIT_POSTPROCESS.md](../.plan/SPIN_WAIT_POSTPROCESS.md)
->   — static spin-region detection + `collapsible` gate (`build_spin_wait_sidecar.py`).
+>   — static spin-region detection + `foldable` gate (`build_spin_wait_sidecar.py`).
 > - **sim modeling**: [SPIN_WAIT_SIM_MODELING.md](../.plan/SPIN_WAIT_SIM_MODELING.md)
->   — collapse block/skip, stall taxonomy, and the generation-counter audit (§13).
+>   — fold block/skip, stall taxonomy, and the generation-counter audit (§13).
 
 #### Why this optimization
 
@@ -952,11 +952,11 @@ handshake instead of replaying the artifact.
 #### How to implement
 
 - **Post-processing** annotates, per kernel, each producer spin region by PC
-  (`primary_wait_pc`, `exit_pc`, `body_pcs`) and a `collapsible` gate
+  (`primary_wait_pc`, `exit_pc`, `body_pcs`) and a `foldable` gate
   (`is_spin_loop && semantic_free_body && barrier_self_tied`), written to
   `spin_wait_sidecar.json`. Read-only wrt the trace; CPU-only.
-- **Sim modeling**, gated by `-spin_wait_collapse_enable` (default 0): at a
-  collapsible `primary_wait_pc`, block the warp until the modeled mbarrier is
+- **Sim modeling**, gated by `-spin_wait_fold_enable` (default 0): at a
+  foldable `primary_wait_pc`, block the warp until the modeled mbarrier is
   ready, then fast-forward the trace cursor to `exit_pc` (B2 dual-cursor skip),
   consuming the residual recorded polls without issuing them. An observe-only
   pre-stage (`-spin_wait_observe_enable`) measures would-be park with no
@@ -964,32 +964,32 @@ handshake instead of replaying the artifact.
 
 #### Result
 
-**Stage status: observe PASS (GO); first collapse run K10 PASS / K5 deadlock;
+**Stage status: observe PASS (GO); first fold run K10 PASS / K5 deadlock;
 direction redirected to accuracy-audit; NCU cross-check pending.**
 
 | Stage | K5 fwd | K10 bwd | Verdict |
 |---|---:|---:|---|
 | Observe-only (would-be park) | closed-episode park 0.63M, watchdog_hits 0 | 3.10M, 0 | GO (no never-flip) |
-| First collapse-ON | ❌ `deadlock @ 85,333` | ✅ 135,352 (target 132,901, **+1.84%**; −1,546 vs Opt 11-A, toward HW) | K10 correct-direction; K5 blocked |
+| First fold-ON | ❌ `deadlock @ 85,333` | ✅ 135,352 (target 132,901, **+1.84%**; −1,546 vs Opt 11-A, toward HW) | K10 correct-direction; K5 blocked |
 
-- **K5 deadlock root cause (established in the collapse-ON run only).** A low-flip
+- **K5 deadlock root cause (established in the fold-ON run only).** A low-flip
   cross-warp barrier (`0x16c20`, warp-arrived, **2 flips/kernel**) hosts two
-  producer waits (`0xb0b0`↔gen1, `0xb3d0`↔gen2). On 21/132 CTAs the collapsed
+  producer waits (`0xb0b0`↔gen1, `0xb3d0`↔gen2). On 21/132 CTAs the folded
   producer reaches `0xb0b0` **after** both flips already passed, and a 1-bit phase
   parity cannot tell "my flip already passed" from "not yet" → permanent park. The
   discriminator is the **gen1→gen2 window width** (poison med ~7.1K vs success
   ~13.5K), which equals the spacing of the two producer TMA fills into the
-  TMA-credited barrier `0x16c58` — i.e. **collapse re-paced the producer and
+  TMA-credited barrier `0x16c58` — i.e. **fold re-paced the producer and
   perturbed the very window it must land in** (a second-order scheduling
   interaction). Full detail: [SPIN_WAIT_SIM_MODELING.md](../.plan/SPIN_WAIT_SIM_MODELING.md) §13.2–§13.4.2.
-- **Direction (decided 2026-08-12): collapse is an accuracy audit.** A missed
+- **Direction (decided 2026-08-12): fold is an accuracy audit.** A missed
   consumer edge is a simulator-accuracy defect, not something to skip past. Keep
-  collapse honoring the mbarrier for real; add a per-barrier monotonic generation
+  fold honoring the mbarrier for real; add a per-barrier monotonic generation
   counter used **only to audit** the 1:1 wait↔flip pairing and **assert/abort** on
   a violation (never force-release). The watchdog likewise becomes assert, not
   force-release. See §13.4/§13.5.
 - **Open item (NCU, another server).** Measure the HW gen1→gen2 window to decide
-  whether the fault is window-narrowing (~13K HW ⇒ collapse pacing shrinks it) or a
+  whether the fault is window-narrowing (~13K HW ⇒ fold pacing shrinks it) or a
   too-slow producer path (~7K HW). Self-contained handover in
   [SPIN_WAIT_SIM_MODELING.md](../.plan/SPIN_WAIT_SIM_MODELING.md) §13.8.
 
