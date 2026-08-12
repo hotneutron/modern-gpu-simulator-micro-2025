@@ -289,6 +289,30 @@ sub-flag, release the park and fall back to trace replay for that warp so the ru
 completes). This covers the two observe blind spots (mutual-collapse interaction,
 2nd-order scheduling) called out in §9 of SPIN_WAIT_SIDECAR.md.
 
+### 6.1 Phase-parity double-flip — keep the 1-bit model (reviewed, not a hazard)
+
+`is_sync_wait_satisfied` releases when `barrier.phase != wait_parity` (1-bit
+parity, bit 31 of wait_state_raw). A theoretical concern: if the barrier flips
+TWICE while a warp is parked (P -> !P -> P), the level compare could miss the
+wakeup. Reviewed and rejected as a hazard, keeping the existing 1-bit model:
+
+- The 1-bit parity is NOT a simulator convenience — it is the exact Hopper
+  `mbarrier.try_wait.parity` semantic (SYNC_ISA.md §; new_sync_plan.md
+  "Two-phase parity model is enough"). Replacing it with an epoch counter would
+  DIVERGE from the validated HW model that the whole sync implementation rests on.
+- Missed-wakeup-by-double-flip is precluded structurally AND empirically:
+  (a) the simulator re-tests every scheduler cycle with no latch (sm.cc
+  2242-2264), worst-case re-eval gap is a few cycles; (b) the mbarrier protocol
+  forbids a second flip before the waiter consumes its phase (the buffer cannot be
+  reused until the consumer arrives), so a double-flip cannot happen "over" a
+  still-waiting warp; (c) measured minimum flip interval on the SAME barrier is
+  1738 cyc (K5) / 2435 cyc (K10), with zero sub-8-cycle gaps — three orders of
+  magnitude above the re-eval gap.
+- The §6 watchdog is the backstop for any unforeseen never-release.
+
+Decision: keep the 1-bit phase compare unchanged (matches HW and the existing
+sync model); do NOT add an epoch counter for v1.
+
 ## 6.5 Stall-reason taxonomy must be corrected for the new park (REQUIRED)
 
 Collapse introduces a NEW reason a warp is not eligible: it is parked on an
@@ -335,6 +359,41 @@ Required change (gated, so feature-off stays bit-identical):
 
 This is the only stall-metric change collapse needs; the execution-count metrics
 (§4c) require none.
+
+### 6.5.1 The park query used off the issue path MUST be non-mutating (REQUIRED)
+
+`SM::warp_waiting_at_barrier` has a SIDE EFFECT: when the mbarrier wait is
+satisfied it clears `m_pending_sync_waits[warp_id]` and bumps a debug counter
+(sm.cc:2253-2260). Today that clear never fires for an mbarrier (the slot is
+always invalid), but under collapse it becomes a real state mutation — and
+`shd_warp_t::waiting()` (which routes to it) is called from a `std::sort`
+comparator `sort_warps_by_highest_id_dynamic_id` (subcore.cc:1472-1485, invoked
+from BOTH `issue()` and `fetch()` every cycle).
+
+Assessment (reviewed): this is NOT undefined behavior — within one sort the
+barrier's satisfied-status is constant, so the comparator stays a valid strict-
+weak-ordering, and the clear mutates SM state, not the sorted `shd_warp_t`
+elements (same benign shape as the existing membar clear inside `waiting()` at
+sm.cc:2709). BUT it IS a real attribution hazard: the authoritative "wait
+released" (park clear + counter + log, and the §6.7 park/release balance the
+debug logs rely on) would fire nondeterministically as a side effect of a
+scheduling sort in fetch/issue, not from the deliberate issue-eligibility
+decision.
+
+Required rule: the clearing `warp_waiting_at_barrier` is called from EXACTLY ONE
+authoritative site — the issue-eligibility check (subcore.cc:747,
+`!c_warp->waiting()` on the non-tail path). Everywhere else that inspects park
+state (the sort comparator, any read-only stall scan, the §6.5 stall
+attribution) MUST use a NON-mutating peek:
+- `SM::warp_parked_on_mbarrier_spin(warp_id) const` — returns
+  `m_barriers.warp_waiting_at_barrier(warp_id) || (pending.valid &&
+  !is_sync_wait_satisfied(pending))` with NO clear, NO counter bump.
+- a `shd_warp_t::waiting_peek() const` (or `waiting(bool no_side_effects)`) that
+  routes the barrier check through the peek; use it at subcore.cc:1475/1477.
+This makes the comparator a pure function of immutable-during-sort state (removes
+even the theoretical UB), and makes release deterministic and correctly
+attributed. Only the remodeled SM path needs this; the baseline
+`shader_core_ctx::warp_waiting_at_barrier` never consults `m_pending_sync_waits`.
 
 ## 6.6 Full metric audit (all instrument flags) and required fixes
 
@@ -626,3 +685,43 @@ it fully nonblocking (today's replay). The simulator ALSO asserts the flag at th
 skip site as defense-in-depth, so a mislabeled region fails loudly instead of
 silently corrupting the scoreboard. This turns "we happened to be safe" into "we
 are safe by construction, and unsafe regions are auto-excluded."
+
+### 12.8 Producer+consumer both-collapsed circular wait — precluded (RESOLVED)
+
+The biggest un-verified risk of the §9 "collapse both roles" decision: could
+parking BOTH the producer's buffer-empty wait AND the consumers' buffer-full wait
+create a circular wait that did not exist under nonblocking replay? Analyzed
+against the K5 SM27 cta0 SYNCDBG timeline; answer is NO, precluded by three
+independent mechanisms:
+
+Dependency structure (confirmed textbook warp-specialization): producer (warp 0)
+only ARRIVEs on full barriers (fills via TMA) and only WAITs on empty barriers;
+consumers (warpgroup leaders, expected_arrive=3) only WAIT on full and only ARRIVE
+on empty. Full/empty barriers cycle 4-deep (full 0x16c30/38/50/58 ↔ empty
+0x16c40/48/60/68).
+
+Why no cycle:
+1. TMA completion is issue-independent — `m_tma_unit_shared_of_sm->cycle()`
+   (sm.cc:558) runs BEFORE `subcore->cycle()` (sm.cc:566) every cycle, so a
+   producer's already-issued in-flight TMA keeps completing and flipping full
+   barriers even while the producer warp is parked (observed: uid30@24652,
+   uid31@24780 complete during the producer's 24499-27770 park).
+2. Multi-buffer decoupling — the producer's reuse-wait frontier sits several
+   buffers BEHIND its fill frontier, so the empty(m) it waits on is freed by
+   consumers draining ALREADY-LANDED earlier buffers, never depending on the
+   parked producer's next fill.
+3. Collapse preserves trace ORDER (only timing changes) — the parked producer
+   resumes at the same wait instruction and issues the same next UTMALDG once its
+   empty frees.
+
+The deadlock pattern {producer waits empty(k) ∧ every consumer waits full(k+1) ∧
+producer stuck before k+1's TMA} never occurs in the timeline: during the whole
+producer park no consumer is blocked on a full barrier whose TMA the producer has
+not yet issued (they are computing on already-landed data). Log-wide: K5/K10 both
+clean-exit, SPINWAITDEADLOCK=0, watchdog_hits=0, max would-be park 3,495 (K5) /
+18,561 (K10) cyc — two orders under the 400K watchdog threshold.
+
+Residual: only a degenerate depth-1 (effectively single-buffer) scheme could close
+the cycle; FA3 is depth-4 so it cannot arise. Any future pathological trace/config
+that did would be caught by the §6 runtime watchdog ([SPINWAITDEADLOCK] mid-run,
+[SPINWAITOPEN] at exit), never a silent hang.
