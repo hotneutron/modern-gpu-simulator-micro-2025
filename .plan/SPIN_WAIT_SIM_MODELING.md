@@ -1340,3 +1340,189 @@ within its current +1.84%"** — an internal-consistency bar, not a HW-window ma
 If a future engagement gets an external flash_attn_3 source build, the §13.8.1
 `clock64()` route can upgrade this from internal-consistency to HW-absolute; until
 then that upgrade is explicitly out of scope, not forgotten.
+
+## 15. Audit diagnostic-run results (K5 `.e72`/`.o72`, K10 `.e46`/`.o46`, 2026-08-13)
+
+The §14.1 audit build (generation counter + `[FOLDAUDIT]`, with the TEMPORARY
+late-release override still in place) was run to completion on K5 and K10. This
+section records the outcome and what the audit newly revealed. Log dir:
+`sim_run_12.8/flashattn-fa3-bf16-bwd-causal-b1-s2048-hd64-nh24/flashattn_fa3_bf16_bwd_causal_b1_s2048_hd64_nh24___warmup_0___iters_1/`
+(K10 = `H100_80GB-OnlyKernel10/*-63a73d452237.{e46,o46}`,
+K5 = `H100_80GB-OnlyKernel5/*-63a73d452237.{e72,o72}`).
+
+### 15.1 Outcome
+
+| Kernel | Result | Final cycle | vs HW target | `[FOLDAUDIT]` |
+|---|---|---:|---|---|
+| **K10** bwd | ✅ clean `exit detected` | **133,796** | target 132,901 → **+0.67%** | **0** (`late_releases=0` on all 384 SM `[FOLDSUM]`) |
+| **K5** fwd | ❌ `abort()` (watchdog) @ cyc **87,962** | — | — | **232** (231 late_release + 1 watchdog abort) |
+
+- **K10 improved further**: audit-run 133,796 vs §13.1 fold-ON 135,352 =
+  **−1,556 cyc**, now **+0.67%** over HW (was +1.84%). K10 has **zero** poison —
+  its handshake pacing is not perturbed into a missed edge. K10 is effectively
+  solved.
+- **K5 aborted deterministically**, exactly as the §13.4 "never force-release"
+  rule intends. The abort is the **watchdog** branch (`cur_gen < exp_gen`, park
+  exceeded the 32,000-cyc threshold), NOT the late-release override:
+  ```
+  [FOLDAUDIT][SM29] cyc=87962 warp=0 producer cta=0 global_cta=29
+    barrier=0x16c20 wait_pc=0xb0b0 exit_pc=0xb0d0
+    expected_gen=3 barrier_gen=2 prev_flip_cyc=49369 current_flip_cyc=55950
+    parked_cyc=32001 threshold=32000
+    : paired consumer flip never arrived within the watchdog window — model gap.
+  ```
+  So the §13.2 original poison (`0xb0b0`/`0x16c20`) is still K5's true hard-fail:
+  its gen-3 flip **never arrives** (barrier stuck at gen 2), which even the
+  temporary late-release cannot paper over (that path only handles `gen > exp`).
+
+### 15.2 What the audit newly revealed — poison is far broader than §13 assumed
+
+§13.2 believed the poison was localized to `0xb0b0`/`0x16c20` on 21 CTAs. The
+audit run shows the **late-release poison spans all 132 CTAs** and is dominated by
+a *different* site. Late-release `[FOLDAUDIT]` by `(barrier, wait_pc)`:
+
+| barrier | wait_pc | late_release count | role of barrier |
+|---|---|---:|---|
+| **0x16c68** | **0xb370** | **105** | consumer empty-barrier |
+| **0x16c60** | **0xb370** | **89** | consumer empty-barrier |
+| 0x16c68 | 0xb310 | 5 | |
+| 0x16c40 | 0xb1f0 | 5 | |
+| 0x16c60 | 0xb310 | 4 | |
+| 0x16c40 | 0xb2b0 | 3 | |
+| 0x16c48 | 0xb2b0 | 3 | |
+| 0x16c68 | 0xb250 | 2 | |
+| 0x16c60 | 0xb250 | 1 | |
+| **0x16c20** | **0xb0b0** | **14** (+1 watchdog abort) | low-flip cross-warp |
+
+Findings:
+
+- **`wait_pc=0xb370` on empty barriers `0x16c60`/`0x16c68` is the dominant poison
+  (194/231 = 84%)**, not the §13.2 `0xb0b0`/`0x16c20` (only 14 late + 1 abort).
+  §13 chased the wrong primary site because the earlier fold run *deadlocked* on
+  `0x16c20` before the `0xb370` poison could even be observed (the hang masked it).
+- **All 132 CTAs** produce at least one late-release → this is a systemic pacing
+  fault, not a 21-CTA corner case.
+- **gen-overshoot delta distribution is entirely odd** (delta 1: 72, delta 3: 75,
+  delta 5: 73, delta 7: 11) — consistent with the parity model (a parity-`p` wait
+  only re-pairs at even gen spacing, so overshoot must be odd). This is strong
+  evidence the audit counting is correct; the overshoot is real missed edges, not
+  a bookkeeping error.
+- The overshoot reaching **+7** on 11 events means some producers arrive a full
+  three consumer cycles late — a large pacing skew on those CTAs, well beyond the
+  ~1.3K "small margin" §13.2.1 measured on `0x16c20` alone.
+
+### 15.3 Corrections to §13/§14 forced by this run
+
+- **§13.2 "21 SMs, single poison site `0x16c20`"** — refuted. The dominant poison
+  is `0xb370`/empty-barriers across all 132 CTAs; `0x16c20` is a minority (and the
+  only *watchdog* case). §13.2's set-equality analysis was true only for the
+  earlier *deadlocking* run, where `0x16c20` hung first and hid everything else.
+- **§14.2 Anchor B/C ("window-narrowing on a specific low-flip barrier")** — the
+  direction (fold re-pacing narrows a consumer window) is corroborated, but the
+  affected barriers are the **empty barriers `0x16c60`/`0x16c68`** the producer
+  waits on (`0xb370`), not primarily `0x16c58`/`0x16c20`. The pacing investigation
+  in §13.4.2 must be re-centered on the `0xb370`↔`0x16c60/68` handshake.
+- **§13.1/§14.3 success criterion** — K10 already satisfies "clean, within a few %
+  of HW" (now +0.67%). The K5 bar is unchanged: it must complete with **zero**
+  `[FOLDAUDIT]` (no late_release, no watchdog abort) once the override is restored
+  to a hard assert.
+
+### 15.4 Immediate next step — the §14.1 MANDATORY RESTORE GATE is now due
+
+The diagnostic logs are collected (this section). Per §14.1 the temporary
+late-release override MUST now be reverted so `barrier.gen > expected_gen` is again
+a hard **assert/abort**. After restore, K5 will abort on the *first* poison
+(currently the earliest `0xb370` late-release, well before cyc 87,962), pinning the
+dominant defect's coordinate directly. Only then does the pacing fix (§14.2,
+re-centered on `0xb370`↔`0x16c60/68` per §15.3) get implemented and validated
+against the zero-`[FOLDAUDIT]` bar.
+
+## 16. Deadlock causal chain fully traced — root cause is consumer compute pacing, not fold (2026-08-13)
+
+This section replaces the earlier scattered "window narrowing" hypotheses (§13.4.2,
+§14.2, §15.2) with the **complete, per-link causal chain** for the actual hang,
+established by directly comparing a **poison SM (SM29, hangs)** against a **success
+SM (SM26, clean)** in the same audit run `.e72`. The generation counter is confirmed
+to be diagnostic-only; the deadlock is a **simulator internal timing (pacing)
+inaccuracy** that fold merely *surfaces*.
+
+### 16.1 The deadlock is a realized double-flip on `0x16c20` (confirmed, not gen bookkeeping)
+
+The watchdog abort (`.e72`, the ONLY hard failure) is at `0x16c20`/`wait_pc=0xb0b0`,
+SM29, cyc 87,962. `0x16c20` is **warp15-arrived only, `expected_arrive=1`, and flips
+exactly 2× per kernel** (gen0→1 @49369, gen1→2 @55950 on SM29; warp15 does its 2nd
+and last arrive, then finishes its TMA store uid=42 @56400 and never arrives again).
+The producer parks at `0xb0b0` @55961 with `expected_gen=3, barrier_gen=2` — it waits
+for a **3rd flip that structurally never happens**. A 1-bit parity cannot distinguish
+"my `0→1` edge already passed (at gen1)" from "not yet", so the park never clears →
+circular wait (warp15 later needs producer-owed data) → SM hang. **"generation
+넘어감(=flip 2회) → deadlock" is exactly correct.**
+
+### 16.2 Why the producer misses its edge — SM29 (poison) vs SM26 (success), full chain
+
+Both SMs run the identical kernel/trace and the producer reaches `0x16c20` parity-0
+at **nearly the same cycle** (SM29 @55835, SM26 @55334). The ONLY difference is
+**when the consumer opens/closes the gen1→gen2 window**, and that is set upstream by
+consumer compute pacing. The chain (all cycles from `.e72`):
+
+| link | SM29 (poison) | SM26 (success) | Δ |
+|---|---:|---:|---:|
+| consumer warp8 inter-arrive on empty barriers (one tile of compute) | **~2,087** | **~2,640** | SM26 ~550 slower |
+| producer fold-park on `0x16c40` (waiting that consumer flip) | **1,724** | **3,228** | SM26 +1,504 |
+| producer next TMA fill `uid30` enqueue | @47,572 | @50,322 | SM26 +2,750 |
+| that TMA credits `0x16c50` flip (TMA-credited) | @47,886 | @50,578 | SM26 +2,692 |
+| warp15 passes `0x16c50` gate → `0x16c20` gen1 arrive | @49,369 | @51,946 | SM26 +2,577 |
+| gen1→gen2 window (producer must land inside) | closes @55,950 (**too early**) | open at producer arrival | — |
+| producer `0x16c20` parity-0 arrival | @55,835 | @55,334 | ~same |
+| outcome | misses edge → **park forever** | immediate-hit → **clean** | — |
+
+**Reading:** the producer's arrival time is essentially SM-independent; the window's
+*open/close* time is what varies, and it is driven, link-by-link, by **how fast the
+consumer completes each tile's compute**. A consumer that is ~550 cyc/tile faster
+(SM29) flips the empty barriers earlier → frees the producer earlier → the producer
+issues its next TMA earlier → `0x16c50` flips earlier → warp15's gen1 arrive is
+~2,577 cyc earlier → the whole 2-flip window slides *ahead of* the producer's
+(fixed) arrival, so the producer lands *after* gen2. On SM26 the slower consumer
+keeps the window open long enough.
+
+### 16.3 Root cause = consumer compute pacing inaccuracy (same defect as the −38K role-tail)
+
+- **All 232 `[FOLDAUDIT]` overshoots are `role=producer`, `warp=0`** — the producer
+  is always the one arriving late relative to a consumer-driven edge. Consumers never
+  overshoot. So the fault is producer-arrives-late / consumer-runs-ahead, a *relative*
+  pacing skew.
+- The per-SM variance in consumer tile time is not a fold artifact (fold only removes
+  producer spin polls; it does not touch consumer compute). It is the **consumer
+  WGMMA/softmax(MUFU) pacing + issue contention** the tracked notes already flag as the
+  post-Opt-10 residual: FA3_progress.md "consumer-warp lockstep / pipe-overlap absence"
+  and [HW_VS_SIM_SFU.md](../.plan/HW_VS_SIM_SFU.md).
+- **This is the SAME defect as the Opt 11-A timing-fidelity FAIL**: K5 sim has the
+  Producer finishing **−37.9K cyc BEFORE** the Consumer (HW has a **+8.0K Producer
+  tail**), and K5 sim is **+23.1% slower than HW (83,308 vs 67,696)**. The producer
+  races ahead of / is mis-paced against the consumer in the sim. The `0x16c20`
+  double-flip deadlock is that same producer/consumer mis-pacing pushed until it
+  strands a 2-flip barrier. **Fixing the deadlock and fixing the K5 +23% / inverted
+  role-tail are the same problem.**
+
+### 16.4 Consequences for the plan
+
+- **Corrections to earlier sections.** The window-generating TMA barrier in the actual
+  hang chain is **`0x16c50`** (not `0x16c58` as §13.4.2 guessed), and the dominant
+  audit-overshoot site is **`0xb370`/`0x16c60-68`** (not `0x16c20` as §13.2 believed —
+  that was masked by the earlier deadlocking run; see §15.2). The *mechanism* (fold
+  re-paces the producer, perturbing a consumer-driven flip window) is confirmed, but
+  it is **downstream of** consumer compute pacing, which is the true independent
+  variable.
+- **The generation audit is validated as correct and diagnostic-only** (§15): overshoot
+  deltas are all odd (parity-consistent), and it pins the fault coordinate. It is not a
+  release mechanism (§13.4 stands).
+- **Fold is not the defect; do not "fix" fold to hide the hang.** The correct target is
+  the consumer compute-pacing model that makes the producer/consumer handshake
+  mis-align vs HW. That is the same axis as the Opt 10 residual / HW_VS_SIM_SFU work.
+- **Open question for the fix.** Whether the consumer tile-time variance across SMs is
+  (a) an HW-faithful reflection of real per-SM scheduling jitter that HW tolerates
+  because its window is wider, or (b) a sim over/under-model of consumer compute
+  latency that both slows K5 ~23% AND narrows the window. Deciding (a) vs (b) needs the
+  HW gen1→gen2 window, which NCU cannot supply (§13.8.1); the HW-free path is to check
+  whether the sim's consumer tile-time distribution matches HW's known SM-active/issue
+  profile (FA3_progress.md §2 secondary section).
