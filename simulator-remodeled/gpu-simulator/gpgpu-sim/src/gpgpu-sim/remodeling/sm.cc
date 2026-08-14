@@ -2735,15 +2735,17 @@ void SM::handle_sync_instruction(warp_inst_t &inst, unsigned int warp_id) {
         //   cur_gen <  expected_gen  -> impossible when wait_ready (invariant)
         if (m_config->spin_wait_fold_enable) {
           SpinWaitRegionRecord region;
-          if (m_gpu->lookup_spin_wait_region(inst.unique_function_id, inst.pc,
+          const bool is_foldable_primary =
+              m_gpu->lookup_spin_wait_region(inst.unique_function_id, inst.pc,
                                              region) &&
-              region.foldable) {
+              region.foldable;
+          if (m_fold_last_gen.size() <= warp_id) {
+            m_fold_last_gen.resize(MAX_WARP_PER_SHADER);
+          }
+          if (is_foldable_primary) {
             // Fold path must not silently tolerate sidecar/runtime drift.
             assert(region.primary_wait_pc == inst.pc);
             assert(region.primary_wait_kind == inst.sync_kind);
-            if (m_fold_last_gen.size() <= warp_id) {
-              m_fold_last_gen.resize(MAX_WARP_PER_SHADER);
-            }
             const uint64_t expected_gen = fold_expected_gen_for_wait(
                 warp_id, key, inst.sync_semantic_raw);
             const uint64_t cur_gen = sync_barrier_gen(key);
@@ -2809,6 +2811,24 @@ void SM::handle_sync_instruction(warp_inst_t &inst, unsigned int warp_id) {
                   std::to_string(cur_gen) + " skipped=" +
                   std::to_string(skipped) + " landing_pc=0x" +
                   format_hex_u64(tw->get_pc()));
+            }
+          } else {
+            // [Stage 0.10-A] Shared-barrier generation tracking. A satisfied
+            // wait that is NOT the primary of a foldable region (a non-foldable
+            // spin, an entry TRYWAIT, or any other PHASECHK/TRYWAIT) still
+            // observes and thus CONSUMES a barrier flip. Multiple wait_pcs can
+            // resolve to the SAME runtime barrier address, so if only foldable
+            // waits advanced the per-(warp,barrier) consumed-gen, a later
+            // foldable wait on that barrier would compute a stale (too-low)
+            // expected_gen and the release/immediate audit would fire a false
+            // double-flip (observed as the K5 SM125 0x16c60 abort). Advance the
+            // consumed-gen monotonically to the gen this parity just observed.
+            // This is audit-only bookkeeping; it never changes issue/timing.
+            const uint64_t observed_gen = sync_barrier_gen(key);
+            auto it = m_fold_last_gen[warp_id].find(key);
+            if (it == m_fold_last_gen[warp_id].end() ||
+                observed_gen > it->second) {
+              m_fold_last_gen[warp_id][key] = observed_gen;
             }
           }
         }

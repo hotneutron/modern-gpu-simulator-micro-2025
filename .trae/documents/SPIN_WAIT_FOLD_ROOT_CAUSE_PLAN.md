@@ -1108,3 +1108,131 @@ SM29의 corrected timeline은 다음을 만족해야 한다.
   root-cause 분석 대상으로 삼는다.
 - corrected K5가 `cur_gen < expected_gen` watchdog으로 abort하면 missing producer/consumer
   edge의 구조적 causal chain을 다시 추적한다.
+
+## Batch A 실험 결과 (2026-08-14)
+
+Batch A 구현(commit `cdc8e9c`) 후 K5/K10 12시간 실험을 실제로 돌렸다. config는
+`SM90_H100_L2_50MB_80GB/gpgpusim.config` 그대로(`-spin_wait_fold_enable 1`,
+`-spin_wait_fold_debug 1`, `-spin_wait_observe_enable 0`).
+
+로그 경로:
+
+- K10: `.../H100_80GB-OnlyKernel10/*.o48`(stdout), `*.e48`(stderr)
+- K5: `.../H100_80GB-OnlyKernel5/*.o74`(stdout), `*.e74`(stderr)
+
+### K10 — clean exit, zero audit (PASS)
+
+- clean exit(`exit detected`), 소요 6h 33m(23,597s), rate 5 cycle/s
+- `gpu_sim_cycle = 134,817` (이전 133,796 대비 +1,021; bit-identity 요구하지 않음)
+- `[FOLDAUDIT]=0`, `[FOLDSKIP_AUDIT]=0`
+- FOLDSUM aggregate: `parks=11,184 releases=11,184 immediate_folds=4`
+  `total_folds=11,188 skipped=2,573,457 imm_skipped=742 late=0 watchdog=0`
+- `parks == releases` balance 성립. 이전 348개 residual primary poll이 사라졌고
+  immediate path가 정상 동작(`[FOLD] immediate+skip` 이벤트 확인).
+- 판정: K10에서 root cause(immediate-ready 누락)는 해결됨. consumer compute model
+  변경 불필요.
+
+### K5 — `[FOLDAUDIT]` abort 1건 (generation-tracking 결함)
+
+- abort 1건으로 중단. 실행 시작 ~전날 23:00, abort 로그 기록 01:15 → 약 2h15m 소요,
+  `cyc=37,435`에서 중단(K10 134,817 대비 약 1/4 지점).
+- crash 로그의 signal 11 / `F2FP.BF16.F32.PACK_AB undefined instruction` /
+  `get_instruction_regions_to_prewarm` segfault는 우리 `abort()` 호출 이후 다른
+  OpenMP 스레드가 계속 돌다 발생한 후유증 노이즈다. 진짜 원인은 아래 단일
+  `[FOLDAUDIT]` hard abort(Stage 2가 의도대로 동작).
+
+```
+[FOLDAUDIT][SM125] cyc=37435 warp=0 role=producer cta=0 global_cta=125
+  barrier=0x16c60 wait_pc=0xb370 exit_pc=0xb390
+  expected_gen=2 barrier_gen=3     # cur_gen(3) > expected_gen(2), 1 초과
+  prev_flip_gen=2 prev_flip_cyc=30011 current_flip_gen=3 current_flip_cyc=33627
+  action=abort : double-flip
+```
+
+#### 이것은 pacing 결함이 아니라 generation bookkeeping 결함이다
+
+barrier 주소 `0x16c60`은 정적으로 서로 다른 여러 spin region이 공유한다
+(sidecar `barrier_operand_text` 기준):
+
+- `wait_pc=0xb250` region: `[R5+URZ+0x60]`, foldable=True
+- `wait_pc=0xb370` region: `[R5+URZ+0x16860]`, foldable=True (abort한 wait)
+- `wait_pc=0xb190` 등: `[R5+URZ+0x60]`, foldable=False
+
+이들이 런타임에는 모두 barrier 주소 `0x16c60`으로 resolve된다. warp0의 causal chain:
+
+1. cyc 20649: foldable `0xb250` release+skip → `m_fold_last_gen[0][0x16c60]=1` commit
+2. cyc 30075: `immediate-hit warp=0 barrier=0x16c60 parity=1` — gen2 소비. 그러나 이
+   wait는 `foldable=False` region이라 `m_fold_last_gen`을 **갱신하지 않음**
+3. cyc 33681: `immediate-hit warp=0 barrier=0x16c60 parity=0` — gen3 소비. 역시
+   non-foldable이라 미갱신
+4. cyc 37434: foldable `0xb370`이 같은 barrier를 park → `expected_gen`을 stale한
+   `last_gen=1` 기준으로 `2`로 계산. 실제 barrier는 이미 gen3 → false double-flip abort
+
+즉 **여러 wait_pc(일부 non-foldable)가 하나의 barrier 주소를 공유**할 때,
+non-foldable wait가 소비한 generation이 per-(warp,barrier) consumed-gen에 반영되지
+않아 이후 foldable wait의 `expected_gen`이 낮게 계산된다. 이는 §Current State
+Analysis 3과 §Stage 0.10 #2/#4가 예측한 케이스이며, Batch A에서 채택한 Stage 0.10
+Option A(최소 audit)의 알려진 한계다. `[FOLD] immediate+skip` 이벤트가 warp0/0x16c60에
+대해 0건인 것이 그 직접 증거다.
+
+#### Decision gate 판정
+
+- K10: fold ready-path 누락이 원인 → 해결.
+- K5: 남은 abort는 consumer compute pacing이 아니라 **shared-barrier generation
+  tracking 결함**. corrected K5의 `cur_gen > expected_gen` abort지만, 그 event의
+  expected_gen 자체가 stale하므로 pacing root cause로 귀속하지 않는다. 먼저 이
+  gen-tracking을 고친 뒤 재실험해야 한다.
+
+### 다음 단계 (K5 gen-tracking fix, Batch A 연장)
+
+**결정: 옵션 A 채택 (2026-08-14).** commit 예정.
+
+#### 옵션 A (채택) — 모든 wait에서 shared-barrier consumed-gen 갱신
+
+`handle_sync_instruction()`의 immediate `wait_ready` 분기에서, foldable primary가
+아닌 satisfied wait(non-foldable spin, entry TRYWAIT, 기타 PHASECHK/TRYWAIT)도
+per-(warp,barrier) consumed-gen(`m_fold_last_gen[warp][key]`)을 관측한 gen으로
+monotonic하게 갱신한다.
+
+- 근거: 여러 wait_pc가 같은 런타임 barrier 주소로 resolve될 때, 그 barrier의 flip은
+  어느 wait가 관측하든 동일한 generation 소비다. foldable wait만 기록하면 non-foldable
+  wait가 소비한 gen이 누락되어 이후 foldable wait의 expected_gen이 stale해진다.
+- 성질: audit 전용 bookkeeping. issue/timing/replay 동작은 바뀌지 않는다(satisfied
+  wait는 원래도 즉시 통과). `observed_gen > 기존값`일 때만 갱신하므로 같은 gen 반복
+  poll은 idempotent.
+- 범위: PHASECHK/TRYWAIT의 `wait_ready` 경로 안에서만, mbarrier key로만 갱신. named BAR
+  등은 건드리지 않는다.
+
+#### 옵션 B (미채택) — FoldVisitState. 알려진 한계와 해결책
+
+옵션 A는 "이 warp가 이 barrier에서 마지막으로 관측한 gen"만 poll 단위로 유지한다.
+다음 케이스에서는 옵션 A가 부정확할 수 있다.
+
+- **Single-shot visit** (§Stage 0.10 #3): 소스 loop가 1회만 도는 방문에서 entry
+  TRYWAIT가 logical wait를 완료하고 primary PHASECHK가 predicated-off되면, 그 visit의
+  gen 소비 순서/경계가 poll 단위 갱신만으로는 모호해질 수 있다.
+  - K5 `0xacb0` single-shot 285회, K10 `0xb4e0` 1,837회 관측.
+- **Entry/primary 결합 부재**: runtime lookup이 primary_wait_pc만 등록하므로 entry
+  TRYWAIT와 primary PHASECHK가 "같은 논리적 wait"임을 시뮬레이터가 알지 못한다. 두
+  site의 parity/expected가 일치하는지 교차검증할 수 없다.
+- **Uninitialized barrier의 gen=0 모호성** (§Stage 0.10 #4): absent barrier의
+  `sync_barrier_gen()==0`이 parity-1 first wait의 expected_gen=0과 충돌할 수 있다.
+
+해결책 (옵션 B 구현 시):
+
+1. per-warp `FoldVisitState{active, uid, region_id, barrier_key, parity,
+   expected_gen, entry_wait_pc, primary_wait_pc}`를 둔다.
+2. 모든 `wait_pcs`(entry+primary)를 region에 매핑해 runtime lookup에 등록한다.
+3. entry TRYWAIT 진입 시 visit을 열고 expected_gen을 한 번 pin. ready면 즉시
+   audit→skip→gen commit→visit close. not-ready면 primary까지 유지.
+4. primary PHASECHK에서 entry가 pin한 key/parity/expected와 일치하는지 assert.
+5. entry not-ready였는데 primary가 predicated-off/missing인 채 exit하려 하면
+   trace/model predicate mismatch로 hard abort.
+6. `m_fold_last_gen` commit은 logical visit이 정상 fold/exit된 뒤에만. 같은 visit의
+   반복 poll은 새 expected_gen을 만들지 않는다.
+7. barrier object에 `initialized` 플래그를 추가하고 `recompute_ready/flip`을
+   initialized && `expected_arrive_count>0`일 때만 허용해 gen=0 모호성을 제거한다.
+
+옵션 B는 옵션 A가 하는 일을 포함하며 single-shot/entry-primary/uninitialized까지
+엄밀하게 처리한다. 현재 FA3 K5/K10에서는 옵션 A로 abort가 해소되는지 먼저 확인하고,
+다른 워크로드에서 위 케이스가 실제 audit로 재현되면 옵션 B로 승격한다.
