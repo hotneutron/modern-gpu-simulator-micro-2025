@@ -251,8 +251,12 @@ class trace_shd_warp_t : public shd_warp_t {
   void decrement_trace_pc(); // MOD. VPREG
   void decrease_num_used_inst(address_type pc);
   // [Spin-wait fold] Forward analogue of get_next_trace_inst's cursor
-  // bookkeeping. Only validated body/loopback entries may be consumed.
-  FoldSkipStats skip_spin_to_exit(const SpinWaitRegionRecord &region);
+  // bookkeeping: advance both used_insts and each skipped pc's per-occurrence
+  // counter until traced_pcs[used_insts] == exit_pc, WITHOUT issuing the skipped
+  // instructions. Lands the cursor AT exit_pc (so the exit BRA issues normally).
+  // Returns the number of skipped instructions. Only used by the fold path;
+  // see .plan/SPIN_WAIT_SIM_MODELING.md 4b.
+  unsigned int skip_spin_to_exit(address_type exit_pc);
   void clear();
   bool trace_done();
   address_type get_start_trace_pc();

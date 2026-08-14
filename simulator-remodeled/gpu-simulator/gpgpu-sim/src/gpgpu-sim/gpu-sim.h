@@ -919,13 +919,10 @@ class gpgpu_sim : public gpgpu_t {
                                  SyncResolvedSiteMetadata &metadata) const;
 
   // Producer spin-wait sidecar lookup: returns true and fills `region` if the
-  // (trace kernel, funcid, pc) tuple is the primary wait of a detected mbarrier
-  // spin loop. Used by the gated producer spin-wait fold feature.
-  bool lookup_spin_wait_region(uint32_t trace_kernel_id,
-                               unsigned int unique_function_id, address_type pc,
+  // (funcid, pc) is the primary wait of a detected mbarrier spin loop. Used by
+  // the (gated) producer spin-wait fold feature. See .plan/SPIN_WAIT_POSTPROCESS.md.
+  bool lookup_spin_wait_region(unsigned int unique_function_id, address_type pc,
                                SpinWaitRegionRecord &region) const;
-  void validate_spin_wait_sidecar_kernel(uint32_t trace_kernel_id,
-                                         size_t grid_ctas) const;
 
   void record_l1i_prefetch_miss_observation(new_addr_type block_addr,
                                             unsigned int unique_function_id,

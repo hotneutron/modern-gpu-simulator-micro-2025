@@ -217,6 +217,21 @@ residual capture-time polls를 replay한 불완전한 fold 위에서 실행되�
 
 ## Proposed Changes
 
+### User-approved scope status
+
+`SKIPPED` means the item is intentionally excluded from the next implementation
+pass and must not be implemented unless the user explicitly reopens it.
+
+| Item | Status | Scope decision |
+|---|---|---|
+| Stage 0.3 startup/provenance | `MINIMAL ONLY` | Keep schema/version, explicit `foldable`, duplicate, non-empty, fold/observe exclusion, extra-metadata, kernel lookup, and CTA-count checks. Skip body-PC/opcode cross-validation and full/untrimmed provenance enforcement. |
+| Stage 0.4 generic effect detector | `SKIPPED` | Do not replace the detector with a generic effect/liveness framework in this pass. |
+| Stage 0.5 extended lifecycle audit | `PARTIAL ONLY` | Keep CTA-exit pending fold-wait and unassigned TMA-credit checks. Skip additional in-flight/outstanding TMA, per-region balance, cursor-invariant, and BAR-leak assertions. |
+| Stage 0.7 barrier re-init epoch | `SKIPPED` | Current FA3 has one EXCH per barrier; do not add generic epoch identity/reset support in this pass. |
+| Runtime expected/executed reconciliation | `SKIPPED` | Do not add hot-path per-instruction/per-CTA reconciliation counters. Perform reconciliation offline from existing logs. |
+| Full trace or sidecar regeneration | `SKIPPED` | Reuse the existing validated trace and sidecar. Do not regenerate them for this implementation. |
+| Compound wait/timeout/acquire generalization | `SKIPPED` | Do not generalize fold semantics to speculative compound waits, timeout exits, or extra acquire/live-out models without a concrete workload. |
+
 ### Stage 0. Fold 이전의 barrier-timing blocker를 먼저 제거한다
 
 Holistic review 결과 immediate-ready path보다 먼저 고쳐야 하는 두 timing blocker가
@@ -273,7 +288,7 @@ subcore는 다음 cycle까지 기다린다. 최대 1-cycle의 subcore-order bias
 - 같은 cycle의 subcore-issued ARRIVE는 다음 cycle release에 반영된다.
 - `Subcore::modify_warp_state()`의 per-subcore release 호출은 제거한다.
 
-### Stage 0.3. Fold startup/provenance를 fail-fast로 만든다
+### Stage 0.3. Fold startup/provenance를 fail-fast로 만든다 (`MINIMAL ONLY`)
 
 Fold enabled validation run은 다음을 모두 hard-check한다.
 
@@ -283,14 +298,19 @@ Fold enabled validation run은 다음을 모두 hard-check한다.
 - `(trace_kernel_id, unique_function_id, primary_wait_pc)` duplicate 없음
 - `validated_ctas == trace grid CTA count`
 - sidecar body PC/opcode가 현재 enhanced execution info와 일치
+  - `SKIPPED`: 다음 재구현에서는 이 cross-validation을 추가하지 않는다.
 - full/untrimmed trace provenance 확인
+  - `SKIPPED`: 다음 재구현에서는 runtime provenance enforcement를 추가하지 않는다.
 - `spin_wait_fold_enable && spin_wait_observe_enable` 조합 금지
 - validation bootstrap에서 K5 8개, K10 6개 foldable region을 출력하고 현재 trace와 대조
 
 Runtime lookup key에도 `trace_kernel_id`를 포함한다. 동일 function/PC를 재사용하는 여러 kernel
 launch가 마지막 sidecar record로 덮어써지는 것을 막는다.
 
-### Stage 0.4. Detector를 opcode 목록이 아닌 effect contract 기반으로 변경
+### Stage 0.4. Detector를 opcode 목록이 아닌 effect contract 기반으로 변경 (`SKIPPED`)
+
+> 사용자 결정으로 다음 재구현 범위에서 제외한다. 아래 내용은 재검토 시 참고할
+> historical design이며 현재 구현 항목이 아니다.
 
 현재 K5/K10 foldable 14개 body가 `TRYWAIT/NANOSLEEP/PHASECHK`, 선택적 `IMAD.U32`,
 loopback `BRA`만 사용한다는 사실은 regression fixture로 유지하되 generic 허용 목록으로
@@ -334,7 +354,11 @@ Foldable region의 generic proof:
 기존 set-based `barrier_self_tied`는 보조 evidence로만 유지한다. Effect analysis와 runtime
 body-PC/occurrence/effect guard(§1.4)가 최종 authority다.
 
-### Stage 0.5. Lifecycle cleanup을 assert-first로 변경
+### Stage 0.5. Lifecycle cleanup을 assert-first로 변경 (`PARTIAL ONLY`)
+
+다음 재구현에서는 CTA-exit의 pending fold wait와 unassigned TMA credit 검사만 유지한다.
+아래 항목 중 CTA TMA in-flight/outstanding, per-region balance, cursor invariant, BAR leak
+추가 검사는 사용자 결정으로 `SKIPPED`다.
 
 CTA exit/slot reuse 전에 다음을 assert한다.
 
@@ -357,7 +381,11 @@ reset한다.
   budgeted warning이 아니라 unbudgeted fatal이다.
 - predicated-off PHASECHK/EXCH/ARRIVE가 barrier state를 바꾸거나 warp를 park/skip하지 못하게 한다.
 
-### Stage 0.7. Barrier re-init epoch를 명시한다
+### Stage 0.7. Barrier re-init epoch를 명시한다 (`SKIPPED`)
+
+> 사용자 결정으로 다음 재구현 범위에서 제외한다. 현재 FA3의 barrier별 EXCH 1회
+> contract를 사용하며 generic re-init epoch는 구현하지 않는다. 아래 내용은 향후
+> cross-application 확장 참고용이다.
 
 현재 EXCH는 count만 reset하고 `phase/gen/flip history/m_fold_last_gen`을 유지한다. 같은 barrier
 key가 CTA 안에서 두 번 init되면 이전 generation epoch를 상속한다.
@@ -802,7 +830,7 @@ FoldSkipStats:
 - `bar_arrive_exch == 0`
 - `other`는 사전에 검토된 scratch/control opcode만 허용
 
-### Stage 1.5. Semantic-work reconciliation은 실험 후 offline으로 수행한다
+### Stage 1.5. Semantic-work reconciliation은 실험 후 offline으로 수행한다 (`RUNTIME IMPLEMENTATION SKIPPED`)
 
 Simulator hot path에 expected/executed aggregate나 opcode별 committed counter를 추가하지
 않는다. 매 instruction issue 및 CTA trace load에서 추가 집계를 수행하면 12시간 실험 자체를

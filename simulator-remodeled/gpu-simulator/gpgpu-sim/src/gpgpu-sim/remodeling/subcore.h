@@ -122,7 +122,6 @@ class Subcore {
     // sub-cause of NV_IBUFFER_EMPTY:
     STEP0_R_NV_IBUF_FETCH_INFLIGHT  = 1u << 19, // fetch for next PC already in flight in L0I
     STEP0_R_NV_IBUF_FETCH_NOT_ISSUED = 1u << 20, // no fetch issued yet (fetch scheduling behind)
-    STEP0_R_MBARRIER_SPIN      = 1u << 21, // warp parked by spin-wait fold
   };
 
   // [FWD drain-idle 축1] mutually-exclusive "sole block reason" for a subcore this cycle.
@@ -132,7 +131,6 @@ class Subcore {
   enum Step0SoleBlock {
     SB_ISSUED = 0,          // this subcore issued this cycle
     SB_DRAINED,             // no warp had a valid head (all trace-drained) = floor
-    SB_ONLY_MBARRIER_SPIN,  // sole unmet = folded mbarrier spin park
     SB_ONLY_WAIT_BARRIER,   // sole unmet = are_wait_barriers_ready (async mbarrier)
     SB_ONLY_TENSOR,         // sole unmet = tensor FU re-issue lockout
     SB_ONLY_STALL_COUNT,    // sole unmet = fixed-latency dependency (NCU wait)

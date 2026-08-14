@@ -390,22 +390,10 @@ class SM : public core_t, public shader_core_ctx_wrapper {
   void bind_tma_completion_to_sync_barrier(unsigned int warp_id,
                                            const HopperMBarrierKey &key,
                                            uint32_t tx_bytes);
-  std::vector<HopperMBarrierCompletionCredit>
-  assign_tma_completion_credits(unsigned int warp_id, uint64_t transfer_uid,
-                                uint32_t transfer_bytes);
-  void notify_tma_completion(
-      unsigned int warp_id, uint64_t transfer_uid,
-      const std::vector<HopperMBarrierCompletionCredit> &credits);
-  FoldSkipStats skip_fold_cursor_to_exit(
-      unsigned int warp_id, const SpinWaitRegionRecord &region);
+  void notify_tma_completion(unsigned int warp_id, uint32_t completed_tx_bytes);
   void debug_log_sync_event(const std::string &message);
   void debug_log_tma_event(const std::string &message);
   void debug_log_fold_event(const std::string &message);
-  void reset_fold_launch_state(unsigned int launch_uid);
-  void dump_fold_abort_context(unsigned int warp_id,
-                               const HopperMBarrierKey &key,
-                               uint64_t wait_pc, uint64_t expected_gen,
-                               uint64_t parity, const char *reason);
   void debug_dump_sync_counters() const;
 
   InterWarp_Coalescing_Waiting_Dep_Counters *m_interwarp_coal_warps_waiting_dep_counter;
@@ -473,17 +461,6 @@ class SM : public core_t, public shader_core_ctx_wrapper {
   uint64_t m_tma_debug_print_budget = 0;
   // Independent budget for spin-wait fold logs (FOLD); 0 disables.
   uint64_t m_fold_debug_print_budget = 20000000;
-  uint64_t m_sync_log_attempted = 0;
-  uint64_t m_sync_log_emitted = 0;
-  uint64_t m_sync_log_dropped = 0;
-  uint64_t m_tma_log_attempted = 0;
-  uint64_t m_tma_log_emitted = 0;
-  uint64_t m_tma_log_dropped = 0;
-  uint64_t m_fold_log_attempted = 0;
-  uint64_t m_fold_log_emitted = 0;
-  uint64_t m_fold_log_dropped = 0;
-  bool m_fold_scope_initialized = false;
-  unsigned int m_fold_scope_launch_uid = 0;
   uint64_t m_sync_debug_sync_insts = 0;
   uint64_t m_sync_debug_exch = 0;
   uint64_t m_sync_debug_arrive = 0;
@@ -603,7 +580,6 @@ class SM : public core_t, public shader_core_ctx_wrapper {
     unsigned long long stall_next_stage = 0;
     unsigned long long stall_issue_port = 0;
     unsigned long long stall_no_valid = 0;
-    unsigned long long stall_mbarrier_spin = 0;
     unsigned long long stall_wait_barrier = 0;
     unsigned long long stall_stall_count = 0;
     unsigned long long stall_fu_occupied = 0;
@@ -669,24 +645,11 @@ class SM : public core_t, public shader_core_ctx_wrapper {
   // cycles is reported immediately as a deadlock candidate for fold. 0 uses
   // the built-in default in record_spin_wait_observe.
   unsigned long long m_spin_wait_watchdog_threshold = 0;
-  struct FoldParkState {
-    bool active = false;
-    unsigned long long start_cycle = 0;
-  };
-  // Per-warp fold park lifetime. Explicit activity avoids overloading cycle 0
-  // as an inactive sentinel.
-  std::vector<FoldParkState> m_fold_park_state;
-  struct FoldVisitState {
-    bool active = false;
-    uint32_t trace_kernel_id = 0;
-    unsigned int unique_function_id = 0;
-    SpinWaitRegionRecord region;
-    HopperMBarrierKey key;
-    uint64_t parity = 0;
-    uint64_t expected_gen = 0;
-    uint64_t entry_wait_pc = 0;
-  };
-  std::vector<FoldVisitState> m_fold_visit_by_warp;
+  // [Spin-wait fold] Per-warp cycle at which the current fold park began
+  // (0 = not parked). Used by service_fold_release to fire a deadlock
+  // watchdog if a real park exceeds m_spin_wait_watchdog_threshold. Sized at
+  // first use to MAX_WARP_PER_SHADER.
+  std::vector<unsigned long long> m_fold_park_start_cycle;
   // [Spin-wait fold audit] Per-warp, per-barrier last consumed generation
   // (the gen a prior foldable wait of this warp on this barrier resolved to).
   // Sentinel: absent key = "none consumed yet" (first wait may pair with gen 0).
@@ -696,8 +659,7 @@ class SM : public core_t, public shader_core_ctx_wrapper {
   struct FoldPaceStats {
     unsigned long long parks = 0;
     unsigned long long releases = 0;
-    unsigned long long immediate_folds = 0;
-    unsigned long long immediate_skipped_insts = 0;
+    unsigned long long late_releases = 0;
     unsigned long long park_cycles_total = 0;
     unsigned long long park_cycles_max = 0;
     unsigned long long first_park_cycle = 0;
@@ -709,17 +671,17 @@ class SM : public core_t, public shader_core_ctx_wrapper {
   // because multiple logical waits (e.g. 0xb0b0/0xb3d0) may share one barrier.
   using FoldPaceKey = std::pair<HopperMBarrierKey, uint64_t>;
   std::vector<std::map<FoldPaceKey, FoldPaceStats>> m_fold_pace_by_warp;
-  // SM-global fold validation counters. A missed generation aborts before any
-  // release is recorded.
+  // [Spin-wait fold] SM-global validation counters (only move when
+  // -spin_wait_fold_enable). At a clean diagnostic exit,
+  // parks == releases; late_releases is the diagnostic subset whose paired flip
+  // had already passed. Emitted at each CTA exit.
   unsigned long long m_fold_parks_total = 0;
   unsigned long long m_fold_releases_total = 0;
-  unsigned long long m_fold_immediate_total = 0;
   unsigned long long m_fold_skipped_insts_total = 0;
-  unsigned long long m_fold_immediate_skipped_insts_total = 0;
-  FoldSkipStats m_fold_skip_stats_total;
   unsigned long long m_fold_park_cycles_total = 0;
   unsigned long long m_fold_park_cycles_max = 0;
   unsigned long long m_fold_watchdog_hits = 0;
+  unsigned long long m_fold_late_releases_total = 0;
  public:
   // Increment the tensor-op count for the CTA slot that owns hardware warp wid.
   void inc_tensor_ops_for_warp(unsigned wid) {
