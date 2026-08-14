@@ -679,6 +679,13 @@ void load_spin_wait_sidecar(const std::filesystem::path &extra_info_dir,
       record.primary_wait_pc = parse_tma_json_uint(region["primary_wait_pc"]);
       record.loopback_bra_pc = parse_tma_json_uint(region["loopback_bra_pc"]);
       record.exit_pc = parse_tma_json_uint(region["exit_pc"]);
+      // [Stage 1.4] Load the loop body PCs so the runtime cursor-skip guard can
+      // assert it only advances over body_pcs + loopback_bra_pc before exit_pc.
+      if (region.HasMember("body_pcs") && region["body_pcs"].IsArray()) {
+        for (const auto &bp : region["body_pcs"].GetArray()) {
+          record.body_pcs.push_back(parse_tma_json_uint(bp));
+        }
+      }
       if (region.HasMember("primary_wait_kind") &&
           region["primary_wait_kind"].IsString()) {
         record.primary_wait_kind =

@@ -5,6 +5,7 @@
 #include <map>
 #include <string>
 #include <utility>
+#include <vector>
 
 enum class TMAOpcodeFamily {
   UTMALDG,
@@ -240,10 +241,33 @@ struct SpinWaitRegionRecord {
   bool semantic_free_body = false;  // body has no TMA/GMMA/MUFU/arrive/memory op
   bool is_spin_loop = false;        // observed to iterate > 1 (not a single-shot wait)
   bool barrier_self_tied = false;   // whole-loop skip is SASS scoreboard net-zero
+  // [Stage 1.4] Loop body PCs (loopback BRA excluded). The cursor-skip guard
+  // allows advancing over exactly these PCs plus loopback_bra_pc; any other PC
+  // encountered before exit_pc is a sidecar/trace drift and aborts loudly.
+  std::vector<uint64_t> body_pcs;
   // The single authoritative fold gate (sidecar v2): the simulator folds
   // a region ONLY when this is true = is_spin_loop && semantic_free_body &&
   // barrier_self_tied. See .plan/SPIN_WAIT_SIM_MODELING.md 6.6/12.7.
   bool foldable = false;
+};
+
+// [Stage 1.4] Decomposition of the instructions the fold cursor-skip advanced
+// over, classified from each skipped occurrence's opcode/sync class. The fold is
+// only sound when NO semantic/local-memory/HGMMA/MUFU/TMA/BAR work is skipped;
+// those fields MUST be zero (asserted at the skip site).
+struct FoldSkipStats {
+  unsigned int warp_insts = 0;          // total dynamic warp-instruction entries skipped
+  unsigned int phasechk_trywait = 0;    // PHASECHK / TRYWAIT polls
+  unsigned int nanosleep = 0;           // backoff/yield
+  unsigned int imad_scratch = 0;        // loop-local scratch ALU
+  unsigned int loopback_bra = 0;        // the closing backward BRA
+  unsigned int local_memory = 0;        // STL/LDL — must be 0
+  unsigned int semantic_memory = 0;     // global/shared memory refs — must be 0
+  unsigned int hgmma = 0;               // must be 0
+  unsigned int mufu = 0;                // must be 0
+  unsigned int tma_family = 0;          // must be 0
+  unsigned int bar_arrive_exch = 0;     // must be 0
+  unsigned int other = 0;               // vetted scratch/control only
 };
 
 // Keyed by (funcid, primary_wait_pc): the simulator matches a PHASECHK/TRYWAIT at

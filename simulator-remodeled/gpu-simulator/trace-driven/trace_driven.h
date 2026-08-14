@@ -58,6 +58,7 @@
 #include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <set>
 
 #ifndef TRACE_DRIVEN_H
 #define TRACE_DRIVEN_H
@@ -256,7 +257,16 @@ class trace_shd_warp_t : public shd_warp_t {
   // instructions. Lands the cursor AT exit_pc (so the exit BRA issues normally).
   // Returns the number of skipped instructions. Only used by the fold path;
   // see .plan/SPIN_WAIT_SIM_MODELING.md 4b.
-  unsigned int skip_spin_to_exit(address_type exit_pc);
+  //
+  // [Stage 1.4] Semantic guard: allowed_skip_pcs is body_pcs + loopback_bra_pc.
+  // Before advancing over any occurrence the guard asserts (a) the current PC is
+  // in allowed_skip_pcs, (b) the PC has a live trace occurrence, and (c) the
+  // occurrence's opcode/sync class carries no semantic/local-memory/HGMMA/MUFU/
+  // TMA/BAR work. Any violation emits [FOLDSKIP_AUDIT] and aborts. The per-class
+  // breakdown of what was skipped is returned in *out_stats when non-null.
+  unsigned int skip_spin_to_exit(address_type exit_pc,
+                                 const std::set<address_type> &allowed_skip_pcs,
+                                 struct FoldSkipStats *out_stats);
   void clear();
   bool trace_done();
   address_type get_start_trace_pc();

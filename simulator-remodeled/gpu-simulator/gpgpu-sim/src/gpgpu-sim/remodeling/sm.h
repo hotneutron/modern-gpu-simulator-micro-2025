@@ -252,6 +252,18 @@ class SM : public core_t, public shader_core_ctx_wrapper {
   // cursor to the region exit_pc, and clear the pending wait. No-op unless
   // -spin_wait_fold_enable. See design doc 5.1/6.5.1.
   void service_fold_release(unsigned warp_id);
+  // [Stage 1] Common cursor-skip used by BOTH the parked-release and the
+  // immediate-ready fold paths so their skip semantics can never diverge again.
+  // Responsibility is deliberately narrow: flush younger IBuffer entries, build
+  // the allowed-skip PC set (region.body_pcs + loopback_bra_pc), advance the
+  // trace cursor to region.exit_pc via skip_spin_to_exit (which asserts the
+  // post-skip get_pc()==exit_pc and the no-real-work guard), and return the
+  // skipped count + per-class FoldSkipStats. It does NOT touch generation
+  // bookkeeping, pending-wait state, counters, park duration, or histograms;
+  // those stay owned by each caller.
+  unsigned fold_cursor_skip_to_exit(unsigned warp_id,
+                                    const SpinWaitRegionRecord &region,
+                                    FoldSkipStats &out_stats);
   bool check_if_non_released_reduction_barrier(warp_inst_t &inst);
   bool warp_waiting_at_mem_barrier(unsigned warp_id) override;
   // True when `pI` is a UTMACMDFLUSH (cp.async.bulk.wait_group 0) and the
@@ -666,6 +678,11 @@ class SM : public core_t, public shader_core_ctx_wrapper {
     unsigned long long last_end_cycle = 0;
     uint64_t last_expected_gen = 0;
     uint64_t last_barrier_gen = 0;
+    // [Stage 1.1] Immediate-ready folds are NOT parks/releases: the primary poll
+    // was already satisfied at issue, so no warp ever parked. Counted separately
+    // so parks == releases stays a real park-balance invariant.
+    unsigned long long immediate_folds = 0;
+    unsigned long long immediate_skipped_insts = 0;
   };
   // Per-(warp, barrier, wait_pc) pacing decomposition. wait_pc is included
   // because multiple logical waits (e.g. 0xb0b0/0xb3d0) may share one barrier.
@@ -682,6 +699,11 @@ class SM : public core_t, public shader_core_ctx_wrapper {
   unsigned long long m_fold_park_cycles_max = 0;
   unsigned long long m_fold_watchdog_hits = 0;
   unsigned long long m_fold_late_releases_total = 0;
+  // [Stage 1.1] Immediate-ready fold totals (ready-at-issue path, no park).
+  // total_folds = releases + immediate_folds; immediate_skipped_insts is the
+  // subset of skipped_insts contributed by the immediate path.
+  unsigned long long m_fold_immediate_folds_total = 0;
+  unsigned long long m_fold_immediate_skipped_insts_total = 0;
  public:
   // Increment the tensor-op count for the CTA slot that owns hardware warp wid.
   void inc_tensor_ops_for_warp(unsigned wid) {

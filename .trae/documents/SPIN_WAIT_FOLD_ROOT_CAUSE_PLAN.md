@@ -232,6 +232,53 @@ pass and must not be implemented unless the user explicitly reopens it.
 | Full trace or sidecar regeneration | `SKIPPED` | Reuse the existing validated trace and sidecar. Do not regenerate them for this implementation. |
 | Compound wait/timeout/acquire generalization | `SKIPPED` | Do not generalize fold semantics to speculative compound waits, timeout exits, or extra acquire/live-out models without a concrete workload. |
 
+### Implementation batching (사용자 승인)
+
+전체 계획을 두 batch로 나누어 구현한다. Batch A(spin-wait root cause)를 먼저
+구현하고 K5/K10 12시간 실험으로 검증한 뒤 Batch B(TMA/barrier-timing)로 돌아온다.
+이는 상호 의존이 강한 stage를 한 번에 구현하지 않고, root cause 수정 효과를 먼저
+독립 검증하기 위한 결정이다.
+
+#### Batch A — Spin-wait root cause 수정 (먼저 구현 → 12시간 실험)
+
+| Stage | 내용 | 이 batch에서의 수준 |
+|---|---|---|
+| Stage 1 | immediate-ready fold semantic 수정. ready path에서도 `skip_spin_to_exit()`. park/immediate 공통 cursor-skip helper 통합 | FULL |
+| Stage 0.10 | immediate-ready path에 `expected_gen` 계산 + `cur_gen > expected_gen` audit abort 추가 | Option A(최소): 기존 per-(warp,barrier) `m_fold_last_gen` 유지, FoldVisitState는 도입하지 않음 |
+| Stage 1.1 | `immediate_folds`/`immediate_skipped_insts` 신규 통계 분리. `parks/releases`는 실제 park만 | FULL |
+| Stage 1.2 | immediate path diagnostic state를 정확히 한 번만 close, `[FOLD] immediate+skip` 로그 | FULL |
+| Stage 1.4 | `body_pcs` sidecar 로드 + `skip_spin_to_exit()` semantic guard + `FoldSkipStats` | FULL |
+| Stage 2 | `late_fold_release` continuation 제거 → hard abort 복원, watchdog 유지 | FULL |
+
+Batch A에서 제외(이 batch 한정 SKIP, Batch B/실험 후로 이월):
+
+- Stage 1.3 fold-aware metric integrity (HOL/overlap/mufu/producer_tail) — root cause 수정과 독립. 실험 분석 시 필요하면 Batch B.
+- Stage 1.5 runtime reconciliation — 계획상 runtime SKIPPED, 로그 offline 분석.
+- Stage 1.6 abort-time emergency dump — 선택적, 핵심 수정에는 불필요.
+- Stage 0.10 Option B(FoldVisitState).
+
+Batch A 완료 후: 빌드 확인 → 사용자가 K5/K10 12시간 실험 실행 → root-cause decision gate로 판정.
+
+#### Batch B — TMA & barrier-timing (실험 후 복귀)
+
+| Stage | 내용 |
+|---|---|
+| Stage 0.1 | TMA completion UID별 exact credit. 먼저 기존 로그/트레이스로 same-warp UID inversion과 partial-consume 걸침 존재를 검증한 뒤 구현 범위 확정 |
+| Stage 0.2 | fold release를 SM cycle-start 단일 phase로 이동 |
+| Stage 0.3 | fold startup/provenance fail-fast (`MINIMAL ONLY`) |
+| Stage 0.5 | lifecycle cleanup assert (`PARTIAL ONLY`) |
+| Stage 0.6 | mbarrier active-mask / payload fail-fast |
+| Stage 0.8 | watchdog/kernel scope config 분리 |
+| Stage 0.9 | mbarrier-only predicate를 named BAR와 분리 |
+| Stage 1.3 | (Batch A에서 이월된 경우) fold-aware metric integrity |
+
+Batch B 제외(계획상 SKIPPED 유지): Stage 0.4, 0.7, full trace/sidecar regen, runtime reconciliation.
+
+#### Stage 3/4 (최종)
+
+- Stage 3: corrected run 결과로 pacing 원인 재분류(코드 아님, 분석).
+- Stage 4: `.plan/SPIN_WAIT_SIM_MODELING.md` 최종 갱신(모든 구현/검증 완료 후).
+
 ### Stage 0. Fold 이전의 barrier-timing blocker를 먼저 제거한다
 
 Holistic review 결과 immediate-ready path보다 먼저 고쳐야 하는 두 timing blocker가
