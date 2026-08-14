@@ -452,6 +452,13 @@ void Subcore::scan_head_of_line_when_blocked(SM *shared_sm) {
         translate_warp_id_of_sm_to_subcore(sm_warp_id, shared_sm->get_num_subcores());
     warp_inst_t *pI = c_warp->get_IBuffer_remodeled()->next_inst();
     if (pI == nullptr) continue;
+    if (m_config->spin_wait_fold_enable &&
+        shared_sm->warp_parked_on_mbarrier_spin(sm_warp_id)) {
+      shared_sm->m_sm_stats
+          .m_stats_map["total_num_next_stage_notready_mbarrier_spin"]
+          ->increment_with_integer(1);
+      continue;
+    }
     shared_sm->m_sm_stats.m_stats_map["total_num_next_stage_valid_head_warps"]->increment_with_integer(1);
 
     bool use_traditional_scoreboarding =
@@ -727,6 +734,9 @@ void Subcore::issue(SM *shared_sm) {
 
         warp_inst_t *pI = c_warp->get_IBuffer_remodeled()->next_inst();
         assert(pI != nullptr);
+        const bool is_mbarrier_parked =
+            m_config->spin_wait_fold_enable &&
+            shared_sm->warp_parked_on_mbarrier_spin(sm_warp_id);
 
         bool are_traditional_scoreaboards_ready = true;
         bool is_stall_counter_0 = true;
@@ -749,7 +759,8 @@ void Subcore::issue(SM *shared_sm) {
         // NOT not_selected, and re-invoking them would perturb membar/log state (bit-identity).
         // See .plan/NCU_STALL_TAXONOMY_METRICS_IMPL.md Phase 2.
         bool is_not_warp_waiting_in_programmer_barrier =
-            tail_readonly ? true : !c_warp->waiting();
+            (tail_readonly || is_mbarrier_parked) ? true
+                                                  : !c_warp->waiting();
         // UTMACMDFLUSH (cp.async.bulk.wait_group 0) stalls its warp until all of
         // that warp's outstanding store-class TMA transfers drain (warp-local).
         bool is_not_warp_waiting_tma_flush =
@@ -796,7 +807,10 @@ void Subcore::issue(SM *shared_sm) {
         bool are_switch_warp_conditions_ready =
             is_not_yield && is_stall_counter_0 && are_wait_barriers_ready &&
             is_fu_available && is_not_warp_waiting_in_programmer_barrier &&
-            is_not_warp_waiting_ldgdepbar && is_not_warp_waiting_tma_flush && are_traditional_scoreaboards_ready && is_write_available_result_queue_for_fixed_latency_available;
+            is_not_warp_waiting_ldgdepbar && is_not_warp_waiting_tma_flush &&
+            are_traditional_scoreaboards_ready &&
+            is_write_available_result_queue_for_fixed_latency_available &&
+            !is_mbarrier_parked;
 
         bool can_l1c_switch_warp = true;
 
@@ -816,16 +830,22 @@ void Subcore::issue(SM *shared_sm) {
         // cycle nobody issues so tail_readonly stays false and every valid-head warp is counted here;
         // on cycles that DO issue the tally is simply discarded (finalize is gated on still_idle below).
         if (m_config->mufu_lockstep_instrument_enable) {
-          mufu_ls_valid_head++;
-          if (pI->op == SFU_OP)              mufu_ls_head_mufu++;
-          else if (pI->op == TENSOR_CORE_OP) mufu_ls_head_tensor++;
-          else                               mufu_ls_head_other++;
-          // For non-SFU (free-pipe) heads only, record why they could not issue (non-exclusive: a warp
-          // may miss several). Lets us diagnose the NOT-lockstep case in the same run.
-          if (pI->op != SFU_OP) {
-            if (!are_wait_barriers_ready)          mufu_ls_nonsfu_wait_barrier++;
-            if (!is_stall_counter_0)               mufu_ls_nonsfu_stall_count++;
-            if (!are_traditional_scoreaboards_ready) mufu_ls_nonsfu_scoreboard++;
+          if (is_mbarrier_parked) {
+            m_sm->m_sm_stats
+                .m_stats_map["total_num_mufu_lockstep_parked_mbarrier"]
+                ->increment_with_integer(1);
+          } else {
+            mufu_ls_valid_head++;
+            if (pI->op == SFU_OP)              mufu_ls_head_mufu++;
+            else if (pI->op == TENSOR_CORE_OP) mufu_ls_head_tensor++;
+            else                               mufu_ls_head_other++;
+            // For non-SFU (free-pipe) heads only, record why they could not issue.
+            if (pI->op != SFU_OP) {
+              if (!are_wait_barriers_ready) mufu_ls_nonsfu_wait_barrier++;
+              if (!is_stall_counter_0) mufu_ls_nonsfu_stall_count++;
+              if (!are_traditional_scoreaboards_ready)
+                mufu_ls_nonsfu_scoreboard++;
+            }
           }
         }
         // [overlap probe] Probe 1+4: per-warp WARP-CYCLE accounting of why each valid-head warp did NOT
@@ -836,7 +856,11 @@ void Subcore::issue(SM *shared_sm) {
         // is directly comparable to HW smsp__average_warps_issue_stalled_X_per_issue_active (wait 1.363,
         // long/short_scoreboard, etc). This is the definition-matched wait-magnitude audit. Read-only.
         if (m_config->overlap_instrument_enable && !is_inst_ready_to_issue) {
-          if (!are_wait_barriers_ready) {
+          if (is_mbarrier_parked) {
+            m_sm->m_sm_stats
+                .m_stats_map["total_num_warpcyc_stalled_mbarrier_spin"]
+                ->increment_with_integer(1);
+          } else if (!are_wait_barriers_ready) {
             m_sm->m_sm_stats.m_stats_map["total_num_warpcyc_stalled_wait_barrier"]->increment_with_integer(1);
             // [wait_barrier-kind probe] classify WHAT this warp is waiting on: WGMMA-result (recoverable
             // by de-phasing) vs TMA (producer floor) vs other. Recompute the SB check list this warp
@@ -855,11 +879,11 @@ void Subcore::issue(SM *shared_sm) {
               default:            m_sm->m_sm_stats.m_stats_map["total_num_warpcyc_wb_wait_unknown"]->increment_with_integer(1); break;
             }
           }
-          if (!is_stall_counter_0)
+          if (!is_mbarrier_parked && !is_stall_counter_0)
             m_sm->m_sm_stats.m_stats_map["total_num_warpcyc_stalled_stall_count"]->increment_with_integer(1);
-          if (!is_not_yield)
+          if (!is_mbarrier_parked && !is_not_yield)
             m_sm->m_sm_stats.m_stats_map["total_num_warpcyc_stalled_yield"]->increment_with_integer(1);
-          if (!is_fu_available) {
+          if (!is_mbarrier_parked && !is_fu_available) {
             m_sm->m_sm_stats.m_stats_map["total_num_warpcyc_stalled_fu_any"]->increment_with_integer(1);
             switch (pI->op) {
               case TENSOR_CORE_OP:
@@ -870,7 +894,7 @@ void Subcore::issue(SM *shared_sm) {
                 m_sm->m_sm_stats.m_stats_map["total_num_warpcyc_stalled_fu_other"]->increment_with_integer(1); break;
             }
           }
-          if (!are_traditional_scoreaboards_ready)
+          if (!is_mbarrier_parked && !are_traditional_scoreaboards_ready)
             m_sm->m_sm_stats.m_stats_map["total_num_warpcyc_stalled_scoreboard"]->increment_with_integer(1);
           // denominator: total valid-head, non-issuing warp-cycles observed.
           m_sm->m_sm_stats.m_stats_map["total_num_warpcyc_stalled_any"]->increment_with_integer(1);
@@ -896,21 +920,27 @@ void Subcore::issue(SM *shared_sm) {
             bool head_is_tensor = (pI->op == TENSOR_CORE_OP);
             // condition -> (met?, sole-reason-if-this-is-the-only-unmet, rank)
             struct { bool met; Step0SoleBlock reason; int rank; } conds[] = {
-              { are_wait_barriers_ready,
+              { !is_mbarrier_parked,
+                SB_ONLY_MBARRIER_SPIN, 8 },
+              { is_mbarrier_parked || are_wait_barriers_ready,
                 SB_ONLY_WAIT_BARRIER, 7 },
-              { !( !is_fu_available && head_is_tensor ),
+              { is_mbarrier_parked ||
+                    !( !is_fu_available && head_is_tensor ),
                 SB_ONLY_TENSOR, 6 },
-              { is_stall_counter_0,
+              { is_mbarrier_parked || is_stall_counter_0,
                 SB_ONLY_STALL_COUNT, 5 },
-              { !( !is_fu_available && !head_is_tensor ),
+              { is_mbarrier_parked ||
+                    !( !is_fu_available && !head_is_tensor ),
                 SB_ONLY_FU_NONTENSOR, 4 },
-              { is_write_available_result_queue_for_fixed_latency_available,
+              { is_mbarrier_parked ||
+                    is_write_available_result_queue_for_fixed_latency_available,
                 SB_ONLY_NEXT_STAGE, 3 },
-              { is_l1c_ready,
+              { is_mbarrier_parked || is_l1c_ready,
                 SB_ONLY_L1C, 2 },
-              { is_not_yield && is_not_warp_waiting_in_programmer_barrier &&
+              { is_mbarrier_parked ||
+                    (is_not_yield && is_not_warp_waiting_in_programmer_barrier &&
                 is_not_warp_waiting_ldgdepbar && is_not_warp_waiting_tma_flush &&
-                are_traditional_scoreaboards_ready,
+                are_traditional_scoreaboards_ready),
                 SB_ONLY_OTHER, 1 },
             };
             int unmet = 0; Step0SoleBlock sole = SB_MULTI; int sole_rank = 0;
@@ -959,7 +989,10 @@ void Subcore::issue(SM *shared_sm) {
           continue;
         }else {
           if(!are_switch_warp_conditions_ready) {
-            if(!is_fu_available) {
+            if (is_mbarrier_parked) {
+              is_any_waiting_in_mbarrier_spin = true;
+            }
+            if(!is_mbarrier_parked && !is_fu_available) {
               is_any_waiting_in_fu_occupied = true;
               // [WGMMA Opt6 Step-0] (I) classify which pipe the blocked head targets.
               if(m_config->wgmma_step0_instrument_enable) {
@@ -991,30 +1024,25 @@ void Subcore::issue(SM *shared_sm) {
               }
               } // m_config->wgmma_step0_instrument_enable
             }
-            if(!is_not_warp_waiting_in_programmer_barrier || !is_not_warp_waiting_ldgdepbar) {
-              // [Spin-wait fold] Attribute an mbarrier-spin park to its own
-              // bucket instead of the named-barrier bucket. The non-mutating peek
-              // avoids re-triggering the release side effect from this scan.
-              if(m_config->spin_wait_fold_enable && !tail_readonly &&
-                 shared_sm->warp_parked_on_mbarrier_spin(sm_warp_id)) {
-                is_any_waiting_in_mbarrier_spin = true;
-              } else {
-                is_any_waiting_in_inst_barrier = true;
-              }
+            if(!is_mbarrier_parked &&
+               (!is_not_warp_waiting_in_programmer_barrier ||
+                !is_not_warp_waiting_ldgdepbar)) {
+              is_any_waiting_in_inst_barrier = true;
             }
-            if(!is_not_warp_waiting_tma_flush) {
+            if(!is_mbarrier_parked && !is_not_warp_waiting_tma_flush) {
               is_any_waiting_in_tma_flush = true;
             }
-            if(!is_not_yield) {
+            if(!is_mbarrier_parked && !is_not_yield) {
               is_any_waiting_in_yield = true;
             }
-            if(!is_stall_counter_0) {
+            if(!is_mbarrier_parked && !is_stall_counter_0) {
               is_any_waiting_in_stall_count = true;
             }
-            if(!are_wait_barriers_ready) {
+            if(!is_mbarrier_parked && !are_wait_barriers_ready) {
               is_any_waiting_in_wait_barrier = true;
             }
-            if(!are_traditional_scoreaboards_ready) {
+            if(!is_mbarrier_parked &&
+               !are_traditional_scoreaboards_ready) {
               is_any_waiting_in_scoreboard = true;
               // [NCU stall-taxonomy] split NCU `warpgroup_arrive` out of scoreboard stalls: the warp
               // is RAW-blocked on a register that is a pending dst of an in-flight tensor (WGMMA) op.
@@ -1024,13 +1052,14 @@ void Subcore::issue(SM *shared_sm) {
                 is_any_waiting_in_warpgroup_arrive = true;
               }
             }
-            if(!is_write_available_result_queue_for_fixed_latency_available) {
+            if(!is_mbarrier_parked &&
+               !is_write_available_result_queue_for_fixed_latency_available) {
               is_any_waiting_in_result_queue_full = true;
               // [NCU stall-taxonomy] result-queue backpressure at the dispatch/RF-write port maps to
               // NCU `dispatch_stall` (re-derived into the per-warp axis).
               is_any_waiting_in_dispatch = true;
             }
-            if(!is_l1c_ready) {
+            if(!is_mbarrier_parked && !is_l1c_ready) {
               is_any_waiting_l1c = true;
             }
           }else {
@@ -1198,6 +1227,7 @@ void Subcore::issue(SM *shared_sm) {
         if(is_any_invalid_head_l0i_response_ready)  mask |= STEP0_R_NV_L0I_RESP_READY;
         if(is_any_invalid_head_unknown)             mask |= STEP0_R_NV_UNKNOWN;
       } else { // no_warps_ready: overlapping per-reason flags
+        if(is_any_waiting_in_mbarrier_spin)      mask |= STEP0_R_MBARRIER_SPIN;
         if(is_any_waiting_in_fu_occupied)        mask |= STEP0_R_FU_OCCUPIED;
         if(is_any_fu_occupied_tensor)            mask |= STEP0_R_FU_OCCUPIED_TENSOR;
         if(is_any_waiting_in_inst_barrier)       mask |= STEP0_R_INST_BARRIER;
@@ -1220,15 +1250,6 @@ void Subcore::issue(SM *shared_sm) {
 void Subcore::modify_warp_state() {
   for (auto warp : m_warps_of_subcore) {
     warp->get_dependency_state()->cycle();
-    // [Spin-wait fold] Once-per-warp-per-cycle release service, at the top of
-    // issue() (subcore.cc:593) so it runs BEFORE this cycle's decode()/fetch()
-    // re-prime get_pc(). No-op unless -spin_wait_fold_enable. If a foldable
-    // park is now satisfied, this flushes the IBuffer and fast-forwards the trace
-    // cursor to the loop exit. See .plan/SPIN_WAIT_SIM_MODELING.md 6.5.1.
-    if (m_config->spin_wait_fold_enable && warp != NULL &&
-        !warp->done_exit()) {
-      m_sm->service_fold_release(warp->get_warp_id());
-    }
     if(m_config->is_interwarp_coalescing_enabled && ((m_config->interwarp_coalescing_selection_policy == DEP_COUNT_WAIT_OLDEST_INST_IBUFFER_GENERIC) ||
         (m_config->interwarp_coalescing_selection_policy == DEP_COUNT_WAIT_OLDEST_INST_IBUFFER_CHECKING_WARP_ID)))  {
       if (warp == NULL || warp->done_exit()) {

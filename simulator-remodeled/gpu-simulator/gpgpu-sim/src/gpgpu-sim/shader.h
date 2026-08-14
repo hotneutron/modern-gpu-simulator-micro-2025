@@ -2280,6 +2280,7 @@ class shader_core_config : public core_config {
   // flips at all (never-flip = deadlock candidate). Reads mbarrier state only;
   // never blocks or advances the trace. Default 0.
   bool spin_wait_observe_enable;
+  unsigned int spin_wait_observe_watchdog_cycles;
 
   // [Spin-wait fold] When on, a PHASECHK/TRYWAIT matching a foldable
   // spin_wait_sidecar.json region actually PARKS the warp when the modeled
@@ -2290,6 +2291,7 @@ class shader_core_config : public core_config {
   // affected. With this off the simulator is bit-identical to the replay baseline.
   // See .plan/SPIN_WAIT_SIM_MODELING.md. Default 0.
   bool spin_wait_fold_enable;
+  unsigned int spin_wait_fold_watchdog_cycles;
 
   // [Spin-wait fold debug] Emit per-park/release/skip [FOLD] lines
   // (cycle-stamped, budget-limited) to validate the feature. Default 0.

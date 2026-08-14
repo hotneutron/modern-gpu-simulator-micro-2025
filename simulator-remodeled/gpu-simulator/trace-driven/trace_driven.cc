@@ -143,30 +143,103 @@ void trace_shd_warp_t::decrease_num_used_inst(address_type pc){
   used_insts--;
 }
 
-// [Spin-wait collapse] Advance the trace cursor from its current position to the
-// spin-loop exit, mirroring get_next_trace_inst's two increments (per-pc
-// occurrence counter + linear used_insts) for every skipped pc, but WITHOUT
-// building/issuing those instructions. Stop condition is the positive
-// traced_pcs[used_insts] == exit_pc (NOT "left the body pc set"): the loopback
-// BRA is deliberately not in body_pcs, so a body-membership test would halt on
-// the first loopback BRA and land short of the exit. See design doc 4b.
-unsigned int trace_shd_warp_t::skip_spin_to_exit(address_type exit_pc) {
-  unsigned int skipped = 0;
-  while (used_insts < traced_pcs.size() && traced_pcs[used_insts] != exit_pc) {
+FoldSkipStats trace_shd_warp_t::skip_spin_to_exit(
+    const SpinWaitRegionRecord &region) {
+  FoldSkipStats stats;
+  while (used_insts < traced_pcs.size() &&
+         traced_pcs[used_insts] != region.exit_pc) {
     address_type pc = traced_pcs[used_insts];
-    auto it_inst_trace = map_warp_traces.find(pc);
-    if (it_inst_trace != map_warp_traces.end() &&
-        it_inst_trace->second.num_used_instructions[0] <
-            it_inst_trace->second.num_traced_instructions) {
-      it_inst_trace->second.num_used_instructions[0]++;  // mirror get_next_trace_inst
+    const bool allowed =
+        region.body_pcs.count(pc) != 0 || pc == region.loopback_bra_pc;
+    if (!allowed) {
+      fprintf(stderr,
+              "[FOLDSKIP_AUDIT] cursor=%u pc=0x%llx exit=0x%llx "
+              "reason=pc_outside_region\n",
+              used_insts, static_cast<unsigned long long>(pc),
+              static_cast<unsigned long long>(region.exit_pc));
+      fflush(stderr);
+      abort();
     }
+    auto it_inst_trace = map_warp_traces.find(pc);
+    if (it_inst_trace == map_warp_traces.end() ||
+        it_inst_trace->second.num_used_instructions[0] >=
+            it_inst_trace->second.num_traced_instructions) {
+      fprintf(stderr,
+              "[FOLDSKIP_AUDIT] cursor=%u pc=0x%llx "
+              "reason=dynamic_occurrence_missing\n",
+              used_insts, static_cast<unsigned long long>(pc));
+      fflush(stderr);
+      abort();
+    }
+    const unsigned int occurrence =
+        it_inst_trace->second.num_used_instructions[0];
+    const inst_trace_t &trace = it_inst_trace->second.instructions[occurrence];
+    const std::string &opcode = trace.opcode;
+    const auto starts = [&opcode](const char *prefix) {
+      return opcode.rfind(prefix, 0) == 0;
+    };
+    stats.warp_insts++;
+    stats.active_lane_insts +=
+        static_cast<uint64_t>(std::bitset<WARP_SIZE>(trace.mask).count());
+    if (pc == region.loopback_bra_pc) {
+      stats.loopback_bra++;
+    } else if (starts("SYNCS.PHASECHK")) {
+      stats.phasechk_trywait++;
+    } else if (starts("NANOSLEEP")) {
+      stats.nanosleep++;
+    } else if (starts("STL") || starts("LDL")) {
+      stats.local_memory++;
+    } else if (!trace.memadd_info.empty() || starts("LDG") || starts("STG") ||
+               starts("LDS") || starts("STS") || starts("ATOM") ||
+               starts("RED")) {
+      stats.semantic_memory++;
+    } else if (starts("HGMMA") || starts("WGMMA") ||
+               starts("IGMMA") || starts("QGMMA") ||
+               starts("BGMMA") || starts("OGMMA") || starts("MMA")) {
+      stats.hgmma++;
+    } else if (starts("MUFU")) {
+      stats.mufu++;
+    } else if (starts("UTMA") || starts("UBLK")) {
+      stats.tma_family++;
+    } else if (starts("SYNCS.ARRIVE") || starts("SYNCS.EXCH") ||
+               starts("BAR")) {
+      stats.bar_arrive_exch++;
+    } else if (starts("IMAD") || starts("IADD") || starts("LOP3") ||
+               starts("SHF") || starts("MOV") || starts("SEL")) {
+      stats.scratch_alu++;
+    } else {
+      stats.other++;
+    }
+    if (stats.has_unsafe_work()) {
+      fprintf(stderr,
+              "[FOLDSKIP_AUDIT] cursor=%u pc=0x%llx opcode=%s "
+              "local=%llu memory=%llu hgmma=%llu mufu=%llu tma=%llu "
+              "bar=%llu other=%llu reason=unsafe_work\n",
+              used_insts, static_cast<unsigned long long>(pc), opcode.c_str(),
+              static_cast<unsigned long long>(stats.local_memory),
+              static_cast<unsigned long long>(stats.semantic_memory),
+              static_cast<unsigned long long>(stats.hgmma),
+              static_cast<unsigned long long>(stats.mufu),
+              static_cast<unsigned long long>(stats.tma_family),
+              static_cast<unsigned long long>(stats.bar_arrive_exch),
+              static_cast<unsigned long long>(stats.other));
+      fflush(stderr);
+      abort();
+    }
+    it_inst_trace->second.num_used_instructions[0]++;
     used_insts++;
-    ++skipped;
   }
-  // exit_pc must exist ahead of the cursor; the sidecar guarantees a mid-stream
-  // BRA (never terminal). If not found the region was mis-detected -> fail loud.
-  assert(used_insts < traced_pcs.size() && traced_pcs[used_insts] == exit_pc);
-  return skipped;
+  if (used_insts >= traced_pcs.size() ||
+      traced_pcs[used_insts] != region.exit_pc) {
+    fprintf(stderr,
+            "[FOLDSKIP_AUDIT] cursor=%u exit=0x%llx "
+            "reason=trace_ended_before_exit\n",
+            used_insts, static_cast<unsigned long long>(region.exit_pc));
+    fflush(stderr);
+    abort();
+  }
+  stats.landing_pc = traced_pcs[used_insts];
+  return stats;
 }
 
 // MOD. Begin. VPREG. Not totally compatible now.

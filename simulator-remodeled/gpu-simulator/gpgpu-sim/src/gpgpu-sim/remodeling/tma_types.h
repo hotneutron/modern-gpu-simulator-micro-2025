@@ -1,10 +1,13 @@
 #pragma once
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <map>
+#include <set>
 #include <string>
 #include <utility>
+#include <vector>
 
 enum class TMAOpcodeFamily {
   UTMALDG,
@@ -237,6 +240,8 @@ struct SpinWaitRegionRecord {
   uint64_t loopback_bra_pc = 0;   // backward BRA that closes the loop
   uint64_t exit_pc = 0;           // fall-through target when the loop is left
   SyncInstructionKind primary_wait_kind = SyncInstructionKind::NONE;
+  std::set<uint64_t> wait_pcs;      // entry and primary wait sites in this region
+  std::set<uint64_t> body_pcs;      // statically validated loop-body PCs
   bool semantic_free_body = false;  // body has no TMA/GMMA/MUFU/arrive/memory op
   bool is_spin_loop = false;        // observed to iterate > 1 (not a single-shot wait)
   bool barrier_self_tied = false;   // whole-loop skip is SASS scoreboard net-zero
@@ -246,14 +251,53 @@ struct SpinWaitRegionRecord {
   bool foldable = false;
 };
 
-// Keyed by (funcid, primary_wait_pc): the simulator matches a PHASECHK/TRYWAIT at
-// issue time against this to know it is inside a foldable spin loop.
-struct SpinWaitSidecarDB {
-  std::map<SyncOperandLookupKey, SpinWaitRegionRecord> regions_by_wait_pc;
+struct SpinWaitLookupKey {
+  uint32_t trace_kernel_id = 0;
+  unsigned int unique_function_id = 0;
+  uint64_t pc = 0;
 
-  void clear() { regions_by_wait_pc.clear(); }
+  bool operator<(const SpinWaitLookupKey &other) const {
+    return std::tie(trace_kernel_id, unique_function_id, pc) <
+           std::tie(other.trace_kernel_id, other.unique_function_id, other.pc);
+  }
+};
+
+// Keyed by (trace kernel, funcid, wait_pc): every entry/primary wait site maps
+// to the same spin-loop region record.
+struct SpinWaitSidecarDB {
+  std::map<SpinWaitLookupKey, SpinWaitRegionRecord> regions_by_wait_pc;
+  std::map<uint32_t, size_t> validated_ctas_by_kernel;
+  std::map<uint32_t, size_t> foldable_regions_by_kernel;
+
+  void clear() {
+    regions_by_wait_pc.clear();
+    validated_ctas_by_kernel.clear();
+    foldable_regions_by_kernel.clear();
+  }
 
   bool empty() const { return regions_by_wait_pc.empty(); }
+};
+
+struct FoldSkipStats {
+  uint64_t warp_insts = 0;
+  uint64_t active_lane_insts = 0;
+  uint64_t phasechk_trywait = 0;
+  uint64_t nanosleep = 0;
+  uint64_t scratch_alu = 0;
+  uint64_t loopback_bra = 0;
+  uint64_t local_memory = 0;
+  uint64_t semantic_memory = 0;
+  uint64_t hgmma = 0;
+  uint64_t mufu = 0;
+  uint64_t tma_family = 0;
+  uint64_t bar_arrive_exch = 0;
+  uint64_t other = 0;
+  uint64_t landing_pc = 0;
+
+  bool has_unsafe_work() const {
+    return local_memory || semantic_memory || hgmma || mufu || tma_family ||
+           bar_arrive_exch || other;
+  }
 };
 
 
@@ -288,6 +332,9 @@ struct HopperMBarrierObject {
   // exact gen1/gen2 window without replaying the full SYNCDBG stream.
   uint64_t prev_flip_cycle = 0;
   uint64_t last_flip_cycle = 0;
+  std::array<std::pair<uint64_t, uint64_t>, 8> recent_flips = {};
+  uint32_t recent_flip_count = 0;
+  uint32_t recent_flip_next = 0;
 };
 
 struct HopperMBarrierPendingWait {
@@ -307,14 +354,18 @@ struct HopperMBarrierPendingWait {
   // paired with (the flip whose data it consumes). Computed parity-aware at park
   // time from the per-(warp,barrier) consumed-gen progress. The release path
   // audits barrier.gen vs this: ==expected -> release+skip; <expected -> keep
-  // parked; >expected -> report poison (temporary diagnostic build late-releases
-  // and continues folding; production/validation must restore assert).
+  // parked; >expected -> hard abort.
   uint64_t fold_expected_gen = 0;
 };
 
 struct HopperMBarrierPendingTxBinding {
   HopperMBarrierKey key;
   uint32_t pending_tx_bytes = 0;
+};
+
+struct HopperMBarrierCompletionCredit {
+  HopperMBarrierKey key;
+  uint32_t tx_bytes = 0;
 };
 
 struct TMACommand {
@@ -368,6 +419,7 @@ struct TMATransferEntry {
   };
 
   TMACommand cmd;
+  std::vector<HopperMBarrierCompletionCredit> completion_credits;
   State state = State::ISSUED;
   uint32_t requests_issued = 0;
   uint32_t requests_completed = 0;

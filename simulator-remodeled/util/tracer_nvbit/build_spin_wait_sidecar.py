@@ -29,9 +29,8 @@ Design decisions (validated against opt11A K5/K10, see handover analysis):
     ([R7+URZ+0x16800]) and only known at replay time from the instruction's
     captured sync.barrier_addr payload. We record barrier_operand_text for
     cross-checking / debugging only.
-  * semantic_free_body=True means the body has no TMA / *GMMA / MUFU / arrive /
-    global-or-shared memory op, so collapsing the poll count cannot drop work.
-    STL/LDL (thread-local stack spill) are allowed and flagged in body_note.
+  * Foldable bodies contain no TMA / *GMMA / MUFU / arrive / memory operation.
+    STL/LDL are local-memory side effects and therefore fail the fold gate.
 
 Usage
 -----
@@ -71,8 +70,8 @@ SEMANTIC_PREFIXES = (
     "LDGSTS", "STG", "LDG", "STS", "LDS", "ATOM", "ATOMS", "RED",
     "SYNCS.ARRIVE", "SYNCS.EXCH", "BAR",
 )
-# Thread-local stack ops that are warp-local side effects only — safe inside a
-# folded wait region, but recorded so the simulator/reviewer can see them.
+# Thread-local stack ops are still stateful memory operations and cannot be
+# skipped by the runtime cursor.
 LOCAL_MEM_PREFIXES = ("STL", "LDL")
 
 WAIT_KINDS = ("PHASECHK", "TRYWAIT")
@@ -344,15 +343,16 @@ def main():
             st = stats[r["region_id"]]
             r_out = dict(r)
             r_out["dynamic"] = st
-            # The simulator folds a region ONLY if all three gates hold:
-            # it is an actual spin loop, its body has no semantic work, and its
-            # SASS wait-barriers are self-tied (whole-loop skip is scoreboard
-            # net-zero). See .plan/SPIN_WAIT_SIM_MODELING.md 12.7.
+            # Fold only actual spin loops with no semantic or local-memory work
+            # and self-tied SASS wait barriers.
             r_out["foldable"] = bool(
                 st["is_spin_loop"] and r["semantic_free_body"]
+                and not r["local_mem_ops_in_body"]
                 and r["barrier_self_tied"])
             clean.append(r_out)
             if not r["semantic_free_body"]:
+                strict_violation = True
+            if r["local_mem_ops_in_body"]:
                 strict_violation = True
             if st["is_spin_loop"] and not r["barrier_self_tied"]:
                 strict_violation = True
@@ -400,7 +400,8 @@ def main():
         "isize_bytes": ISIZE,
         "note": ("PC-anchored producer/consumer spin-wait regions. The simulator "
                  "folds a region ONLY if foldable=true (is_spin_loop && "
-                 "semantic_free_body && barrier_self_tied): block the warp until "
+                 "semantic_free_body && no local memory && "
+                 "barrier_self_tied): block the warp until "
                  "the modeled mbarrier at the runtime barrier_addr of "
                  "primary_wait_pc is ready, then advance the trace cursor to the "
                  "next exit_pc instead of replaying the recorded poll count. "

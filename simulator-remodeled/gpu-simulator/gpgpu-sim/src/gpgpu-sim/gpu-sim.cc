@@ -650,35 +650,106 @@ void load_sync_operand_resolver(const std::filesystem::path &extra_info_dir,
   }
 }
 
-// Producer spin-wait sidecar: map (funcid, primary_wait_pc) -> region so the
-// simulator can recognize an mbarrier spin loop at issue time. Payload untouched;
-// see build_spin_wait_sidecar.py and .plan/SPIN_WAIT_POSTPROCESS.md.
+// Producer spin-wait sidecar: map (trace kernel, funcid, primary_wait_pc) to a
+// region so the simulator can recognize an mbarrier spin loop at issue time.
+[[noreturn]] void spin_wait_sidecar_fatal(
+    const std::filesystem::path &path, const std::string &reason) {
+  std::cerr << "[SPINWAIT_SIDECAR_AUDIT] path=" << path.string()
+            << " reason=" << reason << std::endl;
+  abort();
+}
+
 void load_spin_wait_sidecar(const std::filesystem::path &extra_info_dir,
-                            SpinWaitSidecarDB &db) {
+                            SpinWaitSidecarDB &db, bool strict_validation) {
+  const std::filesystem::path sidecar_path =
+      extra_info_dir / "spin_wait_sidecar.json";
   rapidjson::Document doc;
-  if (!load_tma_json_document(extra_info_dir / "spin_wait_sidecar.json", doc)) {
+  if (!load_tma_json_document(sidecar_path, doc)) {
+    if (strict_validation) {
+      spin_wait_sidecar_fatal(sidecar_path, "missing_or_unparseable");
+    }
     return;
+  }
+  if (strict_validation &&
+      (!doc.IsObject() || !doc.HasMember("schema") ||
+       !doc["schema"].IsString() ||
+       std::string(doc["schema"].GetString()) != "spin_wait_sidecar" ||
+       !doc.HasMember("version") || !doc["version"].IsUint() ||
+       doc["version"].GetUint() != 2)) {
+    spin_wait_sidecar_fatal(sidecar_path, "schema_or_version_mismatch");
   }
   if (!doc.HasMember("kernels") || !doc["kernels"].IsArray()) {
+    if (strict_validation) {
+      spin_wait_sidecar_fatal(sidecar_path, "kernels_array_missing");
+    }
     return;
   }
+  size_t total_foldable_regions = 0;
   for (const auto &kernel : doc["kernels"].GetArray()) {
-    if (!kernel.IsObject() || !kernel.HasMember("unique_function_id") ||
+    if (!kernel.IsObject() || !kernel.HasMember("kernel_id") ||
+        !kernel.HasMember("unique_function_id") ||
         kernel["unique_function_id"].IsNull() ||
         !kernel.HasMember("spin_regions") || !kernel["spin_regions"].IsArray()) {
+      if (strict_validation) {
+        spin_wait_sidecar_fatal(sidecar_path, "malformed_kernel_record");
+      }
       continue;
     }
+    uint32_t trace_kernel_id =
+        static_cast<uint32_t>(parse_tma_json_uint(kernel["kernel_id"]));
     unsigned int unique_function_id = static_cast<unsigned int>(
         parse_tma_json_uint(kernel["unique_function_id"]));
+    if (strict_validation &&
+        (!kernel.HasMember("validated_ctas") ||
+         !kernel["validated_ctas"].IsUint64())) {
+      spin_wait_sidecar_fatal(sidecar_path,
+                              "validated_ctas_missing_or_invalid");
+    }
+    const size_t validated_ctas =
+        kernel.HasMember("validated_ctas")
+            ? static_cast<size_t>(
+                  parse_tma_json_uint(kernel["validated_ctas"]))
+            : 0;
+    if (!db.validated_ctas_by_kernel
+             .emplace(trace_kernel_id, validated_ctas)
+             .second) {
+      if (strict_validation) {
+        spin_wait_sidecar_fatal(sidecar_path, "duplicate_kernel_id");
+      }
+      db.validated_ctas_by_kernel[trace_kernel_id] = validated_ctas;
+    }
+    size_t foldable_regions = 0;
     for (const auto &region : kernel["spin_regions"].GetArray()) {
       if (!region.IsObject() || !region.HasMember("primary_wait_pc")) {
+        if (strict_validation) {
+          spin_wait_sidecar_fatal(sidecar_path, "malformed_region_record");
+        }
         continue;
+      }
+      if (strict_validation &&
+          (!region.HasMember("foldable") ||
+           !region["foldable"].IsBool())) {
+        spin_wait_sidecar_fatal(sidecar_path,
+                                "explicit_foldable_missing");
       }
       SpinWaitRegionRecord record;
       record.loop_head_pc = parse_tma_json_uint(region["loop_head_pc"]);
       record.primary_wait_pc = parse_tma_json_uint(region["primary_wait_pc"]);
       record.loopback_bra_pc = parse_tma_json_uint(region["loopback_bra_pc"]);
       record.exit_pc = parse_tma_json_uint(region["exit_pc"]);
+      if (region.HasMember("wait_pcs") && region["wait_pcs"].IsArray()) {
+        for (const auto &wait_pc : region["wait_pcs"].GetArray()) {
+          record.wait_pcs.insert(parse_tma_json_uint(wait_pc));
+        }
+      }
+      if (record.wait_pcs.empty()) {
+        record.wait_pcs.insert(record.primary_wait_pc);
+      }
+      if (region.HasMember("body_pcs") && region["body_pcs"].IsArray()) {
+        for (const auto &body_pc : region["body_pcs"].GetArray()) {
+          record.body_pcs.insert(parse_tma_json_uint(body_pc));
+        }
+      }
       if (region.HasMember("primary_wait_kind") &&
           region["primary_wait_kind"].IsString()) {
         record.primary_wait_kind =
@@ -697,17 +768,33 @@ void load_spin_wait_sidecar(const std::filesystem::path &extra_info_dir,
           region["dynamic"]["is_spin_loop"].IsBool()) {
         record.is_spin_loop = region["dynamic"]["is_spin_loop"].GetBool();
       }
-      // Prefer the sidecar's authoritative foldable flag (v2); fall back to
-      // recomputing it from the parts so an older sidecar still gates safely.
       if (region.HasMember("foldable") && region["foldable"].IsBool()) {
         record.foldable = region["foldable"].GetBool();
       } else {
         record.foldable = record.is_spin_loop && record.semantic_free_body &&
                              record.barrier_self_tied;
       }
-      db.regions_by_wait_pc[SyncOperandLookupKey{unique_function_id,
-                                                 record.primary_wait_pc}] = record;
+      if (record.foldable) {
+        foldable_regions++;
+        total_foldable_regions++;
+      }
+      for (uint64_t wait_pc : record.wait_pcs) {
+        const SpinWaitLookupKey lookup_key{
+            trace_kernel_id, unique_function_id, wait_pc};
+        if (!db.regions_by_wait_pc.emplace(lookup_key, record).second) {
+          if (strict_validation) {
+            spin_wait_sidecar_fatal(sidecar_path,
+                                    "duplicate_kernel_function_wait_pc");
+          }
+          db.regions_by_wait_pc[lookup_key] = record;
+        }
+      }
     }
+    db.foldable_regions_by_kernel[trace_kernel_id] = foldable_regions;
+  }
+  if (strict_validation &&
+      (db.regions_by_wait_pc.empty() || total_foldable_regions == 0)) {
+    spin_wait_sidecar_fatal(sidecar_path, "no_foldable_regions_loaded");
   }
 }
 
@@ -718,6 +805,17 @@ void gpgpu_sim::parse_extra_trace_info(std::string filepath, bool is_extra_trace
   m_tma_sidecar_db.clear();
   m_sync_sidecar_db.clear();
   m_spin_wait_sidecar_db.clear();
+  if (m_shader_config->spin_wait_fold_enable &&
+      m_shader_config->spin_wait_observe_enable) {
+    spin_wait_sidecar_fatal(
+        std::filesystem::path(filepath),
+        "fold_and_observe_modes_are_mutually_exclusive");
+  }
+  if (m_shader_config->spin_wait_fold_enable &&
+      !is_extra_trace_enabled) {
+    spin_wait_sidecar_fatal(std::filesystem::path(filepath),
+                            "fold_requires_extra_trace_metadata");
+  }
   if(is_extra_trace_enabled) {
     m_extra_trace_info.DeserializeFromFile(filepath.c_str());
     std::filesystem::path metadata_path(filepath);
@@ -729,7 +827,8 @@ void gpgpu_sim::parse_extra_trace_info(std::string filepath, bool is_extra_trace
     // flow through the operand resolver's linked_config_id -> descriptor_configs join.
     load_tma_operand_resolver(extra_info_dir, m_tma_sidecar_db);
     load_sync_operand_resolver(extra_info_dir, m_sync_sidecar_db);
-    load_spin_wait_sidecar(extra_info_dir, m_spin_wait_sidecar_db);
+    load_spin_wait_sidecar(extra_info_dir, m_spin_wait_sidecar_db,
+                           m_shader_config->spin_wait_fold_enable);
     // BASE-MAP LOAD-FAILURE ASSERT (M4): real-base addressing is on by default. An empty
     // base_records map means tma_pc_base_map.json was missing, unparsable, or had no
     // descriptor sites. We deliberately FAIL here rather than silently falling back to the
@@ -760,11 +859,23 @@ void gpgpu_sim::parse_extra_trace_info(std::string filepath, bool is_extra_trace
                 << m_tma_sidecar_db.base_records.size() << std::endl;
     }
     if (m_shader_config->sync_debug_enable ||
-        m_shader_config->trimchk_percta_log_enable) {
+        m_shader_config->trimchk_percta_log_enable ||
+        m_shader_config->spin_wait_fold_enable) {
       std::cerr << "[SYNC] loaded operand_sites="
                 << m_sync_sidecar_db.site_records.size() << std::endl;
       std::cerr << "[SPINWAIT] loaded spin_wait_regions="
                 << m_spin_wait_sidecar_db.regions_by_wait_pc.size() << std::endl;
+      if (m_shader_config->spin_wait_fold_enable) {
+        for (const auto &entry :
+             m_spin_wait_sidecar_db.foldable_regions_by_kernel) {
+          std::cerr << "[SPINWAIT] trace_kernel=" << entry.first
+                    << " foldable_regions=" << entry.second
+                    << " validated_ctas="
+                    << m_spin_wait_sidecar_db
+                           .validated_ctas_by_kernel[entry.first]
+                    << std::endl;
+        }
+      }
     }
   }
 }
@@ -837,16 +948,50 @@ bool gpgpu_sim::lookup_sync_site_metadata(unsigned int unique_function_id,
   return true;
 }
 
-bool gpgpu_sim::lookup_spin_wait_region(unsigned int unique_function_id,
+bool gpgpu_sim::lookup_spin_wait_region(uint32_t trace_kernel_id,
+                                        unsigned int unique_function_id,
                                         address_type pc,
                                         SpinWaitRegionRecord &region) const {
   auto it = m_spin_wait_sidecar_db.regions_by_wait_pc.find(
-      SyncOperandLookupKey{unique_function_id, static_cast<uint64_t>(pc)});
+      SpinWaitLookupKey{trace_kernel_id, unique_function_id,
+                        static_cast<uint64_t>(pc)});
   if (it == m_spin_wait_sidecar_db.regions_by_wait_pc.end()) {
     return false;
   }
   region = it->second;
   return true;
+}
+
+void gpgpu_sim::validate_spin_wait_sidecar_kernel(
+    uint32_t trace_kernel_id, size_t grid_ctas) const {
+  if (!m_shader_config->spin_wait_fold_enable) {
+    return;
+  }
+  auto foldable_it =
+      m_spin_wait_sidecar_db.foldable_regions_by_kernel.find(
+          trace_kernel_id);
+  if (foldable_it ==
+          m_spin_wait_sidecar_db.foldable_regions_by_kernel.end() ||
+      foldable_it->second == 0) {
+    return;
+  }
+  auto cta_it = m_spin_wait_sidecar_db.validated_ctas_by_kernel.find(
+      trace_kernel_id);
+  if (cta_it == m_spin_wait_sidecar_db.validated_ctas_by_kernel.end() ||
+      cta_it->second != grid_ctas) {
+    fprintf(stderr,
+            "[SPINWAIT_SIDECAR_AUDIT] trace_kernel=%u "
+            "validated_ctas=%llu grid_ctas=%llu reason=cta_count_mismatch\n",
+            trace_kernel_id,
+            static_cast<unsigned long long>(
+                cta_it == m_spin_wait_sidecar_db
+                              .validated_ctas_by_kernel.end()
+                    ? 0
+                    : cta_it->second),
+            static_cast<unsigned long long>(grid_ctas));
+    fflush(stderr);
+    abort();
+  }
 }
 
 void power_config::reg_options(class OptionParser *opp) {
@@ -2101,6 +2246,11 @@ void shader_core_config::reg_options(class OptionParser *opp) {
                          "blocks or advances the trace. Requires spin_wait_sidecar.json. "
                          "(default=0)",
                          "0");
+  option_parser_register(opp, "-spin_wait_observe_watchdog_cycles",
+                         OPT_UINT32,
+                         &spin_wait_observe_watchdog_cycles,
+                         "Observe-mode spin-wait watchdog threshold in cycles.",
+                         "400000");
   option_parser_register(opp, "-spin_wait_fold_enable", OPT_BOOL,
                          &spin_wait_fold_enable,
                          "Producer/consumer spin-wait fold. When on, a PHASECHK/TRYWAIT "
@@ -2112,6 +2262,11 @@ void shader_core_config::reg_options(class OptionParser *opp) {
                          "off = bit-identical replay baseline. Requires spin_wait_sidecar.json. "
                          "(default=0)",
                          "0");
+  option_parser_register(opp, "-spin_wait_fold_watchdog_cycles",
+                         OPT_UINT32,
+                         &spin_wait_fold_watchdog_cycles,
+                         "Fold-mode parked-wait watchdog threshold in cycles.",
+                         "32000");
   option_parser_register(opp, "-spin_wait_fold_debug", OPT_BOOL,
                          &spin_wait_fold_debug,
                          "Emit cycle-stamped, budget-limited [FOLD][park/release/skip/summary] "
@@ -3062,6 +3217,7 @@ void gpgpu_sim::create_gpu_per_sm_stats() {
   // the SAME dependency (lockstep — e.g. all on wait_barrier/scoreboard waiting on the same WGMMA), which
   // would mean the limit is over-serialization / lack of warp-stagger, NOT a plain latch-depth fix.
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_next_stage_notready_wait_barrier", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_next_stage_notready_mbarrier_spin", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_next_stage_notready_scoreboard", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_next_stage_notready_stall_count", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_next_stage_notready_yield", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
@@ -3096,6 +3252,7 @@ void gpgpu_sim::create_gpu_per_sm_stats() {
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_mufu_lockstep_sum_head_tensor", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_mufu_lockstep_sum_head_other", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_mufu_lockstep_sum_valid_head", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_mufu_lockstep_parked_mbarrier", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
   // [MUFU-lockstep probe] of the non-SFU (free-pipe) heads on still_idle cycles, blocking reason (why
   // they could not issue) — diagnoses the NOT-lockstep case in the same run.
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_mufu_lockstep_nonsfu_wait_barrier", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
@@ -3126,6 +3283,7 @@ void gpgpu_sim::create_gpu_per_sm_stats() {
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_overlap_sfu_only", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_overlap_neither", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_warpcyc_stalled_any", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_warpcyc_stalled_mbarrier_spin", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_warpcyc_stalled_wait_barrier", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_warpcyc_stalled_stall_count", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_warpcyc_stalled_yield", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
@@ -3148,6 +3306,7 @@ void gpgpu_sim::create_gpu_per_sm_stats() {
   // independent wait_barrier ceiling (cross-checks partition only_wait_barrier). Observe-only.
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_sm_idle_all_blocked_by_wait_barrier", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_sm_idle_partition_drained", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_sm_idle_partition_only_mbarrier_spin", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_sm_idle_partition_only_wait_barrier", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_sm_idle_partition_only_tensor", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_sm_idle_partition_only_stall_count", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
@@ -3174,6 +3333,7 @@ void gpgpu_sim::create_gpu_per_sm_stats() {
       "total_num_cycles_sm_idle_reason_fu_occupied",
       "total_num_cycles_sm_idle_reason_fu_occupied_tensor",
       "total_num_cycles_sm_idle_reason_inst_barrier",
+      "total_num_cycles_sm_idle_reason_mbarrier_spin",
       "total_num_cycles_sm_idle_reason_wait_barrier",
       "total_num_cycles_sm_idle_reason_tma_flush",
       "total_num_cycles_sm_idle_reason_stall_count",
@@ -3798,8 +3958,15 @@ void gpgpu_sim::gpu_print_stat() {
     printf("[TRIMCHK] spin_nanosleep_issued = %llu\n", trimchk_spin_nanosleep_issued);
     printf("[TRIMCHK] spin_branch_issued = %llu\n", trimchk_spin_branch_issued);
     printf("[TRIMCHK] spin_poll_total(phasechk+nanosleep) = %llu\n", trimchk_spin_total);
-    printf("[TRIMCHK] verdict = %s (full-run spin is O(1e5+); trimmed is O(1e3-1e4))\n",
-           trimchk_spin_total < 50000 ? "LIKELY-TRIMMED" : "LIKELY-FULL-RUN");
+    if (m_shader_config->spin_wait_fold_enable) {
+      printf("[TRIMCHK] verdict = FOLD-RUNTIME "
+             "(issued poll count does not identify input-trace provenance)\n");
+    } else {
+      printf("[TRIMCHK] verdict = %s "
+             "(full-run spin is O(1e5+); trimmed is O(1e3-1e4))\n",
+             trimchk_spin_total < 50000 ? "LIKELY-TRIMMED"
+                                        : "LIKELY-FULL-RUN");
+    }
     // reset for the next kernel so each kernel reports its own spin count
     trimchk_spin_phasechk_issued = 0;
     trimchk_spin_nanosleep_issued = 0;

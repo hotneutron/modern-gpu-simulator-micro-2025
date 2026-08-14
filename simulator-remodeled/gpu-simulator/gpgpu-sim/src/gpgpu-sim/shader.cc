@@ -1371,6 +1371,7 @@ void shader_core_stats::print_remodeling_stats(FILE *fout) {
   fprintf(fout, "total_num_next_stage_blocked_by_sp_int_dp = %llu\n", m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_next_stage_blocked_by_sp_int_dp"]->get_value());
   fprintf(fout, "total_num_next_stage_blocked_by_branch_other = %llu\n", m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_next_stage_blocked_by_branch_other"]->get_value());
   fprintf(fout, "total_num_next_stage_notready_wait_barrier = %llu\n", m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_next_stage_notready_wait_barrier"]->get_value());
+  fprintf(fout, "total_num_next_stage_notready_mbarrier_spin = %llu\n", m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_next_stage_notready_mbarrier_spin"]->get_value());
   fprintf(fout, "total_num_next_stage_notready_scoreboard = %llu\n", m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_next_stage_notready_scoreboard"]->get_value());
   fprintf(fout, "total_num_next_stage_notready_stall_count = %llu\n", m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_next_stage_notready_stall_count"]->get_value());
   fprintf(fout, "total_num_next_stage_notready_yield = %llu\n", m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_next_stage_notready_yield"]->get_value());
@@ -1394,6 +1395,7 @@ void shader_core_stats::print_remodeling_stats(FILE *fout) {
   fprintf(fout, "total_num_mufu_lockstep_sum_head_tensor = %llu\n", m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_mufu_lockstep_sum_head_tensor"]->get_value());
   fprintf(fout, "total_num_mufu_lockstep_sum_head_other = %llu\n", m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_mufu_lockstep_sum_head_other"]->get_value());
   fprintf(fout, "total_num_mufu_lockstep_sum_valid_head = %llu\n", m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_mufu_lockstep_sum_valid_head"]->get_value());
+  fprintf(fout, "total_num_mufu_lockstep_parked_mbarrier = %llu\n", m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_mufu_lockstep_parked_mbarrier"]->get_value());
   fprintf(fout, "total_num_mufu_lockstep_nonsfu_wait_barrier = %llu\n", m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_mufu_lockstep_nonsfu_wait_barrier"]->get_value());
   fprintf(fout, "total_num_mufu_lockstep_nonsfu_stall_count = %llu\n", m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_mufu_lockstep_nonsfu_stall_count"]->get_value());
   fprintf(fout, "total_num_mufu_lockstep_nonsfu_scoreboard = %llu\n", m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_mufu_lockstep_nonsfu_scoreboard"]->get_value());
@@ -1405,6 +1407,7 @@ void shader_core_stats::print_remodeling_stats(FILE *fout) {
   fprintf(fout, "total_num_cycles_overlap_sfu_only = %llu\n", m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_cycles_overlap_sfu_only"]->get_value());
   fprintf(fout, "total_num_cycles_overlap_neither = %llu\n", m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_cycles_overlap_neither"]->get_value());
   fprintf(fout, "total_num_warpcyc_stalled_any = %llu\n", m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_warpcyc_stalled_any"]->get_value());
+  fprintf(fout, "total_num_warpcyc_stalled_mbarrier_spin = %llu\n", m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_warpcyc_stalled_mbarrier_spin"]->get_value());
   fprintf(fout, "total_num_warpcyc_stalled_wait_barrier = %llu\n", m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_warpcyc_stalled_wait_barrier"]->get_value());
   fprintf(fout, "total_num_warpcyc_stalled_stall_count = %llu\n", m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_warpcyc_stalled_stall_count"]->get_value());
   fprintf(fout, "total_num_warpcyc_stalled_yield = %llu\n", m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_warpcyc_stalled_yield"]->get_value());
@@ -1557,6 +1560,7 @@ void shader_core_stats::print_remodeling_stats(FILE *fout) {
       "total_num_tensor_add_extra_cycle_initiation_interval",
       "total_num_cycles_sm_all_subcores_idle",
       "total_num_cycles_sm_idle_all_blocked_by_tensor",
+      "total_num_cycles_sm_idle_partition_only_mbarrier_spin",
       "total_num_cycles_sm_idle_blocked_by_frontend_sbwait",
       "total_num_cycles_sm_idle_reason_next_stage",
       "total_num_cycles_sm_idle_reason_issue_port_busy",
@@ -1572,6 +1576,7 @@ void shader_core_stats::print_remodeling_stats(FILE *fout) {
       "total_num_cycles_sm_idle_reason_fu_occupied",
       "total_num_cycles_sm_idle_reason_fu_occupied_tensor",
       "total_num_cycles_sm_idle_reason_inst_barrier",
+      "total_num_cycles_sm_idle_reason_mbarrier_spin",
       "total_num_cycles_sm_idle_reason_wait_barrier",
       "total_num_cycles_sm_idle_reason_tma_flush",
       "total_num_cycles_sm_idle_reason_stall_count",

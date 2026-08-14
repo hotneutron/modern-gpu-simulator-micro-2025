@@ -637,6 +637,10 @@ void tma_unit_sm::enqueue_issued_commands() {
   entry.state = TMATransferEntry::State::ENQUEUED;
   entry.cycle_enqueued = static_cast<int>(m_sm->get_current_gpu_cycle());
   entry.transfer_uid = m_next_transfer_uid++;
+  if (entry.cmd.transfer_type == TMATransferType::LOAD) {
+    entry.completion_credits = m_sm->assign_tma_completion_credits(
+        entry.cmd.warp_id, entry.transfer_uid, entry.cmd.total_bytes);
+  }
   m_in_flight_transfers.push_back(entry);
   m_command_queue.pop();
 
@@ -1029,7 +1033,8 @@ void tma_unit_sm::mover_on_response(TMATransferEntry &entry, mem_fetch *mf,
     // completion uses the bulk async-group (commit-group / wait-group)
     // mechanism, modeled separately by the UTMACMDFLUSH warp-stall.
     if (entry.cmd.transfer_type == TMATransferType::LOAD) {
-      m_sm->notify_tma_completion(entry.cmd.warp_id, entry.cmd.total_bytes);
+      m_sm->notify_tma_completion(entry.cmd.warp_id, entry.transfer_uid,
+                                  entry.completion_credits);
       // Symmetric with the prefetch branch's "mbarrier_credited=0": make the
       // producer->consumer handshake observable. A real load credits the
       // consumer mbarrier's transaction-count (complete_tx) with total_bytes,
@@ -1038,6 +1043,8 @@ void tma_unit_sm::mover_on_response(TMATransferEntry &entry, mem_fetch *mf,
           "load-mbarrier-credit uid=" + std::to_string(entry.transfer_uid) +
           " warp=" + std::to_string(entry.cmd.warp_id) +
           " bytes=" + std::to_string(entry.cmd.total_bytes) +
+          " credit_ranges=" +
+          std::to_string(entry.completion_credits.size()) +
           " mbarrier_credited=1"
           " cycle=" + std::to_string(current_cycle));
     } else if (entry.cmd.transfer_type == TMATransferType::PREFETCH) {
