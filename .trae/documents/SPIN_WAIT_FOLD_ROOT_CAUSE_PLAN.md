@@ -1236,3 +1236,174 @@ monotonic하게 갱신한다.
 옵션 B는 옵션 A가 하는 일을 포함하며 single-shot/entry-primary/uninitialized까지
 엄밀하게 처리한다. 현재 FA3 K5/K10에서는 옵션 A로 abort가 해소되는지 먼저 확인하고,
 다른 워크로드에서 위 케이스가 실제 audit로 재현되면 옵션 B로 승격한다.
+
+## 옵션 A 재실험 결과 (2026-08-14, K5 .e75/.o75)
+
+옵션 A(commit `0e5d4b9`) 후 K5 재실험. **여전히 abort 1건**이지만, `0x16c60`의
+double-flip(cur_gen > expected)이 아니라 `0x16c20`의 **반대 방향** 위반이다.
+
+```
+[FOLDAUDIT][SM131] cyc=39982 warp=0 path=immediate barrier=0x16c20 wait_pc=0xb0b0
+  expected_gen=3 barrier_gen=1
+  : ready-at-issue with cur_gen < expected_gen — internal invariant violation
+```
+
+### 이건 옵션 A 버그가 아니라 generation-per-wait 모델의 구조적 부정합이다
+
+로그로 확정한 `0x16c20` 사실:
+
+- arrive는 **평생 1회** (cyc36457, warp15 arrive=1/1) → flip은 gen0→1 한 번뿐.
+  이 barrier는 전체 실행에서 **gen1까지만** 도달하며 gen2/gen3에 절대 가지 않는다.
+- producer warp0은 같은 barrier를 parity를 바꿔가며 폴링한다:
+  - cyc 7376: parity=1 → gen0에서 satisfied (phase=0)
+  - cyc 39955/39970: parity=0 → gen1에서 satisfied (phase=1)
+  - cyc 39982 `0xb0b0`: parity=0 → gen1에서 satisfied (phase=1)
+- `last_gen`은 (옵션 A로 올바르게) 1. 다음 parity=0 wait의 expected는 "gen1 이후 첫
+  parity=0 satisfied" = **gen3**. 산술은 정확하다. 그러나 barrier는 영원히 gen1이므로
+  `cur_gen(1) < expected(3)`.
+
+즉 `0x16c20`은 **single-flip, multi-observer producer barrier**다: producer loop의
+여러 wait_pc(모두 정적 `0x16820`→런타임 `0x16c20`으로 aliasing)가 **한 번의 flip 이후
+같은 최종 상태(gen1/phase1)를 반복 관측**한다. generation-per-wait 모델은 "각 satisfied
+wait = 새로운 flip 소비"로 가정하므로, 하나의 flip을 공유 관측하는 이 패턴을
+double/triple-count하여 expected가 실제 flip 수를 앞질러 나간다.
+
+이 결함은 옵션 A로도 옵션 B(FoldVisitState)로도 곧바로 잡히지 않는다. 두 옵션 모두
+"satisfied ⇒ 새 gen 소비" 전제 위에 있기 때문이다. 첫 실험(.e74)은 abort를 꺼서
+(진단 목적) 이 불일치가 있어도 계속 돌았고 다른 지점(`0x16c60`)에서 죽었을 뿐, 이
+SM131 불일치는 그때도 잠재해 있었다.
+
+### K5에서 확정된 abort 두 종류
+
+1. `0x16c60`: `cur_gen > expected` (shared-barrier consumed-gen 누락) — 옵션 A로 해소 대상.
+2. `0x16c20`: `cur_gen < expected` (single-flip multi-observer double-count) — gen 모델
+   전제 자체의 부정합. 별도 설계 필요.
+
+### 해결 방향 후보 (미결정)
+
+- **(1) expected_gen을 flip 수가 아니라 "관측 가능한 phase"로 재정의**: 같은 flip을
+  반복 관측하는 wait는 새 gen을 요구하지 않도록, expected를 "이 parity를 만족시키는
+  현재/직전 flip"으로 계산. per-wait 증가를 제거.
+- **(2) generation audit을 이 barrier class에서 비활성**: single-flip(또는 관측자
+  다수) barrier로 판별되면 gen 비교를 skip하고 `is_sync_wait_satisfied`만으로 fold.
+- **(3) logical visit 경계에서만 gen 증가**: 같은 logical wait의 반복 poll이 gen을
+  올리지 않도록(옵션 B의 visit 개념 확장), 서로 다른 wait_pc라도 같은 flip을 관측하면
+  1회만 소비로 계산.
+
+세 방향 모두 "satisfied ⇒ 새 gen 소비" 전제를 완화한다. 어느 것이 producer/consumer
+양쪽에서 안전한지 추가 분석이 필요하다.
+
+## generation과 원래 deadlock의 관계 재확인 (git 히스토리 기준, 2026-08-14)
+
+"gen을 유지해야 하나 — 원래 deadlock이 gen 때문이었나?"를 git 히스토리로 확정했다.
+
+커밋 순서:
+
+- `423c0a2` sim: implement producer/consumer spin-wait collapse — **gen 없는 최초 fold**.
+  not-ready면 park, ready면 skip. phase(`is_sync_wait_satisfied`)만으로 동작.
+- `51856ab` docs: record first collapse run — **"K5 deadlocked on the first collapse-ON
+  run (K10 passed)."** 즉 **gen 도입 전에 이미 K5 deadlock 존재.**
+- `228f18a` sim: add spin-wait generation audit — deadlock 진단용으로 gen 추가.
+- `f4e92ba` continue folding after poison / `929fd0f` docs: consumer pacing 귀속.
+
+결론:
+
+1. **gen은 deadlock을 만들지도 막지도 않았다.** gen 없는 phase-only 최초 버전에서 이미
+   K5가 deadlock했다. gen은 그 deadlock의 원인을 설명하려고 나중에 붙인 audit이다.
+2. **원래 deadlock의 진짜 root cause = immediate-ready fold 누락**(§4). ready인데
+   fold-exit를 안 하고 residual replay → 그 사이 barrier flip → 다음 loop가 not-ready
+   park → 안 오는 flip을 기다려 hang. `51856ab`가 당시 "producer pacing miss"로 본 것을
+   §4가 "producer는 window에 115cyc 먼저 도착, residual replay가 window를 넘겼다"로 정정.
+3. 따라서 deadlock 방지의 주체는 gen이 아니라 **fold가 제때 exit하는 것**(Stage 1)이다.
+
+### K10 clean exit는 Batch A 증거가 아니다 (정정)
+
+K10은 §5대로 **Batch A 이전에도 clean exit + `[FOLDAUDIT]=0`**이었다(barrier window가 넓어
+residual replay가 다음 flip 전에 끝남). 따라서 corrected K10의 clean exit는 Stage 1이
+무언가를 고쳤다는 증거가 될 수 없다. **유일한 증거는 K5**: 예전 deadlock 지점
+(`0x16c20` park→no-flip hang)을 Batch A 수정 후 통과하는지가 판별자다.
+
+### 현재 `.e75` abort가 예전 deadlock이 아니라는 방증
+
+- `.e75`의 `0x16c20` abort는 `path=immediate`, wait_ready=true이고 warp0은 그 barrier에서
+  **한 번도 park하지 않았다**(park 이벤트 0건). 예전 deadlock은 not-ready **park → hang**
+  이었으므로, 지금은 warp가 ready로 통과한다 = **immediate fold 수정이 예전 park→hang을
+  실제로 제거했다는 방증**이다.
+- 남은 abort는 hang이 아니라 gen audit의 오탐(`cur_gen < expected`, single-flip을 여러
+  wait가 반복 관측)일 뿐이다.
+
+### 로그로 확정: Stage 1이 예전 deadlock을 제거했다 (.e75 전수 확인)
+
+K10 clean exit가 아니라 **K5 `.e75`의 `0x16c20` 지점 전수 스캔**으로 확정한다.
+
+| 항목 | 예전 (deadlock, §4 SM29) | 지금 (.e75) |
+|---|---|---|
+| `0x16c20` producer **park** 이벤트 | residual replay 후 park → hang | **0건** (전 SM) |
+| `0x16c20` release+skip | park이 안 풀려 hang | 0건 (park 자체가 없음) |
+| `0x16c20` 통과 방식 | park → no-flip → watchdog abort(cyc 87,962) | **immediate-hit(ready)으로 통과** |
+| `0x16c20` immediate-hit 발생 SM | — | **132개 SM 전부** |
+
+예전 deadlock의 본질은 "`0x16c20`에서 producer가 **park**한 뒤 오지 않는 flip을 기다려
+hang"이었다. `.e75`에는 `0x16c20` park 이벤트가 **단 1건도 없다**(전체 park 2553건은 모두
+다른 barrier). producer는 park 없이 immediate-hit(ready)으로 통과한다. 즉 Stage 1의
+immediate fold 수정이 예전 park→hang(진짜 deadlock)을 제거했다는 **직접 증거**다.
+
+지금 abort는 그 통과 도중 immediate path의 gen audit이 오탐(`cur_gen<expected`)한 것이며,
+skip 실행 전에 abort하므로 `immediate+skip` 이벤트가 남지 않는다(전체 0건). deadlock이
+아니라 audit 계산 결함이다.
+
+### 함의: gen audit 완화의 정당성
+
+gen은 deadlock 방지에 불필요하고(방지는 phase 기반 release + Stage 1 fold-exit가 담당),
+현재는 오탐으로 오히려 "Batch A가 진짜 deadlock을 고쳤는지"의 검증을 막고 있다. 따라서
+gen audit의 `cur_gen < expected` 오탐을 제거해야 K5를 끝까지 돌려 예전 deadlock 지점
+통과를 확인할 수 있다. gen의 유일한 잔존 가치인 `cur_gen > expected`(진짜 double-flip
+= 실제 정확성 결함) 감지는 유지한다.
+
+## 확정된 gen audit 규칙 (immediate/park 통일) + S4 로그 점검
+
+### 규칙 (immediate와 park를 동일하게 취급)
+
+wait가 barrier를 처음 관측하는 순간 한 번만 expected를 계산하고 이후 고정한다.
+`gen`은 flip이 일어날 때만 +1 되며 expected와 독립이다.
+
+```
+wait 도착(첫 관측) 시:
+  ready (phase != parity)     -> expected = 현재 gen        (이미 일어난 이 flip을 관측)
+  not-ready (phase == parity) -> expected = 현재 gen + 1    (아직 안 온 다음 flip을 기다림)
+gen += 1  (flip 발생 시에만)
+audit: 만족 시점에 gen == expected 면 정상, gen > expected 면 double-flip(abort)
+```
+
+- immediate/park를 분기하지 않는다. "도착 시 ready면 +0, not-ready면 +1"이 유일한 차이이며
+  이는 자연스럽게 통일된다.
+- `last_consumed + 1`로 매번 강제하던 기존 방식을 폐기한다. 그것이 같은 flip을 여러 wait가
+  반복 관측할 때 expected를 앞질러 올려 `0x16c20` 오탐(`cur_gen < expected`)을 만들었다.
+- 이 규칙에서 immediate는 정의상 `expected == 현재 gen`이라 절대 오탐 abort하지 않는다.
+  `0x16c20`과 `0x16c60` 오탐이 모두 사라진다.
+
+### S4 위험(놓친 flip 미검출) 로그 점검 결과 — K5/K10
+
+immediate가 항상 `expected=현재gen`이면, producer가 자기 flip을 놓친 채 도착 순간
+이미 ready인 경우(S4)를 감지하지 못할 이론적 사각지대가 있다. 이를 K5 `.e75`, K10 `.e48`
+로그로 점검했다.
+
+- immediate-hit 로그에는 `wait_pc`가 없어 같은 barrier를 공유하는 서로 다른 논리 wait를
+  구분할 수 없다. 따라서 "warp별·barrier별 관측 gen 점프"는 진짜 놓침과, 다른 wait_pc의
+  정상 관측을 구분하지 못한다(과다 계수).
+- naive gen 점프(≥2): K5 306, K10 364. parity-aware 같은-parity 슬롯 건너뜀(≥4): K5 59,
+  K10 323. 그러나 이 수치는 위 착시로 인해 상한(over-count)이다.
+- **결정적 방증**: K10은 이 점프들이 모두 존재하는데도 **원래의 엄격한 gen audit
+  (`last_consumed + 1`)에서 `[FOLDAUDIT]=0`으로 clean exit**했다. 만약 이 점프들이 진짜
+  놓친 flip이었다면 원래 audit이 `cur_gen > expected`로 abort했어야 한다. abort가 없었으므로
+  이들은 실제 결함이 아니라 서로 다른 wait_pc가 같은 barrier를 공유하며 각자 정상 관측한
+  패턴이다.
+
+### 결론: 사용자 규칙으로 진행 안전
+
+- **하드 위험(false abort / deadlock) = 0**: immediate는 정의상 오탐하지 않고, `0x16c20`/
+  `0x16c60` 오탐이 사라진다.
+- **소프트 위험(S4 미검출)**: 이론적으로만 존재. K5/K10에서 진짜 놓침으로 확인된 사례가 없고
+  (K10 엄격 audit이 clean), 설령 발생해도 abort가 아니라 조용한 미검출이라 실행을 막지 않는다.
+- deadlock 방지(원래 목표: phase release + Stage 1 fold-exit)와 오탐 제거를 모두 달성한다.
+- 임시 분석 스크립트(check_s4.py/check_s4b.py)는 점검 후 삭제했다.

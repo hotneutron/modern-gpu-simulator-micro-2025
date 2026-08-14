@@ -2450,13 +2450,11 @@ void SM::service_fold_release(unsigned warp_id) {
   const unsigned skipped =
       fold_cursor_skip_to_exit(warp_id, region, skip_stats);
 
-  // [Gen audit] Record the generation this wait consumed so the NEXT wait of this
-  // warp on this barrier computes its expected_gen strictly after it.
-  if (m_fold_last_gen.size() <= warp_id) {
-    m_fold_last_gen.resize(MAX_WARP_PER_SHADER);
-  }
-  m_fold_last_gen[warp_id][pending_wait.key] = exp_gen;
-
+  // [gen audit v3] expected_gen is pinned at park time from the live barrier gen
+  // (cur_gen+1). It is no longer derived from a per-(warp,barrier) consumed
+  // history, so there is nothing to commit back here — gen advances only on real
+  // flips and each wait re-pins from the current gen at its own park. Release is
+  // reached only when cur_gen == exp_gen (see the checks above).
   m_sync_debug_wait_released++;
   // SM-global validation counters + actual park duration (compared against the
   // observe run's would-be park to confirm the model matches expectation).
@@ -2644,28 +2642,26 @@ uint64_t SM::sync_barrier_gen(const HopperMBarrierKey &key) const {
 uint64_t SM::fold_expected_gen_for_wait(unsigned int warp_id,
                                             const HopperMBarrierKey &key,
                                             uint64_t wait_state_raw) const {
-  // Parity the wait is polling on (bit 31 of wait_state_raw). A foldable wait
-  // is satisfied when barrier.phase != parity; since phase == gen&1, that means
-  // the smallest gen with (gen & 1) != parity. Constrain to strictly after the
-  // last generation this (warp,barrier) already consumed so successive waits map
-  // to successive flips. See .plan/SPIN_WAIT_SIM_MODELING.md 13.4.
+  // [gen audit v3] Pin the generation this wait pairs with from the CURRENT
+  // barrier state at first observation — NOT from a per-(warp,barrier) consumed
+  // history. gen advances only on a real flip and is independent of expected.
+  //
+  //   parity = waited-on phase bit.  phase == (gen & 1).
+  //   ready now (phase != parity)     -> expected = cur_gen       (this flip)
+  //   not-ready (phase == parity)     -> expected = cur_gen + 1   (next flip)
+  //
+  // Rationale: the old "last_consumed + 1" forced every satisfied wait onto a
+  // strictly newer gen, which double-counted a single flip observed by several
+  // waits sharing one runtime barrier address (K5 0x16c20 false cur_gen<expected)
+  // and could over/under-count on shared barriers (K5 0x16c60). Anchoring to the
+  // live barrier gen makes immediate and parked waits use one identical rule and
+  // removes both false-audit directions while still catching a genuine
+  // double-flip: a parked wait pins expected=cur_gen+1 and, if the barrier
+  // over-flips past it, release sees cur_gen > expected and aborts.
+  (void)warp_id;
   const unsigned parity = decode_sync_wait_phase(wait_state_raw);
-  // Lower bound: none consumed yet -> gen 0 is allowed; else last+1.
-  uint64_t lb = 0;
-  bool have_prev = false;
-  if (warp_id < m_fold_last_gen.size()) {
-    auto it = m_fold_last_gen[warp_id].find(key);
-    if (it != m_fold_last_gen[warp_id].end()) {
-      lb = it->second + 1;
-      have_prev = true;
-    }
-  }
-  (void)have_prev;
-  // Advance lb to the first gen whose parity flips the waited-on phase.
-  if ((lb & 1ULL) == (uint64_t)parity) {
-    lb++;
-  }
-  return lb;
+  const uint64_t cur_gen = sync_barrier_gen(key);
+  return cur_gen + (((cur_gen & 1ULL) == (uint64_t)parity) ? 1ULL : 0ULL);
 }
 
 void SM::handle_sync_instruction(warp_inst_t &inst, unsigned int warp_id) {
@@ -2727,60 +2723,29 @@ void SM::handle_sync_instruction(warp_inst_t &inst, unsigned int warp_id) {
         // can false-park/deadlock on the following generation (K5 SM29). Only the
         // primary_wait_pc of a foldable region takes this path. See plan Stage 1.
         //
-        // [Stage 0.10-A] Also compute the parity-aware expected_gen and audit it
-        // here (previously the immediate hit blindly stamped last_gen=current_gen
-        // and could launder an already-missed edge):
-        //   cur_gen == expected_gen  -> normal consume
-        //   cur_gen >  expected_gen  -> missed edge, hard [FOLDAUDIT] abort
-        //   cur_gen <  expected_gen  -> impossible when wait_ready (invariant)
+        // [gen audit v3] The wait is ready-at-issue, so by the pinned rule
+        // (fold_expected_gen_for_wait) expected_gen == cur_gen by construction:
+        // an immediate hit observes the live flip it pairs with. There is no
+        // cur_gen<expected double-count anymore, and no m_fold_last_gen history
+        // to advance. A cur_gen>expected "missed edge" cannot occur on the
+        // immediate path (that only arises for a PARKED wait whose pinned edge
+        // is later over-flipped); genuine double-flips are caught in
+        // service_fold_release. So the immediate path just folds.
         if (m_config->spin_wait_fold_enable) {
           SpinWaitRegionRecord region;
-          const bool is_foldable_primary =
-              m_gpu->lookup_spin_wait_region(inst.unique_function_id, inst.pc,
+          if (m_gpu->lookup_spin_wait_region(inst.unique_function_id, inst.pc,
                                              region) &&
-              region.foldable;
-          if (m_fold_last_gen.size() <= warp_id) {
-            m_fold_last_gen.resize(MAX_WARP_PER_SHADER);
-          }
-          if (is_foldable_primary) {
+              region.foldable) {
             // Fold path must not silently tolerate sidecar/runtime drift.
             assert(region.primary_wait_pc == inst.pc);
             assert(region.primary_wait_kind == inst.sync_kind);
             const uint64_t expected_gen = fold_expected_gen_for_wait(
                 warp_id, key, inst.sync_semantic_raw);
             const uint64_t cur_gen = sync_barrier_gen(key);
-            if (cur_gen != expected_gen) {
-              std::cerr << "[FOLDAUDIT][SM" << m_sm_id << "] cyc="
-                        << get_current_gpu_cycle() << " warp=" << warp_id
-                        << " path=immediate"
-                        << " role="
-                        << (m_warp_is_producer[warp_id]
-                                ? "producer"
-                                : (m_warp_is_consumer[warp_id] ? "consumer"
-                                                               : "unknown"))
-                        << " cta=" << key.cta_id << " global_cta="
-                        << m_local_to_global_cta_id[key.cta_id]
-                        << " barrier=0x" << format_hex_u64(key.barrier_addr)
-                        << " wait_pc=0x" << format_hex_u64(inst.pc)
-                        << " exit_pc=0x" << format_hex_u64(region.exit_pc)
-                        << " expected_gen=" << expected_gen
-                        << " barrier_gen=" << cur_gen
-                        << (cur_gen > expected_gen
-                                ? " : ready-at-issue but the paired flip already"
-                                  " passed (missed edge) — accuracy defect,"
-                                  " aborting."
-                                : " : ready-at-issue with cur_gen < expected_gen"
-                                  " — internal invariant violation, aborting.")
-                        << std::endl;
-              m_fold_watchdog_hits++;
-              abort();
-            }
             // Collapse residual occurrences via the shared cursor-skip helper.
             FoldSkipStats skip_stats;
             const unsigned skipped =
                 fold_cursor_skip_to_exit(warp_id, region, skip_stats);
-            // Commit the consumed generation only AFTER the skip succeeds.
-            m_fold_last_gen[warp_id][key] = expected_gen;
             // [Stage 1.1] Immediate fold accounting — NOT a park/release.
             m_fold_immediate_folds_total++;
             m_fold_immediate_skipped_insts_total += skipped;
@@ -2811,24 +2776,6 @@ void SM::handle_sync_instruction(warp_inst_t &inst, unsigned int warp_id) {
                   std::to_string(cur_gen) + " skipped=" +
                   std::to_string(skipped) + " landing_pc=0x" +
                   format_hex_u64(tw->get_pc()));
-            }
-          } else {
-            // [Stage 0.10-A] Shared-barrier generation tracking. A satisfied
-            // wait that is NOT the primary of a foldable region (a non-foldable
-            // spin, an entry TRYWAIT, or any other PHASECHK/TRYWAIT) still
-            // observes and thus CONSUMES a barrier flip. Multiple wait_pcs can
-            // resolve to the SAME runtime barrier address, so if only foldable
-            // waits advanced the per-(warp,barrier) consumed-gen, a later
-            // foldable wait on that barrier would compute a stale (too-low)
-            // expected_gen and the release/immediate audit would fire a false
-            // double-flip (observed as the K5 SM125 0x16c60 abort). Advance the
-            // consumed-gen monotonically to the gen this parity just observed.
-            // This is audit-only bookkeeping; it never changes issue/timing.
-            const uint64_t observed_gen = sync_barrier_gen(key);
-            auto it = m_fold_last_gen[warp_id].find(key);
-            if (it == m_fold_last_gen[warp_id].end() ||
-                observed_gen > it->second) {
-              m_fold_last_gen[warp_id][key] = observed_gen;
             }
           }
         }
@@ -2864,7 +2811,8 @@ void SM::handle_sync_instruction(warp_inst_t &inst, unsigned int warp_id) {
         debug_log_sync_event(
             "wait immediate-hit warp=" + std::to_string(warp_id) + " cta=" +
             std::to_string(key.cta_id) + " barrier=0x" +
-            format_hex_u64(key.barrier_addr) + " wait_state=" +
+            format_hex_u64(key.barrier_addr) + " wait_pc=0x" +
+            format_hex_u64(inst.pc) + " wait_state=" +
             std::to_string(inst.sync_semantic_raw) + hit_phase_state);
         m_pending_sync_waits[warp_id] = HopperMBarrierPendingWait();
       } else {
@@ -2906,13 +2854,12 @@ void SM::handle_sync_instruction(warp_inst_t &inst, unsigned int warp_id) {
             parked.fold_wait_pc = inst.pc;
             parked.fold_exit_pc = region.exit_pc;
             parked.fold_uid = inst.unique_function_id;
-            // [Gen audit] Pin the absolute generation this wait pairs with, from
-            // the per-(warp,barrier) consumed-gen progress. Computed once when the
-            // warp first parks here; a re-poll of an already-parked warp keeps the
-            // existing pending wait (and its expected_gen) untouched.
-            if (m_fold_last_gen.size() <= warp_id) {
-              m_fold_last_gen.resize(MAX_WARP_PER_SHADER);
-            }
+            // [gen audit v3] Pin the generation this wait pairs with from the
+            // LIVE barrier gen at park time: not-ready here means phase==parity,
+            // so fold_expected_gen_for_wait returns cur_gen+1 (the next flip).
+            // Computed once on the first poll that parks; a re-poll of an
+            // already-parked warp keeps the existing pending wait untouched. No
+            // per-(warp,barrier) history is read or written.
             parked.fold_expected_gen = fold_expected_gen_for_wait(
                 warp_id, key, inst.sync_semantic_raw);
             m_pending_sync_waits[warp_id] = parked;
