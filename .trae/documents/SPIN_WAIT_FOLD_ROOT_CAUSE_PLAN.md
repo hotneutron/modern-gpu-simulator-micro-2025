@@ -1407,3 +1407,57 @@ immediate가 항상 `expected=현재gen`이면, producer가 자기 flip을 놓�
   (K10 엄격 audit이 clean), 설령 발생해도 abort가 아니라 조용한 미검출이라 실행을 막지 않는다.
 - deadlock 방지(원래 목표: phase release + Stage 1 fold-exit)와 오탐 제거를 모두 달성한다.
 - 임시 분석 스크립트(check_s4.py/check_s4b.py)는 점검 후 삭제했다.
+
+## 후속 관측 — `.e76`/`.o76` K5 런 (2026-08-14): gen 오탐은 사라졌으나 진짜 park deadlock은 잔존
+
+gen-audit 규칙 변경(immediate/park 통일, `last_consumed+1` 폐기) 이후 커밋된
+빌드(`f225fa4` "anchor fold expected_gen to live barrier gen")로 K5 fwd 를 다시 돌린
+`.e76`/`.o76` 결과다. 실행 파일:
+`sim_run_12.8/.../H100_80GB-OnlyKernel5/...-63a73d452237.e76`.
+
+### 결과 요약
+
+- **FOLDAUDIT 총 1건**, 종류는 `late_fold_release`가 **아니라 watchdog abort 하나**뿐이다.
+  즉 이전 K5 `.e72`의 231건 `late_fold_release` + gen 오탐(`cur_gen<expected`)은 **모두
+  사라졌다** → 규칙 변경의 오탐 제거 목표는 실제로 달성됐다.
+- 그러나 **`0x16c20` / `wait_pc=0xb0b0` 의 진짜 park deadlock은 그대로 남아** SIGABRT(signal 6)
+  로 죽었다. 이어진 signal 11은 abort 이후 teardown에서 뒤따른 것.
+
+```
+[FOLDAUDIT][SM62] cyc=86170 warp=0 role=producer cta=0 global_cta=62
+  barrier=0x16c20 wait_pc=0xb0b0 exit_pc=0xb0d0
+  expected_gen=3 barrier_gen=2 prev_flip_cyc=45770 current_flip_cyc=53815
+  parked_cyc=32001 threshold=32000
+  : paired consumer flip never arrived within the watchdog window
+    — model gap (never force-release).
+```
+
+### SM62 barrier `0x16c20` timeline (self-deadlock 확정)
+
+```
+cyc=45770  arrive warp=15 pc=0x8240 -> phase flip gen 0->1   (producer 자신이 flip)
+cyc=53815  arrive warp=15 pc=0x8240 -> phase flip gen 1->2   (producer 자신이 flip)
+cyc=54169  [FOLD] park warp=0 wait_pc=0xb0b0 expected_gen=3 barrier_gen=2
+           (이후 flip 없음 -> gen 2에서 정지)
+cyc=86170  watchdog abort (parked_cyc=32001 > threshold 32000)
+```
+
+- `0x16c20`은 producer **자신의 arrive**(`pc=0x8240`)로만 flip된다 (총 2 flip). gen=3을 만들려면
+  producer가 세 번째 arrive를 해야 하는데, 그 전에 같은 producer가 `0xb0b0`에서 gen=3을
+  기다리며 park된다 → **자기 자신을 막는 self-deadlock**. force-release 금지 정책에 의해 abort.
+- 이는 progress 문서 Opt-12의 "K5 deadlock 근본원인(`0x16c20`, `0xb0b0`↔gen, gen1→gen2 window,
+  21/132 poison CTA)"과 **동일한 결함**이다. gen-anchor 커밋은 audit 오탐만 제거했을 뿐
+  **park 진입 조건 자체(fold가 producer를 자기 flip 전에 park시킴)는 고치지 못했다.**
+
+### 함의
+
+1. **규칙 변경은 성공적이나 불충분**: 오탐(`cur_gen<expected`) 및 `late_fold_release`는 0으로
+   내려갔다. 남은 유일한 이벤트가 진짜 deadlock이라는 점에서, 이제 이 abort는 **audit 계산
+   결함이 아니라 fold semantic의 실제 결함**으로 확정된다 (Summary의 "그 결과로도 남는
+   `[FOLDAUDIT]`만 유효한 증거로 취급한다"는 기준 충족).
+2. **다음 root cause = park 진입 시점**: producer가 자기가 flip시켜야 할 barrier(`0x16c20`)의
+   *다음* generation을 기다리며 fold-park 하는 것이 문제. `0x16c20`처럼 **wait 주체와 flip
+   주체가 같은(self-tied, producer-only-arrive) barrier**는 `foldable` 게이트에서 제외하거나,
+   park 대신 fold-exit(residual skip)로 즉시 통과시켜야 한다.
+3. **이전 assert cycle 통과 여부**: park 시작 `cyc=54169`, abort `cyc=86170`. progress 문서의
+   과거 K5 deadlock(@85,333)과 사실상 동일 지점 — **통과하지 못했다.**
