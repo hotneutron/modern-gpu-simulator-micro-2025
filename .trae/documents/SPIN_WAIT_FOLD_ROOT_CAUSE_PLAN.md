@@ -2,33 +2,44 @@
 
 ## Summary
 
-Section 15의 K5 `.e72/.o72` 결과는 `consumer compute pacing`을 고치기 전에
-**fold의 immediate-ready 경로를 먼저 바로잡아야 한다**는 것을 보여준다.
-K10도 같은 결함을 실행했지만, residual replay가 다음 barrier flip 전에 끝나
-deadlock이나 `[FOLDAUDIT]`로 확대되지 않았을 뿐이다.
+Batch A fixed the confirmed immediate-ready defect: a ready foldable primary wait
+now skips the residual captured loop instead of replaying it across a later barrier
+flip. The live-generation audit also removed the false `cur_gen < expected_gen`
+and stale shared-barrier bookkeeping failures.
 
-Holistic review에서 더 선행하는 blocker도 확인됐다. TMA load completion이 exact transfer
-identity 없이 warp별 barrier FIFO를 credit하므로 out-of-order completion이 잘못된 barrier를
-flip한다. 따라서 기존 K5/K10 barrier timeline은 immediate-ready bug뿐 아니라 TMA credit
-misbinding에도 오염되어 있다. Stage 0.1/0.2를 먼저 통과하기 전에는 consumer compute
-pacing을 root cause로 판정하지 않는다.
+K5 `.e76` proves that those fixes were necessary but not sufficient. The remaining
+watchdog is caused by a different trace/model control-flow mismatch:
 
-현재 fold 설계는 `primary_wait_pc`에서 다음 두 경로 모두 residual trace poll을
-`exit_pc`까지 건너뛰어야 한다.
+- Hardware observed the speculative compound TRYWAIT at `0x74e0` as ready and
+  therefore captured the fast path to `0x7520`.
+- In the simulator, the same TRYWAIT is sometimes not ready.
+- `0x74e0/0x7500` are not a dynamically visited foldable sidecar region, so the
+  current runtime records the miss but clears the pending wait and continues along
+  the captured ready path.
+- The out-of-line fallback at `0xaf90` is a pure wait loop
+  (`TRYWAIT -> NANOSLEEP -> PHASECHK -> backedge`) that was not dynamically
+  captured because hardware did not need it.
+- Warp 15 consequently reaches the coarse `0x8240` ARRIVEs before the modeled TMA
+  barrier gates have actually become ready. Warp 0 then reaches `0xb0b0` after
+  both `0x16c20` flips and parks for a nonexistent third flip.
 
-- not-ready: park 후 barrier가 만족되면 `skip_spin_to_exit(exit_pc)`
-- ready-at-issue: 즉시 `skip_spin_to_exit(exit_pc)`
+This is not a same-warp self-deadlock, and bypassing a not-ready `0xb0b0` wait
+would silently delete synchronization. The correct next change is a targeted
+compound wait-block contract: statically prove that the alternate path is a
+wait-only fallback, then park at the speculative TRYWAIT when the modeled barrier
+is not ready and resume the captured continuation only after the real modeled
+flip.
 
-실제 구현은 첫 번째 경로에만 skip이 있다. 두 번째 경로는 generation만 기록하고
-capture-time loop를 계속 replay한다. 따라서 이미 만족된 논리적 wait가 다음 barrier
-flip까지 재실행되고, 그 뒤 동일 PC에서 새 generation을 기다리며 false park/deadlock에
-들어갈 수 있다.
-
-지금은 코드와 기존 문서를 수정하지 않는다. 다음 구현 단계에서는 이 fold semantic
-결함만 먼저 고치고 generation audit을 hard assert로 복원한다. 그 결과로도 남는
-`[FOLDAUDIT]`만 consumer/TMA/compute pacing 결함의 유효한 증거로 취급한다.
+Stage 0.1 exact TMA credit remains an independent correctness fix, but it is not a
+prerequisite for identifying this control-flow defect. In `.e76`, SM62 has no
+same-warp TMA completion inversion, and only 3 of the 17 `0xb0b0` poison CTAs do.
 
 ## Current State Analysis
+
+> Sections 1-10 below preserve the pre-Batch-A investigation that established the
+> immediate-ready residual-replay bug. They are historical evidence for that
+> already-fixed defect, not the final explanation of the `.e76` watchdog. The
+> current root cause and next design are recorded in the final `.e76` section.
 
 ### 1. Section 15의 집계값은 로그와 일치한다
 
@@ -225,12 +236,13 @@ pass and must not be implemented unless the user explicitly reopens it.
 | Item | Status | Scope decision |
 |---|---|---|
 | Stage 0.3 startup/provenance | `MINIMAL ONLY` | Keep schema/version, explicit `foldable`, duplicate, non-empty, fold/observe exclusion, extra-metadata, kernel lookup, and CTA-count checks. Skip body-PC/opcode cross-validation and full/untrimmed provenance enforcement. |
-| Stage 0.4 generic effect detector | `SKIPPED` | Do not replace the detector with a generic effect/liveness framework in this pass. |
+| Stage 0.4 generic effect detector | `PARTIAL TARGETED ONLY` | Do not build a whole-ISA generic framework. Stage 1.7 may implement the bounded CFG/effect/provenance/liveness proof required for WaitBlock candidates; unsupported instructions or control flow fail closed. |
 | Stage 0.5 extended lifecycle audit | `PARTIAL ONLY` | Keep CTA-exit pending fold-wait and unassigned TMA-credit checks. Skip additional in-flight/outstanding TMA, per-region balance, cursor-invariant, and BAR-leak assertions. |
 | Stage 0.7 barrier re-init epoch | `SKIPPED` | Current FA3 has one EXCH per barrier; do not add generic epoch identity/reset support in this pass. |
 | Runtime expected/executed reconciliation | `SKIPPED` | Do not add hot-path per-instruction/per-CTA reconciliation counters. Perform reconciliation offline from existing logs. |
-| Full trace or sidecar regeneration | `SKIPPED` | Reuse the existing validated trace and sidecar. Do not regenerate them for this implementation. |
-| Compound wait/timeout/acquire generalization | `SKIPPED` | Do not generalize fold semantics to speculative compound waits, timeout exits, or extra acquire/live-out models without a concrete workload. |
+| Full trace regeneration | `SKIPPED` | Reuse the existing full trace; the missing fallback is reconstructed from static SASS effects rather than a new hardware capture. |
+| Sidecar regeneration | `TARGETED REOPEN` | Bump the schema and regenerate the sidecar. Stage 1.7 adds the compound WaitBlock while preserving legacy spin records for comparison; Stage 1.9 emits WaitBlock mirrors and then removes the legacy representation after validation. Dynamic trace data remain unchanged. |
+| Compound wait/timeout/acquire generalization | `TARGETED REOPEN` | K5 now provides a concrete pattern at `0x74e0/0x7500 -> 0xaf90 -> 0x7520`. Add only a statically proven wait-only compound block contract; do not globally convert TRYWAIT into a blocking instruction or generalize arbitrary timeout/acquire paths. |
 
 ### Implementation batching (사용자 승인)
 
@@ -259,6 +271,37 @@ Batch A에서 제외(이 batch 한정 SKIP, Batch B/실험 후로 이월):
 
 Batch A 완료 후: 빌드 확인 → 사용자가 K5/K10 12시간 실험 실행 → root-cause decision gate로 판정.
 
+#### Batch A.1 — Targeted compound wait-block repair (next)
+
+Batch A.1 is reopened before Batch B because `.e76` directly demonstrates a
+captured-ready/model-not-ready compound TRYWAIT mismatch. Its scope is limited to
+the statically proven `0x74e0/0x7500 -> 0xaf90 -> 0x7520` wait block described in
+the final section.
+
+| Stage | Content |
+|---|---|
+| Stage 1.7 | Emit and validate a targeted `WaitBlockRecord` for the speculative gate, pure fallback loop, and continuation |
+| Stage 1.8 | At one logical block entry, immediate-fold a modeled-ready visit or park a modeled-not-ready visit; both paths remove only the captured residual A/B/C wait-control path and land at the common resume PC |
+| Stage 1.9 | After Stage 1.7/1.8 validation, migrate existing spin regions to the general WaitBlock contract and remove the legacy spin-fold representation/runtime |
+
+No generic TRYWAIT blocking, arbitrary timeout handling, or global predicate
+override is included.
+
+Implementation control gates:
+
+1. Implement Stage 1.7 only, regenerate the K5/K10 sidecar, and stop for review.
+   Do not modify simulator runtime code in this step.
+2. Implement Stage 1.8 only after the emitted WaitBlock and all proof evidence
+   are reviewed. Keep the legacy spin-fold path during this step.
+3. Run Stage 1.9 only after the user-run K5/K10 validation accepts Stage 1.8.
+4. Do not add a generic SASS analyzer, predicate-write mechanism, generation
+   visit model, full-trace regeneration, or Batch B change without explicit user
+   approval.
+5. Stop and request approval if correctness requires a live predicate commit,
+   an unsupported def/use layout or opcode, a broader CFG/provenance analysis,
+   a pre-entry generation-overshoot model, or relaxation of any fail-closed
+   proof.
+
 #### Batch B — TMA & barrier-timing (실험 후 복귀)
 
 | Stage | 내용 |
@@ -272,7 +315,8 @@ Batch A 완료 후: 빌드 확인 → 사용자가 K5/K10 12시간 실험 실행
 | Stage 0.9 | mbarrier-only predicate를 named BAR와 분리 |
 | Stage 1.3 | (Batch A에서 이월된 경우) fold-aware metric integrity |
 
-Batch B 제외(계획상 SKIPPED 유지): Stage 0.4, 0.7, full trace/sidecar regen, runtime reconciliation.
+Batch B 제외(계획상 SKIPPED 유지): Stage 0.4, 0.7, full trace regeneration,
+runtime reconciliation. Targeted sidecar regeneration belongs to Batch A.1.
 
 #### Stage 3/4 (최종)
 
@@ -316,7 +360,11 @@ ground truth가 아니다.
 - `[TMADBG] load-mbarrier-credit`에
   `uid/barrier/credit_bytes/remaining_for_barrier`를 출력한다.
 
-이 수정이 통과하기 전에는 `0x16c20/0x16c50/empty barrier` pacing 결론을 내리지 않는다.
+This correction is required before final timing signoff for TMA-credited barriers.
+It is not a prerequisite for diagnosing the `.e76` compound wait-control defect:
+SM62 has no same-warp TMA completion inversion, and the simulator already reports
+the relevant TRYWAIT as not ready before incorrectly continuing the captured
+ready path.
 
 #### Stage 0.2. Fold release를 SM cycle-start의 단일 phase로 이동
 
@@ -951,6 +999,557 @@ exit와 abort dump에 출력한다. 기존 BAR logger에는 별도 hot-path coun
 - critical audit/work/skip-violation line은 budget과 무관하게 항상 출력
 - 기존 K10 raw log가 약 162만 줄이므로 더 큰 raw stream보다 aggregate proof를 우선
 
+### Stage 1.7. Generate and validate a targeted compound wait-block sidecar
+
+Files:
+
+- `simulator-remodeled/util/tracer_nvbit/build_spin_wait_sidecar.py`
+- existing K5/K10 `spin_wait_sidecar.json` outputs
+
+Stage 1.7 does not modify simulator C++ or the shared
+`trim_spin_from_ncu.py` helper.
+
+The current detector starts from a backward BRA, requires the loop to appear in
+the dynamic trace, and emits one `SpinWaitRegionRecord` keyed by the dynamically
+executed primary wait. That model is retained unchanged for existing spin
+regions.
+
+Add a separate bounded-CFG detector for a compound wait block. It must identify:
+
+```text
+speculative gate(s) -> ready continuation
+                    -> wait-only fallback loop -> same continuation
+```
+
+For the concrete K5 block:
+
+```text
+gate waits          = [0x74e0, 0x7500]
+captured arm wait   = 0x74e0
+captured next PC    = 0x74f0
+fallback entry      = 0xaf90
+fallback waits      = [0xafc0, 0xafe0]
+fallback loopback   = 0xaff0
+semantic resume PC  = 0x7520
+```
+
+#### 1.7.1 CFG proof
+
+The detector must build a small local CFG instead of treating the PC interval as
+one linear body.
+
+Required properties:
+
+1. A gate TRYWAIT defines predicate `P`.
+2. A predicate branch has a ready arm that reaches one continuation.
+3. The not-ready arm either executes another equivalent gate check or enters one
+   fallback loop.
+4. The fallback loop has one backedge and one exit.
+5. The fallback exit rejoins the same continuation as the ready arm.
+6. CALL, RET, indirect branch, nested side exit, reconvergence that cannot be
+   resolved locally, and unknown control flow reject the block.
+
+The current trace captured `0x74e0 -> 0x74f0 -> 0x7520`. The sidecar must record
+both `captured_next_pc=0x74f0` and semantic `resume_pc=0x7520`; these are not the
+same cursor coordinate.
+
+#### 1.7.2 Wait-condition equivalence
+
+String equality of the SASS operands is insufficient:
+
+```text
+gate barrier       [UR9+0x16850]
+fallback barrier   [R11+URZ+0x16850], with R11 <- UR9
+gate wait state    R11, with R11 <- UR7
+fallback state     R15, with R15 <- UR7
+```
+
+Perform a bounded register-provenance proof through reviewed pure copies/address
+setup. Emit canonical barrier-base, offset, and wait-state sources. Unknown
+definitions, multiple reaching definitions, or a value that escapes the block
+reject the record.
+
+#### 1.7.3 Effect proof
+
+The alternate path may contain only:
+
+- TRYWAIT/PHASECHK wait observations;
+- NANOSLEEP or another reviewed delay-only backoff;
+- pure loop-local register/uniform-register address setup;
+- predicate branches and the final continuation branch.
+
+The following are fatal to wait-block generation:
+
+- local/shared/global memory;
+- TMA, GMMA, MUFU, atomic, reduction, or semantic arithmetic;
+- ARRIVE, EXCH, BAR, fence, or any synchronization mutation;
+- nondeterministic state;
+- live-out register/predicate definitions;
+- unknown opcode/effect.
+
+Stage 1.7 does not introduce modeled predicate writes. It must prove the wait
+predicate is dead at `resume_pc`: along every path after resume, the predicate is
+redefined before its first read. In K5, wait predicate `P1` is redefined by
+`FSETP` at `0x76f0` before the later predicated uses. If a future block requires
+the ready predicate value as a live-out, reject it until an explicit predicate
+commit mechanism is separately designed and verified.
+
+#### 1.7.4 Dynamic capture proof
+
+CTA visits may legitimately capture different paths:
+
+```text
+visit A: first TRYWAIT ready                  -> resume
+visit B: first miss, second TRYWAIT ready     -> resume
+visit C: both miss, fallback loop eventually ready -> resume
+```
+
+These are not separate runtime wait sites. They are different captured executions
+of one logical wait-block visit. Dynamic validation must therefore prove:
+
+- every visit starts at the same `entry_wait_pc`;
+- the effective execution mask `active_mask & predicate_mask` is nonzero at the
+  entry; predicated-off occurrences are not visits;
+- every observed path reaches the same `resume_pc`;
+- every dynamic PC between entry and resume belongs to the statically proven
+  wait-block CFG;
+- no path performs semantic work or leaves through an unreviewed side exit;
+- outcome counts for A/B/C are recorded for diagnostics, but mixed outcomes are
+  allowed;
+- kernel id, unique function id, CTA count, and SASS identity match.
+
+Runtime lookup is installed only at `entry_wait_pc=0x74e0`. Secondary gate and
+fallback wait PCs belong to the already-open logical visit and must never arm an
+independent park. This prevents one block visit from being counted or parked
+multiple times.
+
+The existing lightweight protobuf helper currently returns only
+`(pc, sync_valid)` even though `instruction.proto` already contains
+`active_mask` and `predicate_mask` in fields 2 and 3. Stage 1.7 minimally extends
+`build_spin_wait_sidecar.py` with a private mask-aware parser that reuses the
+existing varint primitives and preserves both masks. It does not modify the
+shared trim helper, change the trace format, or regenerate the full trace.
+
+#### 1.7.5 Schema
+
+Bump the sidecar schema and add a separate array:
+
+```text
+WaitBlockRecord:
+  block_id
+  trace_kernel_id / unique_function_id
+  entry_wait_pc
+  all_gate_wait_pcs
+  captured_next_pc
+  allowed_block_pcs
+  fallback_entry_pc
+  fallback_body_pcs
+  fallback_wait_pcs
+  fallback_loopback_pc
+  resume_pc
+  canonical_wait_condition
+  fallback_effect_safe
+  wait_predicate
+  wait_predicate_dead_at_resume
+  next_predicate_def_pc
+  park_on_model_miss
+  observed_path_counts
+  active_entry_visits
+  predicated_off_entry_occurrences
+```
+
+Existing `spin_regions` and their foldable decisions must remain bit-identical.
+Stage 1.7 generator validation rejects a duplicate entry PC, overlap with another
+wait block, unsafe effect flag, an observed path outside `allowed_block_pcs`, an
+unexpected exit, or mismatched CTA count. Stage 1.8 startup validation adds the
+exact schema/version and required-field checks. Runtime lookup is keyed by
+`(trace_kernel_id, unique_function_id, entry_wait_pc)` so multiple launches
+cannot alias.
+
+#### 1.7.6 Concrete bounded-proof algorithm
+
+Build a small instruction IR from `enhanced_execution_info.json` and
+`sync_operand_resolver.json`:
+
+```text
+InstIR:
+  pc / opcode
+  predicate guard and polarity
+  register/predicate defs and uses
+  direct successors
+  sync kind and semantic operand indices
+  scoreboard control bits
+```
+
+This is not a whole-ISA analyzer. Use explicit conservative bounds such as
+`MAX_WAIT_BLOCK_NODES=64`, `MAX_BRANCH_EDGES=16`, and
+`MAX_PROVENANCE_DEPTH=32`. The out-of-line fallback makes a raw PC-span bound
+invalid. Any bound overflow rejects the candidate.
+
+Candidate discovery and CFG proof:
+
+1. Start only from an active TRYWAIT that defines predicate `P`.
+2. Require its next control dependency to be a direct predicated BRA using `P`.
+3. Add target and fall-through successors for predicated direct branches,
+   target-only successors for unconditional direct branches, and fall-through
+   successors for ordinary instructions.
+4. Reject CALL, RET, indirect branch, unknown target, nested entry, and edges
+   outside the bounded candidate except the final resume edge.
+5. Compute strongly connected components. Cyclic components must be wait/backoff
+   loops; no semantic component may be cyclic.
+6. Collapse SCCs and compute the unique nearest common post-dominator of the
+   ready and not-ready successors. That node is `resume_pc`.
+7. Require every path from entry to leave the candidate only through
+   `resume_pc`. A second common exit or unresolved side exit rejects the block.
+
+Wait-condition provenance proof:
+
+1. Decode the barrier address and wait-state operands at every TRYWAIT/PHASECHK.
+2. Walk reaching definitions backward with PC-sensitive register identity.
+3. Normalize only reviewed expressions:
+   constants, register/uniform-register copies, zero-source `IMAD.MOV` copies,
+   and base-plus-constant address formation.
+4. Reject multiple reaching definitions, loop-carried mutation, arithmetic that
+   is not in the reviewed normalizer, or provenance-depth overflow.
+5. Require all waits to reduce to exactly the same canonical pair
+   `(barrier_address_expression, wait_state_expression)`.
+
+For K5 this must prove:
+
+```text
+gate address     = UR9 + 0x16850
+fallback address = R11 + 0x16850, where 0xafb0 defines R11 <- UR9
+
+gate state       = R11, whose reaching definition is UR7
+fallback state   = R15, where 0xafa0 defines R15 <- UR7
+```
+
+The two textual `R11` operands have different reaching definitions and roles;
+therefore PC-sensitive def-use, not register-name equality, is mandatory.
+
+Effect and scoreboard proof:
+
+1. Classify every candidate instruction with an exact allowlist. Allow only
+   wait observations, `NANOSLEEP`, direct control flow, and reviewed pure
+   copy/address setup.
+2. Reject local/shared/global memory, TMA, GMMA, MUFU, ARRIVE, EXCH, BAR, fence,
+   atomics, nondeterministic reads, calls, and unknown opcodes.
+3. Run scoreboard safety over the retained entry plus residual skip set:
+   every waited barrier id must be armed by the retained synchronous entry or
+   inside the residual set; every residual arm must be self-released inside the
+   set; no async producer may arm a deferred release.
+4. Emit the opcode/effect and scoreboard reason for every allowed PC so review
+   does not rely on a single `effect_safe=true` boolean.
+
+The K5 entry-scoreboard path has been reviewed before Stage 1.8:
+
+```text
+0x74e0 TRYWAIT  arms write barrier 1
+0x74f0 BRA      waits on barrier bit 1
+0x74e0 retire   independently decrements write barrier 1
+0x7520 resume   has no wait-barrier dependency
+0x7580 SHFL     waits on/reuses barrier 1 if the prior entry is still pending
+```
+
+Skipping `0x74f0` does not suppress the entry's barrier release. The resume path
+does not consume `P1`, and the later barrier-1 reuse remains protected by the
+existing dependency state. Stage 1.8 therefore makes no scoreboard-release
+change; it emits/asserts this proof and leaves the current arm/retire path intact.
+
+Liveness proof:
+
+1. Collect all register and predicate definitions in the residual A/B/C paths.
+2. Do not treat `num_destination_registers` as a complete def/use decoder. The
+   current enhanced metadata reduces many instructions to 0/1 destination and,
+   for example, does not by itself describe both destinations of
+   `SHFL.BFLY PT, R14, ...`. Use a reviewed opcode-specific destination layout
+   for every instruction that mentions a tracked live-out. An unknown layout
+   rejects the candidate.
+3. Starting at `resume_pc`, follow every successor until each value is either
+   read or definitely redefined.
+4. A read before redefinition on any path makes the value live and rejects the
+   block.
+5. Unknown control flow, unknown def/use layout, or liveness-bound overflow
+   rejects the block.
+6. Apply the same rule to the wait predicate.
+
+K5 must emit these concrete kill-before-read witnesses:
+
+```text
+fallback R14 -> overwritten by 0x7550 SHFL before any read
+fallback R11 -> overwritten by 0x7580 SHFL before any read
+fallback R15 -> overwritten by 0x7670 FADD before any read
+wait P1      -> overwritten by 0x76f0 FSETP before later predicated uses
+```
+
+Dynamic same-resume proof:
+
+1. Parse `(pc, active_mask, predicate_mask, sync_valid)` for each dynamic
+   instruction.
+2. For every active dynamic `entry_wait_pc` occurrence, scan that warp's PC
+   stream until the first `resume_pc`.
+3. Reject nested entry, missing resume, scan-bound overflow, or any PC not in
+   `allowed_block_pcs`.
+4. Classify the visit as A, B, or C from the observed PCs and record counts.
+5. Record predicated-off entry occurrences separately but never emit a runtime
+   visit for them.
+6. Mixed classes are valid; a different resume or semantic PC is not.
+
+Emit structured proof evidence in the sidecar: CFG nodes/edges, SCCs, canonical
+wait expressions, per-PC effect classes, def-use provenance chains, dead
+live-outs, scoreboard reason, path counts, and the SASS identity hash. `--strict`
+fails sidecar generation on a rejected targeted K5 candidate rather than silently
+omitting it.
+
+Stage 1.7 acceptance:
+
+- K5 emits exactly the reviewed block above.
+- Its existing spin-region records are unchanged.
+- K10 emits either no wait block or only independently proven records.
+- active/predicate masks are preserved and predicated-off entries are excluded
+  from dynamic visit counts.
+- The existing full dynamic trace is reused; only sidecar metadata is regenerated.
+
+### Stage 1.8. Enforce a proven wait block in the simulator
+
+Files:
+
+- `simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/tma_types.h`
+- `simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/gpu-sim.{h,cc}`
+- `simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/sm.{h,cc}`
+- `simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/subcore.cc`
+
+#### 1.8.1 Database and pending-wait mode
+
+Keep spin regions and wait blocks in separate maps:
+
+```text
+regions_by_wait_pc
+wait_blocks_by_entry_pc
+```
+
+Add an explicit pending mode:
+
+```text
+PendingWaitMode:
+  NONE
+  FOLD_REGION
+  WAIT_BLOCK_GATE
+```
+
+A `WAIT_BLOCK_GATE` pending record carries the runtime barrier key, wait state,
+pinned expected generation, block id, entry PC, captured-next PC, and semantic
+resume PC. It does not carry a spin-region fold exit and never invokes
+`skip_spin_to_exit()`; it uses the separate wait-block resume helper.
+
+For Stage 1.8, retain `fold_needs_skip` as a compatibility field for the existing
+fold path and append the new mode without reordering fields used by aggregate
+initializers. Assert `mode == FOLD_REGION` iff `fold_needs_skip` is true. Remove
+the compatibility bool in Stage 1.9 after K5/K10 validation; do not combine that
+migration with the initial compound wait-block behavior change.
+
+#### 1.8.2 Issue-time behavior
+
+For an active PHASECHK/TRYWAIT:
+
+1. Build the runtime barrier key and evaluate the existing
+   `is_sync_wait_satisfied()` phase rule.
+2. Lookup a wait block by `(trace_kernel_id, uid, inst.pc)`.
+3. Assert the sidecar wait kind and runtime payload are valid.
+4. Ready:
+   - keep the current entry TRYWAIT as executed;
+   - flush younger prefetched entries;
+   - skip the residual captured wait-block path to `resume_pc`;
+   - record one immediate wait-block fold.
+5. Not ready:
+   - pin `expected_gen = current_gen + 1`;
+   - assert `inst.next_traced_pc == captured_next_pc`;
+   - flush younger prefetched entries with `flush(false)`;
+   - arm one `WAIT_BLOCK_GATE` pending wait;
+   - record the gate park once.
+
+Use one common `wait_block_cursor_skip_to_resume()` helper for immediate and
+parked-release paths. It flushes younger entries, then consumes only dynamic PCs
+in `allowed_block_pcs` until the trace cursor lands on `resume_pc`. The current
+entry TRYWAIT has already issued and is never rolled back or counted as skipped.
+The helper rejects semantic work, an unexpected side exit, exhausted trace
+occurrences, or a landing PC mismatch.
+
+`handle_sync_instruction()` must return immediately for `active_count()==0`
+before any lookup or state update. The current MBARRIER call site invokes this
+handler before the named-BAR active-mask check, so relying on the caller is
+unsafe. A predicated-off gate must never park or mutate bookkeeping.
+
+Parking at the first modeled miss intentionally replaces both the second
+speculative check and the pure fallback polling loop. If the barrier flips
+between the two hardware checks, the event-based park releases on that flip and
+continues on the captured ready arm. Poll instruction issue cost is folded away;
+barrier readiness is not predicted or forced.
+
+#### 1.8.3 Release behavior
+
+Release service must run before the warp is reconsidered for issue. A ready
+pending wait must not remain valid, because a later phase flip could otherwise
+make `warp_waiting_at_barrier()` park the warp again with stale state.
+
+For `WAIT_BLOCK_GATE`:
+
+```text
+current_gen < expected_gen:
+    keep parked
+
+current_gen > expected_gen:
+    hard abort
+
+current_gen == expected_gen && phase not ready:
+    keep parked / assert initialized-state consistency
+
+current_gen == expected_gen && phase ready:
+    clear pending state
+    record gate release and duration
+    skip the residual captured wait-block path to resume_pc
+```
+
+After release, the next issued instruction is `resume_pc`. The simulator does not
+synthesize `0xaf90` instructions and does not rewrite predicate `P1`; it removes
+whichever captured residual path (A, B, or C) belongs to this visit after modeled
+readiness has determined that the logical wait is complete.
+
+The current release service is per-subcore. Stage 1.8 must preserve one release
+action per warp per cycle and must not introduce a second call from a metric or
+sort path. Moving all releases to the SM cycle-start remains the independent
+Stage 0.2 cleanup.
+
+#### 1.8.4 Accounting and lifecycle
+
+Add separate counters:
+
+```text
+wait_block_gate_hits
+wait_block_gate_parks
+wait_block_gate_releases
+wait_block_gate_park_cycles
+wait_block_gate_watchdog_hits
+wait_block_immediate_folds
+wait_block_skipped_insts
+```
+
+Keep wait-block counters separate from spin-region folds. The skipped count
+contains only residual wait-block control/backoff entries, never the already
+issued entry TRYWAIT. At CTA exit and warp-slot reuse, assert no
+`WAIT_BLOCK_GATE` remains open before clearing state.
+
+#### 1.8.5 Risk audit
+
+| Risk | Required control |
+|---|---|
+| False-positive compound block | Bounded CFG, provenance, effect, liveness, and single-rejoin proofs; unknown fails closed |
+| Mixed captured branch outcomes | Treat A/B/C as one block visit; prove every path is wait-only and rejoins the same resume PC |
+| Gate/fallback address mismatch | Canonical register-provenance proof plus runtime payload validation |
+| Skipped ready PHASECHK would leave the predicate false | Require wait-predicate dead-at-resume proof; reject live-out predicates |
+| Predicated-off TRYWAIT parks | `active_count()==0` early return inside `handle_sync_instruction()` |
+| Skipping the captured branch suppresses entry scoreboard release | Verified false for K5: entry retirement releases barrier 1 independently; keep release code unchanged and assert the sidecar scoreboard proof |
+| Cursor skip crosses semantic work or the wrong captured arm | Flush younger entries, guard every skipped PC against `allowed_block_pcs`, and assert landing at `resume_pc` |
+| Current gate instruction is executed twice | Arm/skip only after the entry TRYWAIT has issued; flush and skip younger entries only |
+| Stale ready pending state re-parks later | Clear in release service before issue eligibility is reevaluated |
+| Spin-region and wait-block skip semantics mix | Explicit pending mode, separate helpers/counters, and block-specific allowed-PC guards |
+| Pending-wait struct migration regresses existing aggregate initializers | Append mode, retain `fold_needs_skip` compatibility, and assert consistency until post-validation cleanup |
+| Same-cycle subcore order bias | Preserve current single service point; Stage 0.2 later centralizes it |
+| Barrier flips twice while parked | Pinned generation hard-abort |
+| Old sidecar silently accepted | Exact schema/version and required-field startup validation |
+| Unsupported timeout/acquire semantics | No record emitted; original captured replay remains the fallback |
+
+Stage 1.8 acceptance:
+
+- feature off is bit-identical;
+- ready entries fold directly to `resume_pc`;
+- modeled misses park once and release once;
+- immediate and parked paths skip only wait-block residual instructions;
+- parks equal releases at clean exit;
+- entry write-barrier counters return to their existing balanced state without a
+  new scoreboard release path;
+- SM62 cannot issue `0x8240` before its modeled gate release;
+- K5 and K10 preserve HGMMA/MUFU/TMA/BAR semantic work counts.
+
+### Stage 1.9. Migrate spin folds into the general WaitBlock model
+
+Stage 1.8 intentionally runs a temporary dual representation so the new compound
+behavior can be isolated. The target architecture has only `WaitBlockRecord` and
+one wait-block runtime.
+
+An existing foldable spin region maps directly:
+
+```text
+SpinWaitRegionRecord.loop_head_pc       -> WaitBlock CFG entry
+ordered wait_pcs                        -> WaitBlock wait sites
+primary_wait_pc                         -> diagnostic/control dependency metadata
+body_pcs + loopback_bra_pc              -> allowed_block_pcs
+exit_pc                                 -> resume_pc
+semantic_free + barrier_self_tied proof -> effect/progress proof
+```
+
+The generalized runtime opens one logical visit at the first active wait site in
+the block. Entry TRYWAIT and primary PHASECHK are no longer independent waits:
+
+```text
+first active wait ready:
+    execute that wait once
+    fold residual block path to resume
+
+first active wait not ready:
+    pin one expected generation
+    park
+    release and fold residual block path to resume
+```
+
+Later wait sites in the same captured block path never open another visit. This
+subsumes the current immediate-ready and parked-release spin-fold paths and also
+implements the previously required entry/primary single-visit semantics.
+
+Migration sequence:
+
+1. Make the v3 generator emit a WaitBlock mirror for every existing
+   `foldable=true` spin region.
+2. Offline-compare each mirror against the legacy record:
+   wait PCs, allowed PCs, resume PC, effect classes, dynamic visits, and CTA count.
+3. In a diagnostic build, perform both lookups but execute only the selected
+   implementation; assert that both classify the same existing spin visits.
+4. Run focused K5/K10 tests with legacy spin execution and WaitBlock spin
+   execution. Existing semantic work counts must match; timing differences are
+   allowed only where first-active-wait behavior intentionally replaces the old
+   primary-only park.
+5. After validation, remove:
+   - `SpinWaitRegionRecord`;
+   - `regions_by_wait_pc`;
+   - `PendingWaitMode::FOLD_REGION`;
+   - `fold_needs_skip`, `fold_exit_pc`, and `fold_uid`;
+   - `fold_cursor_skip_to_exit()` and the legacy release branch;
+   - duplicate spin-only park/release counters.
+6. Rename or alias the existing `spin_wait_fold_enable` option during one
+   compatibility period, then make it enable the unified WaitBlock runtime.
+
+Final counters are block-kind qualified rather than implementation qualified:
+
+```text
+wait_block_kind = CAPTURED_SPIN_LOOP | COMPOUND_FALLBACK
+immediate_folds
+parks
+releases
+skipped_insts
+park_cycles
+watchdog_hits
+```
+
+Stage 1.9 acceptance:
+
+- all existing K5/K10 foldable spin regions have one exact WaitBlock mirror;
+- no runtime visit can match both legacy and final maps after legacy removal;
+- parks equal releases per block kind at clean exit;
+- semantic instruction counts remain unchanged;
+- feature off remains bit-identical;
+- the final code has one pending mode, one resume-skip helper, and one release
+  service for all wait blocks.
+
 ### Stage 2. Diagnostic override를 제거한다
 
 파일:
@@ -1017,8 +1616,9 @@ Section 15의 raw count와 과거 실험은 historical evidence로 보존하되,
 - 정확성이 completion보다 우선이다. force-release는 사용하지 않는다.
 - generation은 audit 전용이며 mbarrier release semantics를 대체하지 않는다.
 - Section 15의 수치는 맞지만 현재 root-cause attribution은 유효하지 않다.
-- K10의 133,796 cycle은 regression anchor이지만 K5 ready-path 결함을 반증하지 않는다.
-  K10은 barrier window가 충분히 넓어 같은 결함이 hard failure로 드러나지 않았다.
+- K10의 133,796 cycle은 historical regression anchor이지만 K5 WaitBlock control
+  mismatch를 반증하지 않는다. K10은 해당 low-flip timing window에서 hard failure가
+  발생하지 않았다.
 - Corrected K10 cycle은 133,796과 bit-identical할 필요가 없다. 현재 값에는 최소 348개의
   명백한 residual primary poll과 그 loop-body 비용이 포함되어 있다.
 - consumer compute pacing 변경은 corrected fold 결과가 이를 요구하기 전까지 out of scope다.
@@ -1028,62 +1628,80 @@ Section 15의 raw count와 과거 실험은 historical evidence로 보존하되,
 
 ### Static verification
 
-1. Foldable ready primary poll과 parked release가 모두 동일한 B2 skip path를 탄다.
-2. `skip_spin_to_exit()`는 logical wait당 정확히 한 번만 호출된다.
-3. feature-off에서는 새 branch/helper가 실행되지 않는다.
-4. `cur_gen > expected_gen`은 continuation 없이 abort한다.
-5. foldable region visit별 primary immediate-hit 수는 0(not-ready/park path) 또는
-   1(ready-at-issue path)이다. 별도 runtime visit tracker/assert는 추가하지 않고
-   PC-qualified event와 aggregate counter로 검증한다.
-6. `cur_gen < expected_gen && !wait_ready`는 정상 park이며 abort하지 않는다.
-7. cursor helper 복귀 후 current PHASECHK의 scoreboard/stall/completion 처리가 정상 수행된다.
-8. clean exit에서:
-   - `parks == releases`
-   - `total_folds == releases + immediate_folds`
-   - `immediate_skipped_insts <= skipped_insts`
-9. Fold-off Gate 0:
+1. Sidecar v3 emits the reviewed K5 compound WaitBlock and preserves every
+   existing spin-region record until Stage 1.9 migration.
+2. Every observed A/B/C path contains only `allowed_block_pcs` and reaches the
+   same `resume_pc`; an unexpected PC or exit rejects the record.
+3. CFG, wait-condition provenance, effect, liveness, predicate-dead-at-resume,
+   and same-resume proofs all pass. Unknown evidence fails closed.
+4. Runtime opens one logical visit at the block's first active wait. Secondary
+   TRYWAIT/PHASECHK sites never open another visit or expected generation.
+5. Ready entry and parked release use the same WaitBlock resume-skip helper. The
+   already-issued entry wait is retained; only residual wait/control entries are
+   skipped.
+6. `active_count()==0` returns before lookup or state mutation.
+7. `cur_gen > expected_gen` aborts without continuation.
+8. `cur_gen < expected_gen && !wait_ready` remains a normal park.
+9. At clean exit, parks equal releases per block kind and no WaitBlock visit is
+   open.
+10. Stage 1.9 emits an exact WaitBlock mirror for every legacy foldable spin
+    region, then removes the legacy DB, pending mode, helper, and counters only
+    after K5/K10 equivalence checks pass.
+11. The final runtime has one WaitBlock lookup model, one pending-wait visit
+    model, one resume-skip helper, and one release service.
+12. Fold-off Gate 0:
    - 같은 binary/trace/config에서 fold flag만 0으로 둔 matched run 사용
    - patch 전/후 fold-off semantic work/count와 cycle이 bit-identical
    - K5 Opt 11-A 83,308 / K10 Opt 11-A 136,898은 historical reference로만 사용
-10. Fold-on metric:
+13. Fold-on metric:
    - HOL ready/eligible/not-selected population에 parked warp가 없음
    - 모든 parked warp-cycle이 `mbarrier_spin` reason으로 귀속
    - MUFU valid-head population에서 parked warp가 제외됨
    - producer tail의 parked cycle이 `stall_mbarrier_spin`에 귀속
    - poll counters와 logical-fold counters를 교차 사용하지 않음
-11. Offline instruction reconciliation:
+14. Offline instruction reconciliation:
    - single-run trace expected warp count ==
      `gpgpu_n_tot_w_icount + skipped_warp_insts`
    - single-run trace expected active-lane count ==
      `gpu_sim_insn + skipped_active_lane_insts`
    - matched fold-off/on A/B도 같은 identity를 독립 확인
-12. Semantic work:
+15. Semantic work:
    - `[FOLDWORK] status=PASS`로 skipped semantic/local-memory work가 0임을 확인
    - K5/K10 HGMMA/MUFU/TMA anchor exact match
    - BAR/memory expected == executed
    - 모든 FoldSkipStats semantic/local-memory field == 0
-13. Debug completeness:
-   - `[FOLD]` 세 경로에 barrier/wait/gen 및 skip landing 정보 존재
+16. Debug completeness:
+   - WaitBlock immediate/park/release events include block kind, entry, barrier,
+     generation, skipped count, and resume landing
    - clean exit 또는 abort에서 SYNC/TMA/FOLD logger `dropped=0`
    - abort 시 `[FOLDAUDIT_CTX]`, `[FOLDSUM_ABORT]`, `[FOLDPACE_ABORT]`,
      `[FOLDWORK] status=INCOMPLETE` 존재
 
 ### Focused K5 log acceptance
 
-SM29의 corrected timeline은 다음을 만족해야 한다.
+SM62 compound WaitBlock:
 
-- cycle 55,835의 첫 ready observation에 immediate release+skip 발생
-- 기존 cycle 55,855 ... 55,948 residual polls가 실행되지 않음
-- cycle 55,961의 `0xb0b0` park가 사라짐
-- gen3 watchdog abort가 사라짐
+- the `0x74e0` visit that observes `0x16c58` not-ready parks once;
+- no `0x8240` ARRIVE issues before that modeled gate releases;
+- release removes only the captured residual wait-block path and lands at
+  `0x7520`;
+- the second coarse ARRIVE no longer closes `0x16c20` before warp 0 consumes the
+  gen1 window;
+- the `0xb0b0` expected-gen3 dangling park and watchdog disappear.
+
+Historical SM29 immediate-ready regression:
+
+- the first ready observation still folds immediately;
+- residual repeated polls remain absent;
+- no later false park is reintroduced by Stage 1.9 migration.
 
 전체 K5:
 
 - 목표: clean exit와 `[FOLDAUDIT]=0`
 - 실패 시: temporary continuation 없이 첫 genuine audit abort만 수집
 - HGMMA/MUFU/TMA/BAR semantic work count는 fold 허용 범위 밖에서 변하지 않음
-- 감소 가능한 것은 foldable spin region의 control/body instruction
-  (PHASECHK/TRYWAIT/NANOSLEEP/IMAD/loopback BRA)뿐임
+- 감소 가능한 것은 proven WaitBlock의 control/backoff/pure loop-local instruction
+  (PHASECHK/TRYWAIT/NANOSLEEP/reviewed scratch ALU/branch)뿐임
 - HGMMA/MUFU/TMA/BAR/semantic memory instruction은 감소하지 않음
 
 ### K10 regression
@@ -1094,20 +1712,27 @@ SM29의 corrected timeline은 다음을 만족해야 한다.
   hit(121,388) 직후 residual hit 348개가 사라짐
 - cycle 변화는 133,796 대비 보고하되 bit-identity를 요구하지 않음
 - HW target 132,901과의 오차를 다시 계산
-- 모든 `[FOLDSUM]`에서 parks/releases balance와 watchdog 0
-- K10 consumer foldable primary(`wait_pc=0xb510`, warp 4-11)에서도
-  immediate/parked 두 경로가 동일한 cursor invariant를 만족하는지 확인
+- Stage 1.8 dual-runtime run에서는 legacy `[FOLDSUM]`과 compound WaitBlock summary를
+  각각 검증하고, Stage 1.9 final run에서는 WaitBlock kind별 parks/releases balance와
+  watchdog 0을 확인
+- K10 consumer spin at `wait_pc=0xb510` is converted to a
+  `CAPTURED_SPIN_LOOP` WaitBlock and satisfies the same immediate/parked resume
+  invariant
 - `[PRODSPIN] ready_run_retries`는 보조 지표로만 사용하고, immediate fold의 정본 count는
-  PC-qualified `[FOLD] immediate+skip`과 `[FOLDPACE] immediate_folds`로 판정
+  Stage 1.8에서는 PC-qualified legacy/WaitBlock events로 교차검증하고 Stage 1.9에서는
+  block-kind-qualified WaitBlock aggregate로 판정
 
 ### Root-cause decision gate
 
-- corrected K5가 zero-audit로 끝나면 문제는 fold ready-path 누락이었으며 consumer compute
-  model 변경은 하지 않는다.
-- corrected K5가 첫 접근부터 `cur_gen > expected_gen`으로 abort하면 그 event만 pacing
-  root-cause 분석 대상으로 삼는다.
-- corrected K5가 `cur_gen < expected_gen` watchdog으로 abort하면 missing producer/consumer
-  edge의 구조적 causal chain을 다시 추적한다.
+- Stage 1.8 K5가 zero-audit로 끝나면 compound wait-control mismatch가 남은 watchdog의
+  직접 원인이었음이 확인된다. Consumer compute latency는 변경하지 않고 Stage 1.9
+  migration 검증으로 진행한다.
+- WaitBlock entry/release가 `cur_gen > expected_gen`으로 abort하면 해당 logical visit의
+  prior generation ordering을 분석한다. Force-release하지 않는다.
+- WaitBlock park가 watchdog으로 abort하면 해당 gate를 advance해야 하는 producer의
+  enqueue/completion/ARRIVE chain을 분석한다.
+- `0xb0b0` dangling park가 남으면 corrected wait-block release 이후의 first failing CTA만
+  사용해 남은 producer/consumer pacing margin을 재분류한다.
 
 ## Batch A 실험 결과 (2026-08-14)
 
@@ -1293,72 +1918,30 @@ SM131 불일치는 그때도 잠재해 있었다.
 세 방향 모두 "satisfied ⇒ 새 gen 소비" 전제를 완화한다. 어느 것이 producer/consumer
 양쪽에서 안전한지 추가 분석이 필요하다.
 
-## generation과 원래 deadlock의 관계 재확인 (git 히스토리 기준, 2026-08-14)
+## Generation audit status and correction of the `.e75` conclusion
 
-"gen을 유지해야 하나 — 원래 deadlock이 gen 때문이었나?"를 git 히스토리로 확정했다.
+Git history still proves that generation tracking did not create the original
+deadlock: the first phase-only fold implementation already hung on K5, and the
+generation counter was added later as a diagnostic.
 
-커밋 순서:
+The earlier `.e75` conclusion that Stage 1 had eliminated the original K5
+deadlock was incorrect and is removed. `.e75` stopped on a generation-audit false
+positive while all observed `0xb0b0` visits happened to be immediate-ready. That
+run did not prove that the not-ready path could no longer recur. `.e76` later
+produced 17 real `0xb0b0` parks after generation 2, including the SM62 watchdog.
 
-- `423c0a2` sim: implement producer/consumer spin-wait collapse — **gen 없는 최초 fold**.
-  not-ready면 park, ready면 skip. phase(`is_sync_wait_satisfied`)만으로 동작.
-- `51856ab` docs: record first collapse run — **"K5 deadlocked on the first collapse-ON
-  run (K10 passed)."** 즉 **gen 도입 전에 이미 K5 deadlock 존재.**
-- `228f18a` sim: add spin-wait generation audit — deadlock 진단용으로 gen 추가.
-- `f4e92ba` continue folding after poison / `929fd0f` docs: consumer pacing 귀속.
+The corrected interpretation is:
 
-결론:
+1. Stage 1 fixed the immediate-ready residual-replay defect.
+2. Live-generation anchoring fixed the false `cur_gen < expected_gen` audit.
+3. Neither change repaired trace/model predicate divergence at speculative
+   TRYWAIT gates that were ready in the hardware capture but not ready in the
+   simulator.
+4. Generation remains audit-only. It neither releases a wait nor repairs missing
+   control flow.
 
-1. **gen은 deadlock을 만들지도 막지도 않았다.** gen 없는 phase-only 최초 버전에서 이미
-   K5가 deadlock했다. gen은 그 deadlock의 원인을 설명하려고 나중에 붙인 audit이다.
-2. **원래 deadlock의 진짜 root cause = immediate-ready fold 누락**(§4). ready인데
-   fold-exit를 안 하고 residual replay → 그 사이 barrier flip → 다음 loop가 not-ready
-   park → 안 오는 flip을 기다려 hang. `51856ab`가 당시 "producer pacing miss"로 본 것을
-   §4가 "producer는 window에 115cyc 먼저 도착, residual replay가 window를 넘겼다"로 정정.
-3. 따라서 deadlock 방지의 주체는 gen이 아니라 **fold가 제때 exit하는 것**(Stage 1)이다.
-
-### K10 clean exit는 Batch A 증거가 아니다 (정정)
-
-K10은 §5대로 **Batch A 이전에도 clean exit + `[FOLDAUDIT]=0`**이었다(barrier window가 넓어
-residual replay가 다음 flip 전에 끝남). 따라서 corrected K10의 clean exit는 Stage 1이
-무언가를 고쳤다는 증거가 될 수 없다. **유일한 증거는 K5**: 예전 deadlock 지점
-(`0x16c20` park→no-flip hang)을 Batch A 수정 후 통과하는지가 판별자다.
-
-### 현재 `.e75` abort가 예전 deadlock이 아니라는 방증
-
-- `.e75`의 `0x16c20` abort는 `path=immediate`, wait_ready=true이고 warp0은 그 barrier에서
-  **한 번도 park하지 않았다**(park 이벤트 0건). 예전 deadlock은 not-ready **park → hang**
-  이었으므로, 지금은 warp가 ready로 통과한다 = **immediate fold 수정이 예전 park→hang을
-  실제로 제거했다는 방증**이다.
-- 남은 abort는 hang이 아니라 gen audit의 오탐(`cur_gen < expected`, single-flip을 여러
-  wait가 반복 관측)일 뿐이다.
-
-### 로그로 확정: Stage 1이 예전 deadlock을 제거했다 (.e75 전수 확인)
-
-K10 clean exit가 아니라 **K5 `.e75`의 `0x16c20` 지점 전수 스캔**으로 확정한다.
-
-| 항목 | 예전 (deadlock, §4 SM29) | 지금 (.e75) |
-|---|---|---|
-| `0x16c20` producer **park** 이벤트 | residual replay 후 park → hang | **0건** (전 SM) |
-| `0x16c20` release+skip | park이 안 풀려 hang | 0건 (park 자체가 없음) |
-| `0x16c20` 통과 방식 | park → no-flip → watchdog abort(cyc 87,962) | **immediate-hit(ready)으로 통과** |
-| `0x16c20` immediate-hit 발생 SM | — | **132개 SM 전부** |
-
-예전 deadlock의 본질은 "`0x16c20`에서 producer가 **park**한 뒤 오지 않는 flip을 기다려
-hang"이었다. `.e75`에는 `0x16c20` park 이벤트가 **단 1건도 없다**(전체 park 2553건은 모두
-다른 barrier). producer는 park 없이 immediate-hit(ready)으로 통과한다. 즉 Stage 1의
-immediate fold 수정이 예전 park→hang(진짜 deadlock)을 제거했다는 **직접 증거**다.
-
-지금 abort는 그 통과 도중 immediate path의 gen audit이 오탐(`cur_gen<expected`)한 것이며,
-skip 실행 전에 abort하므로 `immediate+skip` 이벤트가 남지 않는다(전체 0건). deadlock이
-아니라 audit 계산 결함이다.
-
-### 함의: gen audit 완화의 정당성
-
-gen은 deadlock 방지에 불필요하고(방지는 phase 기반 release + Stage 1 fold-exit가 담당),
-현재는 오탐으로 오히려 "Batch A가 진짜 deadlock을 고쳤는지"의 검증을 막고 있다. 따라서
-gen audit의 `cur_gen < expected` 오탐을 제거해야 K5를 끝까지 돌려 예전 deadlock 지점
-통과를 확인할 수 있다. gen의 유일한 잔존 가치인 `cur_gen > expected`(진짜 double-flip
-= 실제 정확성 결함) 감지는 유지한다.
+K10 clean exit remains a regression check, not evidence that the K5 control-flow
+problem is absent.
 
 ## 확정된 gen audit 규칙 (immediate/park 통일) + S4 로그 점검
 
@@ -1399,29 +1982,20 @@ immediate가 항상 `expected=현재gen`이면, producer가 자기 flip을 놓�
   이들은 실제 결함이 아니라 서로 다른 wait_pc가 같은 barrier를 공유하며 각자 정상 관측한
   패턴이다.
 
-### 결론: 사용자 규칙으로 진행 안전
+### Current conclusion for the live-generation rule
 
-- **하드 위험(false abort / deadlock) = 0**: immediate는 정의상 오탐하지 않고, `0x16c20`/
-  `0x16c60` 오탐이 사라진다.
-- **소프트 위험(S4 미검출)**: 이론적으로만 존재. K5/K10에서 진짜 놓침으로 확인된 사례가 없고
-  (K10 엄격 audit이 clean), 설령 발생해도 abort가 아니라 조용한 미검출이라 실행을 막지 않는다.
-- deadlock 방지(원래 목표: phase release + Stage 1 fold-exit)와 오탐 제거를 모두 달성한다.
-- 임시 분석 스크립트(check_s4.py/check_s4b.py)는 점검 후 삭제했다.
+- The rule successfully removes the known false generation aborts.
+- It is not a deadlock-prevention mechanism and cannot validate a wait whose
+  captured branch result disagrees with the modeled barrier.
+- `.e76` refutes the previous claim that hard deadlock risk was zero after the
+  generation change.
+- The generation rule should remain unchanged while the compound wait-gate
+  control defect is fixed independently.
 
-## 후속 관측 — `.e76`/`.o76` K5 런 (2026-08-14): gen 오탐은 사라졌으나 진짜 park deadlock은 잔존
+## K5 `.e76/.o76`: compound wait-gate control-flow mismatch
 
-gen-audit 규칙 변경(immediate/park 통일, `last_consumed+1` 폐기) 이후 커밋된
-빌드(`f225fa4` "anchor fold expected_gen to live barrier gen")로 K5 fwd 를 다시 돌린
-`.e76`/`.o76` 결과다. 실행 파일:
-`sim_run_12.8/.../H100_80GB-OnlyKernel5/...-63a73d452237.e76`.
-
-### 결과 요약
-
-- **FOLDAUDIT 총 1건**, 종류는 `late_fold_release`가 **아니라 watchdog abort 하나**뿐이다.
-  즉 이전 K5 `.e72`의 231건 `late_fold_release` + gen 오탐(`cur_gen<expected`)은 **모두
-  사라졌다** → 규칙 변경의 오탐 제거 목표는 실제로 달성됐다.
-- 그러나 **`0x16c20` / `wait_pc=0xb0b0` 의 진짜 park deadlock은 그대로 남아** SIGABRT(signal 6)
-  로 죽었다. 이어진 signal 11은 abort 이후 teardown에서 뒤따른 것.
+The K5 run using commit `f225fa4` contains one `[FOLDAUDIT]`, and it is the SM62
+watchdog rather than a generation false positive or late-release continuation.
 
 ```
 [FOLDAUDIT][SM62] cyc=86170 warp=0 role=producer cta=0 global_cta=62
@@ -1432,32 +2006,165 @@ gen-audit 규칙 변경(immediate/park 통일, `last_consumed+1` 폐기) 이후 
     — model gap (never force-release).
 ```
 
-### SM62 barrier `0x16c20` timeline (self-deadlock 확정)
+### Corrected SM62 causal chain
 
 ```
-cyc=45770  arrive warp=15 pc=0x8240 -> phase flip gen 0->1   (producer 자신이 flip)
-cyc=53815  arrive warp=15 pc=0x8240 -> phase flip gen 1->2   (producer 자신이 flip)
-cyc=54169  [FOLD] park warp=0 wait_pc=0xb0b0 expected_gen=3 barrier_gen=2
-           (이후 flip 없음 -> gen 2에서 정지)
-cyc=86170  watchdog abort (parked_cyc=32001 > threshold 32000)
+cyc=44882  warp15 TRYWAIT observes 0x16c58 not-ready
+cyc=45770  warp15 pc=0x8240 ARRIVE flips 0x16c20 gen 0->1
+cyc=46123  modeled 0x16c58 gate finally flips
+
+cyc=52910  warp15 TRYWAIT observes 0x16c50 not-ready
+cyc=53060  modeled 0x16c50 gate flips
+cyc=53815  warp15 pc=0x8240 ARRIVE flips 0x16c20 gen 1->2
+
+cyc=54169  warp0 parks at 0xb0b0 with expected_gen=3, barrier_gen=2
+cyc=86170  watchdog aborts; no third 0x16c20 ARRIVE exists
 ```
 
-- `0x16c20`은 producer **자신의 arrive**(`pc=0x8240`)로만 flip된다 (총 2 flip). gen=3을 만들려면
-  producer가 세 번째 arrive를 해야 하는데, 그 전에 같은 producer가 `0xb0b0`에서 gen=3을
-  기다리며 park된다 → **자기 자신을 막는 self-deadlock**. force-release 금지 정책에 의해 abort.
-- 이는 progress 문서 Opt-12의 "K5 deadlock 근본원인(`0x16c20`, `0xb0b0`↔gen, gen1→gen2 window,
-  21/132 poison CTA)"과 **동일한 결함**이다. gen-anchor 커밋은 audit 오탐만 제거했을 뿐
-  **park 진입 조건 자체(fold가 producer를 자기 flip 전에 park시킴)는 고치지 못했다.**
+Warp 0 is the waiter and warp 15 is the only arriver; they are different warps.
+`barrier_self_tied` is a SASS scoreboard-safety property and does not mean that
+the mbarrier wait and arrive belong to one warp. The old "self-deadlock" wording
+and the proposal to bypass a not-ready `0xb0b0` wait were incorrect.
 
-### 함의
+### Static control flow that the dynamic trace did not capture
 
-1. **규칙 변경은 성공적이나 불충분**: 오탐(`cur_gen<expected`) 및 `late_fold_release`는 0으로
-   내려갔다. 남은 유일한 이벤트가 진짜 deadlock이라는 점에서, 이제 이 abort는 **audit 계산
-   결함이 아니라 fold semantic의 실제 결함**으로 확정된다 (Summary의 "그 결과로도 남는
-   `[FOLDAUDIT]`만 유효한 증거로 취급한다"는 기준 충족).
-2. **다음 root cause = park 진입 시점**: producer가 자기가 flip시켜야 할 barrier(`0x16c20`)의
-   *다음* generation을 기다리며 fold-park 하는 것이 문제. `0x16c20`처럼 **wait 주체와 flip
-   주체가 같은(self-tied, producer-only-arrive) barrier**는 `foldable` 게이트에서 제외하거나,
-   park 대신 fold-exit(residual skip)로 즉시 통과시켜야 한다.
-3. **이전 assert cycle 통과 여부**: park 시작 `cyc=54169`, abort `cyc=86170`. progress 문서의
-   과거 K5 deadlock(@85,333)과 사실상 동일 지점 — **통과하지 못했다.**
+The fast speculative gate is:
+
+```text
+0x74e0  TRYWAIT P1, barrier, state
+0x74f0  @P1  BRA 0x7520
+0x7500  TRYWAIT P1, barrier, state
+0x7510  @!P1 BRA 0xaf90
+0x7520  captured continuation
+```
+
+If both speculative checks fail, hardware uses this out-of-line fallback:
+
+```text
+0xaf90  pure address setup
+0xafb0  pure address setup
+0xafc0  TRYWAIT P1, barrier, state
+0xafd0  @!P1 NANOSLEEP
+0xafe0  @!P1 PHASECHK P1, barrier, state
+0xaff0  @!P1 BRA 0xafb0
+0xb000  BRA 0x7520
+```
+
+TRYWAIT and PHASECHK are nonblocking predicate tests. Neither instruction blocks
+the warp by itself. Hardware waits because the predicate-controlled branch
+repeats the tests, with NANOSLEEP as backoff, until the phase differs from the
+wait state.
+
+Hardware observed `0x74e0` ready in the captured execution, so the dynamic trace
+contains the `0x7520` fast path and zero visits to the `0xaf90` fallback. The
+sidecar does contain static region `k_fid3_h0xafb0`, but dynamic validation records
+`warp_visits=0`, `is_spin_loop=false`, and `foldable=false`.
+
+The simulator recomputes the mbarrier result in `handle_sync_instruction()`, but
+only a dynamically validated foldable primary wait is allowed to park. A miss at
+`0x74e0/0x7500` therefore clears the pending wait and continues along the captured
+ready branch. The modeled miss does not drive the captured predicate or branch.
+
+### Full-run evidence
+
+- All 17 poison CTAs execute only 0 or 1 mainloop iterations between the two
+  coarse `0x8240` ARRIVEs.
+- No CTA with 3 or more iterations is poisoned.
+- The gen1-to-gen2 window averages 7,617 cycles for poison CTAs and 13,432 cycles
+  for successful CTAs.
+- Approximately 89% of that window difference occurs before the final
+  `0x16c50` TMA gate. It comes from causal tile-dependent compute count, not TMA
+  completion attribution.
+- In SM62, the two modeled gate misses omit 1,241 and 150 cycles of wait,
+  respectively. Their sequential sum is 1,391 cycles versus a 354-cycle missed
+  edge.
+- A conservative additive estimate places 13 of the 17 poison CTAs back inside
+  the gen1 window. This is sizing evidence, not a substitute for rerunning the
+  simulator because scheduling will change after the fix.
+
+The short causal-tile path is legitimate. The defect is that the simulator lets
+that path overlap work with a wait that hardware would have taken through the
+fallback loop.
+
+### Design alternatives
+
+#### Option A: targeted sidecar `WaitBlockRecord` plus runtime gate park
+
+Extend static analysis beyond backward spin loops and emit one compound wait
+block only when all of the following are proven:
+
+- speculative wait PCs use the same barrier and wait-state operands;
+- failed checks have one alternate path;
+- the alternate path contains only wait observations, delay-only backoff, pure
+  loop-local address setup, and control flow;
+- no memory, TMA, mbarrier mutation, fence, semantic compute, nondeterministic
+  read, or live-out definition exists;
+- the fallback has one continuation and rejoins the captured path at `resume_pc`.
+
+Proposed record:
+
+```text
+WaitBlockRecord:
+  entry_wait_pc        = 0x74e0
+  all_gate_wait_pcs    = [0x74e0, 0x7500]
+  captured_next_pc     = 0x74f0
+  fallback_entry_pc    = 0xaf90
+  fallback_wait_pcs    = [0xafc0, 0xafe0]
+  fallback_loopback_pc = 0xaff0
+  resume_pc            = 0x7520
+  allowed_block_pcs    = all wait-only PCs on paths A/B/C
+  wait_condition       = same barrier + same wait-state value
+  fallback_effect_safe = true
+```
+
+The sidecar schema must be bumped so startup validation cannot silently load an
+old sidecar without the required wait block. The existing full dynamic trace is
+reused; only sidecar metadata is regenerated.
+
+Runtime behavior:
+
+1. Enter one logical visit at `entry_wait_pc`.
+2. Ready entry: keep the current TRYWAIT, then fold the residual captured A/B/C
+   path to `resume_pc`.
+3. Not-ready entry: pin the expected generation and park before any younger
+   issue.
+4. Release only when phase readiness and generation audit both pass.
+5. On release, fold the residual captured A/B/C path to `resume_pc`.
+6. Do not synthesize an uncaptured fallback; skip a captured fallback only after
+   modeled readiness has completed the logical wait.
+7. Keep compound and legacy-spin counters separate during Stage 1.8 diagnosis;
+   Stage 1.9 merges them into block-kind-qualified WaitBlock counters.
+
+This normalizes all captured outcomes to one event-based logical wait without
+inventing semantic work.
+
+#### Option B: globally make TRYWAIT blocking
+
+Reject this option. TRYWAIT is architecturally a nonblocking predicate test.
+Globally parking every not-ready TRYWAIT would erase valid timeout, fallback,
+single-check, and speculative-control behavior. Updating the predicate globally
+is also unsafe in a trace-driven simulator because an untaken branch body may not
+exist in the dynamic trace.
+
+#### Recommendation
+
+Use Option A. The user's "treat the leading TRYWAIT and fallback loop as one wait
+block" model is the correct abstraction, but it should be represented as a
+compound wait block rather than pretending that `0x74e0` is a conventional loop
+head. Runtime still performs the real phase check at TRYWAIT; the sidecar supplies
+the proof that replacing the uncaptured alternate path with a park is safe.
+After focused validation, Stage 1.9 uses the same abstraction for captured spin
+loops and removes the legacy spin-fold implementation.
+
+### Verification for the targeted fix
+
+1. Bootstrap prints exactly one K5 wait block with the PCs above.
+2. Feature-off execution is bit-identical.
+3. A ready `0x74e0` folds its residual captured A/B/C path to `0x7520`.
+4. A not-ready block entry parks once, releases once, and folds to `0x7520`.
+5. SM62 cannot issue the first `0x8240` ARRIVE before the modeled gate release.
+6. Parks equal releases per WaitBlock kind at clean exit.
+7. No semantic work is synthesized or skipped; only wait-block control/backoff
+   entries are removed.
+8. Generation overshoot and watchdog remain hard aborts.
+9. K5 completes with zero `[FOLDAUDIT]`; K10 remains clean.
