@@ -1,225 +1,741 @@
-# FA3 bwd — Stall-Reason Alignment (Sim vs HW NCU)
+# FA3 bwd - Stall-Reason Alignment (Sim vs HW NCU)
 
-Goal: the FA3 bwd kernel now matches HW on **total cycles** (HW 132,901 vs sim
-134,817, +1.4%), but this document audits whether the **stall-reason
-distribution** also matches HW. It separates two distinct questions:
+## 0. Corrected conclusion
 
-1. **Metric (labeling) problem** — does the sim classify a warp's stall into the
-   same NCU bucket HW would?
-2. **Implementation problem** — after the labels are made HW-consistent, what
-   residual distribution difference remains? That residual is a genuine
-   simulation-model error, not a reporting artifact.
+The FA3 bwd kernel matches HW closely in total cycles:
 
-Bottom line: **the labeling is essentially correct; the residual is an
-implementation problem** — the sim holds warps on functional-unit (FU)
-throughput **6.6× more** than HW.
+- HW: `132,901` cycles
+- Sim `.o48`: `134,817` cycles (`+1.44%`)
+
+The previous version of this document concluded that stall labeling was
+essentially correct and that the simulator had a proven `6.6x` FU-throughput
+implementation error. **That conclusion is retracted.**
+
+The current measurements compare two different state definitions:
+
+- HW `smsp__average_warps_issue_stalled_*_per_issue_active` assigns one
+  highest-priority state to each active warp each cycle. The states are
+  mutually exclusive and include `selected` and `not_selected`.
+- The sim `ncu_stall_*` stack is a set of overlapping per-scheduler-cycle
+  boolean-OR conditions.
+- The sim `overlap_instrument` probe is per valid-head warp-cycle, but its
+  reasons are also overlapping and it does not cover every active-warp state.
+
+Consequently, sim `fu_any = 3.260` and HW
+`gmma + math_pipe_throttle = 0.490` are **not definition-matched values**.
+The reported `6.6x` ratio does not prove an FU timing-model error.
+
+The first problem to solve is the stall metric itself: construct a complete,
+mutually exclusive per-active-warp state accounting and preserve the
+provenance of trace-mode dependencies. Only the residual after that correction
+can be called an implementation error.
+
+The shared-memory `gpgpu_n_shmem_bkconflict` mismatch is also a metric-semantics
+problem, but a different one. Its `37-135x` raw ratio to HW must not be read as
+a `37-135x` timing error. Section 7 defines a timing-neutral metric fix.
 
 ---
 
-## 1. Kernel identity (verified)
+## 1. Kernel identity
 
-The progress notes call this "kernel 10 bwd"; the NCU report calls it **ID 9**.
-They are the **same kernel** — the off-by-one is only because NCU numbers all
-kernels of the process from 0 (9 earlier rng/fill/reduce/preprocess kernels
-precede it).
+The progress notes call this kernel 10; NCU calls it ID 9. They are the same
+kernel. NCU numbers all launches in the process from zero, while the sim filter
+uses the trace kernel ID.
 
 Evidence:
-- Sim launch name (`.o48` line 527) and NCU ID 9 name are **identical incl.
-  template args**:
-  `FlashAttnBwdSm90<CollectiveMainloopBwdSm90<2,2,2,...,C<128>,C<128>,C<64>,bfloat16_t,float,Sm90,1,0,0,0,0,1,0,0,2,1,2,2,0>, CollectiveEpilogueBwd<...,256,0,0,1>, SingleTileBwdLPTScheduler<0,128,0>>`
-- Sim: `-filter_first/last_kernel_id = 10`, `trace_kernel_id: 10`, `CTA/core=1
-  limited by shmem regs`, 12 warps/CTA.
-- NCU ID 9: `gpc__cycles_elapsed.max = 132,901`, grid (384,1,1), block (384,1,1)
-  = 12 warps/CTA.
-- (For reference NCU ID 4 = 67,696 cyc = the fwd "kernel 5".)
 
-Run under audit: sim `.o48` (Opt-12 spin-wait-fold, `gpu_sim_cycle = 134,817`).
-NCU report: `/modern-gpu-simulator-micro-2025/nv_reports/h100/flashattn-fa3-bf16-bwd-causal-b1-s2048-hd64-nh24_full_rpt.ncu-rep`
-(inside `gpu-sim` docker; `ncu` at `/usr/local/cuda-12.8/bin/ncu`).
+- Sim and NCU names have identical template arguments.
+- Sim uses `-filter_first_kernel_id 10` / `-filter_last_kernel_id 10`.
+- Both launches have grid `(384,1,1)`, block `(384,1,1)`, and 12 warps/CTA.
+- Both are limited to one CTA/SM by registers/shared memory.
 
----
+Run under audit:
 
-## 2. How each side is obtained
-
-- **Sim**: the sim already emits an NCU-aligned stall stack in `shader.cc`
-  ([shader.cc:1653-1725](../simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/shader.cc#L1653-L1725)),
-  `ncu_stall_<reason>` + `_pct`, one line per NCU reason. `.o48` lines 7968+.
-- **HW**: `smsp__average_warps_issue_stalled_<reason>_per_issue_active.ratio`,
-  extracted from NCU ID 9 via
-  `ncu -i ... --page raw --csv --launch-skip 9 --launch-count 1 --metrics ...`.
-
-### 2a. The `mma` vs `gmma` naming (corrected)
-
-HW **does** have a tensor-core stall reason; on Hopper it is named **`gmma`**
-(`smsp__average_warps_issue_stalled_gmma_per_issue_active.ratio`), not `mma`.
-An earlier claim that "HW has no mma stall" was wrong — it was queried under the
-wrong name. So the sim's `mma` line (tensor-pipe busy) maps to HW `gmma`.
+- Sim:
+  `simulator-remodeled/sim_run_12.8/flashattn-fa3-bf16-bwd-causal-b1-s2048-hd64-nh24/.../H100_80GB-OnlyKernel10/*.o48`
+- HW:
+  `nv_reports/flashattn-fa3-bf16-bwd-causal-b1-s2048-hd64-nh24_full_rpt.ncu-rep`
 
 ---
 
-## 3. Distribution comparison (each side normalized to 100%)
+## 2. Macro timing and issue density already align
 
-Note on normalization: HW ratios are warp-cycles-per-issued-inst (sum = CPI).
-The sim's `ncu_stall_*_pct` are % of total scheduler cycles and its per-reason
-flags are a per-cycle boolean-OR (reasons overlap, sum ≈ 152.8%). So the table
-below normalizes **each side to 100%** and compares **shape vs shape**, not
-absolute %.
+The cycle match is supported by matched work and issue density, not just by the
+final elapsed-cycle scalar.
 
-| reason | HW % | Sim % | verdict |
-|---|---:|---:|---|
-| barrier | 17.4 | 12.0 | close |
-| long_scoreboard | **19.8** | 7.9 | **sim under** |
-| short_scoreboard | 8.5 | 0.1 | **sim ≈ 0** |
-| wait | 10.4 | 5.4 | sim under |
-| gmma (mma) | 5.3 | 10.5 | sim ~2× over |
-| **math_pipe_throttle** | **1.2** | **25.3** | **sim massively over** |
-| mio_throttle | 6.3 | 0.1 | sim under |
-| no_instructions | 1.5 | 6.7 | sim over (L1I frontend) |
-| sleeping | 4.4 | 1.7 | sim under |
-| dispatch_stall | 4.5 | 0.6 | sim under |
-| not_selected | 5.4 | 9.4 | close |
-| selected (issued) | 13.3 | 20.3 | sim over |
-| imc_miss | 1.3 | 0.1 | sim under |
-| branch_resolving | 0.8 | 0.0 | (no branch unit in trace sim) |
-| drain/membar/lg/tex/misc | ~0 | 0 | match |
+| quantity | HW | Sim `.o48` | sim/HW |
+|---|---:|---:|---:|
+| elapsed cycles | 132,901 | 134,817 | 1.0144 |
+| issued warp instructions | 19,993,658 | 19,911,524 | 0.9959 |
+| issued inst / scheduler / elapsed cycle | 0.284925 | 0.279722 | 0.9817 |
+| issue slots busy | 32.07% | 31.07% | contextual; denominator audit still required |
+| eligible warps / scheduler | 0.46 | 0.4546 | contextual; sim tail scan is approximate |
 
-The single dominant discrepancy is the **compute/pipe axis**: sim
-`math_pipe_throttle`(25.3) + `mma`(10.5) = **35.8%** vs HW
-`gmma`(5.3) + `math_pipe`(1.2) = **6.5%**.
+The matched-basis identity is:
+
+```text
+cycle ratio
+= work ratio x inverse issue-density ratio
+= 0.995892 x 1.018601
+= 1.014417
+```
+
+This does not prove that every internal timing mechanism is correct. Different
+modeling errors can compensate. It does show that the aggregate scheduler
+readiness behavior is already close, so a claimed large internal error requires
+stronger evidence than the current overlapping reason counters.
+
+The sim's printed `ncu_no_eligible_pct = 68.93%` is intentionally not included
+as a matched metric. It is currently computed as
+`100% - ncu_issue_slots_busy_pct`, so it also includes non-issue causes other
+than "zero eligible warps." SR-M0 must replace this proxy with a direct
+per-scheduler eligible-warp population.
 
 ---
 
-## 4. Where the sim decides the label (code)
+## 3. Why the old distribution comparison was invalid
 
-Mapping in `shader.cc`
-([shader.cc:1682-1704](../simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/shader.cc#L1682-L1704)):
+### 3.1 HW warp states are mutually exclusive
 
-```
-math_pipe_throttle <- fu_occ_sfu + fu_occ_sp_int_dp   // SFU + SP/INT/DP pipe busy
-mma                <- fu_occ_tensor                    // tensor pipe busy
-long_scoreboard    <- wait_barrier + tma_flush
-short_scoreboard   <- scoreboard + l1c
-wait               <- stall_count
-mio_throttle       <- result_queue_full
-barrier            <- inst_barrier + mbarrier_spin
-```
+On each cycle, each active HW warp reports one highest-priority state. A warp
+that issues reports `selected`; another eligible warp reports `not_selected`;
+an ineligible warp reports one stall reason.
 
-The `fu_occ_*` flags are set in the issue scan
-([subcore.cc:960-993](../simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/subcore.cc#L960-L993)),
-gated on `!is_fu_available` where
-([subcore.cc:758-773](../simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/subcore.cc#L758-L773)):
+For NCU ID 9, the raw states in Section 9 sum to:
 
-```
-is_fu_available = fu->can_issue(pI);   // false iff the FU is still counting
-                                       // down a prior op's initiation_interval (II)
+```text
+sum(HW states) = 7.539490 warp-cycles / issued instruction
 ```
 
-So `fu_occupied` is **purely a pipe-throughput (II) wait** — which is exactly
-what HW's `gmma` / `math_pipe_throttle` mean. **The label is conceptually
-correct.** (It is NOT a data-dependency/scoreboard wait, so the earlier idea of
-re-routing it to `short_scoreboard` was wrong and is retracted.)
+NCU reports `Warp Cycles Per Issued Instruction = 7.53`. The small difference
+is rounding. This conservation is direct evidence that these HW values form an
+exclusive state accounting.
 
-Stall flags are non-exclusive (a warp missing several conditions increments
-several buckets), matching how NCU's own `smsp__pcsamp` reasons overlap.
+Reference:
+<https://forums.developer.nvidia.com/t/stall-reasons-summation-is-not-100/168096/7>
+
+### 3.2 Sim `ncu_stall_*` is not the same axis
+
+The `shader.cc` block emits:
+
+```text
+ncu_stall_<reason> = cycles where at least one warp met that condition
+```
+
+Reasons can overlap in one scheduler cycle. The denominator is evaluated
+scheduler cycles, not issued instructions or active warp-cycles. Normalizing
+this stack to 100% does not make it equivalent to the HW state vector.
+
+Therefore the old shape table, which normalized the HW exclusive vector and
+the sim overlapping vector independently, has been removed.
+
+### 3.3 Sim `overlap_instrument` is closer, but still not matched
+
+The probe in
+`subcore.cc` counts every valid-head, non-issuing warp and independently tests:
+
+```text
+wait_barrier
+stall_count
+yield
+fu_tensor / fu_sfu / fu_other
+traditional scoreboard
+```
+
+A warp can increment several reasons in one cycle. In particular,
+`!is_fu_available` is recorded even when another condition already prevents
+the warp from issuing.
+
+The probe also omits active warps without a valid head from its reason vector.
+Its coverage check is:
+
+| sim state population | warp-cycles / issued inst |
+|---|---:|
+| selected | 1.000000 |
+| not_selected | 0.463233 |
+| valid-head non-issuing (`stalled_any`) | 4.507599 |
+| **covered total** | **5.970832** |
+| HW active-warp state total | **7.539490** |
+
+The missing `1.568658` warp-cycles/inst include states that the current probe
+does not represent on the same per-active-warp axis. No per-reason comparison
+is definition-complete until this conservation gap is closed.
 
 ---
 
-## 5. Metric vs implementation — the decisive measurement
+## 4. Reinterpretation of the FU counters
 
-The sim already carries a **definition-matched** probe,
-`-overlap_instrument_enable`
-([subcore.cc:838-877](../simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/subcore.cc#L838-L877)):
-per-warp warp-cycle counters on the **same basis** as HW's
-`per_issue_active` (each stalled valid-head warp contributes 1 warp-cycle to its
-reason; denominator = issued warp-insts `gpgpu_n_tot_w_icount`). Values from
-`.o48` (denominator `gpgpu_n_tot_w_icount = 19,911,524`):
+The raw `.o48` probe values remain useful as **condition-incidence**
+diagnostics:
 
-| sim warp-cyc counter | raw | /issued (HW-basis) |
+| sim condition | raw warp-cycles | / issued |
 |---|---:|---:|
-| `fu_tensor` | 17,294,182 | **0.869** |
-| `fu_sfu` | 30,161,607 | **1.515** |
-| `fu_other` | 17,447,082 | **0.876** |
-| `fu_any` (sum) | 64,902,871 | **3.260** |
+| `fu_tensor` | 17,294,182 | 0.869 |
+| `fu_sfu` | 30,161,607 | 1.515 |
+| `fu_other` | 17,447,082 | 0.876 |
+| `fu_any` | 64,902,871 | 3.260 |
 | `wait_barrier` | 5,045,807 | 0.253 |
 | `stall_count` | 7,153,010 | 0.359 |
 | `yield` | 2,124,036 | 0.107 |
-| `scoreboard` | 0 | 0.000 |
 
-Directly comparable to HW ID 9:
+They do **not** yet answer how often FU availability was the warp's exclusive
+or highest-priority blocker. The required split is:
 
-| axis | HW ratio | Sim ratio | sim/HW |
-|---|---:|---:|---:|
-| **FU-throughput total** (HW `gmma`+`math_pipe` vs sim `fu_any`) | **0.490** | **3.260** | **6.6×** |
-| ├ tensor (HW `gmma` vs sim `fu_tensor`) | 0.398 | 0.869 | 2.2× |
-| ├ SFU (in HW `math_pipe`) vs sim `fu_sfu` | — | 1.515 | (dominant) |
-| └ SP/INT/DP (in HW `math_pipe`) vs sim `fu_other` | — | 0.876 | — |
-| long_scoreboard | 1.491 | 0.000 (trace mode) | sim ~0 |
-| mio_throttle | 0.474 | (folded, ~0) | sim ~0 |
-
-This is on **identical basis**, so it is not a normalization artifact.
-
----
-
-## 6. Conclusions
-
-### 6a. Metric (labeling) problem — essentially NONE
-- `fu_occupied → math_pipe_throttle / mma` is the correct NCU bucket
-  (FU II wait == HW `gmma`/`math_pipe_throttle`). No re-routing to
-  scoreboard/wait is warranted.
-- Minor precision nit only: the sim could split `fu_tensor` into its own HW-named
-  `gmma` line (already effectively done via the `mma` line) and keep
-  `fu_sfu + fu_other` as `math_pipe_throttle`. This refines the two labels but
-  **does not change the distribution conclusion** — the totals are already what
-  they are.
-- The one genuine label limitation is `scoreboard = 0` and `mio_throttle ≈ 0`:
-  in trace mode the traditional scoreboard is off
-  ([subcore.cc:736-744](../simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/subcore.cc#L736-L744)),
-  so the sim never *produces* a `long_scoreboard`/`short_scoreboard`/`mio_throttle`
-  event to label. That is not a mislabel — it is reason 6b.
-
-### 6b. Implementation problem — the real cause
-- Sim holds warps on FU throughput **6.6× more** than HW (`fu_any` 3.26 vs 0.49),
-  dominated by **SFU** (`fu_sfu` 1.515).
-- Meanwhile HW spends its stalls on **data-wait axes the sim barely produces**:
-  `long_scoreboard` 1.49 (global-load result wait) and `mio_throttle` 0.47
-  (shared/MIO queue) — sim ≈ 0 on both.
-- Interpretation: HW hides FU-throughput latency by **staggering its 12 consumer
-  warps across pipe stages**, so a warp's stall surfaces as "waiting for its
-  load/shared result" (scoreboard/mio). The sim runs 1 CTA/SM with the 12
-  consumer warps in **lockstep**, so they all present their head to the same
-  SFU/tensor pipe at once and pile up as "FU busy" (II countdown). Same total
-  wait, wrong axis.
-- This is the **exact axis already identified and deferred** in
-  `FA3_progress.md` as *"consumer-warp lockstep / pipe-overlap absence"* and in
-  [WARP_STAGGER_LOCKSTEP.md](WARP_STAGGER_LOCKSTEP.md) /
-  [CONSUMER_COMPUTE_BOUND.md](CONSUMER_COMPUTE_BOUND.md). Total cycles matched
-  only because other corrections (spin-fold etc.) compensated; the stall *shape*
-  still reflects the lockstep.
-
-### 6c. Do we need a new metric / re-run?
-- **Not required to reach the above conclusion** — the `overlap_instrument`
-  probe already gives the HW-basis split, and `.o48` contains it.
-- Optional (labeling-only) follow-up: emit the HW-basis `fu_tensor/fu_sfu/fu_other`
-  ratios directly in the `ncu_stall_*` block so the reported stack lines up 1:1
-  with HW without hand-computation. Timing-neutral. Would NOT close 6b.
-
----
-
-## 7. Open next steps (implementation axis, if pursued)
-
-1. Confirm the lockstep mechanism quantitatively: run with
-   `-mufu_lockstep_instrument_enable` and read `head_mufu / valid_head`
-   (≈1 ⇒ lockstep) plus `nonsfu_{wait_barrier,stall_count,scoreboard}` from the
-   `total_num_mufu_lockstep_*` counters.
-2. Cross-check whether the 6.6× is II magnitude vs pile-up: compare the
-   `[LATCFG]` II values (`sfu`, `tensor`, `tensor_init`) against HW instruction
-   throughput (NCU `sm__pipe_*_cycles_active` / inst-executed). Prior notes hold
-   SFU II=8 and the tensor rate as HW-faithful, which would make the 6.6× a
-   pile-up (lockstep) effect, not a per-op-cost error.
-
-## 8. Raw HW numbers (NCU ID 9, per_issue_active.ratio)
-
+```text
+FU-only
+FU + dependency
+FU + barrier/park
+FU + frontend/other
 ```
+
+Only `FU-only` is priority-independent evidence that the target pipe itself
+prevented issue. Multi-blocker states require an NCU-consistent priority rule
+or must remain explicitly ambiguous.
+
+### 4.1 `fu_occupied -> math_pipe/gmma` is conditional, not globally proven
+
+When FU unavailability is the primary reason, the target-pipe mapping is
+conceptually reasonable:
+
+```text
+tensor target      -> gmma
+SFU/SP/INT/DP target -> math_pipe_throttle
+```
+
+The error was not the target-pipe name. The error was treating every
+simultaneous `!is_fu_available` observation as if HW would necessarily choose
+that FU state over all other unmet conditions.
+
+### 4.2 `.o48` does not confirm the old lockstep claim
+
+On still-idle cycles with at least one SFU-head warp:
+
+| valid-head class | raw | share |
+|---|---:|---:|
+| MUFU/SFU | 25,100,722 | 67.93% |
+| tensor | 3,280,144 | 8.88% |
+| other | 8,568,760 | 23.19% |
+
+`head_mufu / valid_head` is `0.679`, not approximately one. This shows an
+SFU-heavy head population, but it does not show that every available warp was
+at the same MUFU stage.
+
+The SM-level execution-overlap probe also shows substantial simultaneous
+tensor/SFU activity:
+
+| pipe state | cycles | share of classified cycles |
+|---|---:|---:|
+| tensor and SFU | 9,419,510 | 57.25% |
+| tensor only | 942,415 | 5.73% |
+| SFU only | 2,175,734 | 13.22% |
+| neither | 3,914,787 | 23.79% |
+
+Consumer phasing can remain a hypothesis, but `.o48` does not establish it as
+the explanation for a `6.6x` FU error. Earlier launch-stagger and GTLRR tests
+also produced only small effects and must not be cited as positive proof.
+
+---
+
+## 5. Mapping audit: known unsupported folds
+
+| emitted sim label | current source | corrected status |
+|---|---|---|
+| `gmma` (`mma`) | tensor FU unavailable | plausible only for exclusive/primary FU blocker |
+| `math_pipe_throttle` | SFU + SP/INT/DP FU unavailable | plausible only for exclusive/primary FU blocker |
+| `long_scoreboard` | `wait_barrier + tma_flush` | unsupported many-to-one fold |
+| `short_scoreboard` | traditional scoreboard + L1C | incomplete in trace mode |
+| `mio_throttle` | result queue full | not an NCU MIO-input-queue model |
+| `barrier` | instruction barrier + folded mbarrier park | fold changes the represented HW state sequence |
+| `wait` | trace `stall_count` | approximate; compiler-control timing is not an HW reason identity |
+| `no_instruction` | per-scheduler no-valid cycle | not yet a per-active-warp state |
+
+### 5.1 `wait_barrier` is not synonymous with long scoreboard
+
+The definition-matched probe splits `.o48` `wait_barrier` warp-cycles as:
+
+| arming class | warp-cycles | share |
+|---|---:|---:|
+| tensor | 0 | 0.00% |
+| TMA | 108,719 | 2.15% |
+| other | 4,937,088 | 97.85% |
+| total | 5,045,807 | 100% |
+
+Folding all of this into `long_scoreboard` is not justified. `other` is too
+coarse: it can contain arithmetic, conversion, control, shared-memory, or
+other SASS scoreboard dependencies. The arming provenance must be extended
+before assigning an NCU reason.
+
+### 5.2 Trace mode removes dynamic scoreboard provenance
+
+With `-is_remodeling_scoreboarding_enabled 0`, readiness is reconstructed from
+SASS control fields (`wait_barrier`, `stall_count`, yield) plus modeled
+functional-unit and barrier state. This can reproduce aggregate issue timing
+without preserving the physical HW source that NCU uses to name the state.
+
+The correct response is not to add arbitrary scoreboard latency on top of the
+matched cycle count. First recover provenance for the waits already present.
+
+### 5.3 Spin folding changes stall-state shape
+
+HW executes a polling sequence such as `PHASECHK/TRYWAIT`, `NANOSLEEP`, and
+`BRA`. During that interval its warp can report selected, wait, sleeping,
+scoreboard, or branch-related states.
+
+The fold model parks the warp until modeled mbarrier readiness and records that
+interval primarily as `mbarrier_spin -> barrier`. This is a valid timing
+abstraction, but not a state-by-state reproduction of the executed polling
+loop. Folded park cycles must be reported separately until a validated shadow
+state model exists.
+
+---
+
+## 6. Correct stall-metric implementation plan
+
+No timing-model parameter should be changed from the current stall stack.
+
+### Stage SR-M0A - complete active-warp population (timing-neutral)
+
+For every active warp every cycle, record exactly one population entry:
+
+```text
+selected
+eligible_not_selected
+no_valid_instruction
+drain
+fold_parked
+blocked_with_valid_head(mask)
+```
+
+Do not extend the existing `tail_readonly` counter path. It evaluates tail
+warps after the winner has issued, so the winner can already have changed FU
+availability and result-queue state. It also forces the side-effecting
+programmer-barrier and TMA-flush checks to ready. Those observations cannot
+form an exact HW-style state vector.
+
+Capture a cycle-start readiness snapshot after `modify_warp_state()` has
+applied dependency decay and serviced fold releases, but before the issue loop
+can select a winner:
+
+```cpp
+void Subcore::issue(SM *shared_sm) {
+  modify_warp_state();
+
+  StallCycleSnapshot snapshot;
+  if (m_config->stall_reason_align_instrument_enable) {
+    snapshot = capture_pre_issue_snapshot(shared_sm);
+  }
+
+  // Existing scheduling and issue path remains unchanged.
+  run_existing_issue_path_and_record_winner();
+
+  if (m_config->stall_reason_align_instrument_enable) {
+    finalize_stall_snapshot(snapshot, issued_warp_id);
+  }
+}
+```
+
+An active warp is `warp != nullptr && !warp->done_exit()`. A warp whose trace
+has drained but whose architectural resources have not retired belongs to
+`drain`, not frontend `no_instruction`.
+
+The snapshot needs pure, non-mutating SM queries:
+
+```text
+peek_named_barrier_wait(warp_id)
+peek_fold_park(warp_id)
+peek_membar_wait(warp_id)
+peek_grid_barrier_wait(warp_id)
+peek_tma_flush_wait(warp_id, inst)
+```
+
+`peek_membar_wait()` may inspect pending stores but must never clear the
+membar, invalidate a cache, update watchdog maps, or emit an episode log.
+`peek_tma_flush_wait()` may inspect outstanding store-class TMA transfers but
+must not mutate `m_warps_waiting_tma_flush`.
+
+L1C readiness currently uses the mutating `read_only_cache::access()` path. Add
+a pure tag/MSHR/resource probe if it can reproduce the same ready predicate. If
+that cannot be proven, record `l1c_unknown` instead of treating a tail warp as
+ready and inflating `not_selected`.
+
+Required per-cycle invariants:
+
+```text
+selected
++ eligible_not_selected
++ no_valid_instruction
++ drain
++ fold_parked
++ blocked_with_valid_head
+== total active warp-cycles
+
+selected <= 1
+selected + eligible_not_selected == eligible_warps
+```
+
+After division by issued instructions, the population sum must reconstruct the
+sim's own `warp_cycles_per_issued_instruction`. This is the mandatory gate
+before comparing reason distributions.
+
+Any disagreement between the pre-issue snapshot and the actual winner is a
+metric implementation bug. Emit the warp/PC/mask and hard-abort rather than
+continuing with corrupted statistics.
+
+### Stage SR-M0B - blocker-mask accounting (timing-neutral)
+
+For every non-parked `blocked_with_valid_head` warp, record a blocker bit mask
+from the same pre-issue snapshot:
+
+```text
+yield
+stall_count
+SASS wait_barrier
+named barrier
+membar
+grid barrier
+TMA flush
+FU tensor
+FU SFU
+FU SP/INT/DP
+traditional scoreboard
+L1C
+result queue
+issue port busy
+ISSUE_CONTROL full
+frontend
+```
+
+Fold parking is a terminal population state in SR-M0: do not inspect the
+future head's FU and double-count a parked warp as FU-blocked.
+
+Classify masks without inventing an HW priority:
+
+```text
+popcount(mask) == 1 -> sole blocker
+popcount(mask) > 1  -> explicit multi-blocker mask
+mask == 0           -> eligible_not_selected, unless it is the winner
+```
+
+`FU-only` by target pipe is the first priority-independent quantity that can
+be compared with HW `gmma`/`math_pipe_throttle`.
+
+The hot path must not perform string-keyed `m_stats_map` lookups per warp.
+Represent conditions with a numeric enum and accumulate into a fixed
+GPU-global mask histogram. A 16-bit mask needs 65,536 `uint64_t` counters
+(512 KiB) globally; it must not be replicated per warp. Convert mask IDs to
+text only at final print time.
+
+Keep PC/opcode attribution out of SR-M0B's every-cycle hot path. Add it later
+behind a separate gate, limited to dominant masks or selected SMs/CTAs.
+Aggregate role (`producer/consumer/other`) with fixed arrays.
+
+All new scalar counters and histograms must reset at each kernel launch.
+
+Implementation sites:
+
+- `gpu-sim.h` / `gpu-sim.cc`: config gate and scalar-stat registration;
+- `subcore.h` / `subcore.cc`: snapshot structs, masks, capture, and finalize;
+- `sm.h` / `sm.cc`: pure wait-state peek helpers;
+- `shader.cc`: conservation report and mask histogram output.
+
+Header edits require a clean build.
+
+### Stage SR-M1 - priority-independent splits and dependency provenance
+
+First report sole blockers, which do not require guessing HW priority:
+
+```text
+FU-only by target pipe
+wait_barrier-only
+stall_count-only
+barrier-only
+frontend-only
+multi-blocker masks
+```
+
+The current `Wait_Barrier` stores only the most recent `armed_op`. That is
+lossy: several operations can arm the same SB, and a later arm overwrites the
+provenance of older pending credits. Replace the single enum with per-class
+pending counts:
+
+```text
+tensor
+global-memory
+TMA
+shared-memory/MIO
+SFU
+SP/INT/DP
+control/synchronization
+other
+```
+
+Both increment and completion/decrement actions must carry the instruction's
+class. Out-of-order completion then decrements only the matching class. Assert
+on every change:
+
+```text
+sum(pending_by_class) == wait_barrier.counter
+no pending_by_class entry underflows
+```
+
+When a head waits on an SB, return a class mask of all pending sources that can
+block the requested threshold, not one arbitrarily ranked enum. If several
+classes remain, retain the state as ambiguous.
+
+Apply the same provenance rule to trace `stall_count`: record the class and PC
+of the instruction that set the current countdown, and clear that provenance
+when the counter reaches zero.
+
+Do not force multi-blocker masks into one NCU bucket until the HW
+highest-priority rule has been validated, preferably with focused
+microbenchmarks that create known blocker combinations.
+
+### Stage SR-M2 - exclusive NCU projection
+
+After SR-M0A/SR-M0B/SR-M1 validation:
+
+1. Project sole blockers directly.
+2. Apply only validated priority rules to multi-blocker masks.
+3. Keep unresolved masks in an explicit `ambiguous_multi` bucket.
+4. Require:
+
+```text
+sum(exclusive sim states) == sim warp-cycles per issued instruction
+```
+
+Decision gate:
+
+- If exclusive `FU-only` remains materially above HW
+  `gmma + math_pipe_throttle`, investigate FU topology, routing, II, and
+  per-op active cycles.
+- If raw `fu_any` is large but exclusive `FU-only` is close to HW, the old
+  discrepancy was a metric-overlap artifact.
+- If memory/MIO provenance is absent rather than merely mislabeled, that
+  residual is an implementation-model gap.
+
+---
+
+## 7. Shared-memory metric correction
+
+### 7.1 What the current numbers do and do not mean
+
+Observed values:
+
+| kernel | sim `gpgpu_n_shmem_bkconflict` | HW store bank conflicts | raw ratio |
+|---|---:|---:|---:|
+| FA3 fwd | 38,016 | 281 | 135x |
+| FA3 bwd | 1,327,104 | 35,493 | 37x |
+
+These values are not definition-matched.
+
+The sim counter increments in `ldst_unit_sm.cc` on each PRT replay cycle while
+the shared instruction's dispatch delay remains nonzero. It is therefore
+closer to a dispatch-delay replay-cycle counter.
+
+HW `l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_st` counts extra
+conflict wavefronts/events, not the base service cycles of the instruction.
+
+The actual sim dispatch delay per shared instruction is only:
+
+| kernel | `total_accesses_per_shared_instruction` |
+|---|---:|
+| fwd | 3.3607 |
+| bwd | 3.0377 |
+
+Wide shared instructions also have an inherent width cost. A 16-byte access
+requires multiple ideal phases/wavefronts even when every phase is
+conflict-free. HW does not count those base wavefronts as bank conflicts.
+Thus the `37-135x` raw ratio is not a `37-135x` latency error. As documented in
+`FA3_progress.md`, the current sim may even understate the width-based base
+serialization while over-reporting the value named "bank conflict."
+
+This metric must not be used to explain the current `mio_throttle` or
+`short_scoreboard` gap.
+
+### 7.2 Stage SM-M0 - add NCU-aligned observe-only counters
+
+Do not change `cycles = total_accesses` in this stage.
+
+Keep the legacy counter for compatibility, but print an explicit alias/name
+that describes its unit:
+
+```text
+shmem_dispatch_delay_replay_cycles
+```
+
+Do not increment the new metric in the PRT replay loop at
+`ldst_unit_sm.cc:1867-1879`; that is exactly where the legacy counter changes
+units from instructions/wavefronts to replay cycles. Analyze and commit the
+metric once when a shared-memory stage is admitted, after traced lane
+addresses and `data_size` are available.
+
+Add a pure helper:
+
+```cpp
+struct ShmemWavefrontStats {
+  uint32_t ideal;
+  uint32_t actual;
+  uint32_t extra;
+  uint32_t width_bytes;
+  bool is_load;
+  bool is_store;
+  bool classified;
+};
+
+ShmemWavefrontStats analyze_shmem_wavefronts(const warp_inst_t &inst);
+```
+
+Store the result on the instruction or pass it immediately to an SM-level
+numeric accumulator. Add an explicit per-shared-stage recorded guard because
+`LDGSTS` regenerates memory accesses when it changes from its global-load
+stage to its shared-store stage. The global stage must not suppress the later
+shared stage, while the shared stage must contribute exactly once.
+
+At shared-memory access generation, compute a separate wavefront analysis once
+per instruction. Do not reuse the old proposal that applied `addr + 4*p` to all
+32 lanes: for a 16-byte-per-lane request, HW first partitions the warp request
+into base wavefront-sized lane groups. Applying word phases across the full
+warp can classify a conflict-free vector request as conflicting again.
+
+```text
+bank_word_bytes      = WORD_SIZE
+base_wavefront_bytes = num_shmem_banks * bank_word_bytes
+words_per_lane       = ceil(data_size / bank_word_bytes)
+lanes_per_wavefront  = min(subwarp_size,
+                           max(1, floor(base_wavefront_bytes / data_size)))
+```
+
+For ordinary vector `LDS/STS`, partition lanes by their architectural lane
+index into contiguous base-wavefront groups. For every non-empty group:
+
+1. Expand each active lane's traced start address into all touched bank words.
+2. Apply `shmem_bank_func()` to every expanded word.
+3. Apply the existing broadcast rule for identical words.
+4. Set the group's service depth to the maximum number of distinct words
+   targeting any one bank.
+
+Then accumulate:
+
+```text
+ideal_wavefronts  = number of non-empty base-wavefront groups
+actual_wavefronts = sum(group_service_depth)
+extra_conflict_wavefronts = actual_wavefronts - ideal_wavefronts
+```
+
+For example, a full-warp 16-byte request contains 512 bytes and therefore four
+ideal 128-byte base wavefronts. If every 128-byte group reaches all 32 banks
+without duplication, `ideal=4`, `actual=4`, and `extra=0`. The four base
+wavefronts are width cost, not bank conflicts.
+
+The `num_shmem_banks * WORD_SIZE = 128B` grouping is the H100 metric-model
+hypothesis to validate, not a value to tune against FA3 cycles. SM-M0 must first
+confirm it with raw NCU wavefront counts and focused 4B/8B/16B shared-memory
+microbenchmarks.
+
+`LDSM/STSM` must not be assumed to use the generic contiguous-lane grouping
+without validation. Their decoded matrix shape and trace-address convention
+must either produce a verified instruction-family grouping or remain in an
+explicit `shmem_wavefront_unclassified_matrix` bucket. Before enabling the
+counter for those instructions, dump representative lane addresses and verify
+the reconstructed ideal/actual wavefronts by hand and with a focused
+microbenchmark.
+
+Emit load/store counters separately:
+
+```text
+shmem_instructions_{ld,st}
+shmem_ideal_wavefronts_{ld,st}
+shmem_actual_wavefronts_{ld,st}
+shmem_bank_conflict_extra_wavefronts_{ld,st}
+shmem_access_width_{4,8,16,...}_bytes
+```
+
+Do not reuse `gpgpu_n_shmem_insn` as the instruction denominator: that existing
+counter increments by active lanes. Add explicit warp-instruction counters for
+the NCU comparison.
+
+Required invariants:
+
+```text
+actual_wavefronts >= ideal_wavefronts
+extra_conflict_wavefronts
+  == actual_wavefronts - ideal_wavefronts
+each shared instruction contributes exactly once
+```
+
+Validation against raw NCU metrics:
+
+- `extra_conflict_wavefronts_st` vs
+  `l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_st.sum`
+- load equivalent if available;
+- `actual_wavefronts_{ld,st}` vs raw shared LSU wavefront counts;
+- width histogram vs the traced `LDS/STS/LDSM/STSM` instruction mix.
+
+Timing-neutral gate:
+
+```text
+gpu_sim_cycle, gpgpu_n_tot_w_icount, HGMMA, MUFU, TMA
+must remain bit-identical
+```
+
+Implementation sites:
+
+- `abstract_hardware_model.h/.cc`: analysis result and address/width expansion;
+- `ldst_unit_sm.cc` or the shared-stage admission owner: once-only commit;
+- `gpu-sim.cc`: gate and numeric counter registration;
+- `shader.cc`: legacy alias, new counters, ratios, and invariants.
+
+Avoid string map lookups inside per-lane/per-word loops. Build the local
+`ShmemWavefrontStats` with stack arrays, then update fixed numeric counters
+once per instruction.
+
+### 7.3 Stage SM-M1 - timing model only after metric validation
+
+Only after SM-M0 matches the HW metric definitions should a gated timing
+experiment consider:
+
+```text
+cycles = actual_wavefronts
+```
+
+This can increase the base cost of wide conflict-free instructions even while
+reducing extra conflict cost. It must not be presented as a guaranteed
+speedup. The current `FA3_progress.md` conclusion remains in force: this is a
+metric/architecture-fidelity item, not an established cycle lever.
+
+### 7.4 Separate TMA swizzle limitation
+
+The TMA descriptor carries a shared-memory swizzle mode, but the TMA store path
+does not currently model SMEM-bank placement. That is a separate architecture
+TODO. It must not be conflated with:
+
+- the legacy `gpgpu_n_shmem_bkconflict` counter;
+- L2 slice hashing;
+- the SR-M0A/SR-M0B stall-state accounting.
+
+---
+
+## 8. Current decision
+
+1. **Retracted:** the old normalized shape table.
+2. **Retracted:** `fu_any 3.260 / HW FU 0.490 = 6.6x` as a
+   definition-matched implementation result.
+3. **Retracted:** `.o48` proves consumer MUFU lockstep.
+4. **Retained as a candidate:** FU incidence is high and may expose a real
+   residual after exclusive accounting.
+5. **Required next:** SR-M0A, SR-M0B, then SR-M1, with no timing change.
+6. **Independent metric fix:** SM-M0 for NCU-aligned shared-memory wavefront and
+   extra-conflict counters.
+
+Implementation should proceed one stage at a time with review after each stage.
+
+---
+
+## 9. Raw HW warp states (NCU ID 9)
+
+Units: warp-cycles per issued instruction.
+
+```text
 barrier            1.313106      long_scoreboard    1.491451
 branch_resolving   0.060231      math_pipe_throttle 0.091678
 dispatch_stall     0.337559      mio_throttle       0.474407
@@ -230,4 +746,9 @@ lg_throttle        0.000000      sleeping           0.328385
 membar             0.000000      wait               0.783902
 misc               0.001876      tex_throttle       0.000000
 no_instruction     0.115050
+```
+
+```text
+sum = 7.539490
+NCU Warp Cycles Per Issued Instruction = 7.53
 ```
