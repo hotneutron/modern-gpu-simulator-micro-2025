@@ -1301,14 +1301,82 @@ live-outs, scoreboard reason, path counts, and the SASS identity hash. `--strict
 fails sidecar generation on a rejected targeted K5 candidate rather than silently
 omitting it.
 
-Stage 1.7 acceptance:
+#### 1.7.7 Correction: rejected implementation and mandatory next-session scope
 
-- K5 emits exactly the reviewed block above.
-- Its existing spin-region records are unchanged.
-- K10 emits either no wait block or only independently proven records.
-- active/predicate masks are preserved and predicated-off entries are excluded
-  from dynamic visit counts.
-- The existing full dynamic trace is reused; only sidecar metadata is regenerated.
+This section supersedes any earlier Stage 1.7 wording that can be read as
+permitting application-specific production detection or accepting un-emitted
+wait-block candidates as a completed implementation.
+
+The reverted implementation in commit `10c7ea9` was incorrect:
+
+1. Production discovery was hard-coded to kernel id 5, unique function id 3, a
+   FlashAttention kernel-name token, and entry PC `0x74e0`.
+2. Although dynamic validation scanned all 132 K5 CTAs and did not hard-code a
+   CTA/SM/warp, other applications and other wait blocks could never emit a
+   `WaitBlockRecord`.
+3. A follow-up attempt removed the identity filters but treated proof failures as
+   acceptable "original replay" fallbacks. That is fail-safe for one unsupported
+   block, but it does not satisfy the project goal: every discovered wait block
+   in the target traces must be fully proven, emitted, and later modeled by the
+   simulator.
+4. The implementation prioritized the previously written narrow scope over the
+   user's correctness and cross-application requirements. This contradiction
+   should have been reported for approval before implementation.
+
+Commit `10c7ea9` is reverted by `e364e63`. No Stage 1.7 generator/runtime code
+from that attempt remains; `build_spin_wait_sidecar.py` and `run_hw_trace.py`
+match the `6c82fcd` tree, and the local generated sidecar was restored to schema
+v2.
+
+Read-only analysis from the rejected attempt found these compound candidates:
+
+```text
+K5 / fid 3:
+  entry PCs = 0x13b0, 0x35e0, 0x3750, 0x5a50, 0x5bc0, 0x74e0
+
+K10 / fid 8:
+  entry PCs = 0x1900, 0x4fa0
+```
+
+All eight are required Stage 1.7 outputs for the current K5/K10 trace set. K5
+`0x74e0` is a regression expectation, not a production filter.
+
+The next implementation must:
+
+1. Discover wait blocks across every kernel/function without application name,
+   kernel id, function id, CTA, warp, SM, or PC filters.
+2. Traverse every CTA/warp occurrence with the recorded active/predicate masks.
+3. Treat a discovered candidate that cannot yet be proven as an incomplete Stage
+   1.7 implementation, not as an accepted final replay fallback. Safety remains
+   fail-closed while developing, but acceptance requires zero rejected
+   candidates for the current K5/K10 traces.
+4. Extend exact def/use decoding for the currently observed live-out kills,
+   including `IADD3`, `VIADD`, and `FSEL`, instead of hard-coding their PCs.
+5. Fix provenance analysis so dataflow-chain depth is not confused with linear
+   instruction distance. In K10, wait-state `R22` reaches definitions far before
+   `0x1900/0x4fa0`; use CFG-aware reaching definitions and canonicalize the
+   reviewed arithmetic expressions rather than increasing an arbitrary scan
+   distance.
+6. Preserve effect, liveness, same-resume, wait-condition, scoreboard, schema,
+   and dynamic-path proofs for every emitted block. Unknown semantics must stop
+   implementation and trigger design review; proofs must not be weakened to make
+   candidate counts pass.
+7. Keep Stage 1.7 sidecar-only. Do not begin Stage 1.8 runtime changes until the
+   complete candidate/proof table and generated K5/K10 sidecar are reviewed and
+   explicitly approved.
+
+Revised Stage 1.7 acceptance:
+
+- discovered candidate count equals emitted WaitBlock count;
+- rejected candidate count is zero for full K5 and K10 traces;
+- the eight entry PCs listed above are present without production identity
+  filters;
+- every active occurrence lands at the proven common resume and all inactive
+  occurrences are accounted for;
+- existing spin-region runtime fields remain unchanged;
+- no simulator C++ or full-trace regeneration is included.
+
+The earlier targeted Stage 1.7 acceptance criteria are superseded by §1.7.7.
 
 ### Stage 1.8. Enforce a proven wait block in the simulator
 
