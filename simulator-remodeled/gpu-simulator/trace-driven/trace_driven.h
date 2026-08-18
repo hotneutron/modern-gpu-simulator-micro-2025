@@ -271,9 +271,11 @@ class trace_shd_warp_t : public shd_warp_t {
   // residual gate/fallback control path (allowed_block_pcs) and land exactly on
   // resume_pc. Same per-PC semantic guard as skip_spin_to_exit; aborts with
   // [WAITBLOCK_SKIP_AUDIT] on drift. The entry gate TRYWAIT is issued by the
-  // caller before this runs and is never skipped here.
+  // caller before this runs and is never skipped here. allowed_block_pcs uses
+  // uint64_t to match WaitBlockRecord (address_type may be a distinct 64-bit
+  // type on some toolchains).
   unsigned int wait_block_skip_to_resume(
-      address_type resume_pc, const std::set<address_type> &allowed_block_pcs,
+      address_type resume_pc, const std::set<uint64_t> &allowed_block_pcs,
       struct FoldSkipStats *out_stats);
   void clear();
   bool trace_done();

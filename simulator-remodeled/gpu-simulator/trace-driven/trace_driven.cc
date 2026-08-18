@@ -281,7 +281,7 @@ unsigned int trace_shd_warp_t::skip_spin_to_exit(
 }
 
 unsigned int trace_shd_warp_t::wait_block_skip_to_resume(
-    address_type resume_pc, const std::set<address_type> &allowed_block_pcs,
+    address_type resume_pc, const std::set<uint64_t> &allowed_block_pcs,
     FoldSkipStats *out_stats) {
   // [Stage 1.8] Advance the trace cursor over ONLY the captured residual wait-
   // block control path (gate polls + fallback wait loop, incl. its exit BRA) and
@@ -301,7 +301,8 @@ unsigned int trace_shd_warp_t::wait_block_skip_to_resume(
         it_inst_trace->second.num_used_instructions[0] <
             it_inst_trace->second.num_traced_instructions;
 
-    bool pc_allowed = allowed_block_pcs.count(pc) != 0;
+    bool pc_allowed =
+        allowed_block_pcs.count(static_cast<uint64_t>(pc)) != 0;
     std::string opcode;
     SyncInstructionKind sync_kind = SyncInstructionKind::NONE;
     if (have_occurrence) {

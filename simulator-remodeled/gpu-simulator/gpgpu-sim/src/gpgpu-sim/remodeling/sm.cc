@@ -2655,7 +2655,7 @@ void SM::service_wait_block_release(unsigned int warp_id) {
   // Flush younger prefetched IBuffer entries before moving the cursor (§1.8.3),
   // matching the spin-region release path's flush(false).
   tw->get_IBuffer_remodeled()->flush(false);
-  const address_type pre_skip_pc = tw->get_pc();
+  const address_type pre_skip_pc [[maybe_unused]] = tw->get_pc();
   FoldSkipStats skip_stats;
   const unsigned skipped = tw->wait_block_skip_to_resume(
       wb.resume_pc, wb.allowed_block_pcs, &skip_stats);
@@ -2973,7 +2973,7 @@ void SM::handle_sync_instruction(warp_inst_t &inst, unsigned int warp_id) {
             // Flush younger prefetched IBuffer entries before moving the cursor
             // (§1.8.2), matching fold_cursor_skip_to_exit's flush(false).
             tw->get_IBuffer_remodeled()->flush(false);
-            const address_type wb_pre_skip_pc = tw->get_pc();
+            const address_type wb_pre_skip_pc [[maybe_unused]] = tw->get_pc();
             FoldSkipStats wb_stats;
             const unsigned skipped = tw->wait_block_skip_to_resume(
                 wb.resume_pc, wb.allowed_block_pcs, &wb_stats);
