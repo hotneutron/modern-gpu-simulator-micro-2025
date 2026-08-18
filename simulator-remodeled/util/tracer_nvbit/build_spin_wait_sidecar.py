@@ -1,37 +1,26 @@
 #!/usr/bin/env python3
-"""build_spin_wait_sidecar.py — emit a static spin-wait sidecar for FA3 traces.
+"""Build a generic, two-strategy WaitBlock sidecar from compact GPU traces.
 
 Purpose
 -------
 The trace-driven simulator replays each warp's recorded PC stream and takes every
-branch from the captured `next_traced_pc`, so a producer mbarrier spin loop is
-replayed exactly as many times as it happened to spin on the (instrumented) HW.
-That recorded spin count is a capture-timing artifact, not real work: the correct
-number of polls depends on when the *modeled* mbarrier flips, which only the
-simulator can decide.
+branch from the captured stream. Post-processing identifies two independent
+runtime contracts without modifying the payload:
 
-This tool does the STATIC half of the fix (payload untouched): it locates each
-producer spin loop from the disassembly CFG + sync resolver and describes it as a
-"wait region" so the simulator can, at replay time, block the warp at the region
-until the modeled barrier is ready and then jump to the region's exit — instead
-of replaying the recorded poll count. The dynamic half (blocking + exit jump) is
-a separate gated simulator feature; this file is its input contract.
+  * INJECT_MISSING_WAIT: a gate is ready-only in the complete capture. A future
+    simulator may wait-hold an all-live modeled miss at the entry. A partial
+    modeled miss must abort until lane-group scheduling is designed.
+  * FOLD_CAPTURED_POLL: an existing foldable polling loop. A future simulator
+    may use the already-proven poll-site hold and dual-cursor advance to the local
+    loop exit.
 
-Design decisions (validated against opt11A K5/K10, see handover analysis):
-  * A spin region is a short BACKWARD self-loop (loopback BRA target < BRA pc)
-    whose body contains a SYNCS.PHASECHK / SYNCS.PHASECHK.TRANS64.TRYWAIT. First
-    and later iterations may differ (e.g. a leading WARPSYNC.ALL), so we anchor on
-    static PCs (loop head, wait pc, loopback BRA, exit) rather than a fixed body.
-  * We describe regions by PC, NOT by dynamic instruction index: the trace is
-    stored per-CTA and the iteration count varies per CTA/warp, so PC anchors are
-    both stable and match the simulator's `traced_pcs[used_insts]` cursor model.
-  * The barrier ADDRESS is intentionally NOT baked in — it is register-formed
-    ([R7+URZ+0x16800]) and only known at replay time from the instruction's
-    captured sync.barrier_addr payload. We record barrier_operand_text for
-    cross-checking / debugging only.
-  * semantic_free_body=True means the body has no TMA / *GMMA / MUFU / arrive /
-    global-or-shared memory op, so collapsing the poll count cannot drop work.
-    STL/LDL (thread-local stack spill) are allowed and flagged in body_note.
+Discovery is application-independent. It uses static CFG/opcode semantics and
+all selected CTA/warp traces; it has no kernel-name, kernel-id, function-id, PC,
+CTA, warp, SM, or expected-count filters. K5/K10 values are validation results,
+not production rules.
+
+The existing spin_regions records are preserved unchanged. Simulator support for
+schema v4 is a separate stage.
 
 Usage
 -----
@@ -39,8 +28,9 @@ Usage
                              [--out <.../extra_info/spin_wait_sidecar.json>]
                              [--validate-ctas all|N] [--strict]
 
-Runs standalone on a CPU server, and is also invoked automatically from
-run_hw_trace.py after the sync-operand mapping step.
+Production strategy classification requires --validate-ctas all. A smaller
+value is review-only and is rejected by --strict because a gate can be ready-only
+in one CTA and captured-poll in another.
 """
 import argparse
 import glob
@@ -58,7 +48,7 @@ _ts_spec = _ilu.spec_from_file_location(
 _ts = _ilu.module_from_spec(_ts_spec)
 _ts_spec.loader.exec_module(_ts)
 
-ISIZE = 0x10          # every FA3 SM90 SASS instruction is 16 bytes
+ISIZE = 0x10          # SM90 SASS instructions in this trace format are 16 bytes
 MAX_LOOP_SPAN = 0x100  # a spin loop is short; guards against matching big loops
 
 
@@ -82,6 +72,7 @@ def _inst_full(buf, s, e):
     pc = 0
     active_mask = 0
     predicate_mask = 0
+    function_unique_id = None
     sync_valid = False
     barrier_addr = None
     semantic_raw = None
@@ -94,6 +85,8 @@ def _inst_full(buf, s, e):
             active_mask, i = _rv(buf, i)
         elif f == 3 and w == 0:
             predicate_mask, i = _rv(buf, i)
+        elif f == 4 and w == 0:
+            function_unique_id, i = _rv(buf, i)
         elif f == 6 and w == 2:                 # sync_runtime_info sub-message
             ln, j = _rv(buf, i)
             end = j + ln
@@ -117,6 +110,7 @@ def _inst_full(buf, s, e):
         "pc": pc,
         "active_mask": active_mask,
         "predicate_mask": predicate_mask,
+        "function_unique_id": function_unique_id,
         "sync_valid": sync_valid,
         "barrier_addr": barrier_addr,
         "semantic_raw": semantic_raw,
@@ -348,7 +342,7 @@ def detect_regions(fid, byp, sync_sites):
 
 # --- Stage 1.7: compound wait-block CFG detector -------------------------- #
 # A compound wait block is a speculative mbarrier gate whose miss path is a pure
-# wait fallback. FA3 emits two shapes that this detector handles with ONE general
+# wait arm. The detector handles two local CFG shapes with one general
 # rule (plan §1.7.6): follow only branches that consume the gate predicate P.
 #
 #   Type-1 (double gate, out-of-line fallback; HW captured ready only):
@@ -533,6 +527,7 @@ def detect_wait_block_candidates(fid, byp, sync_sites):
             "block_id": "wb_fid%d_e0x%x" % (fid, pc),
             "unique_function_id": fid,
             "entry_wait_pc": pc,
+            "entry_branch_pc": br_pc,
             "wait_predicate": predreg,
             "wait_predicate_uniform": bool(prb[2]),
             "mainline_setup_pcs": [p for p in between if not _is_wait(fid, p, byp, sync_sites)],
@@ -716,7 +711,7 @@ def prove_wait_condition(fid, cand, byp, sync_sites):
         "barrier_offset": next(iter(offs)),
         "wait_state_operands": sorted(states),
     }
-    # Wait-state provenance: FA3 reloads the state into different regs per site
+    # A kernel may reload the state into different registers per site
     # (R11 at the gate, R15 in the fallback) but all originate from the same
     # UR7-derived phase value. We cannot chase full dataflow from aggregate usage
     # info, so we require every wait-state operand to be a single reviewed source:
@@ -799,7 +794,7 @@ def prove_predicate_dead_at_resume(fid, cand, byp):
 def _decode_defuse_generic(inst):
     """Best-effort def/use for opcodes OUTSIDE the wait-block model, used only for
     the post-resume predicate liveness scan. Recognizes the destination-predicate
-    forms FA3 uses to redefine the wait predicate (ISETP/FSETP/PLOP3/etc.) and any
+    common forms used to redefine wait predicates (ISETP/FSETP/PLOP3/etc.) and any
     'PT'/'P<n>' written as operand[0]. Uses operand_string tokens; unknown shapes
     contribute no defs (so liveness stays conservative: a real later use will still
     be seen)."""
@@ -854,49 +849,66 @@ def prove_candidate(fid, cand, byp, sync_sites):
     return True, None
 
 
-def make_wait_block_record(c):
-    """Serialize a fully proven candidate into the §1.7.5 WaitBlockRecord schema.
-    PC fields are emitted as hex strings (like the rest of the sidecar consumers
-    expect for cross-checking) plus decimal for the simulator loader."""
+def make_inject_missing_wait_record(c, sync_sites, byp):
+    """Serialize a ready-only gate for the entry-only missing-wait strategy."""
     st = c.get("dynamic", {})
-    def hx(x):
-        return "0x%x" % x
+    site = sync_sites.get((c["unique_function_id"], c["entry_wait_pc"]), {})
+    operands = [
+        o.get("operand_string", "")
+        for o in byp[c["entry_wait_pc"]].get("operands", [])
+    ]
     return {
         "block_id": c["block_id"],
+        "runtime_strategy": "INJECT_MISSING_WAIT",
         "unique_function_id": c["unique_function_id"],
-        "entry_wait_pc": c["entry_wait_pc"],
-        "entry_wait_pc_hex": hx(c["entry_wait_pc"]),
-        "all_gate_wait_pcs": c["all_gate_wait_pcs"],
-        "captured_next_pc": c["captured_next_pc"],
-        "allowed_block_pcs": c["allowed_block_pcs"],
-        "fallback_entry_pc": c["fallback_entry_pc"],
-        "fallback_body_pcs": c["fallback_body_pcs"],
-        "fallback_wait_pcs": c["fallback_wait_pcs"],
-        "fallback_loopback_pc": c["fallback_loopback_pc"],
-        "resume_pc": c["resume_pc"],
-        "resume_pc_hex": hx(c["resume_pc"]),
-        "canonical_wait_condition": c["canonical_wait_condition"],
-        "fallback_effect_safe": c["fallback_effect_safe"],
-        "effect_classes": c["effect_classes"],
-        "wait_predicate": c["wait_predicate"],
-        "wait_predicate_uniform": c["wait_predicate_uniform"],
-        "wait_predicate_disposition": c["wait_predicate_disposition"],
-        "next_predicate_def_pc": c["next_predicate_def_pc"],
-        "wait_predicate_first_read_pc": c.get("wait_predicate_first_read_pc"),
-        # Mainline setup between the gate TRYWAIT and its branch. These produce
-        # live-out values (addresses) and MUST NOT be skipped by the simulator.
-        # Recorded explicitly so Stage 1.8's cursor-skip guard can assert it never
-        # consumes one of these PCs.
-        "mainline_setup_pcs": c.get("mainline_setup_pcs", []),
-        "park_on_model_miss": True,
+        "entry_probe_pc": c["entry_wait_pc"],
+        "entry_probe_pc_hex": "0x%x" % c["entry_wait_pc"],
+        "entry_branch_pc": c["entry_branch_pc"],
+        "captured_ready_pc": c["resume_pc"],
+        "entry_probe_kind": site.get("sync_kind"),
+        "entry_probe_opcode": site.get("opcode"),
+        "barrier_operand_text": site.get("barrier_operand_text"),
+        "wait_state_operand_text": operands[2] if len(operands) > 2 else None,
+        "partial_modeled_miss_action": "ABORT",
         "observed_path_counts": {
-            "A_first_gate_ready": st.get("path_A_first_gate_ready", 0),
-            "B_second_gate_ready": st.get("path_B_second_gate_ready", 0),
-            "C_fallback_loop": st.get("path_C_fallback_loop", 0),
+            "ready_arm": st.get("path_A_first_gate_ready", 0),
+            "second_gate_arm": st.get("path_B_second_gate_ready", 0),
+            "captured_poll": st.get("path_C_fallback_loop", 0),
         },
         "active_entry_visits": st.get("active_entry_visits", 0),
         "predicated_off_entry_occurrences": st.get(
             "predicated_off_entry_occurrences", 0),
+        "all_live_entry_visits": st.get("all_live_entry_visits", 0),
+        "partial_entry_visits": st.get("partial_entry_visits", 0),
+        "observed_effective_masks": st.get("entry_effective_masks", {}),
+        "observed_live_masks": st.get("entry_live_masks", {}),
+        "observed_barrier_addrs": st.get("entry_barrier_addrs", {}),
+        "observed_wait_states": st.get("entry_wait_states", {}),
+        "sync_payload_missing": st.get("entry_sync_payload_missing", 0),
+    }
+
+
+def make_fold_captured_poll_record(kid, fid, region):
+    """Serialize an existing foldable spin region without changing its owner."""
+    return {
+        "block_id": "wb_k%d_fid%d_p0x%x" % (
+            kid, fid, region["primary_wait_pc"]),
+        "runtime_strategy": "FOLD_CAPTURED_POLL",
+        "unique_function_id": fid,
+        "poll_loop_head_pc": region["loop_head_pc"],
+        "poll_loop_body_pcs": region["body_pcs"],
+        "poll_probe_pc": region["primary_wait_pc"],
+        "poll_probe_kind": region["primary_wait_kind"],
+        "poll_probe_opcode": region["primary_wait_opcode"],
+        "barrier_operand_text": region.get("barrier_operand_text"),
+        "poll_loopback_pc": region["loopback_bra_pc"],
+        "poll_loop_exit_pc": region["exit_pc"],
+        "poll_advance_allowed_pcs": sorted(
+            set(region["body_pcs"]) | {region["loopback_bra_pc"]}),
+        "semantic_free_body": region["semantic_free_body"],
+        "barrier_self_tied": region["barrier_self_tied"],
+        "barrier_reason": region["barrier_reason"],
+        "dynamic": region["dynamic"],
     }
 
 
@@ -963,9 +975,11 @@ def validate_dynamic(kdir, regions, byp, max_ctas):
 # FAIL reason taxonomy (see plan §1.7.8), continued:
 DYNAMIC_PATH_ESCAPE = "DYNAMIC_PATH_ESCAPE"
 CTA_IDENTITY_MISMATCH = "CTA_IDENTITY_MISMATCH"
+ENTRY_WAIT_TARGET_UNDECODABLE = "ENTRY_WAIT_TARGET_UNDECODABLE"
 
 
-def validate_wait_blocks_dynamic(kdir, cands, byp, max_ctas, expected_fid):
+def validate_wait_blocks_dynamic(kdir, cands, byp, all_byp, max_ctas,
+                                 expected_fid):
     """For every proven-shape candidate, traverse each CTA/warp occurrence with the
     recorded active/predicate masks and prove that:
       * every active visit begins at entry_wait_pc (an inactive occurrence, i.e.
@@ -984,6 +998,13 @@ def validate_wait_blocks_dynamic(kdir, cands, byp, max_ctas, expected_fid):
         stats[c["block_id"]] = {
             "active_entry_visits": 0,
             "predicated_off_entry_occurrences": 0,
+            "all_live_entry_visits": 0,
+            "partial_entry_visits": 0,
+            "entry_effective_masks": Counter(),
+            "entry_live_masks": Counter(),
+            "entry_barrier_addrs": Counter(),
+            "entry_wait_states": Counter(),
+            "entry_sync_payload_missing": 0,
             "path_A_first_gate_ready": 0,   # entry -> captured_next, no 2nd gate
             "path_B_second_gate_ready": 0,  # 2nd gate poll before resume
             "path_C_fallback_loop": 0,      # entered the OOL fallback
@@ -995,7 +1016,26 @@ def validate_wait_blocks_dynamic(kdir, cands, byp, max_ctas, expected_fid):
         warps = vpb_parse_full(open(f, "rb").read())
         for wid, insts in warps:
             pcs = [i["pc"] for i in insts]
-            acts = [i["active_mask"] for i in insts]
+            fids = [i["function_unique_id"] for i in insts]
+            effective = [
+                int(i["active_mask"]) & int(i["predicate_mask"])
+                for i in insts
+            ]
+            # Derive the initial live mask from the observed warp itself. This
+            # handles arbitrary block sizes without application or kernel-shape
+            # constants. Dynamic EXIT occurrences remove lanes for later visits.
+            live = 0
+            for inst in insts:
+                live |= int(inst["active_mask"])
+            live_before = []
+            for idx, inst in enumerate(insts):
+                live_before.append(live)
+                inst_fid = fids[idx]
+                static_inst = all_byp.get(inst_fid, {}).get(inst["pc"])
+                if (static_inst is not None
+                        and static_inst["op_code"].split(".")[0] == "EXIT"
+                        and effective[idx]):
+                    live &= ~effective[idx]
             n = len(pcs)
             for c in cands:
                 st = stats[c["block_id"]]
@@ -1016,21 +1056,40 @@ def validate_wait_blocks_dynamic(kdir, cands, byp, max_ctas, expected_fid):
                 fb_entry = c["fallback_entry_pc"]
                 j = 0
                 while j < n:
-                    if pcs[j] != entry:
+                    if pcs[j] != entry or fids[j] != expected_fid:
                         j += 1
                         continue
                     # occurrence of the block entry
-                    if acts[j] == 0:
+                    if effective[j] == 0:
                         st["predicated_off_entry_occurrences"] += 1
                         j += 1
                         continue
                     st["active_entry_visits"] += 1
+                    entry_mask = effective[j]
+                    entry_live = live_before[j]
+                    st["entry_effective_masks"]["0x%x" % entry_mask] += 1
+                    st["entry_live_masks"]["0x%x" % entry_live] += 1
+                    if entry_mask == entry_live:
+                        st["all_live_entry_visits"] += 1
+                    else:
+                        st["partial_entry_visits"] += 1
+                    entry_inst = insts[j]
+                    if (not entry_inst["sync_valid"]
+                            or entry_inst["barrier_addr"] is None):
+                        st["entry_sync_payload_missing"] += 1
+                    else:
+                        st["entry_barrier_addrs"][
+                            "0x%x" % int(entry_inst["barrier_addr"])] += 1
+                        # Proto3 omits scalar zero on the wire. Absence of field
+                        # 4 in a valid sync payload therefore means wait-state 0.
+                        wait_state = entry_inst["semantic_raw"]
+                        wait_state = 0 if wait_state is None else int(wait_state)
+                        st["entry_wait_states"]["0x%x" % wait_state] += 1
                     # Remember which lanes entered here. On a divergent warp the
                     # trace interleaves other lane-groups' PCs (a different
                     # active_mask). Only instructions whose active_mask overlaps
                     # the entering lanes belong to THIS visit; disjoint-mask PCs
                     # are another divergent path and are skipped here.
-                    entry_mask = acts[j]
                     saw_g2 = False
                     saw_fb = False
                     k = j
@@ -1039,9 +1098,14 @@ def validate_wait_blocks_dynamic(kdir, cands, byp, max_ctas, expected_fid):
                         p = pcs[k]
                         # skip instructions that belong to a different divergent
                         # lane-group (no lane overlap with the entering lanes).
-                        if (acts[k] & entry_mask) == 0:
+                        if (effective[k] & entry_mask) == 0:
                             k += 1
                             continue
+                        if fids[k] != expected_fid:
+                            st["dynamic_ok"] = False
+                            st["reason"] = CTA_IDENTITY_MISMATCH
+                            st["escape_pc"] = "0x%x" % p
+                            break
                         if p == resume:
                             landed = True
                             break
@@ -1072,6 +1136,10 @@ def validate_wait_blocks_dynamic(kdir, cands, byp, max_ctas, expected_fid):
                     else:
                         st["path_A_first_gate_ready"] += 1
                     j = k + 1
+    for st in stats.values():
+        for key in ("entry_effective_masks", "entry_live_masks",
+                    "entry_barrier_addrs", "entry_wait_states"):
+            st[key] = dict(sorted(st[key].items()))
     return stats, len(files)
 
 
@@ -1084,7 +1152,7 @@ def main():
                     help="output json (default: <traces>/extra_info/spin_wait_sidecar.json)")
     ap.add_argument("--validate-ctas", default="all", help="'all' or an integer count")
     ap.add_argument("--strict", action="store_true",
-                    help="fail if any detected region has semantic ops in its body")
+                    help="fail if any intended runtime record fails its proof")
     args = ap.parse_args()
 
     traces = args.traces
@@ -1109,12 +1177,8 @@ def main():
 
     out_kernels = []
     strict_violation = False
-    # §1.7.8 mandatory generator report accumulators (always printed).
-    wb_report_lines = []
-    wb_total_discovered = 0
-    wb_total_passed = 0
-    wb_total_failed = 0
-    wb_total_skipped = 0
+    report = Counter()
+    report_lines = []
     for kid in sorted(kdirs):
         if want and kid not in want:
             continue
@@ -1123,12 +1187,9 @@ def main():
             continue
         byp = kernels[fid]
 
-        # ---- Legacy spin-region detection runs FIRST so we know which loops are
-        # foldable. A wait-block candidate whose fallback covers a foldable spin
-        # loop is a fold TARGET: if it fails to prove it is a real failure to fix.
-        # A candidate whose fallback is not a foldable loop (single-shot wait,
-        # local-memory loop, non-compound shape) is legitimately SKIPPED, not
-        # failed (plan §1.7.7 gate 1 / §1.7.8 taxonomy split, three-way report).
+        # Strategy B is exactly the known-good legacy foldable spin-region set.
+        # Keep the legacy records unchanged; the future simulator switches owner
+        # only after it can consume sidecar v4.
         regions = detect_regions(fid, byp, sync_sites)
         stats, n_ctas = ({}, 0)
         clean = []
@@ -1146,6 +1207,7 @@ def main():
                 # net-zero). See .plan/SPIN_WAIT_SIM_MODELING.md 12.7.
                 r_out["foldable"] = bool(
                     st["is_spin_loop"] and r["semantic_free_body"]
+                    and not r["local_mem_ops_in_body"]
                     and r["barrier_self_tied"])
                 if r_out["foldable"]:
                     # PCs from loop head through the loopback branch: any
@@ -1154,26 +1216,30 @@ def main():
                     foldable_body_pcs.update(
                         range(lo, hi + ISIZE, ISIZE))
                 clean.append(r_out)
+                if not r["semantic_free_body"]:
+                    strict_violation = True
+                if st["is_spin_loop"] and not r["barrier_self_tied"]:
+                    strict_violation = True
 
         def _is_fold_target(c):
-            """A candidate is a fold target if its fallback loop overlaps a
-            foldable spin region (i.e. legacy fold would have folded it)."""
+            """Whether a candidate's captured poll arm has a legacy fold owner."""
             return bool(set(c.get("fallback_body_pcs", [])) & foldable_body_pcs)
 
-        # ---- Stage 1.7 compound wait-block discovery (independent per candidate).
-        # Discovered with NO application/kernel/PC filter; each candidate is judged
-        # on its own. A failure never blocks emitting the others (plan §1.7.7/1.7.8).
+        # Strategy A discovery has no application, kernel, function, name, PC,
+        # CTA, warp, or SM filter. The same candidate proof is run independently
+        # for every function found in the selected trace kernels.
         wb_cands = detect_wait_block_candidates(fid, byp, sync_sites)
         wb_pass, wb_fail, wb_skip = [], [], []
         wb_dyn = {}
         cfg_ok_cands = [c for c in wb_cands if c["cfg_ok"]]
         if cfg_ok_cands:
             wb_dyn, _ = validate_wait_blocks_dynamic(
-                kdirs[kid], cfg_ok_cands, byp, args.validate_ctas, fid)
+                kdirs[kid], cfg_ok_cands, byp, kernels,
+                args.validate_ctas, fid)
 
         def _bucket(c, reason):
-            """Route a non-passing candidate to failed (fold target) or skipped
-            (not a fold target: legitimate fail-closed exclusion)."""
+            """A captured-poll candidate is already covered by the legacy fold
+            strategy; a non-target shape is reported as skipped fail-closed."""
             if _is_fold_target(c):
                 wb_fail.append((c, reason))
             else:
@@ -1183,108 +1249,139 @@ def main():
             if not c["cfg_ok"]:
                 _bucket(c, c["reason"])
                 continue
-            ok, reason = prove_candidate(fid, c, byp, sync_sites)
-            if not ok:
-                _bucket(c, reason)
-                continue
             st = wb_dyn.get(c["block_id"], {})
             if not st.get("dynamic_ok", False):
                 _bucket(c, st.get("reason", DYNAMIC_PATH_ESCAPE))
                 continue
             c["dynamic"] = st
             wb_pass.append(c)
-        wb_total_discovered += len(wb_cands)
-        wb_total_passed += len(wb_pass)
-        wb_total_failed += len(wb_fail)
-        wb_total_skipped += len(wb_skip)
-        wb_report_lines.append(
-            "[wait-block] kernel_%d funcid=%d: discovered=%d passed=%d "
-            "failed=%d skipped=%d"
-            % (kid, fid, len(wb_cands), len(wb_pass), len(wb_fail),
-               len(wb_skip)))
+
+        inject_candidates = []
+        metadata_candidates = []
+        strategy_failures = []
         for c in wb_pass:
             st = c["dynamic"]
-            wb_report_lines.append(
-                "    PASS entry=0x%x resume=0x%x gates=%s fb=0x%x loopback=0x%x "
-                "off=%s visits=%d A/B/C=%d/%d/%d"
-                % (c["entry_wait_pc"], c["resume_pc"],
-                   [hex(x) for x in c["all_gate_wait_pcs"]],
-                   c["fallback_entry_pc"], c["fallback_loopback_pc"],
-                   c["canonical_wait_condition"]["barrier_offset"],
-                   st["active_entry_visits"], st["path_A_first_gate_ready"],
-                   st["path_B_second_gate_ready"], st["path_C_fallback_loop"]))
+            path_a = st["path_A_first_gate_ready"]
+            path_b = st["path_B_second_gate_ready"]
+            path_c = st["path_C_fallback_loop"]
+            if path_a > 0 and path_b == 0 and path_c == 0:
+                if st["entry_sync_payload_missing"] == 0:
+                    inject_candidates.append(c)
+                else:
+                    strategy_failures.append(
+                        (c, ENTRY_WAIT_TARGET_UNDECODABLE))
+            elif _is_fold_target(c):
+                # The runtime-facing record is emitted from the legacy spin
+                # region, not from this entry candidate.
+                pass
+            else:
+                metadata_candidates.append(c)
+        wb_fail.extend(strategy_failures)
+
+        inject_records = [
+            make_inject_missing_wait_record(c, sync_sites, byp)
+            for c in inject_candidates
+        ]
+        fold_records = [
+            make_fold_captured_poll_record(kid, fid, r)
+            for r in clean if r["foldable"]
+        ]
+        strategy_records = inject_records + fold_records
+
+        action_keys = set()
+        for rec in strategy_records:
+            action_pc = (rec["entry_probe_pc"]
+                         if rec["runtime_strategy"] == "INJECT_MISSING_WAIT"
+                         else rec["poll_probe_pc"])
+            key = (kid, fid, action_pc)
+            if key in action_keys:
+                raise RuntimeError(
+                    "duplicate wait-block runtime key %r" % (key,))
+            action_keys.add(key)
+
+        kernel_failed = len(wb_fail)
+        kernel_skipped = len(wb_skip)
+        kernel_metadata = len(metadata_candidates)
+        kernel_passed = len(strategy_records) + kernel_metadata
+        kernel_discovered = kernel_passed + kernel_failed + kernel_skipped
+
+        report["discovered"] += kernel_discovered
+        report["passed"] += kernel_passed
+        report["failed"] += kernel_failed
+        report["skipped"] += kernel_skipped
+        report["inject_missing_wait"] += len(inject_records)
+        report["fold_captured_poll"] += len(fold_records)
+        report["metadata_only"] += kernel_metadata
+        report["ready_only_records_with_partial_visits"] += sum(
+            1 for c in inject_candidates
+            if c["dynamic"]["partial_entry_visits"] > 0)
+        for c in inject_candidates:
+            st = c["dynamic"]
+            report["ready_only_all_live_visits"] += \
+                st["all_live_entry_visits"]
+            report["ready_only_partial_visits"] += \
+                st["partial_entry_visits"]
+
+        report_lines.append(
+            "[wait-block] kernel_%d funcid=%d: discovered=%d passed=%d "
+            "failed=%d skipped=%d inject=%d fold=%d metadata=%d"
+            % (kid, fid, kernel_discovered, kernel_passed, kernel_failed,
+               kernel_skipped, len(inject_records), len(fold_records),
+               kernel_metadata))
+        for c in inject_candidates:
+            st = c["dynamic"]
+            report_lines.append(
+                "    INJECT entry=0x%x visits=%d all_live=%d partial=%d "
+                "masks=%s barriers=%s wait_states=%s"
+                % (c["entry_wait_pc"], st["active_entry_visits"],
+                   st["all_live_entry_visits"], st["partial_entry_visits"],
+                   st["entry_effective_masks"], st["entry_barrier_addrs"],
+                   st["entry_wait_states"]))
+        for r in clean:
+            if r["foldable"]:
+                report_lines.append(
+                    "    FOLD poll=0x%x head=0x%x loopback=0x%x exit=0x%x "
+                    "visits=%d iters=%d"
+                    % (r["primary_wait_pc"], r["loop_head_pc"],
+                       r["loopback_bra_pc"], r["exit_pc"],
+                       r["dynamic"]["warp_visits"],
+                       r["dynamic"]["total_iters"]))
         for c, reason in wb_fail:
-            wb_report_lines.append(
+            report_lines.append(
                 "    FAIL entry=0x%x reason=%s (fold target: must fix)"
                 % (c["entry_wait_pc"], reason))
         for c, reason in wb_skip:
-            wb_report_lines.append(
+            report_lines.append(
                 "    SKIP entry=0x%x reason=%s (not a fold target)"
                 % (c["entry_wait_pc"], reason))
+        if metadata_candidates:
+            for c in metadata_candidates:
+                st = c["dynamic"]
+                report_lines.append(
+                    "    METADATA entry=0x%x A/B/C=%d/%d/%d"
+                    % (c["entry_wait_pc"],
+                       st["path_A_first_gate_ready"],
+                       st["path_B_second_gate_ready"],
+                       st["path_C_fallback_loop"]))
 
-        # ---- Demote foldable spin regions that a proven wait block now owns.
-        # A Type-2 wait block's fallback IS an existing spin loop; the simulator
-        # must fold it via the wait block (single owner), not also via the legacy
-        # spin-region path. Mark such regions foldable=false and record which
-        # wait block absorbed them so the double-fold cannot happen (user-approved
-        # dedup: "absorbed spin_region -> foldable released").
-        absorbed_pcs = set()
-        for c in wb_pass:
-            absorbed_pcs.update(c.get("fallback_body_pcs", []))
-        n_absorbed = 0
-        for r in clean:
-            if not r["foldable"]:
-                continue
-            lo, hi = r["loop_head_pc"], r["loopback_bra_pc"]
-            body = set(range(lo, hi + ISIZE, ISIZE))
-            owner = None
-            for c in wb_pass:
-                if body & set(c.get("fallback_body_pcs", [])):
-                    owner = c["block_id"]
-                    break
-            if owner is not None:
-                r["foldable"] = False
-                r["absorbed_by_wait_block"] = owner
-                n_absorbed += 1
-        if n_absorbed:
-            wb_report_lines.append(
-                "    [dedup] demoted %d foldable spin region(s) now owned by a "
-                "wait block (foldable released)" % n_absorbed)
+        if kernel_failed:
+            strict_violation = True
 
-        # ---- Emit kernel entry (spin regions + proven wait blocks).
-        if not regions:
-            # No legacy spin region, but wait blocks may still have been found for
-            # this kernel; emit a wait-block-only kernel entry so PASS records and
-            # the report stay consistent.
-            if wb_pass:
-                out_kernels.append({
-                    "kernel_id": kid,
-                    "unique_function_id": fid,
-                    "kernel_name": names.get(fid, ""),
-                    "num_regions": 0,
-                    "validated_ctas": 0,
-                    "spin_regions": [],
-                    "wait_blocks": [make_wait_block_record(c) for c in wb_pass],
-                })
-            continue
-
-        # regions/stats/clean/foldable were computed above (before wait-block
-        # bucketing). Here we only fold in the strict-violation accounting.
-        for r in regions:
-            st = stats[r["region_id"]]
-            if not r["semantic_free_body"]:
-                strict_violation = True
-            if st["is_spin_loop"] and not r["barrier_self_tied"]:
-                strict_violation = True
         out_kernels.append({
             "kernel_id": kid,
+            "trace_kernel_id": kid,
             "unique_function_id": fid,
             "kernel_name": names.get(fid, ""),
             "num_regions": len(clean),
-            "validated_ctas": n_ctas,
+            "validated_ctas": (n_ctas if regions else
+                                (len(glob.glob(os.path.join(
+                                    kdirs[kid], "*.pb")))
+                                 if args.validate_ctas == "all"
+                                 else int(args.validate_ctas))),
             "spin_regions": clean,
-            "wait_blocks": [make_wait_block_record(c) for c in wb_pass],
+            "wait_blocks": strategy_records,
         })
+
         n_sem = sum(0 if r["semantic_free_body"] else 1 for r in regions)
         n_foldable = sum(1 for r in clean if r["foldable"])
         n_bar_unsafe = sum(1 for r in regions
@@ -1314,65 +1411,55 @@ def main():
                      st["min_iters"], st["max_iters"], st["total_iters"],
                      st["warp_visits"], int(r["foldable"]), note, flags))
 
-    # §1.7.8 mandatory wait-block report: ALWAYS printed, even with zero
-    # candidates, so the next application's unproven blocks are never silent.
-    print("[wait-block] === compound wait-block discovery report ===")
-    print("[wait-block] TOTAL discovered=%d passed=%d failed=%d skipped=%d"
-          % (wb_total_discovered, wb_total_passed, wb_total_failed,
-             wb_total_skipped))
-    print("[wait-block]   passed  = proven fold-target wait blocks (emitted)")
-    print("[wait-block]   failed  = fold targets that FAILED to prove (must be 0)")
-    print("[wait-block]   skipped = not fold targets (single-shot / local-mem / "
-          "non-compound); fail-closed, no action needed")
-    if wb_total_failed:
-        print("[wait-block]   !! %d fold-target failure(s) remain — see FAIL lines"
-              % wb_total_failed)
-    for line in wb_report_lines:
+    print("[wait-block] === two-strategy sidecar report ===")
+    print("[wait-block] TOTAL discovered=%d passed=%d failed=%d skipped=%d "
+          "inject=%d fold=%d metadata=%d"
+          % (report["discovered"], report["passed"], report["failed"],
+             report["skipped"], report["inject_missing_wait"],
+             report["fold_captured_poll"], report["metadata_only"]))
+    print("[wait-block] READY visits all_live=%d partial=%d "
+          "records_with_partial=%d"
+          % (report["ready_only_all_live_visits"],
+             report["ready_only_partial_visits"],
+             report["ready_only_records_with_partial_visits"]))
+    for line in report_lines:
         print(line)
 
     sidecar = {
-        "version": 3,
-        "schema": "spin_wait_sidecar",
+        "version": 4,
+        "schema": "wait_block_sidecar",
+        "validation_complete": args.validate_ctas == "all",
         "source_traces_dir": os.path.abspath(traces),
         "isize_bytes": ISIZE,
-        "note": ("PC-anchored producer/consumer spin-wait regions plus Stage 1.7 "
-                 "compound wait blocks. The simulator folds a spin region ONLY if "
-                 "foldable=true (is_spin_loop && semantic_free_body && "
-                 "barrier_self_tied). A wait_blocks[] entry is a proven speculative "
-                 "gate + out-of-line pure wait fallback: at entry_wait_pc the "
-                 "simulator parks on a modeled miss or immediate-folds a modeled "
-                 "hit, then skips the captured residual gate/fallback path to "
-                 "resume_pc. Barrier address is runtime-only; the sidecar records "
-                 "the canonical barrier offset and wait-state operands only for "
-                 "cross-check. wait_blocks contains ONLY fully proven candidates; "
-                 "rejected candidates are reported at generation time and fall back "
-                 "to original captured replay."),
+        "note": (
+            "Two independent runtime strategies. INJECT_MISSING_WAIT is emitted "
+            "only for a dynamically ready-only gate; modeled-ready replays "
+            "normally, modeled-miss holds only when effective_mask==live_mask, "
+            "and a partial modeled-miss must abort. FOLD_CAPTURED_POLL is emitted "
+            "directly from an existing foldable spin region and advances only to "
+            "its local poll_loop_exit_pc. Legacy spin_regions are preserved "
+            "unchanged until a v4 simulator is implemented."),
         "wait_block_fail_taxonomy": [
-            CFG_UNRESOLVED, MULTI_REJOIN, WAIT_COND_MISMATCH, PROVENANCE_UNKNOWN,
-            EFFECT_UNSAFE, PREDICATE_LIVE_OUT, DEFUSE_UNDECODED,
+            CFG_UNRESOLVED, MULTI_REJOIN,
             DYNAMIC_PATH_ESCAPE, CTA_IDENTITY_MISMATCH,
+            ENTRY_WAIT_TARGET_UNDECODABLE,
         ],
-        "wait_block_report": {
-            "discovered": wb_total_discovered,
-            "passed": wb_total_passed,
-            "failed": wb_total_failed,
-            "skipped": wb_total_skipped,
-            "failed_semantics": ("fold-target candidates (fallback overlaps a "
-                                 "foldable spin region) that failed a proof; "
-                                 "must be 0 for the current application"),
-            "skipped_semantics": ("candidates that are not fold targets "
-                                  "(single-shot wait, local-memory loop, or "
-                                  "non-compound shape); excluded fail-closed"),
-        },
+        "wait_block_report": dict(report),
         "kernels": out_kernels,
     }
-    out_path = args.out or os.path.join(extra, "spin_wait_sidecar.json")
-    with open(out_path, "w") as fh:
-        json.dump(sidecar, fh, indent=2)
-    print("[spin-sidecar] wrote %s (%d kernels)" % (out_path, len(out_kernels)))
+    if args.strict and args.validate_ctas != "all":
+        sys.exit("[spin-sidecar] STRICT: runtime strategy emission requires "
+                 "--validate-ctas all")
     if args.strict and strict_violation:
-        sys.exit("[spin-sidecar] STRICT: a spin region has semantic ops in its "
-                 "body or a non-self-tied SASS wait-barrier (not fold-safe)")
+        sys.exit("[spin-sidecar] STRICT: at least one intended runtime record "
+                 "failed its proof; inspect FAIL lines")
+
+    out_path = args.out or os.path.join(extra, "spin_wait_sidecar.json")
+    tmp_path = out_path + ".tmp"
+    with open(tmp_path, "w") as fh:
+        json.dump(sidecar, fh, indent=2)
+    os.replace(tmp_path, out_path)
+    print("[spin-sidecar] wrote %s (%d kernels)" % (out_path, len(out_kernels)))
 
 
 if __name__ == "__main__":

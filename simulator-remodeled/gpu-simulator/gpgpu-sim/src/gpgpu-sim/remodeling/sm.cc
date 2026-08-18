@@ -1865,20 +1865,7 @@ void SM::reinit(unsigned start_thread, unsigned end_thread,
     m_physical_warp[i]->reset();
     m_simt_stack[i]->reset();
     if (i < m_pending_sync_waits.size()) {
-      // [Stage 1.8] A warp slot must not be reused while a compound wait-block
-      // gate is still parked — that would mean a gate never released (the HW
-      // trace guarantees it does). Assert clean before clearing. Only meaningful
-      // when the fold feature is on; feature-off leaves mode==NONE always.
-      if (m_config->spin_wait_fold_enable) {
-        assert((!m_pending_sync_waits[i].valid ||
-                m_pending_sync_waits[i].mode !=
-                    PendingWaitMode::WAIT_BLOCK_GATE) &&
-               "warp slot reused with an open WAIT_BLOCK_GATE park");
-      }
       m_pending_sync_waits[i] = HopperMBarrierPendingWait();
-    }
-    if (i < m_wait_block_park_start_cycle.size()) {
-      m_wait_block_park_start_cycle[i] = 0;
     }
     // [Gen audit] Clear this warp's per-barrier consumed-gen so a reused slot in
     // the next CTA wave does not inherit a stale generation. Empty when fold
@@ -2330,18 +2317,6 @@ void SM::service_fold_release(unsigned warp_id) {
     return;
   }
   HopperMBarrierPendingWait &pending_wait = m_pending_sync_waits[warp_id];
-  // [Stage 1.8] A WAIT_BLOCK_GATE park is serviced by the separate wait-block
-  // release helper (one release action per warp per cycle is preserved: this is
-  // a dispatch, not a second service point). Its pending wait has
-  // fold_needs_skip=false, so the legacy guard below already ignores it; the
-  // explicit dispatch keeps the two runtimes' logic apart.
-  if (pending_wait.valid &&
-      pending_wait.mode == PendingWaitMode::WAIT_BLOCK_GATE) {
-    service_wait_block_release(warp_id);
-    return;
-  }
-  // Invariant (§1.8.1): the legacy fold path is entered iff fold_needs_skip.
-  assert(pending_wait.mode != PendingWaitMode::WAIT_BLOCK_GATE);
   if (!pending_wait.valid || !pending_wait.fold_needs_skip) {
     return;
   }
@@ -2527,203 +2502,6 @@ void SM::service_fold_release(unsigned warp_id) {
   pending_wait = HopperMBarrierPendingWait();
 }
 
-void SM::service_wait_block_release(unsigned int warp_id) {
-  // [Stage 1.8] Release service for a WAIT_BLOCK_GATE park. Mirrors the gen audit
-  // of service_fold_release but lands on resume_pc via wait_block_skip_to_resume.
-  // A ready pending wait must not remain valid (a later flip could otherwise
-  // re-park with stale state), so on readiness we clear and skip immediately.
-  if (warp_id >= m_pending_sync_waits.size()) {
-    return;
-  }
-  HopperMBarrierPendingWait &pending_wait = m_pending_sync_waits[warp_id];
-  if (!pending_wait.valid ||
-      pending_wait.mode != PendingWaitMode::WAIT_BLOCK_GATE) {
-    return;
-  }
-  const uint64_t cur_gen = sync_barrier_gen(pending_wait.key);
-  const uint64_t exp_gen = pending_wait.fold_expected_gen;
-  const unsigned long long parked_now =
-      (warp_id < m_wait_block_park_start_cycle.size() &&
-       m_wait_block_park_start_cycle[warp_id] != 0)
-          ? get_current_gpu_cycle() - m_wait_block_park_start_cycle[warp_id]
-          : 0;
-
-  // cur_gen > expected: the paired flip already passed (double-flip). This is a
-  // pacing/accuracy defect; abort rather than force-release (same policy as the
-  // spin-region path, §Stage 2).
-  if (cur_gen > exp_gen) {
-    uint64_t prev_flip_cycle = 0, last_flip_cycle = 0;
-    auto bit = m_hopper_mbarriers.find(pending_wait.key);
-    if (bit != m_hopper_mbarriers.end()) {
-      prev_flip_cycle = bit->second.prev_flip_cycle;
-      last_flip_cycle = bit->second.last_flip_cycle;
-    }
-    std::cerr << "[WAITBLOCKAUDIT][SM" << m_sm_id << "] cyc="
-              << get_current_gpu_cycle() << " warp=" << warp_id << " role="
-              << (m_warp_is_producer[warp_id]
-                      ? "producer"
-                      : (m_warp_is_consumer[warp_id] ? "consumer" : "unknown"))
-              << " cta=" << pending_wait.key.cta_id << " barrier=0x"
-              << format_hex_u64(pending_wait.key.barrier_addr) << " entry_pc=0x"
-              << format_hex_u64(pending_wait.wb_entry_pc) << " resume_pc=0x"
-              << format_hex_u64(pending_wait.wb_resume_pc)
-              << " expected_gen=" << exp_gen << " barrier_gen=" << cur_gen
-              << " prev_flip_cyc=" << prev_flip_cycle
-              << " current_flip_cyc=" << last_flip_cycle
-              << " parked_cyc=" << parked_now << " action=abort"
-              << " : paired consumer flip already passed (double-flip) for a"
-                 " compound wait block — pacing/accuracy defect, never"
-                 " force-release. See SPIN_WAIT_FOLD_ROOT_CAUSE_PLAN.md 1.8."
-              << std::endl;
-    m_wait_block_gate_watchdog_hits++;
-    abort();
-  }
-
-  // Not yet releasable: either the paired flip has not happened (cur_gen <
-  // exp_gen) or the gen matches but the phase has not flipped yet. Both keep the
-  // warp parked. A park that outlives the watchdog window is itself a model gap
-  // (the HW trace guarantees the gate opens), so surface it loudly rather than
-  // hang for the full 12h run. Threshold matches the spin-region path (32000).
-  const bool gen_reached = (cur_gen == exp_gen);
-  const bool phase_ready = gen_reached && is_sync_wait_satisfied(pending_wait);
-  if (!gen_reached || !phase_ready) {
-    if (warp_id < m_wait_block_park_start_cycle.size() &&
-        m_wait_block_park_start_cycle[warp_id] != 0) {
-      const unsigned long long threshold =
-          m_spin_wait_watchdog_threshold ? m_spin_wait_watchdog_threshold
-                                         : 32000ULL;
-      if (parked_now > threshold) {
-        uint64_t prev_flip_cycle = 0, last_flip_cycle = 0;
-        auto bit = m_hopper_mbarriers.find(pending_wait.key);
-        if (bit != m_hopper_mbarriers.end()) {
-          prev_flip_cycle = bit->second.prev_flip_cycle;
-          last_flip_cycle = bit->second.last_flip_cycle;
-        }
-        std::cerr << "[WAITBLOCKAUDIT][SM" << m_sm_id << "] cyc="
-                  << get_current_gpu_cycle() << " warp=" << warp_id << " role="
-                  << (m_warp_is_producer[warp_id]
-                          ? "producer"
-                          : (m_warp_is_consumer[warp_id] ? "consumer"
-                                                         : "unknown"))
-                  << " cta=" << pending_wait.key.cta_id << " barrier=0x"
-                  << format_hex_u64(pending_wait.key.barrier_addr)
-                  << " entry_pc=0x" << format_hex_u64(pending_wait.wb_entry_pc)
-                  << " resume_pc=0x" << format_hex_u64(pending_wait.wb_resume_pc)
-                  << " expected_gen=" << exp_gen << " barrier_gen=" << cur_gen
-                  << " gen_reached=" << gen_reached
-                  << " prev_flip_cyc=" << prev_flip_cycle
-                  << " current_flip_cyc=" << last_flip_cycle
-                  << " parked_cyc=" << parked_now << " threshold=" << threshold
-                  << " action=watchdog-abort"
-                  << " : a compound wait-block park exceeded the watchdog window;"
-                     " the modeled gate never opened (model gap, never"
-                     " force-release). See SPIN_WAIT_FOLD_ROOT_CAUSE_PLAN.md 1.8."
-                  << std::endl;
-        m_wait_block_gate_watchdog_hits++;
-        abort();
-      }
-    }
-    // Periodic keep-parked heartbeat so a 12h run shows progress, not silence.
-    if (m_config->spin_wait_fold_debug && parked_now != 0 &&
-        (parked_now % 4096ULL) == 0) {
-      debug_log_fold_event(
-          "wb keep-parked warp=" + std::to_string(warp_id) + " cta=" +
-          std::to_string(pending_wait.key.cta_id) + " barrier=0x" +
-          format_hex_u64(pending_wait.key.barrier_addr) + " entry_pc=0x" +
-          format_hex_u64(pending_wait.wb_entry_pc) + " expected_gen=" +
-          std::to_string(exp_gen) + " barrier_gen=" + std::to_string(cur_gen) +
-          " gen_reached=" + std::to_string(gen_reached) + " parked_cyc=" +
-          std::to_string(parked_now));
-    }
-    return;  // keep parked
-  }
-
-  // Ready (gen matched AND phase flipped): land on resume_pc by skipping only the
-  // captured residual path.
-  WaitBlockRecord wb;
-  if (!m_gpu->lookup_wait_block(pending_wait.fold_uid, pending_wait.wb_entry_pc,
-                                wb)) {
-    std::cerr << "[WAITBLOCKAUDIT][SM" << m_sm_id
-              << "] release could not re-find wait block for entry_pc=0x"
-              << format_hex_u64(pending_wait.wb_entry_pc)
-              << " funcid=" << pending_wait.fold_uid
-              << " — sidecar/runtime drift. Aborting." << std::endl;
-    abort();
-  }
-  trace_shd_warp_t *tw =
-      static_cast<trace_shd_warp_t *>(m_physical_warp[warp_id]);
-  // Flush younger prefetched IBuffer entries before moving the cursor (§1.8.3),
-  // matching the spin-region release path's flush(false).
-  tw->get_IBuffer_remodeled()->flush(false);
-  const address_type pre_skip_pc = tw->get_pc();
-  // [Stage 1.8, revised — plan §1.8] Skip ONLY the captured fallback poll loop,
-  // and only when the cursor is actually sitting inside it. Two release shapes:
-  //   * The warp had entered the in-line fallback loop (Type-2, C-path): the
-  //     cursor is on a fallback body PC -> skip the residual loop iterations to
-  //     resume_pc.
-  //   * The warp parked at the gate but the captured stream is the ready arm
-  //     (no fallback was recorded; the gate is immediately followed by mainline
-  //     address-setup, e.g. 0x93b0 -> 0x93c0): the cursor is NOT a fallback body
-  //     PC. There is nothing to skip; the warp simply resumes normal replay from
-  //     wherever it parked. Skipping here would corrupt mainline live-out state.
-  // We therefore skip iff the current PC is a fallback body PC (a member of
-  // allowed_block_pcs that is not the entry gate itself).
-  const bool cursor_in_fallback =
-      wb.allowed_block_pcs.count(static_cast<uint64_t>(pre_skip_pc)) != 0 &&
-      pre_skip_pc != static_cast<address_type>(wb.entry_wait_pc);
-  unsigned skipped = 0;
-  if (cursor_in_fallback) {
-    FoldSkipStats skip_stats;
-    skipped = tw->wait_block_skip_to_resume(wb.resume_pc, wb.allowed_block_pcs,
-                                            &skip_stats);
-    // Post-skip landing invariant: the cursor MUST now sit on resume_pc. This is
-    // the single most important runtime correctness check for the fold — verify
-    // unconditionally so a 12h run cannot silently drift.
-    const address_type landing_pc = tw->get_pc();
-    if (landing_pc != static_cast<address_type>(wb.resume_pc)) {
-      std::cerr << "[WAITBLOCKAUDIT][SM" << m_sm_id << "] cyc="
-                << get_current_gpu_cycle() << " warp=" << warp_id << " block="
-                << wb.block_id << " entry_pc=0x"
-                << format_hex_u64(pending_wait.wb_entry_pc) << " pre_skip_pc=0x"
-                << format_hex_u64(pre_skip_pc) << " landing_pc=0x"
-                << format_hex_u64(landing_pc) << " expected_resume_pc=0x"
-                << format_hex_u64(wb.resume_pc) << " skipped=" << skipped
-                << " : wait-block release did not land on resume_pc. Aborting."
-                << std::endl;
-      abort();
-    }
-  }
-  m_sync_debug_wait_released++;
-  unsigned long long parked_cyc = 0;
-  if (warp_id < m_wait_block_park_start_cycle.size() &&
-      m_wait_block_park_start_cycle[warp_id] != 0) {
-    parked_cyc =
-        get_current_gpu_cycle() - m_wait_block_park_start_cycle[warp_id];
-    m_wait_block_park_start_cycle[warp_id] = 0;
-  }
-  m_wait_block_gate_releases++;
-  m_wait_block_skipped_insts += skipped;
-  m_wait_block_gate_park_cycles += parked_cyc;
-  if (parked_cyc > m_wait_block_gate_park_cycles_max) {
-    m_wait_block_gate_park_cycles_max = parked_cyc;
-  }
-  if (m_config->spin_wait_fold_debug) {
-    debug_log_fold_event(
-        "wb release warp=" + std::to_string(warp_id) + " cta=" +
-        std::to_string(pending_wait.key.cta_id) + " block=" + wb.block_id +
-        " barrier=0x" + format_hex_u64(pending_wait.key.barrier_addr) +
-        " entry_pc=0x" + format_hex_u64(pending_wait.wb_entry_pc) +
-        " pre_skip_pc=0x" + format_hex_u64(pre_skip_pc) + " resume_pc=0x" +
-        format_hex_u64(wb.resume_pc) + " skipped=" + std::to_string(skipped) +
-        " skipped_fallback=" + std::to_string(cursor_in_fallback ? 1 : 0) +
-        " expected_gen=" + std::to_string(exp_gen) + " barrier_gen=" +
-        std::to_string(cur_gen) + " landing_pc=0x" +
-        format_hex_u64(tw->get_pc()) + " parked_cyc=" +
-        std::to_string(parked_cyc));
-  }
-  pending_wait = HopperMBarrierPendingWait();
-}
-
 void SM::print_spin_wait_fold_summary() const {
   if (!m_config->spin_wait_fold_enable) {
     return;
@@ -2748,22 +2526,6 @@ void SM::print_spin_wait_fold_summary() const {
           m_fold_skipped_insts_total, m_fold_immediate_skipped_insts_total,
           m_fold_late_releases_total, avg, m_fold_park_cycles_max,
           m_fold_watchdog_hits);
-  // [Stage 1.8] Compound wait-block summary, separate from the spin-region fold
-  // line. gate_parks == gate_releases at a clean exit; gate_hits are the ready-
-  // at-issue immediate folds (no park). watchdog_hits must be 0 for a clean run.
-  const double wb_avg = m_wait_block_gate_releases
-                            ? (double)m_wait_block_gate_park_cycles /
-                                  m_wait_block_gate_releases
-                            : 0.0;
-  fprintf(stdout,
-          "[WAITBLOCKSUM] sm=%u gate_hits=%llu gate_parks=%llu "
-          "gate_releases=%llu total_folds=%llu skipped_insts=%llu "
-          "avg_park=%.1f max_park=%llu watchdog_hits=%llu\n",
-          m_sm_id, m_wait_block_gate_hits, m_wait_block_gate_parks,
-          m_wait_block_gate_releases,
-          m_wait_block_gate_hits + m_wait_block_gate_releases,
-          m_wait_block_skipped_insts, wb_avg,
-          m_wait_block_gate_park_cycles_max, m_wait_block_gate_watchdog_hits);
   for (unsigned warp_id = 0; warp_id < m_fold_pace_by_warp.size();
        ++warp_id) {
     const char *role =
@@ -2929,15 +2691,6 @@ void SM::handle_sync_instruction(warp_inst_t &inst, unsigned int warp_id) {
   if (inst.sync_kind == SyncInstructionKind::PHASECHK ||
       inst.sync_kind == SyncInstructionKind::TRYWAIT) {
     if (warp_id < m_pending_sync_waits.size()) {
-      // [Stage 1.8] A predicated-off gate (active_count()==0) must never park or
-      // fold — the lanes did not execute the wait. Guard the fold/wait-block
-      // paths only (feature-gated) so feature-off replay stays bit-identical:
-      // when folding is on we return before any lookup/park/skip; when off we
-      // fall through to the unchanged nonblocking handling below.
-      if (m_config->spin_wait_fold_enable && inst.active_count() == 0) {
-        m_pending_sync_waits[warp_id] = HopperMBarrierPendingWait();
-        return;
-      }
       const bool is_trywait =
           inst.sync_kind == SyncInstructionKind::TRYWAIT;
       const bool wait_ready = is_sync_wait_satisfied(
@@ -2979,39 +2732,8 @@ void SM::handle_sync_instruction(warp_inst_t &inst, unsigned int warp_id) {
         // is later over-flipped); genuine double-flips are caught in
         // service_fold_release. So the immediate path just folds.
         if (m_config->spin_wait_fold_enable) {
-          // [Stage 1.8] Wait-block gate, ready-at-issue path. The gate TRYWAIT
-          // has already functionally executed and the modeled barrier is ready,
-          // so the captured stream is the real ready arm (mainline setup + gate
-          // fall-through + resume) — there is NO residual poll to remove and NO
-          // fallback loop to skip. Doing a skip here would try to advance over
-          // mainline address-setup between the gate and its branch and corrupt
-          // live-out state (that was the 0x93b0 [WAITBLOCK_SKIP_AUDIT] abort).
-          // Correct behavior (plan §1.8, revised): on ready, do nothing but claim
-          // the gate so the spin-region fold does not also fire. Pacing is fixed
-          // only where it is actually wrong — the not-ready park path below.
-          WaitBlockRecord wb;
-          bool wait_block_handled = false;
-          if (m_gpu->lookup_wait_block(inst.unique_function_id, inst.pc, wb)) {
-            assert(wb.entry_wait_pc == inst.pc &&
-                   "wait-block lookup returned a record for a different gate PC");
-            m_wait_block_gate_hits++;
-            if (m_config->spin_wait_fold_debug) {
-              trace_shd_warp_t *tw =
-                  static_cast<trace_shd_warp_t *>(m_physical_warp[warp_id]);
-              debug_log_fold_event(
-                  "wb ready-passthrough warp=" + std::to_string(warp_id) +
-                  " cta=" + std::to_string(key.cta_id) + " block=" + wb.block_id +
-                  " barrier=0x" + format_hex_u64(key.barrier_addr) +
-                  " entry_pc=0x" + format_hex_u64(inst.pc) + " next_pc=0x" +
-                  format_hex_u64(tw->get_pc()) + " barrier_gen=" +
-                  std::to_string(sync_barrier_gen(key)));
-            }
-            // Ready: no skip. Claim the gate so the spin-region fold is not run.
-            wait_block_handled = true;
-          }
           SpinWaitRegionRecord region;
-          if (!wait_block_handled &&
-              m_gpu->lookup_spin_wait_region(inst.unique_function_id, inst.pc,
+          if (m_gpu->lookup_spin_wait_region(inst.unique_function_id, inst.pc,
                                              region) &&
               region.foldable) {
             // Fold path must not silently tolerate sidecar/runtime drift.
@@ -3119,60 +2841,8 @@ void SM::handle_sync_instruction(warp_inst_t &inst, unsigned int warp_id) {
         // so the release path can fast-forward the cursor. See design doc 5.1.
         bool fold_parked = false;
         if (m_config->spin_wait_fold_enable) {
-          // [Stage 1.8] Wait-block gate park (mutually exclusive with spin-region
-          // fold). Modeled miss at the gate: park once as WAIT_BLOCK_GATE. The
-          // event-based release replaces BOTH the second speculative check and the
-          // pure fallback poll loop; on the modeled flip the warp resumes on the
-          // captured ready arm. Poll issue cost is folded; readiness is not forced.
-          WaitBlockRecord wb;
-          if (!fold_parked &&
-              m_gpu->lookup_wait_block(inst.unique_function_id, inst.pc, wb)) {
-            // Drift guard: the block we matched must be keyed on this exact gate
-            // PC. We do NOT compare inst.next_traced_pc to captured_next_pc:
-            // next_traced_pc is the immediate sequential successor (the gate's
-            // own @!P branch instruction), whereas captured_next_pc is the
-            // logical convergence/resume PC after the branch. They are different
-            // by construction. The captured control flow is validated at release
-            // time by wait_block_skip_to_resume's per-PC guard (and offline by
-            // the Stage 1.7 dynamic capture proof).
-            assert(wb.entry_wait_pc == inst.pc &&
-                   "wait-block lookup returned a record for a different gate PC");
-            HopperMBarrierPendingWait parked;
-            parked.valid = true;
-            parked.is_trywait = is_trywait;
-            parked.key = key;
-            parked.wait_state_raw = inst.sync_semantic_raw;
-            parked.mode = PendingWaitMode::WAIT_BLOCK_GATE;
-            parked.wb_entry_pc = wb.entry_wait_pc;
-            parked.wb_resume_pc = wb.resume_pc;
-            parked.fold_uid = inst.unique_function_id;
-            // Pin the generation this wait pairs with: not-ready means
-            // phase==parity, so fold_expected_gen_for_wait returns cur_gen+1.
-            parked.fold_expected_gen = fold_expected_gen_for_wait(
-                warp_id, key, inst.sync_semantic_raw);
-            m_pending_sync_waits[warp_id] = parked;
-            fold_parked = true;
-            if (m_wait_block_park_start_cycle.size() <= warp_id) {
-              m_wait_block_park_start_cycle.resize(MAX_WARP_PER_SHADER, 0);
-            }
-            if (m_wait_block_park_start_cycle[warp_id] == 0) {
-              m_wait_block_park_start_cycle[warp_id] = get_current_gpu_cycle();
-              m_wait_block_gate_parks++;
-            }
-            if (m_config->spin_wait_fold_debug) {
-              debug_log_fold_event(
-                  "wb park warp=" + std::to_string(warp_id) + " cta=" +
-                  std::to_string(key.cta_id) + " block=" + wb.block_id +
-                  " barrier=0x" + format_hex_u64(key.barrier_addr) +
-                  " entry_pc=0x" + format_hex_u64(inst.pc) + " resume_pc=0x" +
-                  format_hex_u64(wb.resume_pc) + " expected_gen=" +
-                  std::to_string(parked.fold_expected_gen) + " barrier_gen=" +
-                  std::to_string(sync_barrier_gen(key)));
-            }
-          }
           SpinWaitRegionRecord region;
-          if (!fold_parked &&
-              m_gpu->lookup_spin_wait_region(inst.unique_function_id, inst.pc,
+          if (m_gpu->lookup_spin_wait_region(inst.unique_function_id, inst.pc,
                                              region) &&
               region.foldable) {
             HopperMBarrierPendingWait parked;
@@ -3184,7 +2854,6 @@ void SM::handle_sync_instruction(warp_inst_t &inst, unsigned int warp_id) {
             parked.fold_wait_pc = inst.pc;
             parked.fold_exit_pc = region.exit_pc;
             parked.fold_uid = inst.unique_function_id;
-            parked.mode = PendingWaitMode::FOLD_REGION;
             // [gen audit v3] Pin the generation this wait pairs with from the
             // LIVE barrier gen at park time: not-ready here means phase==parity,
             // so fold_expected_gen_for_wait returns cur_gen+1 (the next flip).

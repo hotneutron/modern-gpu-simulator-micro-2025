@@ -3,7 +3,6 @@
 #include <array>
 #include <cstdint>
 #include <map>
-#include <set>
 #include <string>
 #include <utility>
 #include <vector>
@@ -252,31 +251,6 @@ struct SpinWaitRegionRecord {
   bool foldable = false;
 };
 
-// ---- Compound wait block (spin_wait_sidecar.json "wait_blocks", schema v3) ----
-// A proven speculative mbarrier gate whose miss path is a pure wait fallback
-// (Type-1 double-gate + out-of-line fallback, or Type-2 single-gate + in-line
-// spin loop). At entry_wait_pc the simulator parks on a modeled miss or
-// immediate-folds a modeled hit, then skips ONLY the captured residual gate/
-// fallback control path (allowed_block_pcs) to land on resume_pc. The barrier
-// address is runtime-only; canonical_barrier_offset is kept for cross-check.
-// See build_spin_wait_sidecar.py (Stage 1.7) and plan §1.7.5/§1.8.
-struct WaitBlockRecord {
-  uint64_t entry_wait_pc = 0;     // the gate TRYWAIT that arms/parks this visit
-  uint64_t captured_next_pc = 0;  // next_traced_pc the gate must have on a miss
-  uint64_t resume_pc = 0;         // common convergence PC (ready arm == fallback exit)
-  // PCs the cursor may advance over when skipping the residual path: the gate
-  // polls/branches plus the fallback loop body (incl. its exit BRA). Mainline
-  // address-setup between the gate and its branch is intentionally NOT here and
-  // is never skipped. A set for O(log n) membership checks in the skip guard.
-  std::set<uint64_t> allowed_block_pcs;
-  // Every gate poll PC (Type-1 has two; Type-2 has one). Diagnostic/assert only.
-  std::vector<uint64_t> all_gate_wait_pcs;
-  unsigned int wait_predicate = 0;       // the predicate the gate TRYWAIT defines
-  bool wait_predicate_uniform = false;   // true if it is a uniform predicate (UP)
-  uint64_t canonical_barrier_offset = 0; // cross-check only; address is runtime
-  std::string block_id;                  // e.g. "wb_fid3_e0x96c0" (log/assert only)
-};
-
 // [Stage 1.4] Decomposition of the instructions the fold cursor-skip advanced
 // over, classified from each skipped occurrence's opcode/sync class. The fold is
 // only sound when NO semantic/local-memory/HGMMA/MUFU/TMA/BAR work is skipped;
@@ -300,19 +274,10 @@ struct FoldSkipStats {
 // issue time against this to know it is inside a foldable spin loop.
 struct SpinWaitSidecarDB {
   std::map<SyncOperandLookupKey, SpinWaitRegionRecord> regions_by_wait_pc;
-  // Stage 1.8: compound wait blocks, keyed by (funcid, entry_wait_pc). Kept in a
-  // separate map from spin regions so the two runtime paths stay independent and
-  // a gate lookup at issue time never collides with a spin-region lookup.
-  std::map<SyncOperandLookupKey, WaitBlockRecord> wait_blocks_by_entry_pc;
 
-  void clear() {
-    regions_by_wait_pc.clear();
-    wait_blocks_by_entry_pc.clear();
-  }
+  void clear() { regions_by_wait_pc.clear(); }
 
-  bool empty() const {
-    return regions_by_wait_pc.empty() && wait_blocks_by_entry_pc.empty();
-  }
+  bool empty() const { return regions_by_wait_pc.empty(); }
 };
 
 
@@ -349,15 +314,6 @@ struct HopperMBarrierObject {
   uint64_t last_flip_cycle = 0;
 };
 
-// Stage 1.8: which runtime owns a parked wait. FOLD_REGION is the legacy spin
-// fold; WAIT_BLOCK_GATE is the new compound wait block. NONE means no parked
-// wait. The two paths use separate lookup maps, skip helpers, and counters.
-enum class PendingWaitMode {
-  NONE = 0,
-  FOLD_REGION,
-  WAIT_BLOCK_GATE,
-};
-
 struct HopperMBarrierPendingWait {
   bool valid = false;
   bool is_trywait = false;
@@ -378,14 +334,6 @@ struct HopperMBarrierPendingWait {
   // parked; >expected -> report poison (temporary diagnostic build late-releases
   // and continues folding; production/validation must restore assert).
   uint64_t fold_expected_gen = 0;
-  // --- Stage 1.8 compound wait block (only set when mode==WAIT_BLOCK_GATE) ---
-  // Appended after the existing fields so aggregate initializers keep working.
-  // A WAIT_BLOCK_GATE pending wait carries the entry/resume PCs and never uses
-  // the spin-region fold_exit_pc / skip_spin_to_exit path. Invariant asserted at
-  // arm/release: (mode == FOLD_REGION) iff fold_needs_skip.
-  PendingWaitMode mode = PendingWaitMode::NONE;
-  uint64_t wb_entry_pc = 0;   // WaitBlockRecord.entry_wait_pc (the gate)
-  uint64_t wb_resume_pc = 0;  // WaitBlockRecord.resume_pc to land on
 };
 
 struct HopperMBarrierPendingTxBinding {
