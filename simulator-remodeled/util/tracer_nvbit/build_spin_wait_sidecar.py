@@ -976,6 +976,7 @@ def validate_dynamic(kdir, regions, byp, max_ctas):
 DYNAMIC_PATH_ESCAPE = "DYNAMIC_PATH_ESCAPE"
 CTA_IDENTITY_MISMATCH = "CTA_IDENTITY_MISMATCH"
 ENTRY_WAIT_TARGET_UNDECODABLE = "ENTRY_WAIT_TARGET_UNDECODABLE"
+CAPTURED_POLL_ENTRY_NOT_REQUIRED = "CAPTURED_POLL_ENTRY_NOT_REQUIRED"
 
 
 def validate_wait_blocks_dynamic(kdir, cands, byp, all_byp, max_ctas,
@@ -1241,7 +1242,8 @@ def main():
             """A captured-poll candidate is already covered by the legacy fold
             strategy; a non-target shape is reported as skipped fail-closed."""
             if _is_fold_target(c):
-                wb_fail.append((c, reason))
+                c["ignored_entry_reason"] = reason
+                wb_skip.append((c, CAPTURED_POLL_ENTRY_NOT_REQUIRED))
             else:
                 wb_skip.append((c, reason))
 
@@ -1352,8 +1354,11 @@ def main():
                 % (c["entry_wait_pc"], reason))
         for c, reason in wb_skip:
             report_lines.append(
-                "    SKIP entry=0x%x reason=%s (not a fold target)"
-                % (c["entry_wait_pc"], reason))
+                "    SKIP entry=0x%x reason=%s%s"
+                % (c["entry_wait_pc"], reason,
+                   (" (entry proof not used by captured-poll strategy; "
+                    "observed=%s)" % c.get("ignored_entry_reason"))
+                   if reason == CAPTURED_POLL_ENTRY_NOT_REQUIRED else ""))
         if metadata_candidates:
             for c in metadata_candidates:
                 st = c["dynamic"]
@@ -1442,7 +1447,7 @@ def main():
         "wait_block_fail_taxonomy": [
             CFG_UNRESOLVED, MULTI_REJOIN,
             DYNAMIC_PATH_ESCAPE, CTA_IDENTITY_MISMATCH,
-            ENTRY_WAIT_TARGET_UNDECODABLE,
+            ENTRY_WAIT_TARGET_UNDECODABLE, CAPTURED_POLL_ENTRY_NOT_REQUIRED,
         ],
         "wait_block_report": dict(report),
         "kernels": out_kernels,

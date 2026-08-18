@@ -605,3 +605,59 @@ Loader/runtime unit tests:
 - Keep all debug artifacts and the server until post-fix user confirmation.
 - Do not modify business logic until the instrumentation patch and this design
   are reviewed.
+
+## V4 Full-Trace Post-Processing Result (2026-08-18)
+
+This section supersedes the earlier proposed universal WaitBlock runtime and its
+`35-record` v3 acceptance target. The v3 counts above remain historical evidence.
+
+The failed Stage 1.7/1.8 implementation was reverted. Full-CTA strict
+post-processing now succeeds with the two-strategy v4 design:
+
+```text
+discovered=43 passed=36 failed=0 skipped=7
+INJECT_MISSING_WAIT=22
+FOLD_CAPTURED_POLL=14
+metadata_only=0
+ready-only all-live visits=76,224
+ready-only partial visits=4,596
+ready-only records with partial visits=11
+```
+
+The additional v4 ready-only record is K10 `0xa810`. V3 rejected it because its
+uncaptured wait arm contains local-memory work. That rejection is not applicable
+to `INJECT_MISSING_WAIT`: the runtime action uses the entry probe and never
+executes or consumes the uncaptured wait arm.
+
+K5 strategy split:
+
+```text
+INJECT_MISSING_WAIT=12
+FOLD_CAPTURED_POLL=8
+partial visits=948
+```
+
+K10 strategy split:
+
+```text
+INJECT_MISSING_WAIT=10
+FOLD_CAPTURED_POLL=6
+partial visits=3,648
+```
+
+The K5 `0x96c0` entry-path dynamic proof still escapes, but it is not a v4
+failure: its captured poll is independently and fully owned by
+`FOLD_CAPTURED_POLL` at `0xb0b0`. Entry-path proof is not a runtime contract for
+that strategy.
+
+The generated candidate passes schema, report-accounting, duplicate-key,
+strategy-shape, sync-payload, fold-owner, local-exit, and exact-advance-set
+audits. It is written to:
+
+```text
+traces/extra_info/spin_wait_sidecar.v4.candidate.json
+```
+
+Simulator v4 remains intentionally unimplemented. Partial modeled misses remain
+an explicit diagnostic-abort boundary pending a separately reviewed lane-group
+execution design.

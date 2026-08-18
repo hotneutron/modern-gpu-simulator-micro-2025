@@ -1,6 +1,6 @@
 # WaitBlock: Two-Strategy Post-Processing and Simulator Design
 
-**Status:** POST-PROCESSING V4 IMPLEMENTED; FULL-TRACE VALIDATION PENDING;
+**Status:** POST-PROCESSING V4 IMPLEMENTED AND FULL-TRACE VALIDATED;
 SIMULATOR NOT IMPLEMENTED.
 
 **Extends:** [`SPIN_WAIT_SIM_MODELING.md`](SPIN_WAIT_SIM_MODELING.md) and
@@ -148,14 +148,16 @@ an entry hold.
 Current intended action sets:
 
 ```text
-21 ready-only records     -> INJECT_MISSING_WAIT
+22 ready-only records     -> INJECT_MISSING_WAIT
 14 captured-poll records  -> FOLD_CAPTURED_POLL
 ```
 
 The earlier "8 missing-wait targets" count referred only to the initially
-identified compound Type-1 subset. It is not the total ready-only count. The
-current v3 K5/K10 sidecar contains 21 ready-only records, and the simplified
-policy treats all 21 through the same mask-aware handler.
+identified compound Type-1 subset. It is not the total ready-only count. Full
+v4 validation finds 22 ready-only records. The additional K10 `0xa810` gate was
+excluded by v3 because its uncaptured wait arm contains local memory; v4
+correctly admits the entry because `INJECT_MISSING_WAIT` neither executes nor
+skips that wait arm.
 
 The v4 generator remains authoritative for the final strategy and visit counts
 and must print:
@@ -410,12 +412,12 @@ implicitly enable entry holds.
     "passed": 35,
     "failed": 0,
     "skipped": 7,
-    "inject_missing_wait": 21,
+    "inject_missing_wait": 22,
     "fold_captured_poll": 14,
     "metadata_only": 0,
     "ready_only_all_live_visits": 76224,
-    "ready_only_partial_visits": 3252,
-    "ready_only_records_with_partial_visits": 10
+    "ready_only_partial_visits": 4596,
+    "ready_only_records_with_partial_visits": 11
   },
   "kernels": [
     {
@@ -452,9 +454,9 @@ implicitly enable entry holds.
 }
 ```
 
-The `21/14` record split and visit-level mask counts are measured from all 516
-K5/K10 CTAs in the current compact trace. The v4 generator must reproduce these
-values. Generated output remains the authority.
+The `22/14` record split and visit-level mask counts are measured from all 516
+K5/K10 CTAs in the current compact trace. Generated output remains the
+authority.
 
 Metadata-only WaitBlocks omit `runtime_strategy`. They remain available for
 reporting and future work but create no runtime lookup.
@@ -531,15 +533,15 @@ entry. Every measured entry count matches the v3 sidecar's
 K5:  12 ready-only records, 24,564 visits
      23,616 all-live, 948 partial
 
-K10: 9 ready-only records, 54,912 visits
-     52,608 all-live, 2,304 partial
+K10: 10 ready-only records, 56,256 visits
+      52,608 all-live, 3,648 partial
 
-Total: 79,476 visits
+Total: 80,820 visits
        76,224 all-live
-        3,252 partial
+        4,596 partial
 ```
 
-Ten ready-only records contain partial visits:
+Eleven ready-only records contain partial visits:
 
 | Kernel | Entry PC | Partial visits | Effective mask |
 |---|---:|---:|---:|
@@ -551,6 +553,7 @@ Ten ready-only records contain partial visits:
 | K5 | `0xac00` | 132 | `0x1` |
 | K10 | `0x9ef0` | 384 | `0x1` |
 | K10 | `0xa460` | 1,344 | `0x1` |
+| K10 | `0xa810` | 1,344 | `0x1` |
 | K10 | `0xac10` | 192 | `0x1` |
 | K10 | `0xb000` | 384 | `0x1` |
 
@@ -561,13 +564,14 @@ Mask value alone is not the criterion. K10 `0xb430` executes with
 The same full-trace scan tested whether both all-live and partial entries could
 delay their wait hold to a later all-live convergence:
 
-- For all 3,252 partial visits, the sidecar `resume_pc` occurrence remains
+- For all 4,596 partial visits, the sidecar `resume_pc` occurrence remains
   partial (`effective_mask=0x1`, `live_mask=0xffffffff`). It is a lane-0 path
   resume, not warp reconvergence.
-- A later all-live occurrence exists before the next same entry for only 2,244
+- A later all-live occurrence exists before the next same entry for only 2,580
   partial visits.
-- K10 `0xa460` has no such occurrence for 1,008 of its 1,344 partial visits.
-- Every one of the 2,244 visits with a later all-live occurrence executes
+- K10 `0xa460` and `0xa810` each have no such occurrence for 1,008 of their
+  1,344 partial visits, for 2,016 missing-boundary visits total.
+- Every one of the 2,580 visits with a later all-live occurrence executes
   waiting-lane work before that boundary.
 
 Representative waiting-lane work before the later all-live occurrence:
@@ -576,6 +580,7 @@ Representative waiting-lane work before the later all-live occurrence:
 K5 0x93b0 -> IMAD, R2UR, ...
 K5 0x9930 -> IMAD, ISETP, UIADD3, R2UR, ...
 K10 0xa460 -> LEA, LDC, ...
+K10 0xa810 -> LDL, R2UR, UMOV, IADD3, ...
 K10 0xac10 -> LDL, LDC, IMAD, R2UR, ...
 K10 0xb000 -> LDL, R2UR, LDC, ...
 ```
@@ -979,7 +984,7 @@ Cross-kernel:
 1. [done] Approve this simplified design.
 2. [done] Revert the failed universal WaitBlock implementation.
 3. [done] Change post-processing classification and emit sidecar v4.
-4. [pending] Generate a full-CTA candidate sidecar with:
+4. [done] Generate a full-CTA candidate sidecar with:
 
    ```text
    build_spin_wait_sidecar.py --traces <TRACE_DIR> --kernels <IDS>
@@ -987,8 +992,9 @@ Cross-kernel:
        --out <TRACE_DIR>/extra_info/spin_wait_sidecar.v4.candidate.json
    ```
 
-5. [pending] Review the strategy counts, missing-wait mask report, and captured
-   poll records.
+5. [done] Review the strategy counts, missing-wait mask report, and captured
+   poll records (`discovered=43`, `passed=36`, `failed=0`, `skipped=7`;
+   `inject=22`, `fold=14`).
 6. [not started] Restore captured-poll ownership at poll probes in the v4
    simulator.
 7. [not started] Implement `INJECT_MISSING_WAIT` and its partial-miss diagnostic
