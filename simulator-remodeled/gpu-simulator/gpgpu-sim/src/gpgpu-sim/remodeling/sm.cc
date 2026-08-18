@@ -2655,10 +2655,44 @@ void SM::service_wait_block_release(unsigned int warp_id) {
   // Flush younger prefetched IBuffer entries before moving the cursor (§1.8.3),
   // matching the spin-region release path's flush(false).
   tw->get_IBuffer_remodeled()->flush(false);
-  const address_type pre_skip_pc [[maybe_unused]] = tw->get_pc();
-  FoldSkipStats skip_stats;
-  const unsigned skipped = tw->wait_block_skip_to_resume(
-      wb.resume_pc, wb.allowed_block_pcs, &skip_stats);
+  const address_type pre_skip_pc = tw->get_pc();
+  // [Stage 1.8, revised — plan §1.8] Skip ONLY the captured fallback poll loop,
+  // and only when the cursor is actually sitting inside it. Two release shapes:
+  //   * The warp had entered the in-line fallback loop (Type-2, C-path): the
+  //     cursor is on a fallback body PC -> skip the residual loop iterations to
+  //     resume_pc.
+  //   * The warp parked at the gate but the captured stream is the ready arm
+  //     (no fallback was recorded; the gate is immediately followed by mainline
+  //     address-setup, e.g. 0x93b0 -> 0x93c0): the cursor is NOT a fallback body
+  //     PC. There is nothing to skip; the warp simply resumes normal replay from
+  //     wherever it parked. Skipping here would corrupt mainline live-out state.
+  // We therefore skip iff the current PC is a fallback body PC (a member of
+  // allowed_block_pcs that is not the entry gate itself).
+  const bool cursor_in_fallback =
+      wb.allowed_block_pcs.count(static_cast<uint64_t>(pre_skip_pc)) != 0 &&
+      pre_skip_pc != static_cast<address_type>(wb.entry_wait_pc);
+  unsigned skipped = 0;
+  if (cursor_in_fallback) {
+    FoldSkipStats skip_stats;
+    skipped = tw->wait_block_skip_to_resume(wb.resume_pc, wb.allowed_block_pcs,
+                                            &skip_stats);
+    // Post-skip landing invariant: the cursor MUST now sit on resume_pc. This is
+    // the single most important runtime correctness check for the fold — verify
+    // unconditionally so a 12h run cannot silently drift.
+    const address_type landing_pc = tw->get_pc();
+    if (landing_pc != static_cast<address_type>(wb.resume_pc)) {
+      std::cerr << "[WAITBLOCKAUDIT][SM" << m_sm_id << "] cyc="
+                << get_current_gpu_cycle() << " warp=" << warp_id << " block="
+                << wb.block_id << " entry_pc=0x"
+                << format_hex_u64(pending_wait.wb_entry_pc) << " pre_skip_pc=0x"
+                << format_hex_u64(pre_skip_pc) << " landing_pc=0x"
+                << format_hex_u64(landing_pc) << " expected_resume_pc=0x"
+                << format_hex_u64(wb.resume_pc) << " skipped=" << skipped
+                << " : wait-block release did not land on resume_pc. Aborting."
+                << std::endl;
+      abort();
+    }
+  }
   m_sync_debug_wait_released++;
   unsigned long long parked_cyc = 0;
   if (warp_id < m_wait_block_park_start_cycle.size() &&
@@ -2673,33 +2707,18 @@ void SM::service_wait_block_release(unsigned int warp_id) {
   if (parked_cyc > m_wait_block_gate_park_cycles_max) {
     m_wait_block_gate_park_cycles_max = parked_cyc;
   }
-  // Post-skip landing invariant: the cursor MUST now sit on resume_pc. This is
-  // the single most important runtime correctness check for the fold — verify it
-  // unconditionally (not only under debug) so a 12h run cannot silently drift.
-  const address_type landing_pc = tw->get_pc();
-  if (landing_pc != static_cast<address_type>(wb.resume_pc)) {
-    std::cerr << "[WAITBLOCKAUDIT][SM" << m_sm_id << "] cyc="
-              << get_current_gpu_cycle() << " warp=" << warp_id << " block="
-              << wb.block_id << " entry_pc=0x"
-              << format_hex_u64(pending_wait.wb_entry_pc) << " pre_skip_pc=0x"
-              << format_hex_u64(pre_skip_pc) << " landing_pc=0x"
-              << format_hex_u64(landing_pc) << " expected_resume_pc=0x"
-              << format_hex_u64(wb.resume_pc) << " skipped=" << skipped
-              << " : wait-block release did not land on resume_pc. Aborting."
-              << std::endl;
-    abort();
-  }
   if (m_config->spin_wait_fold_debug) {
     debug_log_fold_event(
-        "wb release+skip warp=" + std::to_string(warp_id) + " cta=" +
+        "wb release warp=" + std::to_string(warp_id) + " cta=" +
         std::to_string(pending_wait.key.cta_id) + " block=" + wb.block_id +
         " barrier=0x" + format_hex_u64(pending_wait.key.barrier_addr) +
         " entry_pc=0x" + format_hex_u64(pending_wait.wb_entry_pc) +
         " pre_skip_pc=0x" + format_hex_u64(pre_skip_pc) + " resume_pc=0x" +
         format_hex_u64(wb.resume_pc) + " skipped=" + std::to_string(skipped) +
+        " skipped_fallback=" + std::to_string(cursor_in_fallback ? 1 : 0) +
         " expected_gen=" + std::to_string(exp_gen) + " barrier_gen=" +
         std::to_string(cur_gen) + " landing_pc=0x" +
-        format_hex_u64(landing_pc) + " parked_cyc=" +
+        format_hex_u64(tw->get_pc()) + " parked_cyc=" +
         std::to_string(parked_cyc));
   }
   pending_wait = HopperMBarrierPendingWait();
@@ -2960,56 +2979,34 @@ void SM::handle_sync_instruction(warp_inst_t &inst, unsigned int warp_id) {
         // is later over-flipped); genuine double-flips are caught in
         // service_fold_release. So the immediate path just folds.
         if (m_config->spin_wait_fold_enable) {
-          // [Stage 1.8] Wait-block gate takes priority over spin-region fold and
-          // is mutually exclusive with it (Stage 1.7 demotes any absorbed spin
-          // region to foldable=false, and gate/loop PCs never coincide). Ready at
-          // issue: the entry gate TRYWAIT has already functionally executed; skip
-          // only the captured residual gate/fallback path to resume_pc.
+          // [Stage 1.8] Wait-block gate, ready-at-issue path. The gate TRYWAIT
+          // has already functionally executed and the modeled barrier is ready,
+          // so the captured stream is the real ready arm (mainline setup + gate
+          // fall-through + resume) — there is NO residual poll to remove and NO
+          // fallback loop to skip. Doing a skip here would try to advance over
+          // mainline address-setup between the gate and its branch and corrupt
+          // live-out state (that was the 0x93b0 [WAITBLOCK_SKIP_AUDIT] abort).
+          // Correct behavior (plan §1.8, revised): on ready, do nothing but claim
+          // the gate so the spin-region fold does not also fire. Pacing is fixed
+          // only where it is actually wrong — the not-ready park path below.
           WaitBlockRecord wb;
           bool wait_block_handled = false;
           if (m_gpu->lookup_wait_block(inst.unique_function_id, inst.pc, wb)) {
-            trace_shd_warp_t *tw =
-                static_cast<trace_shd_warp_t *>(m_physical_warp[warp_id]);
-            // Flush younger prefetched IBuffer entries before moving the cursor
-            // (§1.8.2), matching fold_cursor_skip_to_exit's flush(false).
-            tw->get_IBuffer_remodeled()->flush(false);
-            const address_type wb_pre_skip_pc [[maybe_unused]] = tw->get_pc();
-            FoldSkipStats wb_stats;
-            const unsigned skipped = tw->wait_block_skip_to_resume(
-                wb.resume_pc, wb.allowed_block_pcs, &wb_stats);
+            assert(wb.entry_wait_pc == inst.pc &&
+                   "wait-block lookup returned a record for a different gate PC");
             m_wait_block_gate_hits++;
-            m_wait_block_immediate_folds++;
-            m_wait_block_skipped_insts += skipped;
-            // Landing invariant: after the skip the cursor must sit on resume_pc.
-            // Checked unconditionally so a 12h run cannot silently drift the PC.
-            const address_type wb_landing_pc = tw->get_pc();
-            if (wb_landing_pc != static_cast<address_type>(wb.resume_pc)) {
-              std::cerr << "[WAITBLOCKAUDIT][SM" << m_sm_id << "] cyc="
-                        << get_current_gpu_cycle() << " warp=" << warp_id
-                        << " block=" << wb.block_id << " entry_pc=0x"
-                        << format_hex_u64(inst.pc) << " pre_skip_pc=0x"
-                        << format_hex_u64(wb_pre_skip_pc) << " landing_pc=0x"
-                        << format_hex_u64(wb_landing_pc)
-                        << " expected_resume_pc=0x"
-                        << format_hex_u64(wb.resume_pc) << " skipped=" << skipped
-                        << " : immediate wait-block fold did not land on"
-                           " resume_pc. Aborting." << std::endl;
-              abort();
-            }
             if (m_config->spin_wait_fold_debug) {
+              trace_shd_warp_t *tw =
+                  static_cast<trace_shd_warp_t *>(m_physical_warp[warp_id]);
               debug_log_fold_event(
-                  "wb immediate+skip warp=" + std::to_string(warp_id) +
+                  "wb ready-passthrough warp=" + std::to_string(warp_id) +
                   " cta=" + std::to_string(key.cta_id) + " block=" + wb.block_id +
                   " barrier=0x" + format_hex_u64(key.barrier_addr) +
-                  " entry_pc=0x" + format_hex_u64(inst.pc) + " pre_skip_pc=0x" +
-                  format_hex_u64(wb_pre_skip_pc) + " resume_pc=0x" +
-                  format_hex_u64(wb.resume_pc) + " skipped=" +
-                  std::to_string(skipped) + " landing_pc=0x" +
-                  format_hex_u64(wb_landing_pc) + " barrier_gen=" +
+                  " entry_pc=0x" + format_hex_u64(inst.pc) + " next_pc=0x" +
+                  format_hex_u64(tw->get_pc()) + " barrier_gen=" +
                   std::to_string(sync_barrier_gen(key)));
             }
-            // A wait-block gate is handled; fall through to the common released-
-            // wait accounting below, but do NOT also run the spin-region fold.
+            // Ready: no skip. Claim the gate so the spin-region fold is not run.
             wait_block_handled = true;
           }
           SpinWaitRegionRecord region;

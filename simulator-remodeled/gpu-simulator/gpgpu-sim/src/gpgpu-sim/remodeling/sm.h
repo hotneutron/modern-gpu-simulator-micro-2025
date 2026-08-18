@@ -711,14 +711,13 @@ class SM : public core_t, public shader_core_ctx_wrapper {
   // [Stage 1.8] Compound wait-block counters, kept SEPARATE from the spin-region
   // fold counters above so the two runtimes never share accounting. Only move
   // when -spin_wait_fold_enable. At a clean exit gate_parks == gate_releases.
-  unsigned long long m_wait_block_gate_hits = 0;       // ready-at-issue immediate folds
+  unsigned long long m_wait_block_gate_hits = 0;       // ready-at-issue passthroughs (no skip)
   unsigned long long m_wait_block_gate_parks = 0;      // modeled-miss parks
   unsigned long long m_wait_block_gate_releases = 0;   // parked-wait releases
   unsigned long long m_wait_block_gate_park_cycles = 0;
   unsigned long long m_wait_block_gate_park_cycles_max = 0;
   unsigned long long m_wait_block_gate_watchdog_hits = 0;
-  unsigned long long m_wait_block_immediate_folds = 0; // alias of hits, explicit
-  unsigned long long m_wait_block_skipped_insts = 0;   // residual entries skipped
+  unsigned long long m_wait_block_skipped_insts = 0;   // residual fallback entries skipped at release
   // Per-warp cycle at which the current WAIT_BLOCK_GATE park began (0 = none).
   // Separate from m_fold_park_start_cycle so a warp can never be miscredited
   // between the two runtimes. Sized to MAX_WARP_PER_SHADER at first use.
