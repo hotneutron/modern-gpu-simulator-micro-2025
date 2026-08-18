@@ -280,6 +280,119 @@ unsigned int trace_shd_warp_t::skip_spin_to_exit(
   return skipped;
 }
 
+unsigned int trace_shd_warp_t::wait_block_skip_to_resume(
+    address_type resume_pc, const std::set<address_type> &allowed_block_pcs,
+    FoldSkipStats *out_stats) {
+  // [Stage 1.8] Advance the trace cursor over ONLY the captured residual wait-
+  // block control path (gate polls + fallback wait loop, incl. its exit BRA) and
+  // land exactly on resume_pc. Mirrors skip_spin_to_exit but targets resume_pc
+  // and guards against allowed_block_pcs. The entry gate TRYWAIT has already
+  // issued and is NOT skipped here (the caller advances past it first). Mainline
+  // address-setup PCs are intentionally absent from allowed_block_pcs, so if the
+  // captured stream ever reaches one before resume_pc the guard aborts.
+  FoldSkipStats stats;
+  unsigned int skipped = 0;
+  while (used_insts < traced_pcs.size() &&
+         traced_pcs[used_insts] != resume_pc) {
+    address_type pc = traced_pcs[used_insts];
+    auto it_inst_trace = map_warp_traces.find(pc);
+    const bool have_occurrence =
+        it_inst_trace != map_warp_traces.end() &&
+        it_inst_trace->second.num_used_instructions[0] <
+            it_inst_trace->second.num_traced_instructions;
+
+    bool pc_allowed = allowed_block_pcs.count(pc) != 0;
+    std::string opcode;
+    SyncInstructionKind sync_kind = SyncInstructionKind::NONE;
+    if (have_occurrence) {
+      const inst_trace_t &occ =
+          it_inst_trace->second.instructions[it_inst_trace->second
+                                                 .num_used_instructions[0]];
+      opcode = occ.opcode;
+      sync_kind = occ.sync_kind;
+    }
+
+    const bool is_hgmma =
+        fold_opcode_has_prefix(opcode, "HGMMA") ||
+        fold_opcode_has_prefix(opcode, "IGMMA") ||
+        fold_opcode_has_prefix(opcode, "QGMMA") ||
+        fold_opcode_has_prefix(opcode, "BGMMA") ||
+        fold_opcode_has_prefix(opcode, "OGMMA") ||
+        fold_opcode_has_prefix(opcode, "WGMMA") ||
+        fold_opcode_has_prefix(opcode, "MMA");
+    const bool is_mufu = fold_opcode_has_prefix(opcode, "MUFU");
+    const bool is_tma =
+        fold_opcode_has_prefix(opcode, "UTMA") ||
+        fold_opcode_has_prefix(opcode, "UBLK") ||
+        fold_opcode_has_prefix(opcode, "LDGSTS");
+    const bool is_bar =
+        fold_opcode_has_prefix(opcode, "BAR") ||
+        fold_opcode_has_prefix(opcode, "SYNCS.ARRIVE") ||
+        fold_opcode_has_prefix(opcode, "SYNCS.EXCH");
+    const bool is_local_mem =
+        fold_opcode_has_prefix(opcode, "STL") ||
+        fold_opcode_has_prefix(opcode, "LDL");
+    const bool is_semantic_mem =
+        fold_opcode_has_prefix(opcode, "STG") ||
+        fold_opcode_has_prefix(opcode, "LDG") ||
+        fold_opcode_has_prefix(opcode, "STS") ||
+        fold_opcode_has_prefix(opcode, "LDS") ||
+        fold_opcode_has_prefix(opcode, "ATOM") ||
+        fold_opcode_has_prefix(opcode, "RED");
+    const bool is_wait =
+        sync_kind == SyncInstructionKind::PHASECHK ||
+        sync_kind == SyncInstructionKind::TRYWAIT ||
+        fold_opcode_has_prefix(opcode, "SYNCS.PHASECHK") ||
+        fold_opcode_has_prefix(opcode, "SYNCS.TRY");
+    const bool is_nanosleep = fold_opcode_has_prefix(opcode, "NANOSLEEP");
+    const bool is_imad = fold_opcode_has_prefix(opcode, "IMAD");
+    const bool is_bra = fold_opcode_has_prefix(opcode, "BRA");
+
+    const bool forbidden = is_hgmma || is_mufu || is_tma || is_bar ||
+                           is_local_mem || is_semantic_mem;
+
+    if (!pc_allowed || !have_occurrence || forbidden) {
+      std::cerr << "[WAITBLOCK_SKIP_AUDIT] wait-block cursor-skip guard failed"
+                << " pc=0x" << std::hex << pc << std::dec
+                << " opcode=" << (opcode.empty() ? "<none>" : opcode)
+                << " pc_allowed=" << pc_allowed
+                << " have_occurrence=" << have_occurrence
+                << " forbidden=" << forbidden << " resume_pc=0x" << std::hex
+                << resume_pc << std::dec << " skipped_so_far=" << skipped
+                << " : the wait block tried to skip an instruction that is not a"
+                   " gate poll or pure fallback wait, or carries real semantic"
+                   " work — sidecar/trace drift, never drop work. See"
+                   " SPIN_WAIT_FOLD_ROOT_CAUSE_PLAN.md 1.8."
+                << std::endl;
+      abort();
+    }
+
+    stats.warp_insts++;
+    if (is_wait) {
+      stats.phasechk_trywait++;
+    } else if (is_nanosleep) {
+      stats.nanosleep++;
+    } else if (is_bra) {
+      stats.loopback_bra++;  // fallback loopback or its exit BRA
+    } else if (is_imad) {
+      stats.imad_scratch++;
+    } else {
+      stats.other++;
+    }
+
+    it_inst_trace->second.num_used_instructions[0]++;  // mirror get_next_trace_inst
+    used_insts++;
+    ++skipped;
+  }
+  // resume_pc must exist ahead of the cursor. Both A-path (ready arm) and C-path
+  // (fallback exit BRA) converge here by construction (Stage 1.7 CFG proof).
+  assert(used_insts < traced_pcs.size() && traced_pcs[used_insts] == resume_pc);
+  if (out_stats) {
+    *out_stats = stats;
+  }
+  return skipped;
+}
+
 // MOD. Begin. VPREG. Not totally compatible now.
 void trace_shd_warp_t::decrement_trace_pc() {
   if(used_insts > 0)

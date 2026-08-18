@@ -280,7 +280,7 @@ the final section.
 
 | Stage | Content |
 |---|---|
-| Stage 1.7 | Emit and validate a targeted `WaitBlockRecord` for the speculative gate, pure fallback loop, and continuation |
+| Stage 1.7 | Discover wait-block candidates across all kernels, judge each independently, emit a `WaitBlockRecord` for every candidate that passes, and always print a per-candidate PASS/FAIL report with failure reasons (§1.7.8) for the speculative gate, pure fallback loop, and continuation |
 | Stage 1.8 | At one logical block entry, immediate-fold a modeled-ready visit or park a modeled-not-ready visit; both paths remove only the captured residual A/B/C wait-control path and land at the common resume PC |
 | Stage 1.9 | After Stage 1.7/1.8 validation, migrate existing spin regions to the general WaitBlock contract and remove the legacy spin-fold representation/runtime |
 
@@ -290,7 +290,13 @@ override is included.
 Implementation control gates:
 
 1. Implement Stage 1.7 only, regenerate the K5/K10 sidecar, and stop for review.
-   Do not modify simulator runtime code in this step.
+   Do not modify simulator runtime code in this step. Judge each candidate
+   independently: emit a `WaitBlockRecord` for every candidate that passes, keep
+   any failing candidate fail-closed, and always print the §1.7.8 report
+   (`discovered=N passed=P failed=F` plus per-FAIL reasons). One candidate's
+   failure must not block emitting the others. For the current K5/K10 traces the
+   target is `failed=0`; fix each reported FAIL one at a time until every
+   candidate passes.
 2. Implement Stage 1.8 only after the emitted WaitBlock and all proof evidence
    are reviewed. Keep the legacy spin-fold path during this step.
 3. Run Stage 1.9 only after the user-run K5/K10 validation accepts Stage 1.8.
@@ -1001,6 +1007,24 @@ exit와 abort dump에 출력한다. 기존 BAR logger에는 별도 hot-path coun
 
 ### Stage 1.7. Generate and validate a targeted compound wait-block sidecar
 
+> **STATUS: IMPLEMENTED & VALIDATED (sidecar v3, committed `179c31a`).**
+> The detector was generalized to one CFG rule (§1.7.6): from an entry TRYWAIT,
+> follow only branches that consume the gate predicate P; the convergence of the
+> P-ready and P-miss edges is `resume_pc`. This unifies two shapes with no
+> application-specific PCs — Type-1 (double gate + out-of-line fallback) and
+> Type-2 (single gate whose miss path is an in-line spin loop, e.g. the deadlock
+> producer wait `0x96c0 -> 0xb090`). Per-candidate independent judgement; the
+> mandatory report (§1.7.8) is always printed with a three-way split:
+> `passed / failed (fold target that failed a proof — must be 0) / skipped (not a
+> fold target: single-shot, local-memory, or non-compound; fail-closed with a
+> closed-taxonomy reason)`. Foldable spin regions absorbed by a proven wait block
+> are demoted to `foldable=false` (`absorbed_by_wait_block`) so the simulator
+> never folds a loop twice. Current K5/K10 trace: `discovered=42 passed=35
+> failed=0 skipped=7`; all 14 foldable spin loops (K5 8, K10 6) proven and owned
+> by a wait block. Legacy `spin_regions` are bit-identical except the intended
+> foldable demotions. No C++ or trace changes. Verified on the server (same
+> counts, sidecar written to the trace's `extra_info/`).
+
 Files:
 
 - `simulator-remodeled/util/tracer_nvbit/build_spin_wait_sidecar.py`
@@ -1346,10 +1370,16 @@ The next implementation must:
 1. Discover wait blocks across every kernel/function without application name,
    kernel id, function id, CTA, warp, SM, or PC filters.
 2. Traverse every CTA/warp occurrence with the recorded active/predicate masks.
-3. Treat a discovered candidate that cannot yet be proven as an incomplete Stage
-   1.7 implementation, not as an accepted final replay fallback. Safety remains
-   fail-closed while developing, but acceptance requires zero rejected
-   candidates for the current K5/K10 traces.
+3. Judge each discovered candidate independently. A candidate that cannot yet be
+   proven must never silently downgrade to an accepted final replay fallback, and
+   it must never block emission of the other candidates that do pass. Prove and
+   emit every candidate that passes; for every candidate that fails, keep it
+   fail-closed (no `WaitBlockRecord`, original captured replay remains) and
+   surface it explicitly in the generator report (§1.7.8) for review. Safety
+   remains fail-closed while developing. For the current K5/K10 traces the goal is
+   zero unresolved candidates, but that target is reached by fixing the proof for
+   each reported failure one at a time, not by gating all eight behind a single
+   pass/fail.
 4. Extend exact def/use decoding for the currently observed live-out kills,
    including `IADD3`, `VIADD`, and `FSEL`, instead of hard-coding their PCs.
 5. Fix provenance analysis so dataflow-chain depth is not confused with linear
@@ -1367,18 +1397,126 @@ The next implementation must:
 
 Revised Stage 1.7 acceptance:
 
-- discovered candidate count equals emitted WaitBlock count;
-- rejected candidate count is zero for full K5 and K10 traces;
+- every candidate is judged independently; a failure on one candidate does not
+  block emitting the others that pass;
+- the generator report (§1.7.8) is always produced and lists per-candidate
+  PASS/FAIL with the exact failure reason for each FAIL;
+- emitted WaitBlock count equals the PASS candidate count;
+- each FAIL candidate has no `WaitBlockRecord` and falls back to original
+  captured replay (fail-closed);
+- for the current K5/K10 traces, acceptance for this application requires all
+  eight candidates to reach PASS; any remaining FAIL is fixed one at a time using
+  the reported reason, not by weakening a proof;
 - the eight entry PCs listed above are present without production identity
   filters;
-- every active occurrence lands at the proven common resume and all inactive
-  occurrences are accounted for;
+- every active occurrence of a PASS block lands at the proven common resume and
+  all inactive occurrences are accounted for;
 - existing spin-region runtime fields remain unchanged;
 - no simulator C++ or full-trace regeneration is included.
 
 The earlier targeted Stage 1.7 acceptance criteria are superseded by §1.7.7.
 
+#### 1.7.8 Mandatory generator report
+
+The sidecar generator must always print a wait-block discovery report to the
+build log, whether or not every candidate passes. This is a hard requirement, not
+a debug option: it is how the next application's unproven blocks are surfaced
+instead of being silently dropped. The report is emitted even when the candidate
+count is zero.
+
+The report must contain, per kernel/function:
+
+- a one-line summary: `discovered=N passed=P failed=F` (invariant `N == P + F`);
+- for every PASS candidate: `entry_pc`, `resume_pc`, gate/fallback wait PCs, and
+  observed A/B/C path counts;
+- for every FAIL candidate: `entry_pc` and a single explicit `reason` drawn from a
+  fixed, closed reason taxonomy so failures are machine-groupable across
+  applications.
+
+The FAIL `reason` taxonomy is closed and each value maps to the proof that
+rejected it:
+
+```text
+CFG_UNRESOLVED          # §1.7.1: CALL/RET/indirect/nested exit/unresolved reconverge
+MULTI_REJOIN            # §1.7.1: alternate path does not rejoin one resume_pc
+WAIT_COND_MISMATCH      # §1.7.2: barrier/offset/wait-state provenance not equal
+PROVENANCE_UNKNOWN      # §1.7.2: unknown/multiple reaching defs or value escapes block
+EFFECT_UNSAFE           # §1.7.3: mem/TMA/GMMA/MUFU/atomic/ARRIVE/EXCH/BAR/fence/etc.
+PREDICATE_LIVE_OUT      # §1.7.3: wait predicate not dead at resume_pc
+DEFUSE_UNDECODED        # §1.7.6: def/use of an opcode not yet exactly decoded
+DYNAMIC_PATH_ESCAPE     # §1.7.4: an observed dynamic PC leaves allowed_block_pcs
+CTA_IDENTITY_MISMATCH   # §1.7.4: kernel/uid/CTA-count/SASS identity mismatch
+```
+
+Rules:
+
+- The taxonomy is closed. An unrecognized failure is not silently bucketed as
+  "other"; it stops generation and triggers design review (consistent with
+  §1.7.7 rule 6 "unknown semantics must stop implementation").
+- Exactly one primary `reason` per FAIL candidate. If several proofs fail, report
+  the first in the order the proofs run and note additional reasons only as
+  secondary detail, so cross-application grouping stays stable.
+- The report is written to the generator's stdout/build log and is not gated by
+  any per-event budget.
+- Acceptance for the current application (all eight PASS) is verified by reading
+  this report, so the report format is part of Stage 1.7 acceptance.
+
+For the current K5/K10 traces the accepted terminal state is `failed=0` in every
+kernel. While iterating toward that state, each run's report shows which specific
+candidate and which `reason` still needs a proof fix.
+
 ### Stage 1.8. Enforce a proven wait block in the simulator
+
+> **STATUS: IMPLEMENTED — awaiting server build + K5/K10 run.**
+> Dual representation as designed: the legacy spin-region fold path is untouched;
+> a parallel `WAIT_BLOCK_GATE` runtime is added. Implemented in five pieces:
+> 1. `tma_types.h`: `WaitBlockRecord`, `PendingWaitMode{NONE,FOLD_REGION,
+>    WAIT_BLOCK_GATE}`, `wait_blocks_by_entry_pc`, and `HopperMBarrierPendingWait`
+>    fields appended after the existing ones (aggregate initializers preserved).
+> 2. `gpu-sim.{h,cc}`: loader parses `wait_blocks`, enforces schema v3 **only when
+>    `spin_wait_fold_enable` is set** (feature-off stays permissive → bit-identical),
+>    field-consistency asserts, `lookup_wait_block()`, startup count log.
+> 3. `trace_driven.{h,cc}`: `wait_block_skip_to_resume()` — skips only
+>    `allowed_block_pcs` to `resume_pc` with the same per-PC semantic guard as
+>    `skip_spin_to_exit` (`[WAITBLOCK_SKIP_AUDIT]` abort on drift).
+> 4. `sm.cc` issue time: ready → immediate skip-to-resume; not-ready →
+>    `WAIT_BLOCK_GATE` park with `expected_gen = cur_gen+1`; mutually exclusive
+>    with spin-region fold; predicated-off (`active_count()==0`) gate never parks.
+> 5. `sm.cc` release: `service_wait_block_release()` gen audit (`>`abort / `<` or
+>    `==`&!ready keep-parked with watchdog / `==`&ready release+skip), separate
+>    counters, `[WAITBLOCKSUM]`, and a reinit open-gate lifecycle assert.
+>
+> **Bugs found and fixed during two self-review passes (before any run):**
+> - *(fatal)* not-ready park asserted `next_traced_pc == captured_next_pc`; but
+>   `next_traced_pc` is the immediate sequential successor (the gate's own `@!P`
+>   branch, e.g. `0x96d0`) while `captured_next_pc == resume_pc` (`0x96e0`) — the
+>   assert would abort on **every** wait-block park. Replaced with
+>   `assert(wb.entry_wait_pc == inst.pc)`; captured-path correctness is enforced
+>   by the release-time landing check + Stage 1.7 dynamic proof.
+> - *(metric)* the ready path `return`ed after the immediate fold, skipping the
+>   shared released-wait accounting the spin-region path runs. Replaced with a
+>   `wait_block_handled` flag that falls through to the common accounting.
+> - *(regression)* an `active_count()==0` early return at function entry also
+>   skipped EXCH/ARRIVE (barrier init/arrival) and changed feature-off behavior.
+>   Scoped it to the PHASECHK/TRYWAIT branch, gated on `spin_wait_fold_enable`.
+> - *(pacing)* wait-block watchdog threshold was `1000000`; unified to `32000` to
+>   match the spin-region path so a wait-block deadlock is caught just as fast.
+> - *(hang)* the `cur_gen==exp && phase-not-ready` keep-parked case had no
+>   watchdog; folded both keep-parked cases under one watchdog.
+>
+> **Debug coverage for the 12h run:** `landing_pc == resume_pc` is asserted
+> **unconditionally** after every immediate and parked skip (the single most
+> important runtime invariant — a silent PC drift aborts loudly). Watchdog aborts
+> log expected/barrier gen and prev/current flip cycles; a keep-parked heartbeat
+> (every 4096 cyc, under `-spin_wait_fold_debug`) shows progress vs a hang;
+> `[WAITBLOCKSUM]` prints per-SM gate_hits/parks/releases/skipped/watchdog_hits at
+> each CTA exit.
+>
+> **Not yet done:** no CUDA in the authoring environment, so the full C++ build
+> and the K5/K10 acceptance run (feature-off bit-identical, parks==releases,
+> SM62 gate-ordering, HGMMA/TMA count preservation) must be executed on the
+> server. The park-time cursor position is the same mechanism as the spin-region
+> fold and is now runtime-enforced by the landing assert.
 
 Files:
 

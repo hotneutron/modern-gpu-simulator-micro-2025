@@ -923,6 +923,10 @@ class gpgpu_sim : public gpgpu_t {
   // the (gated) producer spin-wait fold feature. See .plan/SPIN_WAIT_POSTPROCESS.md.
   bool lookup_spin_wait_region(unsigned int unique_function_id, address_type pc,
                                SpinWaitRegionRecord &region) const;
+  // [Stage 1.8] Look up a compound wait block by (funcid, entry gate PC).
+  // Returns true when the PHASECHK/TRYWAIT at pc is a proven wait-block gate.
+  bool lookup_wait_block(unsigned int unique_function_id, address_type pc,
+                         WaitBlockRecord &block) const;
 
   void record_l1i_prefetch_miss_observation(new_addr_type block_addr,
                                             unsigned int unique_function_id,

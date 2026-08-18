@@ -654,10 +654,41 @@ void load_sync_operand_resolver(const std::filesystem::path &extra_info_dir,
 // simulator can recognize an mbarrier spin loop at issue time. Payload untouched;
 // see build_spin_wait_sidecar.py and .plan/SPIN_WAIT_POSTPROCESS.md.
 void load_spin_wait_sidecar(const std::filesystem::path &extra_info_dir,
-                            SpinWaitSidecarDB &db) {
+                            SpinWaitSidecarDB &db, bool require_v3_schema) {
   rapidjson::Document doc;
   if (!load_tma_json_document(extra_info_dir / "spin_wait_sidecar.json", doc)) {
     return;
+  }
+  // [Stage 1.8] When the compound wait-block runtime is enabled the sidecar MUST
+  // be schema v3 with the wait-block structure (fail-closed: never fold with a
+  // stale contract). When the feature is OFF we stay permissive so a legacy
+  // sidecar still loads its spin_regions and feature-off replay is unchanged —
+  // require_v3_schema is passed from the caller's spin_wait_fold_enable. A kernel
+  // may legitimately have zero wait_blocks; we require the SCHEMA, not per-kernel
+  // presence.
+  if (require_v3_schema) {
+    long long ver = -1;
+    if (doc.HasMember("version") && doc["version"].IsInt()) {
+      ver = doc["version"].GetInt();
+    }
+    if (ver != 3) {
+      fprintf(stderr,
+              "[SPINWAIT] FATAL: spin_wait_sidecar.json version=%lld, "
+              "expected 3 (Stage 1.8 requires the compound wait-block schema). "
+              "Regenerate with build_spin_wait_sidecar.py.\n",
+              ver);
+      abort();
+    }
+    const bool has_wb_schema =
+        doc.HasMember("wait_block_report") &&
+        doc.HasMember("wait_block_fail_taxonomy");
+    if (!has_wb_schema) {
+      fprintf(stderr,
+              "[SPINWAIT] FATAL: spin_wait_sidecar.json v3 is missing the "
+              "wait-block schema (wait_block_report / wait_block_fail_taxonomy). "
+              "Regenerate with build_spin_wait_sidecar.py.\n");
+      abort();
+    }
   }
   if (!doc.HasMember("kernels") || !doc["kernels"].IsArray()) {
     return;
@@ -715,6 +746,76 @@ void load_spin_wait_sidecar(const std::filesystem::path &extra_info_dir,
       db.regions_by_wait_pc[SyncOperandLookupKey{unique_function_id,
                                                  record.primary_wait_pc}] = record;
     }
+    // [Stage 1.8] Compound wait blocks for this kernel (schema v3). Absent or
+    // empty is fine (spin-region-only kernels have none). Only fully proven
+    // records are emitted by the generator, so no per-record proof re-check is
+    // needed here; we assert the runtime fields are internally consistent.
+    if (kernel.HasMember("wait_blocks") && kernel["wait_blocks"].IsArray()) {
+      for (const auto &wb : kernel["wait_blocks"].GetArray()) {
+        if (!wb.IsObject() || !wb.HasMember("entry_wait_pc") ||
+            !wb.HasMember("resume_pc")) {
+          continue;
+        }
+        WaitBlockRecord rec;
+        rec.entry_wait_pc = parse_tma_json_uint(wb["entry_wait_pc"]);
+        rec.resume_pc = parse_tma_json_uint(wb["resume_pc"]);
+        if (wb.HasMember("captured_next_pc")) {
+          rec.captured_next_pc = parse_tma_json_uint(wb["captured_next_pc"]);
+        }
+        if (wb.HasMember("allowed_block_pcs") &&
+            wb["allowed_block_pcs"].IsArray()) {
+          for (const auto &p : wb["allowed_block_pcs"].GetArray()) {
+            rec.allowed_block_pcs.insert(parse_tma_json_uint(p));
+          }
+        }
+        if (wb.HasMember("all_gate_wait_pcs") &&
+            wb["all_gate_wait_pcs"].IsArray()) {
+          for (const auto &p : wb["all_gate_wait_pcs"].GetArray()) {
+            rec.all_gate_wait_pcs.push_back(parse_tma_json_uint(p));
+          }
+        }
+        if (wb.HasMember("wait_predicate") && wb["wait_predicate"].IsInt()) {
+          rec.wait_predicate =
+              static_cast<unsigned int>(wb["wait_predicate"].GetInt());
+        }
+        if (wb.HasMember("wait_predicate_uniform") &&
+            wb["wait_predicate_uniform"].IsBool()) {
+          rec.wait_predicate_uniform = wb["wait_predicate_uniform"].GetBool();
+        }
+        if (wb.HasMember("canonical_wait_condition") &&
+            wb["canonical_wait_condition"].IsObject() &&
+            wb["canonical_wait_condition"].HasMember("barrier_offset")) {
+          const auto &cw = wb["canonical_wait_condition"];
+          if (cw["barrier_offset"].IsString()) {
+            rec.canonical_barrier_offset = static_cast<uint64_t>(
+                strtoull(cw["barrier_offset"].GetString(), nullptr, 0));
+          }
+        }
+        if (wb.HasMember("block_id") && wb["block_id"].IsString()) {
+          rec.block_id = wb["block_id"].GetString();
+        }
+        // Startup consistency: the gate PC and resume PC must be present and the
+        // entry gate PC must be one of the recorded gate polls. Fail closed.
+        if (rec.entry_wait_pc == 0 || rec.resume_pc == 0 ||
+            rec.allowed_block_pcs.empty()) {
+          fprintf(stderr,
+                  "[SPINWAIT] FATAL: wait_block '%s' (funcid=%u) has empty "
+                  "entry/resume/allowed fields.\n",
+                  rec.block_id.c_str(), unique_function_id);
+          abort();
+        }
+        if (rec.allowed_block_pcs.count(rec.entry_wait_pc) == 0) {
+          fprintf(stderr,
+                  "[SPINWAIT] FATAL: wait_block '%s' (funcid=%u) entry_wait_pc "
+                  "0x%llx not in allowed_block_pcs.\n",
+                  rec.block_id.c_str(), unique_function_id,
+                  (unsigned long long)rec.entry_wait_pc);
+          abort();
+        }
+        db.wait_blocks_by_entry_pc[SyncOperandLookupKey{
+            unique_function_id, rec.entry_wait_pc}] = rec;
+      }
+    }
   }
 }
 
@@ -736,7 +837,10 @@ void gpgpu_sim::parse_extra_trace_info(std::string filepath, bool is_extra_trace
     // flow through the operand resolver's linked_config_id -> descriptor_configs join.
     load_tma_operand_resolver(extra_info_dir, m_tma_sidecar_db);
     load_sync_operand_resolver(extra_info_dir, m_sync_sidecar_db);
-    load_spin_wait_sidecar(extra_info_dir, m_spin_wait_sidecar_db);
+    // Require the v3 wait-block schema only when the fold runtime is enabled;
+    // feature-off stays permissive so legacy sidecars still load spin_regions.
+    load_spin_wait_sidecar(extra_info_dir, m_spin_wait_sidecar_db,
+                           m_shader_config->spin_wait_fold_enable);
     // BASE-MAP LOAD-FAILURE ASSERT (M4): real-base addressing is on by default. An empty
     // base_records map means tma_pc_base_map.json was missing, unparsable, or had no
     // descriptor sites. We deliberately FAIL here rather than silently falling back to the
@@ -771,7 +875,10 @@ void gpgpu_sim::parse_extra_trace_info(std::string filepath, bool is_extra_trace
       std::cerr << "[SYNC] loaded operand_sites="
                 << m_sync_sidecar_db.site_records.size() << std::endl;
       std::cerr << "[SPINWAIT] loaded spin_wait_regions="
-                << m_spin_wait_sidecar_db.regions_by_wait_pc.size() << std::endl;
+                << m_spin_wait_sidecar_db.regions_by_wait_pc.size()
+                << " wait_blocks="
+                << m_spin_wait_sidecar_db.wait_blocks_by_entry_pc.size()
+                << std::endl;
     }
   }
 }
@@ -853,6 +960,22 @@ bool gpgpu_sim::lookup_spin_wait_region(unsigned int unique_function_id,
     return false;
   }
   region = it->second;
+  return true;
+}
+
+// [Stage 1.8] Look up a compound wait block by (funcid, entry gate PC). Returns
+// true and fills `block` when the PHASECHK/TRYWAIT at `pc` is a proven wait-block
+// entry gate. Separate from lookup_spin_wait_region so the two runtime paths are
+// mutually exclusive at issue time.
+bool gpgpu_sim::lookup_wait_block(unsigned int unique_function_id,
+                                  address_type pc,
+                                  WaitBlockRecord &block) const {
+  auto it = m_spin_wait_sidecar_db.wait_blocks_by_entry_pc.find(
+      SyncOperandLookupKey{unique_function_id, static_cast<uint64_t>(pc)});
+  if (it == m_spin_wait_sidecar_db.wait_blocks_by_entry_pc.end()) {
+    return false;
+  }
+  block = it->second;
   return true;
 }
 

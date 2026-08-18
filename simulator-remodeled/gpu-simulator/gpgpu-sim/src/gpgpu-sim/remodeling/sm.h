@@ -252,6 +252,10 @@ class SM : public core_t, public shader_core_ctx_wrapper {
   // cursor to the region exit_pc, and clear the pending wait. No-op unless
   // -spin_wait_fold_enable. See design doc 5.1/6.5.1.
   void service_fold_release(unsigned warp_id);
+  // [Stage 1.8] Release service for a WAIT_BLOCK_GATE park: same generation audit
+  // as service_fold_release but lands on the wait block's resume_pc. Dispatched
+  // from service_fold_release so one release action per warp per cycle is kept.
+  void service_wait_block_release(unsigned int warp_id);
   // [Stage 1] Common cursor-skip used by BOTH the parked-release and the
   // immediate-ready fold paths so their skip semantics can never diverge again.
   // Responsibility is deliberately narrow: flush younger IBuffer entries, build
@@ -704,6 +708,21 @@ class SM : public core_t, public shader_core_ctx_wrapper {
   // subset of skipped_insts contributed by the immediate path.
   unsigned long long m_fold_immediate_folds_total = 0;
   unsigned long long m_fold_immediate_skipped_insts_total = 0;
+  // [Stage 1.8] Compound wait-block counters, kept SEPARATE from the spin-region
+  // fold counters above so the two runtimes never share accounting. Only move
+  // when -spin_wait_fold_enable. At a clean exit gate_parks == gate_releases.
+  unsigned long long m_wait_block_gate_hits = 0;       // ready-at-issue immediate folds
+  unsigned long long m_wait_block_gate_parks = 0;      // modeled-miss parks
+  unsigned long long m_wait_block_gate_releases = 0;   // parked-wait releases
+  unsigned long long m_wait_block_gate_park_cycles = 0;
+  unsigned long long m_wait_block_gate_park_cycles_max = 0;
+  unsigned long long m_wait_block_gate_watchdog_hits = 0;
+  unsigned long long m_wait_block_immediate_folds = 0; // alias of hits, explicit
+  unsigned long long m_wait_block_skipped_insts = 0;   // residual entries skipped
+  // Per-warp cycle at which the current WAIT_BLOCK_GATE park began (0 = none).
+  // Separate from m_fold_park_start_cycle so a warp can never be miscredited
+  // between the two runtimes. Sized to MAX_WARP_PER_SHADER at first use.
+  std::vector<unsigned long long> m_wait_block_park_start_cycle;
  public:
   // Increment the tensor-op count for the CTA slot that owns hardware warp wid.
   void inc_tensor_ops_for_warp(unsigned wid) {
