@@ -888,6 +888,28 @@ def make_inject_missing_wait_record(c, sync_sites, byp):
     }
 
 
+def make_metadata_only_record(c):
+    """Serialize a proven WaitBlock that owns no v4 runtime action."""
+    st = c.get("dynamic", {})
+    return {
+        "block_id": c["block_id"],
+        "record_class": "METADATA_ONLY",
+        "unique_function_id": c["unique_function_id"],
+        "entry_probe_pc": c["entry_wait_pc"],
+        "entry_probe_pc_hex": "0x%x" % c["entry_wait_pc"],
+        "entry_branch_pc": c["entry_branch_pc"],
+        "captured_ready_pc": c["resume_pc"],
+        "observed_path_counts": {
+            "ready_arm": st.get("path_A_first_gate_ready", 0),
+            "second_gate_arm": st.get("path_B_second_gate_ready", 0),
+            "captured_poll": st.get("path_C_fallback_loop", 0),
+        },
+        "active_entry_visits": st.get("active_entry_visits", 0),
+        "all_live_entry_visits": st.get("all_live_entry_visits", 0),
+        "partial_entry_visits": st.get("partial_entry_visits", 0),
+    }
+
+
 def make_fold_captured_poll_record(kid, fid, region):
     """Serialize an existing foldable spin region without changing its owner."""
     return {
@@ -906,6 +928,8 @@ def make_fold_captured_poll_record(kid, fid, region):
         "poll_advance_allowed_pcs": sorted(
             set(region["body_pcs"]) | {region["loopback_bra_pc"]}),
         "semantic_free_body": region["semantic_free_body"],
+        "effect_safe": region["effect_safe"],
+        "effect_classes": region["effect_classes"],
         "barrier_self_tied": region["barrier_self_tied"],
         "barrier_reason": region["barrier_reason"],
         "dynamic": region["dynamic"],
@@ -1224,14 +1248,21 @@ def main():
                 st = stats[r["region_id"]]
                 r_out = dict(r)
                 r_out["dynamic"] = st
-                # The simulator folds a region ONLY if all three gates hold:
-                # it is an actual spin loop, its body has no semantic work, and its
-                # SASS wait-barriers are self-tied (whole-loop skip is scoreboard
-                # net-zero). See .plan/SPIN_WAIT_SIM_MODELING.md 12.7.
+                effect_safe, effect_reason, effect_classes = prove_effects(
+                    fid,
+                    {"allowed_block_pcs":
+                     list(r["body_pcs"]) + [r["loopback_bra_pc"]]},
+                    byp)
+                r_out["effect_safe"] = effect_safe
+                r_out["effect_reason"] = effect_reason
+                r_out["effect_classes"] = effect_classes
+                # The simulator folds only an actual spin loop whose body has no
+                # semantic/local work, matches the closed opcode model, and has
+                # self-tied SASS wait barriers.
                 r_out["foldable"] = bool(
                     st["is_spin_loop"] and r["semantic_free_body"]
                     and not r["local_mem_ops_in_body"]
-                    and r["barrier_self_tied"])
+                    and r["barrier_self_tied"] and effect_safe)
                 if r_out["foldable"]:
                     # PCs from loop head through the loopback branch: any
                     # wait-block fallback overlapping these is a fold target.
@@ -1302,11 +1333,16 @@ def main():
             make_inject_missing_wait_record(c, sync_sites, byp)
             for c in inject_candidates
         ]
+        metadata_records = [
+            make_metadata_only_record(c)
+            for c in metadata_candidates
+        ]
         fold_records = [
             make_fold_captured_poll_record(kid, fid, r)
             for r in clean if r["foldable"]
         ]
         strategy_records = inject_records + fold_records
+        wait_block_records = strategy_records + metadata_records
 
         action_keys = set()
         for rec in strategy_records:
@@ -1399,7 +1435,7 @@ def main():
                                  if args.validate_ctas == "all"
                                  else int(args.validate_ctas))),
             "spin_regions": clean,
-            "wait_blocks": strategy_records,
+            "wait_blocks": wait_block_records,
         })
 
         n_sem = sum(0 if r["semantic_free_body"] else 1 for r in regions)

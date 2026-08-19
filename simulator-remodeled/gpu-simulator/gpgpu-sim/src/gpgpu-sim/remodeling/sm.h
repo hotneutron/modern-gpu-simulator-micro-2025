@@ -242,16 +242,15 @@ class SM : public core_t, public shader_core_ctx_wrapper {
   bool ldst_unit_response_buffer_full() const override;
   bool are_all_wait_barrier_ready(unsigned int warp_id);
   bool warp_waiting_at_barrier(unsigned warp_id) const override;
-  // [Spin-wait fold] Non-mutating peek of the same park condition as
+  // Non-mutating peek of the same hold condition as
   // warp_waiting_at_barrier, but with NO clear and NO counter bump. Used off the
   // authoritative issue-eligibility path (sort comparator, stall scans) so the
   // release side effect fires exactly once. See design doc 6.5.1.
-  bool warp_parked_on_mbarrier_spin(unsigned warp_id) const;
-  // [Spin-wait fold] Once-per-warp-per-cycle service on the issue path: if a
-  // foldable park is now satisfied, flush the IBuffer, fast-forward the trace
-  // cursor to the region exit_pc, and clear the pending wait. No-op unless
-  // -spin_wait_fold_enable. See design doc 5.1/6.5.1.
-  void service_fold_release(unsigned warp_id);
+  bool warp_held_on_mbarrier_wait(unsigned warp_id) const;
+  // Once-per-warp-per-cycle authoritative release service. Missing-wait holds
+  // only clear pending state; captured-poll holds additionally fold residual
+  // loop occurrences to their exact local exit.
+  void service_wait_block_release(unsigned warp_id);
   // [Stage 1] Common cursor-skip used by BOTH the parked-release and the
   // immediate-ready fold paths so their skip semantics can never diverge again.
   // Responsibility is deliberately narrow: flush younger IBuffer entries, build
@@ -389,13 +388,12 @@ class SM : public core_t, public shader_core_ctx_wrapper {
       HopperMBarrierObject &barrier, uint64_t barrier_addr);
   bool is_sync_wait_satisfied(
       const HopperMBarrierPendingWait &pending_wait) const;
-  // [Spin-wait fold audit] Parity-aware expected generation for a foldable
-  // wait: the smallest gen > last-consumed (this warp+barrier) whose parity flips
-  // the waited-on phase, i.e. (gen & 1) != wait_parity. The barrier starts
-  // phase=0/gen=0 with phase == gen&1, so the very first wait may pair with gen 0.
-  uint64_t fold_expected_gen_for_wait(unsigned int warp_id,
-                                          const HopperMBarrierKey &key,
-                                          uint64_t wait_state_raw) const;
+  // Pin a modeled wait to the current generation when already ready, or to the
+  // next generation when not ready. Release audits this absolute generation,
+  // not only parity, so an overshoot cannot be mistaken for a valid release.
+  uint64_t expected_gen_for_wait(unsigned int warp_id,
+                                 const HopperMBarrierKey &key,
+                                 uint64_t wait_state_raw) const;
   // Current monotonic generation of a barrier (0 if the object does not exist).
   uint64_t sync_barrier_gen(const HopperMBarrierKey &key) const;
   void clear_sync_barrier_state_for_cta(unsigned int cta_id);
@@ -405,7 +403,8 @@ class SM : public core_t, public shader_core_ctx_wrapper {
   void notify_tma_completion(unsigned int warp_id, uint32_t completed_tx_bytes);
   void debug_log_sync_event(const std::string &message);
   void debug_log_tma_event(const std::string &message);
-  void debug_log_fold_event(const std::string &message);
+  void debug_log_wait_block_event(const char *event,
+                                  const std::string &message);
   void debug_dump_sync_counters() const;
 
   InterWarp_Coalescing_Waiting_Dep_Counters *m_interwarp_coal_warps_waiting_dep_counter;
@@ -471,8 +470,8 @@ class SM : public core_t, public shader_core_ctx_wrapper {
   uint64_t m_sync_debug_skip_runtime_budget = 0;
   // Independent budget for TMA-only stderr logs (TMADBG); 0 disables.
   uint64_t m_tma_debug_print_budget = 0;
-  // Independent budget for spin-wait fold logs (FOLD); 0 disables.
-  uint64_t m_fold_debug_print_budget = 20000000;
+  // Independent budget for WaitBlock event logs; 0 disables.
+  uint64_t m_wait_block_debug_print_budget = 20000000;
   uint64_t m_sync_debug_sync_insts = 0;
   uint64_t m_sync_debug_exch = 0;
   uint64_t m_sync_debug_arrive = 0;
@@ -653,25 +652,9 @@ class SM : public core_t, public shader_core_ctx_wrapper {
     unsigned long long park_hist[6] = {0, 0, 0, 0, 0, 0};  // 0,1-16,17-64,65-256,257-1024,>1024
   };
   std::map<uint64_t, SpinWaitRegionObserve> m_spin_wait_observe_by_region;
-  // Deadlock watchdog threshold: a single would-be park longer than this many
-  // cycles is reported immediately as a deadlock candidate for fold. 0 uses
-  // the built-in default in record_spin_wait_observe.
-  unsigned long long m_spin_wait_watchdog_threshold = 0;
-  // [Spin-wait fold] Per-warp cycle at which the current fold park began
-  // (0 = not parked). Used by service_fold_release to fire a deadlock
-  // watchdog if a real park exceeds m_spin_wait_watchdog_threshold. Sized at
-  // first use to MAX_WARP_PER_SHADER.
-  std::vector<unsigned long long> m_fold_park_start_cycle;
-  // [Spin-wait fold audit] Per-warp, per-barrier last consumed generation
-  // (the gen a prior foldable wait of this warp on this barrier resolved to).
-  // Sentinel: absent key = "none consumed yet" (first wait may pair with gen 0).
-  // Only written on the fold issue path; empty when fold is disabled, so
-  // feature-off is bit-identical. Used to compute the parity-aware expected_gen.
-  std::vector<std::map<HopperMBarrierKey, uint64_t>> m_fold_last_gen;
   struct FoldPaceStats {
     unsigned long long parks = 0;
     unsigned long long releases = 0;
-    unsigned long long late_releases = 0;
     unsigned long long park_cycles_total = 0;
     unsigned long long park_cycles_max = 0;
     unsigned long long first_park_cycle = 0;
@@ -685,25 +668,29 @@ class SM : public core_t, public shader_core_ctx_wrapper {
     unsigned long long immediate_skipped_insts = 0;
   };
   // Per-(warp, barrier, wait_pc) pacing decomposition. wait_pc is included
-  // because multiple logical waits (e.g. 0xb0b0/0xb3d0) may share one barrier.
+  // because multiple logical waits may share one runtime barrier.
   using FoldPaceKey = std::pair<HopperMBarrierKey, uint64_t>;
   std::vector<std::map<FoldPaceKey, FoldPaceStats>> m_fold_pace_by_warp;
-  // [Spin-wait fold] SM-global validation counters (only move when
-  // -spin_wait_fold_enable). At a clean diagnostic exit,
-  // parks == releases; late_releases is the diagnostic subset whose paired flip
-  // had already passed. Emitted at each CTA exit.
+  // Captured-poll validation counters (only move when -wait_block_enable).
+  // At a clean diagnostic exit, holds == releases. Generation overshoot aborts
+  // rather than creating a late-release path.
   unsigned long long m_fold_parks_total = 0;
   unsigned long long m_fold_releases_total = 0;
   unsigned long long m_fold_skipped_insts_total = 0;
   unsigned long long m_fold_park_cycles_total = 0;
   unsigned long long m_fold_park_cycles_max = 0;
   unsigned long long m_fold_watchdog_hits = 0;
-  unsigned long long m_fold_late_releases_total = 0;
   // [Stage 1.1] Immediate-ready fold totals (ready-at-issue path, no park).
   // total_folds = releases + immediate_folds; immediate_skipped_insts is the
   // subset of skipped_insts contributed by the immediate path.
   unsigned long long m_fold_immediate_folds_total = 0;
   unsigned long long m_fold_immediate_skipped_insts_total = 0;
+  unsigned long long m_missing_wait_ready_total = 0;
+  unsigned long long m_missing_wait_holds_total = 0;
+  unsigned long long m_missing_wait_releases_total = 0;
+  unsigned long long m_partial_missing_wait_misses_total = 0;
+  unsigned long long m_wait_block_generation_overshoots_total = 0;
+  unsigned long long m_wait_block_watchdog_aborts_total = 0;
  public:
   // Increment the tensor-op count for the CTA slot that owns hardware warp wid.
   void inc_tensor_ops_for_warp(unsigned wid) {
@@ -727,7 +714,5 @@ class SM : public core_t, public shader_core_ctx_wrapper {
                                 uint64_t barrier_addr, unsigned cta_id,
                                 bool ready);
   void print_spin_wait_observe_summary() const;
-  // [Spin-wait fold] SM-global validation summary ([FOLDSUM]): parks,
-  // releases, skipped insts, avg/max real park, watchdog hits. Emitted per SM.
-  void print_spin_wait_fold_summary() const;
+  void print_wait_block_summary() const;
 };

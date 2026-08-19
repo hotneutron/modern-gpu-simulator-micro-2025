@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <map>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -233,6 +234,7 @@ struct SyncSidecarMetadataDB {
 // barrier is ready, instead of replaying the capture-time poll count. See
 // build_spin_wait_sidecar.py and .plan/SPIN_WAIT_POSTPROCESS.md.
 struct SpinWaitRegionRecord {
+  std::string block_id;
   uint64_t loop_head_pc = 0;
   uint64_t primary_wait_pc = 0;   // the poll whose barrier readiness gates the loop
   uint64_t loopback_bra_pc = 0;   // backward BRA that closes the loop
@@ -268,6 +270,7 @@ struct FoldSkipStats {
   unsigned int tma_family = 0;          // must be 0
   unsigned int bar_arrive_exch = 0;     // must be 0
   unsigned int other = 0;               // vetted scratch/control only
+  std::map<uint64_t, unsigned int> pc_occurrences;
 };
 
 // Keyed by (funcid, primary_wait_pc): the simulator matches a PHASECHK/TRYWAIT at
@@ -278,6 +281,62 @@ struct SpinWaitSidecarDB {
   void clear() { regions_by_wait_pc.clear(); }
 
   bool empty() const { return regions_by_wait_pc.empty(); }
+};
+
+struct WaitBlockLookupKey {
+  uint32_t trace_kernel_id = 0;
+  uint32_t unique_function_id = 0;
+  uint64_t action_pc = 0;
+
+  bool operator<(const WaitBlockLookupKey &other) const {
+    return std::tie(trace_kernel_id, unique_function_id, action_pc) <
+           std::tie(other.trace_kernel_id, other.unique_function_id,
+                    other.action_pc);
+  }
+};
+
+struct MissingWaitRecord {
+  std::string block_id;
+  uint64_t entry_probe_pc = 0;
+  SyncInstructionKind entry_probe_kind = SyncInstructionKind::NONE;
+  bool partial_modeled_miss_aborts = false;
+  uint64_t captured_ready_visits = 0;
+  uint64_t captured_second_gate_visits = 0;
+  uint64_t captured_poll_visits = 0;
+  uint64_t all_live_entry_visits = 0;
+  uint64_t partial_entry_visits = 0;
+};
+
+struct WaitBlockSidecarDB {
+  std::map<WaitBlockLookupKey, MissingWaitRecord> missing_wait_by_entry;
+  std::map<WaitBlockLookupKey, SpinWaitRegionRecord> captured_poll_by_probe;
+  uint64_t discovered = 0;
+  uint64_t passed = 0;
+  uint64_t failed = 0;
+  uint64_t skipped = 0;
+  uint64_t metadata_only = 0;
+  uint64_t ready_only_all_live_visits = 0;
+  uint64_t ready_only_partial_visits = 0;
+  uint64_t ready_only_records_with_partial_visits = 0;
+  bool validation_complete = false;
+
+  void clear() {
+    missing_wait_by_entry.clear();
+    captured_poll_by_probe.clear();
+    discovered = 0;
+    passed = 0;
+    failed = 0;
+    skipped = 0;
+    metadata_only = 0;
+    ready_only_all_live_visits = 0;
+    ready_only_partial_visits = 0;
+    ready_only_records_with_partial_visits = 0;
+    validation_complete = false;
+  }
+
+  bool empty() const {
+    return missing_wait_by_entry.empty() && captured_poll_by_probe.empty();
+  }
 };
 
 
@@ -314,26 +373,28 @@ struct HopperMBarrierObject {
   uint64_t last_flip_cycle = 0;
 };
 
+enum class WaitBlockPendingMode {
+  NONE,
+  MISSING_WAIT_HOLD,
+  CAPTURED_POLL_HOLD,
+};
+
 struct HopperMBarrierPendingWait {
   bool valid = false;
   bool is_trywait = false;
   HopperMBarrierKey key;
   uint64_t wait_state_raw = 0;
-  // --- spin-wait fold (only set when -spin_wait_fold_enable) ---
-  // When the poll that armed this wait was the primary_wait_pc of a foldable
-  // spin region, carry the info the release path needs to fast-forward the trace
-  // cursor to the loop exit. See .plan/SPIN_WAIT_SIM_MODELING.md 5.1/6.5.1.
-  bool fold_needs_skip = false;  // armed by a foldable poll
-  uint64_t fold_wait_pc = 0;     // primary_wait_pc that armed this episode
-  uint64_t fold_exit_pc = 0;     // SpinWaitRegionRecord.exit_pc to land on
-  unsigned int fold_uid = 0;     // unique_function_id (assert/log only)
-  // [Spin-wait fold audit] The absolute barrier generation this wait is
-  // paired with (the flip whose data it consumes). Computed parity-aware at park
-  // time from the per-(warp,barrier) consumed-gen progress. The release path
-  // audits barrier.gen vs this: ==expected -> release+skip; <expected -> keep
-  // parked; >expected -> report poison (temporary diagnostic build late-releases
-  // and continues folding; production/validation must restore assert).
-  uint64_t fold_expected_gen = 0;
+  WaitBlockPendingMode mode = WaitBlockPendingMode::NONE;
+  std::string block_id;
+  uint64_t action_pc = 0;
+  uint64_t poll_loop_exit_pc = 0;
+  unsigned int unique_function_id = 0;
+  // Absolute barrier generation paired with this hold. Both strategies pin it
+  // once after the action probe executes. A captured poll consumes residual
+  // loop occurrences on release; a missing wait never changes either cursor.
+  uint64_t expected_gen = 0;
+  uint64_t hold_start_cycle = 0;
+  uint64_t last_heartbeat_cycle = 0;
 };
 
 struct HopperMBarrierPendingTxBinding {

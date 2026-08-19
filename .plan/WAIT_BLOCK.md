@@ -1,7 +1,7 @@
 # WaitBlock: Two-Strategy Post-Processing and Simulator Design
 
 **Status:** POST-PROCESSING V4 IMPLEMENTED AND FULL-TRACE VALIDATED;
-SIMULATOR NOT IMPLEMENTED.
+SIMULATOR V1 IMPLEMENTED; SERVER BUILD AND K5/K10 RUNTIME VALIDATION PENDING.
 
 **Extends:** [`SPIN_WAIT_SIM_MODELING.md`](SPIN_WAIT_SIM_MODELING.md) and
 [`SPIN_WAIT_POSTPROCESS.md`](SPIN_WAIT_POSTPROCESS.md).
@@ -299,6 +299,8 @@ poll_probe_pc
 poll_loopback_pc
 poll_loop_exit_pc
 poll_advance_allowed_pcs
+effect_safe = true
+effect_classes
 canonical_wait_condition
 ```
 
@@ -446,6 +448,7 @@ implicitly enable entry holds.
             45552,
             45568
           ],
+          "effect_safe": true,
           "canonical_wait_condition": {}
         }
       ]
@@ -957,6 +960,19 @@ actual landing PC
 
 ### 2.9 Feature gating
 
+The v4 runtime has one canonical feature gate and one debug gate:
+
+```text
+-wait_block_enable
+-wait_block_debug
+```
+
+The former `-spin_wait_fold_enable` and `-spin_wait_fold_debug` options are
+removed. `FOLD_CAPTURED_POLL` is a strategy selected by v4 sidecar metadata, not
+a separately enabled runtime mode. `-spin_wait_observe_enable` remains an
+independent read-only measurement option and never creates a hold or advances a
+cursor.
+
 With `-wait_block_enable 0`:
 
 - do not require sidecar v4;
@@ -1102,14 +1118,19 @@ Cross-kernel:
    filter and verify the same report and strategy counts.
 7. [done] Integrate full-CTA strict sidecar generation into `run_hw_trace.py`
    after sync operand mapping, with mandatory metadata and post-trim ordering.
-8. [not started] Restore captured-poll ownership at poll probes in the v4
+8. [done] Restore captured-poll ownership at poll probes in the v4
    simulator.
-9. [not started] Implement `INJECT_MISSING_WAIT` and its partial-miss diagnostic
+9. [done] Implement `INJECT_MISSING_WAIT` and its partial-miss diagnostic
    abort as a
    separate entry-only path.
-10. [not started] Add strict loader, identity, generation, landing, and lifecycle
+10. [done] Add strict loader, identity, generation, landing, and lifecycle
    guards.
-11. [not started] Run simulator static/unit checks.
+11. [in progress] Static sidecar-accounting, stale-field, whitespace,
+    hardcoding, metadata-only serialization, and closed cursor-opcode audits
+    pass. Full-CTA strict regeneration on the compact trace passes with the
+    reviewed `43/36/0/7`, `22/14`, and `76,224/4,596` results. A local C++ build
+    is unavailable because this macOS environment has no CUDA headers; compile
+    validation remains a server step.
 12. [not started] The user builds and runs K5/K10.
 
 The design is complete when each runtime action is explained by exactly one of

@@ -63,6 +63,7 @@
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <limits>
 #include "zlib.h"
 
 #include "dram.h"
@@ -653,8 +654,8 @@ void load_sync_operand_resolver(const std::filesystem::path &extra_info_dir,
 // Producer spin-wait sidecar: map (funcid, primary_wait_pc) -> region so the
 // simulator can recognize an mbarrier spin loop at issue time. Payload untouched;
 // see build_spin_wait_sidecar.py and .plan/SPIN_WAIT_POSTPROCESS.md.
-void load_spin_wait_sidecar(const std::filesystem::path &extra_info_dir,
-                            SpinWaitSidecarDB &db) {
+void load_legacy_spin_wait_sidecar(const std::filesystem::path &extra_info_dir,
+                                   SpinWaitSidecarDB &db) {
   rapidjson::Document doc;
   if (!load_tma_json_document(extra_info_dir / "spin_wait_sidecar.json", doc)) {
     return;
@@ -718,6 +719,383 @@ void load_spin_wait_sidecar(const std::filesystem::path &extra_info_dir,
   }
 }
 
+[[noreturn]] void wait_block_sidecar_fatal(
+    const std::filesystem::path &path, const std::string &message) {
+  std::cerr << "[WAITBLOCK][SIDECAR][FATAL] path=" << path.string()
+            << " reason=" << message << std::endl;
+  abort();
+}
+
+const rapidjson::Value &wait_block_require_member(
+    const rapidjson::Value &object, const char *name,
+    const std::filesystem::path &path) {
+  if (!object.IsObject() || !object.HasMember(name)) {
+    wait_block_sidecar_fatal(path,
+                             std::string("missing required member '") + name +
+                                 "'");
+  }
+  return object[name];
+}
+
+uint64_t wait_block_require_uint(const rapidjson::Value &object,
+                                 const char *name,
+                                 const std::filesystem::path &path) {
+  const rapidjson::Value &value =
+      wait_block_require_member(object, name, path);
+  if (!(value.IsUint64() || value.IsUint() ||
+        (value.IsInt64() && value.GetInt64() >= 0) ||
+        (value.IsInt() && value.GetInt() >= 0))) {
+    wait_block_sidecar_fatal(
+        path, std::string("member '") + name + "' must be an unsigned integer");
+  }
+  return parse_tma_json_uint(value);
+}
+
+uint32_t wait_block_require_uint32(const rapidjson::Value &object,
+                                   const char *name,
+                                   const std::filesystem::path &path) {
+  const uint64_t value = wait_block_require_uint(object, name, path);
+  if (value > std::numeric_limits<uint32_t>::max()) {
+    wait_block_sidecar_fatal(
+        path, std::string("member '") + name + "' exceeds uint32 range");
+  }
+  return static_cast<uint32_t>(value);
+}
+
+bool wait_block_require_bool(const rapidjson::Value &object, const char *name,
+                             const std::filesystem::path &path) {
+  const rapidjson::Value &value =
+      wait_block_require_member(object, name, path);
+  if (!value.IsBool()) {
+    wait_block_sidecar_fatal(
+        path, std::string("member '") + name + "' must be a boolean");
+  }
+  return value.GetBool();
+}
+
+std::string wait_block_require_string(const rapidjson::Value &object,
+                                      const char *name,
+                                      const std::filesystem::path &path) {
+  const rapidjson::Value &value =
+      wait_block_require_member(object, name, path);
+  if (!value.IsString()) {
+    wait_block_sidecar_fatal(
+        path, std::string("member '") + name + "' must be a string");
+  }
+  return value.GetString();
+}
+
+const rapidjson::Value &wait_block_require_object(
+    const rapidjson::Value &object, const char *name,
+    const std::filesystem::path &path) {
+  const rapidjson::Value &value =
+      wait_block_require_member(object, name, path);
+  if (!value.IsObject()) {
+    wait_block_sidecar_fatal(
+        path, std::string("member '") + name + "' must be an object");
+  }
+  return value;
+}
+
+const rapidjson::Value &wait_block_require_array(
+    const rapidjson::Value &object, const char *name,
+    const std::filesystem::path &path) {
+  const rapidjson::Value &value =
+      wait_block_require_member(object, name, path);
+  if (!value.IsArray()) {
+    wait_block_sidecar_fatal(
+        path, std::string("member '") + name + "' must be an array");
+  }
+  return value;
+}
+
+std::vector<uint64_t> wait_block_require_pc_array(
+    const rapidjson::Value &object, const char *name,
+    const std::filesystem::path &path) {
+  const rapidjson::Value &array =
+      wait_block_require_array(object, name, path);
+  std::vector<uint64_t> pcs;
+  pcs.reserve(array.Size());
+  for (const rapidjson::Value &value : array.GetArray()) {
+    if (!(value.IsUint64() || value.IsUint() ||
+          (value.IsInt64() && value.GetInt64() >= 0) ||
+          (value.IsInt() && value.GetInt() >= 0))) {
+      wait_block_sidecar_fatal(
+          path, std::string("member '") + name +
+                    "' contains a non-unsigned PC");
+    }
+    pcs.push_back(parse_tma_json_uint(value));
+  }
+  return pcs;
+}
+
+void wait_block_validate_action_opcode(
+    traced_execution &static_trace_info, uint32_t unique_function_id,
+    uint64_t action_pc, const std::string &sidecar_opcode,
+    const std::filesystem::path &path) {
+  if (sidecar_opcode != "SYNCS.PHASECHK.TRANS64" &&
+      sidecar_opcode != "SYNCS.PHASECHK.TRANS64.TRYWAIT") {
+    wait_block_sidecar_fatal(
+        path, "runtime action opcode is not a supported wait probe");
+  }
+  if (!static_trace_info.has_kernel_with_unique_function_id(
+          unique_function_id)) {
+    wait_block_sidecar_fatal(
+        path, "runtime action references an unknown unique_function_id");
+  }
+  if (action_pc > std::numeric_limits<uint32_t>::max()) {
+    wait_block_sidecar_fatal(
+        path, "runtime action PC exceeds enhanced metadata PC range");
+  }
+  std::shared_ptr<traced_instruction> instruction =
+      static_trace_info.get_kernel_by_unique_function_id(unique_function_id)
+          .get_instruction_ptr(static_cast<uint32_t>(action_pc));
+  if (!instruction) {
+    wait_block_sidecar_fatal(
+        path, "runtime action PC is absent from enhanced execution metadata");
+  }
+  if (instruction->get_op_code() != sidecar_opcode) {
+    wait_block_sidecar_fatal(
+        path, "runtime action opcode disagrees with enhanced execution metadata");
+  }
+}
+
+void load_wait_block_sidecar_v4(const std::filesystem::path &extra_info_dir,
+                                traced_execution &static_trace_info,
+                                WaitBlockSidecarDB &db) {
+  const std::filesystem::path path =
+      extra_info_dir / "spin_wait_sidecar.json";
+  rapidjson::Document doc;
+  if (!load_tma_json_document(path, doc)) {
+    wait_block_sidecar_fatal(path, "missing or malformed JSON document");
+  }
+  if (wait_block_require_uint(doc, "version", path) != 4) {
+    wait_block_sidecar_fatal(path, "unsupported version (expected 4)");
+  }
+  if (wait_block_require_string(doc, "schema", path) !=
+      "wait_block_sidecar") {
+    wait_block_sidecar_fatal(path,
+                             "unsupported schema (expected wait_block_sidecar)");
+  }
+  db.validation_complete =
+      wait_block_require_bool(doc, "validation_complete", path);
+  if (!db.validation_complete) {
+    wait_block_sidecar_fatal(path, "validation_complete is false");
+  }
+
+  const rapidjson::Value &report =
+      wait_block_require_object(doc, "wait_block_report", path);
+  db.discovered = wait_block_require_uint(report, "discovered", path);
+  db.passed = wait_block_require_uint(report, "passed", path);
+  db.failed = wait_block_require_uint(report, "failed", path);
+  db.skipped = wait_block_require_uint(report, "skipped", path);
+  const uint64_t expected_inject =
+      wait_block_require_uint(report, "inject_missing_wait", path);
+  const uint64_t expected_fold =
+      wait_block_require_uint(report, "fold_captured_poll", path);
+  db.metadata_only =
+      wait_block_require_uint(report, "metadata_only", path);
+  db.ready_only_all_live_visits =
+      wait_block_require_uint(report, "ready_only_all_live_visits", path);
+  db.ready_only_partial_visits =
+      wait_block_require_uint(report, "ready_only_partial_visits", path);
+  db.ready_only_records_with_partial_visits = wait_block_require_uint(
+      report, "ready_only_records_with_partial_visits", path);
+  if (db.failed != 0) {
+    wait_block_sidecar_fatal(path, "wait_block_report.failed is nonzero");
+  }
+  if (db.discovered != db.passed + db.failed + db.skipped) {
+    wait_block_sidecar_fatal(path, "report discovered accounting mismatch");
+  }
+  if (db.passed != expected_inject + expected_fold + db.metadata_only) {
+    wait_block_sidecar_fatal(path, "report passed accounting mismatch");
+  }
+
+  const rapidjson::Value &kernels =
+      wait_block_require_array(doc, "kernels", path);
+  uint64_t loaded_metadata = 0;
+  uint64_t loaded_all_live_visits = 0;
+  uint64_t loaded_partial_visits = 0;
+  uint64_t loaded_records_with_partial = 0;
+  for (const rapidjson::Value &kernel : kernels.GetArray()) {
+    if (!kernel.IsObject()) {
+      wait_block_sidecar_fatal(path, "kernels contains a non-object record");
+    }
+    const uint32_t trace_kernel_id =
+        wait_block_require_uint32(kernel, "trace_kernel_id", path);
+    const uint32_t unique_function_id =
+        wait_block_require_uint32(kernel, "unique_function_id", path);
+    const rapidjson::Value &blocks =
+        wait_block_require_array(kernel, "wait_blocks", path);
+    for (const rapidjson::Value &block : blocks.GetArray()) {
+      if (!block.IsObject()) {
+        wait_block_sidecar_fatal(path,
+                                 "wait_blocks contains a non-object record");
+      }
+      const uint32_t block_uid =
+          wait_block_require_uint32(block, "unique_function_id", path);
+      if (block_uid != unique_function_id) {
+        wait_block_sidecar_fatal(
+            path, "block unique_function_id disagrees with kernel record");
+      }
+      const std::string block_id =
+          wait_block_require_string(block, "block_id", path);
+      if (block_id.empty()) {
+        wait_block_sidecar_fatal(path, "empty wait-block block_id");
+      }
+      if (!block.HasMember("runtime_strategy")) {
+        if (wait_block_require_string(block, "record_class", path) !=
+            "METADATA_ONLY") {
+          wait_block_sidecar_fatal(
+              path, "strategy-less record is not METADATA_ONLY");
+        }
+        loaded_metadata++;
+        continue;
+      }
+      const std::string strategy =
+          wait_block_require_string(block, "runtime_strategy", path);
+
+      if (strategy == "INJECT_MISSING_WAIT") {
+        MissingWaitRecord record;
+        record.block_id = block_id;
+        record.entry_probe_pc =
+            wait_block_require_uint(block, "entry_probe_pc", path);
+        const std::string entry_probe_opcode =
+            wait_block_require_string(block, "entry_probe_opcode", path);
+        record.entry_probe_kind = parse_sync_instruction_kind_string(
+            wait_block_require_string(block, "entry_probe_kind", path));
+        if (record.entry_probe_kind != SyncInstructionKind::PHASECHK &&
+            record.entry_probe_kind != SyncInstructionKind::TRYWAIT) {
+          wait_block_sidecar_fatal(path,
+                                   "missing-wait entry is not a wait probe");
+        }
+        record.partial_modeled_miss_aborts =
+            wait_block_require_string(block, "partial_modeled_miss_action",
+                                      path) == "ABORT";
+        if (!record.partial_modeled_miss_aborts) {
+          wait_block_sidecar_fatal(
+              path, "partial modeled miss action must be ABORT");
+        }
+        if (wait_block_require_uint(block, "sync_payload_missing", path) != 0) {
+          wait_block_sidecar_fatal(
+              path, "missing-wait entry has unresolved sync payloads");
+        }
+        const rapidjson::Value &paths =
+            wait_block_require_object(block, "observed_path_counts", path);
+        record.captured_ready_visits =
+            wait_block_require_uint(paths, "ready_arm", path);
+        record.captured_second_gate_visits =
+            wait_block_require_uint(paths, "second_gate_arm", path);
+        record.captured_poll_visits =
+            wait_block_require_uint(paths, "captured_poll", path);
+        record.all_live_entry_visits =
+            wait_block_require_uint(block, "all_live_entry_visits", path);
+        record.partial_entry_visits =
+            wait_block_require_uint(block, "partial_entry_visits", path);
+        if (record.captured_ready_visits == 0 ||
+            record.captured_second_gate_visits != 0 ||
+            record.captured_poll_visits != 0) {
+          wait_block_sidecar_fatal(
+              path, "INJECT_MISSING_WAIT record is not dynamically ready-only");
+        }
+        if (record.all_live_entry_visits + record.partial_entry_visits !=
+            record.captured_ready_visits) {
+          wait_block_sidecar_fatal(
+              path, "missing-wait mask census disagrees with ready visits");
+        }
+        wait_block_validate_action_opcode(
+            static_trace_info, unique_function_id, record.entry_probe_pc,
+            entry_probe_opcode, path);
+        loaded_all_live_visits += record.all_live_entry_visits;
+        loaded_partial_visits += record.partial_entry_visits;
+        loaded_records_with_partial += record.partial_entry_visits != 0;
+        const WaitBlockLookupKey key{trace_kernel_id, unique_function_id,
+                                     record.entry_probe_pc};
+        if (db.captured_poll_by_probe.count(key) != 0 ||
+            !db.missing_wait_by_entry.emplace(key, record).second) {
+          wait_block_sidecar_fatal(path,
+                                   "duplicate or conflicting runtime action key");
+        }
+      } else if (strategy == "FOLD_CAPTURED_POLL") {
+        SpinWaitRegionRecord record;
+        record.block_id = block_id;
+        record.loop_head_pc =
+            wait_block_require_uint(block, "poll_loop_head_pc", path);
+        record.primary_wait_pc =
+            wait_block_require_uint(block, "poll_probe_pc", path);
+        const std::string poll_probe_opcode =
+            wait_block_require_string(block, "poll_probe_opcode", path);
+        record.loopback_bra_pc =
+            wait_block_require_uint(block, "poll_loopback_pc", path);
+        record.exit_pc =
+            wait_block_require_uint(block, "poll_loop_exit_pc", path);
+        record.primary_wait_kind = parse_sync_instruction_kind_string(
+            wait_block_require_string(block, "poll_probe_kind", path));
+        record.semantic_free_body =
+            wait_block_require_bool(block, "semantic_free_body", path);
+        const bool effect_safe =
+            wait_block_require_bool(block, "effect_safe", path);
+        record.barrier_self_tied =
+            wait_block_require_bool(block, "barrier_self_tied", path);
+        const rapidjson::Value &dynamic =
+            wait_block_require_object(block, "dynamic", path);
+        record.is_spin_loop =
+            wait_block_require_bool(dynamic, "is_spin_loop", path);
+        if ((record.primary_wait_kind != SyncInstructionKind::PHASECHK &&
+             record.primary_wait_kind != SyncInstructionKind::TRYWAIT) ||
+            !record.semantic_free_body || !effect_safe ||
+            !record.barrier_self_tied ||
+            !record.is_spin_loop) {
+          wait_block_sidecar_fatal(
+              path, "FOLD_CAPTURED_POLL safety proof is incomplete");
+        }
+        record.body_pcs =
+            wait_block_require_pc_array(block, "poll_loop_body_pcs", path);
+        const std::vector<uint64_t> allowed = wait_block_require_pc_array(
+            block, "poll_advance_allowed_pcs", path);
+        std::set<uint64_t> expected_allowed(record.body_pcs.begin(),
+                                            record.body_pcs.end());
+        expected_allowed.insert(record.loopback_bra_pc);
+        const std::set<uint64_t> actual_allowed(allowed.begin(), allowed.end());
+        if (record.body_pcs.empty() ||
+            expected_allowed.count(record.primary_wait_pc) == 0 ||
+            record.loopback_bra_pc == record.exit_pc ||
+            actual_allowed.size() != allowed.size() ||
+            expected_allowed != actual_allowed ||
+            actual_allowed.count(record.exit_pc) != 0) {
+          wait_block_sidecar_fatal(
+              path, "captured-poll advance set or exit boundary is invalid");
+        }
+        wait_block_validate_action_opcode(
+            static_trace_info, unique_function_id, record.primary_wait_pc,
+            poll_probe_opcode, path);
+        record.foldable = true;
+        const WaitBlockLookupKey key{trace_kernel_id, unique_function_id,
+                                     record.primary_wait_pc};
+        if (db.missing_wait_by_entry.count(key) != 0 ||
+            !db.captured_poll_by_probe.emplace(key, record).second) {
+          wait_block_sidecar_fatal(path,
+                                   "duplicate or conflicting runtime action key");
+        }
+      } else {
+        wait_block_sidecar_fatal(path,
+                                 "unknown runtime_strategy '" + strategy + "'");
+      }
+    }
+  }
+
+  if (db.missing_wait_by_entry.size() != expected_inject ||
+      db.captured_poll_by_probe.size() != expected_fold ||
+      loaded_metadata != db.metadata_only ||
+      loaded_all_live_visits != db.ready_only_all_live_visits ||
+      loaded_partial_visits != db.ready_only_partial_visits ||
+      loaded_records_with_partial !=
+          db.ready_only_records_with_partial_visits) {
+    wait_block_sidecar_fatal(path,
+                             "strategy or mask accounting disagrees with report");
+  }
+}
+
 }
 
 // MOD. Begin. Improved tracer
@@ -725,6 +1103,13 @@ void gpgpu_sim::parse_extra_trace_info(std::string filepath, bool is_extra_trace
   m_tma_sidecar_db.clear();
   m_sync_sidecar_db.clear();
   m_spin_wait_sidecar_db.clear();
+  m_wait_block_sidecar_db.clear();
+  if (m_shader_config->wait_block_enable && !is_extra_trace_enabled) {
+    std::cerr << "[WAITBLOCK][CONFIG][FATAL] -wait_block_enable requires "
+                 "extra trace metadata and a strict schema-v4 sidecar"
+              << std::endl;
+    abort();
+  }
   if(is_extra_trace_enabled) {
     m_extra_trace_info.DeserializeFromFile(filepath.c_str());
     std::filesystem::path metadata_path(filepath);
@@ -736,7 +1121,12 @@ void gpgpu_sim::parse_extra_trace_info(std::string filepath, bool is_extra_trace
     // flow through the operand resolver's linked_config_id -> descriptor_configs join.
     load_tma_operand_resolver(extra_info_dir, m_tma_sidecar_db);
     load_sync_operand_resolver(extra_info_dir, m_sync_sidecar_db);
-    load_spin_wait_sidecar(extra_info_dir, m_spin_wait_sidecar_db);
+    if (m_shader_config->wait_block_enable) {
+      load_wait_block_sidecar_v4(
+          extra_info_dir, m_extra_trace_info, m_wait_block_sidecar_db);
+    } else if (m_shader_config->spin_wait_observe_enable) {
+      load_legacy_spin_wait_sidecar(extra_info_dir, m_spin_wait_sidecar_db);
+    }
     // BASE-MAP LOAD-FAILURE ASSERT (M4): real-base addressing is on by default. An empty
     // base_records map means tma_pc_base_map.json was missing, unparsable, or had no
     // descriptor sites. We deliberately FAIL here rather than silently falling back to the
@@ -767,11 +1157,23 @@ void gpgpu_sim::parse_extra_trace_info(std::string filepath, bool is_extra_trace
                 << m_tma_sidecar_db.base_records.size() << std::endl;
     }
     if (m_shader_config->sync_debug_enable ||
-        m_shader_config->trimchk_percta_log_enable) {
+        m_shader_config->trimchk_percta_log_enable ||
+        m_shader_config->wait_block_debug) {
       std::cerr << "[SYNC] loaded operand_sites="
                 << m_sync_sidecar_db.site_records.size() << std::endl;
-      std::cerr << "[SPINWAIT] loaded spin_wait_regions="
-                << m_spin_wait_sidecar_db.regions_by_wait_pc.size() << std::endl;
+      if (m_shader_config->wait_block_enable) {
+        std::cerr << "[WAITBLOCK] loaded missing_wait="
+                  << m_wait_block_sidecar_db.missing_wait_by_entry.size()
+                  << " captured_poll="
+                  << m_wait_block_sidecar_db.captured_poll_by_probe.size()
+                  << " report_passed=" << m_wait_block_sidecar_db.passed
+                  << " report_skipped=" << m_wait_block_sidecar_db.skipped
+                  << std::endl;
+      } else {
+        std::cerr << "[SPINWAIT] loaded spin_wait_regions="
+                  << m_spin_wait_sidecar_db.regions_by_wait_pc.size()
+                  << std::endl;
+      }
     }
   }
 }
@@ -844,15 +1246,43 @@ bool gpgpu_sim::lookup_sync_site_metadata(unsigned int unique_function_id,
   return true;
 }
 
-bool gpgpu_sim::lookup_spin_wait_region(unsigned int unique_function_id,
+bool gpgpu_sim::lookup_spin_wait_region(unsigned int trace_kernel_id,
+                                        unsigned int unique_function_id,
                                         address_type pc,
                                         SpinWaitRegionRecord &region) const {
+  if (m_shader_config->wait_block_enable) {
+    auto it = m_wait_block_sidecar_db.captured_poll_by_probe.find(
+        WaitBlockLookupKey{trace_kernel_id, unique_function_id,
+                           static_cast<uint64_t>(pc)});
+    if (it == m_wait_block_sidecar_db.captured_poll_by_probe.end()) {
+      return false;
+    }
+    region = it->second;
+    return true;
+  }
   auto it = m_spin_wait_sidecar_db.regions_by_wait_pc.find(
       SyncOperandLookupKey{unique_function_id, static_cast<uint64_t>(pc)});
   if (it == m_spin_wait_sidecar_db.regions_by_wait_pc.end()) {
     return false;
   }
   region = it->second;
+  return true;
+}
+
+bool gpgpu_sim::lookup_missing_wait(unsigned int trace_kernel_id,
+                                    unsigned int unique_function_id,
+                                    address_type pc,
+                                    MissingWaitRecord &record) const {
+  if (!m_shader_config->wait_block_enable) {
+    return false;
+  }
+  auto it = m_wait_block_sidecar_db.missing_wait_by_entry.find(
+      WaitBlockLookupKey{trace_kernel_id, unique_function_id,
+                         static_cast<uint64_t>(pc)});
+  if (it == m_wait_block_sidecar_db.missing_wait_by_entry.end()) {
+    return false;
+  }
+  record = it->second;
   return true;
 }
 
@@ -2108,22 +2538,17 @@ void shader_core_config::reg_options(class OptionParser *opp) {
                          "blocks or advances the trace. Requires spin_wait_sidecar.json. "
                          "(default=0)",
                          "0");
-  option_parser_register(opp, "-spin_wait_fold_enable", OPT_BOOL,
-                         &spin_wait_fold_enable,
-                         "Producer/consumer spin-wait fold. When on, a PHASECHK/TRYWAIT "
-                         "matching a COLLAPSIBLE spin_wait_sidecar.json region parks the warp "
-                         "while the modeled mbarrier is not ready and, on ready, fast-forwards "
-                         "the trace cursor to the region exit_pc (regenerating the poll count "
-                         "instead of replaying it). Only foldable regions "
-                         "(is_spin_loop && semantic_free_body && barrier_self_tied) are affected; "
-                         "off = bit-identical replay baseline. Requires spin_wait_sidecar.json. "
-                         "(default=0)",
-                         "0");
-  option_parser_register(opp, "-spin_wait_fold_debug", OPT_BOOL,
-                         &spin_wait_fold_debug,
-                         "Emit cycle-stamped, budget-limited [FOLD][park/release/skip/summary] "
-                         "lines to validate spin-wait fold. (default=0)",
-                         "0");
+  option_parser_register(
+      opp, "-wait_block_enable", OPT_BOOL, &wait_block_enable,
+      "Enable schema-v4 WaitBlock runtime: fold captured polls at their poll "
+      "probe and inject missing waits only for all-live ready-only entries. "
+      "Partial modeled misses abort. Requires a strict, complete "
+      "spin_wait_sidecar.json v4. (default=0)",
+      "0");
+  option_parser_register(
+      opp, "-wait_block_debug", OPT_BOOL, &wait_block_debug,
+      "Emit [WAITBLOCK] hold/release/guard/summary diagnostics. (default=0)",
+      "0");
   option_parser_register(opp, "-trimchk_percta_log_enable", OPT_BOOL,
                          &trimchk_percta_log_enable,
                          "[TRIMCHK]/[TRACECHECK] Emit per-CTA trace-load contract lines: "

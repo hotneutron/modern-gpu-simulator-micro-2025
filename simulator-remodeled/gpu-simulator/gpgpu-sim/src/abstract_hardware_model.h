@@ -1240,6 +1240,9 @@ class inst_t {
   bool sync_has_semantic_raw = false;
   uint64_t sync_semantic_raw = 0;
   uint32_t trace_kernel_id = 0;
+  bool trace_masks_valid = false;
+  uint32_t trace_active_mask = 0;
+  uint32_t trace_predicate_mask = 0;
   bool skip_wb;
 
   barrier_type bar_type;

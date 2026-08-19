@@ -91,6 +91,8 @@ struct inst_trace_t {
   uint16_t m_unique_function_id;
   unsigned int m_next_traced_pc;
   unsigned int mask;
+  uint32_t active_mask;
+  uint32_t predicate_mask;
   std::string opcode;
   uint32_t block_idx_x;
   uint16_t block_idx_y;

@@ -918,11 +918,15 @@ class gpgpu_sim : public gpgpu_t {
                                  address_type pc,
                                  SyncResolvedSiteMetadata &metadata) const;
 
-  // Producer spin-wait sidecar lookup: returns true and fills `region` if the
-  // (funcid, pc) is the primary wait of a detected mbarrier spin loop. Used by
-  // the (gated) producer spin-wait fold feature. See .plan/SPIN_WAIT_POSTPROCESS.md.
-  bool lookup_spin_wait_region(unsigned int unique_function_id, address_type pc,
+  // Runtime action lookups. WaitBlock v4 uses kernel-aware keys; the legacy
+  // observe-only loader ignores trace_kernel_id and retains its (funcid, pc)
+  // key when spin-wait observation is enabled without the v4 runtime.
+  bool lookup_spin_wait_region(unsigned int trace_kernel_id,
+                               unsigned int unique_function_id, address_type pc,
                                SpinWaitRegionRecord &region) const;
+  bool lookup_missing_wait(unsigned int trace_kernel_id,
+                           unsigned int unique_function_id, address_type pc,
+                           MissingWaitRecord &record) const;
 
   void record_l1i_prefetch_miss_observation(new_addr_type block_addr,
                                             unsigned int unique_function_id,
@@ -1002,6 +1006,7 @@ class gpgpu_sim : public gpgpu_t {
   TMASidecarMetadataDB m_tma_sidecar_db;
   SyncSidecarMetadataDB m_sync_sidecar_db;
   SpinWaitSidecarDB m_spin_wait_sidecar_db;
+  WaitBlockSidecarDB m_wait_block_sidecar_db;
   std::map<new_addr_type, unsigned long long> m_l1i_prefetch_miss_block_histogram;
   std::map<new_addr_type, unsigned int> m_l1i_prefetch_miss_block_unique_function_id;
   std::map<unsigned int, unsigned long long> m_l1i_prefetch_miss_set_histogram;

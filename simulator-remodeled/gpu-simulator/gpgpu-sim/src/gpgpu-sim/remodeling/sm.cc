@@ -108,6 +108,11 @@ unsigned int translate_reg_to_global_id(int reg, TraceEnhancedOperandType reg_ty
 namespace {
 
 static constexpr uint32_t kSyncExchDecodeBase = 0x200000;
+// Policy thresholds from WAIT_BLOCK.md 2.6 and SPIN_WAIT_SIM_MODELING.md 6.
+// They are strategy-wide safety limits, not trace/application identities.
+static constexpr uint64_t kSpinWaitObserveWatchdogCycles = 400000;
+static constexpr uint64_t kWaitBlockHoldWatchdogCycles = 32000;
+static constexpr uint64_t kWaitBlockHeartbeatCycles = 4096;
 
 uint32_t decode_sync_exch_expected_arrive_count(uint64_t raw) {
   if (raw >= kSyncExchDecodeBase) {
@@ -148,6 +153,18 @@ const char *sync_kind_to_string(SyncInstructionKind kind) {
     case SyncInstructionKind::TRYWAIT:
       return "TRYWAIT";
     case SyncInstructionKind::NONE:
+    default:
+      return "NONE";
+  }
+}
+
+const char *wait_block_mode_to_string(WaitBlockPendingMode mode) {
+  switch (mode) {
+    case WaitBlockPendingMode::MISSING_WAIT_HOLD:
+      return "INJECT_MISSING_WAIT";
+    case WaitBlockPendingMode::CAPTURED_POLL_HOLD:
+      return "FOLD_CAPTURED_POLL";
+    case WaitBlockPendingMode::NONE:
     default:
       return "NONE";
   }
@@ -449,17 +466,15 @@ void SM::debug_log_tma_event(const std::string &message) {
   --m_tma_debug_print_budget;
 }
 
-// [Spin-wait fold] per-event log, gated by -spin_wait_fold_debug, with
-// its own budget so it can be enabled without SYNCDBG/TMADBG noise. cyc= prefix
-// lets a park/release/skip be correlated with the SYNCDBG phase-flip timeline.
-void SM::debug_log_fold_event(const std::string &message) {
-  if (!m_config->spin_wait_fold_debug ||
-      m_fold_debug_print_budget == 0) {
+void SM::debug_log_wait_block_event(const char *event,
+                                    const std::string &message) {
+  if (!m_config->wait_block_debug ||
+      m_wait_block_debug_print_budget == 0) {
     return;
   }
-  std::cerr << "[FOLD][SM" << m_sm_id << "] cyc="
+  std::cerr << "[WAITBLOCK][" << event << "][SM" << m_sm_id << "] cyc="
             << get_current_gpu_cycle() << " " << message << std::endl;
-  --m_fold_debug_print_budget;
+  --m_wait_block_debug_print_budget;
 }
 
 void SM::debug_dump_sync_counters() const {
@@ -913,10 +928,7 @@ void SM::record_spin_wait_observe(unsigned wid, uint64_t wait_pc,
   SpinWaitRegionObserve &reg = m_spin_wait_observe_by_region[wait_pc];
   reg.primary_wait_pc = wait_pc;
   const unsigned long long now = get_current_gpu_cycle();
-  // Deadlock watchdog threshold: default to a generous multiple of the largest
-  // FA3 HW target (~133K cycles) so only a pathological wait trips it.
-  const unsigned long long threshold =
-      m_spin_wait_watchdog_threshold ? m_spin_wait_watchdog_threshold : 400000ULL;
+  const unsigned long long threshold = kSpinWaitObserveWatchdogCycles;
   if (!ready) {
     // Open a new episode on the first not-ready poll for this warp+region, or
     // keep the earliest not-ready cycle if an episode for this region is open.
@@ -1839,6 +1851,26 @@ unsigned int SM::sim_init_thread(kernel_info_t &kernel,
 
 void SM::reinit(unsigned start_thread, unsigned end_thread,
                 bool reset_not_completed) {
+  const unsigned first_warp = start_thread / m_config->warp_size;
+  const unsigned end_warp = end_thread / m_config->warp_size;
+  if (m_config->wait_block_enable) {
+    for (unsigned i = first_warp; i < end_warp; ++i) {
+      if (i >= m_pending_sync_waits.size() ||
+          !m_pending_sync_waits[i].valid) {
+        continue;
+      }
+      const HopperMBarrierPendingWait &pending = m_pending_sync_waits[i];
+      std::cerr << "[WAITBLOCK][abort][SM" << m_sm_id << "] cyc="
+                << get_current_gpu_cycle()
+                << " reason=warp-slot-reuse-with-active-hold"
+                << " strategy=" << wait_block_mode_to_string(pending.mode)
+                << " trace_kernel=" << pending.key.trace_kernel_id
+                << " cta=" << pending.key.cta_id << " warp=" << i
+                << " action_pc=0x" << format_hex_u64(pending.action_pc)
+                << " action=abort" << std::endl;
+      abort();
+    }
+  }
   if (reset_not_completed) {
     m_not_completed = 0;
     m_active_threads.reset();
@@ -1860,18 +1892,11 @@ void SM::reinit(unsigned start_thread, unsigned end_thread,
     m_threadState[i].n_insn = 0;
     m_threadState[i].m_cta_id = -1;
   }
-  for (unsigned i = start_thread / m_config->warp_size;
-       i < end_thread / m_config->warp_size; ++i) {
+  for (unsigned i = first_warp; i < end_warp; ++i) {
     m_physical_warp[i]->reset();
     m_simt_stack[i]->reset();
     if (i < m_pending_sync_waits.size()) {
       m_pending_sync_waits[i] = HopperMBarrierPendingWait();
-    }
-    // [Gen audit] Clear this warp's per-barrier consumed-gen so a reused slot in
-    // the next CTA wave does not inherit a stale generation. Empty when fold
-    // is off (never populated), so this is a no-op for feature-off.
-    if (i < m_fold_last_gen.size()) {
-      m_fold_last_gen[i].clear();
     }
     if (i < m_pending_tma_barrier_binds_per_warp.size()) {
       m_pending_tma_barrier_binds_per_warp[i].clear();
@@ -1883,6 +1908,25 @@ void SM::register_cta_thread_exit(unsigned cta_num, kernel_info_t *kernel) {
   assert(m_cta_status[cta_num] > 0);
   m_cta_status[cta_num]--;
   if (!m_cta_status[cta_num]) {
+    if (m_config->wait_block_enable) {
+      for (unsigned warp_id = 0; warp_id < m_pending_sync_waits.size();
+           ++warp_id) {
+        const HopperMBarrierPendingWait &pending =
+            m_pending_sync_waits[warp_id];
+        if (!pending.valid || pending.key.cta_id != cta_num) {
+          continue;
+        }
+        std::cerr << "[WAITBLOCK][abort][SM" << m_sm_id << "] cyc="
+                  << get_current_gpu_cycle()
+                  << " reason=cta-exit-with-active-hold"
+                  << " strategy=" << wait_block_mode_to_string(pending.mode)
+                  << " trace_kernel=" << pending.key.trace_kernel_id
+                  << " cta=" << cta_num << " warp=" << warp_id
+                  << " action_pc=0x" << format_hex_u64(pending.action_pc)
+                  << " action=abort" << std::endl;
+        abort();
+      }
+    }
     // Record first completed CTA for ground truth validation
     unsigned global_cta_id = m_local_to_global_cta_id[cta_num];
     m_gpu->record_first_completed_cta(global_cta_id, m_sm_id);
@@ -1971,10 +2015,8 @@ void SM::register_cta_thread_exit(unsigned cta_num, kernel_info_t *kernel) {
     if (m_config->spin_wait_observe_enable) {
       print_spin_wait_observe_summary();
     }
-    // [Spin-wait fold] SM-global cumulative validation summary. Like observe,
-    // the last CTA-exit print per SM holds the complete totals.
-    if (m_config->spin_wait_fold_enable) {
-      print_spin_wait_fold_summary();
+    if (m_config->wait_block_enable) {
+      print_wait_block_summary();
     }
 
     // [CTA-imbalance diag] Emit this CTA's finish cycle, elapsed cycles, and raw
@@ -2039,6 +2081,19 @@ void SM::register_cta_thread_exit(unsigned cta_num, kernel_info_t *kernel) {
     m_n_active_cta--;
     m_barriers.deallocate_barrier(cta_num);
     clear_sync_barrier_state_for_cta(cta_num);
+    if (m_config->wait_block_enable && m_n_active_cta == 0 &&
+        (m_missing_wait_holds_total != m_missing_wait_releases_total ||
+         m_fold_parks_total != m_fold_releases_total)) {
+      std::cerr << "[WAITBLOCK][abort][SM" << m_sm_id << "] cyc="
+                << get_current_gpu_cycle()
+                << " reason=terminal-hold-release-imbalance"
+                << " missing_holds=" << m_missing_wait_holds_total
+                << " missing_releases=" << m_missing_wait_releases_total
+                << " poll_holds=" << m_fold_parks_total
+                << " poll_releases=" << m_fold_releases_total
+                << " action=abort" << std::endl;
+      abort();
+    }
     shader_CTA_count_unlog(m_sm_id, 1);
 
     SHADER_DPRINTF(
@@ -2274,9 +2329,9 @@ bool SM::warp_waiting_at_barrier(unsigned warp_id) const {
   if (!pending_wait.valid) {
     return false;
   }
-  // Pure peek: report park state, do NOT clear here. The clear + "wait released"
-  // accounting and the fold cursor skip happen exactly once on the issue
-  // path in service_fold_release(), never from this query (which is called
+  // Pure peek: report hold state, do NOT clear here. The clear + "wait released"
+  // accounting and any captured-poll cursor skip happen exactly once on the
+  // issue path in service_wait_block_release(), never from this query
   // from a std::sort comparator). See design doc 6.5.1.
   return !is_sync_wait_satisfied(pending_wait);
 }
@@ -2284,7 +2339,7 @@ bool SM::warp_waiting_at_barrier(unsigned warp_id) const {
 // Non-mutating alias used off the issue path (comparator, stall scans). Same
 // value as warp_waiting_at_barrier; kept as a distinct name so callers document
 // that they must not rely on any side effect.
-bool SM::warp_parked_on_mbarrier_spin(unsigned warp_id) const {
+bool SM::warp_held_on_mbarrier_wait(unsigned warp_id) const {
   return warp_waiting_at_barrier(warp_id);
 }
 
@@ -2307,225 +2362,317 @@ unsigned SM::fold_cursor_skip_to_exit(unsigned warp_id,
   // body_pcs deliberately excludes the loopback BRA; add it so the guard lets
   // the cursor advance over the loop-closing branch on its way to exit_pc.
   allowed_skip_pcs.insert(static_cast<address_type>(region.loopback_bra_pc));
-  return tw->skip_spin_to_exit(static_cast<address_type>(region.exit_pc),
-                               allowed_skip_pcs, &out_stats);
+  return tw->skip_spin_to_exit(
+      static_cast<address_type>(region.exit_pc),
+      static_cast<address_type>(region.loopback_bra_pc), allowed_skip_pcs,
+      &out_stats);
 }
 
-void SM::service_fold_release(unsigned warp_id) {
-  if (!m_config->spin_wait_fold_enable ||
+void SM::service_wait_block_release(unsigned warp_id) {
+  if (!m_config->wait_block_enable ||
       warp_id >= m_pending_sync_waits.size()) {
     return;
   }
   HopperMBarrierPendingWait &pending_wait = m_pending_sync_waits[warp_id];
-  if (!pending_wait.valid || !pending_wait.fold_needs_skip) {
+  if (!pending_wait.valid) {
     return;
   }
-  // [Gen audit] Release/park/poison is decided on the ABSOLUTE generation, not
-  // the 1-bit parity: parity cannot tell "my paired flip already passed"
-  // (poison) from "it has not happened yet" (keep parked). cur_gen == expected
-  // -> release; < -> keep parked; > -> the paired consumer edge already passed
-  // on a low-flip barrier. [Stage 2] The over-shoot case is an accuracy defect
-  // and is reported and ABORTED (no late-release continuation): correctness is
-  // never traded for completion. See .plan/SPIN_WAIT_SIM_MODELING.md 13.4/13.5.
-  const uint64_t cur_gen = sync_barrier_gen(pending_wait.key);
-  const uint64_t exp_gen = pending_wait.fold_expected_gen;
-  if (cur_gen > exp_gen) {
-    unsigned long long parked_cyc = 0;
-    if (warp_id < m_fold_park_start_cycle.size() &&
-        m_fold_park_start_cycle[warp_id] != 0) {
-      parked_cyc = get_current_gpu_cycle() - m_fold_park_start_cycle[warp_id];
-    }
-    uint64_t prev_flip_cycle = 0;
-    uint64_t last_flip_cycle = 0;
-    auto barrier_it = m_hopper_mbarriers.find(pending_wait.key);
-    if (barrier_it != m_hopper_mbarriers.end()) {
-      prev_flip_cycle = barrier_it->second.prev_flip_cycle;
-      last_flip_cycle = barrier_it->second.last_flip_cycle;
-    }
-    const uint64_t flip_window =
-        last_flip_cycle >= prev_flip_cycle
-            ? last_flip_cycle - prev_flip_cycle
-            : 0;
-    const uint64_t expected_flip_cycle =
-        exp_gen + 1 == cur_gen ? prev_flip_cycle : 0;
-    const uint64_t arrival_after_last_flip =
-        get_current_gpu_cycle() >= last_flip_cycle
-            ? get_current_gpu_cycle() - last_flip_cycle
-            : 0;
-    std::cerr << "[FOLDAUDIT][SM" << m_sm_id << "] cyc="
+  if (pending_wait.mode == WaitBlockPendingMode::NONE ||
+      pending_wait.block_id.empty()) {
+    std::cerr << "[WAITBLOCK][abort][SM" << m_sm_id << "] cyc="
               << get_current_gpu_cycle() << " warp=" << warp_id
-              << " role="
-              << (m_warp_is_producer[warp_id]
-                      ? "producer"
-                      : (m_warp_is_consumer[warp_id] ? "consumer" : "unknown"))
-              << " cta=" << pending_wait.key.cta_id << " global_cta="
+              << " reason=invalid-pending-hold-state" << std::endl;
+    abort();
+  }
+
+  const uint64_t now = get_current_gpu_cycle();
+  const uint64_t cur_gen = sync_barrier_gen(pending_wait.key);
+  const uint64_t exp_gen = pending_wait.expected_gen;
+  const uint64_t held_cycles = now - pending_wait.hold_start_cycle;
+  const std::string &block = pending_wait.block_id;
+  std::ostringstream barrier_detail_stream;
+  auto barrier_it = m_hopper_mbarriers.find(pending_wait.key);
+  if (barrier_it == m_hopper_mbarriers.end()) {
+    barrier_detail_stream << " barrier_state=unseen";
+  } else {
+    const HopperMBarrierObject &barrier = barrier_it->second;
+    barrier_detail_stream
+        << " barrier_state=present phase=" << barrier.phase
+        << " arrive=" << barrier.arrive_count << "/"
+        << barrier.expected_arrive_count << " tx="
+        << barrier.completed_tx_bytes << "/" << barrier.expected_tx_bytes
+        << " prev_flip_cycle=" << barrier.prev_flip_cycle
+        << " last_flip_cycle=" << barrier.last_flip_cycle;
+  }
+  const std::string barrier_detail = barrier_detail_stream.str();
+
+  if (cur_gen > exp_gen) {
+    m_wait_block_generation_overshoots_total++;
+    std::cerr << "[WAITBLOCK][abort][SM" << m_sm_id << "] cyc=" << now
+              << " reason=generation-overshoot"
+              << " strategy=" << wait_block_mode_to_string(pending_wait.mode)
+              << " block=" << block
+              << " trace_kernel=" << pending_wait.key.trace_kernel_id
+              << " function=" << pending_wait.unique_function_id
+              << " cta=" << pending_wait.key.cta_id
+              << " global_cta="
               << m_local_to_global_cta_id[pending_wait.key.cta_id]
+              << " warp=" << warp_id << " action_pc=0x"
+              << format_hex_u64(pending_wait.action_pc)
               << " barrier=0x"
               << format_hex_u64(pending_wait.key.barrier_addr)
-              << " wait_pc=0x" << format_hex_u64(pending_wait.fold_wait_pc)
-              << " exit_pc=0x" << format_hex_u64(pending_wait.fold_exit_pc)
-              << " expected_gen=" << exp_gen << " barrier_gen=" << cur_gen
-              << " expected_flip_cyc=" << expected_flip_cycle
-              << " prev_flip_gen=" << (cur_gen ? cur_gen - 1 : 0)
-              << " prev_flip_cyc=" << prev_flip_cycle
-              << " current_flip_gen=" << cur_gen
-              << " current_flip_cyc=" << last_flip_cycle
-              << " flip_window_cyc=" << flip_window
-              << " arrival_after_current_flip_cyc="
-              << arrival_after_last_flip << " parked_cyc=" << parked_cyc
-              << " action=abort"
-              << " : paired consumer flip already passed (double-flip). The"
-                 " folded producer reached this wait too late; this is a"
-                 " simulator-accuracy/pacing defect. Aborting (never"
-                 " force-release). See .plan/SPIN_WAIT_SIM_MODELING.md 13/14."
-              << std::endl;
-    m_fold_watchdog_hits++;
+              << " expected_gen=" << exp_gen << " current_gen=" << cur_gen
+              << " held_cycles=" << held_cycles
+              << barrier_detail
+              << " action=abort" << std::endl;
     abort();
   }
+
   if (cur_gen < exp_gen) {
-    // Paired flip has not happened yet — keep parked. Watchdog: a park that lasts
-    // far longer than any legitimate one is itself a model gap (the HW trace
-    // guarantees the loop exits), so surface it loudly rather than hang for 12h.
-    if (warp_id < m_fold_park_start_cycle.size() &&
-        m_fold_park_start_cycle[warp_id] != 0) {
-      unsigned long long threshold =
-          m_spin_wait_watchdog_threshold ? m_spin_wait_watchdog_threshold
-                                         : 32000ULL;
-      unsigned long long parked =
-          get_current_gpu_cycle() - m_fold_park_start_cycle[warp_id];
-      if (parked > threshold) {
-        uint64_t prev_flip_cycle = 0;
-        uint64_t last_flip_cycle = 0;
-        auto barrier_it = m_hopper_mbarriers.find(pending_wait.key);
-        if (barrier_it != m_hopper_mbarriers.end()) {
-          prev_flip_cycle = barrier_it->second.prev_flip_cycle;
-          last_flip_cycle = barrier_it->second.last_flip_cycle;
-        }
-        std::cerr << "[FOLDAUDIT][SM" << m_sm_id << "] cyc="
-                  << get_current_gpu_cycle() << " warp=" << warp_id
-                  << " role="
-                  << (m_warp_is_producer[warp_id]
-                          ? "producer"
-                          : (m_warp_is_consumer[warp_id] ? "consumer"
-                                                        : "unknown"))
-                  << " cta=" << pending_wait.key.cta_id << " global_cta="
-                  << m_local_to_global_cta_id[pending_wait.key.cta_id]
-                  << " barrier=0x"
-                  << format_hex_u64(pending_wait.key.barrier_addr)
-                  << " wait_pc=0x"
-                  << format_hex_u64(pending_wait.fold_wait_pc)
-                  << " exit_pc=0x" << format_hex_u64(pending_wait.fold_exit_pc)
-                  << " expected_gen=" << exp_gen << " barrier_gen=" << cur_gen
-                  << " prev_flip_cyc=" << prev_flip_cycle
-                  << " current_flip_cyc=" << last_flip_cycle
-                  << " parked_cyc=" << parked << " threshold=" << threshold
-                  << " : paired consumer flip never arrived within the watchdog"
-                     " window — model gap (never force-release). See"
-                     " .plan/SPIN_WAIT_SIM_MODELING.md 13/14."
-                  << std::endl;
+    if (m_config->wait_block_enable &&
+        now - pending_wait.last_heartbeat_cycle >=
+            kWaitBlockHeartbeatCycles) {
+      debug_log_wait_block_event(
+          "heartbeat",
+          "strategy=" +
+              std::string(wait_block_mode_to_string(pending_wait.mode)) +
+              " block=" + block +
+              " trace_kernel=" +
+              std::to_string(pending_wait.key.trace_kernel_id) +
+              " function=" +
+              std::to_string(pending_wait.unique_function_id) +
+              " cta=" + std::to_string(pending_wait.key.cta_id) +
+              " warp=" + std::to_string(warp_id) + " action_pc=0x" +
+              format_hex_u64(pending_wait.action_pc) + " barrier=0x" +
+              format_hex_u64(pending_wait.key.barrier_addr) +
+              " expected_gen=" + std::to_string(exp_gen) +
+              " current_gen=" + std::to_string(cur_gen) +
+              " held_cycles=" + std::to_string(held_cycles) +
+              barrier_detail);
+      pending_wait.last_heartbeat_cycle = now;
+    }
+    const uint64_t threshold = kWaitBlockHoldWatchdogCycles;
+    if (held_cycles > threshold) {
+      m_wait_block_watchdog_aborts_total++;
+      if (pending_wait.mode == WaitBlockPendingMode::CAPTURED_POLL_HOLD) {
         m_fold_watchdog_hits++;
-        abort();
       }
+      std::cerr << "[WAITBLOCK][abort][SM" << m_sm_id << "] cyc=" << now
+                << " reason=hold-watchdog"
+                << " strategy=" << wait_block_mode_to_string(pending_wait.mode)
+                << " block=" << block
+                << " trace_kernel=" << pending_wait.key.trace_kernel_id
+                << " function=" << pending_wait.unique_function_id
+                << " cta=" << pending_wait.key.cta_id
+                << " global_cta="
+                << m_local_to_global_cta_id[pending_wait.key.cta_id]
+                << " warp=" << warp_id << " action_pc=0x"
+                << format_hex_u64(pending_wait.action_pc)
+                << " barrier=0x"
+                << format_hex_u64(pending_wait.key.barrier_addr)
+                << " wait_state=0x"
+                << format_hex_u64(pending_wait.wait_state_raw)
+                << " expected_gen=" << exp_gen
+                << " current_gen=" << cur_gen
+                << " held_cycles=" << held_cycles
+                << " threshold=" << threshold << barrier_detail
+                << " action=abort"
+                << std::endl;
+      abort();
     }
     return;
   }
-  // cur_gen == exp_gen: on-time edge -> release + fold. Advance the trace cursor
-  // to the loop exit via the shared cursor-skip helper so subsequent waits keep
-  // folding. The region carries body_pcs for the skip guard; it must still be
-  // foldable at release time (the same lookup that armed the park).
-  SpinWaitRegionRecord region;
-  if (!m_gpu->lookup_spin_wait_region(pending_wait.fold_uid,
-                                      pending_wait.fold_wait_pc, region) ||
-      !region.foldable) {
-    std::cerr << "[FOLDAUDIT][SM" << m_sm_id << "] cyc="
-              << get_current_gpu_cycle() << " warp=" << warp_id
-              << " wait_pc=0x" << format_hex_u64(pending_wait.fold_wait_pc)
-              << " : parked fold wait no longer resolves to a foldable region at"
-                 " release — sidecar/runtime drift. Aborting."
-              << std::endl;
+
+  if (!is_sync_wait_satisfied(pending_wait)) {
+    std::cerr << "[WAITBLOCK][abort][SM" << m_sm_id << "] cyc=" << now
+              << " reason=generation-ready-state-mismatch"
+              << " strategy=" << wait_block_mode_to_string(pending_wait.mode)
+              << " block=" << block << " warp=" << warp_id
+              << " expected_gen=" << exp_gen << " current_gen=" << cur_gen
+              << " wait_state=0x"
+              << format_hex_u64(pending_wait.wait_state_raw)
+              << " action=abort" << std::endl;
     abort();
   }
-  const uint64_t exit_pc = pending_wait.fold_exit_pc;
+
+  m_sync_debug_wait_released++;
+  if (pending_wait.mode == WaitBlockPendingMode::MISSING_WAIT_HOLD) {
+    m_missing_wait_releases_total++;
+    debug_log_wait_block_event(
+        "missing-wait-release",
+        "block=" + block +
+            " trace_kernel=" +
+            std::to_string(pending_wait.key.trace_kernel_id) +
+            " function=" + std::to_string(pending_wait.unique_function_id) +
+            " cta=" + std::to_string(pending_wait.key.cta_id) +
+            " warp=" + std::to_string(warp_id) + " entry_pc=0x" +
+            format_hex_u64(pending_wait.action_pc) + " barrier=0x" +
+            format_hex_u64(pending_wait.key.barrier_addr) +
+            " expected_gen=" + std::to_string(exp_gen) +
+            " current_gen=" + std::to_string(cur_gen) +
+            " held_cycles=" + std::to_string(held_cycles) +
+            " cursor_action=none");
+    pending_wait = HopperMBarrierPendingWait();
+    return;
+  }
+
+  if (pending_wait.mode != WaitBlockPendingMode::CAPTURED_POLL_HOLD) {
+    std::cerr << "[WAITBLOCK][abort][SM" << m_sm_id << "] cyc=" << now
+              << " reason=unknown-pending-mode warp=" << warp_id
+              << " action=abort" << std::endl;
+    abort();
+  }
+
+  SpinWaitRegionRecord region;
+  if (!m_gpu->lookup_spin_wait_region(
+          pending_wait.key.trace_kernel_id, pending_wait.unique_function_id,
+          pending_wait.action_pc, region) ||
+      !region.foldable || region.exit_pc != pending_wait.poll_loop_exit_pc ||
+      (m_config->wait_block_enable &&
+       region.block_id != pending_wait.block_id)) {
+    std::cerr << "[WAITBLOCK][abort][SM" << m_sm_id << "] cyc=" << now
+              << " reason=captured-poll-sidecar-runtime-drift"
+              << " block=" << block << " warp=" << warp_id
+              << " poll_pc=0x" << format_hex_u64(pending_wait.action_pc)
+              << " expected_exit_pc=0x"
+              << format_hex_u64(pending_wait.poll_loop_exit_pc)
+              << " action=abort" << std::endl;
+    abort();
+  }
+
+  trace_shd_warp_t *tw =
+      static_cast<trace_shd_warp_t *>(m_physical_warp[warp_id]);
+  const unsigned int used_before = tw->used_insts;
   FoldSkipStats skip_stats;
   const unsigned skipped =
       fold_cursor_skip_to_exit(warp_id, region, skip_stats);
-
-  // [gen audit v3] expected_gen is pinned at park time from the live barrier gen
-  // (cur_gen+1). It is no longer derived from a per-(warp,barrier) consumed
-  // history, so there is nothing to commit back here — gen advances only on real
-  // flips and each wait re-pins from the current gen at its own park. Release is
-  // reached only when cur_gen == exp_gen (see the checks above).
-  m_sync_debug_wait_released++;
-  // SM-global validation counters + actual park duration (compared against the
-  // observe run's would-be park to confirm the model matches expectation).
-  unsigned long long parked_cyc = 0;
-  if (warp_id < m_fold_park_start_cycle.size() &&
-      m_fold_park_start_cycle[warp_id] != 0) {
-    parked_cyc = get_current_gpu_cycle() - m_fold_park_start_cycle[warp_id];
-    m_fold_park_start_cycle[warp_id] = 0;
+  const unsigned int used_after = tw->used_insts;
+  if (tw->get_pc() != region.exit_pc || used_after - used_before != skipped) {
+    std::cerr << "[WAITBLOCK][abort][SM" << m_sm_id << "] cyc=" << now
+              << " reason=poll-landing-audit"
+              << " block=" << block << " warp=" << warp_id
+              << " expected_exit_pc=0x" << format_hex_u64(region.exit_pc)
+              << " actual_landing_pc=0x" << format_hex_u64(tw->get_pc())
+              << " used_before=" << used_before
+              << " used_after=" << used_after << " skipped=" << skipped
+              << " action=abort" << std::endl;
+    abort();
   }
+
   if (m_fold_pace_by_warp.size() <= warp_id) {
     m_fold_pace_by_warp.resize(MAX_WARP_PER_SHADER);
   }
   FoldPaceStats &pace =
       m_fold_pace_by_warp[warp_id]
                          [FoldPaceKey(pending_wait.key,
-                                      pending_wait.fold_wait_pc)];
+                                      pending_wait.action_pc)];
   pace.releases++;
-  pace.park_cycles_total += parked_cyc;
-  if (parked_cyc > pace.park_cycles_max) {
-    pace.park_cycles_max = parked_cyc;
+  pace.park_cycles_total += held_cycles;
+  if (held_cycles > pace.park_cycles_max) {
+    pace.park_cycles_max = held_cycles;
   }
-  pace.last_end_cycle = get_current_gpu_cycle();
+  pace.last_end_cycle = now;
   pace.last_expected_gen = exp_gen;
   pace.last_barrier_gen = cur_gen;
   m_fold_releases_total++;
   m_fold_skipped_insts_total += skipped;
-  m_fold_park_cycles_total += parked_cyc;
-  if (parked_cyc > m_fold_park_cycles_max) {
-    m_fold_park_cycles_max = parked_cyc;
+  m_fold_park_cycles_total += held_cycles;
+  if (held_cycles > m_fold_park_cycles_max) {
+    m_fold_park_cycles_max = held_cycles;
   }
-  if (m_config->spin_wait_fold_debug) {
-    trace_shd_warp_t *tw =
-        static_cast<trace_shd_warp_t *>(m_physical_warp[warp_id]);
-    debug_log_fold_event(
-        "release+skip warp=" + std::to_string(warp_id) + " cta=" +
-        std::to_string(pending_wait.key.cta_id) + " barrier=0x" +
-        format_hex_u64(pending_wait.key.barrier_addr) + " wait_pc=0x" +
-        format_hex_u64(pending_wait.fold_wait_pc) + " exit_pc=0x" +
-        format_hex_u64(exit_pc) + " skipped=" + std::to_string(skipped) +
-        " expected_gen=" + std::to_string(exp_gen) +
-        " barrier_gen=" + std::to_string(cur_gen) +
-        " landing_pc=0x" + format_hex_u64(tw->get_pc()) +
-        " parked_cyc=" + std::to_string(parked_cyc));
+
+  std::ostringstream per_pc;
+  bool first_pc = true;
+  for (const auto &entry : skip_stats.pc_occurrences) {
+    if (!first_pc) {
+      per_pc << ",";
+    }
+    first_pc = false;
+    per_pc << "0x" << format_hex_u64(entry.first) << ":" << entry.second;
   }
+  debug_log_wait_block_event(
+      "poll-advance",
+      "block=" + block +
+          " trace_kernel=" +
+          std::to_string(pending_wait.key.trace_kernel_id) +
+          " function=" + std::to_string(pending_wait.unique_function_id) +
+          " cta=" + std::to_string(pending_wait.key.cta_id) +
+          " warp=" + std::to_string(warp_id) + " poll_pc=0x" +
+          format_hex_u64(pending_wait.action_pc) +
+          " used_before=" + std::to_string(used_before) +
+          " used_after=" + std::to_string(used_after) +
+          " skipped=" + std::to_string(skipped) +
+          " per_pc=" + (first_pc ? std::string("<none>") : per_pc.str()) +
+          " phasechk_trywait=" +
+          std::to_string(skip_stats.phasechk_trywait) +
+          " nanosleep=" + std::to_string(skip_stats.nanosleep) +
+          " imad_scratch=" + std::to_string(skip_stats.imad_scratch) +
+          " loopback_bra=" + std::to_string(skip_stats.loopback_bra) +
+          " other=" + std::to_string(skip_stats.other) +
+          " expected_exit_pc=0x" + format_hex_u64(region.exit_pc) +
+          " actual_landing_pc=0x" + format_hex_u64(tw->get_pc()));
+  debug_log_wait_block_event(
+      "poll-release",
+      "block=" + block +
+          " trace_kernel=" +
+          std::to_string(pending_wait.key.trace_kernel_id) +
+          " function=" + std::to_string(pending_wait.unique_function_id) +
+          " cta=" + std::to_string(pending_wait.key.cta_id) +
+          " warp=" + std::to_string(warp_id) + " poll_pc=0x" +
+          format_hex_u64(pending_wait.action_pc) + " exit_pc=0x" +
+          format_hex_u64(region.exit_pc) +
+          " expected_gen=" + std::to_string(exp_gen) +
+          " current_gen=" + std::to_string(cur_gen) +
+          " held_cycles=" + std::to_string(held_cycles));
   pending_wait = HopperMBarrierPendingWait();
 }
 
-void SM::print_spin_wait_fold_summary() const {
-  if (!m_config->spin_wait_fold_enable) {
+void SM::print_wait_block_summary() const {
+  if (!m_config->wait_block_enable) {
     return;
   }
-  const double avg = m_fold_releases_total
-                         ? (double)m_fold_park_cycles_total /
-                               m_fold_releases_total
-                         : 0.0;
-  // At a clean diagnostic exit:
-  // parks_total == releases_total at a clean exit. late_releases is a diagnostic
-  // subset of releases whose expected edge had already passed. [Stage 1.1]
-  // immediate_folds are the ready-at-issue collapses (no park); total_folds =
-  // releases + immediate_folds; immediate_skipped_insts <= skipped_insts.
-  fprintf(stdout,
-          "[FOLDSUM] sm=%u parks=%llu releases=%llu immediate_folds=%llu "
-          "total_folds=%llu skipped_insts=%llu immediate_skipped_insts=%llu "
-          "late_releases=%llu avg_park=%.1f max_park=%llu "
-          "watchdog_hits=%llu\n",
-          m_sm_id, m_fold_parks_total, m_fold_releases_total,
-          m_fold_immediate_folds_total,
-          m_fold_releases_total + m_fold_immediate_folds_total,
-          m_fold_skipped_insts_total, m_fold_immediate_skipped_insts_total,
-          m_fold_late_releases_total, avg, m_fold_park_cycles_max,
-          m_fold_watchdog_hits);
+  unsigned long long active_holds = 0;
+  for (const HopperMBarrierPendingWait &pending : m_pending_sync_waits) {
+    if (pending.valid) {
+      active_holds++;
+    }
+  }
+  const bool balanced =
+      active_holds == 0 &&
+      m_missing_wait_holds_total == m_missing_wait_releases_total &&
+      m_fold_parks_total == m_fold_releases_total;
+  const double captured_poll_avg_hold =
+      m_fold_releases_total
+          ? static_cast<double>(m_fold_park_cycles_total) /
+                m_fold_releases_total
+          : 0.0;
+  fprintf(
+      stdout,
+      "[WAITBLOCK][summary] status=%s sm=%u missing_wait_ready=%llu "
+      "missing_wait_holds=%llu missing_wait_releases=%llu "
+      "partial_missing_wait_model_misses=%llu "
+      "captured_poll_immediate_folds=%llu captured_poll_holds=%llu "
+      "captured_poll_releases=%llu "
+      "captured_poll_advanced_occurrences=%llu "
+      "captured_poll_immediate_advanced_occurrences=%llu "
+      "captured_poll_hold_cycles_total=%llu "
+      "captured_poll_hold_cycles_avg=%.1f captured_poll_hold_cycles_max=%llu "
+      "captured_poll_watchdog_aborts=%llu active_holds=%llu "
+      "generation_overshoots=%llu watchdog_aborts=%llu\n",
+      balanced ? "PASS" : "ACTIVE", m_sm_id, m_missing_wait_ready_total,
+      m_missing_wait_holds_total,
+      m_missing_wait_releases_total, m_partial_missing_wait_misses_total,
+      m_fold_immediate_folds_total, m_fold_parks_total,
+      m_fold_releases_total, m_fold_skipped_insts_total,
+      m_fold_immediate_skipped_insts_total, m_fold_park_cycles_total,
+      captured_poll_avg_hold, m_fold_park_cycles_max, m_fold_watchdog_hits,
+      active_holds,
+      m_wait_block_generation_overshoots_total,
+      m_wait_block_watchdog_aborts_total);
+
+  if (!m_config->wait_block_debug) {
+    return;
+  }
   for (unsigned warp_id = 0; warp_id < m_fold_pace_by_warp.size();
        ++warp_id) {
     const char *role =
@@ -2539,27 +2686,28 @@ void SM::print_spin_wait_fold_summary() const {
       const HopperMBarrierKey &barrier = entry.first.first;
       const uint64_t wait_pc = entry.first.second;
       const FoldPaceStats &pace = entry.second;
-      const unsigned long long completed = pace.releases;
-      const double pace_avg =
-          completed ? (double)pace.park_cycles_total / completed : 0.0;
-      fprintf(stdout,
-              "[FOLDPACE] sm=%u warp=%u role=%s trace_kernel=%u cta=%u "
-              "global_cta=%u "
-              "barrier=0x%s wait_pc=0x%s parks=%llu releases=%llu "
-              "immediate_folds=%llu immediate_skipped_insts=%llu "
-              "late_releases=%llu total_park=%llu avg_park=%.1f "
-              "max_park=%llu first_park_cyc=%llu last_end_cyc=%llu "
-              "last_expected_gen=%llu last_barrier_gen=%llu\n",
-              m_sm_id, warp_id, role, barrier.trace_kernel_id,
-              barrier.cta_id, m_local_to_global_cta_id[barrier.cta_id],
-              format_hex_u64(barrier.barrier_addr).c_str(),
-              format_hex_u64(wait_pc).c_str(), pace.parks, pace.releases,
-              pace.immediate_folds, pace.immediate_skipped_insts,
-              pace.late_releases, pace.park_cycles_total, pace_avg,
-              pace.park_cycles_max, pace.first_park_cycle,
-              pace.last_end_cycle,
-              (unsigned long long)pace.last_expected_gen,
-              (unsigned long long)pace.last_barrier_gen);
+      const double avg_hold =
+          pace.releases
+              ? static_cast<double>(pace.park_cycles_total) / pace.releases
+              : 0.0;
+      fprintf(
+          stdout,
+          "[WAITBLOCK][poll-pace] sm=%u warp=%u role=%s trace_kernel=%u "
+          "cta=%u global_cta=%u barrier=0x%s poll_pc=0x%s "
+          "holds=%llu releases=%llu immediate_folds=%llu "
+          "immediate_advanced_occurrences=%llu total_hold_cycles=%llu "
+          "avg_hold_cycles=%.1f max_hold_cycles=%llu "
+          "first_hold_cycle=%llu last_end_cycle=%llu "
+          "last_expected_gen=%llu last_barrier_gen=%llu\n",
+          m_sm_id, warp_id, role, barrier.trace_kernel_id, barrier.cta_id,
+          m_local_to_global_cta_id[barrier.cta_id],
+          format_hex_u64(barrier.barrier_addr).c_str(),
+          format_hex_u64(wait_pc).c_str(), pace.parks, pace.releases,
+          pace.immediate_folds, pace.immediate_skipped_insts,
+          pace.park_cycles_total, avg_hold, pace.park_cycles_max,
+          pace.first_park_cycle, pace.last_end_cycle,
+          static_cast<unsigned long long>(pace.last_expected_gen),
+          static_cast<unsigned long long>(pace.last_barrier_gen));
     }
   }
 }
@@ -2639,9 +2787,9 @@ uint64_t SM::sync_barrier_gen(const HopperMBarrierKey &key) const {
   return it == m_hopper_mbarriers.end() ? 0 : it->second.gen;
 }
 
-uint64_t SM::fold_expected_gen_for_wait(unsigned int warp_id,
-                                            const HopperMBarrierKey &key,
-                                            uint64_t wait_state_raw) const {
+uint64_t SM::expected_gen_for_wait(unsigned int warp_id,
+                                   const HopperMBarrierKey &key,
+                                   uint64_t wait_state_raw) const {
   // [gen audit v3] Pin the generation this wait pairs with from the CURRENT
   // barrier state at first observation — NOT from a per-(warp,barrier) consumed
   // history. gen advances only on a real flip and is independent of expected.
@@ -2652,20 +2800,52 @@ uint64_t SM::fold_expected_gen_for_wait(unsigned int warp_id,
   //
   // Rationale: the old "last_consumed + 1" forced every satisfied wait onto a
   // strictly newer gen, which double-counted a single flip observed by several
-  // waits sharing one runtime barrier address (K5 0x16c20 false cur_gen<expected)
-  // and could over/under-count on shared barriers (K5 0x16c60). Anchoring to the
-  // live barrier gen makes immediate and parked waits use one identical rule and
-  // removes both false-audit directions while still catching a genuine
-  // double-flip: a parked wait pins expected=cur_gen+1 and, if the barrier
+  // waits sharing one runtime barrier address and could over/under-count on
+  // shared barriers. Anchoring to the live barrier gen makes immediate and held
+  // waits use one identical rule and removes both false-audit directions while
+  // still catching a genuine double-flip: a held wait pins expected=cur_gen+1
+  // and, if the barrier
   // over-flips past it, release sees cur_gen > expected and aborts.
   (void)warp_id;
+  auto barrier_it = m_hopper_mbarriers.find(key);
+  if (barrier_it == m_hopper_mbarriers.end()) {
+    // An unseen barrier is modeled not-ready by is_sync_wait_satisfied().
+    // Pair such a hold with its first real flip instead of treating gen=0
+    // parity as a completed wait on an object that does not yet exist.
+    return 1;
+  }
   const unsigned parity = decode_sync_wait_phase(wait_state_raw);
-  const uint64_t cur_gen = sync_barrier_gen(key);
+  const uint64_t cur_gen = barrier_it->second.gen;
   return cur_gen + (((cur_gen & 1ULL) == (uint64_t)parity) ? 1ULL : 0ULL);
 }
 
 void SM::handle_sync_instruction(warp_inst_t &inst, unsigned int warp_id) {
   if (!inst.sync_site_valid || !inst.sync_runtime_valid) {
+    if (m_config->wait_block_enable) {
+      MissingWaitRecord missing_record;
+      SpinWaitRegionRecord poll_record;
+      const bool is_runtime_action =
+          m_gpu->lookup_missing_wait(inst.trace_kernel_id,
+                                     inst.unique_function_id, inst.pc,
+                                     missing_record) ||
+          m_gpu->lookup_spin_wait_region(inst.trace_kernel_id,
+                                         inst.unique_function_id, inst.pc,
+                                         poll_record);
+      if (is_runtime_action) {
+        std::cerr << "[WAITBLOCK][abort][SM" << m_sm_id << "] cyc="
+                  << get_current_gpu_cycle()
+                  << " reason=runtime-action-payload-missing"
+                  << " trace_kernel=" << inst.trace_kernel_id
+                  << " function=" << inst.unique_function_id
+                  << " cta=" << m_physical_warp[warp_id]->get_cta_id()
+                  << " warp=" << warp_id << " action_pc=0x"
+                  << format_hex_u64(inst.pc)
+                  << " sync_site_valid=" << inst.sync_site_valid
+                  << " sync_runtime_valid=" << inst.sync_runtime_valid
+                  << " action=abort" << std::endl;
+        abort();
+      }
+    }
     m_sync_debug_missing_runtime++;
     if (m_sync_debug_skip_runtime_budget > 0) {
       const std::string opcode =
@@ -2688,14 +2868,78 @@ void SM::handle_sync_instruction(warp_inst_t &inst, unsigned int warp_id) {
 
   m_sync_debug_sync_insts++;
   HopperMBarrierKey key = build_sync_barrier_key(inst, warp_id);
-  if (inst.sync_kind == SyncInstructionKind::PHASECHK ||
-      inst.sync_kind == SyncInstructionKind::TRYWAIT) {
+  MissingWaitRecord missing_record;
+  const bool has_missing_action = m_gpu->lookup_missing_wait(
+      inst.trace_kernel_id, inst.unique_function_id, inst.pc, missing_record);
+  SpinWaitRegionRecord poll_region;
+  const bool has_poll_record = m_gpu->lookup_spin_wait_region(
+      inst.trace_kernel_id, inst.unique_function_id, inst.pc, poll_region);
+  const bool has_poll_action = has_poll_record && poll_region.foldable;
+  if (has_missing_action && has_poll_action) {
+    std::cerr << "[WAITBLOCK][abort][SM" << m_sm_id << "] cyc="
+              << get_current_gpu_cycle()
+              << " reason=conflicting-runtime-actions"
+              << " trace_kernel=" << inst.trace_kernel_id
+              << " function=" << inst.unique_function_id
+              << " pc=0x" << format_hex_u64(inst.pc)
+              << " action=abort" << std::endl;
+    abort();
+  }
+  const bool is_wait_probe =
+      inst.sync_kind == SyncInstructionKind::PHASECHK ||
+      inst.sync_kind == SyncInstructionKind::TRYWAIT;
+  if ((has_missing_action || has_poll_action) && !is_wait_probe) {
+    std::cerr << "[WAITBLOCK][abort][SM" << m_sm_id << "] cyc="
+              << get_current_gpu_cycle()
+              << " reason=runtime-action-kind-mismatch"
+              << " trace_kernel=" << inst.trace_kernel_id
+              << " function=" << inst.unique_function_id
+              << " pc=0x" << format_hex_u64(inst.pc)
+              << " runtime_kind=" << sync_kind_to_string(inst.sync_kind)
+              << " action=abort" << std::endl;
+    abort();
+  }
+  if (is_wait_probe) {
     if (warp_id < m_pending_sync_waits.size()) {
-      const bool is_trywait =
-          inst.sync_kind == SyncInstructionKind::TRYWAIT;
-      const bool wait_ready = is_sync_wait_satisfied(
-          HopperMBarrierPendingWait{true, is_trywait, key,
-                                    inst.sync_semantic_raw});
+      if (m_pending_sync_waits[warp_id].valid) {
+        std::cerr << "[WAITBLOCK][abort][SM" << m_sm_id << "] cyc="
+                  << get_current_gpu_cycle()
+                  << " reason=held-warp-issued-another-sync"
+                  << " trace_kernel=" << inst.trace_kernel_id
+                  << " function=" << inst.unique_function_id
+                  << " cta=" << key.cta_id << " warp=" << warp_id
+                  << " pc=0x" << format_hex_u64(inst.pc)
+                  << " action=abort" << std::endl;
+        abort();
+      }
+      const bool is_trywait = inst.sync_kind == SyncInstructionKind::TRYWAIT;
+      HopperMBarrierPendingWait probe;
+      probe.valid = true;
+      probe.is_trywait = is_trywait;
+      probe.key = key;
+      probe.wait_state_raw = inst.sync_semantic_raw;
+      const bool wait_ready = is_sync_wait_satisfied(probe);
+
+      if ((has_missing_action &&
+           (missing_record.entry_probe_pc != inst.pc ||
+            missing_record.entry_probe_kind != inst.sync_kind ||
+            !missing_record.partial_modeled_miss_aborts ||
+            !inst.sync_has_semantic_raw || !inst.trace_masks_valid)) ||
+          (has_poll_action &&
+           (poll_region.primary_wait_pc != inst.pc ||
+            poll_region.primary_wait_kind != inst.sync_kind ||
+            !poll_region.foldable || !inst.sync_has_semantic_raw))) {
+        std::cerr << "[WAITBLOCK][abort][SM" << m_sm_id << "] cyc="
+                  << get_current_gpu_cycle()
+                  << " reason=action-kind-or-proof-mismatch"
+                  << " trace_kernel=" << inst.trace_kernel_id
+                  << " function=" << inst.unique_function_id
+                  << " pc=0x" << format_hex_u64(inst.pc)
+                  << " runtime_kind=" << sync_kind_to_string(inst.sync_kind)
+                  << " action=abort" << std::endl;
+        abort();
+      }
+
       if (m_config->producer_tail_instrument_enable) {
         record_producer_tail_phasechk_result(warp_id, wait_ready);
       }
@@ -2704,81 +2948,107 @@ void SM::handle_sync_instruction(warp_inst_t &inst, unsigned int warp_id) {
       }
       // [Spin-wait observe] observe-only would-be-park measurement: only for
       // polls that are the primary_wait_pc of a detected foldable spin loop.
-      if (m_config->spin_wait_observe_enable) {
-        SpinWaitRegionRecord region;
-        if (m_gpu->lookup_spin_wait_region(inst.unique_function_id, inst.pc,
-                                            region) &&
-            region.semantic_free_body && region.is_spin_loop) {
-          record_spin_wait_observe(warp_id, inst.pc, key.barrier_addr,
-                                   key.cta_id, wait_ready);
-        }
+      if (m_config->spin_wait_observe_enable && has_poll_record &&
+          poll_region.semantic_free_body && poll_region.is_spin_loop) {
+        record_spin_wait_observe(warp_id, inst.pc, key.barrier_addr, key.cta_id,
+                                 wait_ready);
       }
+
       if (wait_ready) {
         m_sync_debug_wait_released++;
-        // [Stage 1] Immediate-ready fold. The primary poll has just been issued
-        // and functionally executed by issue_warp(); this branch collapses the
-        // REMAINING capture-time loop occurrences by fast-forwarding the trace
-        // cursor to the region exit_pc, exactly like the parked-release path.
-        // Without this the residual polls replay until the next barrier flip and
-        // can false-park/deadlock on the following generation (K5 SM29). Only the
-        // primary_wait_pc of a foldable region takes this path. See plan Stage 1.
-        //
-        // [gen audit v3] The wait is ready-at-issue, so by the pinned rule
-        // (fold_expected_gen_for_wait) expected_gen == cur_gen by construction:
-        // an immediate hit observes the live flip it pairs with. There is no
-        // cur_gen<expected double-count anymore, and no m_fold_last_gen history
-        // to advance. A cur_gen>expected "missed edge" cannot occur on the
-        // immediate path (that only arises for a PARKED wait whose pinned edge
-        // is later over-flipped); genuine double-flips are caught in
-        // service_fold_release. So the immediate path just folds.
-        if (m_config->spin_wait_fold_enable) {
-          SpinWaitRegionRecord region;
-          if (m_gpu->lookup_spin_wait_region(inst.unique_function_id, inst.pc,
-                                             region) &&
-              region.foldable) {
-            // Fold path must not silently tolerate sidecar/runtime drift.
-            assert(region.primary_wait_pc == inst.pc);
-            assert(region.primary_wait_kind == inst.sync_kind);
-            const uint64_t expected_gen = fold_expected_gen_for_wait(
-                warp_id, key, inst.sync_semantic_raw);
-            const uint64_t cur_gen = sync_barrier_gen(key);
-            // Collapse residual occurrences via the shared cursor-skip helper.
-            FoldSkipStats skip_stats;
-            const unsigned skipped =
-                fold_cursor_skip_to_exit(warp_id, region, skip_stats);
-            // [Stage 1.1] Immediate fold accounting — NOT a park/release.
-            m_fold_immediate_folds_total++;
-            m_fold_immediate_skipped_insts_total += skipped;
-            m_fold_skipped_insts_total += skipped;
-            if (m_fold_pace_by_warp.size() <= warp_id) {
-              m_fold_pace_by_warp.resize(MAX_WARP_PER_SHADER);
+        if (has_missing_action) {
+          m_missing_wait_ready_total++;
+        }
+        if (m_config->wait_block_enable && has_poll_action) {
+          const uint64_t expected_gen =
+              expected_gen_for_wait(warp_id, key, inst.sync_semantic_raw);
+          const uint64_t cur_gen = sync_barrier_gen(key);
+          if (expected_gen != cur_gen) {
+            std::cerr << "[WAITBLOCK][abort][SM" << m_sm_id << "] cyc="
+                      << get_current_gpu_cycle()
+                      << " reason=immediate-generation-mismatch"
+                      << " block=" << poll_region.block_id
+                      << " warp=" << warp_id
+                      << " expected_gen=" << expected_gen
+                      << " current_gen=" << cur_gen
+                      << " action=abort" << std::endl;
+            abort();
+          }
+          trace_shd_warp_t *tw =
+              static_cast<trace_shd_warp_t *>(m_physical_warp[warp_id]);
+          const unsigned int used_before = tw->used_insts;
+          FoldSkipStats skip_stats;
+          const unsigned skipped =
+              fold_cursor_skip_to_exit(warp_id, poll_region, skip_stats);
+          const unsigned int used_after = tw->used_insts;
+          if (tw->get_pc() != poll_region.exit_pc ||
+              used_after - used_before != skipped) {
+            std::cerr << "[WAITBLOCK][abort][SM" << m_sm_id << "] cyc="
+                      << get_current_gpu_cycle()
+                      << " reason=immediate-poll-landing-audit"
+                      << " warp=" << warp_id << " poll_pc=0x"
+                      << format_hex_u64(inst.pc)
+                      << " expected_exit_pc=0x"
+                      << format_hex_u64(poll_region.exit_pc)
+                      << " actual_landing_pc=0x"
+                      << format_hex_u64(tw->get_pc())
+                      << " used_before=" << used_before
+                      << " used_after=" << used_after
+                      << " skipped=" << skipped << " action=abort"
+                      << std::endl;
+            abort();
+          }
+          m_fold_immediate_folds_total++;
+          m_fold_immediate_skipped_insts_total += skipped;
+          m_fold_skipped_insts_total += skipped;
+          if (m_fold_pace_by_warp.size() <= warp_id) {
+            m_fold_pace_by_warp.resize(MAX_WARP_PER_SHADER);
+          }
+          FoldPaceStats &pace =
+              m_fold_pace_by_warp[warp_id][FoldPaceKey(key, inst.pc)];
+          pace.immediate_folds++;
+          pace.immediate_skipped_insts += skipped;
+          pace.last_expected_gen = expected_gen;
+          pace.last_barrier_gen = cur_gen;
+          pace.last_end_cycle = get_current_gpu_cycle();
+          if (m_config->wait_block_enable) {
+            std::ostringstream per_pc;
+            bool first_pc = true;
+            for (const auto &entry : skip_stats.pc_occurrences) {
+              if (!first_pc) {
+                per_pc << ",";
+              }
+              first_pc = false;
+              per_pc << "0x" << format_hex_u64(entry.first) << ":"
+                     << entry.second;
             }
-            FoldPaceStats &pace =
-                m_fold_pace_by_warp[warp_id][FoldPaceKey(key, inst.pc)];
-            pace.immediate_folds++;
-            pace.immediate_skipped_insts += skipped;
-            pace.last_expected_gen = expected_gen;
-            pace.last_barrier_gen = cur_gen;
-            pace.last_end_cycle = get_current_gpu_cycle();
-            if (m_config->spin_wait_fold_debug) {
-              trace_shd_warp_t *tw =
-                  static_cast<trace_shd_warp_t *>(m_physical_warp[warp_id]);
-              debug_log_fold_event(
-                  "immediate+skip warp=" + std::to_string(warp_id) + " cta=" +
-                  std::to_string(key.cta_id) + " role=" +
-                  (m_warp_is_producer[warp_id]
-                       ? "producer"
-                       : (m_warp_is_consumer[warp_id] ? "consumer" : "unknown")) +
-                  " barrier=0x" + format_hex_u64(key.barrier_addr) +
-                  " wait_pc=0x" + format_hex_u64(inst.pc) + " exit_pc=0x" +
-                  format_hex_u64(region.exit_pc) + " expected_gen=" +
-                  std::to_string(expected_gen) + " barrier_gen=" +
-                  std::to_string(cur_gen) + " skipped=" +
-                  std::to_string(skipped) + " landing_pc=0x" +
-                  format_hex_u64(tw->get_pc()));
-            }
+            debug_log_wait_block_event(
+                "poll-advance",
+                "mode=immediate block=" + poll_region.block_id +
+                    " trace_kernel=" + std::to_string(inst.trace_kernel_id) +
+                    " function=" + std::to_string(inst.unique_function_id) +
+                    " cta=" + std::to_string(key.cta_id) +
+                    " warp=" + std::to_string(warp_id) + " poll_pc=0x" +
+                    format_hex_u64(inst.pc) +
+                    " used_before=" + std::to_string(used_before) +
+                    " used_after=" + std::to_string(used_after) +
+                    " skipped=" + std::to_string(skipped) +
+                    " per_pc=" +
+                    (first_pc ? std::string("<none>") : per_pc.str()) +
+                    " phasechk_trywait=" +
+                    std::to_string(skip_stats.phasechk_trywait) +
+                    " nanosleep=" + std::to_string(skip_stats.nanosleep) +
+                    " imad_scratch=" +
+                    std::to_string(skip_stats.imad_scratch) +
+                    " loopback_bra=" +
+                    std::to_string(skip_stats.loopback_bra) +
+                    " other=" + std::to_string(skip_stats.other) +
+                    " expected_exit_pc=0x" +
+                    format_hex_u64(poll_region.exit_pc) +
+                    " actual_landing_pc=0x" + format_hex_u64(tw->get_pc()));
           }
         }
+
         // [FWD drain-idle 축4] per-CTA mbarrier test count (released = immediate hit).
         if (m_config->cta_stall_breakdown_instrument_enable &&
             key.cta_id < MAX_CTA_PER_SHADER) {
@@ -2816,8 +3086,8 @@ void SM::handle_sync_instruction(warp_inst_t &inst, unsigned int warp_id) {
             std::to_string(inst.sync_semantic_raw) + hit_phase_state);
         m_pending_sync_waits[warp_id] = HopperMBarrierPendingWait();
       } else {
-        // PHASECHK / TRYWAIT are modeled as nonblocking predicate tests.
-        // The traced control flow performs any retry or fallback sequencing.
+        // Unselected probes remain nonblocking predicate tests. Runtime actions
+        // below create a hold only for a sidecar-owned strategy.
         m_sync_debug_wait_pending++;
         // [FWD drain-idle 축4] per-CTA mbarrier test count (pending = found not-ready).
         if (m_config->cta_stall_breakdown_instrument_enable &&
@@ -2833,73 +3103,159 @@ void SM::handle_sync_instruction(warp_inst_t &inst, unsigned int warp_id) {
             m_sync_first_miss_cycle[warp_id] = get_current_gpu_cycle();
           }
         }
-        // [Spin-wait fold] By default (feature off) PHASECHK/TRYWAIT stay
-        // nonblocking: reset the pending wait to invalid so warp_waiting_at_barrier
-        // never parks on it (the traced control flow replays the poll count). When
-        // -spin_wait_fold_enable AND this poll is the primary_wait_pc of a
-        // COLLAPSIBLE spin region, PARK instead: set valid=true and carry the exit
-        // so the release path can fast-forward the cursor. See design doc 5.1.
-        bool fold_parked = false;
-        if (m_config->spin_wait_fold_enable) {
-          SpinWaitRegionRecord region;
-          if (m_gpu->lookup_spin_wait_region(inst.unique_function_id, inst.pc,
-                                             region) &&
-              region.foldable) {
-            HopperMBarrierPendingWait parked;
-            parked.valid = true;
-            parked.is_trywait = is_trywait;
-            parked.key = key;
-            parked.wait_state_raw = inst.sync_semantic_raw;
-            parked.fold_needs_skip = true;
-            parked.fold_wait_pc = inst.pc;
-            parked.fold_exit_pc = region.exit_pc;
-            parked.fold_uid = inst.unique_function_id;
-            // [gen audit v3] Pin the generation this wait pairs with from the
-            // LIVE barrier gen at park time: not-ready here means phase==parity,
-            // so fold_expected_gen_for_wait returns cur_gen+1 (the next flip).
-            // Computed once on the first poll that parks; a re-poll of an
-            // already-parked warp keeps the existing pending wait untouched. No
-            // per-(warp,barrier) history is read or written.
-            parked.fold_expected_gen = fold_expected_gen_for_wait(
-                warp_id, key, inst.sync_semantic_raw);
-            m_pending_sync_waits[warp_id] = parked;
-            fold_parked = true;
-            // Record park-start for the deadlock watchdog only on the FIRST poll
-            // that parks this warp (a re-poll of an already-parked warp keeps the
-            // earliest start). service_fold_release clears it on release.
-            if (m_fold_park_start_cycle.size() <= warp_id) {
-              m_fold_park_start_cycle.resize(MAX_WARP_PER_SHADER, 0);
-            }
-            if (m_fold_park_start_cycle[warp_id] == 0) {
-              m_fold_park_start_cycle[warp_id] = get_current_gpu_cycle();
-              m_fold_parks_total++;
-              if (m_fold_pace_by_warp.size() <= warp_id) {
-                m_fold_pace_by_warp.resize(MAX_WARP_PER_SHADER);
-              }
-              FoldPaceStats &pace =
-                  m_fold_pace_by_warp[warp_id][FoldPaceKey(key, inst.pc)];
-              pace.parks++;
-              if (pace.first_park_cycle == 0) {
-                pace.first_park_cycle = get_current_gpu_cycle();
-              }
-              pace.last_expected_gen = parked.fold_expected_gen;
-              pace.last_barrier_gen = sync_barrier_gen(key);
-            }
-            if (m_config->spin_wait_fold_debug) {
-              debug_log_fold_event(
-                  "park warp=" + std::to_string(warp_id) + " cta=" +
-                  std::to_string(key.cta_id) + " barrier=0x" +
-                  format_hex_u64(key.barrier_addr) + " wait_pc=0x" +
-                  format_hex_u64(inst.pc) + " exit_pc=0x" +
-                  format_hex_u64(region.exit_pc) + " expected_gen=" +
-                  std::to_string(parked.fold_expected_gen) + " barrier_gen=" +
+        bool hold_created = false;
+        if (m_config->wait_block_enable && has_missing_action) {
+          const active_mask_t effective_mask = inst.get_active_mask();
+          const active_mask_t live_mask =
+              m_physical_warp[warp_id]->get_active_mask();
+          if ((effective_mask & ~live_mask).any() || live_mask.none()) {
+            std::cerr << "[WAITBLOCK][abort][SM" << m_sm_id << "] cyc="
+                      << get_current_gpu_cycle()
+                      << " reason=invalid-entry-mask-state"
+                      << " block=" << missing_record.block_id
+                      << " trace_kernel=" << inst.trace_kernel_id
+                      << " function=" << inst.unique_function_id
+                      << " cta=" << key.cta_id << " warp=" << warp_id
+                      << " entry_pc=0x" << format_hex_u64(inst.pc)
+                      << " effective_mask=0x"
+                      << format_hex_u64(effective_mask.to_ullong())
+                      << " live_mask=0x"
+                      << format_hex_u64(live_mask.to_ullong())
+                      << " action=abort" << std::endl;
+            abort();
+          }
+          const uint64_t expected_gen =
+              expected_gen_for_wait(warp_id, key, inst.sync_semantic_raw);
+          if (effective_mask != live_mask) {
+            m_partial_missing_wait_misses_total++;
+            const uint64_t captured_active_mask =
+                inst.trace_masks_valid
+                    ? static_cast<uint64_t>(inst.trace_active_mask)
+                    : effective_mask.to_ullong();
+            const uint64_t captured_predicate_mask =
+                inst.trace_masks_valid
+                    ? static_cast<uint64_t>(inst.trace_predicate_mask)
+                    : effective_mask.to_ullong();
+            std::cerr
+                << "[WAITBLOCK][UNSUPPORTED_PARTIAL_MISSING_WAIT][SM"
+                << m_sm_id << "] cyc=" << get_current_gpu_cycle()
+                << " block=" << missing_record.block_id
+                << " trace_kernel=" << inst.trace_kernel_id
+                << " function=" << inst.unique_function_id
+                << " cta=" << key.cta_id
+                << " global_cta=" << m_local_to_global_cta_id[key.cta_id]
+                << " warp=" << warp_id << " entry_probe_pc=0x"
+                << format_hex_u64(inst.pc) << " active_mask=0x"
+                << format_hex_u64(captured_active_mask)
+                << " predicate_mask=0x"
+                << format_hex_u64(captured_predicate_mask)
+                << " effective_mask=0x"
+                << format_hex_u64(effective_mask.to_ullong())
+                << " live_mask=0x"
+                << format_hex_u64(live_mask.to_ullong())
+                << " barrier=0x" << format_hex_u64(key.barrier_addr)
+                << " wait_state=0x"
+                << format_hex_u64(inst.sync_semantic_raw)
+                << " wait_parity="
+                << decode_sync_wait_phase(inst.sync_semantic_raw)
+                << " current_gen=" << sync_barrier_gen(key)
+                << " expected_gen=" << expected_gen
+                << " captured_ready_visits="
+                << missing_record.captured_ready_visits
+                << " captured_second_gate_visits="
+                << missing_record.captured_second_gate_visits
+                << " captured_poll_visits="
+                << missing_record.captured_poll_visits
+                << " all_live_entry_visits="
+                << missing_record.all_live_entry_visits
+                << " partial_entry_visits="
+                << missing_record.partial_entry_visits
+                << " scheduler_mutation=none cursor_mutation=none"
+                << " action=abort" << std::endl;
+            abort();
+          }
+
+          HopperMBarrierPendingWait held;
+          held.valid = true;
+          held.is_trywait = is_trywait;
+          held.key = key;
+          held.wait_state_raw = inst.sync_semantic_raw;
+          held.mode = WaitBlockPendingMode::MISSING_WAIT_HOLD;
+          held.block_id = missing_record.block_id;
+          held.action_pc = inst.pc;
+          held.unique_function_id = inst.unique_function_id;
+          held.expected_gen = expected_gen;
+          held.hold_start_cycle = get_current_gpu_cycle();
+          held.last_heartbeat_cycle = held.hold_start_cycle;
+          m_pending_sync_waits[warp_id] = held;
+          m_missing_wait_holds_total++;
+          hold_created = true;
+          debug_log_wait_block_event(
+              "missing-wait-hold",
+              "block=" + missing_record.block_id +
+                  " trace_kernel=" + std::to_string(inst.trace_kernel_id) +
+                  " function=" + std::to_string(inst.unique_function_id) +
+                  " cta=" + std::to_string(key.cta_id) +
+                  " warp=" + std::to_string(warp_id) + " entry_pc=0x" +
+                  format_hex_u64(inst.pc) + " effective_mask=0x" +
+                  format_hex_u64(effective_mask.to_ullong()) +
+                  " live_mask=0x" +
+                  format_hex_u64(live_mask.to_ullong()) + " barrier=0x" +
+                  format_hex_u64(key.barrier_addr) +
+                  " wait_state=0x" +
+                  format_hex_u64(inst.sync_semantic_raw) +
+                  " expected_gen=" + std::to_string(expected_gen) +
+                  " current_gen=" +
                   std::to_string(sync_barrier_gen(key)));
-            }
+        } else if (m_config->wait_block_enable && has_poll_action) {
+          HopperMBarrierPendingWait held;
+          held.valid = true;
+          held.is_trywait = is_trywait;
+          held.key = key;
+          held.wait_state_raw = inst.sync_semantic_raw;
+          held.mode = WaitBlockPendingMode::CAPTURED_POLL_HOLD;
+          held.block_id = poll_region.block_id;
+          held.action_pc = inst.pc;
+          held.poll_loop_exit_pc = poll_region.exit_pc;
+          held.unique_function_id = inst.unique_function_id;
+          held.expected_gen =
+              expected_gen_for_wait(warp_id, key, inst.sync_semantic_raw);
+          held.hold_start_cycle = get_current_gpu_cycle();
+          held.last_heartbeat_cycle = held.hold_start_cycle;
+          m_pending_sync_waits[warp_id] = held;
+          hold_created = true;
+          m_fold_parks_total++;
+          if (m_fold_pace_by_warp.size() <= warp_id) {
+            m_fold_pace_by_warp.resize(MAX_WARP_PER_SHADER);
+          }
+          FoldPaceStats &pace =
+              m_fold_pace_by_warp[warp_id][FoldPaceKey(key, inst.pc)];
+          pace.parks++;
+          if (pace.first_park_cycle == 0) {
+            pace.first_park_cycle = get_current_gpu_cycle();
+          }
+          pace.last_expected_gen = held.expected_gen;
+          pace.last_barrier_gen = sync_barrier_gen(key);
+          if (m_config->wait_block_enable) {
+            debug_log_wait_block_event(
+                "poll-hold",
+                "block=" + poll_region.block_id +
+                    " trace_kernel=" + std::to_string(inst.trace_kernel_id) +
+                    " function=" + std::to_string(inst.unique_function_id) +
+                    " cta=" + std::to_string(key.cta_id) +
+                    " warp=" + std::to_string(warp_id) + " poll_pc=0x" +
+                    format_hex_u64(inst.pc) + " exit_pc=0x" +
+                    format_hex_u64(poll_region.exit_pc) + " barrier=0x" +
+                    format_hex_u64(key.barrier_addr) +
+                    " expected_gen=" + std::to_string(held.expected_gen) +
+                    " current_gen=" +
+                    std::to_string(sync_barrier_gen(key)));
           }
         }
-        if (!fold_parked) {
+        if (!hold_created) {
           m_pending_sync_waits[warp_id] = HopperMBarrierPendingWait();
         }
+
         // Deadlock diagnosis: dump the current barrier counters so a barrier
         // that never becomes ready (arrive_count < expected, or tx bytes short)
         // is visible even late in a long run.
@@ -3064,6 +3420,27 @@ void SM::handle_sync_instruction(warp_inst_t &inst, unsigned int warp_id) {
 }
 
 void SM::clear_sync_barrier_state_for_cta(unsigned int cta_id) {
+  for (unsigned warp_id = 0; warp_id < m_pending_sync_waits.size();
+       ++warp_id) {
+    HopperMBarrierPendingWait &pending_wait =
+        m_pending_sync_waits[warp_id];
+    if (pending_wait.valid && pending_wait.key.cta_id == cta_id) {
+      if (m_config->wait_block_enable) {
+        std::cerr << "[WAITBLOCK][abort][SM" << m_sm_id << "] cyc="
+                  << get_current_gpu_cycle()
+                  << " reason=cta-cleanup-with-active-hold"
+                  << " strategy="
+                  << wait_block_mode_to_string(pending_wait.mode)
+                  << " trace_kernel=" << pending_wait.key.trace_kernel_id
+                  << " cta=" << cta_id << " warp=" << warp_id
+                  << " action_pc=0x"
+                  << format_hex_u64(pending_wait.action_pc)
+                  << " action=abort" << std::endl;
+        abort();
+      }
+      pending_wait = HopperMBarrierPendingWait();
+    }
+  }
   for (auto it = m_hopper_mbarriers.begin(); it != m_hopper_mbarriers.end();) {
     if (it->first.cta_id == cta_id) {
       it = m_hopper_mbarriers.erase(it);
@@ -3071,24 +3448,7 @@ void SM::clear_sync_barrier_state_for_cta(unsigned int cta_id) {
       ++it;
     }
   }
-  for (HopperMBarrierPendingWait &pending_wait : m_pending_sync_waits) {
-    if (pending_wait.valid && pending_wait.key.cta_id == cta_id) {
-      pending_wait = HopperMBarrierPendingWait();
-    }
-  }
-  // [Gen audit] Drop this CTA's consumed-gen entries so a later CTA reusing the
-  // same barrier addresses starts from a fresh (gen 0) barrier object. Empty when
-  // fold is off.
-  for (auto &per_warp : m_fold_last_gen) {
-    for (auto it = per_warp.begin(); it != per_warp.end();) {
-      if (it->first.cta_id == cta_id) {
-        it = per_warp.erase(it);
-      } else {
-        ++it;
-      }
-    }
-  }
-  // FOLDPACE is emitted immediately before this cleanup at CTA exit. Drop the
+  // Poll pace is emitted immediately before this cleanup at CTA exit. Drop the
   // just-printed CTA-slot entries so a later CTA reusing the slot gets an
   // independent pacing record rather than a cross-wave aggregate.
   for (auto &per_warp : m_fold_pace_by_warp) {

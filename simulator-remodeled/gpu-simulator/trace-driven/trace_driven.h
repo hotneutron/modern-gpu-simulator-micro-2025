@@ -265,6 +265,7 @@ class trace_shd_warp_t : public shd_warp_t {
   // TMA/BAR work. Any violation emits [FOLDSKIP_AUDIT] and aborts. The per-class
   // breakdown of what was skipped is returned in *out_stats when non-null.
   unsigned int skip_spin_to_exit(address_type exit_pc,
+                                 address_type loopback_bra_pc,
                                  const std::set<address_type> &allowed_skip_pcs,
                                  struct FoldSkipStats *out_stats);
   void clear();

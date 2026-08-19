@@ -94,6 +94,8 @@ void split(const std::string &str, std::vector<std::string> &cont,
 inst_trace_t::inst_trace_t() { 
   is_instruction_traced = true;
   is_constant_addr_already_calculated = false;
+  active_mask = 0;
+  predicate_mask = 0;
   sync_site_valid = false;
   sync_kind = SyncInstructionKind::NONE;
   sync_semantic_operand_role = SyncSemanticOperandRole::NONE;
@@ -117,6 +119,8 @@ inst_trace_t::inst_trace_t(const inst_trace_t &b) {
   m_next_traced_pc = b.m_next_traced_pc;
   m_unique_function_id = b.m_unique_function_id;
   mask = b.mask;
+  active_mask = b.active_mask;
+  predicate_mask = b.predicate_mask;
   opcode = b.opcode;
   memadd_info.resize(b.memadd_info.size());
   for(unsigned int i = 0; i < b.memadd_info.size(); ++i) {
@@ -154,6 +158,8 @@ inst_trace_t::inst_trace_t(address_type pc, unsigned int unique_function_id, boo
   m_unique_function_id = unique_function_id;
   this->is_instruction_traced = is_instruction_traced;
   mask = 0;
+  active_mask = 0;
+  predicate_mask = 0;
   opcode = "NOP";
   is_constant_addr_already_calculated = false;
   sync_site_valid = false;
@@ -311,7 +317,9 @@ void inst_trace_t::parse_memref(unsigned int idx, unsigned int mem_width, const 
 bool inst_trace_t::parse_from_pb(dynamic_trace::instruction pb_inst,
                                      unsigned trace_version, gpgpu_sim *gpu, std::string kernel_name, traced_execution &static_trace_info) {
   m_pc = pb_inst.pc();
-  mask = pb_inst.active_mask() & pb_inst.predicate_mask();
+  active_mask = pb_inst.active_mask();
+  predicate_mask = pb_inst.predicate_mask();
+  mask = active_mask & predicate_mask;
   m_unique_function_id = pb_inst.function_unique_id();
   sync_runtime_valid = pb_inst.has_sync() && pb_inst.sync().valid();
   sync_barrier_addr = sync_runtime_valid ? pb_inst.sync().barrier_addr() : 0;
