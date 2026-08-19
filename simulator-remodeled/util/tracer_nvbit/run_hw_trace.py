@@ -328,22 +328,34 @@ def build_sync_operand_mapping_if_available(trace_folder):
     subprocess.run([sys.executable, sync_script, extra_info_dir], check=True)
 
 
-def build_spin_wait_sidecar_if_available(trace_folder):
-    # Static producer spin-wait sidecar (payload untouched). Needs the sync
-    # resolver + disassembly, so it runs after build_sync_operand_mapping. The
-    # simulator consumes this to block a producer at each mbarrier spin loop
-    # until the modeled barrier is ready, instead of replaying the capture-time
-    # poll count. Also runnable standalone on a CPU server.
+def build_spin_wait_sidecar(trace_folder):
+    # WaitBlock v4 sidecar. It needs the sync resolver + disassembly, so it runs
+    # after build_sync_operand_mapping. Production trace generation always
+    # validates every CTA and fails closed if any intended runtime record fails
+    # its proof. Also runnable standalone on a CPU server.
     extra_info_dir = os.path.join(trace_folder, "extra_info")
     inputs = [
         os.path.join(extra_info_dir, "enhanced_execution_info.json"),
         os.path.join(extra_info_dir, "sync_operand_resolver.json"),
     ]
-    if not all(os.path.exists(path) for path in inputs):
-        return
+    missing = [path for path in inputs if not os.path.exists(path)]
+    if missing:
+        raise RuntimeError(
+            "cannot build mandatory WaitBlock v4 sidecar; missing: {0}".format(
+                ", ".join(missing)
+            )
+        )
     sidecar_script = os.path.join(this_directory, "build_spin_wait_sidecar.py")
     subprocess.run(
-        [sys.executable, sidecar_script, "--traces", trace_folder],
+        [
+            sys.executable,
+            sidecar_script,
+            "--traces",
+            trace_folder,
+            "--validate-ctas",
+            "all",
+            "--strict",
+        ],
         check=True,
     )
 
@@ -559,6 +571,7 @@ for bench in benchmarks:
                 build_tma_descriptor_mapping_if_available(this_trace_folder)
                 build_tma_operand_mapping_if_available(this_trace_folder)
                 build_sync_operand_mapping_if_available(this_trace_folder)
-                build_spin_wait_sidecar_if_available(this_trace_folder)
             if trim_spin_enabled:
                 spin_trim_run_dir(this_run_dir)
+            if not warp_lifetime_only:
+                build_spin_wait_sidecar(this_trace_folder)

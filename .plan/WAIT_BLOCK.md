@@ -408,8 +408,8 @@ implicitly enable entry holds.
   "version": 4,
   "schema": "wait_block_sidecar",
   "wait_block_report": {
-    "discovered": 42,
-    "passed": 35,
+    "discovered": 43,
+    "passed": 36,
     "failed": 0,
     "skipped": 7,
     "inject_missing_wait": 22,
@@ -486,7 +486,16 @@ TRACE_IDENTITY_MISMATCH
 ```
 
 `--strict` fails when an intended runtime target is not emitted with its expected
-strategy.
+strategy. `wait_block_report.failed` is the single report-level authority:
+
+```text
+failed == 0  -> no strategy-proof strict failure
+failed != 0  -> strict exits nonzero before publishing output
+```
+
+A semantic-bearing, local-memory-bearing, single-shot, or dependency-unsafe
+region that is not an intended runtime target remains non-foldable/skipped. Its
+existence alone does not make strict generation fail.
 
 Runtime rejects:
 
@@ -603,6 +612,92 @@ These can be added only if current K5/K10 evidence shows they are required.
 They are not prerequisites for the two requested functions. A ready-only
 partial-mask modeled miss is still detected at runtime and aborts; it is not
 silently treated as supported.
+
+### 1.14 Server full-trace acceptance
+
+The v4 post-processor was rerun on the server against the production compact
+trace, without a kernel filter:
+
+```text
+python3 simulator-remodeled/util/tracer_nvbit/build_spin_wait_sidecar.py \
+    --traces <TRACE_ROOT>/traces \
+    --validate-ctas all \
+    --strict
+```
+
+For every normal (non-warp-lifetime-only) trace, `run_hw_trace.py` requires
+`enhanced_execution_info.json` and `sync_operand_resolver.json`. Missing
+metadata aborts trace post-processing instead of silently omitting the sidecar.
+It passes `--validate-ctas all --strict`; `subprocess.run(check=True)` makes any
+proof or completeness failure fail the trace-generation workflow instead of
+publishing a new sidecar.
+
+The automatic order is:
+
+```text
+NVBit trace
+-> TMA/sync operand mapping
+-> optional TRIM_SPIN rewrite
+-> strict WaitBlock v4 generation on the final simulator-facing trace
+```
+
+`TRIM_SPIN` copies `extra_info` while rewriting dynamic protobuf streams.
+Generating v4 only after that rewrite prevents full-trace counts and proofs
+from being copied unchanged into a different trimmed trace.
+
+The strict run completed successfully and published a schema-v4 sidecar with:
+
+```text
+discovered=43 passed=36 failed=0 skipped=7
+INJECT_MISSING_WAIT=22
+FOLD_CAPTURED_POLL=14
+metadata_only=0
+ready-only all-live visits=76,224
+ready-only partial visits=4,596
+ready-only records with partial visits=11
+```
+
+After publishing the sidecar, the generator repeats the complete acceptance
+result as its final log line:
+
+```text
+[wait-block] FINAL status=PASS validation_complete=true discovered=43 passed=36 failed=0 skipped=7 inject=22 fold=14 metadata=0 all_live=76224 partial=4596 records_with_partial=11 output=<SIDECAR_PATH>
+```
+
+Consequently `tail -n 1` is sufficient to inspect a successful run; no `grep`
+is required. A strict proof failure exits before publishing a sidecar and never
+prints `status=PASS`.
+
+Kernel-level acceptance:
+
+```text
+K5:  INJECT_MISSING_WAIT=12, FOLD_CAPTURED_POLL=8
+K10: INJECT_MISSING_WAIT=10, FOLD_CAPTURED_POLL=6
+```
+
+All skips are expected and fail-closed:
+
+- K5 `0x96c0` is `CAPTURED_POLL_ENTRY_NOT_REQUIRED`; its runtime action is the
+  independently proven captured poll at `0xb0b0`.
+- K5 `0xac40` and `0xac60`, K10 `0xb480` and `0xb4a0`, and K11 `0x5a0` and
+  `0x5c0` are unresolved single-shot/internal shapes and create no runtime
+  action.
+
+The report invariants hold:
+
+```text
+43 = 36 passed + 0 failed + 7 skipped
+36 = 22 inject + 14 fold + 0 metadata
+```
+
+Because the command omitted `--out`, it wrote
+`extra_info/spin_wait_sidecar.json`. That server artifact is schema v4 and must
+not be consumed by the reverted baseline simulator. It is a post-processing
+acceptance artifact until the v4 loader and runtime are implemented.
+
+This acceptance proves classification, payload extraction, mask census,
+strategy ownership, and strict report completeness. It does not prove simulator
+hold/release or cursor behavior.
 
 ## 2. Simulator Redesign: Two Independent Runtime Paths
 
@@ -922,6 +1017,14 @@ reviewed design replaces it.
 
 Post-processing:
 
+- missing `enhanced_execution_info.json` aborts automatic generation;
+- missing `sync_operand_resolver.json` aborts automatic generation;
+- an empty resolver with no static wait opcode emits a valid empty v4 sidecar;
+- an empty resolver with static wait opcodes aborts;
+- `failed=0` cannot produce a strategy-proof strict failure;
+- `failed>0` exits before output publication;
+- a published sidecar prints the complete `FINAL` summary as the last log line;
+- `TRIM_SPIN` runs before strict sidecar generation;
 - ready-only/all-live gate emits `INJECT_MISSING_WAIT`;
 - ready-only/partial-mask gate emits `INJECT_MISSING_WAIT`, records its masks,
   and declares `partial_modeled_miss_action=ABORT`;
@@ -995,15 +1098,19 @@ Cross-kernel:
 5. [done] Review the strategy counts, missing-wait mask report, and captured
    poll records (`discovered=43`, `passed=36`, `failed=0`, `skipped=7`;
    `inject=22`, `fold=14`).
-6. [not started] Restore captured-poll ownership at poll probes in the v4
+6. [done] Repeat full-CTA strict generation on the server without a kernel
+   filter and verify the same report and strategy counts.
+7. [done] Integrate full-CTA strict sidecar generation into `run_hw_trace.py`
+   after sync operand mapping, with mandatory metadata and post-trim ordering.
+8. [not started] Restore captured-poll ownership at poll probes in the v4
    simulator.
-7. [not started] Implement `INJECT_MISSING_WAIT` and its partial-miss diagnostic
+9. [not started] Implement `INJECT_MISSING_WAIT` and its partial-miss diagnostic
    abort as a
    separate entry-only path.
-8. [not started] Add strict loader, identity, generation, landing, and lifecycle
+10. [not started] Add strict loader, identity, generation, landing, and lifecycle
    guards.
-9. [not started] Run simulator static/unit checks.
-10. [not started] The user builds and runs K5/K10.
+11. [not started] Run simulator static/unit checks.
+12. [not started] The user builds and runs K5/K10.
 
 The design is complete when each runtime action is explained by exactly one of
 the two strategies. No entry action is permitted for a captured-poll record, and

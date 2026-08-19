@@ -1162,10 +1162,27 @@ def main():
         sys.exit("no extra_info under %s" % traces)
 
     kernels, names = load_kernels(extra)
-    sync_sites = load_sync_sites(extra)
-    if not sync_sites:
+    sync_path = os.path.join(extra, "sync_operand_resolver.json")
+    if not os.path.exists(sync_path):
+        if args.strict:
+            sys.exit("[spin-sidecar] STRICT: missing %s" % sync_path)
         print("[spin-sidecar] no sync_operand_resolver.json; nothing to do")
         return
+    sync_sites = load_sync_sites(extra)
+    if not sync_sites:
+        static_waits = [
+            (fid, pc)
+            for fid, byp in kernels.items()
+            for pc, inst in byp.items()
+            if any(kind in inst.get("op_code", "") for kind in WAIT_KINDS)
+        ]
+        if static_waits:
+            sys.exit(
+                "[spin-sidecar] sync_operand_resolver.json contains no wait "
+                "sites, but static wait opcodes exist (first funcid=%d pc=0x%x)"
+                % static_waits[0]
+            )
+        print("[spin-sidecar] no wait instructions; emitting empty v4 sidecar")
     kdirs = kernel_dir_map(traces)
     want = set(int(x) for x in args.kernels.split(",")) if args.kernels else None
 
@@ -1177,8 +1194,13 @@ def main():
             kid_to_fid[kid] = _ts._peek_funcid(pbs[0])
 
     out_kernels = []
-    strict_violation = False
     report = Counter()
+    for field in (
+            "discovered", "passed", "failed", "skipped",
+            "inject_missing_wait", "fold_captured_poll", "metadata_only",
+            "ready_only_all_live_visits", "ready_only_partial_visits",
+            "ready_only_records_with_partial_visits"):
+        report[field] = 0
     report_lines = []
     for kid in sorted(kdirs):
         if want and kid not in want:
@@ -1217,10 +1239,6 @@ def main():
                     foldable_body_pcs.update(
                         range(lo, hi + ISIZE, ISIZE))
                 clean.append(r_out)
-                if not r["semantic_free_body"]:
-                    strict_violation = True
-                if st["is_spin_loop"] and not r["barrier_self_tied"]:
-                    strict_violation = True
 
         def _is_fold_target(c):
             """Whether a candidate's captured poll arm has a legacy fold owner."""
@@ -1369,9 +1387,6 @@ def main():
                        st["path_B_second_gate_ready"],
                        st["path_C_fallback_loop"]))
 
-        if kernel_failed:
-            strict_violation = True
-
         out_kernels.append({
             "kernel_id": kid,
             "trace_kernel_id": kid,
@@ -1455,7 +1470,7 @@ def main():
     if args.strict and args.validate_ctas != "all":
         sys.exit("[spin-sidecar] STRICT: runtime strategy emission requires "
                  "--validate-ctas all")
-    if args.strict and strict_violation:
+    if args.strict and report["failed"]:
         sys.exit("[spin-sidecar] STRICT: at least one intended runtime record "
                  "failed its proof; inspect FAIL lines")
 
@@ -1465,6 +1480,31 @@ def main():
         json.dump(sidecar, fh, indent=2)
     os.replace(tmp_path, out_path)
     print("[spin-sidecar] wrote %s (%d kernels)" % (out_path, len(out_kernels)))
+    final_status = (
+        "FAILED" if report["failed"]
+        else ("PASS" if sidecar["validation_complete"] else "INCOMPLETE")
+    )
+    print(
+        "[wait-block] FINAL status=%s validation_complete=%s "
+        "discovered=%d passed=%d failed=%d skipped=%d "
+        "inject=%d fold=%d metadata=%d all_live=%d partial=%d "
+        "records_with_partial=%d output=%s"
+        % (
+            final_status,
+            str(sidecar["validation_complete"]).lower(),
+            report["discovered"],
+            report["passed"],
+            report["failed"],
+            report["skipped"],
+            report["inject_missing_wait"],
+            report["fold_captured_poll"],
+            report["metadata_only"],
+            report["ready_only_all_live_visits"],
+            report["ready_only_partial_visits"],
+            report["ready_only_records_with_partial_visits"],
+            out_path,
+        )
+    )
 
 
 if __name__ == "__main__":
