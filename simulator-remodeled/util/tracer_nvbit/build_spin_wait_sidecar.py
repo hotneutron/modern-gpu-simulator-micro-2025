@@ -9,7 +9,8 @@ runtime contracts without modifying the payload:
 
   * INJECT_MISSING_WAIT: a gate is ready-only in the complete capture. A future
     simulator may wait-hold an all-live modeled miss at the entry. A partial
-    modeled miss must abort until lane-group scheduling is designed.
+    modeled miss may use the v5 deferred-suffix contract only after static CFG
+    and complete dynamic-trace proofs establish a join-only complementary path.
   * FOLD_CAPTURED_POLL: an existing foldable polling loop. A future simulator
     may use the already-proven poll-site hold and dual-cursor advance to the local
     loop exit.
@@ -20,7 +21,7 @@ CTA, warp, SM, or expected-count filters. K5/K10 values are validation results,
 not production rules.
 
 The existing spin_regions records are preserved unchanged. Simulator support for
-schema v4 is a separate stage.
+schema v5 is a separate stage.
 
 Usage
 -----
@@ -672,6 +673,7 @@ def detect_wait_block_candidates(fid, byp, sync_sites):
             fb_entry = bra_target(b2)
             gate_wait_pcs.append(br_pc + ISIZE)
             gate_poll_pcs = [pc, br_pc, br_pc + ISIZE, br_pc + 2 * ISIZE]
+            not_ready_branch_pc = br_pc + 2 * ISIZE
             resume_expected = ready_arm
         else:
             # @!P BRA fallback  => Type-2: miss goes to the fallback loop; ready
@@ -679,6 +681,7 @@ def detect_wait_block_candidates(fid, byp, sync_sites):
             fb_entry = tgt
             resume_expected = br_pc + ISIZE
             gate_poll_pcs = [pc, br_pc]
+            not_ready_branch_pc = br_pc
 
         if fb_entry is None:
             cand["cfg_ok"] = False
@@ -698,11 +701,16 @@ def detect_wait_block_candidates(fid, byp, sync_sites):
             continue
         cand["cfg_ok"] = True
         cand["all_gate_wait_pcs"] = gate_wait_pcs
+        cand["not_ready_branch_pc"] = not_ready_branch_pc
+        cand["entry_arming_pcs"] = sorted(
+            (set(gate_poll_pcs) | set(cand["mainline_setup_pcs"])) - {pc}
+        )
         cand["captured_next_pc"] = resume_expected
         cand["fallback_entry_pc"] = fb_entry
         cand["fallback_body_pcs"] = info["fallback_body_pcs"]
         cand["fallback_wait_pcs"] = info["fallback_wait_pcs"]
         cand["fallback_loopback_pc"] = info["fallback_loopback_pc"]
+        cand["fallback_exit_pc"] = info["fallback_exit_pc"]
         cand["resume_pc"] = info["resume_pc"]
         # allowed_block_pcs = ONLY gate polls/branches + fallback loop body.
         # Mainline setup between the gate and its branch is deliberately excluded.
@@ -1012,24 +1020,37 @@ def prove_candidate(fid, cand, byp, sync_sites):
 def make_inject_missing_wait_record(c, sync_sites, byp):
     """Serialize a ready-only gate for the entry-only missing-wait strategy."""
     st = c.get("dynamic", {})
+    partial = c.get("partial_join_proof")
     site = sync_sites.get((c["unique_function_id"], c["entry_wait_pc"]), {})
     operands = [
         o.get("operand_string", "")
         for o in byp[c["entry_wait_pc"]].get("operands", [])
     ]
-    return {
+    record = {
         "block_id": c["block_id"],
         "runtime_strategy": "INJECT_MISSING_WAIT",
         "unique_function_id": c["unique_function_id"],
         "entry_probe_pc": c["entry_wait_pc"],
         "entry_probe_pc_hex": "0x%x" % c["entry_wait_pc"],
-        "entry_branch_pc": c["entry_branch_pc"],
+        "entry_first_branch_pc": c["entry_branch_pc"],
+        "entry_branch_pc": c["not_ready_branch_pc"],
         "captured_ready_pc": c["resume_pc"],
+        "entry_setup_pcs": c.get("mainline_setup_pcs", []),
+        "entry_arming_pcs": c.get("entry_arming_pcs", []),
+        "entry_branch_not_ready_polarity": "PREDICATE_FALSE",
+        "miss_arm_entry_pc": c["fallback_entry_pc"],
+        "miss_arm_wait_pcs": c["fallback_wait_pcs"],
+        "miss_arm_loopback_pc": c["fallback_loopback_pc"],
+        "miss_arm_exit_pc": c["fallback_exit_pc"],
         "entry_probe_kind": site.get("sync_kind"),
         "entry_probe_opcode": site.get("opcode"),
         "barrier_operand_text": site.get("barrier_operand_text"),
         "wait_state_operand_text": operands[2] if len(operands) > 2 else None,
-        "partial_modeled_miss_action": "ABORT",
+        "canonical_wait_condition": c.get("canonical_wait_condition"),
+        "partial_modeled_miss_action": (
+            "DEFER_BLOCKED_SUFFIX_THEN_HOLD"
+            if partial is not None else "ABORT"
+        ),
         "observed_path_counts": {
             "ready_arm": st.get("path_A_first_gate_ready", 0),
             "second_gate_arm": st.get("path_B_second_gate_ready", 0),
@@ -1046,10 +1067,36 @@ def make_inject_missing_wait_record(c, sync_sites, byp):
         "observed_wait_states": st.get("entry_wait_states", {}),
         "sync_payload_missing": st.get("entry_sync_payload_missing", 0),
     }
+    if partial is not None:
+        region = partial["region"]
+        record["partial_hold_proof_version"] = 1
+        record["partial_region_id"] = "pr_fid%d_b0x%x_j0x%x" % (
+            c["unique_function_id"],
+            region["sibling_branch_pc"],
+            region["join_pc"],
+        )
+        record["sibling_branch_pc"] = region["sibling_branch_pc"]
+        record["sibling_branch_target_pc"] = \
+            region["sibling_branch_target_pc"]
+        record["join_pc"] = region["join_pc"]
+        record["post_join_pc"] = region["post_join_pc"]
+        record["join_kind"] = region["join_kind"]
+        record["join_bssy_pc"] = region["bssy_pc"]
+        record["join_token"] = region["join_token"]
+        record["observed_sibling_masks"] = partial["sibling_masks"]
+        record["partial_join_pending_visits"] = \
+            partial["join_pending_visits"]
+        record["partial_join_already_issued_visits"] = \
+            partial["join_already_issued_visits"]
+        record["complementary_masks_complete"] = True
+        record["sibling_join_only"] = True
+        record["blocked_path_reaches_same_join"] = True
+        record["linear_capsule_safe"] = True
+    return record
 
 
 def make_metadata_only_record(c):
-    """Serialize a proven WaitBlock that owns no v4 runtime action."""
+    """Serialize a proven WaitBlock that owns no v5 runtime action."""
     st = c.get("dynamic", {})
     return {
         "block_id": c["block_id"],
@@ -1251,6 +1298,326 @@ POLL_WAIT_CONDITION_MISMATCH = "POLL_WAIT_CONDITION_MISMATCH"
 POLL_EFFECT_UNSAFE = "POLL_EFFECT_UNSAFE"
 POLL_SCOREBOARD_UNSAFE = "POLL_SCOREBOARD_UNSAFE"
 CAPTURED_POLL_ENTRY_NOT_REQUIRED = "CAPTURED_POLL_ENTRY_NOT_REQUIRED"
+PARTIAL_MASK_PARTITION_INVALID = "PARTIAL_MASK_PARTITION_INVALID"
+PARTIAL_SIBLING_BRANCH_UNRESOLVED = "PARTIAL_SIBLING_BRANCH_UNRESOLVED"
+PARTIAL_JOIN_STATIC_UNSAFE = "PARTIAL_JOIN_STATIC_UNSAFE"
+PARTIAL_JOIN_OCCURRENCE_MISSING = "PARTIAL_JOIN_OCCURRENCE_MISSING"
+PARTIAL_SIBLING_NOT_QUIESCENT = "PARTIAL_SIBLING_NOT_QUIESCENT"
+PARTIAL_CAPSULE_MASK_ESCAPE = "PARTIAL_CAPSULE_MASK_ESCAPE"
+PARTIAL_POST_JOIN_UNRESOLVED = "PARTIAL_POST_JOIN_UNRESOLVED"
+PARTIAL_REGION_INCONSISTENT = "PARTIAL_REGION_INCONSISTENT"
+
+
+def _opcode_base(inst):
+    return inst["op_code"].split(".")[0]
+
+
+def _direct_target(inst):
+    for operand in inst.get("operands", []):
+        if operand.get("has_inmediate"):
+            return int(operand["operand_inmmediates"][-1])
+    return None
+
+
+def _operand_texts(inst):
+    return [
+        _normalized_operand(operand.get("operand_string", ""))
+        for operand in inst.get("operands", [])
+    ]
+
+
+def prove_partial_join_static(byp, sibling_branch_pc, join_pc, post_join_pc):
+    """Prove the static branch/join anchors for one partial-lane region.
+
+    WARPSYNC is self-describing. BSYNC additionally requires a preceding BSSY
+    with the same token and an exact post-join target.
+    """
+    branch = byp.get(sibling_branch_pc)
+    join = byp.get(join_pc)
+    post_join = byp.get(post_join_pc)
+    if (branch is None or _opcode_base(branch) != "BRA"
+            or bra_target(branch) != join_pc
+            or join is None or post_join is None):
+        return False, PARTIAL_JOIN_STATIC_UNSAFE, None
+
+    join_kind = _opcode_base(join)
+    if (join_kind not in ("WARPSYNC", "BSYNC")
+            or join.get("is_predicated")):
+        return False, PARTIAL_JOIN_STATIC_UNSAFE, None
+
+    proof = {
+        "sibling_branch_pc": sibling_branch_pc,
+        "sibling_branch_target_pc": join_pc,
+        "join_pc": join_pc,
+        "post_join_pc": post_join_pc,
+        "join_kind": join_kind,
+        "bssy_pc": None,
+        "join_token": None,
+    }
+    if join_kind == "WARPSYNC":
+        return True, None, proof
+
+    join_operands = _operand_texts(join)
+    if len(join_operands) != 1:
+        return False, PARTIAL_JOIN_STATIC_UNSAFE, None
+    token = join_operands[0]
+    proof["join_token"] = token
+    for pc in sorted((p for p in byp if p < sibling_branch_pc), reverse=True):
+        inst = byp[pc]
+        if _opcode_base(inst) != "BSSY":
+            continue
+        operands = _operand_texts(inst)
+        if not operands or operands[0] != token:
+            continue
+        if _direct_target(inst) != post_join_pc:
+            return False, PARTIAL_JOIN_STATIC_UNSAFE, None
+        proof["bssy_pc"] = pc
+        return True, None, proof
+    return False, PARTIAL_JOIN_STATIC_UNSAFE, None
+
+
+def prove_partial_join_visit(cand, insts, byp, expected_fid, entry_index,
+                             live_before):
+    """Prove one dynamic partial entry belongs to a join-only divergence region.
+
+    The proof uses the raw active mask for lane-group ownership. Predicate masks
+    still determine the partial entry itself, but a predicated-off instruction
+    remains owned by the lane group that issued it.
+    """
+    n = len(insts)
+    entry_inst = insts[entry_index]
+    entry_mask = (
+        int(entry_inst["active_mask"]) &
+        int(entry_inst["predicate_mask"])
+    )
+    live_mask = int(live_before[entry_index])
+    sibling_mask = live_mask & ~entry_mask
+    if (entry_mask == 0 or sibling_mask == 0
+            or entry_mask & sibling_mask
+            or (entry_mask | sibling_mask) != live_mask):
+        return False, PARTIAL_MASK_PARTITION_INVALID, None
+
+    effective = [
+        int(inst["active_mask"]) & int(inst["predicate_mask"])
+        for inst in insts
+    ]
+
+    sibling_branch_index = None
+    static_proof = None
+    for idx in range(entry_index - 1, -1, -1):
+        if insts[idx]["function_unique_id"] != expected_fid:
+            continue
+        if effective[idx] == live_mask:
+            break
+        if effective[idx] != sibling_mask:
+            continue
+        static_inst = byp.get(insts[idx]["pc"])
+        if static_inst is None or _opcode_base(static_inst) != "BRA":
+            continue
+        target = bra_target(static_inst)
+        target_inst = byp.get(target)
+        if target is None or target_inst is None:
+            continue
+        if _opcode_base(target_inst) not in ("WARPSYNC", "BSYNC"):
+            continue
+        post_join_pc = target + ISIZE
+        ok, _, proof = prove_partial_join_static(
+            byp, insts[idx]["pc"], target, post_join_pc)
+        if ok:
+            sibling_branch_index = idx
+            static_proof = proof
+            break
+    if sibling_branch_index is None:
+        return False, PARTIAL_SIBLING_BRANCH_UNRESOLVED, None
+
+    join_pc = static_proof["join_pc"]
+    post_join_pc = static_proof["post_join_pc"]
+    sibling_join_index = None
+    blocked_join_index = None
+    for idx in range(sibling_branch_index + 1, n):
+        if insts[idx]["function_unique_id"] != expected_fid:
+            continue
+        if insts[idx]["pc"] != join_pc:
+            continue
+        owner = int(insts[idx]["active_mask"]) & live_mask
+        if sibling_join_index is None and owner == sibling_mask:
+            sibling_join_index = idx
+        if idx >= entry_index and blocked_join_index is None and owner == entry_mask:
+            blocked_join_index = idx
+        if sibling_join_index is not None and blocked_join_index is not None:
+            break
+    if sibling_join_index is None or blocked_join_index is None:
+        return False, PARTIAL_JOIN_OCCURRENCE_MISSING, None
+
+    resume_index = None
+    for idx in range(entry_index + 1, blocked_join_index + 1):
+        if (insts[idx]["function_unique_id"] == expected_fid
+                and insts[idx]["pc"] == cand["resume_pc"]
+                and (int(insts[idx]["active_mask"]) & entry_mask)):
+            resume_index = idx
+            break
+    if resume_index is None:
+        return False, PARTIAL_JOIN_OCCURRENCE_MISSING, None
+
+    last_join_index = max(sibling_join_index, blocked_join_index)
+    post_join_index = None
+    for idx in range(last_join_index + 1, n):
+        if insts[idx]["function_unique_id"] != expected_fid:
+            continue
+        if (insts[idx]["pc"] == post_join_pc
+                and effective[idx] == live_mask):
+            post_join_index = idx
+            break
+        if effective[idx] == live_mask:
+            return False, PARTIAL_POST_JOIN_UNRESOLVED, None
+    if post_join_index is None:
+        return False, PARTIAL_POST_JOIN_UNRESOLVED, None
+
+    for idx in range(sibling_branch_index + 1, post_join_index):
+        inst = insts[idx]
+        if inst["function_unique_id"] != expected_fid:
+            return False, CTA_IDENTITY_MISMATCH, None
+        owner = int(inst["active_mask"]) & live_mask
+        if owner == 0:
+            continue
+        if idx == sibling_join_index:
+            if owner != sibling_mask or inst["pc"] != join_pc:
+                return False, PARTIAL_JOIN_OCCURRENCE_MISSING, None
+            continue
+        if owner & sibling_mask:
+            return False, PARTIAL_SIBLING_NOT_QUIESCENT, {
+                "escape_pc": inst["pc"],
+                "escape_index": idx,
+                "escape_mask": owner,
+            }
+        if owner & ~entry_mask:
+            return False, PARTIAL_CAPSULE_MASK_ESCAPE, {
+                "escape_pc": inst["pc"],
+                "escape_index": idx,
+                "escape_mask": owner,
+            }
+
+    return True, None, {
+        "entry_mask": entry_mask,
+        "sibling_mask": sibling_mask,
+        "live_mask": live_mask,
+        "sibling_branch_index": sibling_branch_index,
+        "sibling_join_index": sibling_join_index,
+        "blocked_join_index": blocked_join_index,
+        "resume_index": resume_index,
+        "post_join_index": post_join_index,
+        "join_pending_at_entry": sibling_join_index > entry_index,
+        "static": static_proof,
+    }
+
+
+def validate_partial_join_dynamic(kdir, cands, byp, max_ctas, expected_fid):
+    """Validate the partial deferred-suffix contract over every selected CTA."""
+    files = sorted(glob.glob(os.path.join(kdir, "*.pb")))
+    if max_ctas != "all":
+        files = files[:int(max_ctas)]
+    stats = {}
+    for cand in cands:
+        stats[cand["block_id"]] = {
+            "dynamic_ok": True,
+            "reason": None,
+            "partial_visits": 0,
+            "join_pending_visits": 0,
+            "join_already_issued_visits": 0,
+            "entry_masks": Counter(),
+            "sibling_masks": Counter(),
+            "live_masks": Counter(),
+            "regions": {},
+        }
+
+    for path in files:
+        warps = vpb_parse_full(open(path, "rb").read())
+        for _, insts in warps:
+            effective = [
+                int(inst["active_mask"]) & int(inst["predicate_mask"])
+                for inst in insts
+            ]
+            live = 0
+            for inst in insts:
+                live |= int(inst["active_mask"])
+            live_before = []
+            for idx, inst in enumerate(insts):
+                live_before.append(live)
+                static_inst = byp.get(inst["pc"])
+                if (static_inst is not None
+                        and _opcode_base(static_inst) == "EXIT"
+                        and effective[idx]):
+                    live &= ~effective[idx]
+
+            for cand in cands:
+                st = stats[cand["block_id"]]
+                if not st["dynamic_ok"]:
+                    continue
+                for idx, inst in enumerate(insts):
+                    if (inst["function_unique_id"] != expected_fid
+                            or inst["pc"] != cand["entry_wait_pc"]
+                            or effective[idx] == 0
+                            or effective[idx] == live_before[idx]):
+                        continue
+                    ok, reason, proof = prove_partial_join_visit(
+                        cand, insts, byp, expected_fid, idx, live_before)
+                    if not ok:
+                        st["dynamic_ok"] = False
+                        st["reason"] = reason
+                        if proof:
+                            st["failure_detail"] = {
+                                key: ("0x%x" % value if key.endswith("_pc")
+                                      or key.endswith("_mask") else value)
+                                for key, value in proof.items()
+                            }
+                        break
+                    st["partial_visits"] += 1
+                    if proof["join_pending_at_entry"]:
+                        st["join_pending_visits"] += 1
+                    else:
+                        st["join_already_issued_visits"] += 1
+                    for key, value in (
+                            ("entry_masks", proof["entry_mask"]),
+                            ("sibling_masks", proof["sibling_mask"]),
+                            ("live_masks", proof["live_mask"])):
+                        st[key]["0x%x" % value] += 1
+                    static = proof["static"]
+                    region_key = (
+                        static["sibling_branch_pc"],
+                        static["join_pc"],
+                        static["post_join_pc"],
+                        static["join_kind"],
+                        static["bssy_pc"],
+                        static["join_token"],
+                    )
+                    st["regions"].setdefault(region_key, 0)
+                    st["regions"][region_key] += 1
+
+    for cand in cands:
+        st = stats[cand["block_id"]]
+        expected_visits = cand["dynamic"]["partial_entry_visits"]
+        if st["dynamic_ok"] and st["partial_visits"] != expected_visits:
+            st["dynamic_ok"] = False
+            st["reason"] = PARTIAL_REGION_INCONSISTENT
+        if st["dynamic_ok"] and len(st["regions"]) != 1:
+            st["dynamic_ok"] = False
+            st["reason"] = PARTIAL_REGION_INCONSISTENT
+        if st["dynamic_ok"]:
+            region_key, region_visits = next(iter(st["regions"].items()))
+            st["region"] = {
+                "sibling_branch_pc": region_key[0],
+                "sibling_branch_target_pc": region_key[1],
+                "join_pc": region_key[1],
+                "post_join_pc": region_key[2],
+                "join_kind": region_key[3],
+                "bssy_pc": region_key[4],
+                "join_token": region_key[5],
+                "validated_visits": region_visits,
+            }
+        del st["regions"]
+        for key in ("entry_masks", "sibling_masks", "live_masks"):
+            st[key] = dict(sorted(st[key].items()))
+    return stats, len(files)
 
 
 def validate_wait_blocks_dynamic(kdir, cands, byp, all_byp, max_ctas,
@@ -1456,7 +1823,7 @@ def main():
                 "sites, but static wait opcodes exist (first funcid=%d pc=0x%x)"
                 % static_waits[0]
             )
-        print("[spin-sidecar] no wait instructions; emitting empty v4 sidecar")
+        print("[spin-sidecar] no wait instructions; emitting empty v5 sidecar")
     kdirs = kernel_dir_map(traces)
     want = set(int(x) for x in args.kernels.split(",")) if args.kernels else None
 
@@ -1473,7 +1840,9 @@ def main():
             "discovered", "passed", "failed", "skipped",
             "inject_missing_wait", "fold_captured_poll", "metadata_only",
             "ready_only_all_live_visits", "ready_only_partial_visits",
-            "ready_only_records_with_partial_visits"):
+            "ready_only_records_with_partial_visits",
+            "partial_defer_records", "partial_join_pending_visits",
+            "partial_join_already_issued_visits"):
         report[field] = 0
     report_lines = []
     for kid in sorted(kdirs):
@@ -1486,7 +1855,7 @@ def main():
 
         # Strategy B is exactly the known-good legacy foldable spin-region set.
         # Keep the legacy records unchanged; the future simulator switches owner
-        # only after it can consume sidecar v4.
+        # only after it can consume sidecar v5.
         regions = detect_regions(fid, byp, sync_sites)
         stats, n_ctas = ({}, 0)
         clean = []
@@ -1570,6 +1939,12 @@ def main():
             if not c["cfg_ok"]:
                 _bucket(c, c["reason"])
                 continue
+            wait_ok, wait_reason, canonical = prove_wait_condition(
+                fid, c, byp, sync_sites)
+            if not wait_ok:
+                _bucket(c, wait_reason)
+                continue
+            c["canonical_wait_condition"] = canonical
             st = wb_dyn.get(c["block_id"], {})
             if not st.get("dynamic_ok", False):
                 _bucket(c, st.get("reason", DYNAMIC_PATH_ESCAPE))
@@ -1578,6 +1953,7 @@ def main():
             wb_pass.append(c)
 
         inject_candidates = []
+        ready_only_candidates = []
         metadata_candidates = []
         strategy_failures = []
         for c in wb_pass:
@@ -1587,7 +1963,7 @@ def main():
             path_c = st["path_C_fallback_loop"]
             if path_a > 0 and path_b == 0 and path_c == 0:
                 if st["entry_sync_payload_missing"] == 0:
-                    inject_candidates.append(c)
+                    ready_only_candidates.append(c)
                 else:
                     strategy_failures.append(
                         (c, ENTRY_WAIT_TARGET_UNDECODABLE))
@@ -1597,6 +1973,28 @@ def main():
                 pass
             else:
                 metadata_candidates.append(c)
+
+        partial_candidates = [
+            c for c in ready_only_candidates
+            if c["dynamic"]["partial_entry_visits"] > 0
+        ]
+        partial_proofs = {}
+        if partial_candidates:
+            partial_proofs, _ = validate_partial_join_dynamic(
+                kdirs[kid], partial_candidates, byp,
+                args.validate_ctas, fid)
+        for c in ready_only_candidates:
+            if c["dynamic"]["partial_entry_visits"] == 0:
+                inject_candidates.append(c)
+                continue
+            proof = partial_proofs.get(c["block_id"], {})
+            if not proof.get("dynamic_ok", False):
+                strategy_failures.append(
+                    (c, proof.get("reason", PARTIAL_REGION_INCONSISTENT)))
+                c["partial_join_failure"] = proof
+                continue
+            c["partial_join_proof"] = proof
+            inject_candidates.append(c)
         wb_fail.extend(strategy_failures)
 
         inject_records = [
@@ -1641,12 +2039,21 @@ def main():
         report["ready_only_records_with_partial_visits"] += sum(
             1 for c in inject_candidates
             if c["dynamic"]["partial_entry_visits"] > 0)
+        report["partial_defer_records"] += sum(
+            1 for c in inject_candidates
+            if c.get("partial_join_proof") is not None)
         for c in inject_candidates:
             st = c["dynamic"]
             report["ready_only_all_live_visits"] += \
                 st["all_live_entry_visits"]
             report["ready_only_partial_visits"] += \
                 st["partial_entry_visits"]
+            proof = c.get("partial_join_proof")
+            if proof is not None:
+                report["partial_join_pending_visits"] += \
+                    proof["join_pending_visits"]
+                report["partial_join_already_issued_visits"] += \
+                    proof["join_already_issued_visits"]
 
         report_lines.append(
             "[wait-block] kernel_%d funcid=%d: discovered=%d passed=%d "
@@ -1656,13 +2063,20 @@ def main():
                kernel_metadata))
         for c in inject_candidates:
             st = c["dynamic"]
+            proof = c.get("partial_join_proof")
             report_lines.append(
                 "    INJECT entry=0x%x visits=%d all_live=%d partial=%d "
-                "masks=%s barriers=%s wait_states=%s"
+                "masks=%s barriers=%s wait_states=%s%s"
                 % (c["entry_wait_pc"], st["active_entry_visits"],
                    st["all_live_entry_visits"], st["partial_entry_visits"],
                    st["entry_effective_masks"], st["entry_barrier_addrs"],
-                   st["entry_wait_states"]))
+                   st["entry_wait_states"],
+                   (" partial_action=DEFER_BLOCKED_SUFFIX_THEN_HOLD "
+                    "join=0x%x pending=%d already_issued=%d"
+                    % (proof["region"]["join_pc"],
+                       proof["join_pending_visits"],
+                       proof["join_already_issued_visits"]))
+                   if proof is not None else ""))
         for r in clean:
             if r["foldable"]:
                 report_lines.append(
@@ -1691,9 +2105,11 @@ def main():
                    r["dynamic"]["wait_sync_payload_missing"],
                    r["dynamic"]["wait_condition_mismatches"]))
         for c, reason in wb_fail:
+            detail = c.get("partial_join_failure", {})
             report_lines.append(
-                "    FAIL entry=0x%x reason=%s (fold target: must fix)"
-                % (c["entry_wait_pc"], reason))
+                "    FAIL entry=0x%x reason=%s detail=%s"
+                % (c["entry_wait_pc"], reason,
+                   detail.get("failure_detail")))
         for c, reason in wb_skip:
             report_lines.append(
                 "    SKIP entry=0x%x reason=%s%s"
@@ -1766,11 +2182,16 @@ def main():
           % (report["ready_only_all_live_visits"],
              report["ready_only_partial_visits"],
              report["ready_only_records_with_partial_visits"]))
+    print("[wait-block] PARTIAL defer_records=%d join_pending=%d "
+          "join_already_issued=%d"
+          % (report["partial_defer_records"],
+             report["partial_join_pending_visits"],
+             report["partial_join_already_issued_visits"]))
     for line in report_lines:
         print(line)
 
     sidecar = {
-        "version": 4,
+        "version": 5,
         "schema": "wait_block_sidecar",
         "validation_complete": args.validate_ctas == "all",
         "source_traces_dir": os.path.abspath(traces),
@@ -1778,8 +2199,10 @@ def main():
         "note": (
             "Two independent runtime strategies. INJECT_MISSING_WAIT is emitted "
             "only for a dynamically ready-only gate; modeled-ready replays "
-            "normally, modeled-miss holds only when effective_mask==live_mask, "
-            "and a partial modeled-miss must abort. FOLD_CAPTURED_POLL is emitted "
+            "normally, an all-live modeled miss holds at the entry, and a "
+            "partial modeled miss uses DEFER_BLOCKED_SUFFIX_THEN_HOLD only after "
+            "static CFG and complete dynamic join/capsule proofs. "
+            "FOLD_CAPTURED_POLL is emitted "
             "directly from an existing foldable spin region only after proving "
             "primary-wait control ownership, one static/dynamic wait condition, "
             "idempotent skipped ALU effects, and scoreboard safety over the full "
@@ -1792,6 +2215,14 @@ def main():
             POLL_CONTROL_UNPROVEN, POLL_WAIT_CONDITION_MISMATCH,
             POLL_EFFECT_UNSAFE, POLL_SCOREBOARD_UNSAFE,
             CAPTURED_POLL_ENTRY_NOT_REQUIRED,
+            PARTIAL_MASK_PARTITION_INVALID,
+            PARTIAL_SIBLING_BRANCH_UNRESOLVED,
+            PARTIAL_JOIN_STATIC_UNSAFE,
+            PARTIAL_JOIN_OCCURRENCE_MISSING,
+            PARTIAL_SIBLING_NOT_QUIESCENT,
+            PARTIAL_CAPSULE_MASK_ESCAPE,
+            PARTIAL_POST_JOIN_UNRESOLVED,
+            PARTIAL_REGION_INCONSISTENT,
         ],
         "wait_block_report": dict(report),
         "kernels": out_kernels,
@@ -1817,7 +2248,8 @@ def main():
         "[wait-block] FINAL status=%s validation_complete=%s "
         "discovered=%d passed=%d failed=%d skipped=%d "
         "inject=%d fold=%d metadata=%d all_live=%d partial=%d "
-        "records_with_partial=%d output=%s"
+        "records_with_partial=%d partial_defer_records=%d "
+        "partial_join_pending=%d partial_join_already_issued=%d output=%s"
         % (
             final_status,
             str(sidecar["validation_complete"]).lower(),
@@ -1831,6 +2263,9 @@ def main():
             report["ready_only_all_live_visits"],
             report["ready_only_partial_visits"],
             report["ready_only_records_with_partial_visits"],
+            report["partial_defer_records"],
+            report["partial_join_pending_visits"],
+            report["partial_join_already_issued_visits"],
             out_path,
         )
     )

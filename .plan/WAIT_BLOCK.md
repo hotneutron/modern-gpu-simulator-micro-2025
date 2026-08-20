@@ -6,7 +6,8 @@ PAYLOAD GUARD; SECOND SERVER RUN EXPOSED A FALSE CURSOR-ACCOUNTING AUDIT;
 CAPTURED-POLL PROOF HARDENING IMPLEMENTED AND FULL-TRACE VALIDATED;
 THIRD SERVER RUN CONFIRMED AN ACTUAL K5 PARTIAL MODELED MISS AND STOPPED AT THE
 INTENTIONAL V1 GUARD; K10 POST-FIX VALIDATION IS STILL RUNNING;
-PARTIAL-MISSING-WAIT V2 DESIGN APPROVED, IMPLEMENTATION PENDING.
+PARTIAL-MISSING-WAIT V2 POST-PROCESSING IMPLEMENTED AND FULL-TRACE VALIDATED;
+SIMULATOR V2 IMPLEMENTATION PENDING.
 
 **Extends:** [`SPIN_WAIT_SIM_MODELING.md`](SPIN_WAIT_SIM_MODELING.md) and
 [`SPIN_WAIT_POSTPROCESS.md`](SPIN_WAIT_POSTPROCESS.md).
@@ -1356,6 +1357,22 @@ executes the blocked path. K10 `0xa460` and `0xa810` may revisit the same entry
 before the distant `0xb2c0` join; this is a long blocked-lane path, not evidence
 of runnable sibling work.
 
+The implemented schema-v5 generator passes a strict K5/K10 full-trace scan:
+
+```text
+[wait-block] TOTAL discovered=41 passed=36 failed=0 skipped=5
+[wait-block] READY visits all_live=76224 partial=4596
+[wait-block] PARTIAL defer_records=11
+             join_pending=2076
+             join_already_issued=2520
+[wait-block] FINAL status=PASS validation_complete=true
+```
+
+The pending/already-issued split is visit-specific. A K10 entry may first occur
+before the complementary `0xb2c0` occurrence and later repeat after that
+occurrence has issued. The simulator must track the region's runtime join state;
+it must not infer it from the entry PC alone.
+
 If any static or dynamic condition is not proven, retain:
 
 ```text
@@ -1746,13 +1763,15 @@ Cross-kernel:
 16. [done] Approve the partial v2 design: defer the blocked suffix, issue the
     complementary join, begin the whole-warp hold, and replay the deferred
     suffix after release.
-17. [pending] Extend post-processing and bump the sidecar schema to v5 with static
+17. [done] Extend post-processing and bump the sidecar schema to v5 with static
     wait-arm/join proof, full-trace complementary-mask proof, and linear capsule
-    proof. Regenerate all CTAs in strict mode.
+    proof. The K5/K10 strict scan passes for all 11 partial records and all 4,596
+    visits (`join_pending=2,076`, `join_already_issued=2,520`).
 18. [pending] Extend the strict loader and implement `PARTIAL_ARMED`,
     `PARTIAL_EXTRACT`, `PARTIAL_WAIT_AFTER_JOIN`, and `PARTIAL_REPLAY`.
-19. [pending] Run focused cursor/payload/lifecycle tests, then rerun K5 and K10
-    with the v2 partial policy enabled.
+19. [in progress] Ten post-processing unit tests pass. Add simulator-focused
+    cursor/payload/lifecycle tests, then rerun K5 and K10 with the v2 partial
+    policy enabled.
 
 The design is complete when each runtime action is explained by exactly one of
 the two strategies. No entry action is permitted for a captured-poll record, and
