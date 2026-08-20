@@ -257,9 +257,9 @@ class SM : public core_t, public shader_core_ctx_wrapper {
   // the allowed-skip PC set (region.body_pcs + loopback_bra_pc), advance the
   // trace cursor to region.exit_pc via skip_spin_to_exit (which asserts the
   // post-skip get_pc()==exit_pc and the no-real-work guard), and return the
-  // skipped count + per-class FoldSkipStats. It does NOT touch generation
-  // bookkeeping, pending-wait state, counters, park duration, or histograms;
-  // those stay owned by each caller.
+  // skipped count plus phase-aware cursor/rollback and per-class statistics.
+  // It does NOT touch generation bookkeeping, pending-wait state, counters,
+  // hold duration, or histograms; those stay owned by each caller.
   unsigned fold_cursor_skip_to_exit(unsigned warp_id,
                                     const SpinWaitRegionRecord &region,
                                     FoldSkipStats &out_stats);

@@ -2,7 +2,8 @@
 
 **Status:** POST-PROCESSING V4 IMPLEMENTED AND FULL-TRACE VALIDATED;
 SIMULATOR V1 IMPLEMENTED; FIRST SERVER RUN EXPOSED AND FIXED A PREDICATED-OFF
-PAYLOAD GUARD; POST-FIX K5/K10 RUNTIME VALIDATION PENDING.
+PAYLOAD GUARD; SECOND SERVER RUN EXPOSED A FALSE CURSOR-ACCOUNTING AUDIT;
+POST-FIX K5/K10 RUNTIME VALIDATION PENDING.
 
 **Extends:** [`SPIN_WAIT_SIM_MODELING.md`](SPIN_WAIT_SIM_MODELING.md) and
 [`SPIN_WAIT_POSTPROCESS.md`](SPIN_WAIT_POSTPROCESS.md).
@@ -866,6 +867,21 @@ assert trace_head_pc == poll_loop_exit_pc
 
 The operation stops before the exit instruction.
 
+The IBuffer flush rolls back prefetched-but-unissued trace occurrences before
+the forward skip. Cursor accounting is therefore phase-aware:
+
+```text
+cursor_after_flush <= cursor_before_flush
+prefetched_rollback = cursor_before_flush - cursor_after_flush
+cursor_after_skip >= cursor_after_flush
+cursor_after_skip - cursor_after_flush == skipped
+trace_head_pc == poll_loop_exit_pc
+```
+
+It is invalid to compare `cursor_after_skip - cursor_before_flush` directly
+with `skipped`; that net delta also includes the reverse prefetch rollback and
+may be negative.
+
 It aborts before consuming:
 
 - `BSYNC`, `BSSY`, or `WARPSYNC`;
@@ -1152,8 +1168,12 @@ Cross-kernel:
     active+payload, `897` predicated-off+no-payload, and zero active omissions;
     K10 has `1,901`, `1,879`, and zero respectively.
 13. [in progress] Treat zero-effective mbarrier instructions as architectural
-    no-ops, retain fail-closed payload validation for active actions, and rerun
-    K5/K10 on the server.
+    no-ops and retain fail-closed payload validation for active actions. The
+    second K10 run confirms this fix and reaches captured-poll release, then
+    exposes a false cursor audit: `215 - 2 rollback + 1 skip = 214` lands
+    correctly at `0xb530`, but the old audit expected a net `+1`.
+14. [in progress] Audit IBuffer rollback and forward skip as separate cursor
+    phases, then rerun K5/K10 on the server.
 
 The design is complete when each runtime action is explained by exactly one of
 the two strategies. No entry action is permitted for a captured-poll record, and

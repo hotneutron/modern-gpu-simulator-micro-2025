@@ -2354,7 +2354,19 @@ unsigned SM::fold_cursor_skip_to_exit(unsigned warp_id,
                                       FoldSkipStats &out_stats) {
   trace_shd_warp_t *tw =
       static_cast<trace_shd_warp_t *>(m_physical_warp[warp_id]);
+  const unsigned int cursor_before_flush = tw->used_insts;
   tw->get_IBuffer_remodeled()->flush(false);
+  const unsigned int cursor_after_flush = tw->used_insts;
+  if (cursor_after_flush > cursor_before_flush) {
+    std::cerr << "[WAITBLOCK][abort][SM" << m_sm_id
+              << "] cyc=" << get_current_gpu_cycle()
+              << " reason=poll-prefetch-rollback-direction"
+              << " block=" << region.block_id << " warp=" << warp_id
+              << " cursor_before_flush=" << cursor_before_flush
+              << " cursor_after_flush=" << cursor_after_flush
+              << " action=abort" << std::endl;
+    abort();
+  }
   std::set<address_type> allowed_skip_pcs;
   for (uint64_t bp : region.body_pcs) {
     allowed_skip_pcs.insert(static_cast<address_type>(bp));
@@ -2362,10 +2374,33 @@ unsigned SM::fold_cursor_skip_to_exit(unsigned warp_id,
   // body_pcs deliberately excludes the loopback BRA; add it so the guard lets
   // the cursor advance over the loop-closing branch on its way to exit_pc.
   allowed_skip_pcs.insert(static_cast<address_type>(region.loopback_bra_pc));
-  return tw->skip_spin_to_exit(
+  const unsigned int skipped = tw->skip_spin_to_exit(
       static_cast<address_type>(region.exit_pc),
       static_cast<address_type>(region.loopback_bra_pc), allowed_skip_pcs,
       &out_stats);
+  const unsigned int cursor_after_skip = tw->used_insts;
+  out_stats.cursor_before_flush = cursor_before_flush;
+  out_stats.cursor_after_flush = cursor_after_flush;
+  out_stats.cursor_after_skip = cursor_after_skip;
+  out_stats.prefetched_rollback = cursor_before_flush - cursor_after_flush;
+  if (cursor_after_skip < cursor_after_flush ||
+      cursor_after_skip - cursor_after_flush != skipped ||
+      out_stats.warp_insts != skipped ||
+      tw->get_pc() != region.exit_pc) {
+    std::cerr << "[WAITBLOCK][abort][SM" << m_sm_id
+              << "] cyc=" << get_current_gpu_cycle()
+              << " reason=poll-cursor-accounting"
+              << " block=" << region.block_id << " warp=" << warp_id
+              << " expected_exit_pc=0x" << format_hex_u64(region.exit_pc)
+              << " actual_landing_pc=0x" << format_hex_u64(tw->get_pc())
+              << " cursor_before_flush=" << cursor_before_flush
+              << " cursor_after_flush=" << cursor_after_flush
+              << " prefetched_rollback=" << out_stats.prefetched_rollback
+              << " cursor_after_skip=" << cursor_after_skip
+              << " skipped=" << skipped << " action=abort" << std::endl;
+    abort();
+  }
+  return skipped;
 }
 
 void SM::service_wait_block_release(unsigned warp_id) {
@@ -2542,22 +2577,9 @@ void SM::service_wait_block_release(unsigned warp_id) {
 
   trace_shd_warp_t *tw =
       static_cast<trace_shd_warp_t *>(m_physical_warp[warp_id]);
-  const unsigned int used_before = tw->used_insts;
   FoldSkipStats skip_stats;
   const unsigned skipped =
       fold_cursor_skip_to_exit(warp_id, region, skip_stats);
-  const unsigned int used_after = tw->used_insts;
-  if (tw->get_pc() != region.exit_pc || used_after - used_before != skipped) {
-    std::cerr << "[WAITBLOCK][abort][SM" << m_sm_id << "] cyc=" << now
-              << " reason=poll-landing-audit"
-              << " block=" << block << " warp=" << warp_id
-              << " expected_exit_pc=0x" << format_hex_u64(region.exit_pc)
-              << " actual_landing_pc=0x" << format_hex_u64(tw->get_pc())
-              << " used_before=" << used_before
-              << " used_after=" << used_after << " skipped=" << skipped
-              << " action=abort" << std::endl;
-    abort();
-  }
 
   if (m_fold_pace_by_warp.size() <= warp_id) {
     m_fold_pace_by_warp.resize(MAX_WARP_PER_SHADER);
@@ -2599,8 +2621,14 @@ void SM::service_wait_block_release(unsigned warp_id) {
           " cta=" + std::to_string(pending_wait.key.cta_id) +
           " warp=" + std::to_string(warp_id) + " poll_pc=0x" +
           format_hex_u64(pending_wait.action_pc) +
-          " used_before=" + std::to_string(used_before) +
-          " used_after=" + std::to_string(used_after) +
+          " cursor_before_flush=" +
+          std::to_string(skip_stats.cursor_before_flush) +
+          " cursor_after_flush=" +
+          std::to_string(skip_stats.cursor_after_flush) +
+          " prefetched_rollback=" +
+          std::to_string(skip_stats.prefetched_rollback) +
+          " cursor_after_skip=" +
+          std::to_string(skip_stats.cursor_after_skip) +
           " skipped=" + std::to_string(skipped) +
           " per_pc=" + (first_pc ? std::string("<none>") : per_pc.str()) +
           " phasechk_trywait=" +
@@ -3018,30 +3046,9 @@ void SM::handle_sync_instruction(warp_inst_t &inst, unsigned int warp_id) {
                       << " action=abort" << std::endl;
             abort();
           }
-          trace_shd_warp_t *tw =
-              static_cast<trace_shd_warp_t *>(m_physical_warp[warp_id]);
-          const unsigned int used_before = tw->used_insts;
           FoldSkipStats skip_stats;
           const unsigned skipped =
               fold_cursor_skip_to_exit(warp_id, poll_region, skip_stats);
-          const unsigned int used_after = tw->used_insts;
-          if (tw->get_pc() != poll_region.exit_pc ||
-              used_after - used_before != skipped) {
-            std::cerr << "[WAITBLOCK][abort][SM" << m_sm_id << "] cyc="
-                      << get_current_gpu_cycle()
-                      << " reason=immediate-poll-landing-audit"
-                      << " warp=" << warp_id << " poll_pc=0x"
-                      << format_hex_u64(inst.pc)
-                      << " expected_exit_pc=0x"
-                      << format_hex_u64(poll_region.exit_pc)
-                      << " actual_landing_pc=0x"
-                      << format_hex_u64(tw->get_pc())
-                      << " used_before=" << used_before
-                      << " used_after=" << used_after
-                      << " skipped=" << skipped << " action=abort"
-                      << std::endl;
-            abort();
-          }
           m_fold_immediate_folds_total++;
           m_fold_immediate_skipped_insts_total += skipped;
           m_fold_skipped_insts_total += skipped;
@@ -3074,8 +3081,14 @@ void SM::handle_sync_instruction(warp_inst_t &inst, unsigned int warp_id) {
                     " cta=" + std::to_string(key.cta_id) +
                     " warp=" + std::to_string(warp_id) + " poll_pc=0x" +
                     format_hex_u64(inst.pc) +
-                    " used_before=" + std::to_string(used_before) +
-                    " used_after=" + std::to_string(used_after) +
+                    " cursor_before_flush=" +
+                    std::to_string(skip_stats.cursor_before_flush) +
+                    " cursor_after_flush=" +
+                    std::to_string(skip_stats.cursor_after_flush) +
+                    " prefetched_rollback=" +
+                    std::to_string(skip_stats.prefetched_rollback) +
+                    " cursor_after_skip=" +
+                    std::to_string(skip_stats.cursor_after_skip) +
                     " skipped=" + std::to_string(skipped) +
                     " per_pc=" +
                     (first_pc ? std::string("<none>") : per_pc.str()) +
@@ -3089,7 +3102,11 @@ void SM::handle_sync_instruction(warp_inst_t &inst, unsigned int warp_id) {
                     " other=" + std::to_string(skip_stats.other) +
                     " expected_exit_pc=0x" +
                     format_hex_u64(poll_region.exit_pc) +
-                    " actual_landing_pc=0x" + format_hex_u64(tw->get_pc()));
+                    " actual_landing_pc=0x" +
+                    format_hex_u64(
+                        static_cast<trace_shd_warp_t *>(
+                            m_physical_warp[warp_id])
+                            ->get_pc()));
           }
         }
 

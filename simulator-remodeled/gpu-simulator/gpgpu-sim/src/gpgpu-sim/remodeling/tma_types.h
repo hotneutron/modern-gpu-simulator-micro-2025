@@ -258,6 +258,10 @@ struct SpinWaitRegionRecord {
 // only sound when NO semantic/local-memory/HGMMA/MUFU/TMA/BAR work is skipped;
 // those fields MUST be zero (asserted at the skip site).
 struct FoldSkipStats {
+  unsigned int cursor_before_flush = 0;  // includes prefetched occurrences
+  unsigned int cursor_after_flush = 0;   // after IBuffer rollback
+  unsigned int cursor_after_skip = 0;    // after residual poll consumption
+  unsigned int prefetched_rollback = 0;  // before_flush - after_flush
   unsigned int warp_insts = 0;          // total dynamic warp-instruction entries skipped
   unsigned int phasechk_trywait = 0;    // PHASECHK / TRYWAIT polls
   unsigned int nanosleep = 0;           // backoff/yield
