@@ -2820,6 +2820,41 @@ uint64_t SM::expected_gen_for_wait(unsigned int warp_id,
 }
 
 void SM::handle_sync_instruction(warp_inst_t &inst, unsigned int warp_id) {
+  if (inst.active_count() == 0) {
+    if (m_config->wait_block_enable && m_config->wait_block_debug) {
+      MissingWaitRecord missing_record;
+      SpinWaitRegionRecord poll_record;
+      const bool has_missing_action = m_gpu->lookup_missing_wait(
+          inst.trace_kernel_id, inst.unique_function_id, inst.pc,
+          missing_record);
+      const bool has_poll_action = m_gpu->lookup_spin_wait_region(
+          inst.trace_kernel_id, inst.unique_function_id, inst.pc, poll_record);
+      if (has_missing_action || has_poll_action) {
+        debug_log_wait_block_event(
+            "predicated-off-noop",
+            "strategy=" +
+                std::string(has_missing_action ? "INJECT_MISSING_WAIT"
+                                               : "FOLD_CAPTURED_POLL") +
+                " block=" +
+                (has_missing_action ? missing_record.block_id
+                                    : poll_record.block_id) +
+                " trace_kernel=" + std::to_string(inst.trace_kernel_id) +
+                " function=" + std::to_string(inst.unique_function_id) +
+                " cta=" +
+                std::to_string(m_physical_warp[warp_id]->get_cta_id()) +
+                " warp=" + std::to_string(warp_id) + " action_pc=0x" +
+                format_hex_u64(inst.pc) + " effective_mask=0x" +
+                format_hex_u64(inst.get_active_mask().to_ullong()) +
+                " trace_active_mask=0x" +
+                format_hex_u64(inst.trace_active_mask) +
+                " trace_predicate_mask=0x" +
+                format_hex_u64(inst.trace_predicate_mask) +
+                " sync_runtime_valid=" +
+                std::to_string(inst.sync_runtime_valid));
+      }
+    }
+    return;
+  }
   if (!inst.sync_site_valid || !inst.sync_runtime_valid) {
     if (m_config->wait_block_enable) {
       MissingWaitRecord missing_record;
@@ -2842,6 +2877,15 @@ void SM::handle_sync_instruction(warp_inst_t &inst, unsigned int warp_id) {
                   << format_hex_u64(inst.pc)
                   << " sync_site_valid=" << inst.sync_site_valid
                   << " sync_runtime_valid=" << inst.sync_runtime_valid
+                  // #region debug-point F:runtime-action-mask
+                  << " effective_mask=0x"
+                  << format_hex_u64(inst.get_active_mask().to_ullong())
+                  << " trace_masks_valid=" << inst.trace_masks_valid
+                  << " trace_active_mask=0x"
+                  << format_hex_u64(inst.trace_active_mask)
+                  << " trace_predicate_mask=0x"
+                  << format_hex_u64(inst.trace_predicate_mask)
+                  // #endregion
                   << " action=abort" << std::endl;
         abort();
       }

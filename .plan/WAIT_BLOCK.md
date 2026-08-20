@@ -1,7 +1,8 @@
 # WaitBlock: Two-Strategy Post-Processing and Simulator Design
 
 **Status:** POST-PROCESSING V4 IMPLEMENTED AND FULL-TRACE VALIDATED;
-SIMULATOR V1 IMPLEMENTED; SERVER BUILD AND K5/K10 RUNTIME VALIDATION PENDING.
+SIMULATOR V1 IMPLEMENTED; FIRST SERVER RUN EXPOSED AND FIXED A PREDICATED-OFF
+PAYLOAD GUARD; POST-FIX K5/K10 RUNTIME VALIDATION PENDING.
 
 **Extends:** [`SPIN_WAIT_SIM_MODELING.md`](SPIN_WAIT_SIM_MODELING.md) and
 [`SPIN_WAIT_POSTPROCESS.md`](SPIN_WAIT_POSTPROCESS.md).
@@ -397,8 +398,12 @@ For `INJECT_MISSING_WAIT`, equivalent static probes belonging to the same gate
 must have equivalent reaching definitions. Equal immediate offsets alone are not
 sufficient.
 
-For `FOLD_CAPTURED_POLL`, the runtime payload at `poll_probe_pc` remains the
-authority used by the already-successful fold path.
+For `FOLD_CAPTURED_POLL`, the runtime payload at an active `poll_probe_pc`
+occurrence remains the authority used by the already-successful fold path.
+A predicated-off occurrence has `effective_mask == 0`, is an architectural
+no-op, and may legitimately omit the runtime payload. Strict post-processing
+must prove that every active poll occurrence has a valid payload while counting
+predicated-off occurrences separately.
 
 ### 1.9 Sidecar schema
 
@@ -761,6 +766,11 @@ Lookup occurs only at `entry_probe_pc`.
 The entry probe executes normally. Runtime then evaluates the modeled wait.
 
 ```text
+if effective_mask == 0:
+    treat the instruction as a predicated-off no-op
+    do not require runtime payload
+    do not create a hold or advance a cursor
+
 if modeled ready:
     continue normal trace replay
 
@@ -813,6 +823,11 @@ Lookup occurs only when the captured trace reaches `poll_probe_pc`.
 The poll probe executes normally.
 
 ```text
+if effective_mask == 0:
+    treat the instruction as a predicated-off no-op
+    do not require runtime payload
+    do not fold, hold, or advance a cursor
+
 if modeled ready:
     fold residual captured poll-loop occurrences immediately
 
@@ -1125,13 +1140,20 @@ Cross-kernel:
    separate entry-only path.
 10. [done] Add strict loader, identity, generation, landing, and lifecycle
    guards.
-11. [in progress] Static sidecar-accounting, stale-field, whitespace,
+11. [done] Static sidecar-accounting, stale-field, whitespace,
     hardcoding, metadata-only serialization, and closed cursor-opcode audits
     pass. Full-CTA strict regeneration on the compact trace passes with the
     reviewed `43/36/0/7`, `22/14`, and `76,224/4,596` results. A local C++ build
     is unavailable because this macOS environment has no CUDA headers; compile
     validation remains a server step.
-12. [not started] The user builds and runs K5/K10.
+12. [done] The first server K5/K10 run identifies a common
+    `runtime-action-payload-missing` abort. Raw protobuf census proves payload
+    omission occurs only on predicated-off poll probes: K5 has `3,169`
+    active+payload, `897` predicated-off+no-payload, and zero active omissions;
+    K10 has `1,901`, `1,879`, and zero respectively.
+13. [in progress] Treat zero-effective mbarrier instructions as architectural
+    no-ops, retain fail-closed payload validation for active actions, and rerun
+    K5/K10 on the server.
 
 The design is complete when each runtime action is explained by exactly one of
 the two strategies. No entry action is permitted for a captured-poll record, and

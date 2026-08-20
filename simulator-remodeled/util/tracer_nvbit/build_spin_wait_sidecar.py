@@ -953,27 +953,50 @@ def kernel_dir_map(traces_dir):
     return out
 
 
-def validate_dynamic(kdir, regions, byp, max_ctas):
+def validate_dynamic(kdir, fid, regions, max_ctas):
     """Confirm each region's anchors appear in the recorded producer streams and
-    the body actually repeats (spins). Returns per-region dynamic stats."""
+    the body actually repeats (spins). Active poll probes must carry a runtime
+    sync payload; predicated-off probes are architectural no-ops and may omit it.
+    Returns per-region dynamic stats."""
     files = sorted(p for p in glob.glob(os.path.join(kdir, "*.pb")))
     if max_ctas != "all":
         files = files[:int(max_ctas)]
     loopback_pcs = {r["loopback_bra_pc"] for r in regions}
+    regions_by_poll = {}
+    for r in regions:
+        regions_by_poll.setdefault(r["primary_wait_pc"], []).append(r)
     stats = {r["region_id"]: {
         # a "visit" is one (cta, warp) that entered this region at least once;
         # iters is the number of loopback-BRA executions in that visit.
         "warp_visits": 0, "total_iters": 0, "max_iters": 0,
-        "min_iters": None, "single_shot_visits": 0} for r in regions}
+        "min_iters": None, "single_shot_visits": 0,
+        "active_poll_visits": 0,
+        "predicated_off_poll_occurrences": 0,
+        "poll_sync_payload_missing": 0} for r in regions}
     for f in files:
-        warps = dict((k, [pc for pc, _ in insts])
-                     for k, insts in _ts._vpb_parse(open(f, "rb").read()))
-        for wid, pcs in warps.items():
+        warps = vpb_parse_full(open(f, "rb").read())
+        for wid, insts in warps:
             # count loopback occurrences per region -> iteration count in this warp
             per_region = Counter()
-            for p in pcs:
+            for inst in insts:
+                if inst["function_unique_id"] != fid:
+                    continue
+                p = inst["pc"]
                 if p in loopback_pcs:
                     per_region[p] += 1
+                for r in regions_by_poll.get(p, []):
+                    s = stats[r["region_id"]]
+                    effective = (
+                        int(inst["active_mask"]) &
+                        int(inst["predicate_mask"])
+                    )
+                    if effective == 0:
+                        s["predicated_off_poll_occurrences"] += 1
+                    else:
+                        s["active_poll_visits"] += 1
+                        if (not inst["sync_valid"]
+                                or inst["barrier_addr"] is None):
+                            s["poll_sync_payload_missing"] += 1
             # attribute loopback pc -> region (one visit per (cta,warp) that entered)
             for r in regions:
                 lb = r["loopback_bra_pc"]
@@ -992,6 +1015,10 @@ def validate_dynamic(kdir, regions, byp, max_ctas):
     for r in regions:
         s = stats[r["region_id"]]
         s["is_spin_loop"] = bool(s["warp_visits"]) and s["max_iters"] > 1
+        s["active_poll_payload_complete"] = (
+            s["active_poll_visits"] > 0 and
+            s["poll_sync_payload_missing"] == 0
+        )
     return stats, len(files)
 
 
@@ -1000,6 +1027,7 @@ def validate_dynamic(kdir, regions, byp, max_ctas):
 DYNAMIC_PATH_ESCAPE = "DYNAMIC_PATH_ESCAPE"
 CTA_IDENTITY_MISMATCH = "CTA_IDENTITY_MISMATCH"
 ENTRY_WAIT_TARGET_UNDECODABLE = "ENTRY_WAIT_TARGET_UNDECODABLE"
+POLL_WAIT_TARGET_UNDECODABLE = "POLL_WAIT_TARGET_UNDECODABLE"
 CAPTURED_POLL_ENTRY_NOT_REQUIRED = "CAPTURED_POLL_ENTRY_NOT_REQUIRED"
 
 
@@ -1240,10 +1268,11 @@ def main():
         regions = detect_regions(fid, byp, sync_sites)
         stats, n_ctas = ({}, 0)
         clean = []
-        foldable_body_pcs = set()
+        captured_poll_body_pcs = set()
+        fold_failures = []
         if regions:
             stats, n_ctas = validate_dynamic(
-                kdirs[kid], regions, byp, args.validate_ctas)
+                kdirs[kid], fid, regions, args.validate_ctas)
             for r in regions:
                 st = stats[r["region_id"]]
                 r_out = dict(r)
@@ -1259,21 +1288,29 @@ def main():
                 # The simulator folds only an actual spin loop whose body has no
                 # semantic/local work, matches the closed opcode model, and has
                 # self-tied SASS wait barriers.
-                r_out["foldable"] = bool(
+                fold_shape = bool(
                     st["is_spin_loop"] and r["semantic_free_body"]
                     and not r["local_mem_ops_in_body"]
                     and r["barrier_self_tied"] and effect_safe)
-                if r_out["foldable"]:
+                r_out["foldable"] = bool(
+                    fold_shape and st["active_poll_payload_complete"])
+                if fold_shape:
                     # PCs from loop head through the loopback branch: any
                     # wait-block fallback overlapping these is a fold target.
                     lo, hi = r["loop_head_pc"], r["loopback_bra_pc"]
-                    foldable_body_pcs.update(
+                    captured_poll_body_pcs.update(
                         range(lo, hi + ISIZE, ISIZE))
+                    if not st["active_poll_payload_complete"]:
+                        fold_failures.append(
+                            (r_out, POLL_WAIT_TARGET_UNDECODABLE))
                 clean.append(r_out)
 
         def _is_fold_target(c):
             """Whether a candidate's captured poll arm has a legacy fold owner."""
-            return bool(set(c.get("fallback_body_pcs", [])) & foldable_body_pcs)
+            return bool(
+                set(c.get("fallback_body_pcs", [])) &
+                captured_poll_body_pcs
+            )
 
         # Strategy A discovery has no application, kernel, function, name, PC,
         # CTA, warp, or SM filter. The same candidate proof is run independently
@@ -1355,7 +1392,7 @@ def main():
                     "duplicate wait-block runtime key %r" % (key,))
             action_keys.add(key)
 
-        kernel_failed = len(wb_fail)
+        kernel_failed = len(wb_fail) + len(fold_failures)
         kernel_skipped = len(wb_skip)
         kernel_metadata = len(metadata_candidates)
         kernel_passed = len(strategy_records) + kernel_metadata
@@ -1397,11 +1434,20 @@ def main():
             if r["foldable"]:
                 report_lines.append(
                     "    FOLD poll=0x%x head=0x%x loopback=0x%x exit=0x%x "
-                    "visits=%d iters=%d"
+                    "visits=%d iters=%d active_polls=%d predicated_off=%d"
                     % (r["primary_wait_pc"], r["loop_head_pc"],
                        r["loopback_bra_pc"], r["exit_pc"],
                        r["dynamic"]["warp_visits"],
-                       r["dynamic"]["total_iters"]))
+                       r["dynamic"]["total_iters"],
+                       r["dynamic"]["active_poll_visits"],
+                       r["dynamic"]["predicated_off_poll_occurrences"]))
+        for r, reason in fold_failures:
+            report_lines.append(
+                "    FAIL poll=0x%x reason=%s active_polls=%d "
+                "payload_missing=%d"
+                % (r["primary_wait_pc"], reason,
+                   r["dynamic"]["active_poll_visits"],
+                   r["dynamic"]["poll_sync_payload_missing"]))
         for c, reason in wb_fail:
             report_lines.append(
                 "    FAIL entry=0x%x reason=%s (fold target: must fix)"
