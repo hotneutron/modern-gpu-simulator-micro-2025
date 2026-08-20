@@ -4,7 +4,9 @@
 SIMULATOR V1 IMPLEMENTED; FIRST SERVER RUN EXPOSED AND FIXED A PREDICATED-OFF
 PAYLOAD GUARD; SECOND SERVER RUN EXPOSED A FALSE CURSOR-ACCOUNTING AUDIT;
 CAPTURED-POLL PROOF HARDENING IMPLEMENTED AND FULL-TRACE VALIDATED;
-POST-FIX K5/K10 RUNTIME VALIDATION PENDING.
+THIRD SERVER RUN CONFIRMED AN ACTUAL K5 PARTIAL MODELED MISS AND STOPPED AT THE
+INTENTIONAL V1 GUARD; K10 POST-FIX VALIDATION IS STILL RUNNING;
+PARTIAL-MISSING-WAIT V2 DESIGN APPROVED, IMPLEMENTATION PENDING.
 
 **Extends:** [`SPIN_WAIT_SIM_MODELING.md`](SPIN_WAIT_SIM_MODELING.md) and
 [`SPIN_WAIT_POSTPROCESS.md`](SPIN_WAIT_POSTPROCESS.md).
@@ -74,13 +76,21 @@ Terminology:
 Hard invariants:
 
 - Every selected probe executes once before a wait hold can begin.
-- `INJECT_MISSING_WAIT` never advances either trace cursor.
+- The all-live `INJECT_MISSING_WAIT` path never advances either trace cursor.
+- The approved partial extension never holds the whole warp at the partial
+  entry. It may extract blocked-lane occurrences into an owned replay queue,
+  but it never discards or semantically consumes them.
+- A partial whole-warp hold begins only after the complementary join occurrence
+  has actually issued.
 - `FOLD_CAPTURED_POLL` never acts at the entry probe.
 - Poll folding stops before `poll_loop_exit_pc`.
 - Mainline, complementary-lane, reconvergence, and semantic instructions are
   never consumed by poll folding.
-- A ready-only partial-mask modeled miss never silently continues and never
-  becomes a whole-warp wait hold; it aborts with a complete diagnostic.
+- Under the current v1 implementation, a ready-only partial-mask modeled miss
+  never silently continues and never becomes a whole-warp wait hold; it aborts
+  with a complete diagnostic. Under the approved v2 design, it may hold only
+  after the complementary join occurrence has issued and all extracted blocked
+  occurrences are owned by the replay queue.
 - Generation overshoot and a 32,000-cycle wait-hold timeout abort.
 - Feature-off behavior is bit-identical.
 
@@ -1094,6 +1104,491 @@ No lane-group implementation is part of this v1 document. The
 `UNSUPPORTED_PARTIAL_MISSING_WAIT` abort remains enabled until a separately
 reviewed design replaces it.
 
+#### K5 `.e80`: actual partial modeled miss confirmed
+
+The third server run reached the previously hypothetical v1 boundary. Its first
+fatal event was:
+
+```text
+[WAITBLOCK][UNSUPPORTED_PARTIAL_MISSING_WAIT][SM103]
+cyc=44865
+block=wb_fid3_e0x93b0
+trace_kernel=5
+function=3
+cta=0
+global_cta=103
+warp=0
+entry_probe_pc=0x93b0
+active_mask=0x1
+predicate_mask=0x1
+effective_mask=0x1
+live_mask=0xffffffff
+barrier=0x16c48
+wait_state=0x0
+current_gen=4
+expected_gen=5
+captured_ready_visits=264
+all_live_entry_visits=0
+partial_entry_visits=264
+scheduler_mutation=none
+cursor_mutation=none
+action=abort
+```
+
+This proves that a captured partial entry can become a modeled miss. The
+partial-lane design is therefore required for K5 completion and is no longer a
+hypothetical future extension.
+
+The abort is not a regression in the captured-poll path:
+
+- K5 completed 2,669 poll advances before the guard;
+- all 2,667 non-interleaved poll-advance records satisfy rollback direction,
+  forward-skip distance, per-PC/opcode accounting, and exact local-exit landing;
+- two poll-advance log lines were split by concurrent stderr output and are not
+  runtime invariant failures;
+- maximum completed hold duration was 7,625 cycles and maximum heartbeat age was
+  8,192 cycles, both below the 32,000-cycle watchdog;
+- no generation, payload, sidecar, or cursor fatal preceded the partial guard;
+- the subsequent signal 11, undefined `UIADD3`, and final signal 6 are secondary
+  failures after the deliberate abort.
+
+The source trace for global CTA 103, warp 0 shows why the guard cannot be
+replaced by passthrough or cursor advance. After the active lane-0 `0x93b0`
+probe, the captured ready path contains lane-0 IMAD/R2UR/UIADD3 setup,
+`SYNCS.ARRIVE.TRANS64` at `0x94d0`, `UTMALDG.4D` at `0x94e0`, and lane-0
+`WARPSYNC.ALL` at `0x9500`; the complementary `0xfffffffe` WARPSYNC occurrence
+follows. A modeled miss must not execute or consume that lane-0 semantic suffix
+before release.
+
+For SM103, barrier `0x16c48` is configured for three arrivals and prior
+generations are completed by warps 4, 8, and 12. The failing occurrence had one
+of three arrivals for generation 5. This makes a conservative whole-warp hold
+worth evaluating, because the known producer warps are distinct from held warp
+0, but it does not prove timing equivalence for the live sibling lanes.
+
+This result requires deferred handling of the blocked lane suffix. A direct
+whole-warp hold at the partial entry is rejected because the complementary join
+occurrence has not yet issued in the simulator's linear trace stream. The
+approved v2 design is specified below. Until it is implemented, `0x93b0` and
+every other partial modeled miss must continue to abort without scheduler or
+cursor mutation. K5 should not be rerun with the same v1 policy. K10 validation
+can continue independently.
+
+#### Approved v2 partial policy: defer blocked suffix, issue join, then hold
+
+The design review selected a bounded deferred-occurrence implementation. It
+does not add general lane-group cursors and it does not permit a whole-warp hold
+at the partial entry.
+
+The action remains a sub-policy of a ready-only `INJECT_MISSING_WAIT` record:
+
+```text
+partial_modeled_miss_action = DEFER_BLOCKED_SUFFIX_THEN_HOLD
+partial_hold_proof_version = 1
+```
+
+This metadata changes the mandatory partial action from `ABORT` to a
+cursor-owning replay contract and therefore requires a sidecar schema bump.
+Schema v4 remains the current implemented format; the approved implementation
+must emit and require schema v5.
+
+The entry probe still owns the modeled readiness observation. The scheduler
+hold, however, starts only after the complementary lane group has issued its
+proven join occurrence.
+
+##### Partial-miss execution flow
+
+```mermaid
+flowchart TD
+    A["Partial entry probe issues<br/>blocked mask M"] --> B{"Modeled ready?"}
+    B -->|yes| C["Normal captured replay"]
+    B -->|no| D["PARTIAL_ARMED<br/>no scheduler hold"]
+    D --> E["Issue proven setup and<br/>controlling branch"]
+    E --> F["Flush IBuffer<br/>extract M-owned ready suffix"]
+    F --> G["Issue complementary<br/>join occurrence with mask C"]
+    G --> H["PARTIAL_WAIT_AFTER_JOIN<br/>whole-warp hold starts here"]
+    H --> I{"Expected generation ready?"}
+    I -->|no| H
+    I -->|yes| J["PARTIAL_REPLAY<br/>issue deferred M suffix"]
+    J --> K["Issue blocked join occurrence<br/>assert source head = post_join_pc"]
+    K --> L["Resume canonical replay<br/>with full live mask"]
+
+    X["Forbidden:<br/>whole-warp hold at entry"] -. suppresses sibling join .-> G
+```
+
+The two lane groups have different logical positions while the scheduler hold
+is active:
+
+```text
+blocked lanes M:
+    virtual uncaptured wait arm
+
+complementary lanes C:
+    join occurrence already issued
+
+canonical source cursor:
+    parked at post_join_pc
+
+deferred replay queue:
+    owns every blocked-lane occurrence from captured_ready_pc through the
+    blocked join occurrence
+```
+
+This distinction is mandatory. The earlier K10 failure demonstrated:
+
+```text
+clean:
+    0xa9c0 miss
+    -> complementary WARPSYNC 0xb2c0 issues
+    -> lane 0 reaches captured poll 0xb980
+    -> hold and release
+
+failed:
+    whole-warp hold at partial entry 0xa9c0
+    -> complementary 0xb2c0 never issues
+    -> barrier 0x31020 remains at generation 0
+    -> watchdog
+```
+
+A static branch target at a join proves the sibling lane's logical destination.
+It does not prove that the corresponding dynamic join occurrence has already
+issued in the linear trace-driven simulator.
+
+##### Post-processing proof
+
+Post-processing combines static CFG/SASS proof with the existing full dynamic
+mask scan. It does not attempt to prove EXCH, ARRIVE, TMA, or transitive release
+dependencies. Release liveness remains guarded by the runtime generation audit
+and 32,000-cycle watchdog.
+
+For each partial-capable ready-only record, emit:
+
+```text
+entry_probe_pc
+entry_setup_pcs
+entry_branch_pc
+entry_branch_not_ready_polarity
+miss_arm_entry_pc
+miss_arm_wait_pcs
+miss_arm_loopback_pc
+miss_arm_exit_pc
+captured_ready_pc
+
+sibling_branch_pc
+sibling_branch_target_pc
+join_pc
+post_join_pc
+join_kind
+
+observed_entry_masks
+observed_sibling_masks
+observed_live_masks
+
+complementary_masks_complete
+sibling_join_only
+blocked_path_reaches_same_join
+linear_capsule_safe
+```
+
+The static proof must establish:
+
+1. `entry_probe_pc` defines the predicate consumed by `entry_branch_pc`.
+2. The not-ready branch targets `miss_arm_entry_pc`.
+3. The not-ready arm is a bounded pure wait/control/backoff region.
+4. All arm waits use the same normalized barrier and wait-state expressions as
+   the entry.
+5. The arm exits to `captured_ready_pc`.
+6. A dominating sibling branch sends the complementary path to `join_pc`.
+7. The blocked path also reaches `join_pc`.
+8. `join_pc` is `WARPSYNC` or a statically matched `BSSY`/`BSYNC`.
+9. `post_join_pc` is the first instruction after the join.
+10. There is no unresolved indirect control, call, return, or exit inside the
+    capsule boundary.
+
+For each validated dynamic partial visit:
+
+```text
+M = entry effective_mask
+C = live_mask & ~M
+```
+
+The dynamic proof must establish:
+
+1. `M` and `C` are both nonzero, disjoint, and their union is `live_mask`.
+2. Before the entry, the sibling branch occurrence executes with mask `C` and
+   targets `join_pc`.
+3. From that branch through the capsule, the only `C` occurrence is the sibling
+   join occurrence.
+4. Every blocked-path occurrence has raw active mask contained in `M`.
+   Ownership uses raw `active_mask`, not `effective_mask`, so predicated-off
+   instructions retain their lane-group identity.
+5. The blocked and sibling join occurrences use the same `join_pc`, have
+   disjoint masks, and their union is `live_mask`.
+6. The next occurrence at `post_join_pc` covers `live_mask`.
+7. No mixed-mask occurrence, unclassified lane group, or trace exhaustion is
+   encountered before `post_join_pc`.
+8. Every deferred occurrence retains its complete dynamic payload. Semantic
+   instructions are moved to replay storage, never skipped.
+
+The full K5/K10 trace currently has four proven sibling-quiescence regions:
+
+```text
+K5  0x93b0:
+    sibling branch 0x9220 -> WARPSYNC 0x9500
+    post-join 0x9510
+
+K5  0x9930, 0x9aa0:
+    sibling branch 0x97b0 -> BSYNC 0x9c20
+    post-join 0x9c30
+
+K5  0xab40, 0xabc0, 0xac00:
+    sibling branch 0xaaf0 -> BSYNC 0xac80
+    post-join 0xac90
+
+K10 0x9ef0, 0xa460, 0xa810, 0xac10, 0xb000:
+    sibling branch 0x9ea0 -> WARPSYNC 0xb2c0
+    post-join 0xb2d0
+```
+
+Across all 4,596 observed partial visits, complementary lanes perform no
+semantic work after their branch. They wait at the listed join while lane 0
+executes the blocked path. K10 `0xa460` and `0xa810` may revisit the same entry
+before the distant `0xb2c0` join; this is a long blocked-lane path, not evidence
+of runnable sibling work.
+
+If any static or dynamic condition is not proven, retain:
+
+```text
+partial_modeled_miss_action = ABORT
+```
+
+##### Runtime state
+
+The partial sub-policy needs one bounded per-warp capsule:
+
+```text
+NONE
+PARTIAL_ARMED
+PARTIAL_EXTRACT
+PARTIAL_WAIT_AFTER_JOIN
+PARTIAL_REPLAY
+```
+
+Common capsule state:
+
+```text
+block and action identity
+blocked mask M
+sibling mask C
+barrier key and wait state
+expected generation
+entry branch PC
+captured ready PC
+join PC and post-join PC
+hold start and heartbeat cycles
+owned deferred-occurrence queue
+sibling-join-issued flag
+source cursor audit coordinates
+```
+
+There is still one authoritative linear source cursor. The deferred queue is a
+temporary owner of already-extracted occurrences, not a second lane-group trace
+cursor.
+
+##### Entry and arming
+
+At `entry_probe_pc`:
+
+```text
+effective_mask == 0:
+    architectural no-op
+
+modeled ready:
+    normal replay
+
+modeled miss and effective_mask == live_mask:
+    existing MISSING_WAIT_HOLD
+
+modeled miss and effective_mask != live_mask
+and partial proof is absent:
+    UNSUPPORTED_PARTIAL_MISSING_WAIT
+    abort
+
+modeled miss and effective_mask != live_mask
+and partial proof is complete:
+    pin barrier key, wait state, expected generation, M, and C
+    enter PARTIAL_ARMED
+    do not change scheduler eligibility
+    do not change either trace cursor
+```
+
+`PARTIAL_ARMED` permits the sidecar-listed `entry_setup_pcs` and the controlling
+entry branch to issue normally. The captured branch occurrence may be
+predicated off because the hardware capture was ready. Runtime treats it as the
+control marker for the modeled not-ready arm; it does not redirect the canonical
+trace to uncaptured PCs.
+
+If any PC other than the proven setup sequence and branch occurs while armed,
+abort before extraction.
+
+##### Blocked-suffix extraction
+
+After the controlling branch issues:
+
+1. Flush the warp IBuffer.
+2. Audit that every prefetched traced occurrence rolls both source cursors back.
+3. Starting at `captured_ready_pc`, inspect source occurrences in linear order.
+4. Move every occurrence owned by `M` into the deferred queue, preserving its
+   PC, opcode, active/predicate masks, sync payload, memory payload, and original
+   sequence identity.
+5. Continue until the complementary `join_pc` occurrence owned by `C` is found.
+6. Stop with the canonical source head at `post_join_pc`.
+
+Extraction is not poll folding:
+
+```text
+fold:
+    consume a proven effect-free occurrence permanently
+
+partial extraction:
+    transfer ownership of a semantic occurrence from the source stream to the
+    deferred replay queue
+```
+
+Every extracted source occurrence advances both authoritative source cursors
+exactly once:
+
+```text
+map_warp_traces[pc].num_used_instructions[0]++
+used_insts++
+```
+
+Deferred replay must not advance either source cursor again.
+
+##### Sibling join and hold activation
+
+Issue the complementary join occurrence through the normal pipeline. Only after
+that issue succeeds:
+
+```text
+sibling_join_issued = true
+mode = PARTIAL_WAIT_AFTER_JOIN
+begin whole-warp scheduler hold
+```
+
+At this point the scheduler-level hold is valid:
+
+```text
+blocked lanes:
+    logically waiting in the uncaptured pure wait arm
+
+complementary lanes:
+    have actually issued their join occurrence
+
+runnable lanes:
+    none
+```
+
+The whole-warp hold must never begin in `PARTIAL_ARMED` or
+`PARTIAL_EXTRACT`.
+
+##### Release and deferred replay
+
+The existing generation and watchdog service owns release:
+
+```text
+current_gen < expected_gen:
+    remain held
+
+current_gen == expected_gen and modeled condition ready:
+    enter PARTIAL_REPLAY
+
+current_gen > expected_gen:
+    abort generation overshoot
+```
+
+On release, issue deferred occurrences through the normal pipelines in their
+original blocked-lane order. They retain their captured dynamic payloads and
+therefore execute semantic work such as ARRIVE, TMA, local memory, and
+WARPSYNC normally.
+
+For K5 `0x93b0`, the capsule is:
+
+```text
+deferred:
+    0x9400 ... 0x9500, mask 0x1
+
+sibling join:
+    0x9500, mask 0xfffffffe
+
+canonical landing:
+    0x9510, mask 0xffffffff
+```
+
+The deferred `0x94d0` ARRIVE and `0x94e0` UTMALDG execute only after release.
+
+When the deferred blocked join occurrence issues:
+
+```text
+assert sibling_join_issued
+assert deferred queue is empty
+assert canonical source head == post_join_pc
+clear partial capsule
+resume canonical replay at post_join_pc
+```
+
+##### Nested partial entries
+
+A long deferred blocked path may contain another ready-only partial entry. This
+occurs in the current K5 and K10 traces.
+
+The implementation does not create a second capsule or a second source cursor.
+During `PARTIAL_REPLAY`, a later partial modeled miss with the same blocked mask
+may suspend the existing replay queue and enter another
+`PARTIAL_WAIT_AFTER_JOIN`, because the complementary join has already issued.
+After release, replay resumes from the same queue head.
+
+Abort if:
+
+- the nested blocked mask differs;
+- a second complementary join is requested;
+- the nested record names a different capsule boundary;
+- any source-cursor extraction is attempted while replaying an existing
+  capsule.
+
+##### Cursor, lifecycle, and runtime guards
+
+Required invariants:
+
+```text
+extracted_blocked == replayed_blocked at capsule close
+each source occurrence is extracted at most once
+each deferred occurrence is issued exactly once
+deferred replay never increments a source cursor
+sibling join issues exactly once
+post_join_pc never issues before both lane groups reach the join
+no capsule survives CTA cleanup or warp-slot reuse
+```
+
+Any mismatch aborts with:
+
+```text
+trace kernel, function, CTA, warp
+entry and join PCs
+blocked, sibling, and live masks
+source cursor before/after flush and extraction
+deferred queue size and replay index
+expected/current generation
+```
+
+Post-processing deliberately does not admit or reject this policy from EXCH,
+ARRIVE, TMA, or producer-warp dependency analysis. A release dependency cycle
+is a runtime liveness failure and is handled by the existing generation audit,
+4,096-cycle heartbeat, and 32,000-cycle watchdog abort.
+
+Until this design is implemented and validated, the current v1
+`UNSUPPORTED_PARTIAL_MISSING_WAIT` abort remains mandatory.
+
 ### 2.11 Focused tests
 
 Post-processing:
@@ -1110,6 +1605,16 @@ Post-processing:
 - ready-only/partial-mask gate emits `INJECT_MISSING_WAIT`, records its masks,
   and declares `partial_modeled_miss_action=ABORT`;
 - partial visit and partial-record report counts reconcile with raw trace visits;
+- a v2 partial candidate emits
+  `partial_modeled_miss_action=DEFER_BLOCKED_SUFFIX_THEN_HOLD` only when all
+  static CFG, wait-arm, join, and full-trace mask proofs pass;
+- every v2 partial visit has a complementary branch occurrence before the entry,
+  a complementary join occurrence, a blocked join occurrence, and a full-mask
+  `post_join_pc`;
+- a complementary semantic occurrence, mixed pre-join mask, unresolved join,
+  mismatched wait arm, or incomplete payload retains `ABORT`;
+- the current 4,596 partial visits reconcile with the four reviewed
+  sibling-quiescence regions;
 - any record owning a foldable captured loop emits
   `FOLD_CAPTURED_POLL`, never `INJECT_MISSING_WAIT`;
 - unsafe loop effects or dependency barriers reject poll folding;
@@ -1125,10 +1630,29 @@ Runtime path A:
 - ready entry performs no hold and no cursor change;
 - ready partial entry performs no hold and replays normally;
 - not-ready all-live entry holds and releases at the expected generation;
-- not-ready partial entry prints the complete diagnostic and aborts before
-  scheduler or cursor mutation;
+- under the current v1 implementation, a not-ready partial entry prints the
+  complete diagnostic and aborts before scheduler or cursor mutation;
 - release preserves both trace cursors;
 - the guard remains disabled when `-wait_block_enable 0`.
+
+Runtime partial v2:
+
+- a partial miss enters `PARTIAL_ARMED` without a scheduler hold;
+- only proven entry setup PCs and the controlling branch may issue while armed;
+- IBuffer rollback precedes extraction;
+- blocked occurrences are moved with complete payloads and are not issued;
+- the complementary join occurrence issues before any whole-warp hold begins;
+- the canonical source cursor lands exactly at `post_join_pc`;
+- release replays every deferred occurrence exactly once without advancing a
+  source cursor again;
+- semantic, TMA, local-memory, and join occurrences in the deferred queue issue
+  normally after release;
+- nested partial misses may suspend one existing replay queue only when their
+  blocked mask and capsule boundary agree;
+- no partial capsule or deferred occurrence survives CTA cleanup or warp-slot
+  reuse;
+- any extraction, mask, landing, replay-count, generation, or lifecycle
+  mismatch aborts.
 
 Runtime path B:
 
@@ -1163,9 +1687,13 @@ Cross-kernel:
 - semantic instruction and TMA command/byte counts are unchanged;
 - with zero partial modeled misses, K5 and K10 exit without generation
   overshoot or watchdog abort;
-- if a partial modeled miss occurs, the run stops at the first
-  `UNSUPPORTED_PARTIAL_MISSING_WAIT` diagnostic before scheduler or cursor
-  mutation. It must not hang or continue with approximate behavior.
+- under v1, a partial modeled miss stops at the first
+  `UNSUPPORTED_PARTIAL_MISSING_WAIT` diagnostic;
+- under v2, every admitted partial miss issues the complementary join before
+  holding, releases or reaches the watchdog, replays all blocked semantic work,
+  and resumes at the exact post-join occurrence;
+- partial visits without a complete v2 proof continue to abort before scheduler
+  or cursor mutation.
 
 ### 2.12 Implementation order
 
@@ -1205,14 +1733,29 @@ Cross-kernel:
     omission occurs only on predicated-off poll probes: K5 has `3,169`
     active+payload, `897` predicated-off+no-payload, and zero active omissions;
     K10 has `1,901`, `1,879`, and zero respectively.
-13. [in progress] Treat zero-effective mbarrier instructions as architectural
+13. [done] Treat zero-effective mbarrier instructions as architectural
     no-ops and retain fail-closed payload validation for active actions. The
     second K10 run confirms this fix and reaches captured-poll release, then
     exposes a false cursor audit: `215 - 2 rollback + 1 skip = 214` lands
     correctly at `0xb530`, but the old audit expected a net `+1`.
-14. [in progress] Audit IBuffer rollback and forward skip as separate cursor
-    phases, then rerun K5/K10 on the server.
+14. [done] Audit IBuffer rollback and forward skip as separate cursor phases.
+    The next K10 snapshot passes all observed phase-aware cursor audits.
+15. [done] Confirm the first actual partial modeled miss in K5 `.e80` at
+    `0x93b0`, with no scheduler or cursor mutation before the intentional v1
+    abort.
+16. [done] Approve the partial v2 design: defer the blocked suffix, issue the
+    complementary join, begin the whole-warp hold, and replay the deferred
+    suffix after release.
+17. [pending] Extend post-processing and bump the sidecar schema to v5 with static
+    wait-arm/join proof, full-trace complementary-mask proof, and linear capsule
+    proof. Regenerate all CTAs in strict mode.
+18. [pending] Extend the strict loader and implement `PARTIAL_ARMED`,
+    `PARTIAL_EXTRACT`, `PARTIAL_WAIT_AFTER_JOIN`, and `PARTIAL_REPLAY`.
+19. [pending] Run focused cursor/payload/lifecycle tests, then rerun K5 and K10
+    with the v2 partial policy enabled.
 
 The design is complete when each runtime action is explained by exactly one of
 the two strategies. No entry action is permitted for a captured-poll record, and
-no cursor action is permitted for a missing-wait record.
+the all-live missing-wait path performs no cursor action. The partial
+missing-wait sub-policy may move source occurrences only into an owned replay
+queue under the approved extraction and replay invariants.
