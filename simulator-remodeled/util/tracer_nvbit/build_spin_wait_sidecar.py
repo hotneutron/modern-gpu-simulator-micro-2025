@@ -214,8 +214,95 @@ def _cb(inst):
     return inst.get("control_bits", {}) or {}
 
 
-def compute_barrier_self_tied(body_pcs, byp):
-    """A spin body is barrier-self-tied iff whole-loop skip cannot corrupt the SASS
+def _normalized_operand(text):
+    return (text or "").replace(".reuse", "").replace(" ", "")
+
+
+def _wait_destination_predicate(inst):
+    operands = inst.get("operands", [])
+    if not operands:
+        return None
+    destination = _normalized_operand(operands[0].get("operand_string", ""))
+    prefix = "UP" if destination.startswith("UP") else "P"
+    digits = destination[len(prefix):]
+    if not digits.isdigit():
+        return None
+    return {
+        "name": prefix + digits,
+        "register": int(digits),
+        "uniform": prefix == "UP",
+    }
+
+
+def prove_poll_loop_control(region, byp):
+    """Prove that the selected poll predicate owns the loopback decision."""
+    primary = byp.get(region["primary_wait_pc"])
+    branch = byp.get(region["loopback_bra_pc"])
+    if primary is None or branch is None:
+        return False, "POLL_CONTROL_METADATA_MISSING", None
+    predicate = _wait_destination_predicate(primary)
+    if predicate is None:
+        return False, "POLL_PREDICATE_UNDECODABLE", None
+    for wait_pc in region["wait_pcs"]:
+        wait_predicate = _wait_destination_predicate(byp.get(wait_pc, {}))
+        if wait_predicate != predicate:
+            return False, "POLL_PREDICATE_MISMATCH", None
+    target = bra_target(branch)
+    branch_predicate = {
+        "name": ("UP" if branch.get("is_uniform_predicate") else "P") +
+                str(branch.get("predicate_register")),
+        "register": int(branch.get("predicate_register", -1)),
+        "uniform": bool(branch.get("is_uniform_predicate")),
+    }
+    if (branch["op_code"] != "BRA" or
+            not branch.get("is_predicated") or
+            not branch.get("is_predicate_negate") or
+            branch_predicate != predicate or
+            target != region["loop_head_pc"] or
+            region["exit_pc"] != region["loopback_bra_pc"] + ISIZE):
+        return False, "POLL_LOOPBACK_NOT_OWNED_BY_PRIMARY_WAIT", None
+    return True, None, {
+        "primary_predicate": predicate["name"],
+        "all_wait_predicates_match": True,
+        "loopback_predicate": branch_predicate["name"],
+        "loopback_predicate_negated": True,
+        "loopback_target_pc": target,
+        "loopback_fallthrough_pc": region["exit_pc"],
+    }
+
+
+def prove_poll_wait_condition(region, byp):
+    """Require every skipped wait to use the same static barrier and wait state."""
+    sites = []
+    expected = None
+    for wait_pc in region["wait_pcs"]:
+        inst = byp.get(wait_pc)
+        operands = inst.get("operands", []) if inst else []
+        if len(operands) < 3:
+            return False, "POLL_WAIT_CONDITION_UNDECODABLE", None
+        barrier = _normalized_operand(operands[1].get("operand_string", ""))
+        wait_state = _normalized_operand(operands[2].get("operand_string", ""))
+        if not barrier or not wait_state:
+            return False, "POLL_WAIT_CONDITION_UNDECODABLE", None
+        condition = (barrier, wait_state)
+        if expected is None:
+            expected = condition
+        elif condition != expected:
+            return False, "POLL_WAIT_CONDITION_MISMATCH", None
+        sites.append({
+            "pc": wait_pc,
+            "barrier_operand": barrier,
+            "wait_state_operand": wait_state,
+        })
+    return True, None, {
+        "barrier_operand": expected[0],
+        "wait_state_operand": expected[1],
+        "sites": sites,
+    }
+
+
+def compute_barrier_self_tied(skip_pcs, byp):
+    """A skip set is barrier-self-tied iff folding cannot corrupt the SASS
     scoreboard wait-barrier state. In this model a wait-barrier armed by an
     instruction is released by that SAME instruction's own pipeline stage (write
     barrier at WB, read barrier at read-stage), so an arm INSIDE the body is
@@ -229,23 +316,39 @@ def compute_barrier_self_tied(body_pcs, byp):
     armed_ids = set()
     waited_ids = set()
     async_ops = []
-    for p in body_pcs:
+    per_pc = []
+    for p in skip_pcs:
         inst = byp[p]
         op = inst["op_code"]
         cb = _cb(inst)
+        pc_armed = []
         if cb.get("is_new_read_barrier"):
-            armed_ids.add(int(cb.get("id_new_read_barrier", -1)))
+            barrier_id = int(cb.get("id_new_read_barrier", -1))
+            armed_ids.add(barrier_id)
+            pc_armed.append(barrier_id)
         if cb.get("is_new_write_barrier"):
-            armed_ids.add(int(cb.get("id_new_write_barrier", -1)))
+            barrier_id = int(cb.get("id_new_write_barrier", -1))
+            armed_ids.add(barrier_id)
+            pc_armed.append(barrier_id)
         mask = int(cb.get("wait_barrier_bits", 0) or 0)
+        pc_waited = []
         for bit in range(6):
             if mask & (1 << bit):
                 waited_ids.add(bit)
+                pc_waited.append(bit)
         if is_async_producer(op):
             async_ops.append((hex(p), op))
+        per_pc.append({
+            "pc": p,
+            "opcode": op,
+            "armed_ids": sorted(pc_armed),
+            "waited_ids": sorted(pc_waited),
+        })
     wait_on_external = sorted(waited_ids - armed_ids)
     self_tied = (not wait_on_external) and (not async_ops)
     return self_tied, {
+        "checked_pcs": list(skip_pcs),
+        "per_pc": per_pc,
         "armed_ids": sorted(armed_ids),
         "waited_ids": sorted(waited_ids),
         "wait_on_externally_armed_ids": wait_on_external,
@@ -318,8 +421,9 @@ def detect_regions(fid, byp, sync_sites):
                     if sync_sites[(fid, p)]["sync_kind"] == "PHASECHK"]
         primary_wait = (phasechk[-1] if phasechk else wait_pcs[-1])
         wsite = sync_sites[(fid, primary_wait)]
-        self_tied, bar_reason = compute_barrier_self_tied(body_pcs, byp)
-        regions.append({
+        skip_pcs = body_pcs + [pc]
+        self_tied, bar_reason = compute_barrier_self_tied(skip_pcs, byp)
+        region = {
             "region_id": "k_fid%d_h0x%x" % (fid, tgt),
             "loop_head_pc": tgt,
             "body_pcs": body_pcs,
@@ -336,7 +440,18 @@ def detect_regions(fid, byp, sync_sites):
             "local_mem_ops_in_body": local_ops,
             "barrier_self_tied": self_tied,
             "barrier_reason": bar_reason,
-        })
+        }
+        control_safe, control_reason, control_proof = (
+            prove_poll_loop_control(region, byp))
+        wait_safe, wait_reason, wait_proof = prove_poll_wait_condition(
+            region, byp)
+        region["control_safe"] = control_safe
+        region["control_reason"] = control_reason
+        region["control_proof"] = control_proof
+        region["wait_condition_safe"] = wait_safe
+        region["wait_condition_reason"] = wait_reason
+        region["wait_condition_proof"] = wait_proof
+        regions.append(region)
     return regions
 
 
@@ -674,6 +789,29 @@ def _decode_defuse(inst):
     return defs, uses, False
 
 
+def _reviewed_idempotent_copy(inst):
+    """Return proof detail only for a loop-invariant IMAD copy."""
+    if inst.get("op_code") not in ("IMAD.U32", "IMAD.MOV.U32"):
+        return None
+    operands = [
+        _normalized_operand(o.get("operand_string", ""))
+        for o in inst.get("operands", [])
+    ]
+    if len(operands) != 4:
+        return None
+    destination, multiplicand_a, multiplicand_b, source = operands
+    if (multiplicand_a not in ("RZ", "URZ") or
+            multiplicand_b not in ("RZ", "URZ")):
+        return None
+    if len(_regs_in(destination)) != 1 or len(_regs_in(source)) != 1:
+        return None
+    return {
+        "destination": destination,
+        "source": source,
+        "reason": "zero-product register copy is idempotent",
+    }
+
+
 def _barrier_offset(text):
     """Return the immediate byte offset of a barrier operand `[base(+idx)(+0xNN)]`.
     A barrier with no `+0x..` immediate (e.g. `[R7+URZ]`) is base+0, so return
@@ -733,10 +871,11 @@ def prove_effects(fid, cand, byp):
     control opcodes; no memory/TMA/GMMA/MUFU/atomic/ARRIVE/EXCH/BAR/fence and no
     unknown opcode. Returns (ok, reason|None, effect_classes)."""
     classes = Counter()
+    per_pc = []
+    loopback_pc = cand.get("loopback_bra_pc")
     for pc in cand["allowed_block_pcs"]:
         inst = byp[pc]
         op = inst["op_code"]
-        base = op.split(".")[0]
         # Local memory (STL/LDL) is a real side effect; skipping the loop would
         # drop or reorder a local store/load. Classify as unsafe (not just
         # undecoded) so the report reason is precise.
@@ -747,7 +886,28 @@ def prove_effects(fid, cand, byp):
         model = _WB_OPCODE_MODEL.get(op)
         if model is None:
             return False, DEFUSE_UNDECODED, None
+        detail = None
+        if model == "dst_first":
+            detail = _reviewed_idempotent_copy(inst)
+            if detail is None:
+                return False, EFFECT_UNSAFE, None
+            effect = "IDEMPOTENT_COPY"
+        elif model == "wait":
+            effect = "WAIT_OBSERVATION"
+        elif model == "nanosleep":
+            effect = "DELAY_ONLY"
+        else:
+            if loopback_pc is not None and pc != loopback_pc:
+                return False, EFFECT_UNSAFE, None
+            effect = "LOOPBACK_CONTROL"
         classes[model] += 1
+        per_pc.append({
+            "pc": pc,
+            "opcode": op,
+            "effect": effect,
+            "detail": detail,
+        })
+    cand["effect_proof"] = per_pc
     return True, None, dict(classes)
 
 
@@ -916,9 +1076,11 @@ def make_fold_captured_poll_record(kid, fid, region):
         "block_id": "wb_k%d_fid%d_p0x%x" % (
             kid, fid, region["primary_wait_pc"]),
         "runtime_strategy": "FOLD_CAPTURED_POLL",
+        "fold_proof_version": 1,
         "unique_function_id": fid,
         "poll_loop_head_pc": region["loop_head_pc"],
         "poll_loop_body_pcs": region["body_pcs"],
+        "poll_wait_pcs": region["wait_pcs"],
         "poll_probe_pc": region["primary_wait_pc"],
         "poll_probe_kind": region["primary_wait_kind"],
         "poll_probe_opcode": region["primary_wait_opcode"],
@@ -927,11 +1089,17 @@ def make_fold_captured_poll_record(kid, fid, region):
         "poll_loop_exit_pc": region["exit_pc"],
         "poll_advance_allowed_pcs": sorted(
             set(region["body_pcs"]) | {region["loopback_bra_pc"]}),
+        "control_safe": region["control_safe"],
+        "control_proof": region["control_proof"],
+        "wait_condition_safe": region["wait_condition_safe"],
+        "wait_condition_proof": region["wait_condition_proof"],
         "semantic_free_body": region["semantic_free_body"],
         "effect_safe": region["effect_safe"],
         "effect_classes": region["effect_classes"],
+        "effect_proof": region["effect_proof"],
         "barrier_self_tied": region["barrier_self_tied"],
         "barrier_reason": region["barrier_reason"],
+        "scoreboard_proof": region["barrier_reason"],
         "dynamic": region["dynamic"],
     }
 
@@ -963,8 +1131,13 @@ def validate_dynamic(kdir, fid, regions, max_ctas):
         files = files[:int(max_ctas)]
     loopback_pcs = {r["loopback_bra_pc"] for r in regions}
     regions_by_poll = {}
+    regions_by_loop_head = defaultdict(list)
+    regions_by_static_pc = defaultdict(list)
     for r in regions:
         regions_by_poll.setdefault(r["primary_wait_pc"], []).append(r)
+        regions_by_loop_head[r["loop_head_pc"]].append(r)
+        for pc in r["body_pcs"] + [r["loopback_bra_pc"]]:
+            regions_by_static_pc[pc].append(r)
     stats = {r["region_id"]: {
         # a "visit" is one (cta, warp) that entered this region at least once;
         # iters is the number of loopback-BRA executions in that visit.
@@ -972,18 +1145,57 @@ def validate_dynamic(kdir, fid, regions, max_ctas):
         "min_iters": None, "single_shot_visits": 0,
         "active_poll_visits": 0,
         "predicated_off_poll_occurrences": 0,
-        "poll_sync_payload_missing": 0} for r in regions}
+        "poll_sync_payload_missing": 0,
+        "active_wait_occurrences": 0,
+        "predicated_off_wait_occurrences": 0,
+        "wait_sync_payload_missing": 0,
+        "wait_condition_mismatches": 0,
+        "wait_iterations_checked": 0,
+        "active_wait_pcs": Counter()} for r in regions}
     for f in files:
         warps = vpb_parse_full(open(f, "rb").read())
         for wid, insts in warps:
             # count loopback occurrences per region -> iteration count in this warp
             per_region = Counter()
+            open_iterations = {}
             for inst in insts:
                 if inst["function_unique_id"] != fid:
                     continue
                 p = inst["pc"]
                 if p in loopback_pcs:
                     per_region[p] += 1
+                for r in regions_by_loop_head.get(p, []):
+                    open_iterations[r["region_id"]] = set()
+                for r in regions_by_static_pc.get(p, []):
+                    rid = r["region_id"]
+                    if rid not in open_iterations:
+                        continue
+                    if p in r["wait_pcs"]:
+                        s = stats[rid]
+                        effective = (
+                            int(inst["active_mask"]) &
+                            int(inst["predicate_mask"])
+                        )
+                        if effective == 0:
+                            s["predicated_off_wait_occurrences"] += 1
+                        else:
+                            s["active_wait_occurrences"] += 1
+                            s["active_wait_pcs"]["0x%x" % p] += 1
+                            if (not inst["sync_valid"]
+                                    or inst["barrier_addr"] is None):
+                                s["wait_sync_payload_missing"] += 1
+                            else:
+                                wait_state = (
+                                    0 if inst["semantic_raw"] is None
+                                    else int(inst["semantic_raw"]))
+                                open_iterations[rid].add(
+                                    (int(inst["barrier_addr"]), wait_state))
+                    if p == r["loopback_bra_pc"]:
+                        s = stats[rid]
+                        s["wait_iterations_checked"] += 1
+                        if len(open_iterations[rid]) > 1:
+                            s["wait_condition_mismatches"] += 1
+                        del open_iterations[rid]
                 for r in regions_by_poll.get(p, []):
                     s = stats[r["region_id"]]
                     effective = (
@@ -1019,6 +1231,12 @@ def validate_dynamic(kdir, fid, regions, max_ctas):
             s["active_poll_visits"] > 0 and
             s["poll_sync_payload_missing"] == 0
         )
+        s["active_wait_payload_complete"] = (
+            s["active_wait_occurrences"] > 0 and
+            s["wait_sync_payload_missing"] == 0 and
+            s["wait_condition_mismatches"] == 0
+        )
+        s["active_wait_pcs"] = dict(sorted(s["active_wait_pcs"].items()))
     return stats, len(files)
 
 
@@ -1028,6 +1246,10 @@ DYNAMIC_PATH_ESCAPE = "DYNAMIC_PATH_ESCAPE"
 CTA_IDENTITY_MISMATCH = "CTA_IDENTITY_MISMATCH"
 ENTRY_WAIT_TARGET_UNDECODABLE = "ENTRY_WAIT_TARGET_UNDECODABLE"
 POLL_WAIT_TARGET_UNDECODABLE = "POLL_WAIT_TARGET_UNDECODABLE"
+POLL_CONTROL_UNPROVEN = "POLL_CONTROL_UNPROVEN"
+POLL_WAIT_CONDITION_MISMATCH = "POLL_WAIT_CONDITION_MISMATCH"
+POLL_EFFECT_UNSAFE = "POLL_EFFECT_UNSAFE"
+POLL_SCOREBOARD_UNSAFE = "POLL_SCOREBOARD_UNSAFE"
 CAPTURED_POLL_ENTRY_NOT_REQUIRED = "CAPTURED_POLL_ENTRY_NOT_REQUIRED"
 
 
@@ -1277,32 +1499,43 @@ def main():
                 st = stats[r["region_id"]]
                 r_out = dict(r)
                 r_out["dynamic"] = st
+                effect_input = {
+                    "allowed_block_pcs":
+                        list(r["body_pcs"]) + [r["loopback_bra_pc"]],
+                    "loopback_bra_pc": r["loopback_bra_pc"],
+                }
                 effect_safe, effect_reason, effect_classes = prove_effects(
-                    fid,
-                    {"allowed_block_pcs":
-                     list(r["body_pcs"]) + [r["loopback_bra_pc"]]},
-                    byp)
+                    fid, effect_input, byp)
                 r_out["effect_safe"] = effect_safe
                 r_out["effect_reason"] = effect_reason
                 r_out["effect_classes"] = effect_classes
-                # The simulator folds only an actual spin loop whose body has no
-                # semantic/local work, matches the closed opcode model, and has
-                # self-tied SASS wait barriers.
-                fold_shape = bool(
+                r_out["effect_proof"] = effect_input.get("effect_proof")
+                # An actual semantic-free spin is an intended fold target. Every
+                # control, wait-condition, effect, scoreboard, and dynamic
+                # payload proof must pass; otherwise strict generation fails.
+                fold_candidate = bool(
                     st["is_spin_loop"] and r["semantic_free_body"]
-                    and not r["local_mem_ops_in_body"]
-                    and r["barrier_self_tied"] and effect_safe)
-                r_out["foldable"] = bool(
-                    fold_shape and st["active_poll_payload_complete"])
-                if fold_shape:
-                    # PCs from loop head through the loopback branch: any
-                    # wait-block fallback overlapping these is a fold target.
+                    and not r["local_mem_ops_in_body"])
+                proof_failure = None
+                if fold_candidate:
                     lo, hi = r["loop_head_pc"], r["loopback_bra_pc"]
                     captured_poll_body_pcs.update(
                         range(lo, hi + ISIZE, ISIZE))
-                    if not st["active_poll_payload_complete"]:
-                        fold_failures.append(
-                            (r_out, POLL_WAIT_TARGET_UNDECODABLE))
+                    if not r["control_safe"]:
+                        proof_failure = POLL_CONTROL_UNPROVEN
+                    elif not r["wait_condition_safe"]:
+                        proof_failure = POLL_WAIT_CONDITION_MISMATCH
+                    elif not effect_safe:
+                        proof_failure = POLL_EFFECT_UNSAFE
+                    elif not r["barrier_self_tied"]:
+                        proof_failure = POLL_SCOREBOARD_UNSAFE
+                    elif (not st["active_poll_payload_complete"] or
+                          not st["active_wait_payload_complete"]):
+                        proof_failure = POLL_WAIT_TARGET_UNDECODABLE
+                r_out["foldable"] = bool(
+                    fold_candidate and proof_failure is None)
+                if proof_failure is not None:
+                    fold_failures.append((r_out, proof_failure))
                 clean.append(r_out)
 
         def _is_fold_target(c):
@@ -1443,11 +1676,20 @@ def main():
                        r["dynamic"]["predicated_off_poll_occurrences"]))
         for r, reason in fold_failures:
             report_lines.append(
-                "    FAIL poll=0x%x reason=%s active_polls=%d "
-                "payload_missing=%d"
+                "    FAIL poll=0x%x reason=%s control_reason=%s "
+                "wait_condition_reason=%s effect_reason=%s "
+                "scoreboard_external=%s active_polls=%d "
+                "payload_missing=%d all_wait_payload_missing=%d "
+                "dynamic_wait_mismatches=%d"
                 % (r["primary_wait_pc"], reason,
+                   r.get("control_reason"),
+                   r.get("wait_condition_reason"),
+                   r.get("effect_reason"),
+                   r["barrier_reason"]["wait_on_externally_armed_ids"],
                    r["dynamic"]["active_poll_visits"],
-                   r["dynamic"]["poll_sync_payload_missing"]))
+                   r["dynamic"]["poll_sync_payload_missing"],
+                   r["dynamic"]["wait_sync_payload_missing"],
+                   r["dynamic"]["wait_condition_mismatches"]))
         for c, reason in wb_fail:
             report_lines.append(
                 "    FAIL entry=0x%x reason=%s (fold target: must fix)"
@@ -1538,13 +1780,18 @@ def main():
             "only for a dynamically ready-only gate; modeled-ready replays "
             "normally, modeled-miss holds only when effective_mask==live_mask, "
             "and a partial modeled-miss must abort. FOLD_CAPTURED_POLL is emitted "
-            "directly from an existing foldable spin region and advances only to "
-            "its local poll_loop_exit_pc. Legacy spin_regions are preserved "
-            "unchanged until a v4 simulator is implemented."),
+            "directly from an existing foldable spin region only after proving "
+            "primary-wait control ownership, one static/dynamic wait condition, "
+            "idempotent skipped ALU effects, and scoreboard safety over the full "
+            "body plus loopback branch. It advances only to its local "
+            "poll_loop_exit_pc."),
         "wait_block_fail_taxonomy": [
             CFG_UNRESOLVED, MULTI_REJOIN,
             DYNAMIC_PATH_ESCAPE, CTA_IDENTITY_MISMATCH,
-            ENTRY_WAIT_TARGET_UNDECODABLE, CAPTURED_POLL_ENTRY_NOT_REQUIRED,
+            ENTRY_WAIT_TARGET_UNDECODABLE, POLL_WAIT_TARGET_UNDECODABLE,
+            POLL_CONTROL_UNPROVEN, POLL_WAIT_CONDITION_MISMATCH,
+            POLL_EFFECT_UNSAFE, POLL_SCOREBOARD_UNSAFE,
+            CAPTURED_POLL_ENTRY_NOT_REQUIRED,
         ],
         "wait_block_report": dict(report),
         "kernels": out_kernels,

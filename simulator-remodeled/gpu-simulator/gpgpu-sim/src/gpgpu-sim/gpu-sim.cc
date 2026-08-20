@@ -860,6 +860,200 @@ void wait_block_validate_action_opcode(
   }
 }
 
+std::shared_ptr<traced_instruction> wait_block_require_static_instruction(
+    traced_execution &static_trace_info, uint32_t unique_function_id,
+    uint64_t pc, const std::filesystem::path &path) {
+  if (pc > std::numeric_limits<uint32_t>::max() ||
+      !static_trace_info.has_kernel_with_unique_function_id(
+          unique_function_id)) {
+    wait_block_sidecar_fatal(
+        path, "fold proof references invalid function or PC");
+  }
+  std::shared_ptr<traced_instruction> instruction =
+      static_trace_info.get_kernel_by_unique_function_id(unique_function_id)
+          .get_instruction_ptr(static_cast<uint32_t>(pc));
+  if (!instruction) {
+    wait_block_sidecar_fatal(
+        path, "fold proof PC is absent from enhanced execution metadata");
+  }
+  return instruction;
+}
+
+std::string wait_block_normalize_operand(std::string operand) {
+  const std::string reuse = ".reuse";
+  for (size_t pos = operand.find(reuse); pos != std::string::npos;
+       pos = operand.find(reuse)) {
+    operand.erase(pos, reuse.size());
+  }
+  operand.erase(std::remove(operand.begin(), operand.end(), ' '),
+                operand.end());
+  return operand;
+}
+
+bool wait_block_is_wait_opcode(const std::string &opcode) {
+  return opcode == "SYNCS.PHASECHK.TRANS64" ||
+         opcode == "SYNCS.PHASECHK.TRANS64.TRYWAIT";
+}
+
+bool wait_block_is_register_operand(TraceEnhancedOperandType type) {
+  return type == TraceEnhancedOperandType::REG ||
+         type == TraceEnhancedOperandType::UREG;
+}
+
+void wait_block_validate_fold_static_proof(
+    traced_execution &static_trace_info, uint32_t unique_function_id,
+    const SpinWaitRegionRecord &record,
+    const std::vector<uint64_t> &wait_pcs,
+    uint64_t instruction_size,
+    const std::filesystem::path &path) {
+  if (wait_pcs.empty()) {
+    wait_block_sidecar_fatal(path, "captured-poll proof has no wait PCs");
+  }
+  const std::set<uint64_t> declared_wait_pcs(wait_pcs.begin(), wait_pcs.end());
+  if (declared_wait_pcs.size() != wait_pcs.size() ||
+      declared_wait_pcs.count(record.primary_wait_pc) == 0) {
+    wait_block_sidecar_fatal(
+        path, "captured-poll wait PC set is duplicate or misses the primary");
+  }
+
+  bool have_wait_condition = false;
+  std::string expected_barrier_operand;
+  std::string expected_wait_state_operand;
+  TraceEnhancedOperandType expected_predicate_type =
+      TraceEnhancedOperandType::NONE;
+  long expected_predicate_register = -1;
+  for (uint64_t wait_pc : wait_pcs) {
+    std::shared_ptr<traced_instruction> wait =
+        wait_block_require_static_instruction(
+            static_trace_info, unique_function_id, wait_pc, path);
+    if (!wait_block_is_wait_opcode(wait->get_op_code()) ||
+        wait->get_num_operands() < 3) {
+      wait_block_sidecar_fatal(
+          path, "captured-poll wait proof references a non-wait instruction");
+    }
+    traced_operand &predicate = wait->get_operand(0);
+    const TraceEnhancedOperandType predicate_type =
+        predicate.get_operand_type();
+    if (predicate_type != TraceEnhancedOperandType::PRED &&
+        predicate_type != TraceEnhancedOperandType::UPRED) {
+      wait_block_sidecar_fatal(
+          path, "captured-poll wait destination is not a predicate");
+    }
+    const std::string barrier_operand = wait_block_normalize_operand(
+        wait->get_operand(1).get_operand_string());
+    const std::string wait_state_operand = wait_block_normalize_operand(
+        wait->get_operand(2).get_operand_string());
+    if (!have_wait_condition) {
+      have_wait_condition = true;
+      expected_barrier_operand = barrier_operand;
+      expected_wait_state_operand = wait_state_operand;
+      expected_predicate_type = predicate_type;
+      expected_predicate_register = predicate.get_operand_reg_number();
+    } else if (barrier_operand != expected_barrier_operand ||
+               wait_state_operand != expected_wait_state_operand ||
+               predicate_type != expected_predicate_type ||
+               predicate.get_operand_reg_number() !=
+                   expected_predicate_register) {
+      wait_block_sidecar_fatal(
+          path, "captured-poll waits do not share one static condition");
+    }
+  }
+
+  std::shared_ptr<traced_instruction> loopback =
+      wait_block_require_static_instruction(
+          static_trace_info, unique_function_id, record.loopback_bra_pc, path);
+  if (loopback->get_op_code() != "BRA" ||
+      !loopback->get_is_predicated() ||
+      !loopback->get_is_predicate_negate() ||
+      loopback->get_is_uniform_predicate() !=
+          (expected_predicate_type == TraceEnhancedOperandType::UPRED) ||
+      static_cast<long>(loopback->get_predicate_register()) !=
+          expected_predicate_register ||
+      instruction_size == 0 ||
+      record.loopback_bra_pc >
+          std::numeric_limits<uint64_t>::max() - instruction_size ||
+      record.exit_pc != record.loopback_bra_pc + instruction_size) {
+    wait_block_sidecar_fatal(
+        path, "captured-poll loopback is not owned by the primary wait");
+  }
+  bool target_found = false;
+  uint64_t loopback_target = 0;
+  for (size_t i = 0; i < loopback->get_num_operands(); ++i) {
+    traced_operand &operand = loopback->get_operand(i);
+    const std::vector<double> immediates = operand.get_operands_inmediates();
+    if (operand.get_has_inmediate() && !immediates.empty()) {
+      loopback_target = static_cast<uint64_t>(immediates.back());
+      target_found = true;
+      break;
+    }
+  }
+  if (!target_found || loopback_target != record.loop_head_pc) {
+    wait_block_sidecar_fatal(
+        path, "captured-poll loopback target disagrees with loop head");
+  }
+
+  std::set<uint64_t> static_wait_pcs;
+  std::set<int> armed_ids;
+  std::set<int> waited_ids;
+  std::vector<uint64_t> skip_pcs = record.body_pcs;
+  skip_pcs.push_back(record.loopback_bra_pc);
+  for (uint64_t pc : skip_pcs) {
+    std::shared_ptr<traced_instruction> instruction =
+        wait_block_require_static_instruction(
+            static_trace_info, unique_function_id, pc, path);
+    const std::string opcode = instruction->get_op_code();
+    if (wait_block_is_wait_opcode(opcode)) {
+      static_wait_pcs.insert(pc);
+    } else if (opcode == "NANOSLEEP.SYNCS") {
+      // Delay-only backoff.
+    } else if (opcode == "IMAD.U32" || opcode == "IMAD.MOV.U32") {
+      if (instruction->get_num_operands() != 4 ||
+          !wait_block_is_register_operand(
+              instruction->get_operand(0).get_operand_type()) ||
+          !wait_block_is_register_operand(
+              instruction->get_operand(3).get_operand_type()) ||
+          (wait_block_normalize_operand(
+               instruction->get_operand(1).get_operand_string()) != "RZ" &&
+           wait_block_normalize_operand(
+               instruction->get_operand(1).get_operand_string()) != "URZ") ||
+          (wait_block_normalize_operand(
+               instruction->get_operand(2).get_operand_string()) != "RZ" &&
+           wait_block_normalize_operand(
+               instruction->get_operand(2).get_operand_string()) != "URZ")) {
+        wait_block_sidecar_fatal(
+            path, "captured-poll IMAD is not an idempotent register copy");
+      }
+    } else if (opcode != "BRA" || pc != record.loopback_bra_pc) {
+      wait_block_sidecar_fatal(
+          path, "captured-poll skip set contains an unapproved effect");
+    }
+
+    control_bits &bits = instruction->get_control_bits();
+    if (bits.get_is_new_read_barrier()) {
+      armed_ids.insert(bits.get_id_new_read_barrier());
+    }
+    if (bits.get_is_new_write_barrier()) {
+      armed_ids.insert(bits.get_id_new_write_barrier());
+    }
+    const int wait_mask = bits.get_wait_barrier_bits();
+    for (int bit = 0; bit < 6; ++bit) {
+      if (wait_mask & (1 << bit)) {
+        waited_ids.insert(bit);
+      }
+    }
+  }
+  if (static_wait_pcs != declared_wait_pcs) {
+    wait_block_sidecar_fatal(
+        path, "captured-poll wait PC proof is incomplete");
+  }
+  for (int waited_id : waited_ids) {
+    if (armed_ids.count(waited_id) == 0) {
+      wait_block_sidecar_fatal(
+          path, "captured-poll skip set waits on an external scoreboard barrier");
+    }
+  }
+}
+
 void load_wait_block_sidecar_v4(const std::filesystem::path &extra_info_dir,
                                 traced_execution &static_trace_info,
                                 WaitBlockSidecarDB &db) {
@@ -876,6 +1070,11 @@ void load_wait_block_sidecar_v4(const std::filesystem::path &extra_info_dir,
       "wait_block_sidecar") {
     wait_block_sidecar_fatal(path,
                              "unsupported schema (expected wait_block_sidecar)");
+  }
+  const uint64_t instruction_size =
+      wait_block_require_uint(doc, "isize_bytes", path);
+  if (instruction_size == 0) {
+    wait_block_sidecar_fatal(path, "isize_bytes must be nonzero");
   }
   db.validation_complete =
       wait_block_require_bool(doc, "validation_complete", path);
@@ -1018,6 +1217,10 @@ void load_wait_block_sidecar_v4(const std::filesystem::path &extra_info_dir,
         }
       } else if (strategy == "FOLD_CAPTURED_POLL") {
         SpinWaitRegionRecord record;
+        if (wait_block_require_uint(block, "fold_proof_version", path) != 1) {
+          wait_block_sidecar_fatal(
+              path, "unsupported captured-poll proof version");
+        }
         record.block_id = block_id;
         record.loop_head_pc =
             wait_block_require_uint(block, "poll_loop_head_pc", path);
@@ -1033,19 +1236,46 @@ void load_wait_block_sidecar_v4(const std::filesystem::path &extra_info_dir,
             wait_block_require_string(block, "poll_probe_kind", path));
         record.semantic_free_body =
             wait_block_require_bool(block, "semantic_free_body", path);
+        const bool control_safe =
+            wait_block_require_bool(block, "control_safe", path);
+        const bool wait_condition_safe =
+            wait_block_require_bool(block, "wait_condition_safe", path);
         const bool effect_safe =
             wait_block_require_bool(block, "effect_safe", path);
         record.barrier_self_tied =
             wait_block_require_bool(block, "barrier_self_tied", path);
+        const rapidjson::Value &control_proof =
+            wait_block_require_object(block, "control_proof", path);
+        const rapidjson::Value &wait_condition_proof =
+            wait_block_require_object(block, "wait_condition_proof", path);
+        const rapidjson::Value &effect_proof =
+            wait_block_require_array(block, "effect_proof", path);
+        const rapidjson::Value &scoreboard_proof =
+            wait_block_require_object(block, "scoreboard_proof", path);
+        const std::vector<uint64_t> wait_pcs =
+            wait_block_require_pc_array(block, "poll_wait_pcs", path);
         const rapidjson::Value &dynamic =
             wait_block_require_object(block, "dynamic", path);
         record.is_spin_loop =
             wait_block_require_bool(dynamic, "is_spin_loop", path);
+        const bool active_wait_payload_complete =
+            wait_block_require_bool(
+                dynamic, "active_wait_payload_complete", path);
+        const uint64_t active_wait_occurrences =
+            wait_block_require_uint(dynamic, "active_wait_occurrences", path);
+        const uint64_t wait_payload_missing =
+            wait_block_require_uint(
+                dynamic, "wait_sync_payload_missing", path);
+        const uint64_t wait_condition_mismatches =
+            wait_block_require_uint(
+                dynamic, "wait_condition_mismatches", path);
         if ((record.primary_wait_kind != SyncInstructionKind::PHASECHK &&
              record.primary_wait_kind != SyncInstructionKind::TRYWAIT) ||
-            !record.semantic_free_body || !effect_safe ||
-            !record.barrier_self_tied ||
-            !record.is_spin_loop) {
+            !record.semantic_free_body || !control_safe ||
+            !wait_condition_safe || !effect_safe ||
+            !record.barrier_self_tied || !record.is_spin_loop ||
+            !active_wait_payload_complete || active_wait_occurrences == 0 ||
+            wait_payload_missing != 0 || wait_condition_mismatches != 0) {
           wait_block_sidecar_fatal(
               path, "FOLD_CAPTURED_POLL safety proof is incomplete");
         }
@@ -1066,9 +1296,73 @@ void load_wait_block_sidecar_v4(const std::filesystem::path &extra_info_dir,
           wait_block_sidecar_fatal(
               path, "captured-poll advance set or exit boundary is invalid");
         }
+        if (!wait_block_require_bool(
+                control_proof, "all_wait_predicates_match", path) ||
+            !wait_block_require_bool(
+                control_proof, "loopback_predicate_negated", path) ||
+            wait_block_require_uint(
+                control_proof, "loopback_target_pc", path) !=
+                record.loop_head_pc ||
+            wait_block_require_uint(
+                control_proof, "loopback_fallthrough_pc", path) !=
+                record.exit_pc) {
+          wait_block_sidecar_fatal(
+              path, "captured-poll control proof disagrees with record");
+        }
+        const rapidjson::Value &wait_sites =
+            wait_block_require_array(wait_condition_proof, "sites", path);
+        std::set<uint64_t> proven_wait_pcs;
+        for (const rapidjson::Value &site : wait_sites.GetArray()) {
+          proven_wait_pcs.insert(wait_block_require_uint(site, "pc", path));
+          if (wait_block_require_string(
+                  site, "barrier_operand", path).empty() ||
+              wait_block_require_string(
+                  site, "wait_state_operand", path).empty()) {
+            wait_block_sidecar_fatal(
+                path, "captured-poll wait-condition proof is empty");
+          }
+        }
+        const std::set<uint64_t> declared_wait_pcs(
+            wait_pcs.begin(), wait_pcs.end());
+        if (proven_wait_pcs.size() != wait_sites.Size() ||
+            proven_wait_pcs != declared_wait_pcs) {
+          wait_block_sidecar_fatal(
+              path, "captured-poll wait-condition proof is incomplete");
+        }
+        std::set<uint64_t> proven_effect_pcs;
+        for (const rapidjson::Value &effect : effect_proof.GetArray()) {
+          proven_effect_pcs.insert(
+              wait_block_require_uint(effect, "pc", path));
+          if (wait_block_require_string(effect, "opcode", path).empty() ||
+              wait_block_require_string(effect, "effect", path).empty()) {
+            wait_block_sidecar_fatal(
+                path, "captured-poll effect proof is empty");
+          }
+        }
+        const std::vector<uint64_t> scoreboard_pcs =
+            wait_block_require_pc_array(
+                scoreboard_proof, "checked_pcs", path);
+        const std::set<uint64_t> proven_scoreboard_pcs(
+            scoreboard_pcs.begin(), scoreboard_pcs.end());
+        if (proven_effect_pcs.size() != effect_proof.Size() ||
+            proven_effect_pcs != expected_allowed ||
+            proven_scoreboard_pcs.size() != scoreboard_pcs.size() ||
+            proven_scoreboard_pcs != expected_allowed ||
+            !wait_block_require_array(
+                 scoreboard_proof, "wait_on_externally_armed_ids", path)
+                 .Empty() ||
+            !wait_block_require_array(
+                 scoreboard_proof, "async_producer_ops", path)
+                 .Empty()) {
+          wait_block_sidecar_fatal(
+              path, "captured-poll effect or scoreboard proof is incomplete");
+        }
         wait_block_validate_action_opcode(
             static_trace_info, unique_function_id, record.primary_wait_pc,
             poll_probe_opcode, path);
+        wait_block_validate_fold_static_proof(
+            static_trace_info, unique_function_id, record, wait_pcs,
+            instruction_size, path);
         record.foldable = true;
         const WaitBlockLookupKey key{trace_kernel_id, unique_function_id,
                                      record.primary_wait_pc};

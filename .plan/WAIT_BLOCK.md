@@ -3,6 +3,7 @@
 **Status:** POST-PROCESSING V4 IMPLEMENTED AND FULL-TRACE VALIDATED;
 SIMULATOR V1 IMPLEMENTED; FIRST SERVER RUN EXPOSED AND FIXED A PREDICATED-OFF
 PAYLOAD GUARD; SECOND SERVER RUN EXPOSED A FALSE CURSOR-ACCOUNTING AUDIT;
+CAPTURED-POLL PROOF HARDENING IMPLEMENTED AND FULL-TRACE VALIDATED;
 POST-FIX K5/K10 RUNTIME VALIDATION PENDING.
 
 **Extends:** [`SPIN_WAIT_SIM_MODELING.md`](SPIN_WAIT_SIM_MODELING.md) and
@@ -259,12 +260,18 @@ implementation.
 Reuse the existing spin-region requirements:
 
 - the loopback is a direct branch to `poll_loop_head_pc`;
-- `poll_probe_pc` controls the loopback;
+- `poll_probe_pc` defines the exact predicate consumed by the loopback;
+- the loopback uses the not-ready polarity, targets `poll_loop_head_pc`, and
+  falls through to `poll_loop_exit_pc`;
+- every wait in the skipped loop uses the same normalized barrier operand,
+  wait-state operand, and destination predicate;
 - the body contains only reviewed wait/control/backoff/setup instructions;
 - the body contains no semantic, memory, reconvergence, dependency, call,
   return, or unknown operation;
-- setup definitions do not escape the poll loop;
-- dependency barriers are self-tied;
+- an `IMAD.U32` or `IMAD.MOV.U32` setup is allowed only when it is an
+  idempotent zero-product register copy;
+- dependency barriers are self-tied across the complete skip set, including the
+  loopback branch;
 - `poll_loop_exit_pc` is the first instruction after the loopback and exists in
   the trace.
 
@@ -282,7 +289,9 @@ The dynamic trace must show repeated loop visits and a reachable local exit.
 
 Post-processing verifies:
 
-- the poll probe's runtime barrier address and wait state;
+- every active wait occurrence has a runtime payload;
+- active waits in one loop iteration agree on runtime barrier address and wait
+  state;
 - every loop occurrence belongs to the expected loop body or loopback;
 - the next local exit occurrence is `poll_loop_exit_pc`;
 - no complementary-lane instruction occurs inside a cursor interval that is
@@ -295,18 +304,31 @@ normally.
 
 ```text
 runtime_strategy = FOLD_CAPTURED_POLL
+fold_proof_version = 1
 poll_loop_head_pc
 poll_loop_body_pcs
+poll_wait_pcs
 poll_probe_pc
 poll_loopback_pc
 poll_loop_exit_pc
 poll_advance_allowed_pcs
+control_safe = true
+control_proof
+wait_condition_safe = true
+wait_condition_proof
 effect_safe = true
 effect_classes
-canonical_wait_condition
+effect_proof
+barrier_self_tied = true
+scoreboard_proof
 ```
 
 There is no entry action for this strategy.
+
+The v4 loader independently rechecks the wait operands, predicate-owned
+loopback, idempotent-copy shape, and scoreboard arm/wait closure against
+`enhanced_execution_info.json`. Required proof objects are evidence, not trusted
+substitutes for loader validation.
 
 ### 1.6 Simplified CFG design
 
@@ -444,7 +466,9 @@ implicitly enable entry holds.
         {
           "block_id": "wb_k5_fid3_e0x9e80",
           "runtime_strategy": "FOLD_CAPTURED_POLL",
+          "fold_proof_version": 1,
           "poll_loop_head_pc": 45520,
+          "poll_wait_pcs": [45520, 45552],
           "poll_probe_pc": 45552,
           "poll_loopback_pc": 45568,
           "poll_loop_exit_pc": 45584,
@@ -454,8 +478,10 @@ implicitly enable entry holds.
             45552,
             45568
           ],
+          "control_safe": true,
+          "wait_condition_safe": true,
           "effect_safe": true,
-          "canonical_wait_condition": {}
+          "barrier_self_tied": true
         }
       ]
     }
@@ -698,6 +724,14 @@ The report invariants hold:
 43 = 36 passed + 0 failed + 7 skipped
 36 = 22 inject + 14 fold + 0 metadata
 ```
+
+The captured-poll proof hardening was revalidated against the same complete
+trace. All 14 fold records passed control ownership, static and dynamic wait
+condition, idempotent-copy effect, and complete skip-set scoreboard checks.
+Across those records, 754,859 active wait occurrences had zero payload omissions
+and zero per-iteration condition mismatches. The runtime action projection
+(strategy key, body, loopback, and exit) is unchanged from the previous v4
+sidecar.
 
 Because the command omitted `--out`, it wrote
 `extra_info/spin_wait_sidecar.json`. That server artifact is schema v4 and must
@@ -1079,6 +1113,10 @@ Post-processing:
 - any record owning a foldable captured loop emits
   `FOLD_CAPTURED_POLL`, never `INJECT_MISSING_WAIT`;
 - unsafe loop effects or dependency barriers reject poll folding;
+- a loopback predicate unrelated to the selected poll rejects poll folding;
+- wait probes with different barrier or wait-state operands reject poll folding;
+- a non-idempotent `IMAD` rejects poll folding;
+- a loopback scoreboard wait on an externally armed barrier rejects poll folding;
 - K5/K10 action counts and PC anchors match the reviewed sidecar;
 - duplicate kernel/function/action-PC identities are rejected.
 
