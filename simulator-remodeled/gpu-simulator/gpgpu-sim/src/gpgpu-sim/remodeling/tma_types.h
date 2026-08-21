@@ -453,6 +453,23 @@ struct HopperPartialWaitArm {
   bool extracted_capsule = false;
 };
 
+struct HopperPartialReplayProgress {
+  bool valid = false;
+  std::string block_id;
+  std::string region_id;
+  uint32_t trace_kernel_id = 0;
+  uint32_t unique_function_id = 0;
+  uint32_t cta_id = 0;
+  uint64_t start_cycle = 0;
+  uint64_t last_heartbeat_cycle = 0;
+  uint64_t last_progress_cycle = 0;
+  uint64_t last_pc = 0;
+  uint64_t post_join_pc = 0;
+  uint64_t progressed_occurrences = 0;
+  unsigned int initial_remaining = 0;
+  unsigned int last_remaining = 0;
+};
+
 struct HopperMBarrierPendingWait {
   bool valid = false;
   bool is_trywait = false;

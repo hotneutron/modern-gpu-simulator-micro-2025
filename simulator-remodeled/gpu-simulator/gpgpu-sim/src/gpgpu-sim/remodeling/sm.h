@@ -385,6 +385,11 @@ class SM : public core_t, public shader_core_ctx_wrapper {
                                               unsigned int warp_id);
   void start_partial_wait_hold(unsigned int warp_id,
                                HopperPartialWaitArm &arm);
+  void note_partial_replay_progress(unsigned int warp_id,
+                                    unsigned int remaining,
+                                    uint64_t pc,
+                                    unsigned int advanced_occurrences);
+  void service_partial_replay_progress(unsigned int warp_id);
   HopperMBarrierKey build_sync_barrier_key(const warp_inst_t &inst,
                                            unsigned int warp_id) const;
   HopperMBarrierObject &get_or_create_sync_barrier(
@@ -469,6 +474,7 @@ class SM : public core_t, public shader_core_ctx_wrapper {
   std::map<HopperMBarrierKey, HopperMBarrierObject> m_hopper_mbarriers;
   mutable std::vector<HopperMBarrierPendingWait> m_pending_sync_waits;
   std::vector<HopperPartialWaitArm> m_partial_wait_arms;
+  std::vector<HopperPartialReplayProgress> m_partial_replay_progress;
   std::vector<std::set<std::string>> m_partial_joined_regions;
   std::vector<std::deque<HopperMBarrierPendingTxBinding>>
       m_pending_tma_barrier_binds_per_warp;
@@ -703,6 +709,7 @@ class SM : public core_t, public shader_core_ctx_wrapper {
   unsigned long long m_partial_folded_occurrences_total = 0;
   unsigned long long m_partial_join_holds_total = 0;
   unsigned long long m_partial_join_releases_total = 0;
+  unsigned long long m_partial_replay_watchdog_aborts_total = 0;
   unsigned long long m_wait_block_generation_overshoots_total = 0;
   unsigned long long m_wait_block_watchdog_aborts_total = 0;
  public:

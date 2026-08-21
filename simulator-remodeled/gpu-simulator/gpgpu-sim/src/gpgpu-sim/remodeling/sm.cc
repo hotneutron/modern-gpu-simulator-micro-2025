@@ -309,6 +309,7 @@ SM::SM(unsigned int num_subcores, gpgpu_sim *gpu, simt_core_cluster *cluster,
   m_num_cycles_to_wait_to_dispatch_another_inst_from_subcore_to_sm_shared_pipeline = 0;
   m_pending_sync_waits.resize(config->max_warps_per_shader);
   m_partial_wait_arms.resize(config->max_warps_per_shader);
+  m_partial_replay_progress.resize(config->max_warps_per_shader);
   m_partial_joined_regions.resize(config->max_warps_per_shader);
   m_pending_tma_barrier_binds_per_warp.resize(config->max_warps_per_shader);
   if (config->sync_debug_enable) {
@@ -1218,12 +1219,33 @@ void SM::issue_warp(register_set_uniptr &pipe_reg_set, warp_inst_t *next_inst,
   std::unique_ptr<warp_inst_t> inst_smart(next_inst);
   move_warp_uniptr(pipe_reg, inst_smart);
 
+  trace_warp_inst_t *trace_inst = nullptr;
+  trace_shd_warp_t *trace_warp = nullptr;
+  if (m_config->is_trace_mode) {
+    trace_inst = static_cast<trace_warp_inst_t *>(pipe_reg.get());
+    trace_warp =
+        static_cast<trace_shd_warp_t *>(m_physical_warp[warp_id]);
+    if (m_config->wait_block_enable &&
+        trace_inst->wait_block_trace_origin ==
+            WaitBlockTraceOrigin::SYNTHETIC &&
+        (trace_warp->partial_capsule_active() ||
+         m_partial_replay_progress[warp_id].valid)) {
+      std::cerr << "[WAITBLOCK][abort][SM" << m_sm_id << "] cyc="
+                << get_current_gpu_cycle()
+                << " reason=partial-replay-synthetic-issued"
+                << " trace_kernel=" << trace_inst->trace_kernel_id
+                << " function=" << trace_inst->unique_function_id
+                << " cta=" << m_physical_warp[warp_id]->get_cta_id()
+                << " warp=" << warp_id
+                << " requested_pc=0x" << format_hex_u64(trace_inst->pc)
+                << " expected_pc=0x" << format_hex_u64(trace_warp->get_pc())
+                << " action=abort" << std::endl;
+      abort();
+    }
+  }
+
   m_physical_warp[warp_id]->get_IBuffer_remodeled()->issued();
   if (m_config->is_trace_mode) {
-    trace_warp_inst_t *trace_inst =
-        static_cast<trace_warp_inst_t *>(pipe_reg.get());
-    trace_shd_warp_t *trace_warp =
-        static_cast<trace_shd_warp_t *>(m_physical_warp[warp_id]);
     const unsigned int replay_remaining_before =
         trace_inst->wait_block_trace_origin ==
                 WaitBlockTraceOrigin::PARTIAL_BLOCKED_REPLAY
@@ -1233,6 +1255,9 @@ void SM::issue_warp(register_set_uniptr &pipe_reg_set, warp_inst_t *next_inst,
     if (trace_inst->wait_block_trace_origin ==
         WaitBlockTraceOrigin::PARTIAL_BLOCKED_REPLAY) {
       m_partial_replayed_occurrences_total++;
+      note_partial_replay_progress(
+          warp_id, trace_warp->partial_replay_remaining(),
+          trace_inst->pc, 1);
       if (replay_remaining_before == 1) {
         debug_log_wait_block_event(
             "partial-replay-drained",
@@ -1244,8 +1269,8 @@ void SM::issue_warp(register_set_uniptr &pipe_reg_set, warp_inst_t *next_inst,
                 std::to_string(m_physical_warp[warp_id]->get_cta_id()) +
                 " warp=" + std::to_string(warp_id) +
                 " last_pc=0x" + format_hex_u64(trace_inst->pc) +
-                " canonical_pc=0x" +
-                format_hex_u64(trace_warp->canonical_trace_pc()));
+                " expected_post_join_pc=0x" +
+                format_hex_u64(trace_inst->next_traced_pc));
       }
     }
   }
@@ -1911,6 +1936,9 @@ void SM::reinit(unsigned start_thread, unsigned end_thread,
       const bool partial_arm =
           i < m_partial_wait_arms.size() &&
           m_partial_wait_arms[i].valid;
+      const bool replay_progress =
+          i < m_partial_replay_progress.size() &&
+          m_partial_replay_progress[i].valid;
       const bool joined_region =
           i < m_partial_joined_regions.size() &&
           !m_partial_joined_regions[i].empty();
@@ -1918,8 +1946,8 @@ void SM::reinit(unsigned start_thread, unsigned end_thread,
           m_config->is_trace_mode &&
           static_cast<trace_shd_warp_t *>(m_physical_warp[i])
               ->partial_capsule_active();
-      if (!pending_hold && !partial_arm && !joined_region &&
-          !trace_capsule) {
+      if (!pending_hold && !partial_arm && !replay_progress &&
+          !joined_region && !trace_capsule) {
         continue;
       }
       const HopperMBarrierPendingWait &pending = m_pending_sync_waits[i];
@@ -1928,6 +1956,7 @@ void SM::reinit(unsigned start_thread, unsigned end_thread,
                 << " reason=warp-slot-reuse-with-active-wait-block-state"
                 << " pending_hold=" << pending_hold
                 << " partial_arm=" << partial_arm
+                << " replay_progress=" << replay_progress
                 << " joined_regions=" << joined_region
                 << " trace_capsule=" << trace_capsule
                 << " strategy="
@@ -1967,6 +1996,9 @@ void SM::reinit(unsigned start_thread, unsigned end_thread,
     if (i < m_partial_wait_arms.size()) {
       m_partial_wait_arms[i] = HopperPartialWaitArm();
     }
+    if (i < m_partial_replay_progress.size()) {
+      m_partial_replay_progress[i] = HopperPartialReplayProgress();
+    }
     if (i < m_partial_joined_regions.size()) {
       m_partial_joined_regions[i].clear();
     }
@@ -2004,13 +2036,16 @@ void SM::register_cta_thread_exit(unsigned cta_num, kernel_info_t *kernel) {
           continue;
         }
         const bool partial_arm = m_partial_wait_arms[warp_id].valid;
+        const bool replay_progress =
+            m_partial_replay_progress[warp_id].valid;
         const bool joined_region =
             !m_partial_joined_regions[warp_id].empty();
         const bool trace_capsule =
             m_config->is_trace_mode &&
             static_cast<trace_shd_warp_t *>(m_physical_warp[warp_id])
                 ->partial_capsule_active();
-        if (!partial_arm && !joined_region && !trace_capsule) {
+        if (!partial_arm && !replay_progress && !joined_region &&
+            !trace_capsule) {
           continue;
         }
         std::cerr << "[WAITBLOCK][abort][SM" << m_sm_id << "] cyc="
@@ -2018,6 +2053,7 @@ void SM::register_cta_thread_exit(unsigned cta_num, kernel_info_t *kernel) {
                   << " reason=cta-exit-with-active-partial-state"
                   << " cta=" << cta_num << " warp=" << warp_id
                   << " partial_arm=" << partial_arm
+                  << " replay_progress=" << replay_progress
                   << " joined_regions=" << joined_region
                   << " trace_capsule=" << trace_capsule
                   << " action=abort" << std::endl;
@@ -2534,7 +2570,164 @@ unsigned SM::fold_cursor_skip_to_exit(unsigned warp_id,
               << " skipped=" << skipped << " action=abort" << std::endl;
     abort();
   }
+  if (in_partial_replay && skipped != 0) {
+    note_partial_replay_progress(
+        warp_id, tw->partial_replay_remaining(), tw->get_pc(), skipped);
+  }
   return skipped;
+}
+
+void SM::note_partial_replay_progress(
+    unsigned int warp_id, unsigned int remaining, uint64_t pc,
+    unsigned int advanced_occurrences) {
+  if (warp_id >= m_partial_replay_progress.size()) {
+    std::cerr << "[WAITBLOCK][abort][SM" << m_sm_id << "] cyc="
+              << get_current_gpu_cycle()
+              << " reason=partial-replay-progress-warp-range"
+              << " warp=" << warp_id << " action=abort" << std::endl;
+    abort();
+  }
+  HopperPartialReplayProgress &progress =
+      m_partial_replay_progress[warp_id];
+  if (advanced_occurrences == 0 || !progress.valid ||
+      remaining > progress.last_remaining ||
+      progress.last_remaining - remaining != advanced_occurrences ||
+      progress.progressed_occurrences + advanced_occurrences >
+          progress.initial_remaining) {
+    std::cerr << "[WAITBLOCK][abort][SM" << m_sm_id << "] cyc="
+              << get_current_gpu_cycle()
+              << " reason=partial-replay-progress-accounting"
+              << " warp=" << warp_id
+              << " valid=" << progress.valid
+              << " previous_remaining=" << progress.last_remaining
+              << " remaining=" << remaining
+              << " advanced=" << advanced_occurrences
+              << " pc=0x" << format_hex_u64(pc)
+              << " action=abort" << std::endl;
+    abort();
+  }
+  progress.last_remaining = remaining;
+  progress.last_pc = pc;
+  progress.progressed_occurrences += advanced_occurrences;
+  progress.last_progress_cycle = get_current_gpu_cycle();
+  progress.last_heartbeat_cycle = progress.last_progress_cycle;
+}
+
+void SM::service_partial_replay_progress(unsigned int warp_id) {
+  if (warp_id >= m_partial_replay_progress.size()) {
+    return;
+  }
+  HopperPartialReplayProgress &progress =
+      m_partial_replay_progress[warp_id];
+  if (!progress.valid) {
+    return;
+  }
+
+  const uint64_t now = get_current_gpu_cycle();
+  if (m_physical_warp[warp_id]->get_cta_id() != progress.cta_id) {
+    std::cerr << "[WAITBLOCK][abort][SM" << m_sm_id << "] cyc=" << now
+              << " reason=partial-replay-progress-cta-mismatch"
+              << " trace_kernel=" << progress.trace_kernel_id
+              << " cta=" << progress.cta_id
+              << " actual_cta="
+              << m_physical_warp[warp_id]->get_cta_id()
+              << " warp=" << warp_id << " action=abort" << std::endl;
+    abort();
+  }
+
+  HopperPartialWaitArm &arm = m_partial_wait_arms[warp_id];
+  HopperMBarrierPendingWait &pending_wait =
+      m_pending_sync_waits[warp_id];
+  if (arm.valid || pending_wait.valid) {
+    if (arm.valid && !arm.source_was_deferred_replay) {
+      std::cerr << "[WAITBLOCK][abort][SM" << m_sm_id << "] cyc=" << now
+                << " reason=partial-replay-overlapped-by-canonical-arm"
+                << " owner_region=" << progress.region_id
+                << " nested_region=" << arm.record.partial_region_id
+                << " warp=" << warp_id << " action=abort" << std::endl;
+      abort();
+    }
+    // The nested partial or mbarrier hold owns forward-progress checking until
+    // it releases. Its transition/hold watchdog remains active independently.
+    progress.last_progress_cycle = now;
+    progress.last_heartbeat_cycle = now;
+    return;
+  }
+
+  trace_shd_warp_t *tw =
+      static_cast<trace_shd_warp_t *>(m_physical_warp[warp_id]);
+  const unsigned int remaining = tw->partial_replay_remaining();
+  const bool replay_active = tw->partial_replay_active();
+  if (remaining != progress.last_remaining ||
+      progress.progressed_occurrences + remaining !=
+          progress.initial_remaining ||
+      (replay_active &&
+       tw->partial_replay_origin() !=
+           WaitBlockTraceOrigin::PARTIAL_BLOCKED_REPLAY) ||
+      (!replay_active && remaining != 0)) {
+    std::cerr << "[WAITBLOCK][abort][SM" << m_sm_id << "] cyc=" << now
+              << " reason=partial-replay-progress-state-drift"
+              << " block=" << progress.block_id
+              << " region=" << progress.region_id
+              << " warp=" << warp_id
+              << " replay_active=" << replay_active
+              << " expected_remaining=" << progress.last_remaining
+              << " actual_remaining=" << remaining
+              << " initial=" << progress.initial_remaining
+              << " progressed=" << progress.progressed_occurrences
+              << " action=abort" << std::endl;
+    abort();
+  }
+
+  const uint64_t no_progress_cycles = now - progress.last_progress_cycle;
+  if (now - progress.last_heartbeat_cycle >=
+      kWaitBlockHeartbeatCycles) {
+    debug_log_wait_block_event(
+        "partial-replay-heartbeat",
+        "block=" + progress.block_id +
+            " region=" + progress.region_id +
+            " trace_kernel=" +
+            std::to_string(progress.trace_kernel_id) +
+            " function=" +
+            std::to_string(progress.unique_function_id) +
+            " cta=" + std::to_string(progress.cta_id) +
+            " warp=" + std::to_string(warp_id) +
+            " remaining=" + std::to_string(remaining) +
+            " progressed=" +
+            std::to_string(progress.progressed_occurrences) +
+            " last_pc=0x" + format_hex_u64(progress.last_pc) +
+            " expected_post_join_pc=0x" +
+            format_hex_u64(progress.post_join_pc) +
+            " age=" + std::to_string(now - progress.start_cycle) +
+            " no_progress_cycles=" +
+            std::to_string(no_progress_cycles));
+    progress.last_heartbeat_cycle = now;
+  }
+  if (no_progress_cycles > kWaitBlockHoldWatchdogCycles) {
+    m_partial_replay_watchdog_aborts_total++;
+    m_wait_block_watchdog_aborts_total++;
+    std::cerr << "[WAITBLOCK][abort][SM" << m_sm_id << "] cyc=" << now
+              << " reason=partial-replay-watchdog"
+              << " block=" << progress.block_id
+              << " region=" << progress.region_id
+              << " trace_kernel=" << progress.trace_kernel_id
+              << " function=" << progress.unique_function_id
+              << " cta=" << progress.cta_id
+              << " global_cta="
+              << m_local_to_global_cta_id[progress.cta_id]
+              << " warp=" << warp_id
+              << " remaining=" << remaining
+              << " initial=" << progress.initial_remaining
+              << " progressed=" << progress.progressed_occurrences
+              << " last_pc=0x" << format_hex_u64(progress.last_pc)
+              << " expected_post_join_pc=0x"
+              << format_hex_u64(progress.post_join_pc)
+              << " age=" << now - progress.start_cycle
+              << " no_progress_cycles=" << no_progress_cycles
+              << " threshold=" << kWaitBlockHoldWatchdogCycles
+              << " action=abort" << std::endl;
+    abort();
+  }
 }
 
 void SM::start_partial_wait_hold(unsigned int warp_id,
@@ -2819,6 +3012,40 @@ void SM::handle_partial_wait_instruction_issue(const warp_inst_t &inst,
                 << " warp=" << warp_id << " action=abort" << std::endl;
       abort();
     }
+    HopperPartialReplayProgress &progress =
+        m_partial_replay_progress[warp_id];
+    const bool replay_region_matches =
+        progress.valid && progress.region_id == post_region.region_id;
+    const bool replay_pc_matches =
+        progress.valid && progress.post_join_pc == inst.pc;
+    const bool closes_replay_progress =
+        replay_region_matches && replay_pc_matches;
+    if (progress.valid &&
+        (replay_region_matches != replay_pc_matches ||
+         (closes_replay_progress &&
+          (progress.trace_kernel_id != inst.trace_kernel_id ||
+           progress.unique_function_id != inst.unique_function_id ||
+           progress.cta_id !=
+               m_physical_warp[warp_id]->get_cta_id() ||
+           progress.last_remaining != 0 ||
+           progress.progressed_occurrences !=
+               progress.initial_remaining)))) {
+      std::cerr << "[WAITBLOCK][abort][SM" << m_sm_id << "] cyc="
+                << get_current_gpu_cycle()
+                << " reason=partial-replay-post-join-accounting"
+                << " owner_region=" << progress.region_id
+                << " observed_region=" << post_region.region_id
+                << " warp=" << warp_id
+                << " expected_post_join_pc=0x"
+                << format_hex_u64(progress.post_join_pc)
+                << " actual_post_join_pc=0x"
+                << format_hex_u64(inst.pc)
+                << " initial=" << progress.initial_remaining
+                << " remaining=" << progress.last_remaining
+                << " progressed=" << progress.progressed_occurrences
+                << " action=abort" << std::endl;
+      abort();
+    }
     if (m_partial_joined_regions[warp_id].erase(post_region.region_id) != 1) {
       std::cerr << "[WAITBLOCK][abort][SM" << m_sm_id << "] cyc="
                 << get_current_gpu_cycle()
@@ -2835,7 +3062,16 @@ void SM::handle_partial_wait_instruction_issue(const warp_inst_t &inst,
             " cta=" +
             std::to_string(m_physical_warp[warp_id]->get_cta_id()) +
             " warp=" + std::to_string(warp_id) +
-            " post_join_pc=0x" + format_hex_u64(inst.pc));
+            " post_join_pc=0x" + format_hex_u64(inst.pc) +
+            " replay_progress_closed=" +
+            std::to_string(closes_replay_progress) +
+            " replay_occurrences=" +
+            std::to_string(closes_replay_progress
+                               ? progress.progressed_occurrences
+                               : 0));
+    if (closes_replay_progress) {
+      progress = HopperPartialReplayProgress();
+    }
   }
 }
 
@@ -2844,6 +3080,7 @@ void SM::service_wait_block_release(unsigned warp_id) {
       warp_id >= m_pending_sync_waits.size()) {
     return;
   }
+  service_partial_replay_progress(warp_id);
   HopperPartialWaitArm &partial_arm = m_partial_wait_arms[warp_id];
   if (partial_arm.valid &&
       partial_arm.mode != PartialWaitArmMode::HOLDING) {
@@ -3029,8 +3266,19 @@ void SM::service_wait_block_release(unsigned warp_id) {
 
     trace_shd_warp_t *tw =
         static_cast<trace_shd_warp_t *>(m_physical_warp[warp_id]);
+    HopperPartialReplayProgress &replay_progress =
+        m_partial_replay_progress[warp_id];
     tw->get_IBuffer_remodeled()->flush(false);
     if (arm.extracted_capsule) {
+      if (replay_progress.valid) {
+        std::cerr << "[WAITBLOCK][abort][SM" << m_sm_id << "] cyc=" << now
+                  << " reason=partial-replay-owner-already-active"
+                  << " owner_region=" << replay_progress.region_id
+                  << " new_region=" << arm.record.partial_region_id
+                  << " block=" << block << " warp=" << warp_id
+                  << " action=abort" << std::endl;
+        abort();
+      }
       if (!tw->activate_partial_blocked_replay()) {
         std::cerr << "[WAITBLOCK][abort][SM" << m_sm_id << "] cyc=" << now
                   << " reason=partial-deferred-replay-activation-failed"
@@ -3039,19 +3287,60 @@ void SM::service_wait_block_release(unsigned warp_id) {
                   << " action=abort" << std::endl;
         abort();
       }
+      const unsigned int replay_remaining =
+          tw->partial_replay_remaining();
+      if (replay_remaining == 0) {
+        std::cerr << "[WAITBLOCK][abort][SM" << m_sm_id << "] cyc=" << now
+                  << " reason=partial-replay-activated-empty"
+                  << " block=" << block << " warp=" << warp_id
+                  << " action=abort" << std::endl;
+        abort();
+      }
+      replay_progress.valid = true;
+      replay_progress.block_id = arm.record.block_id;
+      replay_progress.region_id = arm.record.partial_region_id;
+      replay_progress.trace_kernel_id =
+          pending_wait.key.trace_kernel_id;
+      replay_progress.unique_function_id =
+          pending_wait.unique_function_id;
+      replay_progress.cta_id = pending_wait.key.cta_id;
+      replay_progress.start_cycle = now;
+      replay_progress.last_heartbeat_cycle = now;
+      replay_progress.last_progress_cycle = now;
+      replay_progress.last_pc = arm.record.join_pc;
+      replay_progress.post_join_pc = arm.record.post_join_pc;
+      replay_progress.initial_remaining = replay_remaining;
+      replay_progress.last_remaining = replay_remaining;
     } else if (arm.source_was_deferred_replay) {
-      if (!tw->partial_replay_active() ||
+      if (!replay_progress.valid ||
+          replay_progress.trace_kernel_id !=
+              pending_wait.key.trace_kernel_id ||
+          replay_progress.unique_function_id !=
+              pending_wait.unique_function_id ||
+          replay_progress.cta_id != pending_wait.key.cta_id ||
+          !tw->partial_replay_active() ||
           tw->partial_replay_origin() !=
-              WaitBlockTraceOrigin::PARTIAL_BLOCKED_REPLAY) {
+              WaitBlockTraceOrigin::PARTIAL_BLOCKED_REPLAY ||
+          replay_progress.last_remaining !=
+              tw->partial_replay_remaining()) {
         std::cerr << "[WAITBLOCK][abort][SM" << m_sm_id << "] cyc=" << now
                   << " reason=partial-nested-replay-state-lost"
                   << " block=" << block << " warp=" << warp_id
                   << " action=abort" << std::endl;
         abort();
       }
+      replay_progress.last_progress_cycle = now;
+      replay_progress.last_heartbeat_cycle = now;
     } else if (tw->partial_capsule_active()) {
       std::cerr << "[WAITBLOCK][abort][SM" << m_sm_id << "] cyc=" << now
                 << " reason=unexpected-partial-capsule-on-direct-release"
+                << " block=" << block << " warp=" << warp_id
+                << " action=abort" << std::endl;
+      abort();
+    } else if (replay_progress.valid) {
+      std::cerr << "[WAITBLOCK][abort][SM" << m_sm_id << "] cyc=" << now
+                << " reason=canonical-partial-release-with-replay-owner"
+                << " owner_region=" << replay_progress.region_id
                 << " block=" << block << " warp=" << warp_id
                 << " action=abort" << std::endl;
       abort();
@@ -3214,11 +3503,14 @@ void SM::print_wait_block_summary() const {
     }
   }
   unsigned long long active_partial_arms = 0;
+  unsigned long long active_partial_replay_progress = 0;
   unsigned long long active_partial_regions = 0;
   unsigned long long active_partial_capsules = 0;
   for (unsigned warp_id = 0; warp_id < m_partial_wait_arms.size();
        ++warp_id) {
     active_partial_arms += m_partial_wait_arms[warp_id].valid;
+    active_partial_replay_progress +=
+        m_partial_replay_progress[warp_id].valid;
     active_partial_regions += m_partial_joined_regions[warp_id].size();
     if (m_config->is_trace_mode &&
         static_cast<trace_shd_warp_t *>(m_physical_warp[warp_id])
@@ -3229,6 +3521,7 @@ void SM::print_wait_block_summary() const {
   const bool balanced =
       active_holds == 0 &&
       active_partial_arms == 0 &&
+      active_partial_replay_progress == 0 &&
       active_partial_regions == 0 &&
       active_partial_capsules == 0 &&
       m_missing_wait_holds_total == m_missing_wait_releases_total &&
@@ -3258,8 +3551,10 @@ void SM::print_wait_block_summary() const {
       "captured_poll_hold_cycles_total=%llu "
       "captured_poll_hold_cycles_avg=%.1f captured_poll_hold_cycles_max=%llu "
       "captured_poll_watchdog_aborts=%llu active_holds=%llu "
-      "active_partial_arms=%llu active_partial_regions=%llu "
+      "active_partial_arms=%llu active_partial_replay_progress=%llu "
+      "active_partial_regions=%llu "
       "active_partial_capsules=%llu "
+      "partial_replay_watchdog_aborts=%llu "
       "generation_overshoots=%llu watchdog_aborts=%llu\n",
       balanced ? "PASS" : "ACTIVE", m_sm_id, m_missing_wait_ready_total,
       m_missing_wait_holds_total,
@@ -3274,7 +3569,9 @@ void SM::print_wait_block_summary() const {
       m_fold_immediate_skipped_insts_total, m_fold_park_cycles_total,
       captured_poll_avg_hold, m_fold_park_cycles_max, m_fold_watchdog_hits,
       active_holds,
-      active_partial_arms, active_partial_regions, active_partial_capsules,
+      active_partial_arms, active_partial_replay_progress,
+      active_partial_regions, active_partial_capsules,
+      m_partial_replay_watchdog_aborts_total,
       m_wait_block_generation_overshoots_total,
       m_wait_block_watchdog_aborts_total);
 
@@ -4121,6 +4418,7 @@ void SM::clear_sync_barrier_state_for_cta(unsigned int cta_id) {
     }
     if (m_config->wait_block_enable &&
         (m_partial_wait_arms[warp_id].valid ||
+         m_partial_replay_progress[warp_id].valid ||
          !m_partial_joined_regions[warp_id].empty() ||
          (m_config->is_trace_mode &&
           static_cast<trace_shd_warp_t *>(m_physical_warp[warp_id])
@@ -4129,10 +4427,18 @@ void SM::clear_sync_barrier_state_for_cta(unsigned int cta_id) {
                 << get_current_gpu_cycle()
                 << " reason=cta-cleanup-with-active-partial-state"
                 << " cta=" << cta_id << " warp=" << warp_id
+                << " partial_arm="
+                << m_partial_wait_arms[warp_id].valid
+                << " replay_progress="
+                << m_partial_replay_progress[warp_id].valid
+                << " joined_regions="
+                << m_partial_joined_regions[warp_id].size()
                 << " action=abort" << std::endl;
       abort();
     }
     m_partial_wait_arms[warp_id] = HopperPartialWaitArm();
+    m_partial_replay_progress[warp_id] =
+        HopperPartialReplayProgress();
     m_partial_joined_regions[warp_id].clear();
   }
   for (auto it = m_hopper_mbarriers.begin(); it != m_hopper_mbarriers.end();) {
