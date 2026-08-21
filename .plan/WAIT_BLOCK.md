@@ -1,13 +1,14 @@
 # WaitBlock: Two-Strategy Post-Processing and Simulator Design
 
-**Status:** POST-PROCESSING V4 IMPLEMENTED AND FULL-TRACE VALIDATED;
+**Status:** POST-PROCESSING V5 IMPLEMENTED AND FULL-TRACE VALIDATED;
 SIMULATOR V1 IMPLEMENTED; FIRST SERVER RUN EXPOSED AND FIXED A PREDICATED-OFF
 PAYLOAD GUARD; SECOND SERVER RUN EXPOSED A FALSE CURSOR-ACCOUNTING AUDIT;
 CAPTURED-POLL PROOF HARDENING IMPLEMENTED AND FULL-TRACE VALIDATED;
 THIRD SERVER RUN CONFIRMED AN ACTUAL K5 PARTIAL MODELED MISS AND STOPPED AT THE
 INTENTIONAL V1 GUARD; K10 POST-FIX VALIDATION IS STILL RUNNING;
 PARTIAL-MISSING-WAIT V2 POST-PROCESSING IMPLEMENTED AND FULL-TRACE VALIDATED;
-SIMULATOR V2 IMPLEMENTATION PENDING.
+SIMULATOR V2 LOADER AND DEFERRED-REPLAY IMPLEMENTATION COMPLETE;
+SERVER BUILD AND K5/K10 RUNTIME VALIDATION PENDING.
 
 **Extends:** [`SPIN_WAIT_SIM_MODELING.md`](SPIN_WAIT_SIM_MODELING.md) and
 [`SPIN_WAIT_POSTPROCESS.md`](SPIN_WAIT_POSTPROCESS.md).
@@ -1044,14 +1045,14 @@ The v4 runtime has one canonical feature gate and one debug gate:
 ```
 
 The former `-spin_wait_fold_enable` and `-spin_wait_fold_debug` options are
-removed. `FOLD_CAPTURED_POLL` is a strategy selected by v4 sidecar metadata, not
+removed. `FOLD_CAPTURED_POLL` is a strategy selected by v5 sidecar metadata, not
 a separately enabled runtime mode. `-spin_wait_observe_enable` remains an
 independent read-only measurement option and never creates a hold or advances a
 cursor.
 
 With `-wait_block_enable 0`:
 
-- do not require sidecar v4;
+- do not require sidecar v5;
 - do not build either strategy map;
 - do not create pending wait state;
 - do not change scheduler eligibility;
@@ -1493,6 +1494,13 @@ mode = PARTIAL_WAIT_AFTER_JOIN
 begin whole-warp scheduler hold
 ```
 
+The reordered complementary join and the later replayed blocked join still use
+the normal instruction pipeline for timing and accounting, but they bypass the
+legacy whole-warp barrier rendezvous update. The capsule itself owns this
+two-group rendezvous and prevents `post_join_pc` from issuing until both join
+occurrences have issued. Canonical, non-replayed joins keep the existing barrier
+behavior unchanged.
+
 At this point the scheduler-level hold is valid:
 
 ```text
@@ -1528,6 +1536,11 @@ On release, issue deferred occurrences through the normal pipelines in their
 original blocked-lane order. They retain their captured dynamic payloads and
 therefore execute semantic work such as ARRIVE, TMA, local memory, and
 WARPSYNC normally.
+
+If a deferred suffix contains a sidecar-owned `FOLD_CAPTURED_POLL`, its
+residual polling occurrences are folded inside the deferred replay stream.
+They must not advance the canonical source cursor, which already landed at
+`post_join_pc` during capsule extraction.
 
 For K5 `0x93b0`, the capsule is:
 
@@ -1612,7 +1625,7 @@ Post-processing:
 
 - missing `enhanced_execution_info.json` aborts automatic generation;
 - missing `sync_operand_resolver.json` aborts automatic generation;
-- an empty resolver with no static wait opcode emits a valid empty v4 sidecar;
+- an empty resolver with no static wait opcode emits a valid empty v5 sidecar;
 - an empty resolver with static wait opcodes aborts;
 - `failed=0` cannot produce a strategy-proof strict failure;
 - `failed>0` exits before output publication;
@@ -1767,11 +1780,14 @@ Cross-kernel:
     wait-arm/join proof, full-trace complementary-mask proof, and linear capsule
     proof. The K5/K10 strict scan passes for all 11 partial records and all 4,596
     visits (`join_pending=2,076`, `join_already_issued=2,520`).
-18. [pending] Extend the strict loader and implement `PARTIAL_ARMED`,
-    `PARTIAL_EXTRACT`, `PARTIAL_WAIT_AFTER_JOIN`, and `PARTIAL_REPLAY`.
-19. [in progress] Ten post-processing unit tests pass. Add simulator-focused
-    cursor/payload/lifecycle tests, then rerun K5 and K10 with the v2 partial
-    policy enabled.
+18. [done] Extend the strict schema-v5 loader and implement `PARTIAL_ARMED`,
+    `PARTIAL_EXTRACT`, `PARTIAL_WAIT_AFTER_JOIN`, and `PARTIAL_REPLAY`, including
+    replay-aware IBuffer rollback, nested waits, and captured-poll folding inside
+    a deferred stream.
+19. [in progress] Twelve post-processing unit tests pass. Local simulator
+    compilation is unavailable because this macOS environment has no CUDA
+    headers. Build on the server, run focused cursor/payload/lifecycle tests,
+    then rerun K5 and K10 with the v2 partial policy enabled.
 
 The design is complete when each runtime action is explained by exactly one of
 the two strategies. No entry action is permitted for a captured-poll record, and

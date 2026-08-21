@@ -142,7 +142,10 @@ void IBuffer_Remodeled::flush(bool reset_pc_to_0) {
             }
             if(m_config->is_trace_mode && (m_remodeled_ibuffer.front().m_inst != NULL)
                 && m_remodeled_ibuffer.front().m_inst->m_has_the_instruction_been_traced) {
-                static_cast<trace_shd_warp_t*>(m_shd_warp)->decrease_num_used_inst(m_remodeled_ibuffer.front().m_pc);
+                static_cast<trace_shd_warp_t*>(m_shd_warp)
+                    ->rollback_trace_inst(
+                        static_cast<trace_warp_inst_t*>(
+                            m_remodeled_ibuffer.front().m_inst));
                 delete m_remodeled_ibuffer.front().m_inst;
             }else if(m_remodeled_ibuffer.front().m_inst != NULL){
                 delete m_remodeled_ibuffer.front().m_inst;

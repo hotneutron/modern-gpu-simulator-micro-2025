@@ -2281,10 +2281,10 @@ class shader_core_config : public core_config {
   // never blocks or advances the trace. Default 0.
   bool spin_wait_observe_enable;
 
-  // [WaitBlock v4] Master gate for the two-strategy runtime. When enabled,
-  // spin_wait_sidecar.json must be a complete schema-v4 document. Captured
+  // [WaitBlock v5] Master gate for the two-strategy runtime. When enabled,
+  // spin_wait_sidecar.json must be a complete schema-v5 document. Captured
   // polls reuse the existing fold path; ready-only all-live misses create an
-  // entry hold with no cursor advance. Partial modeled misses abort.
+  // entry hold, and proven partial misses use bounded deferred replay.
   bool wait_block_enable;
 
   // Emit [WAITBLOCK] hold/release/guard/summary diagnostics.

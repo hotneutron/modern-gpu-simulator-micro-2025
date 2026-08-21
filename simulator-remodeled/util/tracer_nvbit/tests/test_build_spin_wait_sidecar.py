@@ -168,6 +168,7 @@ class PartialJoinProofTest(unittest.TestCase):
     def setUp(self):
         self.candidate = {
             "resume_pc": self.RESUME,
+            "not_ready_branch_pc": 0x120,
         }
         self.by_pc = {
             0x80: instruction(
@@ -243,6 +244,32 @@ class PartialJoinProofTest(unittest.TestCase):
 
         self.assertFalse(ok)
         self.assertEqual(reason, SIDECAR.PARTIAL_SIBLING_NOT_QUIESCENT)
+
+    def test_missing_not_ready_branch_occurrence_is_rejected(self):
+        insts = [
+            inst for inst in self._pending_trace()
+            if inst["pc"] != 0x120
+        ]
+
+        ok, reason, _ = SIDECAR.prove_partial_join_visit(
+            self.candidate, insts, self.by_pc, 1, 1,
+            [self.FULL] * len(insts))
+
+        self.assertFalse(ok)
+        self.assertEqual(
+            reason, SIDECAR.PARTIAL_ENTRY_BRANCH_OCCURRENCE_MISSING)
+
+    def test_call_inside_capsule_is_rejected(self):
+        self.by_pc[0x140] = instruction(
+            "CALL", [operand("0x400", 0x400)])
+        insts = self._pending_trace()
+
+        ok, reason, _ = SIDECAR.prove_partial_join_visit(
+            self.candidate, insts, self.by_pc, 1, 1,
+            [self.FULL] * len(insts))
+
+        self.assertFalse(ok)
+        self.assertEqual(reason, SIDECAR.PARTIAL_CAPSULE_CONTROL_UNSAFE)
 
     def test_bsync_requires_matching_bssy_target(self):
         self.by_pc[0x70] = instruction(
@@ -320,13 +347,14 @@ class PartialJoinProofTest(unittest.TestCase):
         }
 
         record = SIDECAR.make_inject_missing_wait_record(
-            candidate, sync_sites, self.by_pc)
+            7, candidate, sync_sites, self.by_pc)
 
         self.assertEqual(
             record["partial_modeled_miss_action"],
             "DEFER_BLOCKED_SUFFIX_THEN_HOLD")
         self.assertEqual(record["partial_hold_proof_version"], 1)
-        self.assertEqual(record["partial_region_id"], "pr_fid1_b0x80_j0x200")
+        self.assertEqual(
+            record["partial_region_id"], "pr_k7_fid1_b0x80_j0x200")
         self.assertEqual(record["entry_branch_pc"], 0x120)
         self.assertEqual(record["join_pc"], self.JOIN)
         self.assertTrue(record["linear_capsule_safe"])

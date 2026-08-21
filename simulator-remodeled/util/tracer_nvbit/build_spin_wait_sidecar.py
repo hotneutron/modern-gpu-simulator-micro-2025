@@ -1017,7 +1017,7 @@ def prove_candidate(fid, cand, byp, sync_sites):
     return True, None
 
 
-def make_inject_missing_wait_record(c, sync_sites, byp):
+def make_inject_missing_wait_record(kid, c, sync_sites, byp):
     """Serialize a ready-only gate for the entry-only missing-wait strategy."""
     st = c.get("dynamic", {})
     partial = c.get("partial_join_proof")
@@ -1070,7 +1070,8 @@ def make_inject_missing_wait_record(c, sync_sites, byp):
     if partial is not None:
         region = partial["region"]
         record["partial_hold_proof_version"] = 1
-        record["partial_region_id"] = "pr_fid%d_b0x%x_j0x%x" % (
+        record["partial_region_id"] = "pr_k%d_fid%d_b0x%x_j0x%x" % (
+            kid,
             c["unique_function_id"],
             region["sibling_branch_pc"],
             region["join_pc"],
@@ -1300,10 +1301,13 @@ POLL_SCOREBOARD_UNSAFE = "POLL_SCOREBOARD_UNSAFE"
 CAPTURED_POLL_ENTRY_NOT_REQUIRED = "CAPTURED_POLL_ENTRY_NOT_REQUIRED"
 PARTIAL_MASK_PARTITION_INVALID = "PARTIAL_MASK_PARTITION_INVALID"
 PARTIAL_SIBLING_BRANCH_UNRESOLVED = "PARTIAL_SIBLING_BRANCH_UNRESOLVED"
+PARTIAL_ENTRY_BRANCH_OCCURRENCE_MISSING = \
+    "PARTIAL_ENTRY_BRANCH_OCCURRENCE_MISSING"
 PARTIAL_JOIN_STATIC_UNSAFE = "PARTIAL_JOIN_STATIC_UNSAFE"
 PARTIAL_JOIN_OCCURRENCE_MISSING = "PARTIAL_JOIN_OCCURRENCE_MISSING"
 PARTIAL_SIBLING_NOT_QUIESCENT = "PARTIAL_SIBLING_NOT_QUIESCENT"
 PARTIAL_CAPSULE_MASK_ESCAPE = "PARTIAL_CAPSULE_MASK_ESCAPE"
+PARTIAL_CAPSULE_CONTROL_UNSAFE = "PARTIAL_CAPSULE_CONTROL_UNSAFE"
 PARTIAL_POST_JOIN_UNRESOLVED = "PARTIAL_POST_JOIN_UNRESOLVED"
 PARTIAL_REGION_INCONSISTENT = "PARTIAL_REGION_INCONSISTENT"
 
@@ -1458,6 +1462,16 @@ def prove_partial_join_visit(cand, insts, byp, expected_fid, entry_index,
             break
     if resume_index is None:
         return False, PARTIAL_JOIN_OCCURRENCE_MISSING, None
+    entry_branch_index = None
+    for idx in range(entry_index + 1, resume_index):
+        if (insts[idx]["function_unique_id"] == expected_fid
+                and insts[idx]["pc"] == cand["not_ready_branch_pc"]
+                and (int(insts[idx]["active_mask"]) & live_mask) ==
+                    entry_mask):
+            entry_branch_index = idx
+            break
+    if entry_branch_index is None:
+        return False, PARTIAL_ENTRY_BRANCH_OCCURRENCE_MISSING, None
 
     last_join_index = max(sibling_join_index, blocked_join_index)
     post_join_index = None
@@ -1477,6 +1491,21 @@ def prove_partial_join_visit(cand, insts, byp, expected_fid, entry_index,
         inst = insts[idx]
         if inst["function_unique_id"] != expected_fid:
             return False, CTA_IDENTITY_MISMATCH, None
+        static_inst = byp.get(inst["pc"])
+        if static_inst is None:
+            return False, PARTIAL_CAPSULE_CONTROL_UNSAFE, None
+        if inst["pc"] == post_join_pc:
+            return False, PARTIAL_POST_JOIN_UNRESOLVED, {
+                "escape_pc": inst["pc"],
+                "escape_index": idx,
+            }
+        if _opcode_base(static_inst) in (
+                "CALL", "CALL.REL", "RET", "EXIT", "BRX", "JMP", "JMX",
+                "RTT"):
+            return False, PARTIAL_CAPSULE_CONTROL_UNSAFE, {
+                "escape_pc": inst["pc"],
+                "escape_index": idx,
+            }
         owner = int(inst["active_mask"]) & live_mask
         if owner == 0:
             continue
@@ -1504,6 +1533,7 @@ def prove_partial_join_visit(cand, insts, byp, expected_fid, entry_index,
         "sibling_branch_index": sibling_branch_index,
         "sibling_join_index": sibling_join_index,
         "blocked_join_index": blocked_join_index,
+        "entry_branch_index": entry_branch_index,
         "resume_index": resume_index,
         "post_join_index": post_join_index,
         "join_pending_at_entry": sibling_join_index > entry_index,
@@ -1998,7 +2028,7 @@ def main():
         wb_fail.extend(strategy_failures)
 
         inject_records = [
-            make_inject_missing_wait_record(c, sync_sites, byp)
+            make_inject_missing_wait_record(kid, c, sync_sites, byp)
             for c in inject_candidates
         ]
         metadata_records = [
@@ -2217,10 +2247,12 @@ def main():
             CAPTURED_POLL_ENTRY_NOT_REQUIRED,
             PARTIAL_MASK_PARTITION_INVALID,
             PARTIAL_SIBLING_BRANCH_UNRESOLVED,
+            PARTIAL_ENTRY_BRANCH_OCCURRENCE_MISSING,
             PARTIAL_JOIN_STATIC_UNSAFE,
             PARTIAL_JOIN_OCCURRENCE_MISSING,
             PARTIAL_SIBLING_NOT_QUIESCENT,
             PARTIAL_CAPSULE_MASK_ESCAPE,
+            PARTIAL_CAPSULE_CONTROL_UNSAFE,
             PARTIAL_POST_JOIN_UNRESOLVED,
             PARTIAL_REGION_INCONSISTENT,
         ],

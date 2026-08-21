@@ -918,15 +918,23 @@ class gpgpu_sim : public gpgpu_t {
                                  address_type pc,
                                  SyncResolvedSiteMetadata &metadata) const;
 
-  // Runtime action lookups. WaitBlock v4 uses kernel-aware keys; the legacy
+  // Runtime action lookups. WaitBlock v5 uses kernel-aware keys; the legacy
   // observe-only loader ignores trace_kernel_id and retains its (funcid, pc)
-  // key when spin-wait observation is enabled without the v4 runtime.
+  // key when spin-wait observation is enabled without the v5 runtime.
   bool lookup_spin_wait_region(unsigned int trace_kernel_id,
                                unsigned int unique_function_id, address_type pc,
                                SpinWaitRegionRecord &region) const;
   bool lookup_missing_wait(unsigned int trace_kernel_id,
                            unsigned int unique_function_id, address_type pc,
                            MissingWaitRecord &record) const;
+  bool lookup_partial_wait_join(unsigned int trace_kernel_id,
+                                unsigned int unique_function_id,
+                                address_type pc,
+                                PartialWaitRegionRecord &region) const;
+  bool lookup_partial_wait_post_join(unsigned int trace_kernel_id,
+                                     unsigned int unique_function_id,
+                                     address_type pc,
+                                     PartialWaitRegionRecord &region) const;
 
   void record_l1i_prefetch_miss_observation(new_addr_type block_addr,
                                             unsigned int unique_function_id,

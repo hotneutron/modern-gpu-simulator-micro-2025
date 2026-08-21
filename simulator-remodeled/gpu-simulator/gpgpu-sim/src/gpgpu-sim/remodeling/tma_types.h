@@ -3,6 +3,7 @@
 #include <array>
 #include <cstdint>
 #include <map>
+#include <set>
 #include <string>
 #include <tuple>
 #include <utility>
@@ -302,8 +303,26 @@ struct WaitBlockLookupKey {
 struct MissingWaitRecord {
   std::string block_id;
   uint64_t entry_probe_pc = 0;
+  uint64_t entry_branch_pc = 0;
+  uint64_t captured_ready_pc = 0;
   SyncInstructionKind entry_probe_kind = SyncInstructionKind::NONE;
   bool partial_modeled_miss_aborts = false;
+  bool partial_deferred_replay = false;
+  std::vector<uint64_t> entry_arming_pcs;
+  uint64_t miss_arm_entry_pc = 0;
+  std::vector<uint64_t> miss_arm_wait_pcs;
+  uint64_t miss_arm_loopback_pc = 0;
+  uint64_t miss_arm_exit_pc = 0;
+  uint64_t canonical_barrier_offset = 0;
+  std::set<std::string> canonical_wait_state_operands;
+  std::string partial_region_id;
+  uint64_t sibling_branch_pc = 0;
+  uint64_t join_pc = 0;
+  uint64_t post_join_pc = 0;
+  std::string join_kind;
+  std::set<uint64_t> observed_entry_masks;
+  std::set<uint64_t> observed_sibling_masks;
+  std::set<uint64_t> observed_live_masks;
   uint64_t captured_ready_visits = 0;
   uint64_t captured_second_gate_visits = 0;
   uint64_t captured_poll_visits = 0;
@@ -311,9 +330,26 @@ struct MissingWaitRecord {
   uint64_t partial_entry_visits = 0;
 };
 
+struct PartialWaitRegionRecord {
+  std::string region_id;
+  uint32_t trace_kernel_id = 0;
+  uint32_t unique_function_id = 0;
+  uint64_t sibling_branch_pc = 0;
+  uint64_t join_pc = 0;
+  uint64_t post_join_pc = 0;
+  std::string join_kind;
+  uint64_t bssy_pc = 0;
+  std::string join_token;
+  std::set<uint64_t> sibling_masks;
+  std::set<uint64_t> live_masks;
+};
+
 struct WaitBlockSidecarDB {
   std::map<WaitBlockLookupKey, MissingWaitRecord> missing_wait_by_entry;
   std::map<WaitBlockLookupKey, SpinWaitRegionRecord> captured_poll_by_probe;
+  std::map<std::string, PartialWaitRegionRecord> partial_regions_by_id;
+  std::map<WaitBlockLookupKey, std::string> partial_region_id_by_join;
+  std::map<WaitBlockLookupKey, std::string> partial_region_id_by_post_join;
   uint64_t discovered = 0;
   uint64_t passed = 0;
   uint64_t failed = 0;
@@ -322,11 +358,17 @@ struct WaitBlockSidecarDB {
   uint64_t ready_only_all_live_visits = 0;
   uint64_t ready_only_partial_visits = 0;
   uint64_t ready_only_records_with_partial_visits = 0;
+  uint64_t partial_defer_records = 0;
+  uint64_t partial_join_pending_visits = 0;
+  uint64_t partial_join_already_issued_visits = 0;
   bool validation_complete = false;
 
   void clear() {
     missing_wait_by_entry.clear();
     captured_poll_by_probe.clear();
+    partial_regions_by_id.clear();
+    partial_region_id_by_join.clear();
+    partial_region_id_by_post_join.clear();
     discovered = 0;
     passed = 0;
     failed = 0;
@@ -335,11 +377,15 @@ struct WaitBlockSidecarDB {
     ready_only_all_live_visits = 0;
     ready_only_partial_visits = 0;
     ready_only_records_with_partial_visits = 0;
+    partial_defer_records = 0;
+    partial_join_pending_visits = 0;
+    partial_join_already_issued_visits = 0;
     validation_complete = false;
   }
 
   bool empty() const {
-    return missing_wait_by_entry.empty() && captured_poll_by_probe.empty();
+    return missing_wait_by_entry.empty() && captured_poll_by_probe.empty() &&
+           partial_regions_by_id.empty();
   }
 };
 
@@ -380,7 +426,31 @@ struct HopperMBarrierObject {
 enum class WaitBlockPendingMode {
   NONE,
   MISSING_WAIT_HOLD,
+  PARTIAL_MISSING_WAIT_HOLD,
   CAPTURED_POLL_HOLD,
+};
+
+enum class PartialWaitArmMode {
+  NONE,
+  ARMED,
+  WAITING_FOR_SIBLING_JOIN,
+  HOLDING,
+};
+
+struct HopperPartialWaitArm {
+  bool valid = false;
+  PartialWaitArmMode mode = PartialWaitArmMode::NONE;
+  MissingWaitRecord record;
+  HopperMBarrierKey key;
+  uint64_t wait_state_raw = 0;
+  uint64_t expected_gen = 0;
+  uint64_t blocked_mask = 0;
+  uint64_t sibling_mask = 0;
+  uint32_t unique_function_id = 0;
+  uint64_t arm_start_cycle = 0;
+  uint64_t last_heartbeat_cycle = 0;
+  bool source_was_deferred_replay = false;
+  bool extracted_capsule = false;
 };
 
 struct HopperMBarrierPendingWait {
@@ -395,7 +465,8 @@ struct HopperMBarrierPendingWait {
   unsigned int unique_function_id = 0;
   // Absolute barrier generation paired with this hold. Both strategies pin it
   // once after the action probe executes. A captured poll consumes residual
-  // loop occurrences on release; a missing wait never changes either cursor.
+  // loop occurrences on release; an all-live missing wait never changes either
+  // cursor; a partial missing wait replays occurrences extracted before hold.
   uint64_t expected_gen = 0;
   uint64_t hold_start_cycle = 0;
   uint64_t last_heartbeat_cycle = 0;

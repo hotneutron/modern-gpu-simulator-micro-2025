@@ -162,6 +162,8 @@ const char *wait_block_mode_to_string(WaitBlockPendingMode mode) {
   switch (mode) {
     case WaitBlockPendingMode::MISSING_WAIT_HOLD:
       return "INJECT_MISSING_WAIT";
+    case WaitBlockPendingMode::PARTIAL_MISSING_WAIT_HOLD:
+      return "DEFER_PARTIAL_MISSING_WAIT";
     case WaitBlockPendingMode::CAPTURED_POLL_HOLD:
       return "FOLD_CAPTURED_POLL";
     case WaitBlockPendingMode::NONE:
@@ -306,6 +308,8 @@ SM::SM(unsigned int num_subcores, gpgpu_sim *gpu, simt_core_cluster *cluster,
   m_config = config;
   m_num_cycles_to_wait_to_dispatch_another_inst_from_subcore_to_sm_shared_pipeline = 0;
   m_pending_sync_waits.resize(config->max_warps_per_shader);
+  m_partial_wait_arms.resize(config->max_warps_per_shader);
+  m_partial_joined_regions.resize(config->max_warps_per_shader);
   m_pending_tma_barrier_binds_per_warp.resize(config->max_warps_per_shader);
   if (config->sync_debug_enable) {
     m_sync_debug_print_budget = config->sync_debug_print_budget;
@@ -1215,6 +1219,16 @@ void SM::issue_warp(register_set_uniptr &pipe_reg_set, warp_inst_t *next_inst,
   move_warp_uniptr(pipe_reg, inst_smart);
 
   m_physical_warp[warp_id]->get_IBuffer_remodeled()->issued();
+  if (m_config->is_trace_mode) {
+    trace_warp_inst_t *trace_inst =
+        static_cast<trace_warp_inst_t *>(pipe_reg.get());
+    static_cast<trace_shd_warp_t *>(m_physical_warp[warp_id])
+        ->commit_trace_inst(trace_inst);
+    if (trace_inst->wait_block_trace_origin ==
+        WaitBlockTraceOrigin::PARTIAL_BLOCKED_REPLAY) {
+      m_partial_replayed_occurrences_total++;
+    }
+  }
 
   pipe_reg->issue(active_mask, warp_id,
                      m_gpu->gpu_tot_sim_cycle + m_gpu->gpu_sim_cycle,
@@ -1264,12 +1278,25 @@ void SM::issue_warp(register_set_uniptr &pipe_reg_set, warp_inst_t *next_inst,
   if (pipe_reg->op == MBARRIER_OP) {
     handle_sync_instruction(*pipe_reg, warp_id);
   } else if (pipe_reg->op == BARRIER_OP) {
+    PartialWaitRegionRecord replay_join_region;
+    const WaitBlockTraceOrigin trace_origin =
+        m_config->is_trace_mode
+            ? static_cast<trace_warp_inst_t *>(pipe_reg.get())
+                  ->wait_block_trace_origin
+            : WaitBlockTraceOrigin::CANONICAL;
+    const bool is_partial_replay_join =
+        m_config->is_trace_mode &&
+        (trace_origin == WaitBlockTraceOrigin::PARTIAL_SIBLING_JOIN ||
+         trace_origin == WaitBlockTraceOrigin::PARTIAL_BLOCKED_REPLAY) &&
+        m_gpu->lookup_partial_wait_join(
+            pipe_reg->trace_kernel_id, pipe_reg->unique_function_id,
+            pipe_reg->pc, replay_join_region);
     // A predicated-off BAR (active_count()==0, e.g. a warp-specialized BAR.ARV/BAR.SYNC
     // executed only by a subset of warps) is a no-op for this warp: the warp does not
     // actually arrive at the barrier on hardware. Skip the barrier-set update entirely;
     // otherwise it would (a) register a spurious arrival and (b) decode to a fallback
     // bar_id=0 since no register operand value was captured for the inactive lanes.
-    if (pipe_reg->active_count() == 0) {
+    if (pipe_reg->active_count() == 0 || is_partial_replay_join) {
       // nothing to do for this warp
     } else {
       debug_print_sm_barrier_issue(*pipe_reg, warp_id, m_sm_id,
@@ -1389,6 +1416,9 @@ void SM::issue_warp(register_set_uniptr &pipe_reg_set, warp_inst_t *next_inst,
         m_physical_warp[warp_id]->pop_function_call(
             pipe_reg->get_active_mask());
       }
+    }
+    if (m_config->wait_block_enable) {
+      handle_partial_wait_instruction_issue(*pipe_reg, warp_id);
     }
   }
 }
@@ -1855,18 +1885,34 @@ void SM::reinit(unsigned start_thread, unsigned end_thread,
   const unsigned end_warp = end_thread / m_config->warp_size;
   if (m_config->wait_block_enable) {
     for (unsigned i = first_warp; i < end_warp; ++i) {
-      if (i >= m_pending_sync_waits.size() ||
-          !m_pending_sync_waits[i].valid) {
+      const bool pending_hold =
+          i < m_pending_sync_waits.size() &&
+          m_pending_sync_waits[i].valid;
+      const bool partial_arm =
+          i < m_partial_wait_arms.size() &&
+          m_partial_wait_arms[i].valid;
+      const bool joined_region =
+          i < m_partial_joined_regions.size() &&
+          !m_partial_joined_regions[i].empty();
+      const bool trace_capsule =
+          m_config->is_trace_mode &&
+          static_cast<trace_shd_warp_t *>(m_physical_warp[i])
+              ->partial_capsule_active();
+      if (!pending_hold && !partial_arm && !joined_region &&
+          !trace_capsule) {
         continue;
       }
       const HopperMBarrierPendingWait &pending = m_pending_sync_waits[i];
       std::cerr << "[WAITBLOCK][abort][SM" << m_sm_id << "] cyc="
                 << get_current_gpu_cycle()
-                << " reason=warp-slot-reuse-with-active-hold"
-                << " strategy=" << wait_block_mode_to_string(pending.mode)
-                << " trace_kernel=" << pending.key.trace_kernel_id
-                << " cta=" << pending.key.cta_id << " warp=" << i
-                << " action_pc=0x" << format_hex_u64(pending.action_pc)
+                << " reason=warp-slot-reuse-with-active-wait-block-state"
+                << " pending_hold=" << pending_hold
+                << " partial_arm=" << partial_arm
+                << " joined_regions=" << joined_region
+                << " trace_capsule=" << trace_capsule
+                << " strategy="
+                << wait_block_mode_to_string(pending.mode)
+                << " warp=" << i
                 << " action=abort" << std::endl;
       abort();
     }
@@ -1898,6 +1944,12 @@ void SM::reinit(unsigned start_thread, unsigned end_thread,
     if (i < m_pending_sync_waits.size()) {
       m_pending_sync_waits[i] = HopperMBarrierPendingWait();
     }
+    if (i < m_partial_wait_arms.size()) {
+      m_partial_wait_arms[i] = HopperPartialWaitArm();
+    }
+    if (i < m_partial_joined_regions.size()) {
+      m_partial_joined_regions[i].clear();
+    }
     if (i < m_pending_tma_barrier_binds_per_warp.size()) {
       m_pending_tma_barrier_binds_per_warp[i].clear();
     }
@@ -1923,6 +1975,31 @@ void SM::register_cta_thread_exit(unsigned cta_num, kernel_info_t *kernel) {
                   << " trace_kernel=" << pending.key.trace_kernel_id
                   << " cta=" << cta_num << " warp=" << warp_id
                   << " action_pc=0x" << format_hex_u64(pending.action_pc)
+                  << " action=abort" << std::endl;
+        abort();
+      }
+      for (unsigned warp_id = 0; warp_id < m_partial_wait_arms.size();
+           ++warp_id) {
+        if (m_physical_warp[warp_id]->get_cta_id() != cta_num) {
+          continue;
+        }
+        const bool partial_arm = m_partial_wait_arms[warp_id].valid;
+        const bool joined_region =
+            !m_partial_joined_regions[warp_id].empty();
+        const bool trace_capsule =
+            m_config->is_trace_mode &&
+            static_cast<trace_shd_warp_t *>(m_physical_warp[warp_id])
+                ->partial_capsule_active();
+        if (!partial_arm && !joined_region && !trace_capsule) {
+          continue;
+        }
+        std::cerr << "[WAITBLOCK][abort][SM" << m_sm_id << "] cyc="
+                  << get_current_gpu_cycle()
+                  << " reason=cta-exit-with-active-partial-state"
+                  << " cta=" << cta_num << " warp=" << warp_id
+                  << " partial_arm=" << partial_arm
+                  << " joined_regions=" << joined_region
+                  << " trace_capsule=" << trace_capsule
                   << " action=abort" << std::endl;
         abort();
       }
@@ -2083,7 +2160,11 @@ void SM::register_cta_thread_exit(unsigned cta_num, kernel_info_t *kernel) {
     clear_sync_barrier_state_for_cta(cta_num);
     if (m_config->wait_block_enable && m_n_active_cta == 0 &&
         (m_missing_wait_holds_total != m_missing_wait_releases_total ||
-         m_fold_parks_total != m_fold_releases_total)) {
+         m_fold_parks_total != m_fold_releases_total ||
+         m_partial_join_holds_total != m_partial_join_releases_total ||
+         m_partial_deferred_occurrences_total !=
+             m_partial_replayed_occurrences_total +
+                 m_partial_folded_occurrences_total)) {
       std::cerr << "[WAITBLOCK][abort][SM" << m_sm_id << "] cyc="
                 << get_current_gpu_cycle()
                 << " reason=terminal-hold-release-imbalance"
@@ -2091,6 +2172,14 @@ void SM::register_cta_thread_exit(unsigned cta_num, kernel_info_t *kernel) {
                 << " missing_releases=" << m_missing_wait_releases_total
                 << " poll_holds=" << m_fold_parks_total
                 << " poll_releases=" << m_fold_releases_total
+                << " partial_holds=" << m_partial_join_holds_total
+                << " partial_releases=" << m_partial_join_releases_total
+                << " partial_deferred="
+                << m_partial_deferred_occurrences_total
+                << " partial_replayed="
+                << m_partial_replayed_occurrences_total
+                << " partial_folded="
+                << m_partial_folded_occurrences_total
                 << " action=abort" << std::endl;
       abort();
     }
@@ -2354,6 +2443,10 @@ unsigned SM::fold_cursor_skip_to_exit(unsigned warp_id,
                                       FoldSkipStats &out_stats) {
   trace_shd_warp_t *tw =
       static_cast<trace_shd_warp_t *>(m_physical_warp[warp_id]);
+  const bool in_partial_replay =
+      tw->partial_replay_active() &&
+      tw->partial_replay_origin() ==
+          WaitBlockTraceOrigin::PARTIAL_BLOCKED_REPLAY;
   const unsigned int cursor_before_flush = tw->used_insts;
   tw->get_IBuffer_remodeled()->flush(false);
   const unsigned int cursor_after_flush = tw->used_insts;
@@ -2374,17 +2467,34 @@ unsigned SM::fold_cursor_skip_to_exit(unsigned warp_id,
   // body_pcs deliberately excludes the loopback BRA; add it so the guard lets
   // the cursor advance over the loop-closing branch on its way to exit_pc.
   allowed_skip_pcs.insert(static_cast<address_type>(region.loopback_bra_pc));
-  const unsigned int skipped = tw->skip_spin_to_exit(
-      static_cast<address_type>(region.exit_pc),
-      static_cast<address_type>(region.loopback_bra_pc), allowed_skip_pcs,
-      &out_stats);
+  const unsigned int skipped =
+      in_partial_replay
+          ? tw->skip_partial_replay_to_exit(
+                static_cast<address_type>(region.exit_pc),
+                static_cast<address_type>(region.loopback_bra_pc),
+                allowed_skip_pcs, &out_stats)
+          : tw->skip_spin_to_exit(
+                static_cast<address_type>(region.exit_pc),
+                static_cast<address_type>(region.loopback_bra_pc),
+                allowed_skip_pcs, &out_stats);
   const unsigned int cursor_after_skip = tw->used_insts;
-  out_stats.cursor_before_flush = cursor_before_flush;
-  out_stats.cursor_after_flush = cursor_after_flush;
-  out_stats.cursor_after_skip = cursor_after_skip;
-  out_stats.prefetched_rollback = cursor_before_flush - cursor_after_flush;
-  if (cursor_after_skip < cursor_after_flush ||
-      cursor_after_skip - cursor_after_flush != skipped ||
+  if (in_partial_replay) {
+    m_partial_folded_occurrences_total += skipped;
+  }
+  if (!in_partial_replay) {
+    out_stats.cursor_before_flush = cursor_before_flush;
+    out_stats.cursor_after_flush = cursor_after_flush;
+    out_stats.cursor_after_skip = cursor_after_skip;
+    out_stats.prefetched_rollback = cursor_before_flush - cursor_after_flush;
+  }
+  const bool cursor_accounting_ok =
+      in_partial_replay
+          ? (out_stats.cursor_after_skip >= out_stats.cursor_after_flush &&
+             out_stats.cursor_after_skip - out_stats.cursor_after_flush ==
+                 skipped)
+          : (cursor_after_skip >= cursor_after_flush &&
+             cursor_after_skip - cursor_after_flush == skipped);
+  if (!cursor_accounting_ok ||
       out_stats.warp_insts != skipped ||
       tw->get_pc() != region.exit_pc) {
     std::cerr << "[WAITBLOCK][abort][SM" << m_sm_id
@@ -2397,10 +2507,316 @@ unsigned SM::fold_cursor_skip_to_exit(unsigned warp_id,
               << " cursor_after_flush=" << cursor_after_flush
               << " prefetched_rollback=" << out_stats.prefetched_rollback
               << " cursor_after_skip=" << cursor_after_skip
+              << " replay_cursor_after_skip="
+              << out_stats.cursor_after_skip
+              << " source="
+              << (in_partial_replay ? "partial-replay" : "canonical")
               << " skipped=" << skipped << " action=abort" << std::endl;
     abort();
   }
   return skipped;
+}
+
+void SM::start_partial_wait_hold(unsigned int warp_id,
+                                 HopperPartialWaitArm &arm) {
+  if (!arm.valid || arm.mode == PartialWaitArmMode::NONE ||
+      warp_id >= m_pending_sync_waits.size() ||
+      m_pending_sync_waits[warp_id].valid ||
+      m_partial_joined_regions[warp_id].count(
+          arm.record.partial_region_id) == 0) {
+    std::cerr << "[WAITBLOCK][abort][SM" << m_sm_id << "] cyc="
+              << get_current_gpu_cycle()
+              << " reason=invalid-partial-hold-transition"
+              << " warp=" << warp_id
+              << " block=" << arm.record.block_id
+              << " region=" << arm.record.partial_region_id
+              << " action=abort" << std::endl;
+    abort();
+  }
+
+  trace_shd_warp_t *tw =
+      static_cast<trace_shd_warp_t *>(m_physical_warp[warp_id]);
+  tw->get_IBuffer_remodeled()->flush(false);
+
+  HopperMBarrierPendingWait held;
+  held.valid = true;
+  held.is_trywait =
+      arm.record.entry_probe_kind == SyncInstructionKind::TRYWAIT;
+  held.key = arm.key;
+  held.wait_state_raw = arm.wait_state_raw;
+  held.mode = WaitBlockPendingMode::PARTIAL_MISSING_WAIT_HOLD;
+  held.block_id = arm.record.block_id;
+  held.action_pc = arm.record.entry_probe_pc;
+  held.unique_function_id = arm.unique_function_id;
+  held.expected_gen = arm.expected_gen;
+  held.hold_start_cycle = get_current_gpu_cycle();
+  held.last_heartbeat_cycle = held.hold_start_cycle;
+  m_pending_sync_waits[warp_id] = held;
+  arm.mode = PartialWaitArmMode::HOLDING;
+  m_missing_wait_holds_total++;
+  m_partial_join_holds_total++;
+  debug_log_wait_block_event(
+      "partial-join-hold",
+      "block=" + arm.record.block_id +
+          " region=" + arm.record.partial_region_id +
+          " trace_kernel=" + std::to_string(arm.key.trace_kernel_id) +
+          " function=" + std::to_string(held.unique_function_id) +
+          " cta=" + std::to_string(arm.key.cta_id) +
+          " warp=" + std::to_string(warp_id) +
+          " entry_pc=0x" + format_hex_u64(arm.record.entry_probe_pc) +
+          " join_pc=0x" + format_hex_u64(arm.record.join_pc) +
+          " blocked_mask=0x" + format_hex_u64(arm.blocked_mask) +
+          " sibling_mask=0x" + format_hex_u64(arm.sibling_mask) +
+          " expected_gen=" + std::to_string(arm.expected_gen) +
+          " current_gen=" + std::to_string(sync_barrier_gen(arm.key)) +
+          " deferred=" +
+          std::to_string(tw->partial_deferred_size()));
+}
+
+void SM::handle_partial_wait_instruction_issue(const warp_inst_t &inst,
+                                               unsigned int warp_id) {
+  if (!m_config->is_trace_mode ||
+      warp_id >= m_partial_wait_arms.size() ||
+      warp_id >= m_partial_joined_regions.size()) {
+    return;
+  }
+
+  PartialWaitRegionRecord join_region;
+  if (m_gpu->lookup_partial_wait_join(
+          inst.trace_kernel_id, inst.unique_function_id, inst.pc,
+          join_region)) {
+    const uint64_t issued_mask = inst.get_active_mask().to_ullong();
+    if (join_region.sibling_masks.count(issued_mask) != 0) {
+      if (!m_partial_joined_regions[warp_id]
+               .insert(join_region.region_id)
+               .second) {
+        std::cerr << "[WAITBLOCK][abort][SM" << m_sm_id << "] cyc="
+                  << get_current_gpu_cycle()
+                  << " reason=duplicate-partial-sibling-join"
+                  << " region=" << join_region.region_id
+                  << " warp=" << warp_id << " action=abort" << std::endl;
+        abort();
+      }
+      debug_log_wait_block_event(
+          "partial-sibling-join",
+          "region=" + join_region.region_id +
+              " trace_kernel=" + std::to_string(inst.trace_kernel_id) +
+              " function=" + std::to_string(inst.unique_function_id) +
+              " cta=" +
+              std::to_string(m_physical_warp[warp_id]->get_cta_id()) +
+              " warp=" + std::to_string(warp_id) +
+              " join_pc=0x" + format_hex_u64(inst.pc) +
+              " sibling_mask=0x" + format_hex_u64(issued_mask));
+    }
+  }
+
+  HopperPartialWaitArm &arm = m_partial_wait_arms[warp_id];
+  if (arm.valid) {
+    if (inst.trace_kernel_id != arm.key.trace_kernel_id ||
+        inst.unique_function_id != arm.unique_function_id) {
+      std::cerr << "[WAITBLOCK][abort][SM" << m_sm_id << "] cyc="
+                << get_current_gpu_cycle()
+                << " reason=partial-arm-identity-mismatch"
+                << " block=" << arm.record.block_id
+                << " warp=" << warp_id
+                << " trace_kernel=" << inst.trace_kernel_id
+                << " function=" << inst.unique_function_id
+                << " action=abort" << std::endl;
+      abort();
+    }
+    if (arm.mode == PartialWaitArmMode::ARMED) {
+      if (inst.pc == arm.record.entry_probe_pc) {
+        return;
+      }
+      const uint64_t arming_owner =
+          static_cast<uint64_t>(inst.trace_active_mask) &
+          (arm.blocked_mask | arm.sibling_mask);
+      if (!inst.trace_masks_valid ||
+          (arming_owner != 0 &&
+           (arming_owner & ~arm.blocked_mask) != 0)) {
+        std::cerr << "[WAITBLOCK][abort][SM" << m_sm_id << "] cyc="
+                  << get_current_gpu_cycle()
+                  << " reason=partial-arming-mask-escape"
+                  << " block=" << arm.record.block_id
+                  << " warp=" << warp_id << " pc=0x"
+                  << format_hex_u64(inst.pc)
+                  << " trace_active_mask=0x"
+                  << format_hex_u64(inst.trace_active_mask)
+                  << " blocked_mask=0x"
+                  << format_hex_u64(arm.blocked_mask)
+                  << " action=abort" << std::endl;
+        abort();
+      }
+      if (inst.pc != arm.record.entry_branch_pc) {
+        if (std::find(arm.record.entry_arming_pcs.begin(),
+                      arm.record.entry_arming_pcs.end(),
+                      static_cast<uint64_t>(inst.pc)) ==
+            arm.record.entry_arming_pcs.end()) {
+          std::cerr << "[WAITBLOCK][abort][SM" << m_sm_id << "] cyc="
+                    << get_current_gpu_cycle()
+                    << " reason=partial-arming-path-escape"
+                    << " block=" << arm.record.block_id
+                    << " warp=" << warp_id << " pc=0x"
+                    << format_hex_u64(inst.pc)
+                    << " expected_branch_pc=0x"
+                    << format_hex_u64(arm.record.entry_branch_pc)
+                    << " action=abort" << std::endl;
+          abort();
+        }
+        return;
+      }
+
+      if (m_partial_joined_regions[warp_id].count(
+              arm.record.partial_region_id) != 0) {
+        m_partial_join_already_issued_total++;
+        start_partial_wait_hold(warp_id, arm);
+        return;
+      }
+
+      trace_shd_warp_t *tw =
+          static_cast<trace_shd_warp_t *>(m_physical_warp[warp_id]);
+      const unsigned int cursor_before_flush = tw->used_insts;
+      tw->get_IBuffer_remodeled()->flush(false);
+      const unsigned int cursor_after_flush = tw->used_insts;
+      if (cursor_after_flush > cursor_before_flush) {
+        std::cerr << "[WAITBLOCK][abort][SM" << m_sm_id << "] cyc="
+                  << get_current_gpu_cycle()
+                  << " reason=partial-prefetch-rollback-direction"
+                  << " block=" << arm.record.block_id
+                  << " warp=" << warp_id
+                  << " cursor_before_flush=" << cursor_before_flush
+                  << " cursor_after_flush=" << cursor_after_flush
+                  << " action=abort" << std::endl;
+        abort();
+      }
+      PartialTraceExtractStats stats;
+      std::string failure;
+      if (!tw->extract_partial_wait_capsule(
+              arm.blocked_mask, arm.sibling_mask,
+              arm.blocked_mask | arm.sibling_mask,
+              arm.unique_function_id,
+              static_cast<address_type>(arm.record.captured_ready_pc),
+              static_cast<address_type>(arm.record.join_pc),
+              static_cast<address_type>(arm.record.post_join_pc),
+              &stats, &failure)) {
+        std::cerr << "[WAITBLOCK][abort][SM" << m_sm_id << "] cyc="
+                  << get_current_gpu_cycle()
+                  << " reason=partial-capsule-extraction-failed"
+                  << " detail=" << failure
+                  << " block=" << arm.record.block_id
+                  << " region=" << arm.record.partial_region_id
+                  << " warp=" << warp_id
+                  << " source_pc=0x"
+                  << format_hex_u64(tw->canonical_trace_pc())
+                  << " expected_ready_pc=0x"
+                  << format_hex_u64(arm.record.captured_ready_pc)
+                  << " action=abort" << std::endl;
+        abort();
+      }
+      if (stats.cursor_before != cursor_after_flush ||
+          stats.cursor_after < stats.cursor_before ||
+          stats.cursor_after - stats.cursor_before !=
+              stats.blocked_occurrences + stats.sibling_join_occurrences) {
+        std::cerr << "[WAITBLOCK][abort][SM" << m_sm_id << "] cyc="
+                  << get_current_gpu_cycle()
+                  << " reason=partial-extraction-cursor-accounting"
+                  << " block=" << arm.record.block_id
+                  << " warp=" << warp_id
+                  << " cursor_before_flush=" << cursor_before_flush
+                  << " cursor_after_flush=" << cursor_after_flush
+                  << " cursor_after_extract=" << stats.cursor_after
+                  << " blocked_occurrences=" << stats.blocked_occurrences
+                  << " sibling_join_occurrences="
+                  << stats.sibling_join_occurrences
+                  << " action=abort" << std::endl;
+        abort();
+      }
+      arm.mode = PartialWaitArmMode::WAITING_FOR_SIBLING_JOIN;
+      arm.extracted_capsule = true;
+      m_partial_capsules_total++;
+      m_partial_deferred_occurrences_total += stats.blocked_occurrences;
+      debug_log_wait_block_event(
+          "partial-extract",
+          "block=" + arm.record.block_id +
+              " region=" + arm.record.partial_region_id +
+              " warp=" + std::to_string(warp_id) +
+              " cursor_before_flush=" +
+              std::to_string(cursor_before_flush) +
+              " cursor_after_flush=" +
+              std::to_string(cursor_after_flush) +
+              " prefetched_rollback=" +
+              std::to_string(cursor_before_flush - cursor_after_flush) +
+              " cursor_after_extract=" +
+              std::to_string(stats.cursor_after) +
+              " blocked_occurrences=" +
+              std::to_string(stats.blocked_occurrences) +
+              " sibling_join_occurrences=" +
+              std::to_string(stats.sibling_join_occurrences) +
+              " landing_pc=0x" +
+              format_hex_u64(tw->canonical_trace_pc()));
+      return;
+    }
+
+    if (arm.mode == PartialWaitArmMode::WAITING_FOR_SIBLING_JOIN &&
+        inst.pc == arm.record.join_pc &&
+        inst.get_active_mask().to_ullong() == arm.sibling_mask) {
+      if (m_partial_joined_regions[warp_id].count(
+              arm.record.partial_region_id) == 0) {
+        std::cerr << "[WAITBLOCK][abort][SM" << m_sm_id << "] cyc="
+                  << get_current_gpu_cycle()
+                  << " reason=partial-join-issue-not-recorded"
+                  << " block=" << arm.record.block_id
+                  << " warp=" << warp_id << " action=abort" << std::endl;
+        abort();
+      }
+      start_partial_wait_hold(warp_id, arm);
+      return;
+    }
+  }
+
+  PartialWaitRegionRecord post_region;
+  if (m_gpu->lookup_partial_wait_post_join(
+          inst.trace_kernel_id, inst.unique_function_id, inst.pc,
+          post_region)) {
+    const uint64_t issued_mask = inst.get_active_mask().to_ullong();
+    if (post_region.live_masks.count(issued_mask) == 0) {
+      std::cerr << "[WAITBLOCK][abort][SM" << m_sm_id << "] cyc="
+                << get_current_gpu_cycle()
+                << " reason=partial-post-join-mask-mismatch"
+                << " region=" << post_region.region_id
+                << " warp=" << warp_id
+                << " mask=0x" << format_hex_u64(issued_mask)
+                << " action=abort" << std::endl;
+      abort();
+    }
+    trace_shd_warp_t *tw =
+        static_cast<trace_shd_warp_t *>(m_physical_warp[warp_id]);
+    if (tw->partial_capsule_active()) {
+      std::cerr << "[WAITBLOCK][abort][SM" << m_sm_id << "] cyc="
+                << get_current_gpu_cycle()
+                << " reason=post-join-with-active-partial-capsule"
+                << " region=" << post_region.region_id
+                << " warp=" << warp_id << " action=abort" << std::endl;
+      abort();
+    }
+    if (m_partial_joined_regions[warp_id].erase(post_region.region_id) != 1) {
+      std::cerr << "[WAITBLOCK][abort][SM" << m_sm_id << "] cyc="
+                << get_current_gpu_cycle()
+                << " reason=post-join-without-sibling-join"
+                << " region=" << post_region.region_id
+                << " warp=" << warp_id << " action=abort" << std::endl;
+      abort();
+    }
+    debug_log_wait_block_event(
+        "partial-region-close",
+        "region=" + post_region.region_id +
+            " trace_kernel=" + std::to_string(inst.trace_kernel_id) +
+            " function=" + std::to_string(inst.unique_function_id) +
+            " cta=" +
+            std::to_string(m_physical_warp[warp_id]->get_cta_id()) +
+            " warp=" + std::to_string(warp_id) +
+            " post_join_pc=0x" + format_hex_u64(inst.pc));
+  }
 }
 
 void SM::service_wait_block_release(unsigned warp_id) {
@@ -2408,9 +2824,57 @@ void SM::service_wait_block_release(unsigned warp_id) {
       warp_id >= m_pending_sync_waits.size()) {
     return;
   }
+  HopperPartialWaitArm &partial_arm = m_partial_wait_arms[warp_id];
+  if (partial_arm.valid &&
+      partial_arm.mode != PartialWaitArmMode::HOLDING) {
+    const uint64_t now = get_current_gpu_cycle();
+    const uint64_t age = now - partial_arm.arm_start_cycle;
+    if (now - partial_arm.last_heartbeat_cycle >=
+        kWaitBlockHeartbeatCycles) {
+      debug_log_wait_block_event(
+          "partial-transition-heartbeat",
+          "block=" + partial_arm.record.block_id +
+              " region=" + partial_arm.record.partial_region_id +
+              " warp=" + std::to_string(warp_id) +
+              " mode=" +
+              std::to_string(static_cast<int>(partial_arm.mode)) +
+              " age=" + std::to_string(age));
+      partial_arm.last_heartbeat_cycle = now;
+    }
+    if (age > kWaitBlockHoldWatchdogCycles) {
+      m_wait_block_watchdog_aborts_total++;
+      std::cerr << "[WAITBLOCK][abort][SM" << m_sm_id << "] cyc=" << now
+                << " reason=partial-transition-watchdog"
+                << " block=" << partial_arm.record.block_id
+                << " region=" << partial_arm.record.partial_region_id
+                << " warp=" << warp_id
+                << " mode=" << static_cast<int>(partial_arm.mode)
+                << " age=" << age << " action=abort" << std::endl;
+      abort();
+    }
+  }
   HopperMBarrierPendingWait &pending_wait = m_pending_sync_waits[warp_id];
+  if (partial_arm.valid &&
+      partial_arm.mode == PartialWaitArmMode::HOLDING &&
+      !pending_wait.valid) {
+    std::cerr << "[WAITBLOCK][abort][SM" << m_sm_id << "] cyc="
+              << get_current_gpu_cycle()
+              << " reason=partial-hold-lost-pending-state"
+              << " block=" << partial_arm.record.block_id
+              << " warp=" << warp_id << " action=abort" << std::endl;
+    abort();
+  }
   if (!pending_wait.valid) {
     return;
+  }
+  if (pending_wait.mode == WaitBlockPendingMode::PARTIAL_MISSING_WAIT_HOLD &&
+      (!partial_arm.valid ||
+       partial_arm.mode != PartialWaitArmMode::HOLDING)) {
+    std::cerr << "[WAITBLOCK][abort][SM" << m_sm_id << "] cyc="
+              << get_current_gpu_cycle()
+              << " reason=partial-pending-hold-lost-arm-state"
+              << " warp=" << warp_id << " action=abort" << std::endl;
+    abort();
   }
   if (pending_wait.mode == WaitBlockPendingMode::NONE ||
       pending_wait.block_id.empty()) {
@@ -2531,6 +2995,70 @@ void SM::service_wait_block_release(unsigned warp_id) {
   }
 
   m_sync_debug_wait_released++;
+  if (pending_wait.mode == WaitBlockPendingMode::PARTIAL_MISSING_WAIT_HOLD) {
+    HopperPartialWaitArm &arm = m_partial_wait_arms[warp_id];
+    if (!arm.valid || arm.mode != PartialWaitArmMode::HOLDING ||
+        arm.record.block_id != pending_wait.block_id ||
+        arm.expected_gen != pending_wait.expected_gen) {
+      std::cerr << "[WAITBLOCK][abort][SM" << m_sm_id << "] cyc=" << now
+                << " reason=partial-release-state-mismatch"
+                << " block=" << block << " warp=" << warp_id
+                << " action=abort" << std::endl;
+      abort();
+    }
+
+    trace_shd_warp_t *tw =
+        static_cast<trace_shd_warp_t *>(m_physical_warp[warp_id]);
+    tw->get_IBuffer_remodeled()->flush(false);
+    if (arm.extracted_capsule) {
+      if (!tw->activate_partial_blocked_replay()) {
+        std::cerr << "[WAITBLOCK][abort][SM" << m_sm_id << "] cyc=" << now
+                  << " reason=partial-deferred-replay-activation-failed"
+                  << " block=" << block << " warp=" << warp_id
+                  << " deferred=" << tw->partial_deferred_size()
+                  << " action=abort" << std::endl;
+        abort();
+      }
+    } else if (arm.source_was_deferred_replay) {
+      if (!tw->partial_replay_active() ||
+          tw->partial_replay_origin() !=
+              WaitBlockTraceOrigin::PARTIAL_BLOCKED_REPLAY) {
+        std::cerr << "[WAITBLOCK][abort][SM" << m_sm_id << "] cyc=" << now
+                  << " reason=partial-nested-replay-state-lost"
+                  << " block=" << block << " warp=" << warp_id
+                  << " action=abort" << std::endl;
+        abort();
+      }
+    } else if (tw->partial_capsule_active()) {
+      std::cerr << "[WAITBLOCK][abort][SM" << m_sm_id << "] cyc=" << now
+                << " reason=unexpected-partial-capsule-on-direct-release"
+                << " block=" << block << " warp=" << warp_id
+                << " action=abort" << std::endl;
+      abort();
+    }
+
+    m_missing_wait_releases_total++;
+    m_partial_join_releases_total++;
+    debug_log_wait_block_event(
+        "partial-join-release",
+        "block=" + block +
+            " region=" + arm.record.partial_region_id +
+            " trace_kernel=" +
+            std::to_string(pending_wait.key.trace_kernel_id) +
+            " function=" + std::to_string(pending_wait.unique_function_id) +
+            " cta=" + std::to_string(pending_wait.key.cta_id) +
+            " warp=" + std::to_string(warp_id) +
+            " entry_pc=0x" + format_hex_u64(pending_wait.action_pc) +
+            " expected_gen=" + std::to_string(exp_gen) +
+            " current_gen=" + std::to_string(cur_gen) +
+            " held_cycles=" + std::to_string(held_cycles) +
+            " replay_remaining=" +
+            std::to_string(tw->partial_replay_remaining()));
+    arm = HopperPartialWaitArm();
+    pending_wait = HopperMBarrierPendingWait();
+    return;
+  }
+
   if (pending_wait.mode == WaitBlockPendingMode::MISSING_WAIT_HOLD) {
     m_missing_wait_releases_total++;
     debug_log_wait_block_event(
@@ -2665,10 +3193,30 @@ void SM::print_wait_block_summary() const {
       active_holds++;
     }
   }
+  unsigned long long active_partial_arms = 0;
+  unsigned long long active_partial_regions = 0;
+  unsigned long long active_partial_capsules = 0;
+  for (unsigned warp_id = 0; warp_id < m_partial_wait_arms.size();
+       ++warp_id) {
+    active_partial_arms += m_partial_wait_arms[warp_id].valid;
+    active_partial_regions += m_partial_joined_regions[warp_id].size();
+    if (m_config->is_trace_mode &&
+        static_cast<trace_shd_warp_t *>(m_physical_warp[warp_id])
+            ->partial_capsule_active()) {
+      active_partial_capsules++;
+    }
+  }
   const bool balanced =
       active_holds == 0 &&
+      active_partial_arms == 0 &&
+      active_partial_regions == 0 &&
+      active_partial_capsules == 0 &&
       m_missing_wait_holds_total == m_missing_wait_releases_total &&
-      m_fold_parks_total == m_fold_releases_total;
+      m_fold_parks_total == m_fold_releases_total &&
+      m_partial_join_holds_total == m_partial_join_releases_total &&
+      m_partial_deferred_occurrences_total ==
+          m_partial_replayed_occurrences_total +
+              m_partial_folded_occurrences_total;
   const double captured_poll_avg_hold =
       m_fold_releases_total
           ? static_cast<double>(m_fold_park_cycles_total) /
@@ -2679,6 +3227,10 @@ void SM::print_wait_block_summary() const {
       "[WAITBLOCK][summary] status=%s sm=%u missing_wait_ready=%llu "
       "missing_wait_holds=%llu missing_wait_releases=%llu "
       "partial_missing_wait_model_misses=%llu "
+      "partial_capsules=%llu partial_join_already_issued=%llu "
+      "partial_deferred_occurrences=%llu partial_replayed_occurrences=%llu "
+      "partial_folded_occurrences=%llu "
+      "partial_join_holds=%llu partial_join_releases=%llu "
       "captured_poll_immediate_folds=%llu captured_poll_holds=%llu "
       "captured_poll_releases=%llu "
       "captured_poll_advanced_occurrences=%llu "
@@ -2686,15 +3238,23 @@ void SM::print_wait_block_summary() const {
       "captured_poll_hold_cycles_total=%llu "
       "captured_poll_hold_cycles_avg=%.1f captured_poll_hold_cycles_max=%llu "
       "captured_poll_watchdog_aborts=%llu active_holds=%llu "
+      "active_partial_arms=%llu active_partial_regions=%llu "
+      "active_partial_capsules=%llu "
       "generation_overshoots=%llu watchdog_aborts=%llu\n",
       balanced ? "PASS" : "ACTIVE", m_sm_id, m_missing_wait_ready_total,
       m_missing_wait_holds_total,
       m_missing_wait_releases_total, m_partial_missing_wait_misses_total,
+      m_partial_capsules_total, m_partial_join_already_issued_total,
+      m_partial_deferred_occurrences_total,
+      m_partial_replayed_occurrences_total,
+      m_partial_folded_occurrences_total, m_partial_join_holds_total,
+      m_partial_join_releases_total,
       m_fold_immediate_folds_total, m_fold_parks_total,
       m_fold_releases_total, m_fold_skipped_insts_total,
       m_fold_immediate_skipped_insts_total, m_fold_park_cycles_total,
       captured_poll_avg_hold, m_fold_park_cycles_max, m_fold_watchdog_hits,
       active_holds,
+      active_partial_arms, active_partial_regions, active_partial_capsules,
       m_wait_block_generation_overshoots_total,
       m_wait_block_watchdog_aborts_total);
 
@@ -2995,7 +3555,8 @@ void SM::handle_sync_instruction(warp_inst_t &inst, unsigned int warp_id) {
       if ((has_missing_action &&
            (missing_record.entry_probe_pc != inst.pc ||
             missing_record.entry_probe_kind != inst.sync_kind ||
-            !missing_record.partial_modeled_miss_aborts ||
+            (!missing_record.partial_modeled_miss_aborts &&
+             !missing_record.partial_deferred_replay) ||
             !inst.sync_has_semantic_raw || !inst.trace_masks_valid)) ||
           (has_poll_action &&
            (poll_region.primary_wait_pc != inst.pc ||
@@ -3189,85 +3750,116 @@ void SM::handle_sync_instruction(warp_inst_t &inst, unsigned int warp_id) {
               expected_gen_for_wait(warp_id, key, inst.sync_semantic_raw);
           if (effective_mask != live_mask) {
             m_partial_missing_wait_misses_total++;
-            const uint64_t captured_active_mask =
-                inst.trace_masks_valid
-                    ? static_cast<uint64_t>(inst.trace_active_mask)
-                    : effective_mask.to_ullong();
-            const uint64_t captured_predicate_mask =
-                inst.trace_masks_valid
-                    ? static_cast<uint64_t>(inst.trace_predicate_mask)
-                    : effective_mask.to_ullong();
-            std::cerr
-                << "[WAITBLOCK][UNSUPPORTED_PARTIAL_MISSING_WAIT][SM"
-                << m_sm_id << "] cyc=" << get_current_gpu_cycle()
-                << " block=" << missing_record.block_id
-                << " trace_kernel=" << inst.trace_kernel_id
-                << " function=" << inst.unique_function_id
-                << " cta=" << key.cta_id
-                << " global_cta=" << m_local_to_global_cta_id[key.cta_id]
-                << " warp=" << warp_id << " entry_probe_pc=0x"
-                << format_hex_u64(inst.pc) << " active_mask=0x"
-                << format_hex_u64(captured_active_mask)
-                << " predicate_mask=0x"
-                << format_hex_u64(captured_predicate_mask)
-                << " effective_mask=0x"
-                << format_hex_u64(effective_mask.to_ullong())
-                << " live_mask=0x"
-                << format_hex_u64(live_mask.to_ullong())
-                << " barrier=0x" << format_hex_u64(key.barrier_addr)
-                << " wait_state=0x"
-                << format_hex_u64(inst.sync_semantic_raw)
-                << " wait_parity="
-                << decode_sync_wait_phase(inst.sync_semantic_raw)
-                << " current_gen=" << sync_barrier_gen(key)
-                << " expected_gen=" << expected_gen
-                << " captured_ready_visits="
-                << missing_record.captured_ready_visits
-                << " captured_second_gate_visits="
-                << missing_record.captured_second_gate_visits
-                << " captured_poll_visits="
-                << missing_record.captured_poll_visits
-                << " all_live_entry_visits="
-                << missing_record.all_live_entry_visits
-                << " partial_entry_visits="
-                << missing_record.partial_entry_visits
-                << " scheduler_mutation=none cursor_mutation=none"
-                << " action=abort" << std::endl;
-            abort();
-          }
+            const uint64_t effective_bits = effective_mask.to_ullong();
+            const uint64_t live_bits = live_mask.to_ullong();
+            const uint64_t sibling_bits = live_bits & ~effective_bits;
+            if (!missing_record.partial_deferred_replay ||
+                missing_record.partial_modeled_miss_aborts ||
+                missing_record.partial_region_id.empty() ||
+                missing_record.observed_entry_masks.count(effective_bits) == 0 ||
+                missing_record.observed_sibling_masks.count(sibling_bits) == 0 ||
+                missing_record.observed_live_masks.count(live_bits) == 0 ||
+                sibling_bits == 0 ||
+                m_partial_wait_arms[warp_id].valid) {
+              std::cerr
+                  << "[WAITBLOCK][UNSUPPORTED_PARTIAL_MISSING_WAIT][SM"
+                  << m_sm_id << "] cyc=" << get_current_gpu_cycle()
+                  << " block=" << missing_record.block_id
+                  << " trace_kernel=" << inst.trace_kernel_id
+                  << " function=" << inst.unique_function_id
+                  << " cta=" << key.cta_id
+                  << " global_cta="
+                  << m_local_to_global_cta_id[key.cta_id]
+                  << " warp=" << warp_id << " entry_probe_pc=0x"
+                  << format_hex_u64(inst.pc)
+                  << " effective_mask=0x"
+                  << format_hex_u64(effective_bits)
+                  << " live_mask=0x" << format_hex_u64(live_bits)
+                  << " sibling_mask=0x"
+                  << format_hex_u64(sibling_bits)
+                  << " partial_deferred_replay="
+                  << missing_record.partial_deferred_replay
+                  << " arm_already_valid="
+                  << m_partial_wait_arms[warp_id].valid
+                  << " action=abort" << std::endl;
+              abort();
+            }
 
-          HopperMBarrierPendingWait held;
-          held.valid = true;
-          held.is_trywait = is_trywait;
-          held.key = key;
-          held.wait_state_raw = inst.sync_semantic_raw;
-          held.mode = WaitBlockPendingMode::MISSING_WAIT_HOLD;
-          held.block_id = missing_record.block_id;
-          held.action_pc = inst.pc;
-          held.unique_function_id = inst.unique_function_id;
-          held.expected_gen = expected_gen;
-          held.hold_start_cycle = get_current_gpu_cycle();
-          held.last_heartbeat_cycle = held.hold_start_cycle;
-          m_pending_sync_waits[warp_id] = held;
-          m_missing_wait_holds_total++;
-          hold_created = true;
-          debug_log_wait_block_event(
-              "missing-wait-hold",
-              "block=" + missing_record.block_id +
-                  " trace_kernel=" + std::to_string(inst.trace_kernel_id) +
-                  " function=" + std::to_string(inst.unique_function_id) +
-                  " cta=" + std::to_string(key.cta_id) +
-                  " warp=" + std::to_string(warp_id) + " entry_pc=0x" +
-                  format_hex_u64(inst.pc) + " effective_mask=0x" +
-                  format_hex_u64(effective_mask.to_ullong()) +
-                  " live_mask=0x" +
-                  format_hex_u64(live_mask.to_ullong()) + " barrier=0x" +
-                  format_hex_u64(key.barrier_addr) +
-                  " wait_state=0x" +
-                  format_hex_u64(inst.sync_semantic_raw) +
-                  " expected_gen=" + std::to_string(expected_gen) +
-                  " current_gen=" +
-                  std::to_string(sync_barrier_gen(key)));
+            HopperPartialWaitArm arm;
+            arm.valid = true;
+            arm.mode = PartialWaitArmMode::ARMED;
+            arm.record = missing_record;
+            arm.key = key;
+            arm.wait_state_raw = inst.sync_semantic_raw;
+            arm.expected_gen = expected_gen;
+            arm.blocked_mask = effective_bits;
+            arm.sibling_mask = sibling_bits;
+            arm.unique_function_id = inst.unique_function_id;
+            arm.arm_start_cycle = get_current_gpu_cycle();
+            arm.last_heartbeat_cycle = arm.arm_start_cycle;
+            arm.source_was_deferred_replay =
+                static_cast<const trace_warp_inst_t &>(inst)
+                    .wait_block_trace_origin ==
+                WaitBlockTraceOrigin::PARTIAL_BLOCKED_REPLAY;
+            m_partial_wait_arms[warp_id] = arm;
+            hold_created = true;
+            debug_log_wait_block_event(
+                "partial-arm",
+                "block=" + missing_record.block_id +
+                    " region=" + missing_record.partial_region_id +
+                    " trace_kernel=" +
+                    std::to_string(inst.trace_kernel_id) +
+                    " function=" +
+                    std::to_string(inst.unique_function_id) +
+                    " cta=" + std::to_string(key.cta_id) +
+                    " warp=" + std::to_string(warp_id) +
+                    " entry_pc=0x" + format_hex_u64(inst.pc) +
+                    " branch_pc=0x" +
+                    format_hex_u64(missing_record.entry_branch_pc) +
+                    " blocked_mask=0x" +
+                    format_hex_u64(effective_bits) +
+                    " sibling_mask=0x" +
+                    format_hex_u64(sibling_bits) +
+                    " join_already_issued=" +
+                    std::to_string(
+                        m_partial_joined_regions[warp_id].count(
+                            missing_record.partial_region_id) != 0) +
+                    " source_is_deferred_replay=" +
+                    std::to_string(arm.source_was_deferred_replay));
+          } else {
+            HopperMBarrierPendingWait held;
+            held.valid = true;
+            held.is_trywait = is_trywait;
+            held.key = key;
+            held.wait_state_raw = inst.sync_semantic_raw;
+            held.mode = WaitBlockPendingMode::MISSING_WAIT_HOLD;
+            held.block_id = missing_record.block_id;
+            held.action_pc = inst.pc;
+            held.unique_function_id = inst.unique_function_id;
+            held.expected_gen = expected_gen;
+            held.hold_start_cycle = get_current_gpu_cycle();
+            held.last_heartbeat_cycle = held.hold_start_cycle;
+            m_pending_sync_waits[warp_id] = held;
+            m_missing_wait_holds_total++;
+            hold_created = true;
+            debug_log_wait_block_event(
+                "missing-wait-hold",
+                "block=" + missing_record.block_id +
+                    " trace_kernel=" + std::to_string(inst.trace_kernel_id) +
+                    " function=" + std::to_string(inst.unique_function_id) +
+                    " cta=" + std::to_string(key.cta_id) +
+                    " warp=" + std::to_string(warp_id) + " entry_pc=0x" +
+                    format_hex_u64(inst.pc) + " effective_mask=0x" +
+                    format_hex_u64(effective_mask.to_ullong()) +
+                    " live_mask=0x" +
+                    format_hex_u64(live_mask.to_ullong()) + " barrier=0x" +
+                    format_hex_u64(key.barrier_addr) +
+                    " wait_state=0x" +
+                    format_hex_u64(inst.sync_semantic_raw) +
+                    " expected_gen=" + std::to_string(expected_gen) +
+                    " current_gen=" +
+                    std::to_string(sync_barrier_gen(key)));
+          }
         } else if (m_config->wait_block_enable && has_poll_action) {
           HopperMBarrierPendingWait held;
           held.valid = true;
@@ -3501,6 +4093,27 @@ void SM::clear_sync_barrier_state_for_cta(unsigned int cta_id) {
       }
       pending_wait = HopperMBarrierPendingWait();
     }
+  }
+  for (unsigned warp_id = 0; warp_id < m_partial_wait_arms.size();
+       ++warp_id) {
+    if (m_physical_warp[warp_id]->get_cta_id() != cta_id) {
+      continue;
+    }
+    if (m_config->wait_block_enable &&
+        (m_partial_wait_arms[warp_id].valid ||
+         !m_partial_joined_regions[warp_id].empty() ||
+         (m_config->is_trace_mode &&
+          static_cast<trace_shd_warp_t *>(m_physical_warp[warp_id])
+              ->partial_capsule_active()))) {
+      std::cerr << "[WAITBLOCK][abort][SM" << m_sm_id << "] cyc="
+                << get_current_gpu_cycle()
+                << " reason=cta-cleanup-with-active-partial-state"
+                << " cta=" << cta_id << " warp=" << warp_id
+                << " action=abort" << std::endl;
+      abort();
+    }
+    m_partial_wait_arms[warp_id] = HopperPartialWaitArm();
+    m_partial_joined_regions[warp_id].clear();
   }
   for (auto it = m_hopper_mbarriers.begin(); it != m_hopper_mbarriers.end();) {
     if (it->first.cta_id == cta_id) {

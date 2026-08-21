@@ -105,6 +105,41 @@ void advance_trace_cta_id(kernel_trace_t *kernel_trace_info) {
 }
 
 trace_warp_inst_t *trace_shd_warp_t::get_next_trace_inst(address_type pc) {
+  if (m_partial_replay_origin != WaitBlockTraceOrigin::CANONICAL &&
+      m_partial_replay_decoded < m_partial_replay.size()) {
+    trace_warp_inst_t *new_inst =
+        new trace_warp_inst_t(get_shader()->get_config());
+    if (pc != m_partial_replay[m_partial_replay_decoded].m_pc) {
+      inst_trace_t synthetic(
+          pc, get_current_unique_function_id_call(), false);
+      traced_execution &trc_exec =
+          get_shader()->get_gpu()->get_extra_trace_info();
+      new_inst->parse_from_trace_struct(
+          synthetic, m_kernel_info->OpcodeMap, m_kernel_info->m_tconfig,
+          m_kernel_info->m_kernel_trace_info, trc_exec);
+      new_inst->set_extra_trace_instruction_info(
+          trc_exec
+              .get_kernel_by_unique_function_id(new_inst->unique_function_id)
+              .get_instruction_ptr(pc));
+      new_inst->wait_block_trace_origin =
+          WaitBlockTraceOrigin::SYNTHETIC;
+      return new_inst;
+    }
+
+    inst_trace_t &trace = m_partial_replay[m_partial_replay_decoded++];
+    traced_execution &trc_exec =
+        get_shader()->get_gpu()->get_extra_trace_info();
+    new_inst->parse_from_trace_struct(
+        trace, m_kernel_info->OpcodeMap, m_kernel_info->m_tconfig,
+        m_kernel_info->m_kernel_trace_info, trc_exec);
+    new_inst->set_extra_trace_instruction_info(
+        trc_exec
+            .get_kernel_by_unique_function_id(new_inst->unique_function_id)
+            .get_instruction_ptr(pc));
+    new_inst->wait_block_trace_origin = m_partial_replay_origin;
+    return new_inst;
+  }
+
   if (used_insts < traced_pcs.size()) {
     trace_warp_inst_t *new_inst =
         new trace_warp_inst_t(get_shader()->get_config());
@@ -124,10 +159,14 @@ trace_warp_inst_t *trace_shd_warp_t::get_next_trace_inst(address_type pc) {
         m_kernel_info->m_tconfig, m_kernel_info->m_kernel_trace_info, trc_exec);
     new_inst->set_extra_trace_instruction_info(trc_exec.get_kernel_by_unique_function_id(new_inst->unique_function_id).get_instruction_ptr(pc));
     if(!is_pc_found) {
+      new_inst->wait_block_trace_origin =
+          WaitBlockTraceOrigin::SYNTHETIC;
       delete trace_ptr;
     }else {
       it_inst_trace->second.num_used_instructions[0]++;
       used_insts++;
+      new_inst->wait_block_trace_origin =
+          WaitBlockTraceOrigin::CANONICAL;
     }
     return new_inst;
   } else
@@ -141,6 +180,284 @@ void trace_shd_warp_t::decrease_num_used_inst(address_type pc){
   it_inst_trace->second.num_used_instructions[0]--;
   assert(used_insts > 0);
   used_insts--;
+}
+
+void trace_shd_warp_t::rollback_trace_inst(
+    const trace_warp_inst_t *inst) {
+  assert(inst != nullptr);
+  if (inst->wait_block_trace_origin == WaitBlockTraceOrigin::CANONICAL) {
+    decrease_num_used_inst(inst->pc);
+    return;
+  }
+  if (inst->wait_block_trace_origin == WaitBlockTraceOrigin::SYNTHETIC) {
+    return;
+  }
+  assert(inst->wait_block_trace_origin == m_partial_replay_origin);
+  assert(m_partial_replay_decoded > m_partial_replay_issued);
+  m_partial_replay_decoded--;
+}
+
+void trace_shd_warp_t::commit_trace_inst(
+    const trace_warp_inst_t *inst) {
+  assert(inst != nullptr);
+  if (inst->wait_block_trace_origin == WaitBlockTraceOrigin::CANONICAL ||
+      inst->wait_block_trace_origin == WaitBlockTraceOrigin::SYNTHETIC) {
+    return;
+  }
+  assert(inst->wait_block_trace_origin == m_partial_replay_origin);
+  assert(m_partial_replay_issued < m_partial_replay_decoded);
+  assert(m_partial_replay_issued < m_partial_replay.size());
+  assert(m_partial_replay[m_partial_replay_issued].m_pc == inst->pc);
+  m_partial_replay_issued++;
+  if (m_partial_replay_issued == m_partial_replay.size()) {
+    m_partial_replay.clear();
+    m_partial_replay_decoded = 0;
+    m_partial_replay_issued = 0;
+    m_partial_replay_origin = WaitBlockTraceOrigin::CANONICAL;
+  }
+}
+
+bool trace_shd_warp_t::extract_partial_wait_capsule(
+    uint64_t blocked_mask, uint64_t sibling_mask, uint64_t live_mask,
+    unsigned int unique_function_id,
+    address_type captured_ready_pc, address_type join_pc,
+    address_type post_join_pc, PartialTraceExtractStats *out_stats,
+    std::string *failure_reason) {
+  auto fail = [&](const std::string &reason) {
+    if (failure_reason != nullptr) {
+      *failure_reason = reason;
+    }
+    return false;
+  };
+  if (partial_capsule_active() || blocked_mask == 0 || sibling_mask == 0 ||
+      (blocked_mask & sibling_mask) != 0 ||
+      (blocked_mask | sibling_mask) != live_mask) {
+    return fail("invalid-capsule-state-or-mask-partition");
+  }
+  if (used_insts >= traced_pcs.size() ||
+      traced_pcs[used_insts] != captured_ready_pc) {
+    return fail("captured-ready-pc-is-not-source-head");
+  }
+
+  std::vector<inst_trace_t> deferred;
+  std::vector<inst_trace_t> sibling_join;
+  std::vector<address_type> consumed_pcs;
+  std::map<address_type, unsigned int> local_occurrences;
+  bool saw_blocked_join = false;
+  unsigned int cursor = used_insts;
+  while (cursor < traced_pcs.size() &&
+         traced_pcs[cursor] != post_join_pc) {
+    const address_type pc = traced_pcs[cursor];
+    auto trace_it = map_warp_traces.find(pc);
+    if (trace_it == map_warp_traces.end()) {
+      return fail("source-pc-has-no-trace-vector");
+    }
+    const unsigned int occurrence =
+        trace_it->second.num_used_instructions[0] + local_occurrences[pc];
+    if (occurrence >= trace_it->second.num_traced_instructions) {
+      return fail("source-pc-occurrence-exhausted");
+    }
+    const inst_trace_t &trace = trace_it->second.instructions[occurrence];
+    if (trace.m_unique_function_id != unique_function_id) {
+      return fail("capsule-function-identity-mismatch");
+    }
+    const std::string opcode_base =
+        trace.opcode.substr(0, trace.opcode.find('.'));
+    if (opcode_base == "CALL" || opcode_base == "RET" ||
+        opcode_base == "EXIT" || opcode_base == "BRX" ||
+        opcode_base == "JMP" || opcode_base == "JMX" ||
+        opcode_base == "RTT") {
+      return fail("capsule-control-opcode-unsafe");
+    }
+    const uint64_t owner = static_cast<uint64_t>(trace.active_mask) & live_mask;
+    if (pc == join_pc && owner == sibling_mask) {
+      if (!sibling_join.empty() ||
+          static_cast<uint64_t>(trace.mask) != sibling_mask) {
+        return fail("duplicate-sibling-join-occurrence");
+      }
+      sibling_join.emplace_back(trace);
+    } else if (owner == 0 || (owner & ~blocked_mask) == 0) {
+      deferred.emplace_back(trace);
+      if (pc == join_pc && owner == blocked_mask) {
+        saw_blocked_join = true;
+      }
+    } else {
+      return fail("capsule-occurrence-mask-escape");
+    }
+    consumed_pcs.push_back(pc);
+    local_occurrences[pc]++;
+    cursor++;
+  }
+  if (cursor >= traced_pcs.size() || traced_pcs[cursor] != post_join_pc) {
+    return fail("post-join-pc-not-found");
+  }
+  if (sibling_join.size() != 1 || !saw_blocked_join || deferred.empty()) {
+    return fail("join-occurrence-pair-incomplete");
+  }
+  auto post_join_it = map_warp_traces.find(post_join_pc);
+  const unsigned int post_join_occurrence =
+      post_join_it == map_warp_traces.end()
+          ? 0
+          : post_join_it->second.num_used_instructions[0] +
+                local_occurrences[post_join_pc];
+  if (post_join_it == map_warp_traces.end() ||
+      post_join_occurrence >= post_join_it->second.num_traced_instructions ||
+      post_join_it->second.instructions[post_join_occurrence]
+              .m_unique_function_id != unique_function_id ||
+      static_cast<uint64_t>(
+          post_join_it->second.instructions[post_join_occurrence].mask) !=
+          live_mask) {
+    return fail("post-join-occurrence-mismatch");
+  }
+
+  sibling_join.front().m_next_traced_pc = post_join_pc;
+  for (unsigned int i = 0; i < deferred.size(); ++i) {
+    deferred[i].m_next_traced_pc =
+        i + 1 < deferred.size() ? deferred[i + 1].m_pc : post_join_pc;
+  }
+
+  for (address_type pc : consumed_pcs) {
+    auto trace_it = map_warp_traces.find(pc);
+    assert(trace_it != map_warp_traces.end());
+    assert(trace_it->second.num_used_instructions[0] <
+           trace_it->second.num_traced_instructions);
+    trace_it->second.num_used_instructions[0]++;
+    used_insts++;
+  }
+  assert(used_insts == cursor);
+  assert(traced_pcs[used_insts] == post_join_pc);
+
+  m_partial_deferred.swap(deferred);
+  m_partial_replay.swap(sibling_join);
+  m_partial_replay_decoded = 0;
+  m_partial_replay_issued = 0;
+  m_partial_replay_origin = WaitBlockTraceOrigin::PARTIAL_SIBLING_JOIN;
+  if (out_stats != nullptr) {
+    out_stats->cursor_before = cursor - consumed_pcs.size();
+    out_stats->cursor_after = cursor;
+    out_stats->blocked_occurrences = m_partial_deferred.size();
+    out_stats->sibling_join_occurrences = m_partial_replay.size();
+  }
+  return true;
+}
+
+bool trace_shd_warp_t::activate_partial_blocked_replay() {
+  if (m_partial_replay_origin != WaitBlockTraceOrigin::CANONICAL ||
+      !m_partial_replay.empty() || m_partial_deferred.empty()) {
+    return false;
+  }
+  m_partial_replay.swap(m_partial_deferred);
+  m_partial_replay_decoded = 0;
+  m_partial_replay_issued = 0;
+  m_partial_replay_origin = WaitBlockTraceOrigin::PARTIAL_BLOCKED_REPLAY;
+  return true;
+}
+
+unsigned int trace_shd_warp_t::skip_partial_replay_to_exit(
+    address_type exit_pc, address_type loopback_bra_pc,
+    const std::set<address_type> &allowed_skip_pcs,
+    FoldSkipStats *out_stats) {
+  assert(m_partial_replay_origin ==
+         WaitBlockTraceOrigin::PARTIAL_BLOCKED_REPLAY);
+  assert(m_partial_replay_decoded == m_partial_replay_issued);
+  FoldSkipStats stats;
+  stats.cursor_before_flush = m_partial_replay_issued;
+  stats.cursor_after_flush = m_partial_replay_issued;
+  unsigned int skipped = 0;
+  while (m_partial_replay_issued < m_partial_replay.size() &&
+         m_partial_replay[m_partial_replay_issued].m_pc != exit_pc) {
+    const inst_trace_t &trace = m_partial_replay[m_partial_replay_issued];
+    const address_type pc = trace.m_pc;
+    const std::string &opcode = trace.opcode;
+    const bool pc_allowed = allowed_skip_pcs.count(pc) != 0;
+    const bool is_wait =
+        (trace.sync_kind == SyncInstructionKind::PHASECHK ||
+         trace.sync_kind == SyncInstructionKind::TRYWAIT) &&
+        (opcode == "SYNCS.PHASECHK.TRANS64" ||
+         opcode == "SYNCS.PHASECHK.TRANS64.TRYWAIT");
+    const bool is_nanosleep = opcode == "NANOSLEEP.SYNCS";
+    const bool is_imad =
+        opcode == "IMAD.U32" || opcode == "IMAD.MOV.U32";
+    const bool is_bra = opcode == "BRA" && pc == loopback_bra_pc;
+    if (!pc_allowed ||
+        !(is_wait || is_nanosleep || is_imad || is_bra)) {
+      std::cerr << "[WAITBLOCK][poll-advance-abort]"
+                << " reason=deferred-replay-opcode"
+                << " pc=0x" << std::hex << pc << std::dec
+                << " opcode=" << opcode
+                << " exit_pc=0x" << std::hex << exit_pc << std::dec
+                << " skipped_so_far=" << skipped << std::endl;
+      abort();
+    }
+    stats.warp_insts++;
+    stats.pc_occurrences[static_cast<uint64_t>(pc)]++;
+    if (is_wait) {
+      stats.phasechk_trywait++;
+    } else if (is_nanosleep) {
+      stats.nanosleep++;
+    } else if (is_bra) {
+      stats.loopback_bra++;
+    } else {
+      stats.imad_scratch++;
+    }
+    m_partial_replay_issued++;
+    m_partial_replay_decoded++;
+    skipped++;
+  }
+  if (m_partial_replay_issued >= m_partial_replay.size() ||
+      m_partial_replay[m_partial_replay_issued].m_pc != exit_pc) {
+    std::cerr << "[WAITBLOCK][poll-advance-abort]"
+              << " reason=deferred-replay-exit-not-found"
+              << " exit_pc=0x" << std::hex << exit_pc << std::dec
+              << " replay_issued=" << m_partial_replay_issued
+              << " replay_size=" << m_partial_replay.size()
+              << " skipped=" << skipped << std::endl;
+    abort();
+  }
+  stats.cursor_after_skip = m_partial_replay_issued;
+  stats.prefetched_rollback = 0;
+  if (out_stats != nullptr) {
+    *out_stats = stats;
+  }
+  return skipped;
+}
+
+bool trace_shd_warp_t::partial_replay_active() const {
+  return m_partial_replay_origin != WaitBlockTraceOrigin::CANONICAL;
+}
+
+bool trace_shd_warp_t::partial_blocked_replay_pending() const {
+  return !m_partial_deferred.empty();
+}
+
+bool trace_shd_warp_t::partial_capsule_active() const {
+  return partial_replay_active() || partial_blocked_replay_pending();
+}
+
+WaitBlockTraceOrigin trace_shd_warp_t::partial_replay_origin() const {
+  return m_partial_replay_origin;
+}
+
+unsigned int trace_shd_warp_t::partial_replay_remaining() const {
+  assert(m_partial_replay_issued <= m_partial_replay.size());
+  return m_partial_replay.size() - m_partial_replay_issued;
+}
+
+unsigned int trace_shd_warp_t::partial_deferred_size() const {
+  return m_partial_deferred.size();
+}
+
+address_type trace_shd_warp_t::canonical_trace_pc() const {
+  assert(used_insts < traced_pcs.size());
+  return traced_pcs[used_insts];
+}
+
+void trace_shd_warp_t::clear_partial_wait_capsule() {
+  m_partial_replay.clear();
+  m_partial_deferred.clear();
+  m_partial_replay_decoded = 0;
+  m_partial_replay_issued = 0;
+  m_partial_replay_origin = WaitBlockTraceOrigin::CANONICAL;
 }
 
 // [Spin-wait collapse] Advance the trace cursor from its current position to the
@@ -184,7 +501,7 @@ unsigned int trace_shd_warp_t::skip_spin_to_exit(
       sync_kind = occ.sync_kind;
     }
 
-    // Guard (c): use the same closed opcode model as the v4 post-processor.
+    // Guard (c): use the same closed opcode model as the v5 post-processor.
     // A denylist is insufficient here: stale metadata must not consume an
     // unknown fence/control/semantic opcode merely because its PC is allowed.
     const bool is_wait =
@@ -265,10 +582,13 @@ void trace_shd_warp_t::clear() {
   used_insts = 0;
   map_warp_traces.clear();
   traced_pcs.clear();
+  clear_partial_wait_capsule();
 }
 
 // functional_done
-bool trace_shd_warp_t::trace_done() { return used_insts == (traced_pcs.size()); }
+bool trace_shd_warp_t::trace_done() {
+  return used_insts == traced_pcs.size() && !partial_capsule_active();
+}
 
 address_type trace_shd_warp_t::get_start_trace_pc() {
   assert(traced_pcs.size() > 0);
@@ -277,6 +597,10 @@ address_type trace_shd_warp_t::get_start_trace_pc() {
 
 address_type trace_shd_warp_t::get_pc() {
   assert(traced_pcs.size() > 0);
+  if (partial_replay_active() &&
+      m_partial_replay_decoded < m_partial_replay.size()) {
+    return m_partial_replay[m_partial_replay_decoded].m_pc;
+  }
   assert(used_insts < traced_pcs.size());
   return traced_pcs[used_insts];
 }

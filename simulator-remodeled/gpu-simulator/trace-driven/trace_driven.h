@@ -92,6 +92,13 @@ class trace_function_info : public function_info {
   ~trace_function_info() override {}
 };
 
+enum class WaitBlockTraceOrigin {
+  CANONICAL,
+  PARTIAL_SIBLING_JOIN,
+  PARTIAL_BLOCKED_REPLAY,
+  SYNTHETIC,
+};
+
 class trace_warp_inst_t : public warp_inst_t {
  public:
   trace_warp_inst_t() {
@@ -112,9 +119,18 @@ class trace_warp_inst_t : public warp_inst_t {
       traced_execution &static_trace_info);
       
   bool is_s2r() { return m_opcode == OP_S2R; }
+  WaitBlockTraceOrigin wait_block_trace_origin =
+      WaitBlockTraceOrigin::CANONICAL;
 
  private:
   unsigned m_opcode;
+};
+
+struct PartialTraceExtractStats {
+  unsigned int cursor_before = 0;
+  unsigned int cursor_after = 0;
+  unsigned int blocked_occurrences = 0;
+  unsigned int sibling_join_occurrences = 0;
 };
 
 class trace_kernel_info_t : public kernel_info_t {
@@ -251,6 +267,27 @@ class trace_shd_warp_t : public shd_warp_t {
   trace_warp_inst_t *get_next_trace_inst(address_type pc); // MOD. VPREG
   void decrement_trace_pc(); // MOD. VPREG
   void decrease_num_used_inst(address_type pc);
+  void rollback_trace_inst(const trace_warp_inst_t *inst);
+  void commit_trace_inst(const trace_warp_inst_t *inst);
+  bool extract_partial_wait_capsule(
+      uint64_t blocked_mask, uint64_t sibling_mask, uint64_t live_mask,
+      unsigned int unique_function_id,
+      address_type captured_ready_pc, address_type join_pc,
+      address_type post_join_pc, PartialTraceExtractStats *out_stats,
+      std::string *failure_reason);
+  bool activate_partial_blocked_replay();
+  unsigned int skip_partial_replay_to_exit(
+      address_type exit_pc, address_type loopback_bra_pc,
+      const std::set<address_type> &allowed_skip_pcs,
+      struct FoldSkipStats *out_stats);
+  bool partial_replay_active() const;
+  bool partial_blocked_replay_pending() const;
+  bool partial_capsule_active() const;
+  WaitBlockTraceOrigin partial_replay_origin() const;
+  unsigned int partial_replay_remaining() const;
+  unsigned int partial_deferred_size() const;
+  address_type canonical_trace_pc() const;
+  void clear_partial_wait_capsule();
   // [Spin-wait fold] Forward analogue of get_next_trace_inst's cursor
   // bookkeeping: advance both used_insts and each skipped pc's per-occurrence
   // counter until traced_pcs[used_insts] == exit_pc, WITHOUT issuing the skipped
@@ -278,6 +315,12 @@ class trace_shd_warp_t : public shd_warp_t {
   }
 
  private:
+  std::vector<inst_trace_t> m_partial_replay;
+  std::vector<inst_trace_t> m_partial_deferred;
+  unsigned int m_partial_replay_decoded = 0;
+  unsigned int m_partial_replay_issued = 0;
+  WaitBlockTraceOrigin m_partial_replay_origin =
+      WaitBlockTraceOrigin::CANONICAL;
   trace_kernel_info_t *m_kernel_info;
 };
 

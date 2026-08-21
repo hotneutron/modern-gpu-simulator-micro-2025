@@ -247,9 +247,10 @@ class SM : public core_t, public shader_core_ctx_wrapper {
   // authoritative issue-eligibility path (sort comparator, stall scans) so the
   // release side effect fires exactly once. See design doc 6.5.1.
   bool warp_held_on_mbarrier_wait(unsigned warp_id) const;
-  // Once-per-warp-per-cycle authoritative release service. Missing-wait holds
-  // only clear pending state; captured-poll holds additionally fold residual
-  // loop occurrences to their exact local exit.
+  // Once-per-warp-per-cycle authoritative release service. All-live
+  // missing-wait holds only clear pending state; partial holds activate or
+  // resume their owned replay stream; captured-poll holds fold residual loop
+  // occurrences to their exact local exit.
   void service_wait_block_release(unsigned warp_id);
   // [Stage 1] Common cursor-skip used by BOTH the parked-release and the
   // immediate-ready fold paths so their skip semantics can never diverge again.
@@ -380,6 +381,10 @@ class SM : public core_t, public shader_core_ctx_wrapper {
   void enqueue_instruction_region_prewarm(kernel_info_t &kernel);
   void issue_pending_instruction_region_prewarm();
   void handle_sync_instruction(warp_inst_t &inst, unsigned int warp_id);
+  void handle_partial_wait_instruction_issue(const warp_inst_t &inst,
+                                              unsigned int warp_id);
+  void start_partial_wait_hold(unsigned int warp_id,
+                               HopperPartialWaitArm &arm);
   HopperMBarrierKey build_sync_barrier_key(const warp_inst_t &inst,
                                            unsigned int warp_id) const;
   HopperMBarrierObject &get_or_create_sync_barrier(
@@ -463,6 +468,8 @@ class SM : public core_t, public shader_core_ctx_wrapper {
   barrier_set_t m_barriers;
   std::map<HopperMBarrierKey, HopperMBarrierObject> m_hopper_mbarriers;
   mutable std::vector<HopperMBarrierPendingWait> m_pending_sync_waits;
+  std::vector<HopperPartialWaitArm> m_partial_wait_arms;
+  std::vector<std::set<std::string>> m_partial_joined_regions;
   std::vector<std::deque<HopperMBarrierPendingTxBinding>>
       m_pending_tma_barrier_binds_per_warp;
   // Initialized from shader_core_config in SM::SM(); 0 disables logging.
@@ -689,6 +696,13 @@ class SM : public core_t, public shader_core_ctx_wrapper {
   unsigned long long m_missing_wait_holds_total = 0;
   unsigned long long m_missing_wait_releases_total = 0;
   unsigned long long m_partial_missing_wait_misses_total = 0;
+  unsigned long long m_partial_capsules_total = 0;
+  unsigned long long m_partial_join_already_issued_total = 0;
+  unsigned long long m_partial_deferred_occurrences_total = 0;
+  unsigned long long m_partial_replayed_occurrences_total = 0;
+  unsigned long long m_partial_folded_occurrences_total = 0;
+  unsigned long long m_partial_join_holds_total = 0;
+  unsigned long long m_partial_join_releases_total = 0;
   unsigned long long m_wait_block_generation_overshoots_total = 0;
   unsigned long long m_wait_block_watchdog_aborts_total = 0;
  public:
