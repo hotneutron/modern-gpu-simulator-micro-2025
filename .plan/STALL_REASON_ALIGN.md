@@ -386,6 +386,12 @@ Capture must occur before
 blocks the current cycle; observing the post-decrement value would shift the
 metric by one cycle.
 
+This deliberately matches the authoritative `if`/`else if` control flow. When
+the counter enters `issue()` as one, the first branch decrements it to zero but
+the `else if` issue branch is not re-evaluated, so that cycle remains blocked.
+An instruction that sets the counter later in the same call affects subsequent
+cycles only and cannot invalidate the already captured state.
+
 ```cpp
 void Subcore::issue(SM *shared_sm) {
   modify_warp_state();
@@ -440,7 +446,8 @@ Final output counters use a separate enum:
 ```cpp
 enum class StallPopulation : uint8_t {
   SELECTED,
-  ELIGIBLE_NOT_SELECTED,
+  ELIGIBLE_NOT_SELECTED_WITH_ISSUE,
+  ELIGIBLE_NOT_SELECTED_WITHOUT_ISSUE,
   NO_VALID_INSTRUCTION,
   DRAIN,
   WAIT_BLOCK_HOLD,
@@ -472,9 +479,8 @@ Classify each active warp in this order:
    classify `non_frontend_hold_without_valid_head`. These conditions are
    observable without a head instruction and must not inflate
    `no_valid_instruction`.
-4. If there is no valid head, the IBuffer is empty, all canonical and partial
-   replay sources are exhausted, and there is no matching decode or fetch
-   request that can still produce a head, classify `drain`.
+4. If there is no valid head, the IBuffer is empty, and all canonical and
+   partial-replay sources are exhausted, classify `drain`.
 5. Classify every remaining no-valid-head case as `no_valid_instruction`;
    this includes decode/fetch work that is still able to produce a head.
 6. If a valid head has one or more known blockers, classify
@@ -484,14 +490,17 @@ Classify each active warp in this order:
 7. If a valid head has no known blocker but at least one unknown readiness
    result, classify `unknown_valid_head`.
 8. Otherwise mark it as an internal `eligible_candidate`; finalize converts
-   that candidate to `selected` or `eligible_not_selected`.
+   that candidate to `selected`, `eligible_not_selected_with_issue`, or
+   `eligible_not_selected_without_issue`.
 
 `trace_done()` alone is not sufficient for `drain`. In trace mode the canonical
 cursor advances when an instruction is decoded, so the final decoded
 instruction can still be a valid IBuffer head after `trace_done()` becomes
 true. A dedicated pure `peek_trace_drained()` predicate must therefore require
-an empty IBuffer, exhausted canonical and partial-replay sources, and no
-decode/L0I state capable of supplying another instruction. The `done_exit()`
+an empty IBuffer plus exhausted canonical and partial-replay sources. Fetch
+allocates an invalid IBuffer entry before issuing its request, so an outstanding
+fetch/decode operation remains `no_valid_instruction` through the non-empty
+IBuffer test without an additional L0I status-map lookup. The `done_exit()`
 test remains the outer active-warp boundary.
 
 The following combinations indicate a state-machine error and must abort:
@@ -532,8 +541,11 @@ L1C operands ready
 
 The existing scheduler-specific greedy L1C hold controls selection, not the
 definition of a warp-local ready state. It is therefore legal for a cycle to
-contain `eligible_not_selected > 0` and `selected == 0`; report such cycles as
-`eligible_without_issue_cycles` instead of forcing a synthetic winner.
+contain known-eligible warps and `selected == 0`. Keep those warp-cycles in
+`eligible_not_selected_without_issue`, separate from
+`eligible_not_selected_with_issue`, and increment
+`eligible_without_issue_cycles`. Do not force a synthetic winner or merge the
+two populations before the NCU-priority stage.
 
 The per-warp readiness facts may be stored internally as a numeric bit mask so
 SR-M0B can reuse the representation. SR-M0A uses only `mask == 0` versus
@@ -578,8 +590,9 @@ transfers. It must never insert into or erase from
 `peek_named_barrier_wait()` must inspect only `m_barriers`.
 `peek_grid_barrier_wait()` must read only the warp's grid-barrier flag.
 `peek_trace_drained()` must require no valid head, an empty IBuffer, exhausted
-canonical and partial-replay sources, and no matching decode/L0I state capable
-of producing a head.
+canonical and partial-replay sources. SR-M0A does not classify frontend
+subreasons and must not call `get_access_status_for_warp_pc()` while processing
+the aggregate `no_valid_instruction` state.
 Existing dependency-state queries, scoreboard collision checks,
 `functional_unit::can_issue()`, and result-queue capacity checks are already
 read-only and may be reused.
@@ -623,9 +636,11 @@ exactly. If another predicate is definitely blocked, classify the warp as
 `blocked_with_valid_head`; the known blocker is sufficient regardless of L1C.
 Only a warp with no known blocker and at least one unknown predicate contributes
 to `unknown_valid_head`. It must never be counted as
-`eligible_not_selected`. An actual winner whose pre-issue L1C state was unknown
-is not classifiable; emit the mismatch context and hard-abort before committing
-population counters.
+an eligible-not-selected state. If the actual winner's only unresolved
+pre-issue predicate was L1C, classify the factual outcome as `selected`,
+increment `winner_prestate_unknown`, and make the final status FAIL. Do not
+abort a functionally valid simulation solely because an observe-only predicate
+was unknown.
 
 For every pre-winner warp on which the authoritative path later calls
 `are_l1c_operands_ready()`, compare the pure result with the authoritative
@@ -654,6 +669,7 @@ struct StallCycleSnapshot {
              static_cast<size_t>(StallPopulation::COUNT)> population{};
   uint32_t active_count = 0;
   uint32_t eligible_count = 0;
+  uint32_t unknown_count = 0;
 };
 
 struct StallPopulationTotals {
@@ -664,6 +680,7 @@ struct StallPopulationTotals {
   uint64_t sampled_subcore_cycles = 0;
   uint64_t eligible_without_issue_cycles = 0;
   uint64_t winner_mismatch = 0;
+  uint64_t winner_prestate_unknown = 0;
   unsigned int measured_kernel_uid = 0;
   bool measured_kernel_uid_valid = false;
 };
@@ -693,35 +710,62 @@ not allocated by SR-M0A.
 
 Record the actual Subcore-local warp index, SM warp ID, and PC immediately
 before the existing `issue_warp()` call. Keeping the local index avoids a
-second search or ID translation during finalization.
+second search or ID translation during finalization. Capture commits terminal
+states immediately, but defers both `ELIGIBLE_CANDIDATE` and `UNKNOWN_VALID`
+until the actual issue result is known.
 
 ```cpp
 const bool issued = issued_subcore_warp_id >= 0;
+bool selected_was_known_eligible = false;
+bool selected_was_unknown = false;
 if (issued) {
   const StallWarpSample &winner =
       snapshot.samples[issued_subcore_warp_id];
   if (winner.sm_warp_id != issued_sm_warp_id ||
-      winner.state != StallPreIssueClass::ELIGIBLE_CANDIDATE ||
       winner.head_pc != issued_pc) {
+    print_stall_align_mismatch_and_abort(...);
+  }
+  if (winner.state == StallPreIssueClass::ELIGIBLE_CANDIDATE) {
+    selected_was_known_eligible = true;
+  } else if (winner.state == StallPreIssueClass::UNKNOWN_VALID) {
+    selected_was_unknown = true;
+    totals.winner_prestate_unknown++;
+  } else {
     print_stall_align_mismatch_and_abort(...);
   }
 }
 
 const uint32_t selected = issued ? 1 : 0;
-assert(snapshot.eligible_count >= selected);
-const uint32_t eligible_not_selected =
-    snapshot.eligible_count - selected;
+const uint32_t known_selected = selected_was_known_eligible ? 1 : 0;
+assert(snapshot.eligible_count >= known_selected);
+const uint32_t not_selected_with_issue =
+    issued ? snapshot.eligible_count - known_selected : 0;
+const uint32_t not_selected_without_issue =
+    issued ? 0 : snapshot.eligible_count;
+assert(snapshot.unknown_count >= (selected_was_unknown ? 1u : 0u));
+const uint32_t unknown_nonwinner =
+    snapshot.unknown_count - (selected_was_unknown ? 1u : 0u);
 
 snapshot.population[
     static_cast<size_t>(StallPopulation::SELECTED)] += selected;
 snapshot.population[
-    static_cast<size_t>(StallPopulation::ELIGIBLE_NOT_SELECTED)] +=
-        eligible_not_selected;
+    static_cast<size_t>(
+        StallPopulation::ELIGIBLE_NOT_SELECTED_WITH_ISSUE)] +=
+            not_selected_with_issue;
+snapshot.population[
+    static_cast<size_t>(
+        StallPopulation::ELIGIBLE_NOT_SELECTED_WITHOUT_ISSUE)] +=
+            not_selected_without_issue;
+snapshot.population[
+    static_cast<size_t>(StallPopulation::UNKNOWN_VALID_HEAD)] +=
+        unknown_nonwinner;
 ```
 
 Do not require the snapshot to select or predict the exact winner. It validates
-that the actual winner belonged to the cycle-start eligible set. Scheduler
-ordering remains owned by the existing issue path.
+that the actual winner was either a known eligible candidate or an explicitly
+unknown valid-head candidate; a definitely blocked, invalid, held, or drained
+winner remains a hard error. Scheduler ordering remains owned by the existing
+issue path.
 
 `selected <= 1` is a per-Subcore/SMSP-cycle invariant. It is not an SM-wide
 invariant because up to four Subcores may issue in the same SM cycle.
@@ -732,7 +776,8 @@ Required per-Subcore-cycle invariant:
 
 ```text
 selected
-+ eligible_not_selected
++ eligible_not_selected_with_issue
++ eligible_not_selected_without_issue
 + no_valid_instruction
 + drain
 + wait_block_hold
@@ -742,7 +787,10 @@ selected
 == active_warps
 
 selected <= 1
-selected + eligible_not_selected == cycle_start_eligible_warps
+known_selected
++ eligible_not_selected_with_issue
++ eligible_not_selected_without_issue
+== cycle_start_known_eligible_warps
 active_warps == independently_counted_active_warps
 ```
 
@@ -753,14 +801,17 @@ sum(population) == total_active_warp_cycles
 selected == total_num_cycles_issue_stage_selected
 sampled_subcore_cycles == total_num_cycles_issue_stage_evaluated
 winner_mismatch == 0
+winner_prestate_unknown == 0
 unknown_valid_head == 0
 selected > 0 before printing any "/ selected" ratio
 ```
 
 The selected equality is against issue-active warp cycles, not blindly against
-an instruction counter in configurations that permit dual issue. For the
-current remodeling Subcore, at most one `issue_warp()` call occurs per cycle,
-so the two are expected to coincide; print both values and their delta.
+an instruction counter in configurations that permit dual issue. It is a hard
+invariant only while the current remodeling Subcore permits at most one
+`issue_warp()` call per cycle. If a future implementation enables multiple
+warp issues per Subcore cycle, print this check as `not_applicable` and add a
+new definition-matched reference counter before making it an acceptance gate.
 
 At kernel end, emit raw totals and `/ selected` values, then a grep-friendly
 summary:
@@ -769,12 +820,14 @@ summary:
 [STALLALIGN] FINAL status=PASS active=... population_sum=... delta=0
 selected=... issue_selected=... eligible=... unknown=0 sampled=...
 issue_evaluated=... kernel_uid=... winner_mismatch=0
+winner_prestate_unknown=0
 ```
 
-Any per-cycle conservation failure, winner mismatch, counter underflow, or
-impossible WaitBlock state prints cycle/SM/Subcore/warp/PC/state/mask and
-hard-aborts immediately. A nonzero unknown count makes the final status FAIL
-even though arithmetic conservation still holds.
+Any per-cycle conservation failure, definitely blocked winner, PC/warp
+mismatch, counter underflow, or impossible WaitBlock state prints
+cycle/SM/Subcore/warp/PC/state/mask and hard-aborts immediately. An unknown
+winner or nonzero unknown population preserves execution and arithmetic
+conservation but makes the final status FAIL.
 
 At capture, independently recount active entries and require that count to
 equal `m_num_active_warps_subcore`. Also verify each non-inactive sample's
@@ -792,15 +845,23 @@ quantities:
 |---|---:|
 | `total_active_warp_cycles / selected` | warp cycles per issued instruction: `7.539490` |
 | `selected / selected` | `selected`: `0.999982` |
-| `eligible_not_selected / selected` | `not_selected`: `0.405119` |
-| `no_valid_instruction / selected` | `no_instruction`: `0.115050` |
-| `drain / selected` | `drain`: `0.001395` |
+| `eligible_not_selected_with_issue / selected` | closest M0A candidate for `not_selected`: `0.405119` |
+| `eligible_not_selected_without_issue / selected` | simulator scheduler-suppression residual; no direct HW mapping yet |
+| `no_valid_instruction / selected` | upper-bound candidate for `no_instruction`: `0.115050` |
+| `drain / selected` | first-order candidate for `drain`: `0.001395` |
 
 These comparisons validate population accounting, not the detailed reason
 distribution. `wait_block_hold` remains a simulator-only timing abstraction:
 real HW executes the represented polling instructions and can report several
 states during that interval. Do not map the whole hold directly to NCU
 `barrier`.
+
+The two eligible-not-selected populations must remain separate because the
+greedy L1C hold can prevent the scheduler from reaching a later ready warp even
+when no winner issues. Likewise, `no_valid_instruction` includes aggregate
+L0I/fetch/decode delay and is only an upper-bound candidate until its frontend
+substates are validated. NCU `imc_miss` is an immediate-constant-cache state,
+not a generic instruction-fetch state.
 
 SR-M0A is intentionally insufficient for these NCU states:
 
@@ -891,6 +952,19 @@ scheduling merely to reduce observer overhead; that would turn the
 instrumentation into a timing change. First make the pure helpers
 allocation-free and measure their cost.
 
+SR-M0A records only the aggregate `no_valid_instruction` population. It must
+not duplicate the existing `is_any_invalid_head_*` breakdown or perform L0I
+status-map lookups for frontend subreason attribution. The fast path is:
+
+```text
+valid head                         -> evaluate valid-head readiness
+no valid head + empty + trace done -> drain
+all other no-valid-head cases      -> no_valid_instruction
+```
+
+Detailed L0I miss, response-queue, stream-buffer, and decode-pending attribution
+remains outside SR-M0A.
+
 Validation order:
 
 1. Clean build because public headers change.
@@ -939,7 +1013,7 @@ Classify masks without inventing an HW priority:
 ```text
 popcount(mask) == 1 -> sole blocker
 popcount(mask) > 1  -> explicit multi-blocker mask
-mask == 0           -> eligible_not_selected, unless it is the winner
+mask == 0           -> eligible candidate; finalize by actual issue outcome
 ```
 
 `FU-only` by target pipe is the first priority-independent quantity that can
