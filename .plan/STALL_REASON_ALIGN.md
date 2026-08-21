@@ -503,6 +503,15 @@ fetch/decode operation remains `no_valid_instruction` through the non-empty
 IBuffer test without an additional L0I status-map lookup. The `done_exit()`
 test remains the outer active-warp boundary.
 
+The no-head `stall_count` and yield checks are valid warp-state observations:
+they are stored in `Dependency_State`, set when the preceding instruction is
+processed, and decayed by `modify_warp_state()` before the IBuffer-head test.
+They do not require `pI`. Track
+`no_head_stall_count_warp_cycles` and `no_head_yield_warp_cycles` as
+overlapping diagnostic subsets of
+`non_frontend_hold_without_valid_head`; focused validation must demonstrate
+that they decay to zero and never survive warp-slot reset.
+
 The following combinations indicate a state-machine error and must abort:
 
 ```text
@@ -642,6 +651,11 @@ increment `winner_prestate_unknown`, and make the final status FAIL. Do not
 abort a functionally valid simulation solely because an observe-only predicate
 was unknown.
 
+By contrast, a pure L1C result of `BLOCKED` followed by the same warp actually
+issuing is a definite predicate disagreement, not missing observability. Treat
+that case as `winner_mismatch` and hard-abort; silently downgrading it would
+allow a broken pure probe to produce trusted population totals.
+
 For every pre-winner warp on which the authoritative path later calls
 `are_l1c_operands_ready()`, compare the pure result with the authoritative
 result. Emit cycle/SM/Subcore/warp/PC/status and abort on disagreement. This
@@ -679,6 +693,8 @@ struct StallPopulationTotals {
   uint64_t eligible_warp_cycles = 0;
   uint64_t sampled_subcore_cycles = 0;
   uint64_t eligible_without_issue_cycles = 0;
+  uint64_t no_head_stall_count_warp_cycles = 0;
+  uint64_t no_head_yield_warp_cycles = 0;
   uint64_t winner_mismatch = 0;
   uint64_t winner_prestate_unknown = 0;
   unsigned int measured_kernel_uid = 0;
