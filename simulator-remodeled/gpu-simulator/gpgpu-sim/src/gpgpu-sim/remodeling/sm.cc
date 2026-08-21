@@ -1222,11 +1222,31 @@ void SM::issue_warp(register_set_uniptr &pipe_reg_set, warp_inst_t *next_inst,
   if (m_config->is_trace_mode) {
     trace_warp_inst_t *trace_inst =
         static_cast<trace_warp_inst_t *>(pipe_reg.get());
-    static_cast<trace_shd_warp_t *>(m_physical_warp[warp_id])
-        ->commit_trace_inst(trace_inst);
+    trace_shd_warp_t *trace_warp =
+        static_cast<trace_shd_warp_t *>(m_physical_warp[warp_id]);
+    const unsigned int replay_remaining_before =
+        trace_inst->wait_block_trace_origin ==
+                WaitBlockTraceOrigin::PARTIAL_BLOCKED_REPLAY
+            ? trace_warp->partial_replay_remaining()
+            : 0;
+    trace_warp->commit_trace_inst(trace_inst);
     if (trace_inst->wait_block_trace_origin ==
         WaitBlockTraceOrigin::PARTIAL_BLOCKED_REPLAY) {
       m_partial_replayed_occurrences_total++;
+      if (replay_remaining_before == 1) {
+        debug_log_wait_block_event(
+            "partial-replay-drained",
+            "trace_kernel=" +
+                std::to_string(trace_inst->trace_kernel_id) +
+                " function=" +
+                std::to_string(trace_inst->unique_function_id) +
+                " cta=" +
+                std::to_string(m_physical_warp[warp_id]->get_cta_id()) +
+                " warp=" + std::to_string(warp_id) +
+                " last_pc=0x" + format_hex_u64(trace_inst->pc) +
+                " canonical_pc=0x" +
+                format_hex_u64(trace_warp->canonical_trace_pc()));
+      }
     }
   }
 

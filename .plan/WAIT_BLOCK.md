@@ -1789,6 +1789,67 @@ Cross-kernel:
     headers. Build on the server, run focused cursor/payload/lifecycle tests,
     then rerun K5 and K10 with the v2 partial policy enabled.
 
+## 21. First simulator v5 full-run result
+
+Server runs:
+
+- K10: `.o55/.e55`, completed after 136,997 cycles and 6h30m.
+- K5: `.o81/.e81`, aborted at cycle 69,031.
+
+K10 completed with all 132 final SM summaries at `status=PASS`, balanced
+missing-wait and captured-poll hold/release counts, zero generation overshoots,
+and zero watchdog aborts. It had no modeled partial misses. The 384 observed
+partial sibling joins followed the captured ready path and closed normally, so
+K10 is a regression result but did not exercise deferred replay.
+
+K5 exercised deferred replay:
+
+```text
+partial arms/extractions/holds:
+  entry 0x93b0: 36
+  entry 0x9930: 38
+
+partial releases:
+  entry 0x93b0: 11
+  entry 0x9930: 38
+
+deferred occurrences:
+  entry 0x93b0: 17 per capsule
+  entry 0x9930: 46 per capsule
+```
+
+No partial-specific assertion fired. However, none of the 49 released capsules
+reached its `post_join_pc`. The release path flushed the IBuffer while the
+canonical source was still selected, then activated the deferred stream.
+`get_next_pc_to_fetch_request()` selected the first replay PC correctly but
+advanced its internal fetch cursor from the stale canonical PC. The fix is to
+compute the next fetch PC from the selected `res`:
+
+```text
+m_next_pc_to_fetch_request = res + fetch_width * instruction_size
+```
+
+A `partial-replay-drained` event is emitted after the final deferred occurrence
+issues. The next server run must show one drain and one region close for every
+partial release.
+
+The K5 primary fatal was separate from partial replay:
+
+```text
+SM124 global_cta=124 warp=6
+entry=0x5a50 barrier=0x16c38
+expected_gen=5 current_gen=4
+held_cycles=32001
+strategy=INJECT_MISSING_WAIT
+```
+
+SM124 had no modeled partial miss. At abort, warp 0 was held at captured poll
+`0xb370` waiting on `0x16c60`, while warps 4-15 were held at existing all-live
+missing-wait entries waiting on `0x16c38`, `0x16c50`, and `0x16c58`. No CTA
+warp remained runnable, so increasing the watchdog threshold is not a fix.
+After verifying the replay-cursor correction, this all-live cross-warp
+dependency cycle remains a separate design problem.
+
 The design is complete when each runtime action is explained by exactly one of
 the two strategies. No entry action is permitted for a captured-poll record, and
 the all-live missing-wait path performs no cursor action. The partial

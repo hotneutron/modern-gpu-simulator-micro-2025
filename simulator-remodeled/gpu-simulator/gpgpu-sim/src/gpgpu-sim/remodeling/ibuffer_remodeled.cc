@@ -91,7 +91,10 @@ address_type IBuffer_Remodeled::get_next_pc_to_fetch_request() {
         address_type pc_to_fetch = res + 16 * i;
         m_remodeled_ibuffer.push_back(IBuffer_Entry(false, pc_to_fetch, NULL));
     }
-    m_next_pc_to_fetch_request = m_next_pc_to_fetch_request + 16 * m_fetch_decode_width;
+    // The trace source can switch from the canonical stream to a deferred
+    // replay while this IBuffer is uninitialized. Advance from the PC selected
+    // above, not from the stale pre-switch fetch cursor.
+    m_next_pc_to_fetch_request = res + 16 * m_fetch_decode_width;
     return res;
 }
 
