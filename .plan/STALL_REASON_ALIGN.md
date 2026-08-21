@@ -2,16 +2,26 @@
 
 ## 0. Corrected conclusion
 
-The FA3 bwd kernel matches HW closely in total cycles:
+The current FA3 bwd WaitBlock-v5 run remains close to HW in total cycles, but
+the stall-reason distribution is **not yet definition-matched**:
 
 - HW: `132,901` cycles
-- Sim `.o48`: `134,817` cycles (`+1.44%`)
+- Sim `.o55`: `136,997` cycles (`+3.08%`)
+- Previous sim `.o48`: `134,817` cycles (`+1.44%`); `.o55` is
+  `+2,180` cycles (`+1.62%`) slower than `.o48`
+
+The current verdict therefore has two separate parts:
+
+- Macro timing and traced work are close: elapsed cycles differ by `3.08%`
+  and issued warp instructions by `-0.41%`.
+- HW stall-reason alignment is unproven. `.o55` does not contain the SR-M0
+  complete, mutually exclusive active-warp accounting required by Section 6.
 
 The previous version of this document concluded that stall labeling was
 essentially correct and that the simulator had a proven `6.6x` FU-throughput
 implementation error. **That conclusion is retracted.**
 
-The current measurements compare two different state definitions:
+The current `.o55` measurements still compare two different state definitions:
 
 - HW `smsp__average_warps_issue_stalled_*_per_issue_active` assigns one
   highest-priority state to each active warp each cycle. The states are
@@ -21,9 +31,10 @@ The current measurements compare two different state definitions:
 - The sim `overlap_instrument` probe is per valid-head warp-cycle, but its
   reasons are also overlapping and it does not cover every active-warp state.
 
-Consequently, sim `fu_any = 3.260` and HW
+Consequently, current sim `fu_any = 3.350` and HW
 `gmma + math_pipe_throttle = 0.490` are **not definition-matched values**.
-The reported `6.6x` ratio does not prove an FU timing-model error.
+Neither their raw `6.84x` ratio nor the previous `.o48` `6.6x` ratio
+proves an FU timing-model error.
 
 The first problem to solve is the stall metric itself: construct a complete,
 mutually exclusive per-active-warp state accounting and preserve the
@@ -52,32 +63,44 @@ Evidence:
 Run under audit:
 
 - Sim:
-  `simulator-remodeled/sim_run_12.8/flashattn-fa3-bf16-bwd-causal-b1-s2048-hd64-nh24/.../H100_80GB-OnlyKernel10/*.o48`
+  `simulator-remodeled/sim_run_12.8/flashattn-fa3-bf16-bwd-causal-b1-s2048-hd64-nh24/.../H100_80GB-OnlyKernel10/*.o55`
 - HW:
   `nv_reports/flashattn-fa3-bf16-bwd-causal-b1-s2048-hd64-nh24_full_rpt.ncu-rep`
 
+Run-integrity evidence for `.o55`:
+
+- all `384` CTAs completed;
+- all `384` `[WAITBLOCK][summary]` records report `status=PASS`;
+- aggregate WaitBlock watchdog and residual active-state counters are zero;
+- `.e55` has no fatal, abort, assertion-failure, or deadlock marker;
+- the log ends with `GPGPU-Sim: *** exit detected ***`.
+
+The printed configuration replaces the old `spin_wait_fold_enable/debug`
+controls with `wait_block_enable/debug`. Therefore `.o55` is the current
+WaitBlock-v5 timing result, not a bit-identical rerun of `.o48`.
+
 ---
 
-## 2. Macro timing and issue density already align
+## 2. Macro timing and issue density remain close
 
-The cycle match is supported by matched work and issue density, not just by the
-final elapsed-cycle scalar.
+The cycle comparison is supported by matched work and issue density, not just
+by the final elapsed-cycle scalar.
 
-| quantity | HW | Sim `.o48` | sim/HW |
+| quantity | HW | Sim `.o55` | sim/HW |
 |---|---:|---:|---:|
-| elapsed cycles | 132,901 | 134,817 | 1.0144 |
+| elapsed cycles | 132,901 | 136,997 | 1.0308 |
 | issued warp instructions | 19,993,658 | 19,911,524 | 0.9959 |
-| issued inst / scheduler / elapsed cycle | 0.284925 | 0.279722 | 0.9817 |
-| issue slots busy | 32.07% | 31.07% | contextual; denominator audit still required |
-| eligible warps / scheduler | 0.46 | 0.4546 | contextual; sim tail scan is approximate |
+| issued inst / scheduler / elapsed cycle | 0.284925 | 0.275270 | 0.9661 |
+| issue slots busy | 32.07% | 29.97% | contextual; denominator audit still required |
+| eligible warps / scheduler | 0.46 | 0.4409 | contextual; sim tail scan is approximate |
 
 The matched-basis identity is:
 
 ```text
 cycle ratio
 = work ratio x inverse issue-density ratio
-= 0.995892 x 1.018601
-= 1.014417
+= 0.995892 x 1.035072
+= 1.030820
 ```
 
 This does not prove that every internal timing mechanism is correct. Different
@@ -85,7 +108,7 @@ modeling errors can compensate. It does show that the aggregate scheduler
 readiness behavior is already close, so a claimed large internal error requires
 stronger evidence than the current overlapping reason counters.
 
-The sim's printed `ncu_no_eligible_pct = 68.93%` is intentionally not included
+The sim's printed `ncu_no_eligible_pct = 70.03%` is intentionally not included
 as a matched metric. It is currently computed as
 `100% - ncu_issue_slots_busy_pct`, so it also includes non-issue causes other
 than "zero eligible warps." SR-M0 must replace this proxy with a direct
@@ -147,36 +170,39 @@ A warp can increment several reasons in one cycle. In particular,
 the warp from issuing.
 
 The probe also omits active warps without a valid head from its reason vector.
-Its coverage check is:
+The available partial-population cross-check is:
 
 | sim state population | warp-cycles / issued inst |
 |---|---:|
 | selected | 1.000000 |
-| not_selected | 0.463233 |
-| valid-head non-issuing (`stalled_any`) | 4.507599 |
-| **covered total** | **5.970832** |
-| HW active-warp state total | **7.539490** |
+| not_selected | 0.471181 |
+| valid-head non-issuing (`stalled_any`) | 4.934007 |
+| **observed partial total** | **6.405187** |
+| HW active-warp state reference | **7.539490** |
 
-The missing `1.568658` warp-cycles/inst include states that the current probe
-does not represent on the same per-active-warp axis. No per-reason comparison
-is definition-complete until this conservation gap is closed.
+The numeric difference to HW is `1.134303` warp-cycles/inst, but this must
+**not** be called a measured sim coverage gap. The simulator does not report
+its own total active-warp population, and real HW/sim occupancy can differ.
+The table only shows that the available sim counters cannot establish their
+own conservation or reconstruct the HW vector. No per-reason comparison is
+definition-complete until SR-M0 adds the missing sim-side total and categories.
 
 ---
 
 ## 4. Reinterpretation of the FU counters
 
-The raw `.o48` probe values remain useful as **condition-incidence**
+The raw `.o55` probe values remain useful as **condition-incidence**
 diagnostics:
 
 | sim condition | raw warp-cycles | / issued |
 |---|---:|---:|
-| `fu_tensor` | 17,294,182 | 0.869 |
-| `fu_sfu` | 30,161,607 | 1.515 |
-| `fu_other` | 17,447,082 | 0.876 |
-| `fu_any` | 64,902,871 | 3.260 |
-| `wait_barrier` | 5,045,807 | 0.253 |
-| `stall_count` | 7,153,010 | 0.359 |
-| `yield` | 2,124,036 | 0.107 |
+| `fu_tensor` | 17,660,053 | 0.887 |
+| `fu_sfu` | 31,081,995 | 1.561 |
+| `fu_other` | 17,955,055 | 0.902 |
+| `fu_any` | 66,697,103 | 3.350 |
+| `wait_barrier` | 5,121,159 | 0.257 |
+| `stall_count` | 7,146,796 | 0.359 |
+| `yield` | 2,123,549 | 0.107 |
 
 They do **not** yet answer how often FU availability was the warp's exclusive
 or highest-priority blocker. The required split is:
@@ -206,17 +232,17 @@ The error was not the target-pipe name. The error was treating every
 simultaneous `!is_fu_available` observation as if HW would necessarily choose
 that FU state over all other unmet conditions.
 
-### 4.2 `.o48` does not confirm the old lockstep claim
+### 4.2 `.o55` does not confirm the old lockstep claim
 
 On still-idle cycles with at least one SFU-head warp:
 
 | valid-head class | raw | share |
 |---|---:|---:|
-| MUFU/SFU | 25,100,722 | 67.93% |
-| tensor | 3,280,144 | 8.88% |
-| other | 8,568,760 | 23.19% |
+| MUFU/SFU | 25,985,715 | 69.30% |
+| tensor | 3,232,340 | 8.62% |
+| other | 8,281,914 | 22.09% |
 
-`head_mufu / valid_head` is `0.679`, not approximately one. This shows an
+`head_mufu / valid_head` is `0.693`, not approximately one. This shows an
 SFU-heavy head population, but it does not show that every available warp was
 at the same MUFU stage.
 
@@ -225,12 +251,12 @@ tensor/SFU activity:
 
 | pipe state | cycles | share of classified cycles |
 |---|---:|---:|
-| tensor and SFU | 9,419,510 | 57.25% |
-| tensor only | 942,415 | 5.73% |
-| SFU only | 2,175,734 | 13.22% |
-| neither | 3,914,787 | 23.79% |
+| tensor and SFU | 8,886,447 | 52.55% |
+| tensor only | 1,030,405 | 6.09% |
+| SFU only | 2,364,731 | 13.98% |
+| neither | 4,628,146 | 27.37% |
 
-Consumer phasing can remain a hypothesis, but `.o48` does not establish it as
+Consumer phasing can remain a hypothesis, but `.o55` does not establish it as
 the explanation for a `6.6x` FU error. Earlier launch-stagger and GTLRR tests
 also produced only small effects and must not be cited as positive proof.
 
@@ -251,14 +277,14 @@ also produced only small effects and must not be cited as positive proof.
 
 ### 5.1 `wait_barrier` is not synonymous with long scoreboard
 
-The definition-matched probe splits `.o48` `wait_barrier` warp-cycles as:
+The provenance probe splits `.o55` `wait_barrier` warp-cycles as:
 
 | arming class | warp-cycles | share |
 |---|---:|---:|
 | tensor | 0 | 0.00% |
-| TMA | 108,719 | 2.15% |
-| other | 4,937,088 | 97.85% |
-| total | 5,045,807 | 100% |
+| TMA | 107,140 | 2.09% |
+| other | 5,014,019 | 97.91% |
+| total | 5,121,159 | 100% |
 
 Folding all of this into `long_scoreboard` is not justified. `other` is too
 coarse: it can contain arithmetic, conversion, control, shared-memory, or
@@ -720,12 +746,15 @@ TODO. It must not be conflated with:
 1. **Retracted:** the old normalized shape table.
 2. **Retracted:** `fu_any 3.260 / HW FU 0.490 = 6.6x` as a
    definition-matched implementation result.
-3. **Retracted:** `.o48` proves consumer MUFU lockstep.
+3. **Not supported:** `.o55` proves consumer MUFU lockstep.
 4. **Retained as a candidate:** FU incidence is high and may expose a real
    residual after exclusive accounting.
 5. **Required next:** SR-M0A, SR-M0B, then SR-M1, with no timing change.
 6. **Independent metric fix:** SM-M0 for NCU-aligned shared-memory wavefront and
    extra-conflict counters.
+7. **Current `.o55` verdict:** macro timing is close at `+3.08%`, but the
+   stall taxonomy cannot pass alignment until SR-M0 demonstrates sim-side
+   active-warp conservation and reports sole/multi-blocker masks.
 
 Implementation should proceed one stage at a time with review after each stage.
 
