@@ -1799,7 +1799,7 @@ Cross-kernel:
     focused traces, and rerun K5 before addressing the independent all-live
     cross-warp dependency cycle.
 
-## 21. First simulator v5 full-run result
+## 3. First simulator v5 full-run result
 
 Server runs:
 
@@ -1860,9 +1860,9 @@ warp remained runnable, so increasing the watchdog threshold is not a fix.
 After verifying the replay-cursor correction, this all-live cross-warp
 dependency cycle remains a separate design problem.
 
-## 22. Second K5 v5 run: replay progress confirmed, reservation gap exposed
+## 4. Second K5 v5 run: replay progress confirmed, reservation gap exposed
 
-### 22.1 Run result
+### 4.1 Run result
 
 The K5 `.o82/.e82` server run includes both the initial replay fetch-base fix
 (`9f8e4fd`) and the replay lifecycle hardening (`f5168dd`). It aborts earlier
@@ -1920,7 +1920,7 @@ This proves that `9f8e4fd` fixed the original stale-base failure from `.e81`.
 It does not prove that the replay frontend is correct for every instruction
 cache response order.
 
-### 22.2 Failing SM117 capsule
+### 4.2 Failing SM117 capsule
 
 SM117 follows the expected partial state machine until replay:
 
@@ -1942,7 +1942,7 @@ The source trace for CTA 117 warp 0 contains this exact blocked suffix:
 `0x9970` is therefore a real replay occurrence, not an absent or wrong-path
 instruction.
 
-### 22.3 What a synthetic instruction means
+### 4.3 What a synthetic instruction means
 
 Synthetic instructions predate partial replay. The remodeled frontend can
 speculatively request sequential instruction PCs before an older branch
@@ -1974,7 +1974,7 @@ issue order:               A, B, C   (FIFO)
 Only response completion and IBuffer filling may be out of order. Warp
 instruction issue remains in order.
 
-### 22.4 Why replay misclassifies an early response
+### 4.4 Why replay misclassifies an early response
 
 The current replay reader has one sequential decode cursor:
 
@@ -2080,7 +2080,7 @@ instruction_size`; it must obtain every requested PC from the reserved dynamic
 occurrence. This also supports a branch target or repeated PC inside the
 deferred stream.
 
-### 22.6 Reservation lifecycle and guards
+### 4.6 Reservation lifecycle and guards
 
 A robust implementation needs these monotonic bounds:
 
@@ -2114,7 +2114,7 @@ Serializing replay to one outstanding IBuffer entry would avoid this specific
 response reordering, but it is only a conservative stopgap. Occurrence-index
 reservation preserves the normal IBuffer behavior and is the selected design.
 
-### 22.7 Next-session implementation checklist
+### 4.7 Next-session implementation checklist
 
 1. Extend `IBuffer_Entry` with optional replay epoch/origin/index metadata.
 2. Replace replay's global decode-head lookup with fetch-time occurrence
@@ -2147,3 +2147,78 @@ the two strategies. No entry action is permitted for a captured-poll record, and
 the all-live missing-wait path performs no cursor action. The partial
 missing-wait sub-policy may move source occurrences only into an owned replay
 queue under the approved extraction and replay invariants.
+
+### 4.8 Reservation implementation review: flush-vs-commit ordering bug
+
+The reservation design of 4.5-4.6 was implemented and then re-reviewed against
+the actual issue/commit ordering in `SM::issue_warp`. One real bug was found and
+fixed; the rest of the reservation logic checked out.
+
+Ordering fact: `issue_warp` calls the IBuffer `issued()` **before**
+`commit_trace_inst`:
+
+```text
+ibuffer->issued();          // pop_front; may trigger flush(true) on a
+                            // non-sequential next_traced_pc
+commit_trace_inst(inst);    // replay_issued++ only here
+```
+
+Checklist item 4.7.4 ("flush cancels both decoded and not-yet-decoded replay
+reservations") was first implemented literally, as a bulk
+`reserved = decoded = issued` cancel at the end of flush. That is wrong because
+the just-issued replay occurrence has already been `pop_front`'d by `issued()`
+but its `replay_issued` has not advanced yet. A bulk cancel rewinds `reserved`
+onto that in-flight occurrence, and the following `commit_trace_inst` then makes
+`issued > reserved`, so the next fetch re-reserves an already-issued index and
+double-issues it (or trips the FIFO identity assert).
+
+This is triggered in practice: the K5 `0x9930` blocked suffix is not fully
+sequential (`... 0x9ac0 -> 0x9c20`), so `next_traced_pc != pc + isize` fires
+`flush(true)` from inside `issued()` mid-replay.
+
+Fix: reservation rollback is per-removed-entry, not bulk. The flush loop calls
+`unreserve_last_partial_replay()` once for every removed IBuffer slot that
+carries a replay reservation (both filled and never-filled slots, so unfilled
+reservations do not leak). The in-flight occurrence is already out of the deque,
+so it is not un-reserved, and the subsequent commit advances `issued` past it
+correctly. This mirrors the original per-entry `rollback_trace_inst` semantics
+that the bulk cancel had replaced. The unused bulk
+`cancel_partial_replay_reservations()` was removed.
+
+Items confirmed correct during the review:
+
+- The `.e81` stale-fetch-base fix still holds: flush sets `m_is_init_next_pc =
+  false`, so the next fetch re-derives its base from `get_pc()` after the replay
+  stream is activated, not from a stale canonical cursor.
+- Stream activation (`extract_partial_wait_capsule`,
+  `activate_partial_blocked_replay`) is always preceded by a flush, so a
+  stale-epoch response never survives to decode; the epoch assert is a
+  fail-closed guard, not a normal path.
+- `RESERVATION_FAIL` in `remove_entry` gives back exactly one reservation via
+  the same `unreserve_last_partial_replay()`.
+- Deferred FOLD (`skip_partial_replay_to_exit`) runs after a flush with
+  `reserved == issued`, and advances reserved lock-step with issued over the
+  skipped occurrences.
+
+Still pending: the 4.7.8 focused tests and the 4.7.9 K5 rerun.
+
+### 4.9 Post-review cleanup
+
+Two review notes from the full replay-queue re-read were addressed. Neither was
+a correctness bug in the fixed reservation model; both remove latent hazards.
+
+- Removed `m_partial_replay_decoded`. After the reservation rewrite each IBuffer
+  slot decodes its own reserved occurrence index, so a separate global decode
+  cursor was dead state whose only remaining reader was a redundant
+  `decoded == issued` assert in the deferred FOLD path (already covered by
+  `reserved == issued`). The cursor is gone; decode is purely
+  reservation-indexed and the invariant is now `0 <= issued <= reserved <=
+  size`.
+- Added a fail-closed guard in `get_next_pc_to_fetch_request`: partial replay
+  requires `fetch_decode_width == 1`. The reservation rollback (`remove_entry`
+  after RESERVATION_FAIL, and per-entry flush unreserve) assumes one slot is
+  allocated at a time and that `back().m_pc` equals the returned request PC. A
+  width > 1 request would allocate several slots at once and mix reserved replay
+  slots with sequential canonical slots, breaking that identity. The server
+  config already uses width 1; the guard aborts instead of silently corrupting
+  replay ordering if the width is ever raised while a replay stream is active.

@@ -1643,7 +1643,7 @@ void Subcore::decode(SM *shared_sm) {
               warp->get_IBuffer_remodeled()->get_remodeled_ibuffer()) {
             if (!ibuffer_entry.m_valid && (ibuffer_entry.m_pc == pc)) {
               shared_sm->m_sm_stats.m_stats_map["total_num_ibuffer_entries_decoded"]->increment_with_integer(1);
-              warp_inst_t *pI = get_next_inst(shared_sm, subcore_warp_id, pc);
+              warp_inst_t *pI = get_next_inst(shared_sm, subcore_warp_id, pc, ibuffer_entry);
               single_decode(shared_sm, pI, ibuffer_entry, sm_warp_id,
                             subcore_warp_id, warp);
             }
@@ -1659,7 +1659,7 @@ void Subcore::decode(SM *shared_sm) {
            warp->get_IBuffer_remodeled()->get_remodeled_ibuffer()) {
         if (!ibuffer_entry.m_valid && (ibuffer_entry.m_pc == pc)) {
           shared_sm->m_sm_stats.m_stats_map["total_num_ibuffer_entries_decoded"]->increment_with_integer(1);
-          warp_inst_t *pI = get_next_inst(shared_sm, subcore_warp_id, pc);
+          warp_inst_t *pI = get_next_inst(shared_sm, subcore_warp_id, pc, ibuffer_entry);
           single_decode(shared_sm, pI, ibuffer_entry, sm_warp_id,
                         subcore_warp_id, warp);
         }
@@ -1669,12 +1669,20 @@ void Subcore::decode(SM *shared_sm) {
   }
 }
 
-warp_inst_t *Subcore::get_next_inst(SM *shared_sm, unsigned int warp_id, address_type pc) {
+warp_inst_t *Subcore::get_next_inst(SM *shared_sm, unsigned int warp_id, address_type pc, const IBuffer_Entry &ibuffer_entry) {
   assert(warp_id < m_warps_of_subcore.size());
   if (m_config->is_trace_mode) {
     // read the inst from the traces
     trace_shd_warp_t *m_trace_warp = static_cast<trace_shd_warp_t *>(
         m_warps_of_subcore[warp_id]);
+    // [WaitBlock partial replay] A slot bound to a reserved replay occurrence
+    // decodes exactly that occurrence (reservation-indexed), so out-of-order
+    // instruction-cache fills cannot misclassify it as synthetic.
+    if (ibuffer_entry.m_is_replay) {
+      return m_trace_warp->get_next_trace_inst(
+          pc, /*is_replay=*/true, ibuffer_entry.m_replay_index,
+          ibuffer_entry.m_replay_epoch);
+    }
     return m_trace_warp->get_next_trace_inst(pc);
   } else {
     return shared_sm->get_gpu()->gpgpu_ctx->ptx_fetch_inst(pc);

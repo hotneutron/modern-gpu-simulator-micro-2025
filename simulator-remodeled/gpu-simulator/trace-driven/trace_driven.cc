@@ -105,11 +105,34 @@ void advance_trace_cta_id(kernel_trace_t *kernel_trace_info) {
 }
 
 trace_warp_inst_t *trace_shd_warp_t::get_next_trace_inst(address_type pc) {
-  if (m_partial_replay_origin != WaitBlockTraceOrigin::CANONICAL &&
-      m_partial_replay_decoded < m_partial_replay.size()) {
+  // Canonical decode entry point. A replay stream, when active, is decoded
+  // through the reservation-indexed overload below (the IBuffer slot carries
+  // the reserved occurrence index/epoch). This preserves slot<->occurrence
+  // identity under out-of-order instruction-cache fills.
+  return get_next_trace_inst(pc, /*is_replay=*/false, /*replay_index=*/0,
+                             /*replay_epoch=*/0);
+}
+
+trace_warp_inst_t *trace_shd_warp_t::get_next_trace_inst(
+    address_type pc, bool is_replay, unsigned int replay_index,
+    uint64_t replay_epoch) {
+  if (is_replay) {
+    // The slot was reserved against a specific replay occurrence. Reject a
+    // stale instruction-cache response from an older replay stream, and decode
+    // exactly that occurrence rather than a moving global head.
+    assert(m_partial_replay_origin != WaitBlockTraceOrigin::CANONICAL &&
+           "replay slot decoded while no replay stream is active");
+    assert(replay_epoch == m_partial_replay_epoch &&
+           "stale replay-epoch instruction-cache response");
+    assert(replay_index < m_partial_replay.size() &&
+           "replay reservation index out of range");
+    inst_trace_t &trace = m_partial_replay[replay_index];
     trace_warp_inst_t *new_inst =
         new trace_warp_inst_t(get_shader()->get_config());
-    if (pc != m_partial_replay[m_partial_replay_decoded].m_pc) {
+    if (pc != trace.m_pc) {
+      // A speculatively-fetched wrong-path PC has no replay occurrence. It must
+      // never issue; the older resolving branch flushes it. Materialize the
+      // usual zero-active synthetic NOP so the IBuffer slot can be filled.
       inst_trace_t synthetic(
           pc, get_current_unique_function_id_call(), false);
       traced_execution &trc_exec =
@@ -126,7 +149,6 @@ trace_warp_inst_t *trace_shd_warp_t::get_next_trace_inst(address_type pc) {
       return new_inst;
     }
 
-    inst_trace_t &trace = m_partial_replay[m_partial_replay_decoded++];
     traced_execution &trc_exec =
         get_shader()->get_gpu()->get_extra_trace_info();
     new_inst->parse_from_trace_struct(
@@ -137,6 +159,11 @@ trace_warp_inst_t *trace_shd_warp_t::get_next_trace_inst(address_type pc) {
             .get_kernel_by_unique_function_id(new_inst->unique_function_id)
             .get_instruction_ptr(pc));
     new_inst->wait_block_trace_origin = m_partial_replay_origin;
+    // Record which reserved occurrence this decoded instruction represents so
+    // FIFO issue can verify exact-once, in-order commit. Filling a slot does not
+    // consume/commit the replay occurrence; that happens at issue in
+    // commit_trace_inst.
+    new_inst->replay_occurrence_index = replay_index;
     return new_inst;
   }
 
@@ -192,9 +219,11 @@ void trace_shd_warp_t::rollback_trace_inst(
   if (inst->wait_block_trace_origin == WaitBlockTraceOrigin::SYNTHETIC) {
     return;
   }
+  // Replay occurrences are un-reserved per-removed-entry by the IBuffer flush
+  // (unreserve_last_partial_replay), which covers both filled and never-filled
+  // slots. A decoded-but-unissued replay slot holds no committed state, so this
+  // per-instruction rollback hook is a no-op for replay origins.
   assert(inst->wait_block_trace_origin == m_partial_replay_origin);
-  assert(m_partial_replay_decoded > m_partial_replay_issued);
-  m_partial_replay_decoded--;
 }
 
 void trace_shd_warp_t::commit_trace_inst(
@@ -205,14 +234,21 @@ void trace_shd_warp_t::commit_trace_inst(
     return;
   }
   assert(inst->wait_block_trace_origin == m_partial_replay_origin);
-  assert(m_partial_replay_issued < m_partial_replay_decoded);
+  // FIFO issue: the issued occurrence must be exactly the reservation at the
+  // head of the replay queue, decoded into this instruction.
   assert(m_partial_replay_issued < m_partial_replay.size());
-  assert(m_partial_replay[m_partial_replay_issued].m_pc == inst->pc);
+  assert(inst->replay_occurrence_index == m_partial_replay_issued &&
+         "replay issued out of FIFO order");
+  assert(m_partial_replay[m_partial_replay_issued].m_pc == inst->pc &&
+         "replay issue PC identity mismatch");
   m_partial_replay_issued++;
   if (m_partial_replay_issued == m_partial_replay.size()) {
     m_partial_replay.clear();
-    m_partial_replay_decoded = 0;
     m_partial_replay_issued = 0;
+    m_partial_replay_reserved = 0;
+    // Advance the epoch so any still-outstanding cache response from this
+    // now-drained stream cannot fill a slot of a future replay stream.
+    m_partial_replay_epoch++;
     m_partial_replay_origin = WaitBlockTraceOrigin::CANONICAL;
   }
 }
@@ -329,8 +365,11 @@ bool trace_shd_warp_t::extract_partial_wait_capsule(
 
   m_partial_deferred.swap(deferred);
   m_partial_replay.swap(sibling_join);
-  m_partial_replay_decoded = 0;
   m_partial_replay_issued = 0;
+  m_partial_replay_reserved = 0;
+  // New replay stream: bump the epoch so any late cache response from a prior
+  // stream cannot fill a slot reserved against this one.
+  m_partial_replay_epoch++;
   m_partial_replay_origin = WaitBlockTraceOrigin::PARTIAL_SIBLING_JOIN;
   if (out_stats != nullptr) {
     out_stats->cursor_before = cursor - consumed_pcs.size();
@@ -347,8 +386,11 @@ bool trace_shd_warp_t::activate_partial_blocked_replay() {
     return false;
   }
   m_partial_replay.swap(m_partial_deferred);
-  m_partial_replay_decoded = 0;
   m_partial_replay_issued = 0;
+  m_partial_replay_reserved = 0;
+  // New replay stream (blocked suffix): bump the epoch so a late cache response
+  // from the drained sibling-join stream cannot fill a blocked-replay slot.
+  m_partial_replay_epoch++;
   m_partial_replay_origin = WaitBlockTraceOrigin::PARTIAL_BLOCKED_REPLAY;
   return true;
 }
@@ -359,7 +401,11 @@ unsigned int trace_shd_warp_t::skip_partial_replay_to_exit(
     FoldSkipStats *out_stats) {
   assert(m_partial_replay_origin ==
          WaitBlockTraceOrigin::PARTIAL_BLOCKED_REPLAY);
-  assert(m_partial_replay_decoded == m_partial_replay_issued);
+  // Deferred FOLD runs only after the IBuffer flush has cancelled every
+  // reserved-but-unissued replay slot, so the reservation cursor is back at the
+  // issued head. The skipped occurrences are consumed here without ever being
+  // fetched, so reservation advances lock-step with issue.
+  assert(m_partial_replay_reserved == m_partial_replay_issued);
   FoldSkipStats stats;
   stats.cursor_before_flush = m_partial_replay_issued;
   stats.cursor_after_flush = m_partial_replay_issued;
@@ -401,7 +447,7 @@ unsigned int trace_shd_warp_t::skip_partial_replay_to_exit(
       stats.imad_scratch++;
     }
     m_partial_replay_issued++;
-    m_partial_replay_decoded++;
+    m_partial_replay_reserved++;
     skipped++;
   }
   if (m_partial_replay_issued >= m_partial_replay.size() ||
@@ -452,11 +498,48 @@ address_type trace_shd_warp_t::canonical_trace_pc() const {
   return traced_pcs[used_insts];
 }
 
+bool trace_shd_warp_t::reserve_next_partial_replay(address_type *pc_out,
+                                                   unsigned int *index_out,
+                                                   uint64_t *epoch_out) {
+  if (m_partial_replay_origin == WaitBlockTraceOrigin::CANONICAL ||
+      m_partial_replay_reserved >= m_partial_replay.size()) {
+    return false;
+  }
+  const unsigned int index = m_partial_replay_reserved;
+  if (pc_out != nullptr) {
+    *pc_out = m_partial_replay[index].m_pc;
+  }
+  if (index_out != nullptr) {
+    *index_out = index;
+  }
+  if (epoch_out != nullptr) {
+    *epoch_out = m_partial_replay_epoch;
+  }
+  m_partial_replay_reserved++;
+  return true;
+}
+
+void trace_shd_warp_t::unreserve_last_partial_replay() {
+  // Give back exactly one replay reservation. Called per-removed-entry by the
+  // IBuffer flush and once by remove_entry after a RESERVATION_FAIL, so an
+  // un-fetched occurrence is re-reserved on the next fetch. Never drops below
+  // the issued head (the in-flight occurrence has already left the deque).
+  assert(m_partial_replay_reserved > m_partial_replay_issued);
+  m_partial_replay_reserved--;
+}
+
+uint64_t trace_shd_warp_t::partial_replay_epoch() const {
+  return m_partial_replay_epoch;
+}
+
 void trace_shd_warp_t::clear_partial_wait_capsule() {
   m_partial_replay.clear();
   m_partial_deferred.clear();
-  m_partial_replay_decoded = 0;
   m_partial_replay_issued = 0;
+  m_partial_replay_reserved = 0;
+  // Bump the epoch so any outstanding cache response cannot fill a slot of a
+  // future replay stream after this capsule is torn down.
+  m_partial_replay_epoch++;
   m_partial_replay_origin = WaitBlockTraceOrigin::CANONICAL;
 }
 
@@ -598,8 +681,11 @@ address_type trace_shd_warp_t::get_start_trace_pc() {
 address_type trace_shd_warp_t::get_pc() {
   assert(traced_pcs.size() > 0);
   if (partial_replay_active() &&
-      m_partial_replay_decoded < m_partial_replay.size()) {
-    return m_partial_replay[m_partial_replay_decoded].m_pc;
+      m_partial_replay_reserved < m_partial_replay.size()) {
+    // Next fetch target within the replay stream is the next occurrence to be
+    // reserved. Reservation (reserve_next_partial_replay) drives the actual
+    // per-slot PC; this keeps the IBuffer's fetch base consistent with it.
+    return m_partial_replay[m_partial_replay_reserved].m_pc;
   }
   assert(used_insts < traced_pcs.size());
   return traced_pcs[used_insts];

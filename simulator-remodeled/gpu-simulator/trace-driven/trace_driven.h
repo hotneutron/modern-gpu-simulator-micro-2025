@@ -121,6 +121,12 @@ class trace_warp_inst_t : public warp_inst_t {
   bool is_s2r() { return m_opcode == OP_S2R; }
   WaitBlockTraceOrigin wait_block_trace_origin =
       WaitBlockTraceOrigin::CANONICAL;
+  // [WaitBlock partial replay] When this instruction was decoded from a
+  // reserved replay occurrence, the index of that occurrence in the warp's
+  // replay stream. Used by commit_trace_inst to enforce exact-once, in-order
+  // (FIFO) issue. Meaningful only when wait_block_trace_origin is a replay
+  // origin (not CANONICAL or SYNTHETIC).
+  unsigned int replay_occurrence_index = 0;
 
  private:
   unsigned m_opcode;
@@ -265,6 +271,15 @@ class trace_shd_warp_t : public shd_warp_t {
   std::vector<address_type> traced_pcs;
   unsigned int used_insts;
   trace_warp_inst_t *get_next_trace_inst(address_type pc); // MOD. VPREG
+  // [WaitBlock partial replay] Reservation-indexed decode. When the IBuffer
+  // slot was allocated against a replay occurrence, decode the exact reserved
+  // occurrence (is_replay=true, replay_index, replay_epoch) instead of the
+  // global decode head. This keeps slot<->occurrence identity stable under
+  // out-of-order instruction-cache fills. A canonical slot (is_replay=false)
+  // falls back to the ordinary pc-keyed path.
+  trace_warp_inst_t *get_next_trace_inst(address_type pc, bool is_replay,
+                                         unsigned int replay_index,
+                                         uint64_t replay_epoch);
   void decrement_trace_pc(); // MOD. VPREG
   void decrease_num_used_inst(address_type pc);
   void rollback_trace_inst(const trace_warp_inst_t *inst);
@@ -287,6 +302,21 @@ class trace_shd_warp_t : public shd_warp_t {
   unsigned int partial_replay_remaining() const;
   unsigned int partial_deferred_size() const;
   address_type canonical_trace_pc() const;
+  // [WaitBlock partial replay] Fetch-time reservation API. When a replay stream
+  // is active and has unreserved occurrences, reserve the next one and return
+  // its PC, occurrence index, and stream epoch through the out-params so the
+  // IBuffer slot can bind to it. Returns false when no replay reservation is
+  // available (caller then uses the canonical sequential fetch PC).
+  bool reserve_next_partial_replay(address_type *pc_out,
+                                   unsigned int *index_out,
+                                   uint64_t *epoch_out);
+  // [WaitBlock partial replay] Undo exactly one (the most recent) replay
+  // reservation. Called per-removed-entry by the IBuffer flush and once by
+  // remove_entry after a RESERVATION_FAIL, so an un-fetched occurrence is
+  // re-reserved on the next fetch. The in-flight (already pop_front'd but not
+  // yet committed) occurrence is never un-reserved.
+  void unreserve_last_partial_replay();
+  uint64_t partial_replay_epoch() const;
   void clear_partial_wait_capsule();
   // [Spin-wait fold] Forward analogue of get_next_trace_inst's cursor
   // bookkeeping: advance both used_insts and each skipped pc's per-occurrence
@@ -317,8 +347,19 @@ class trace_shd_warp_t : public shd_warp_t {
  private:
   std::vector<inst_trace_t> m_partial_replay;
   std::vector<inst_trace_t> m_partial_deferred;
-  unsigned int m_partial_replay_decoded = 0;
   unsigned int m_partial_replay_issued = 0;
+  // [WaitBlock partial replay] Fetch-time reservation cursor and stream epoch.
+  // m_partial_replay_reserved is the number of replay occurrences already bound
+  // to an IBuffer slot; it satisfies
+  //   0 <= issued <= reserved <= size.
+  // Decode does not use a separate decoded cursor: each IBuffer slot carries the
+  // exact reserved occurrence index, so decode is reservation-indexed and safe
+  // under out-of-order instruction-cache fills.
+  // m_partial_replay_epoch changes whenever a replay stream is activated,
+  // drained, or replaced, so a stale instruction-cache response carrying an
+  // older epoch cannot fill a slot in a newer stream.
+  unsigned int m_partial_replay_reserved = 0;
+  uint64_t m_partial_replay_epoch = 0;
   WaitBlockTraceOrigin m_partial_replay_origin =
       WaitBlockTraceOrigin::CANONICAL;
   trace_kernel_info_t *m_kernel_info;

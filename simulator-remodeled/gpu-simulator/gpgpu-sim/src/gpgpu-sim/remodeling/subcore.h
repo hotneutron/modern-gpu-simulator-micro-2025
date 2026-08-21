@@ -265,7 +265,7 @@ class Subcore {
   void allocate_reads(RF_requests rf_requests, const warp_inst_t *pI, unsigned int sm_warp_id, unsigned int regular_rf_num_read_cycles);
   void allocate_writes(warp_inst_t *inst, Register_file *dst_rf, unsigned int num_uses, unsigned int target_latency_execution_wb);
   bool is_possible_to_write(warp_inst_t *inst, Register_file *dst_rf, unsigned int target_latency_execution_wb, unsigned int &num_uses);
-  warp_inst_t *get_next_inst(SM *shared_sm, unsigned int warp_id, address_type pc);
+  warp_inst_t *get_next_inst(SM *shared_sm, unsigned int warp_id, address_type pc, const IBuffer_Entry &ibuffer_entry);
   bool is_waiting_ldgdepbar(const warp_inst_t *pI, unsigned int subcore_warp_id);
   bool is_wait_barriers_ready_entry_point(const warp_inst_t* inst, unsigned int subcore_warp_id);
   std::vector<Wait_Barrier_Checking> wait_barriers_to_check_generic(const warp_inst_t* inst, unsigned int subcore_warp_id);
