@@ -5,10 +5,13 @@ SIMULATOR V1 IMPLEMENTED; FIRST SERVER RUN EXPOSED AND FIXED A PREDICATED-OFF
 PAYLOAD GUARD; SECOND SERVER RUN EXPOSED A FALSE CURSOR-ACCOUNTING AUDIT;
 CAPTURED-POLL PROOF HARDENING IMPLEMENTED AND FULL-TRACE VALIDATED;
 THIRD SERVER RUN CONFIRMED AN ACTUAL K5 PARTIAL MODELED MISS AND STOPPED AT THE
-INTENTIONAL V1 GUARD; K10 POST-FIX VALIDATION IS STILL RUNNING;
+INTENTIONAL V1 GUARD;
 PARTIAL-MISSING-WAIT V2 POST-PROCESSING IMPLEMENTED AND FULL-TRACE VALIDATED;
 SIMULATOR V2 LOADER AND DEFERRED-REPLAY IMPLEMENTATION COMPLETE;
-SERVER BUILD AND K5/K10 RUNTIME VALIDATION PENDING.
+K10 SERVER REGRESSION PASSED; K5 `.e81` EXPOSED A STALE REPLAY FETCH BASE AND
+AN INDEPENDENT ALL-LIVE CROSS-WARP DEADLOCK; THE FETCH-BASE FIX AND REPLAY
+LIFECYCLE GUARDS ARE IMPLEMENTED; K5 `.e82` CONFIRMED SUCCESSFUL CAPSULE
+REPLAY/CLOSE BUT EXPOSED AN OUT-OF-ORDER REPLAY-DECODE RESERVATION GAP.
 
 **Extends:** [`SPIN_WAIT_SIM_MODELING.md`](SPIN_WAIT_SIM_MODELING.md) and
 [`SPIN_WAIT_POSTPROCESS.md`](SPIN_WAIT_POSTPROCESS.md).
@@ -88,7 +91,7 @@ Hard invariants:
 - Poll folding stops before `poll_loop_exit_pc`.
 - Mainline, complementary-lane, reconvergence, and semantic instructions are
   never consumed by poll folding.
-- Under the current v1 implementation, a ready-only partial-mask modeled miss
+- Under the historical v1 implementation, a ready-only partial-mask modeled miss
   never silently continues and never becomes a whole-warp wait hold; it aborts
   with a complete diagnostic. Under the approved v2 design, it may hold only
   after the complementary join occurrence has issued and all extracted blocked
@@ -1616,8 +1619,8 @@ ARRIVE, TMA, or producer-warp dependency analysis. A release dependency cycle
 is a runtime liveness failure and is handled by the existing generation audit,
 4,096-cycle heartbeat, and 32,000-cycle watchdog abort.
 
-Until this design is implemented and validated, the current v1
-`UNSUPPORTED_PARTIAL_MISSING_WAIT` abort remains mandatory.
+Before this v2 design was implemented, the v1
+`UNSUPPORTED_PARTIAL_MISSING_WAIT` abort remained mandatory.
 
 ### 2.11 Focused tests
 
@@ -1660,7 +1663,7 @@ Runtime path A:
 - ready entry performs no hold and no cursor change;
 - ready partial entry performs no hold and replays normally;
 - not-ready all-live entry holds and releases at the expected generation;
-- under the current v1 implementation, a not-ready partial entry prints the
+- under the historical v1 implementation, a not-ready partial entry prints the
   complete diagnostic and aborts before scheduler or cursor mutation;
 - release preserves both trace cursors;
 - the guard remains disabled when `-wait_block_enable 0`.
@@ -1784,10 +1787,17 @@ Cross-kernel:
     `PARTIAL_EXTRACT`, `PARTIAL_WAIT_AFTER_JOIN`, and `PARTIAL_REPLAY`, including
     replay-aware IBuffer rollback, nested waits, and captured-poll folding inside
     a deferred stream.
-19. [in progress] Twelve post-processing unit tests pass. Local simulator
-    compilation is unavailable because this macOS environment has no CUDA
-    headers. Build on the server, run focused cursor/payload/lifecycle tests,
-    then rerun K5 and K10 with the v2 partial policy enabled.
+19. [done] Build and run K5/K10 on the server. K10 completes at 136,997 cycles
+    with all 132 WaitBlock summaries passing. K5 `.e81` exercises 49 partial
+    releases but exposes a stale canonical fetch cursor after replay activation.
+20. [done] Fix the initial replay fetch base, add replay-drain logging, and add
+    fail-closed synthetic-issue, progress, watchdog, post-join, cleanup, and
+    warp-slot lifecycle checks.
+21. [in progress] K5 `.e82` proves that seven released capsules drain and close,
+    then exposes an out-of-order replay decode reservation bug at cycle 50,173.
+    Add replay-occurrence reservation to IBuffer fetch entries, validate it on
+    focused traces, and rerun K5 before addressing the independent all-live
+    cross-warp dependency cycle.
 
 ## 21. First simulator v5 full-run result
 
@@ -1849,6 +1859,288 @@ missing-wait entries waiting on `0x16c38`, `0x16c50`, and `0x16c58`. No CTA
 warp remained runnable, so increasing the watchdog threshold is not a fix.
 After verifying the replay-cursor correction, this all-live cross-warp
 dependency cycle remains a separate design problem.
+
+## 22. Second K5 v5 run: replay progress confirmed, reservation gap exposed
+
+### 22.1 Run result
+
+The K5 `.o82/.e82` server run includes both the initial replay fetch-base fix
+(`9f8e4fd`) and the replay lifecycle hardening (`f5168dd`). It aborts earlier
+than `.e81`:
+
+```text
+[WAITBLOCK][abort][SM117] cyc=50173
+reason=partial-replay-synthetic-issued
+trace_kernel=5 function=3 cta=0 warp=0
+requested_pc=0x9970 expected_pc=0x9970
+```
+
+The primary failure is the intentional fail-closed guard. The later signal 11
+and `undefined instruction: UIADD3` messages are secondary failures emitted by
+other simulator threads after the primary abort. This run does not reach the
+old cycle-69,031 all-live watchdog, so it provides no new evidence about that
+separate deadlock.
+
+Observed partial lifecycle totals before the abort:
+
+```text
+partial-arm=23
+partial-extract=21
+partial-join-hold=23
+partial-join-release=11
+partial-replay-drained=7
+partial-region-close with replay_progress_closed=1: 7
+partial-replay-heartbeat=0
+partial replay accounting/watchdog aborts=0
+synthetic issue aborts=1
+```
+
+Seven capsules therefore complete the entire sequence:
+
+```text
+release -> replay all deferred occurrences -> replay drain -> post_join close
+```
+
+
+Representative successful cases:
+
+```text
+SM113:
+  cycle 46450 release, remaining=17
+  cycle 46502 drained at 0x9500
+  cycle 46511 close at 0x9510, replay_occurrences=17
+
+SM103:
+  cycle 48164 release, remaining=46
+  cycle 48324 drained at 0x9c20
+  cycle 48328 close at 0x9c30, replay_occurrences=46
+```
+
+This proves that `9f8e4fd` fixed the original stale-base failure from `.e81`.
+It does not prove that the replay frontend is correct for every instruction
+cache response order.
+
+### 22.2 Failing SM117 capsule
+
+SM117 follows the expected partial state machine until replay:
+
+```text
+cycle 47362  arm at 0x9930
+cycle 47371  extract 46 blocked occurrences and one sibling join
+cycle 47374  issue sibling BSYNC 0x9c20 and begin hold
+cycle 50154  release generation 6 and activate 46-entry blocked replay
+cycle 50173  reject synthetic 0x9970 before issue
+```
+
+The source trace for CTA 117 warp 0 contains this exact blocked suffix:
+
+```text
+0x9950, 0x9960, 0x9970, 0x9980, ...,
+0x9aa0, 0x9ab0, 0x9ac0, ..., 0x9c20
+```
+
+`0x9970` is therefore a real replay occurrence, not an absent or wrong-path
+instruction.
+
+### 22.3 What a synthetic instruction means
+
+Synthetic instructions predate partial replay. The remodeled frontend can
+speculatively request sequential instruction PCs before an older branch
+resolves. Dynamic traces contain only executed-path occurrences, so a fetched
+wrong-path PC may have no matching dynamic record. The legacy trace reader
+materializes a zero-active synthetic NOP for such a response:
+
+```text
+pc = requested speculative PC
+opcode = NOP
+active mask = 0
+dynamic payload = absent
+is_instruction_traced = false
+```
+
+The synthetic instruction is not intended to issue. The older branch should
+issue first and flush all younger wrong-path IBuffer entries. Returning no
+instruction would leave an IBuffer entry unfillable after its cache response
+has already been consumed.
+
+This is compatible with in-order warp issue:
+
+```text
+IBuffer allocation order:  A, B, C
+response/fill order:       C, A, B   (allowed)
+issue order:               A, B, C   (FIFO)
+```
+
+Only response completion and IBuffer filling may be out of order. Warp
+instruction issue remains in order.
+
+### 22.4 Why replay misclassifies an early response
+
+The current replay reader has one sequential decode cursor:
+
+```cpp
+if (pc != m_partial_replay[m_partial_replay_decoded].m_pc) {
+  // construct a synthetic instruction
+}
+```
+
+The server configuration has:
+
+```text
+fetch_decode_width=1
+ibuffer_remodeled_size=5
+ibuffer_coalescing=0
+```
+
+One request is generated at a time, but up to five IBuffer entries and fetches
+may be outstanding. Their cache responses are not required to return in PC
+order. A valid failing ordering is:
+
+```text
+replay sequence: 0x9950 -> 0x9960 -> 0x9970
+
+decode 0x9950:
+  expected=0x9950
+  bind real occurrence
+  replay decoded cursor now expects 0x9960
+
+response 0x9970 arrives before 0x9960:
+  requested=0x9970
+  expected=0x9960
+  current code incorrectly creates synthetic 0x9970
+  replay decoded cursor remains at 0x9960
+
+decode 0x9960:
+  expected=0x9960
+  bind real occurrence
+  replay decoded cursor now expects 0x9970
+
+issue:
+  real 0x9950
+  real 0x9960
+  synthetic 0x9970 reaches the FIFO head
+```
+
+The abort prints `requested_pc=expected_pc=0x9970` because those values are
+sampled at issue time. They differed when the synthetic object was created;
+the real `0x9960` decode advanced the replay cursor before the synthetic
+`0x9970` reached the issue head.
+
+The fail-closed guard must remain. Allowing the synthetic instruction to issue
+would silently replace a real deferred occurrence with a zero-active NOP and
+violate exact-once replay.
+
+### 22.5 Required fix: reserve replay occurrences at fetch allocation
+
+The replay queue is not a new execution model. It is a temporary source of
+ordinary traced instructions; the existing IBuffer may still fetch, fill, and
+issue them with its normal timing. The missing contract is stable identity
+between an IBuffer slot and the replay occurrence that the slot represents.
+
+At IBuffer allocation time, reserve the next replay occurrence:
+
+```text
+IBuffer entry:
+  requested_pc
+  replay_epoch
+  replay_occurrence_index
+  replay_origin
+```
+
+Then bind a response using the entry's reservation rather than the global
+`m_partial_replay_decoded` head:
+
+```text
+fetch allocation:
+  reserve replay[index]
+  entry.pc = replay[index].pc
+  entry.replay_index = index
+
+response/decode:
+  locate the matching unfilled IBuffer entry
+  decode replay[entry.replay_index]
+  require replay PC/function/origin/epoch identity
+
+issue:
+  require entry.replay_index == replay_issued
+  commit exactly one occurrence
+  replay_issued++
+```
+
+Out-of-order fill is then safe:
+
+```text
+entries:        [index 0:0x9950] [index 1:0x9960] [index 2:0x9970]
+response order: index 0, index 2, index 1
+issue order:    index 0, index 1, index 2
+```
+
+The implementation must not derive later replay requests as `previous_pc +
+instruction_size`; it must obtain every requested PC from the reserved dynamic
+occurrence. This also supports a branch target or repeated PC inside the
+deferred stream.
+
+### 22.6 Reservation lifecycle and guards
+
+A robust implementation needs these monotonic bounds:
+
+```text
+0 <= replay_issued <= replay_reserved <= replay_size
+```
+
+Decoded readiness belongs to each IBuffer entry and need not be represented by
+a single monotonic `replay_decoded` cursor. Required invariants:
+
+1. Reservation advances once when an IBuffer slot is allocated.
+2. A cache response may fill only the slot carrying the same replay epoch and
+   occurrence index.
+3. Filling a slot never consumes or commits the replay occurrence.
+4. FIFO issue requires `entry.replay_occurrence_index == replay_issued`.
+5. Issue advances `replay_issued` exactly once.
+6. IBuffer flush cancels every unissued reservation, including entries whose
+   cache response has not arrived, and resets `replay_reserved` to
+   `replay_issued`.
+7. A replay epoch changes whenever a replay stream is activated, drained, or
+   replaced. A response from an older epoch cannot fill a new replay entry even
+   when its PC is identical.
+8. FOLD inside replay first flushes/cancels reservations, then advances
+   `replay_issued` over the proven poll occurrences.
+9. Nested partial hold preserves the active replay and its issued position but
+   cancels younger speculative reservations before resuming.
+10. No synthetic instruction may issue while a replay owner or post-join
+    progress record is active.
+
+Serializing replay to one outstanding IBuffer entry would avoid this specific
+response reordering, but it is only a conservative stopgap. Occurrence-index
+reservation preserves the normal IBuffer behavior and is the selected design.
+
+### 22.7 Next-session implementation checklist
+
+1. Extend `IBuffer_Entry` with optional replay epoch/origin/index metadata.
+2. Replace replay's global decode-head lookup with fetch-time occurrence
+   reservation and reservation-indexed decode.
+3. Keep canonical trace lookup unchanged.
+4. Make flush cancel both decoded and not-yet-decoded replay reservations.
+5. Tag or otherwise reject late instruction-cache responses from an older
+   replay epoch.
+6. Make commit verify FIFO replay index and exact PC/function identity.
+7. Make deferred FOLD reconcile reserved, issued, and skipped positions.
+8. Add focused tests for in-order response, `0x9970`-before-`0x9960` response,
+   branch flush, repeated PC, stale response after release, nested hold, and
+   replay drain to post-join.
+9. Rerun K5 and require:
+
+   ```text
+   synthetic issue aborts=0
+   partial replay accounting/watchdog aborts=0
+   partial-replay-drained == extracted capsules that release
+   replay_progress_closed=1 == partial-replay-drained
+   ```
+
+10. Only after replay passes the `.e82` failure point should the independent
+    all-live cross-warp deadlock be analyzed again. Passing cycle 50,173 proves
+    only that this reservation failure did not recur; it does not resolve the
+    old cycle-69,031 dependency cycle.
 
 The design is complete when each runtime action is explained by exactly one of
 the two strategies. No entry action is permitted for a captured-poll record, and
