@@ -987,6 +987,9 @@ class gpgpu_sim : public gpgpu_t {
   void reset_cycless_access_history();
   void gather_gpu_per_sm_single_stat(std::string stat_name);
   void reset_gpu_per_sm_stats();
+  // [SR-M0A] Kernel-boundary driver: fold every SM's stall-reason-align totals
+  // and print the report. No-op unless the instrument gate is on.
+  void report_stall_reason_align_stats();
   // clocks
   void reinit_clock_domains(void);
   int next_clock_domain(void);

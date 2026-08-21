@@ -166,6 +166,7 @@ static std::string format_top_histogram_entries(
 #include "mem_latency_stat.h"
 
 #include "remodeling/gmmu.h"
+#include "remodeling/sm.h"
 
 namespace {
 
@@ -3364,6 +3365,17 @@ void shader_core_config::reg_options(class OptionParser *opp) {
                          "breakdown. Read-only, timing-neutral, default 0 = bit-identical. See "
                          ".plan/HW_VS_SIM_SFU.md section 5. (default=0)",
                          "0");
+  option_parser_register(opp, "-stall_reason_align_instrument_enable", OPT_BOOL,
+                         &stall_reason_align_instrument_enable,
+                         "Enable observe-only SR-M0A stall-reason-alignment accounting: a cycle-start "
+                         "pre-issue snapshot that classifies every active warp into exactly one "
+                         "mutually-exclusive population (selected / eligible_not_selected / "
+                         "no_valid_instruction / drain / wait_block_hold / blocked_with_valid_head / "
+                         "non_frontend_hold_without_valid_head / unknown_valid_head) and validates "
+                         "per-cycle conservation against the actual issue winner. Never calls a mutating "
+                         "readiness function and never changes scheduling; default 0 = bit-identical. "
+                         "See .plan/STALL_REASON_ALIGN.md Stage SR-M0A. (default=0)",
+                         "0");
   option_parser_register(opp, "-subcore_gtlrr_enable", OPT_BOOL,
                          &subcore_gtlrr_enable,
                          "Warp-ordering policy for the remodeling subcore issue/fetch path. 0 = GTO "
@@ -4456,6 +4468,115 @@ void gpgpu_sim::reset_gpu_per_sm_stats() {
   m_l1i_prefetch_miss_set_histogram.clear();
   m_l1i_prefetch_evicted_prefetch_block_histogram.clear();
   m_l1i_prefetch_resident_blocks.clear();
+  // [SR-M0A] Reset per-Subcore stall-reason-align totals once per kernel
+  // boundary (never from SM::reinit()). Strictly gated.
+  if (m_shader_config->stall_reason_align_instrument_enable) {
+    for(unsigned int i = 0; i < m_shader_config->n_simt_clusters; i++) {
+      for(unsigned int j = 0; j < m_cluster[i]->get_num_cores(); j++) {
+        SM *sm = static_cast<SM *>(m_cluster[i]->get_core(j));
+        sm->reset_stall_reason_align_stats();
+      }
+    }
+  }
+}
+
+void gpgpu_sim::report_stall_reason_align_stats() {
+  if (!m_shader_config->stall_reason_align_instrument_enable) return;
+
+  Subcore::StallPopulationTotals agg;
+  for(unsigned int i = 0; i < m_shader_config->n_simt_clusters; i++) {
+    for(unsigned int j = 0; j < m_cluster[i]->get_num_cores(); j++) {
+      SM *sm = static_cast<SM *>(m_cluster[i]->get_core(j));
+      sm->gather_stall_reason_align_stats(agg);
+    }
+  }
+
+  auto idx = [](Subcore::StallPopulation p) {
+    return static_cast<size_t>(p);
+  };
+  static const char *const kNames[] = {
+      "SELECTED",
+      "ELIGIBLE_NOT_SELECTED_WITH_ISSUE",
+      "ELIGIBLE_NOT_SELECTED_WITHOUT_ISSUE",
+      "NO_VALID_INSTRUCTION",
+      "DRAIN",
+      "WAIT_BLOCK_HOLD",
+      "BLOCKED_WITH_VALID_HEAD",
+      "NON_FRONTEND_HOLD_WITHOUT_VALID_HEAD",
+      "UNKNOWN_VALID_HEAD",
+  };
+
+  const uint64_t selected = agg.population[idx(Subcore::StallPopulation::SELECTED)];
+  const uint64_t unknown = agg.population[idx(Subcore::StallPopulation::UNKNOWN_VALID_HEAD)];
+
+  uint64_t population_sum = 0;
+  for (size_t b = 0; b < static_cast<size_t>(Subcore::StallPopulation::COUNT); b++) {
+    population_sum += agg.population[b];
+  }
+  const long long delta =
+      static_cast<long long>(population_sum) - static_cast<long long>(agg.active_warp_cycles);
+
+  const bool fail = (agg.winner_mismatch != 0) || (agg.winner_prestate_unknown != 0) ||
+                    (unknown != 0) || (population_sum != agg.active_warp_cycles);
+  const char *status = fail ? "FAIL" : "PASS";
+
+  printf("[STALLALIGN] ---- SR-M0A stall-reason alignment report ----\n");
+  for (size_t b = 0; b < static_cast<size_t>(Subcore::StallPopulation::COUNT); b++) {
+    printf("[STALLALIGN] population[%s] = %llu\n", kNames[b],
+           (unsigned long long)agg.population[b]);
+  }
+  printf("[STALLALIGN] active_warp_cycles = %llu\n",
+         (unsigned long long)agg.active_warp_cycles);
+  printf("[STALLALIGN] eligible_warp_cycles = %llu\n",
+         (unsigned long long)agg.eligible_warp_cycles);
+  printf("[STALLALIGN] sampled_subcore_cycles = %llu\n",
+         (unsigned long long)agg.sampled_subcore_cycles);
+  printf("[STALLALIGN] eligible_without_issue_cycles = %llu\n",
+         (unsigned long long)agg.eligible_without_issue_cycles);
+  printf("[STALLALIGN] no_head_stall_count_warp_cycles = %llu\n",
+         (unsigned long long)agg.no_head_stall_count_warp_cycles);
+  printf("[STALLALIGN] no_head_yield_warp_cycles = %llu\n",
+         (unsigned long long)agg.no_head_yield_warp_cycles);
+  printf("[STALLALIGN] winner_mismatch = %llu\n",
+         (unsigned long long)agg.winner_mismatch);
+  printf("[STALLALIGN] winner_prestate_unknown = %llu\n",
+         (unsigned long long)agg.winner_prestate_unknown);
+  printf("[STALLALIGN] measured_kernel_uid = %u\n", agg.measured_kernel_uid);
+  printf("[STALLALIGN] population_sum = %llu\n", (unsigned long long)population_sum);
+  printf("[STALLALIGN] delta(population_sum - active_warp_cycles) = %lld\n", delta);
+
+  if (selected > 0) {
+    const double sel = static_cast<double>(selected);
+    printf("[STALLALIGN] ratio active_warp_cycles/selected = %.6f\n",
+           static_cast<double>(agg.active_warp_cycles) / sel);
+    printf("[STALLALIGN] ratio selected/selected = %.6f\n",
+           static_cast<double>(selected) / sel);
+    printf("[STALLALIGN] ratio eligible_not_selected_with_issue/selected = %.6f\n",
+           static_cast<double>(agg.population[idx(Subcore::StallPopulation::ELIGIBLE_NOT_SELECTED_WITH_ISSUE)]) / sel);
+    printf("[STALLALIGN] ratio eligible_not_selected_without_issue/selected = %.6f\n",
+           static_cast<double>(agg.population[idx(Subcore::StallPopulation::ELIGIBLE_NOT_SELECTED_WITHOUT_ISSUE)]) / sel);
+    printf("[STALLALIGN] ratio no_valid_instruction/selected = %.6f\n",
+           static_cast<double>(agg.population[idx(Subcore::StallPopulation::NO_VALID_INSTRUCTION)]) / sel);
+    printf("[STALLALIGN] ratio drain/selected = %.6f\n",
+           static_cast<double>(agg.population[idx(Subcore::StallPopulation::DRAIN)]) / sel);
+  } else {
+    printf("[STALLALIGN] selected=0 (no ratios)\n");
+  }
+
+  printf("[STALLALIGN] FINAL status=%s active=%llu population_sum=%llu delta=%lld "
+         "selected=%llu eligible=%llu unknown=%llu sampled=%llu kernel_uid=%u "
+         "winner_mismatch=%llu winner_prestate_unknown=%llu\n",
+         status,
+         (unsigned long long)agg.active_warp_cycles,
+         (unsigned long long)population_sum,
+         delta,
+         (unsigned long long)selected,
+         (unsigned long long)agg.eligible_warp_cycles,
+         (unsigned long long)unknown,
+         (unsigned long long)agg.sampled_subcore_cycles,
+         agg.measured_kernel_uid,
+         (unsigned long long)agg.winner_mismatch,
+         (unsigned long long)agg.winner_prestate_unknown);
 }
 
 void gpgpu_sim::record_l1i_prefetch_miss_observation(
@@ -4979,6 +5100,7 @@ void gpgpu_sim::gpu_print_stat() {
 
   std::string kernel_info_str = executed_kernel_info_string();
   gather_gpu_per_sm_stats();
+  report_stall_reason_align_stats();
   reset_cycless_access_history();
   
   gpu_sim_insn = m_gpu_per_sm_stats.m_stats_map["gpu_sim_insn"]->get_value();

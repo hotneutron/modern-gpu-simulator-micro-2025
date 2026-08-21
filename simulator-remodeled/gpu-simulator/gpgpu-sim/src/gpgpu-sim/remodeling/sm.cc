@@ -560,6 +560,18 @@ void SM::increment_sm_stat_by_integer(std::string stat_name, int val_to_incremen
   m_sm_stats.m_stats_map[stat_name]->increment_with_integer(val_to_increment);
 }
 
+void SM::gather_stall_reason_align_stats(Subcore::StallPopulationTotals &dst) const {
+  for (auto subcore : m_subcores) {
+    subcore->gather_stall_reason_align_stats(dst);
+  }
+}
+
+void SM::reset_stall_reason_align_stats() {
+  for (auto subcore : m_subcores) {
+    subcore->reset_stall_reason_align_stats();
+  }
+}
+
 void SM::cycle() {
   if (!isactive() && get_not_completed() == 0) return;
 
@@ -4620,6 +4632,63 @@ bool SM::warp_waiting_at_mem_barrier(unsigned warp_id) {
 
 bool SM::warp_waiting_grid_barrier(unsigned warp_id) {
   return m_physical_warp[warp_id]->get_gridbar();
+}
+
+// [SR-M0A] Pure, non-mutating wait-state peeks. See STALL_REASON_ALIGN.md SR-M0A.6.
+// These reproduce the readiness predicates used by the authoritative issue path
+// WITHOUT any of its side effects (no clear, no wait-set insert/erase, no cache
+// invalidate, no watchdog-map update, no log emission).
+
+WaitBlockPendingMode SM::peek_wait_block_hold_mode(unsigned warp_id) const {
+  // Inspect ONLY the pending WaitBlock state, never the programmer/named-barrier
+  // set (that is peek_named_barrier_wait's job). Returns NONE when there is no
+  // unresolved WaitBlock hold.
+  if (warp_id >= m_pending_sync_waits.size()) {
+    return WaitBlockPendingMode::NONE;
+  }
+  const HopperMBarrierPendingWait &pending_wait = m_pending_sync_waits[warp_id];
+  if (!pending_wait.valid || is_sync_wait_satisfied(pending_wait)) {
+    return WaitBlockPendingMode::NONE;
+  }
+  return pending_wait.mode;
+}
+
+bool SM::peek_named_barrier_wait(unsigned warp_id) const {
+  return m_barriers.warp_waiting_at_barrier(warp_id);
+}
+
+bool SM::peek_membar_wait(unsigned warp_id) const {
+  // Mirror warp_waiting_at_mem_barrier()'s drain predicate with no clear/log/
+  // watchdog/L1-invalidate side effects.
+  if (!m_physical_warp[warp_id]->get_membar()) return false;
+  bool use_traditional_scoreboarding =
+      !m_physical_warp[warp_id]->get_kernel_info()->is_captured_from_binary ||
+      m_config->is_remodeling_scoreboarding_enabled || !m_config->is_trace_mode;
+  bool clear_membar = false;
+  if (use_traditional_scoreboarding) {
+    clear_membar = (!m_scoreboard->pendingWrites(warp_id) &&
+                    !m_scoreboard_WAR->pendingReads(warp_id));
+  } else {
+    membar_scope_t scope = m_physical_warp[warp_id]->get_membar_scope();
+    if (scope == MEMBAR_SCOPE_NONE) {
+      clear_membar = true;
+    } else {
+      clear_membar = !warp_has_pending_fence_stores(warp_id, (int)scope);
+    }
+  }
+  return !clear_membar;
+}
+
+bool SM::peek_grid_barrier_wait(unsigned warp_id) const {
+  return m_physical_warp[warp_id]->get_gridbar();
+}
+
+bool SM::peek_tma_flush_wait(unsigned warp_id, const warp_inst_t *inst) const {
+  if (inst == nullptr ||
+      inst->tma_opcode_family != TMAOpcodeFamily::UTMACMDFLUSH) {
+    return false;
+  }
+  return m_tma_unit_shared_of_sm->warp_has_outstanding_stores(warp_id);
 }
 
 bool SM::warp_waiting_at_tma_flush(unsigned warp_id, const warp_inst_t *pI) {

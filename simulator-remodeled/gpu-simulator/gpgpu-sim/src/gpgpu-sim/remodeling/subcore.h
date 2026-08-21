@@ -35,6 +35,8 @@
 #include <vector>
 #include <queue>
 #include <memory>
+#include <array>
+#include <cstdint>
 #include "../../constants.h"
 #include "../shader.h"
 #include "register_file.h"
@@ -157,6 +159,74 @@ class Subcore {
   // so SM::cycle() can attribute true SM-idle cycles to every reason in one run.
   unsigned int step0_reason_mask_this_cycle() const { return m_step0_reason_mask_this_cycle; }
 
+  // ===================== SR-M0A stall-reason alignment =====================
+  // Complete, mutually-exclusive per-active-warp population accounting captured
+  // at cycle start (pre-issue), validated against the actual issue winner. All
+  // observe-only; gated by -stall_reason_align_instrument_enable. See
+  // .plan/STALL_REASON_ALIGN.md Stage SR-M0A.
+
+  // Internal per-warp pre-issue class (SR-M0A.4). One enum value per warp makes
+  // mutual exclusion structural.
+  enum class StallPreIssueClass : uint8_t {
+    INACTIVE,
+    WAIT_BLOCK_HOLD,
+    NON_FRONTEND_HOLD_NO_HEAD,
+    DRAIN,
+    NO_VALID,
+    BLOCKED_VALID,
+    ELIGIBLE_CANDIDATE,
+    UNKNOWN_VALID,
+  };
+
+  // Final output population buckets (SR-M0A.4).
+  enum class StallPopulation : uint8_t {
+    SELECTED,
+    ELIGIBLE_NOT_SELECTED_WITH_ISSUE,
+    ELIGIBLE_NOT_SELECTED_WITHOUT_ISSUE,
+    NO_VALID_INSTRUCTION,
+    DRAIN,
+    WAIT_BLOCK_HOLD,
+    BLOCKED_WITH_VALID_HEAD,
+    NON_FRONTEND_HOLD_WITHOUT_VALID_HEAD,
+    UNKNOWN_VALID_HEAD,
+    COUNT,
+  };
+
+  struct StallWarpSample {
+    StallPreIssueClass state = StallPreIssueClass::INACTIVE;
+    unsigned int sm_warp_id = 0;
+    address_type head_pc = 0;
+    uint32_t blocker_mask = 0;
+  };
+
+  struct StallCycleSnapshot {
+    // resize(m_num_warps_per_subcore) exactly once during Subcore construction.
+    std::vector<StallWarpSample> samples;
+    std::array<uint32_t, static_cast<size_t>(StallPopulation::COUNT)> population{};
+    uint32_t active_count = 0;
+    uint32_t eligible_count = 0;
+    uint32_t unknown_count = 0;
+  };
+
+  struct StallPopulationTotals {
+    std::array<uint64_t, static_cast<size_t>(StallPopulation::COUNT)> population{};
+    uint64_t active_warp_cycles = 0;
+    uint64_t eligible_warp_cycles = 0;
+    uint64_t sampled_subcore_cycles = 0;
+    uint64_t eligible_without_issue_cycles = 0;
+    uint64_t no_head_stall_count_warp_cycles = 0;
+    uint64_t no_head_yield_warp_cycles = 0;
+    uint64_t winner_mismatch = 0;
+    uint64_t winner_prestate_unknown = 0;
+    unsigned int measured_kernel_uid = 0;
+    bool measured_kernel_uid_valid = false;
+  };
+
+  // Fold this Subcore's SR-M0A totals into an accumulator (SM-level gather).
+  void gather_stall_reason_align_stats(StallPopulationTotals &dst) const;
+  // Reset once per measured kernel (never from SM::reinit()).
+  void reset_stall_reason_align_stats();
+
  private:
   int m_num_active_warps_subcore;
   first_level_instruction_cache* m_L0I;
@@ -191,6 +261,19 @@ class Subcore {
   // [FWD drain-idle 축1] this subcore's mutually-exclusive sole-block reason this cycle.
   Step0SoleBlock m_step0_sole_block_this_cycle = SB_ISSUED;
   unsigned int m_step0_reason_mask_this_cycle = 0;
+
+  // [SR-M0A] Reused scratch snapshot (samples sized once in the constructor) plus
+  // surviving per-kernel totals. Only touched under the gate.
+  StallCycleSnapshot m_stall_cycle_snapshot;
+  StallPopulationTotals m_stall_totals;
+  // Capture the cycle-start pre-issue population (read-only). Called right after
+  // modify_warp_state() and before the authoritative issue loop.
+  void capture_pre_issue_snapshot(SM *shared_sm, StallCycleSnapshot &snap);
+  // Validate the actual winner against the snapshot and fold the cycle into totals.
+  void finalize_stall_snapshot(StallCycleSnapshot &snap,
+                               int issued_subcore_warp_id,
+                               int issued_sm_warp_id,
+                               address_type issued_pc);
 
   register_set_uniptr m_ISSUE_CONTROL_latch = register_set_uniptr(1, "ISSUE_CONTROL_latch");
   register_set_uniptr m_CONTROL_ALLOCATE_latch = register_set_uniptr(1, "CONTROL_ALLOCATE_latch");
@@ -260,6 +343,11 @@ class Subcore {
   void set_num_pending_cycles_with_issue_port_busy(const warp_inst_t *pI);
   void generate_fixed_latency_constant_accesses(warp_inst_t *pI);
   bool are_l1c_operands_ready(SM *shared_sm, const warp_inst_t *pI);
+  // [SR-M0A] Pure tri-state constant-cache readiness for the pre-issue snapshot.
+  // Never allocates a mem_fetch, calls read_only_cache::access(), or mutates any
+  // cache state. See .plan/STALL_REASON_ALIGN.md SR-M0A.7.
+  enum class PeekReady { READY, BLOCKED, UNKNOWN };
+  PeekReady peek_l1c_operands_ready(const warp_inst_t *pI) const;
   void assign_instruction_warp_id(warp_inst_t *pI, unsigned int subcore_warp_id, unsigned int sm_warp_id);
 
   void allocate_reads(RF_requests rf_requests, const warp_inst_t *pI, unsigned int sm_warp_id, unsigned int regular_rf_num_read_cycles);

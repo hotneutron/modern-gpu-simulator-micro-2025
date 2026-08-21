@@ -76,6 +76,8 @@ Subcore::Subcore(unsigned subcore_id, const shader_core_config *config,
   m_reserved_slots_uniform_fixed_latency_rf_write_queue = 0;
   m_num_active_warps_subcore = 0;
   m_is_next_stage_of_issue_busy = false;
+  // [SR-M0A] Size the reused snapshot scratch exactly once (SR-M0A.8).
+  m_stall_cycle_snapshot.samples.resize(m_num_warps_per_subcore);
 }
 
 Subcore::~Subcore() {
@@ -596,6 +598,16 @@ void Subcore::issue(SM *shared_sm) {
   unsigned int mufu_ls_nonsfu_scoreboard = 0;
 
   modify_warp_state();
+
+  // [SR-M0A] Capture the cycle-start pre-issue population before the port-busy
+  // decrement and before the authoritative issue loop can pick a winner.
+  int sra_issued_subcore_warp_id = -1;
+  int sra_issued_sm_warp_id = -1;
+  address_type sra_issued_pc = 0;
+  if (m_config->stall_reason_align_instrument_enable) {
+    capture_pre_issue_snapshot(shared_sm, m_stall_cycle_snapshot);
+  }
+
   if(m_num_pending_cycles_with_issue_port_busy > 0) {
     m_num_pending_cycles_with_issue_port_busy--;
   }else if(m_ISSUE_CONTROL_latch.has_free()) {
@@ -945,6 +957,13 @@ void Subcore::issue(SM *shared_sm) {
           }
           issue_warp(shared_sm, m_ISSUE_CONTROL_latch, pI, active_mask, sm_warp_id, fu, is_fixed_latency_inst, use_traditional_scoreboarding, has_dst_regs, dst_type);
           is_issued_inst = true;
+          // [SR-M0A] Record the actual winner (Subcore-local index, SM warp id, PC)
+          // for pre-issue-snapshot validation at finalize.
+          if (m_config->stall_reason_align_instrument_enable) {
+            sra_issued_subcore_warp_id = (int)subcore_warp_id;
+            sra_issued_sm_warp_id = (int)sm_warp_id;
+            sra_issued_pc = pI->pc;
+          }
           // [NANOSLEEP spin lever] record whether the winning op is a producer mbarrier spin poll
           // (PHASECHK/TRYWAIT). Used with n_eligible_this_cycle (finalized on the tail) to detect
           // spin displacing a co-eligible warp. Observe-only; gated at the stats site.
@@ -1215,6 +1234,13 @@ void Subcore::issue(SM *shared_sm) {
   shared_sm->m_sm_stats.m_stats_map["total_num_cycles_issue_stage_evaluated"]->increment_with_integer(1);
 
   m_is_next_stage_of_issue_busy = !is_next_stage_availabe;
+
+  // [SR-M0A] Validate the actual winner against the cycle-start snapshot and fold
+  // this cycle into the per-kernel totals.
+  if (m_config->stall_reason_align_instrument_enable) {
+    finalize_stall_snapshot(m_stall_cycle_snapshot, sra_issued_subcore_warp_id,
+                            sra_issued_sm_warp_id, sra_issued_pc);
+  }
 }
 
 void Subcore::modify_warp_state() {
@@ -1392,6 +1418,349 @@ bool Subcore::are_l1c_operands_ready(SM *shared_sm, const warp_inst_t *pI) {
     }
   }
   return are_l1c_operands_ready;
+}
+
+Subcore::PeekReady Subcore::peek_l1c_operands_ready(const warp_inst_t *pI) const {
+  // Pure mirror of are_l1c_operands_ready(): the authoritative path accepts only
+  // HIT as ready, so any non-HIT tag status observed here is BLOCKED. No mem_fetch
+  // allocation, no read_only_cache::access(), no cache-state mutation.
+  if(m_config->perfect_inst_const_cache || m_config->perfect_constant_cache) {
+    return PeekReady::READY;
+  }
+  if(!pI->get_generated_constant_accesses() || pI->accessq_empty()) {
+    return PeekReady::READY;
+  }
+  for(const auto mem_acc : pI->get_mem_accesses()) {
+    if(mem_acc.get_type() != CONST_ACC_R) {
+      // The address/mask for this access cannot be reconstructed as a plain
+      // constant probe; fail closed rather than fabricate a ready result.
+      return PeekReady::UNKNOWN;
+    }
+    enum cache_request_status status =
+        m_L0C_cache->probe_tag_only(mem_acc.get_addr(), mem_acc.get_sector_mask());
+    if(status != HIT) {
+      return PeekReady::BLOCKED;
+    }
+  }
+  return PeekReady::READY;
+}
+
+// [SR-M0A] Blocker-mask bit positions (used only as mask==0 vs !=0 by SR-M0A;
+// the numeric encoding is reused by SR-M0B). Kept local to the capture logic.
+namespace {
+enum StallBlockerBit : uint32_t {
+  SB_BIT_YIELD          = 1u << 0,
+  SB_BIT_STALL_COUNT    = 1u << 1,
+  SB_BIT_WAIT_BARRIER   = 1u << 2,
+  SB_BIT_NAMED_BARRIER  = 1u << 3,
+  SB_BIT_MEMBAR         = 1u << 4,
+  SB_BIT_GRID_BARRIER   = 1u << 5,
+  SB_BIT_LDGDEPBAR      = 1u << 6,
+  SB_BIT_TMA_FLUSH      = 1u << 7,
+  SB_BIT_FU             = 1u << 8,
+  SB_BIT_SCOREBOARD     = 1u << 9,
+  SB_BIT_RESULT_QUEUE   = 1u << 10,
+  SB_BIT_L1C            = 1u << 11,  // definite BLOCKED only
+  SB_BIT_L1C_UNKNOWN    = 1u << 12,  // observe-only: L1C could not be probed
+};
+}  // namespace
+
+void Subcore::capture_pre_issue_snapshot(SM *shared_sm, StallCycleSnapshot &snap) {
+  // Zero the small per-cycle scalars/population; samples[] is overwritten per
+  // active warp and never resized here (SR-M0A.8).
+  snap.population.fill(0);
+  snap.active_count = 0;
+  snap.eligible_count = 0;
+  snap.unknown_count = 0;
+
+  // Global Subcore gates observed at cycle start (SR-M0A.5). issue_port_ready
+  // reflects the pre-decrement value, matching the authoritative if/else-if flow
+  // (SR-M0A.3).
+  const bool issue_port_ready = (m_num_pending_cycles_with_issue_port_busy == 0);
+  const bool issue_control_free = m_ISSUE_CONTROL_latch.has_free();
+  const bool global_gates_open = issue_port_ready && issue_control_free;
+
+  unsigned int recount_active = 0;
+
+  for (unsigned int subcore_warp_id = 0;
+       subcore_warp_id < m_warps_of_subcore.size(); subcore_warp_id++) {
+    StallWarpSample &s = snap.samples[subcore_warp_id];
+    s = StallWarpSample();
+
+    shd_warp_t *c_warp = m_warps_of_subcore[subcore_warp_id];
+    if (c_warp == nullptr || c_warp->done_exit()) {
+      s.state = StallPreIssueClass::INACTIVE;
+      continue;
+    }
+    recount_active++;
+    snap.active_count++;
+
+    const unsigned int sm_warp_id = c_warp->get_warp_id();
+    s.sm_warp_id = sm_warp_id;
+
+    // Stamp/verify the single measured kernel (SR-M0A.12).
+    const unsigned int kuid =
+        c_warp->get_kernel_info() ? c_warp->get_kernel_info()->get_uid() : 0u;
+    if (!m_stall_totals.measured_kernel_uid_valid) {
+      m_stall_totals.measured_kernel_uid = kuid;
+      m_stall_totals.measured_kernel_uid_valid = true;
+    } else if (m_stall_totals.measured_kernel_uid != kuid) {
+      std::fprintf(stderr,
+                   "[STALLALIGN][abort] cross-kernel mix sm=%u subcore=%u warp=%u "
+                   "measured_uid=%u new_uid=%u cyc=%llu\n",
+                   shared_sm->get_sid(), m_subcore_id, sm_warp_id,
+                   m_stall_totals.measured_kernel_uid, kuid,
+                   (unsigned long long)shared_sm->get_current_gpu_cycle());
+      abort();
+    }
+
+    // (1) WaitBlock hold is a terminal population state; never inspect a future
+    //     head's FU (SR-M0A.4 step 2).
+    if (m_config->wait_block_enable &&
+        shared_sm->peek_wait_block_hold_mode(sm_warp_id) !=
+            WaitBlockPendingMode::NONE) {
+      s.state = StallPreIssueClass::WAIT_BLOCK_HOLD;
+      snap.population[(size_t)StallPopulation::WAIT_BLOCK_HOLD]++;
+      continue;
+    }
+
+    IBuffer_Remodeled *ibuffer = c_warp->get_IBuffer_remodeled();
+    const bool has_valid_head = ibuffer->is_next_valid();
+
+    if (!has_valid_head) {
+      // (3) No head, but an observable non-frontend hold blocks the warp.
+      const bool stall_ct = !c_warp->get_dependency_state()->is_stall_counter_0();
+      const bool yield_hold = !c_warp->get_dependency_state()->is_yield_ready();
+      const bool named_bar = shared_sm->peek_named_barrier_wait(sm_warp_id);
+      const bool membar = shared_sm->peek_membar_wait(sm_warp_id);
+      const bool grid_bar = shared_sm->peek_grid_barrier_wait(sm_warp_id);
+      if (stall_ct || yield_hold || named_bar || membar || grid_bar) {
+        s.state = StallPreIssueClass::NON_FRONTEND_HOLD_NO_HEAD;
+        snap.population[(size_t)StallPopulation::
+                            NON_FRONTEND_HOLD_WITHOUT_VALID_HEAD]++;
+        if (stall_ct) m_stall_totals.no_head_stall_count_warp_cycles++;
+        if (yield_hold) m_stall_totals.no_head_yield_warp_cycles++;
+        continue;
+      }
+      // (4) drain: empty IBuffer + trace fully drained (SR-M0A.4/.6). Any other
+      //     no-head case is aggregate no_valid_instruction (5), including a fetch
+      //     in flight (fetch allocates an invalid IBuffer entry, so the IBuffer
+      //     is non-empty there — no L0I status lookup needed).
+      bool trace_drained = false;
+      if (ibuffer->get_is_empty()) {
+        if (m_config->is_trace_mode) {
+          trace_shd_warp_t *tw = static_cast<trace_shd_warp_t *>(c_warp);
+          trace_drained = tw->trace_done() && !tw->partial_replay_active();
+        } else {
+          trace_drained = false;
+        }
+      }
+      if (trace_drained) {
+        s.state = StallPreIssueClass::DRAIN;
+        snap.population[(size_t)StallPopulation::DRAIN]++;
+      } else {
+        s.state = StallPreIssueClass::NO_VALID;
+        snap.population[(size_t)StallPopulation::NO_VALID_INSTRUCTION]++;
+      }
+      continue;
+    }
+
+    // Valid head: reconstruct the warp-local readiness predicates purely.
+    warp_inst_t *pI = ibuffer->next_inst();
+    s.head_pc = pI->pc;
+
+    const bool use_traditional_scoreboarding =
+        !c_warp->get_kernel_info()->is_captured_from_binary ||
+        m_config->is_remodeling_scoreboarding_enabled || !m_config->is_trace_mode;
+
+    bool sb_ready = true;
+    bool stall_ct0 = true;
+    bool wb_ready = true;
+    bool yield_ok = true;
+    if (use_traditional_scoreboarding) {
+      sb_ready = !(shared_sm->get_scoreboard()->checkCollision_remodeling(sm_warp_id, pI) ||
+                   shared_sm->get_scoreboard_WAR()->checkCollision_remodeling(sm_warp_id, pI));
+    } else {
+      stall_ct0 = c_warp->get_dependency_state()->is_stall_counter_0();
+      wb_ready = is_wait_barriers_ready_entry_point(pI, subcore_warp_id);
+      yield_ok = c_warp->get_dependency_state()->is_yield_ready();
+    }
+    const bool ldgdepbar_ok = !is_waiting_ldgdepbar(pI, subcore_warp_id);
+    const bool named_bar = shared_sm->peek_named_barrier_wait(sm_warp_id);
+    const bool membar = shared_sm->peek_membar_wait(sm_warp_id);
+    const bool grid_bar = shared_sm->peek_grid_barrier_wait(sm_warp_id);
+    const bool tma_flush = shared_sm->peek_tma_flush_wait(sm_warp_id, pI);
+
+    functional_unit *fu = get_fu(pI);
+    bool fu_available = true;
+    const bool is_fixed_latency_inst = fu->is_fixed_latency_unit();
+    if (is_fixed_latency_inst) {
+      fu_available = fu->can_issue(pI);
+    } else if (m_config->intra_smsp_warpswitch_enable && !fu->get_has_queue()) {
+      fu_available = fu->can_issue(pI);
+    }
+
+    bool result_queue_ok = true;
+    if (is_fixed_latency_inst &&
+        pI->get_extra_trace_instruction_info().has_destination_registers()) {
+      if (fu->get_result_queue_type() == TraceEnhancedOperandType::UREG) {
+        result_queue_ok = has_uniform_fixed_latency_rf_result_queue_space();
+      } else {
+        result_queue_ok = has_regular_fixed_latency_rf_result_queue_space();
+      }
+    }
+
+    const PeekReady l1c = peek_l1c_operands_ready(pI);
+
+    uint32_t mask = 0;
+    if (!yield_ok)        mask |= SB_BIT_YIELD;
+    if (!stall_ct0)       mask |= SB_BIT_STALL_COUNT;
+    if (!wb_ready)        mask |= SB_BIT_WAIT_BARRIER;
+    if (named_bar)        mask |= SB_BIT_NAMED_BARRIER;
+    if (membar)           mask |= SB_BIT_MEMBAR;
+    if (grid_bar)         mask |= SB_BIT_GRID_BARRIER;
+    if (!ldgdepbar_ok)    mask |= SB_BIT_LDGDEPBAR;
+    if (tma_flush)        mask |= SB_BIT_TMA_FLUSH;
+    if (!fu_available)    mask |= SB_BIT_FU;
+    if (!sb_ready)        mask |= SB_BIT_SCOREBOARD;
+    if (!result_queue_ok) mask |= SB_BIT_RESULT_QUEUE;
+    if (l1c == PeekReady::BLOCKED) mask |= SB_BIT_L1C;
+
+    const bool has_known_blocker = (mask != 0);
+    const bool l1c_unknown = (l1c == PeekReady::UNKNOWN);
+    if (l1c_unknown) mask |= SB_BIT_L1C_UNKNOWN;
+    s.blocker_mask = mask;
+
+    if (has_known_blocker) {
+      // (6) A definite blocker wins even if L1C is unknown.
+      s.state = StallPreIssueClass::BLOCKED_VALID;
+      snap.population[(size_t)StallPopulation::BLOCKED_WITH_VALID_HEAD]++;
+    } else if (l1c_unknown) {
+      // (7) No known blocker but at least one unknown readiness result.
+      s.state = StallPreIssueClass::UNKNOWN_VALID;
+      snap.unknown_count++;
+      // population committed at finalize (unknown_valid_head minus winner-if-unknown).
+    } else {
+      // (8) Eligible candidate; also requires the global gates to be open, else
+      //     the warp is not selectable this cycle and is counted as eligible-not-
+      //     selected-without-issue at finalize.
+      (void)global_gates_open;
+      s.state = StallPreIssueClass::ELIGIBLE_CANDIDATE;
+      snap.eligible_count++;
+    }
+  }
+
+  // Independent active recount cross-check (SR-M0A.10).
+  if ((int)recount_active != m_num_active_warps_subcore) {
+    std::fprintf(stderr,
+                 "[STALLALIGN][abort] active recount mismatch sm=%u subcore=%u "
+                 "recount=%u m_num_active_warps_subcore=%d cyc=%llu\n",
+                 shared_sm->get_sid(), m_subcore_id, recount_active,
+                 m_num_active_warps_subcore,
+                 (unsigned long long)shared_sm->get_current_gpu_cycle());
+    abort();
+  }
+  m_stall_totals.sampled_subcore_cycles++;
+}
+
+void Subcore::finalize_stall_snapshot(StallCycleSnapshot &snap,
+                                      int issued_subcore_warp_id,
+                                      int issued_sm_warp_id,
+                                      address_type issued_pc) {
+  const bool issued = issued_subcore_warp_id >= 0;
+  bool selected_was_known_eligible = false;
+  bool selected_was_unknown = false;
+
+  if (issued) {
+    const StallWarpSample &winner = snap.samples[issued_subcore_warp_id];
+    if ((int)winner.sm_warp_id != issued_sm_warp_id ||
+        winner.head_pc != issued_pc) {
+      std::fprintf(stderr,
+                   "[STALLALIGN][abort] winner id/pc mismatch subcore=%u "
+                   "snap_warp=%u issued_warp=%d snap_pc=0x%llx issued_pc=0x%llx\n",
+                   m_subcore_id, winner.sm_warp_id, issued_sm_warp_id,
+                   (unsigned long long)winner.head_pc,
+                   (unsigned long long)issued_pc);
+      m_stall_totals.winner_mismatch++;
+      abort();
+    }
+    if (winner.state == StallPreIssueClass::ELIGIBLE_CANDIDATE) {
+      selected_was_known_eligible = true;
+    } else if (winner.state == StallPreIssueClass::UNKNOWN_VALID) {
+      // Observe-only predicate was unknown: keep the run, mark FAIL (SR-M0A.7/.9).
+      selected_was_unknown = true;
+      m_stall_totals.winner_prestate_unknown++;
+    } else {
+      // Definitely blocked / invalid / held / drained winner: hard error.
+      std::fprintf(stderr,
+                   "[STALLALIGN][abort] winner pre-issue state=%u not eligible "
+                   "subcore=%u warp=%d pc=0x%llx mask=0x%x\n",
+                   (unsigned)winner.state, m_subcore_id, issued_sm_warp_id,
+                   (unsigned long long)issued_pc, winner.blocker_mask);
+      m_stall_totals.winner_mismatch++;
+      abort();
+    }
+  }
+
+  const uint32_t selected = issued ? 1u : 0u;
+  const uint32_t known_selected = selected_was_known_eligible ? 1u : 0u;
+  const uint32_t not_selected_with_issue =
+      issued ? (snap.eligible_count - known_selected) : 0u;
+  const uint32_t not_selected_without_issue =
+      issued ? 0u : snap.eligible_count;
+  const uint32_t unknown_nonwinner =
+      snap.unknown_count - (selected_was_unknown ? 1u : 0u);
+
+  snap.population[(size_t)StallPopulation::SELECTED] += selected;
+  snap.population[(size_t)StallPopulation::ELIGIBLE_NOT_SELECTED_WITH_ISSUE] +=
+      not_selected_with_issue;
+  snap.population[(size_t)StallPopulation::ELIGIBLE_NOT_SELECTED_WITHOUT_ISSUE] +=
+      not_selected_without_issue;
+  snap.population[(size_t)StallPopulation::UNKNOWN_VALID_HEAD] += unknown_nonwinner;
+
+  if (!issued && snap.eligible_count > 0) {
+    m_stall_totals.eligible_without_issue_cycles++;
+  }
+
+  // Per-cycle conservation (SR-M0A.10).
+  uint32_t sum = 0;
+  for (size_t i = 0; i < (size_t)StallPopulation::COUNT; i++) sum += snap.population[i];
+  if (sum != snap.active_count || selected > 1) {
+    std::fprintf(stderr,
+                 "[STALLALIGN][abort] conservation fail subcore=%u sum=%u active=%u "
+                 "selected=%u\n",
+                 m_subcore_id, sum, snap.active_count, selected);
+    abort();
+  }
+
+  // Fold into per-kernel totals.
+  for (size_t i = 0; i < (size_t)StallPopulation::COUNT; i++) {
+    m_stall_totals.population[i] += snap.population[i];
+  }
+  m_stall_totals.active_warp_cycles += snap.active_count;
+  m_stall_totals.eligible_warp_cycles += snap.eligible_count;
+}
+
+void Subcore::gather_stall_reason_align_stats(StallPopulationTotals &dst) const {
+  for (size_t i = 0; i < (size_t)StallPopulation::COUNT; i++) {
+    dst.population[i] += m_stall_totals.population[i];
+  }
+  dst.active_warp_cycles += m_stall_totals.active_warp_cycles;
+  dst.eligible_warp_cycles += m_stall_totals.eligible_warp_cycles;
+  dst.sampled_subcore_cycles += m_stall_totals.sampled_subcore_cycles;
+  dst.eligible_without_issue_cycles += m_stall_totals.eligible_without_issue_cycles;
+  dst.no_head_stall_count_warp_cycles += m_stall_totals.no_head_stall_count_warp_cycles;
+  dst.no_head_yield_warp_cycles += m_stall_totals.no_head_yield_warp_cycles;
+  dst.winner_mismatch += m_stall_totals.winner_mismatch;
+  dst.winner_prestate_unknown += m_stall_totals.winner_prestate_unknown;
+  if (m_stall_totals.measured_kernel_uid_valid) {
+    dst.measured_kernel_uid = m_stall_totals.measured_kernel_uid;
+    dst.measured_kernel_uid_valid = true;
+  }
+}
+
+void Subcore::reset_stall_reason_align_stats() {
+  m_stall_totals = StallPopulationTotals();
 }
 
 void Subcore::assign_instruction_warp_id(warp_inst_t *pI, unsigned int subcore_warp_id, unsigned int sm_warp_id) {

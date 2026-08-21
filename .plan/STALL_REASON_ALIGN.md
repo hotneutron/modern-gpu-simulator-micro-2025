@@ -517,9 +517,15 @@ The following combinations indicate a state-machine error and must abort:
 ```text
 wait_block_hold && done_exit
 wait_block_hold && non_frontend_hold_without_valid_head
-selected && pre_issue_state != eligible_candidate
+selected && pre_issue_state not in { eligible_candidate, unknown_valid }
 selected && snapshot_head_pc != issued_pc
 ```
+
+A `selected` winner whose pre-issue state was `unknown_valid` is not a
+state-machine error: SR-M0A.9 keeps it, counts `winner_prestate_unknown`, and
+downgrades the final status to FAIL instead of aborting. Only a `selected`
+winner whose pre-issue state was definitely blocked, invalid, held, or drained
+aborts here.
 
 #### SR-M0A.5 Eligibility inputs
 

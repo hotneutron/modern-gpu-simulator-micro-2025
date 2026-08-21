@@ -2332,6 +2332,12 @@ class shader_core_config : public core_config {
   // gaps, (4) per-warp total stall/wait warp-cycles. All read-only, timing-neutral, default 0 =
   // bit-identical. See .plan/HW_VS_SIM_SFU.md §5.
   bool overlap_instrument_enable;
+  // [SR-M0A stall-reason alignment] Enable the observe-only complete, mutually-exclusive per-active-warp
+  // population accounting (a cycle-start pre-issue snapshot separate from the authoritative issue path).
+  // Read-only: never calls a mutating readiness function, never changes scheduler order/eligibility/issue
+  // selection/WaitBlock behavior. Default 0 = bit-identical baseline. See .plan/STALL_REASON_ALIGN.md §6
+  // Stage SR-M0A.
+  bool stall_reason_align_instrument_enable;
   // [GTLRR lever] warp-ordering policy for the remodeling subcore issue path (default 0 = GTO, the
   // baseline order_greedy_then_highest_id). 1 = GTLRR (greedy-then-loose-round-robin): keep the greedy
   // warp first, but order the fallback warps round-robin from greedy_pointer+1 instead of oldest-first,
@@ -3826,6 +3832,12 @@ class simt_core_cluster {
       m_core[i]->gather_gpu_per_sm_single_stat(all_stats, stat_name);
     }
   }
+
+  // [SR-M0A] Number of cores held by this cluster and index accessor. Used by
+  // the gpgpu_sim-level stall-reason-align driver, which downcasts each wrapper
+  // to the remodeling SM to reach its per-Subcore totals.
+  unsigned get_num_cores() const { return m_core.size(); }
+  shader_core_ctx_wrapper *get_core(unsigned i) { return m_core[i]; }
 
   traffic_breakdown& get_incomming_traffic_stats() { return m_incoming_traffic_stats; }
   traffic_breakdown& get_outgoing_traffic_stats() { return m_outgoing_traffic_stats; }

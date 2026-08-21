@@ -271,6 +271,26 @@ class SM : public core_t, public shader_core_ctx_wrapper {
   // stall (warp-local drain-all) until all its store/reduce transfers complete.
   bool warp_waiting_at_tma_flush(unsigned warp_id, const warp_inst_t *pI);
   bool warp_waiting_grid_barrier(unsigned warp_id) override;
+  // [SR-M0A] Pure, non-mutating wait-state queries used only by the stall-reason
+  // alignment snapshot. None of them clear a barrier/membar, insert/erase a
+  // wait-set entry, invalidate a cache, update a watchdog map, or emit a log.
+  // See .plan/STALL_REASON_ALIGN.md Stage SR-M0A.6.
+  //
+  // peek_wait_block_hold_mode inspects ONLY the pending WaitBlock state
+  // (m_pending_sync_waits) and returns NONE when no unresolved hold exists.
+  // It deliberately does NOT consult the programmer/named-barrier set, unlike
+  // warp_waiting_at_barrier / warp_held_on_mbarrier_wait.
+  WaitBlockPendingMode peek_wait_block_hold_mode(unsigned warp_id) const;
+  // Named/programmer barrier hold only (m_barriers), no mbarrier fold state.
+  bool peek_named_barrier_wait(unsigned warp_id) const;
+  // Scope-aware fence drain condition, observed without clearing the membar,
+  // invalidating L1, or touching the stuck-watchdog maps.
+  bool peek_membar_wait(unsigned warp_id) const;
+  // Grid-barrier flag only.
+  bool peek_grid_barrier_wait(unsigned warp_id) const;
+  // UTMACMDFLUSH with outstanding store-class TMA transfers, without touching
+  // m_warps_waiting_tma_flush or emitting an episode log.
+  bool peek_tma_flush_wait(unsigned warp_id, const warp_inst_t *inst) const;
   void clear_gridbar(unsigned int kernel_id);
   void broadcast_barrier_reduction(unsigned cta_id, unsigned bar_id,
                                    warp_set_t warps);
@@ -374,6 +394,11 @@ class SM : public core_t, public shader_core_ctx_wrapper {
   void reset_cycless_access_history() override;
   void gather_gpu_per_sm_stats(Element_stats &all_stats, coalescingStatsAcrossSms& coal_stats_l1d, coalescingStatsAcrossSms& coal_stats_const, coalescingStatsAcrossSms& coal_stats_sharedmem) override;
   void gather_gpu_per_sm_single_stat(Element_stats &all_stats, std::string stat_name) override;
+
+  // [SR-M0A] Fold every resident Subcore's stall-reason-align totals into dst
+  // (additive) and reset them. Boundary-only; gated by the caller.
+  void gather_stall_reason_align_stats(Subcore::StallPopulationTotals &dst) const;
+  void reset_stall_reason_align_stats();
 
   void increment_sm_stat_by_integer(std::string stat_name, int val_to_increment) override;
   
