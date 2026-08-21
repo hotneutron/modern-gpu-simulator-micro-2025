@@ -321,95 +321,595 @@ No timing-model parameter should be changed from the current stall stack.
 
 ### Stage SR-M0A - complete active-warp population (timing-neutral)
 
-For every active warp every cycle, record exactly one population entry:
+#### SR-M0A.1 Scope and non-goals
 
-```text
-selected
-eligible_not_selected
-no_valid_instruction
-drain
-fold_parked
-blocked_with_valid_head(mask)
+SR-M0A is an accounting change, not an NCU-priority model and not a timing
+change. For every active warp on every Subcore issue cycle, it must record
+exactly one population entry. It must not:
+
+- change scheduler order, eligibility, issue selection, or WaitBlock behavior;
+- call a mutating readiness function from the observation path;
+- retain per-cycle history or add a runtime queue;
+- project blocked warps into final NCU reasons.
+
+The implementation is gated by
+`-stall_reason_align_instrument_enable`, default off. With the gate off, the
+binary must follow the original path without an additional scan or branch in
+the per-warp loop beyond the top-level disabled gate.
+
+#### SR-M0A.2 Why the existing tail scan cannot be reused
+
+Do not extend the existing `tail_readonly` counter path in
+`remodeling/subcore.cc`. It can start after either:
+
+- a winner has issued; or
+- a greedy warp's L1C miss prevents switching to another warp.
+
+In the first case, the winner may already have changed FU and result-queue
+availability. In both cases, the tail path forces the side-effecting
+programmer-barrier and TMA-flush checks to ready and forces L1C ready:
+
+```cpp
+tail_readonly ? true : !c_warp->waiting()
+tail_readonly ? true : !shared_sm->warp_waiting_at_tma_flush(...)
+tail_readonly ? true : are_l1c_operands_ready(...)
 ```
 
-Do not extend the existing `tail_readonly` counter path. It evaluates tail
-warps after the winner has issued, so the winner can already have changed FU
-availability and result-queue state. It also forces the side-effecting
-programmer-barrier and TMA-flush checks to ready. Those observations cannot
-form an exact HW-style state vector.
+The `overlap_instrument` path is also unsuitable: it observes only valid-head
+non-issuing warps and independently increments every true reason. It is useful
+as condition-incidence telemetry but cannot produce a complete, exclusive
+population.
 
-Capture a cycle-start readiness snapshot after `modify_warp_state()` has
-applied dependency decay and serviced fold releases, but before the issue loop
-can select a winner:
+SR-M0A therefore needs a separate cycle-start snapshot. Keep the old counters
+unchanged for compatibility until the new accounting passes its invariants.
+
+#### SR-M0A.3 Capture and finalize points
+
+`Subcore::cycle()` executes `control_stage()` before `issue()`, so the
+`ISSUE_CONTROL` latch already reflects this cycle's upstream pipeline state.
+Inside `issue()`, capture immediately after `modify_warp_state()`:
+
+```text
+writeback -> execute -> read_rf -> allocate -> control_stage
+                                              |
+                                              v
+issue:
+  modify_warp_state()       dependency decay + WaitBlock release
+  capture snapshot          read-only, cycle-start issue state
+  existing issue path       remains authoritative
+  finalize snapshot         use actual winner ID
+decode -> fetch
+```
+
+Capture must occur before
+`m_num_pending_cycles_with_issue_port_busy` is decremented. A positive value
+blocks the current cycle; observing the post-decrement value would shift the
+metric by one cycle.
 
 ```cpp
 void Subcore::issue(SM *shared_sm) {
   modify_warp_state();
 
-  StallCycleSnapshot snapshot;
   if (m_config->stall_reason_align_instrument_enable) {
-    snapshot = capture_pre_issue_snapshot(shared_sm);
+    // m_stall_cycle_snapshot.samples was sized once in the constructor.
+    capture_pre_issue_snapshot(shared_sm, m_stall_cycle_snapshot);
   }
 
-  // Existing scheduling and issue path remains unchanged.
-  run_existing_issue_path_and_record_winner();
+  int issued_subcore_warp_id = -1;
+  int issued_sm_warp_id = -1;
+  address_type issued_pc = 0;
+
+  // Existing scheduling and issue logic is unchanged. Immediately before its
+  // one issue_warp() call, save sm_warp_id and pI->pc.
 
   if (m_config->stall_reason_align_instrument_enable) {
-    finalize_stall_snapshot(snapshot, issued_warp_id);
+    finalize_stall_snapshot(m_stall_cycle_snapshot,
+                            issued_subcore_warp_id,
+                            issued_sm_warp_id,
+                            issued_pc);
   }
 }
 ```
 
-An active warp is `warp != nullptr && !warp->done_exit()`. A warp whose trace
-has drained but whose architectural resources have not retired belongs to
-`drain`, not frontend `no_instruction`.
+The snapshot never chooses a winner. The existing issue path remains the sole
+authority for scheduling and all state transitions.
 
-The snapshot needs pure, non-mutating SM queries:
+#### SR-M0A.4 Population states and classification precedence
 
-```text
-peek_named_barrier_wait(warp_id)
-peek_fold_park(warp_id)
-peek_membar_wait(warp_id)
-peek_grid_barrier_wait(warp_id)
-peek_tma_flush_wait(warp_id, inst)
+Use one enum-valued state per warp rather than independent population bitsets.
+This makes mutual exclusion structural: a warp cannot accidentally be counted
+as both `drain` and `no_valid_instruction`.
+
+The pre-issue state is:
+
+```cpp
+enum class StallPreIssueClass : uint8_t {
+  INACTIVE,
+  WAIT_BLOCK_HOLD,
+  NON_FRONTEND_HOLD_NO_HEAD,
+  DRAIN,
+  NO_VALID,
+  BLOCKED_VALID,
+  ELIGIBLE_CANDIDATE,
+  UNKNOWN_VALID,
+};
 ```
 
-`peek_membar_wait()` may inspect pending stores but must never clear the
-membar, invalidate a cache, update watchdog maps, or emit an episode log.
-`peek_tma_flush_wait()` may inspect outstanding store-class TMA transfers but
-must not mutate `m_warps_waiting_tma_flush`.
+Final output counters use a separate enum:
 
-L1C readiness currently uses the mutating `read_only_cache::access()` path. Add
-a pure tag/MSHR/resource probe if it can reproduce the same ready predicate. If
-that cannot be proven, record `l1c_unknown` instead of treating a tail warp as
-ready and inflating `not_selected`.
+```cpp
+enum class StallPopulation : uint8_t {
+  SELECTED,
+  ELIGIBLE_NOT_SELECTED,
+  NO_VALID_INSTRUCTION,
+  DRAIN,
+  WAIT_BLOCK_HOLD,
+  BLOCKED_WITH_VALID_HEAD,
+  NON_FRONTEND_HOLD_WITHOUT_VALID_HEAD,
+  UNKNOWN_VALID_HEAD,
+  COUNT,
+};
+```
 
-Required per-cycle invariants:
+`unknown_valid_head` is a fail-closed instrumentation state, not an NCU state.
+It keeps conservation exact when a readiness predicate cannot be observed
+without mutation. A run is not accepted as SR-M0A-complete unless this counter
+is zero.
+
+An active warp is:
+
+```cpp
+warp != nullptr && !warp->done_exit()
+```
+
+Classify each active warp in this order:
+
+1. Read WaitBlock, architectural-wait, IBuffer, and trace state.
+2. If an unresolved WaitBlock pending wait exists, classify
+   `wait_block_hold`. Do not inspect a future head's FU state.
+3. If there is no valid head but a named barrier, MEMBAR, grid barrier,
+   nonzero `stall_count`, or unresolved yield hold is blocking the warp,
+   classify `non_frontend_hold_without_valid_head`. These conditions are
+   observable without a head instruction and must not inflate
+   `no_valid_instruction`.
+4. If there is no valid head, the IBuffer is empty, all canonical and partial
+   replay sources are exhausted, and there is no matching decode or fetch
+   request that can still produce a head, classify `drain`.
+5. Classify every remaining no-valid-head case as `no_valid_instruction`;
+   this includes decode/fetch work that is still able to produce a head.
+6. If a valid head has one or more known blockers, classify
+   `blocked_with_valid_head`.
+   A definite blocker wins even when another predicate, such as L1C, is
+   unknown.
+7. If a valid head has no known blocker but at least one unknown readiness
+   result, classify `unknown_valid_head`.
+8. Otherwise mark it as an internal `eligible_candidate`; finalize converts
+   that candidate to `selected` or `eligible_not_selected`.
+
+`trace_done()` alone is not sufficient for `drain`. In trace mode the canonical
+cursor advances when an instruction is decoded, so the final decoded
+instruction can still be a valid IBuffer head after `trace_done()` becomes
+true. A dedicated pure `peek_trace_drained()` predicate must therefore require
+an empty IBuffer, exhausted canonical and partial-replay sources, and no
+decode/L0I state capable of supplying another instruction. The `done_exit()`
+test remains the outer active-warp boundary.
+
+The following combinations indicate a state-machine error and must abort:
+
+```text
+wait_block_hold && done_exit
+wait_block_hold && non_frontend_hold_without_valid_head
+selected && pre_issue_state != eligible_candidate
+selected && snapshot_head_pc != issued_pc
+```
+
+#### SR-M0A.5 Eligibility inputs
+
+Eligibility is the conjunction of global Subcore gates and warp-local gates.
+The cycle-start snapshot must include both global gates:
+
+```text
+issue_port_ready   := m_num_pending_cycles_with_issue_port_busy == 0
+issue_control_free := m_ISSUE_CONTROL_latch.has_free()
+```
+
+For a valid head, capture these warp-local predicates:
+
+```text
+SASS wait-barrier ready
+stall_count == 0
+yield ready
+traditional RAW/WAR scoreboard ready
+named barrier not waiting
+MEMBAR not waiting
+grid barrier not waiting
+LDGDEPBAR not waiting
+TMA flush not waiting
+target FU available
+fixed-latency result queue available
+L1C operands ready
+```
+
+The existing scheduler-specific greedy L1C hold controls selection, not the
+definition of a warp-local ready state. It is therefore legal for a cycle to
+contain `eligible_not_selected > 0` and `selected == 0`; report such cycles as
+`eligible_without_issue_cycles` instead of forcing a synthetic winner.
+
+The per-warp readiness facts may be stored internally as a numeric bit mask so
+SR-M0B can reuse the representation. SR-M0A uses only `mask == 0` versus
+`mask != 0`; it does not emit the mask histogram or map masks to NCU reasons.
+
+#### SR-M0A.6 Non-mutating query contract
+
+Add the following explicit SM queries:
+
+```cpp
+bool peek_named_barrier_wait(unsigned warp_id) const;
+WaitBlockPendingMode peek_wait_block_hold_mode(unsigned warp_id) const;
+bool peek_membar_wait(unsigned warp_id) const;
+bool peek_grid_barrier_wait(unsigned warp_id) const;
+bool peek_tma_flush_wait(unsigned warp_id,
+                         const warp_inst_t *inst) const;
+bool peek_trace_drained(unsigned subcore_warp_id) const;
+```
+
+Do not reuse `warp_held_on_mbarrier_wait()` for
+`peek_wait_block_hold_mode()`. The current implementation delegates to
+`warp_waiting_at_barrier()`, which first checks the programmer/named-barrier
+set and then `m_pending_sync_waits`; despite its name, it combines both states.
+The new WaitBlock-only query must inspect only the pending WaitBlock state and
+return `NONE` when no unresolved hold exists. Otherwise it returns one of the
+three pending modes:
+
+```text
+MISSING_WAIT_HOLD
+PARTIAL_MISSING_WAIT_HOLD
+CAPTURED_POLL_HOLD
+```
+
+`peek_membar_wait()` may inspect the membar flag, scoreboard state, scope, and
+pending store counters. It must never clear the membar, invalidate a cache,
+update watchdog maps, or emit a release/stuck log.
+
+`peek_tma_flush_wait()` may inspect the opcode and outstanding store-class TMA
+transfers. It must never insert into or erase from
+`m_warps_waiting_tma_flush`, and it must not emit an episode log.
+
+`peek_named_barrier_wait()` must inspect only `m_barriers`.
+`peek_grid_barrier_wait()` must read only the warp's grid-barrier flag.
+`peek_trace_drained()` must require no valid head, an empty IBuffer, exhausted
+canonical and partial-replay sources, and no matching decode/L0I state capable
+of producing a head.
+Existing dependency-state queries, scoreboard collision checks,
+`functional_unit::can_issue()`, and result-queue capacity checks are already
+read-only and may be reused.
+
+The current wait-barrier wrappers construct
+`std::vector<Wait_Barrier_Checking>` objects. The snapshot hot path must instead
+use a fixed-capacity array plus count, with a non-allocating dependency-state
+overload:
+
+```cpp
+bool are_wait_barriers_ready(
+    const Wait_Barrier_Checking *checks,
+    unsigned int num_checks) const;
+```
+
+The existing vector-based issue-path API may delegate to this overload. This
+keeps the readiness predicate shared without adding per-warp heap allocation.
+
+#### SR-M0A.7 L1C readiness
+
+`are_l1c_operands_ready()` cannot be called by the snapshot. It allocates a
+`mem_fetch`, invokes `read_only_cache::access()`, updates cache/LRU/MSHR state,
+and may enqueue a miss.
+
+Add a tri-state pure query:
+
+```cpp
+enum class PeekReady { READY, BLOCKED, UNKNOWN };
+
+PeekReady peek_l1c_operands_ready(const warp_inst_t *inst) const;
+```
+
+For perfect constant-cache configurations or instructions without generated
+constant accesses, return `READY`. Otherwise use the const
+`tag_array::probe()` path for every constant access without allocating a
+`mem_fetch` or updating cache state. Since the authoritative issue path accepts
+only `HIT` as ready, any observed non-`HIT` status is `BLOCKED`.
+
+Return `UNKNOWN` when the access mask or address cannot be reconstructed
+exactly. If another predicate is definitely blocked, classify the warp as
+`blocked_with_valid_head`; the known blocker is sufficient regardless of L1C.
+Only a warp with no known blocker and at least one unknown predicate contributes
+to `unknown_valid_head`. It must never be counted as
+`eligible_not_selected`. An actual winner whose pre-issue L1C state was unknown
+is not classifiable; emit the mismatch context and hard-abort before committing
+population counters.
+
+For every pre-winner warp on which the authoritative path later calls
+`are_l1c_operands_ready()`, compare the pure result with the authoritative
+result. Emit cycle/SM/Subcore/warp/PC/status and abort on disagreement. This
+detects an incorrect pure probe or an in-cycle cache-ordering dependency rather
+than silently corrupting the population.
+
+#### SR-M0A.8 Fixed-storage implementation
+
+SR-M0A must not allocate a queue or retain one record per cycle. Use fixed
+totals plus a contiguous scratch vector allocated once in the `Subcore`
+constructor and reused on every cycle:
+
+```cpp
+struct StallWarpSample {
+  StallPreIssueClass state = StallPreIssueClass::INACTIVE;
+  unsigned int sm_warp_id = 0;
+  address_type head_pc = 0;
+  uint32_t blocker_mask = 0;
+};
+
+struct StallCycleSnapshot {
+  // resize(m_num_warps_per_subcore) exactly once during Subcore construction
+  std::vector<StallWarpSample> samples;
+  std::array<uint32_t,
+             static_cast<size_t>(StallPopulation::COUNT)> population{};
+  uint32_t active_count = 0;
+  uint32_t eligible_count = 0;
+};
+
+struct StallPopulationTotals {
+  std::array<uint64_t,
+             static_cast<size_t>(StallPopulation::COUNT)> population{};
+  uint64_t active_warp_cycles = 0;
+  uint64_t eligible_warp_cycles = 0;
+  uint64_t sampled_subcore_cycles = 0;
+  uint64_t eligible_without_issue_cycles = 0;
+  uint64_t winner_mismatch = 0;
+  unsigned int measured_kernel_uid = 0;
+  bool measured_kernel_uid_valid = false;
+};
+```
+
+Do not construct or resize `samples` inside `issue()`. Its size is the existing
+`m_num_warps_per_subcore`, so the implementation adds no kernel-specific warp
+count and does not clear unused SM-wide slots. Every active entry is
+overwritten once in the bounded capture pass; only the small scalar counts and
+population array are zeroed per cycle.
+
+`StallWarpSample::state` is the sole ownership of the warp's pre-issue
+population. Do not mirror `blocked`, `no_valid`, `drain`, and
+`wait_block_hold` in independent bitsets. `blocker_mask` is retained only for
+winner diagnostics and SR-M0B reuse; SR-M0A does not allocate or update a mask
+histogram.
+
+Accumulate by numeric enum index. Do not perform per-warp string-keyed
+`m_stats_map` lookups, build `std::vector<Wait_Barrier_Checking>` objects
+solely for statistics, or emit per-cycle logs.
+
+Only the fixed totals survive the cycle. Text names are resolved at final
+print time. The 65,536-entry blocker-mask histogram belongs to SR-M0B and is
+not allocated by SR-M0A.
+
+#### SR-M0A.9 Finalization and winner validation
+
+Record the actual Subcore-local warp index, SM warp ID, and PC immediately
+before the existing `issue_warp()` call. Keeping the local index avoids a
+second search or ID translation during finalization.
+
+```cpp
+const bool issued = issued_subcore_warp_id >= 0;
+if (issued) {
+  const StallWarpSample &winner =
+      snapshot.samples[issued_subcore_warp_id];
+  if (winner.sm_warp_id != issued_sm_warp_id ||
+      winner.state != StallPreIssueClass::ELIGIBLE_CANDIDATE ||
+      winner.head_pc != issued_pc) {
+    print_stall_align_mismatch_and_abort(...);
+  }
+}
+
+const uint32_t selected = issued ? 1 : 0;
+assert(snapshot.eligible_count >= selected);
+const uint32_t eligible_not_selected =
+    snapshot.eligible_count - selected;
+
+snapshot.population[
+    static_cast<size_t>(StallPopulation::SELECTED)] += selected;
+snapshot.population[
+    static_cast<size_t>(StallPopulation::ELIGIBLE_NOT_SELECTED)] +=
+        eligible_not_selected;
+```
+
+Do not require the snapshot to select or predict the exact winner. It validates
+that the actual winner belonged to the cycle-start eligible set. Scheduler
+ordering remains owned by the existing issue path.
+
+`selected <= 1` is a per-Subcore/SMSP-cycle invariant. It is not an SM-wide
+invariant because up to four Subcores may issue in the same SM cycle.
+
+#### SR-M0A.10 Conservation and fail-closed checks
+
+Required per-Subcore-cycle invariant:
 
 ```text
 selected
 + eligible_not_selected
 + no_valid_instruction
 + drain
-+ fold_parked
++ wait_block_hold
 + blocked_with_valid_head
-== total active warp-cycles
++ non_frontend_hold_without_valid_head
++ unknown_valid_head
+== active_warps
 
 selected <= 1
-selected + eligible_not_selected == eligible_warps
+selected + eligible_not_selected == cycle_start_eligible_warps
+active_warps == independently_counted_active_warps
 ```
 
-After division by issued instructions, the population sum must reconstruct the
-sim's own `warp_cycles_per_issued_instruction`. This is the mandatory gate
-before comparing reason distributions.
+Required per-kernel invariants:
 
-Any disagreement between the pre-issue snapshot and the actual winner is a
-metric implementation bug. Emit the warp/PC/mask and hard-abort rather than
-continuing with corrupted statistics.
+```text
+sum(population) == total_active_warp_cycles
+selected == total_num_cycles_issue_stage_selected
+sampled_subcore_cycles == total_num_cycles_issue_stage_evaluated
+winner_mismatch == 0
+unknown_valid_head == 0
+selected > 0 before printing any "/ selected" ratio
+```
+
+The selected equality is against issue-active warp cycles, not blindly against
+an instruction counter in configurations that permit dual issue. For the
+current remodeling Subcore, at most one `issue_warp()` call occurs per cycle,
+so the two are expected to coincide; print both values and their delta.
+
+At kernel end, emit raw totals and `/ selected` values, then a grep-friendly
+summary:
+
+```text
+[STALLALIGN] FINAL status=PASS active=... population_sum=... delta=0
+selected=... issue_selected=... eligible=... unknown=0 sampled=...
+issue_evaluated=... kernel_uid=... winner_mismatch=0
+```
+
+Any per-cycle conservation failure, winner mismatch, counter underflow, or
+impossible WaitBlock state prints cycle/SM/Subcore/warp/PC/state/mask and
+hard-aborts immediately. A nonzero unknown count makes the final status FAIL
+even though arithmetic conservation still holds.
+
+At capture, independently recount active entries and require that count to
+equal `m_num_active_warps_subcore`. Also verify each non-inactive sample's
+Subcore-local index translates back to its stored SM warp ID. These checks catch
+slot-lifecycle and indexing errors before they become plausible-looking global
+totals.
+
+#### SR-M0A.11 Boundary of the NCU comparison
+
+SR-M0A provides the denominator and the scheduler population envelope. After
+its invariants pass, normalize by `selected` and compare these first-order
+quantities:
+
+| SR-M0A output | HW NCU reference |
+|---|---:|
+| `total_active_warp_cycles / selected` | warp cycles per issued instruction: `7.539490` |
+| `selected / selected` | `selected`: `0.999982` |
+| `eligible_not_selected / selected` | `not_selected`: `0.405119` |
+| `no_valid_instruction / selected` | `no_instruction`: `0.115050` |
+| `drain / selected` | `drain`: `0.001395` |
+
+These comparisons validate population accounting, not the detailed reason
+distribution. `wait_block_hold` remains a simulator-only timing abstraction:
+real HW executes the represented polling instructions and can report several
+states during that interval. Do not map the whole hold directly to NCU
+`barrier`.
+
+SR-M0A is intentionally insufficient for these NCU states:
+
+```text
+barrier
+long_scoreboard
+short_scoreboard
+wait
+gmma
+math_pipe_throttle
+mio_throttle
+dispatch_stall
+sleeping
+branch_resolving
+imc_miss
+misc
+```
+
+The remaining stages have separate responsibilities:
+
+```text
+SR-M0B: retain the complete blocker mask; split sole and multi blockers
+SR-M1:  recover wait-barrier and stall-count producer provenance
+SR-M2:  apply only validated HW priority rules to form one NCU state per warp
+```
+
+Only SR-M2 can claim detailed stall-reason alignment. SR-M0A can reject a bad
+population basis before that more expensive work is attempted.
+
+#### SR-M0A.12 Reset, output, and implementation ownership
+
+- `shader.h`: add the `shader_core_config` gate.
+- `gpu-sim.cc`: register the option and scalar output counters; explicitly
+  gather the new direct totals before printing and reset them from the existing
+  `gpgpu_sim::reset_gpu_per_sm_stats()` kernel boundary.
+- `subcore.h` / `subcore.cc`: define fixed snapshot/totals storage, capture
+  cycle-start state, record the actual winner, and finalize.
+- `sm.h` / `sm.cc`: add the separated pure wait-state queries.
+- `gpu-cache.h` / `gpu-cache.cc`: add the pure L1C probe.
+- `shader.cc`: print totals, normalized values, deltas, and final status only.
+
+`reset_gpu_per_sm_stats()` currently resets registered `m_stats_map` entries,
+not direct `StallPopulationTotals` members. Add an explicit lifecycle:
+
+```text
+Subcore::gather_stall_reason_align_stats(dst)
+SM::gather_stall_reason_align_stats(dst)       # folds all Subcores
+gpgpu_sim::gather_gpu_per_sm_stats()           # gathers before report
+shader.cc                                      # prints the gathered snapshot
+gpgpu_sim::reset_gpu_per_sm_stats()
+  -> SM::reset_stall_reason_align_stats()
+     -> Subcore::reset_stall_reason_align_stats()
+```
+
+Do not reset local totals from `SM::reinit()` because an SM can execute several
+CTAs from the same kernel in successive waves. Reset once per kernel only after
+the per-SM values have been gathered and printed.
+
+The first implementation supports exactly one measured kernel launch at a
+time. Stamp the first active sample's `kernel_info_t::get_uid()` into
+`measured_kernel_uid` and hard-abort if another UID contributes before reset.
+This prevents silent cross-kernel mixing without adding a per-warp map lookup.
+If concurrent-kernel measurement is later required, replace this guard with
+per-kernel accumulator slots rather than weakening the invariant.
+
+Also correct the existing `overlap_instrument` comments that call its
+non-exclusive values "directly comparable" or "definition-matched"; retaining
+those comments after SR-M0A would contradict this audit.
+
+#### SR-M0A.13 Performance and acceptance gates
+
+The expected runtime cost is one bounded read-only pass over the Subcore's
+resident warps plus fixed-array increments. For Kernel 10, 12 warps/CTA across
+four Subcores means roughly three resident warps per Subcore. The implementation
+must still satisfy:
+
+```text
+gate OFF: bit-identical baseline
+gate ON:  identical gpu_sim_cycle and issued work
+gate ON:  no state/hash/log differences except SR-M0A counters
+wall-clock overhead target: <= 5%
+```
+
+The first implementation deliberately keeps the authoritative issue path
+independent from the snapshot, so some pure readiness predicates are evaluated
+twice for pre-winner warps. Do not feed cached snapshot answers back into
+scheduling merely to reduce observer overhead; that would turn the
+instrumentation into a timing change. First make the pure helpers
+allocation-free and measure their cost.
+
+Validation order:
+
+1. Clean build because public headers change.
+2. Focused traces covering selected, not-selected, frontend, drain, each
+   WaitBlock hold mode, and an L1C miss.
+3. Gate-off versus gate-on bit-identity comparison on a short trace.
+4. Run a bounded Kernel 10 prefix with the gate off and on; compare wall-clock
+   time over repeated runs. If median overhead exceeds 5%, profile and optimize
+   the pure helpers before starting the full run.
+5. Full Kernel 10 run with all conservation and winner checks passing.
+6. Only after SR-M0A passes, enable SR-M0B mask histogram accounting.
+
+Kernel 5 is not the first acceptance target because its existing cross-warp
+deadlock can terminate independently of the observer. It becomes a
+non-perturbation and diagnostic test after Kernel 10 passes.
 
 ### Stage SR-M0B - blocker-mask accounting (timing-neutral)
 
-For every non-parked `blocked_with_valid_head` warp, record a blocker bit mask
+For every non-held `blocked_with_valid_head` warp, record a blocker bit mask
 from the same pre-issue snapshot:
 
 ```text
@@ -431,8 +931,8 @@ ISSUE_CONTROL full
 frontend
 ```
 
-Fold parking is a terminal population state in SR-M0: do not inspect the
-future head's FU and double-count a parked warp as FU-blocked.
+A WaitBlock hold is a terminal population state in SR-M0: do not inspect the
+future head's FU and double-count a held warp as FU-blocked.
 
 Classify masks without inventing an HW priority:
 
@@ -459,10 +959,10 @@ All new scalar counters and histograms must reset at each kernel launch.
 
 Implementation sites:
 
-- `gpu-sim.h` / `gpu-sim.cc`: config gate and scalar-stat registration;
-- `subcore.h` / `subcore.cc`: snapshot structs, masks, capture, and finalize;
+- `shader.h` / `gpu-sim.cc`: config gate and scalar-stat registration;
+- `subcore.h` / `subcore.cc`: blocker-mask capture and histogram commit;
 - `sm.h` / `sm.cc`: pure wait-state peek helpers;
-- `shader.cc`: conservation report and mask histogram output.
+- `shader.cc`: mask histogram and sole/multi-blocker output.
 
 Header edits require a clean build.
 
