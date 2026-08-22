@@ -784,6 +784,22 @@ void Subcore::issue(SM *shared_sm) {
           if(!is_fu_available) intra_ws_sfu_filtered_this_cycle = true;
         }
         bool is_l1c_ready = tail_readonly ? true : are_l1c_operands_ready(shared_sm, pI);
+        if (m_config->stall_reason_align_instrument_enable && !tail_readonly) {
+          const StallWarpSample &sample =
+              m_stall_cycle_snapshot.samples[subcore_warp_id];
+          const bool snapshot_probed_l1c =
+              sample.state == StallPreIssueClass::BLOCKED_VALID ||
+              sample.state == StallPreIssueClass::ELIGIBLE_CANDIDATE ||
+              sample.state == StallPreIssueClass::UNKNOWN_VALID;
+          if (snapshot_probed_l1c &&
+              sample.l1c_ready != PeekReady::UNKNOWN) {
+            const bool pure_ready = sample.l1c_ready == PeekReady::READY;
+            if (pure_ready != is_l1c_ready) {
+              m_stall_totals
+                  .l1c_snapshot_authoritative_disagreement++;
+            }
+          }
+        }
         bool is_write_available_result_queue_for_fixed_latency_available = true;
         bool has_dst_regs = false;
         TraceEnhancedOperandType dst_type = TraceEnhancedOperandType::NONE;
@@ -1338,6 +1354,64 @@ bool Subcore::is_wait_barriers_ready_entry_point(const warp_inst_t *inst,
   return are_wait_barriers_ready;
 }
 
+bool Subcore::are_wait_barriers_ready_snapshot_noalloc(
+    const warp_inst_t *inst, unsigned int subcore_warp_id) const {
+  Dependency_State *dependency_state =
+      m_warps_of_subcore[subcore_warp_id]->get_dependency_state();
+  const uint32_t wait_mask = static_cast<uint32_t>(
+      inst->get_extra_trace_instruction_info()
+          .get_control_bits()
+          .get_wait_barrier_bits());
+  assert(m_config->num_wait_barriers_per_warp <= sizeof(wait_mask) * 8);
+  for (unsigned int i = 0; i < m_config->num_wait_barriers_per_warp; i++) {
+    if ((wait_mask & (1u << i)) != 0 &&
+        !dependency_state->peek_wait_barrier_ready(i, 0)) {
+      return false;
+    }
+  }
+
+  if (inst->op != DEPBAR_OP) return true;
+
+  const std::size_t num_operands =
+      inst->get_extra_trace_instruction_info().get_num_operands();
+  assert(num_operands > 1);
+  traced_operand &op_sb =
+      inst->get_extra_trace_instruction_info().get_operand(0);
+  traced_operand &op_val =
+      inst->get_extra_trace_instruction_info().get_operand(1);
+  assert(op_sb.get_operand_type() == TraceEnhancedOperandType::SB);
+  assert(op_sb.get_has_reg());
+  assert(op_val.get_operand_type() == TraceEnhancedOperandType::IMM_UINT64);
+  assert(op_val.get_has_inmediate());
+  const std::vector<double> &value_immediates =
+      op_val.get_operands_inmediates_ref();
+  assert(!value_immediates.empty());
+  const unsigned int sb_reg = op_sb.get_operand_reg_number();
+  const unsigned int sb_max_allowed_val =
+      static_cast<unsigned int>(value_immediates[0]);
+  assert(sb_reg < m_config->num_wait_barriers_per_warp);
+  if (!dependency_state->peek_wait_barrier_ready(sb_reg,
+                                                  sb_max_allowed_val)) {
+    return false;
+  }
+
+  for (unsigned int i = 2; i < num_operands; i++) {
+    traced_operand &operand =
+        inst->get_extra_trace_instruction_info().get_operand(i);
+    assert(operand.get_has_inmediate());
+    const std::vector<double> &immediates =
+        operand.get_operands_inmediates_ref();
+    assert(!immediates.empty());
+    const unsigned int extra_sb_reg =
+        static_cast<unsigned int>(immediates[0]);
+    assert(extra_sb_reg < m_config->num_wait_barriers_per_warp);
+    if (!dependency_state->peek_wait_barrier_ready(extra_sb_reg, 0)) {
+      return false;
+    }
+  }
+  return true;
+}
+
 std::vector<Wait_Barrier_Checking> Subcore::wait_barriers_to_check_generic(const warp_inst_t* inst, unsigned int subcore_warp_id) {
   int wait_barrier_mask_int = inst->get_extra_trace_instruction_info()
                                   .get_control_bits()
@@ -1430,7 +1504,7 @@ Subcore::PeekReady Subcore::peek_l1c_operands_ready(const warp_inst_t *pI) const
   if(!pI->get_generated_constant_accesses() || pI->accessq_empty()) {
     return PeekReady::READY;
   }
-  for(const auto mem_acc : pI->get_mem_accesses()) {
+  for(const auto &mem_acc : pI->get_mem_access_queue()) {
     if(mem_acc.get_type() != CONST_ACC_R) {
       // The address/mask for this access cannot be reconstructed as a plain
       // constant probe; fail closed rather than fabricate a ready result.
@@ -1462,6 +1536,8 @@ enum StallBlockerBit : uint32_t {
   SB_BIT_RESULT_QUEUE   = 1u << 10,
   SB_BIT_L1C            = 1u << 11,  // definite BLOCKED only
   SB_BIT_L1C_UNKNOWN    = 1u << 12,  // observe-only: L1C could not be probed
+  SB_BIT_ISSUE_PORT     = 1u << 13,
+  SB_BIT_ISSUE_CONTROL  = 1u << 14,
 };
 }  // namespace
 
@@ -1499,8 +1575,15 @@ void Subcore::capture_pre_issue_snapshot(SM *shared_sm, StallCycleSnapshot &snap
     s.sm_warp_id = sm_warp_id;
 
     // Stamp/verify the single measured kernel (SR-M0A.12).
-    const unsigned int kuid =
-        c_warp->get_kernel_info() ? c_warp->get_kernel_info()->get_uid() : 0u;
+    if (c_warp->get_kernel_info() == nullptr) {
+      std::fprintf(stderr,
+                   "[STALLALIGN][abort] active warp has no kernel sm=%u "
+                   "subcore=%u warp=%u cyc=%llu\n",
+                   shared_sm->get_sid(), m_subcore_id, sm_warp_id,
+                   (unsigned long long)shared_sm->get_current_gpu_cycle());
+      abort();
+    }
+    const unsigned int kuid = c_warp->get_kernel_info()->get_uid();
     if (!m_stall_totals.measured_kernel_uid_valid) {
       m_stall_totals.measured_kernel_uid = kuid;
       m_stall_totals.measured_kernel_uid_valid = true;
@@ -1582,7 +1665,8 @@ void Subcore::capture_pre_issue_snapshot(SM *shared_sm, StallCycleSnapshot &snap
                    shared_sm->get_scoreboard_WAR()->checkCollision_remodeling(sm_warp_id, pI));
     } else {
       stall_ct0 = c_warp->get_dependency_state()->is_stall_counter_0();
-      wb_ready = is_wait_barriers_ready_entry_point(pI, subcore_warp_id);
+      wb_ready =
+          are_wait_barriers_ready_snapshot_noalloc(pI, subcore_warp_id);
       yield_ok = c_warp->get_dependency_state()->is_yield_ready();
     }
     const bool ldgdepbar_ok = !is_waiting_ldgdepbar(pI, subcore_warp_id);
@@ -1611,6 +1695,7 @@ void Subcore::capture_pre_issue_snapshot(SM *shared_sm, StallCycleSnapshot &snap
     }
 
     const PeekReady l1c = peek_l1c_operands_ready(pI);
+    s.l1c_ready = l1c;
 
     uint32_t mask = 0;
     if (!yield_ok)        mask |= SB_BIT_YIELD;
@@ -1625,6 +1710,8 @@ void Subcore::capture_pre_issue_snapshot(SM *shared_sm, StallCycleSnapshot &snap
     if (!sb_ready)        mask |= SB_BIT_SCOREBOARD;
     if (!result_queue_ok) mask |= SB_BIT_RESULT_QUEUE;
     if (l1c == PeekReady::BLOCKED) mask |= SB_BIT_L1C;
+    if (!issue_port_ready) mask |= SB_BIT_ISSUE_PORT;
+    if (!issue_control_free) mask |= SB_BIT_ISSUE_CONTROL;
 
     const bool has_known_blocker = (mask != 0);
     const bool l1c_unknown = (l1c == PeekReady::UNKNOWN);
@@ -1641,10 +1728,8 @@ void Subcore::capture_pre_issue_snapshot(SM *shared_sm, StallCycleSnapshot &snap
       snap.unknown_count++;
       // population committed at finalize (unknown_valid_head minus winner-if-unknown).
     } else {
-      // (8) Eligible candidate; also requires the global gates to be open, else
-      //     the warp is not selectable this cycle and is counted as eligible-not-
-      //     selected-without-issue at finalize.
-      (void)global_gates_open;
+      // (8) No local or global blocker remains.
+      assert(global_gates_open);
       s.state = StallPreIssueClass::ELIGIBLE_CANDIDATE;
       snap.eligible_count++;
     }
@@ -1690,6 +1775,16 @@ void Subcore::finalize_stall_snapshot(StallCycleSnapshot &snap,
       // Observe-only predicate was unknown: keep the run, mark FAIL (SR-M0A.7/.9).
       selected_was_unknown = true;
       m_stall_totals.winner_prestate_unknown++;
+    } else if (winner.state == StallPreIssueClass::BLOCKED_VALID &&
+               winner.blocker_mask == SB_BIT_L1C) {
+      // The cycle-start L1C observation disagreed with the later authoritative
+      // access. Preserve functional execution and factual SELECTED accounting,
+      // but invalidate the metric at kernel end.
+      assert(snap.population[
+                 (size_t)StallPopulation::BLOCKED_WITH_VALID_HEAD] > 0);
+      snap.population[
+          (size_t)StallPopulation::BLOCKED_WITH_VALID_HEAD]--;
+      m_stall_totals.winner_prestate_l1c_disagreement++;
     } else {
       // Definitely blocked / invalid / held / drained winner: hard error.
       std::fprintf(stderr,
@@ -1753,7 +1848,20 @@ void Subcore::gather_stall_reason_align_stats(StallPopulationTotals &dst) const 
   dst.no_head_yield_warp_cycles += m_stall_totals.no_head_yield_warp_cycles;
   dst.winner_mismatch += m_stall_totals.winner_mismatch;
   dst.winner_prestate_unknown += m_stall_totals.winner_prestate_unknown;
+  dst.l1c_snapshot_authoritative_disagreement +=
+      m_stall_totals.l1c_snapshot_authoritative_disagreement;
+  dst.winner_prestate_l1c_disagreement +=
+      m_stall_totals.winner_prestate_l1c_disagreement;
   if (m_stall_totals.measured_kernel_uid_valid) {
+    if (dst.measured_kernel_uid_valid &&
+        dst.measured_kernel_uid != m_stall_totals.measured_kernel_uid) {
+      std::fprintf(stderr,
+                   "[STALLALIGN][abort] cross-kernel aggregate mix sm=%u "
+                   "subcore=%u measured_uid=%u new_uid=%u\n",
+                   m_sm->get_sid(), m_subcore_id, dst.measured_kernel_uid,
+                   m_stall_totals.measured_kernel_uid);
+      abort();
+    }
     dst.measured_kernel_uid = m_stall_totals.measured_kernel_uid;
     dst.measured_kernel_uid_valid = true;
   }

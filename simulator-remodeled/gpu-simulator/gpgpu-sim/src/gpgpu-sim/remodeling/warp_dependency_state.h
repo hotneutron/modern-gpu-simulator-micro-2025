@@ -88,7 +88,7 @@ struct Wait_Barrier_Checking {
 class Wait_Barrier {
     public:
         Wait_Barrier(unsigned int barrier_id);
-        bool is_ready(unsigned int min_val);
+        bool is_ready(unsigned int min_val) const;
         void reset();
         void decrease_counter();
         void increase_counter();
@@ -122,7 +122,10 @@ class Dependency_State {
 
         bool is_yield_ready();
         bool is_stall_counter_0();
-        bool are_wait_barriers_ready(std::vector<Wait_Barrier_Checking> wait_barriers_checking);
+        bool are_wait_barriers_ready(
+            const std::vector<Wait_Barrier_Checking> &wait_barriers_checking) const;
+        bool peek_wait_barrier_ready(unsigned int barrier_id,
+                                     unsigned int min_val) const;
 
         // [wait_barrier-kind probe] For a warp blocked on wait-barriers: of the SBs in
         // `wait_barriers_checking` that are NOT ready (the ones actually blocking), return the op-class
@@ -144,5 +147,3 @@ class Dependency_State {
         std::vector<Wait_Barrier> m_wait_barriers;//{0,1,2,3,4,5};
         shader_core_stats* m_stats;
 };
-
-

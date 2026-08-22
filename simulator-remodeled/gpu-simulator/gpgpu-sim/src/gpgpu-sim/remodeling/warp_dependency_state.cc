@@ -46,7 +46,7 @@ unsigned int Wait_Barrier::get_barrier_id(){
     return m_barrier_id;
 }
 
-bool Wait_Barrier::is_ready(unsigned int min_val){
+bool Wait_Barrier::is_ready(unsigned int min_val) const {
     return m_counter <= min_val;
 }
 
@@ -138,13 +138,20 @@ bool Dependency_State::is_stall_counter_0() {
     return m_stall_counter == 0;
 }
 
-bool Dependency_State::are_wait_barriers_ready(std::vector<Wait_Barrier_Checking> wait_barriers_checking) {
-    for(auto &wait_barrier_checking : wait_barriers_checking){
+bool Dependency_State::are_wait_barriers_ready(
+    const std::vector<Wait_Barrier_Checking> &wait_barriers_checking) const {
+    for(const auto &wait_barrier_checking : wait_barriers_checking){
         if(!m_wait_barriers[wait_barrier_checking.barrier_id].is_ready(wait_barrier_checking.min_val)){
             return false;
         }
     }
     return true;
+}
+
+bool Dependency_State::peek_wait_barrier_ready(unsigned int barrier_id,
+                                               unsigned int min_val) const {
+    assert(barrier_id < m_wait_barriers.size());
+    return m_wait_barriers[barrier_id].is_ready(min_val);
 }
 
 void Dependency_State::increase_num_pending_ldgsts() {

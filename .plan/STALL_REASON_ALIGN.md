@@ -517,15 +517,15 @@ The following combinations indicate a state-machine error and must abort:
 ```text
 wait_block_hold && done_exit
 wait_block_hold && non_frontend_hold_without_valid_head
-selected && pre_issue_state not in { eligible_candidate, unknown_valid }
+selected && pre_issue_state is definitely blocked for a non-L1C reason
 selected && snapshot_head_pc != issued_pc
 ```
 
-A `selected` winner whose pre-issue state was `unknown_valid` is not a
-state-machine error: SR-M0A.9 keeps it, counts `winner_prestate_unknown`, and
-downgrades the final status to FAIL instead of aborting. Only a `selected`
-winner whose pre-issue state was definitely blocked, invalid, held, or drained
-aborts here.
+A `selected` winner whose pre-issue state was `unknown_valid` or L1C-only
+`blocked_valid` is not a simulator state-machine error. SR-M0A.9 keeps the
+actual winner as `selected`, records the corresponding diagnostic, and
+downgrades the final metric status to FAIL. A winner that was blocked by any
+non-L1C reason, invalid, held, or drained still aborts.
 
 #### SR-M0A.5 Eligibility inputs
 
@@ -657,16 +657,19 @@ increment `winner_prestate_unknown`, and make the final status FAIL. Do not
 abort a functionally valid simulation solely because an observe-only predicate
 was unknown.
 
-By contrast, a pure L1C result of `BLOCKED` followed by the same warp actually
-issuing is a definite predicate disagreement, not missing observability. Treat
-that case as `winner_mismatch` and hard-abort; silently downgrading it would
-allow a broken pure probe to produce trusted population totals.
-
 For every pre-winner warp on which the authoritative path later calls
 `are_l1c_operands_ready()`, compare the pure result with the authoritative
-result. Emit cycle/SM/Subcore/warp/PC/status and abort on disagreement. This
-detects an incorrect pure probe or an in-cycle cache-ordering dependency rather
-than silently corrupting the population.
+result. A disagreement may be caused by an incorrect pure probe or by legitimate
+cache-state evolution from an earlier warp in the same scheduler scan. It is a
+metric-validity failure, not a functional simulation failure: increment
+`l1c_snapshot_authoritative_disagreement`, continue execution, and make the
+final status FAIL.
+
+If an actual winner was classified L1C-only `blocked_valid` at cycle start,
+remove that warp from `blocked_with_valid_head`, count it as the factual
+`selected` winner, increment `winner_prestate_l1c_disagreement`, and continue.
+This preserves exclusive population conservation without allowing the
+disagreement to produce a trusted PASS.
 
 #### SR-M0A.8 Fixed-storage implementation
 
@@ -680,6 +683,7 @@ struct StallWarpSample {
   unsigned int sm_warp_id = 0;
   address_type head_pc = 0;
   uint32_t blocker_mask = 0;
+  PeekReady l1c_ready = PeekReady::READY;
 };
 
 struct StallCycleSnapshot {
@@ -703,6 +707,8 @@ struct StallPopulationTotals {
   uint64_t no_head_yield_warp_cycles = 0;
   uint64_t winner_mismatch = 0;
   uint64_t winner_prestate_unknown = 0;
+  uint64_t l1c_snapshot_authoritative_disagreement = 0;
+  uint64_t winner_prestate_l1c_disagreement = 0;
   unsigned int measured_kernel_uid = 0;
   bool measured_kernel_uid_valid = false;
 };
@@ -824,8 +830,11 @@ selected == total_num_cycles_issue_stage_selected
 sampled_subcore_cycles == total_num_cycles_issue_stage_evaluated
 winner_mismatch == 0
 winner_prestate_unknown == 0
+l1c_snapshot_authoritative_disagreement == 0
+winner_prestate_l1c_disagreement == 0
 unknown_valid_head == 0
 selected > 0 before printing any "/ selected" ratio
+measured_kernel_uid_valid == true
 ```
 
 The selected equality is against issue-active warp cycles, not blindly against
@@ -840,16 +849,18 @@ summary:
 
 ```text
 [STALLALIGN] FINAL status=PASS active=... population_sum=... delta=0
-selected=... issue_selected=... eligible=... unknown=0 sampled=...
-issue_evaluated=... kernel_uid=... winner_mismatch=0
-winner_prestate_unknown=0
+selected=... issue_selected=... selected_delta=0 eligible=... unknown=0
+sampled=... issue_evaluated=... sampled_delta=0 kernel_uid=...
+kernel_uid_valid=1 winner_mismatch=0 winner_prestate_unknown=0
+l1c_snapshot_authoritative_disagreement=0
+winner_prestate_l1c_disagreement=0
 ```
 
-Any per-cycle conservation failure, definitely blocked winner, PC/warp
-mismatch, counter underflow, or impossible WaitBlock state prints
-cycle/SM/Subcore/warp/PC/state/mask and hard-aborts immediately. An unknown
-winner or nonzero unknown population preserves execution and arithmetic
-conservation but makes the final status FAIL.
+Any per-cycle conservation failure, non-L1C definite blocker on the actual
+winner, PC/warp mismatch, counter underflow, or impossible WaitBlock state
+prints cycle/SM/Subcore/warp/PC/state/mask and hard-aborts immediately. An L1C
+snapshot disagreement, unknown winner, or nonzero unknown population preserves
+execution and arithmetic conservation but makes the final status FAIL.
 
 At capture, independently recount active entries and require that count to
 equal `m_num_active_warps_subcore`. Also verify each non-inactive sample's
@@ -923,7 +934,8 @@ population basis before that more expensive work is attempted.
   cycle-start state, record the actual winner, and finalize.
 - `sm.h` / `sm.cc`: add the separated pure wait-state queries.
 - `gpu-cache.h` / `gpu-cache.cc`: add the pure L1C probe.
-- `shader.cc`: print totals, normalized values, deltas, and final status only.
+- `gpu-sim.cc`: print totals, normalized values, reference deltas, and final
+  status after the existing per-SM gather.
 
 `reset_gpu_per_sm_stats()` currently resets registered `m_stats_map` entries,
 not direct `StallPopulationTotals` members. Add an explicit lifecycle:
@@ -998,6 +1010,14 @@ Validation order:
    the pure helpers before starting the full run.
 5. Full Kernel 10 run with all conservation and winner checks passing.
 6. Only after SR-M0A passes, enable SR-M0B mask histogram accounting.
+
+The H100 80 GB base configuration explicitly enables SR-M0A, so use the
+existing `H100_80GB-OnlyKernel10` configuration for the instrumented Kernel 10
+run. The source-level option default remains off for other configurations.
+Reject any result whose echoed configuration shows
+`-stall_reason_align_instrument_enable 0` or whose output lacks the
+`[STALLALIGN] FINAL` line. The `.o56` run met both rejection conditions and is
+therefore a gate-off baseline, not an SR-M0A acceptance result.
 
 Kernel 5 is not the first acceptance target because its existing cross-warp
 deadlock can terminate independently of the observer. It becomes a

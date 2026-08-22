@@ -4508,6 +4508,12 @@ void gpgpu_sim::report_stall_reason_align_stats() {
 
   const uint64_t selected = agg.population[idx(Subcore::StallPopulation::SELECTED)];
   const uint64_t unknown = agg.population[idx(Subcore::StallPopulation::UNKNOWN_VALID_HEAD)];
+  const uint64_t issue_selected =
+      m_gpu_per_sm_stats.m_stats_map["total_num_cycles_issue_stage_selected"]
+          ->get_value();
+  const uint64_t issue_evaluated =
+      m_gpu_per_sm_stats.m_stats_map["total_num_cycles_issue_stage_evaluated"]
+          ->get_value();
 
   uint64_t population_sum = 0;
   for (size_t b = 0; b < static_cast<size_t>(Subcore::StallPopulation::COUNT); b++) {
@@ -4515,9 +4521,20 @@ void gpgpu_sim::report_stall_reason_align_stats() {
   }
   const long long delta =
       static_cast<long long>(population_sum) - static_cast<long long>(agg.active_warp_cycles);
+  const long long selected_delta =
+      static_cast<long long>(selected) - static_cast<long long>(issue_selected);
+  const long long sampled_delta =
+      static_cast<long long>(agg.sampled_subcore_cycles) -
+      static_cast<long long>(issue_evaluated);
 
   const bool fail = (agg.winner_mismatch != 0) || (agg.winner_prestate_unknown != 0) ||
-                    (unknown != 0) || (population_sum != agg.active_warp_cycles);
+                    (agg.l1c_snapshot_authoritative_disagreement != 0) ||
+                    (agg.winner_prestate_l1c_disagreement != 0) ||
+                    (unknown != 0) ||
+                    (population_sum != agg.active_warp_cycles) ||
+                    (selected == 0) || !agg.measured_kernel_uid_valid ||
+                    (selected != issue_selected) ||
+                    (agg.sampled_subcore_cycles != issue_evaluated);
   const char *status = fail ? "FAIL" : "PASS";
 
   printf("[STALLALIGN] ---- SR-M0A stall-reason alignment report ----\n");
@@ -4541,9 +4558,18 @@ void gpgpu_sim::report_stall_reason_align_stats() {
          (unsigned long long)agg.winner_mismatch);
   printf("[STALLALIGN] winner_prestate_unknown = %llu\n",
          (unsigned long long)agg.winner_prestate_unknown);
-  printf("[STALLALIGN] measured_kernel_uid = %u\n", agg.measured_kernel_uid);
+  printf("[STALLALIGN] l1c_snapshot_authoritative_disagreement = %llu\n",
+         (unsigned long long)agg.l1c_snapshot_authoritative_disagreement);
+  printf("[STALLALIGN] winner_prestate_l1c_disagreement = %llu\n",
+         (unsigned long long)agg.winner_prestate_l1c_disagreement);
+  printf("[STALLALIGN] measured_kernel_uid = %u valid=%u\n",
+         agg.measured_kernel_uid, agg.measured_kernel_uid_valid ? 1u : 0u);
   printf("[STALLALIGN] population_sum = %llu\n", (unsigned long long)population_sum);
   printf("[STALLALIGN] delta(population_sum - active_warp_cycles) = %lld\n", delta);
+  printf("[STALLALIGN] reference_issue_selected = %llu delta(selected-reference) = %lld\n",
+         (unsigned long long)issue_selected, selected_delta);
+  printf("[STALLALIGN] reference_issue_evaluated = %llu delta(sampled-reference) = %lld\n",
+         (unsigned long long)issue_evaluated, sampled_delta);
 
   if (selected > 0) {
     const double sel = static_cast<double>(selected);
@@ -4564,19 +4590,31 @@ void gpgpu_sim::report_stall_reason_align_stats() {
   }
 
   printf("[STALLALIGN] FINAL status=%s active=%llu population_sum=%llu delta=%lld "
-         "selected=%llu eligible=%llu unknown=%llu sampled=%llu kernel_uid=%u "
-         "winner_mismatch=%llu winner_prestate_unknown=%llu\n",
+         "selected=%llu issue_selected=%llu selected_delta=%lld eligible=%llu "
+         "unknown=%llu sampled=%llu issue_evaluated=%llu sampled_delta=%lld "
+         "kernel_uid=%u kernel_uid_valid=%u winner_mismatch=%llu "
+         "winner_prestate_unknown=%llu "
+         "l1c_snapshot_authoritative_disagreement=%llu "
+         "winner_prestate_l1c_disagreement=%llu\n",
          status,
          (unsigned long long)agg.active_warp_cycles,
          (unsigned long long)population_sum,
          delta,
          (unsigned long long)selected,
+         (unsigned long long)issue_selected,
+         selected_delta,
          (unsigned long long)agg.eligible_warp_cycles,
          (unsigned long long)unknown,
          (unsigned long long)agg.sampled_subcore_cycles,
+         (unsigned long long)issue_evaluated,
+         sampled_delta,
          agg.measured_kernel_uid,
+         agg.measured_kernel_uid_valid ? 1u : 0u,
          (unsigned long long)agg.winner_mismatch,
-         (unsigned long long)agg.winner_prestate_unknown);
+         (unsigned long long)agg.winner_prestate_unknown,
+         (unsigned long long)
+             agg.l1c_snapshot_authoritative_disagreement,
+         (unsigned long long)agg.winner_prestate_l1c_disagreement);
 }
 
 void gpgpu_sim::record_l1i_prefetch_miss_observation(

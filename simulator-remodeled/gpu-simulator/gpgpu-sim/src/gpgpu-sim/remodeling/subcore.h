@@ -192,11 +192,14 @@ class Subcore {
     COUNT,
   };
 
+  enum class PeekReady : uint8_t { READY, BLOCKED, UNKNOWN };
+
   struct StallWarpSample {
     StallPreIssueClass state = StallPreIssueClass::INACTIVE;
     unsigned int sm_warp_id = 0;
     address_type head_pc = 0;
     uint32_t blocker_mask = 0;
+    PeekReady l1c_ready = PeekReady::READY;
   };
 
   struct StallCycleSnapshot {
@@ -218,6 +221,8 @@ class Subcore {
     uint64_t no_head_yield_warp_cycles = 0;
     uint64_t winner_mismatch = 0;
     uint64_t winner_prestate_unknown = 0;
+    uint64_t l1c_snapshot_authoritative_disagreement = 0;
+    uint64_t winner_prestate_l1c_disagreement = 0;
     unsigned int measured_kernel_uid = 0;
     bool measured_kernel_uid_valid = false;
   };
@@ -346,8 +351,9 @@ class Subcore {
   // [SR-M0A] Pure tri-state constant-cache readiness for the pre-issue snapshot.
   // Never allocates a mem_fetch, calls read_only_cache::access(), or mutates any
   // cache state. See .plan/STALL_REASON_ALIGN.md SR-M0A.7.
-  enum class PeekReady { READY, BLOCKED, UNKNOWN };
   PeekReady peek_l1c_operands_ready(const warp_inst_t *pI) const;
+  bool are_wait_barriers_ready_snapshot_noalloc(
+      const warp_inst_t *inst, unsigned int subcore_warp_id) const;
   void assign_instruction_warp_id(warp_inst_t *pI, unsigned int subcore_warp_id, unsigned int sm_warp_id);
 
   void allocate_reads(RF_requests rf_requests, const warp_inst_t *pI, unsigned int sm_warp_id, unsigned int regular_rf_num_read_cycles);

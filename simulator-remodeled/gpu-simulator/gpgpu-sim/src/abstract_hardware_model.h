@@ -1630,6 +1630,9 @@ class warp_inst_t : public inst_t {
   void accessq_clear() { m_accessq.clear(); }
 
   std::list<mem_access_t>& get_mem_access_queue() { return m_accessq; }
+  const std::list<mem_access_t>& get_mem_access_queue() const {
+    return m_accessq;
+  }
 
   // MOD. Begin. LOOG
   std::vector<mem_access_t> get_mem_accesses() const { 
