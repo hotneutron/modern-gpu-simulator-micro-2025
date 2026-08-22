@@ -11,10 +11,16 @@ SIMULATOR V2 LOADER AND DEFERRED-REPLAY IMPLEMENTATION COMPLETE;
 K10 SERVER REGRESSION PASSED; K5 `.e81` EXPOSED A STALE REPLAY FETCH BASE AND
 AN INDEPENDENT ALL-LIVE CROSS-WARP DEADLOCK; THE FETCH-BASE FIX AND REPLAY
 LIFECYCLE GUARDS ARE IMPLEMENTED; K5 `.e82` CONFIRMED SUCCESSFUL CAPSULE
-REPLAY/CLOSE BUT EXPOSED AN OUT-OF-ORDER REPLAY-DECODE RESERVATION GAP.
+REPLAY/CLOSE BUT EXPOSED AN OUT-OF-ORDER REPLAY-DECODE RESERVATION GAP; K5
+`.e83` CONFIRMED THE RESERVATION FIX AND EXPOSED AN INDEPENDENT TMA
+COMPLETION-BINDING AND TX-SIZE CONTRACT FAILURE.
 
-**Extends:** [`SPIN_WAIT_SIM_MODELING.md`](SPIN_WAIT_SIM_MODELING.md) and
-[`SPIN_WAIT_POSTPROCESS.md`](SPIN_WAIT_POSTPROCESS.md).
+This document is the authoritative, self-contained design and execution record
+for WaitBlock, partial replay, and the post-`.e83` TMA/barrier work. The linked
+[`SPIN_WAIT_SIM_MODELING.md`](SPIN_WAIT_SIM_MODELING.md),
+[`SPIN_WAIT_POSTPROCESS.md`](SPIN_WAIT_POSTPROCESS.md), and older `.trae`
+planning documents are historical/supporting material only; they are not
+required to implement or validate this document.
 
 **Debug record:** [`../debug-k10-wait-fold-deadlock.md`](../debug-k10-wait-fold-deadlock.md).
 
@@ -1040,7 +1046,7 @@ actual landing PC
 
 ### 2.9 Feature gating
 
-The v4 runtime has one canonical feature gate and one debug gate:
+The v5 runtime has one canonical feature gate and one debug gate:
 
 ```text
 -wait_block_enable
@@ -1793,11 +1799,17 @@ Cross-kernel:
 20. [done] Fix the initial replay fetch base, add replay-drain logging, and add
     fail-closed synthetic-issue, progress, watchdog, post-join, cleanup, and
     warp-slot lifecycle checks.
-21. [in progress] K5 `.e82` proves that seven released capsules drain and close,
-    then exposes an out-of-order replay decode reservation bug at cycle 50,173.
-    Add replay-occurrence reservation to IBuffer fetch entries, validate it on
-    focused traces, and rerun K5 before addressing the independent all-live
-    cross-warp dependency cycle.
+21. [done] K5 `.e82` proves that seven released capsules drain and close, then
+    exposes an out-of-order replay decode reservation bug at cycle 50,173.
+    Replay-occurrence reservation was added to IBuffer fetch entries.
+22. [done] K5 `.e83` passes the old cycle-50,173 failure, completes 48 real
+    replay drains/closes, and has no replay reservation or synthetic-issue
+    abort. It then exposes the independent TMA completion-credit failure
+    described in Section 5.
+23. [in progress] Complete the consolidated Batch B design in Section 6:
+    prove the `0x96b0` 24-KiB/16-KiB contract, bind each TMA command to its
+    exact barrier/generation, remove anonymous FIFO completion routing, and
+    rerun K5/K10 before timing signoff.
 
 ## 3. First simulator v5 full-run result
 
@@ -2030,7 +2042,7 @@ The fail-closed guard must remain. Allowing the synthetic instruction to issue
 would silently replace a real deferred occurrence with a zero-active NOP and
 violate exact-once replay.
 
-### 22.5 Required fix: reserve replay occurrences at fetch allocation
+### 4.5 Required fix: reserve replay occurrences at fetch allocation
 
 The replay queue is not a new execution model. It is a temporary source of
 ordinary traced instructions; the existing IBuffer may still fetch, fill, and
@@ -2236,7 +2248,7 @@ The `.e83` K5 run built on the reservation fix. Result:
   independent all-live cross-warp deadlock predicted by 4.7.10. This is not a
   partial-replay failure.
 
-### 5.1 Deadlock state (SM121, CTA 0, all 16 warps held)
+### 5.1 Deadlock state (SM121, CTA 0, all 13 participating warps held)
 
 ```text
 warp 4,7      block 0x5a50  barrier 0x16c38  exp/cur gen 5/4  arrive 0/1
@@ -2246,61 +2258,697 @@ warp 5,6      block 0x5bc0  barrier 0x16c58  exp/cur gen 4/3  arrive 1/1 tx=8192
 warp 0        poll 0xb370   barrier 0x16c60  exp/cur gen 4/3  arrive 2/3
 ```
 
-The whole CTA is held, so no warp can supply the missing arrival/tx that another
-warp is waiting on.
+These records cover warp IDs `0` and `4-15`, which are the 13 participating
+warps visible in the kernel's synchronization traffic. The earlier "all 16
+warps held" wording was inaccurate: `.e83` has no terminal WaitBlock state for
+warp IDs `1-3`. All 13 participating warps are held, so no logged producer can
+supply the missing arrival/tx that another warp is waiting on.
 
-### 5.2 Root cause: TMA tx-credit misalignment in notify_tma_completion
+### 5.2 Root cause audit: identity-free TMA credit plus an unresolved size mismatch
 
-This is not a replay bug, not a trace bug, and not caused by the WaitBlock
-holds. It is a pre-existing bug in the simulator's TMA completion accounting.
+This is not a partial-replay reservation bug. The deadlocked SM121 has no
+deferred-replay miss, while the full run has 48 real
+`partial-replay-drained`/`replay_progress_closed=1` pairs and no replay
+reservation or synthetic-issue abort.
 
-Evidence it is none of those three:
+The prior analysis correctly identified an invalid byte-routing mechanism in
+`notify_tma_completion`, but it overstated the conclusion in three ways:
 
-- Replay: the deadlocked SM121 has zero partial-replay events. It never used
-  deferred replay.
-- Trace: every `bind_tma` and `arrive_expect_tx` on SM121 is internally
-  consistent -- each barrier binds and expects exactly its transfer size
-  (16384 for `0x16c30/38/50/58`, 24576 for `0x16c00`). The trace maps each
-  UTMALDG to its completion mbarrier 1:1.
-- WaitBlock holds: the misalignment starts at cycle 9,767, long before the
-  first `INJECT_MISSING_WAIT` hold at 38,122. The holds do not cause or reorder
-  it.
+1. The runtime metadata is not size-consistent. The `0x16c00` expect-tx
+   occurrence requests 24,576 bytes, but the following `UTMALDG` at `0x96b0`
+   is modeled from descriptor metadata as 16,384 bytes (`128` 128-byte AGU
+   requests).
+2. SM121 already has captured-poll holds at cycle 6,581 and
+   `INJECT_MISSING_WAIT` holds at cycle 6,655. The old claim that no WaitBlock
+   hold existed before cycle 38,122 is false. The first hold in the final
+   non-releasing set is warp 7 at cycle 36,270.
+3. The terminal table contains 13 participating warps, not 16.
 
-The seed is `0x16c00`, whose `expected_tx = 24576` is not a multiple of the
-16384-byte transfer size. `notify_tma_completion` pours each completion's bytes
-into the per-warp FIFO front binding with `applied = min(remaining, pending)`:
+The exact SM121 sequence is:
 
 ```text
-cyc=8182  0x16c00 applied=16384 -> 16384/24576
-cyc=9767  0x16c00 applied=8192  -> 24576/24576  (fills 0x16c00)
-cyc=9767  0x16c38 applied=8192  -> 8192/16384   (SAME completion spills 8192 here)
+cyc=5774  bind 0x16c30 expect=16384
+cyc=5787  enqueue uid=6 load_bytes=16384
+cyc=6896  bind 0x16c00 expect=24576
+cyc=6917  enqueue uid=7 load_bytes=16384
+cyc=7984  uid=6 completes -> 0x16c30 gets 16384/16384
+cyc=8182  uid=7 completes -> 0x16c00 gets 16384/24576
+
+cyc=9094  bind 0x16c38 expect=16384
+cyc=9107  enqueue uid=8 load_bytes=16384
+cyc=9767  uid=8 completes
+          -> stale FIFO front 0x16c00 gets 8192 and flips
+          -> remaining 8192 spills into 0x16c38
 ```
 
-The second 16384-byte completion finishes `0x16c00` (needs only 8192) and the
-leftover 8192 overflows into the next binding (`0x16c38`). From that point every
-barrier is credited by the wrong transfer, permanently offset by 8192. ~25k
-cycles later `0x16c58` is left at `8192/16384`, never flips gen 3->4, and warps
-5,6 (expected_gen 4) hang; the whole CTA then jams behind them and the watchdog
-fires at 68,271.
+`notify_tma_completion(warp_id, completed_tx_bytes)` has no transfer identity.
+It applies bytes to the oldest per-warp binding and permits one completion to
+cross binding boundaries. UID 8 therefore credits both the stale UID 7 barrier
+and its own later barrier. From then on the queue is permanently offset by
+8,192 bytes. At the terminal state `0x16c58` remains at `8192/16384`, never
+flips generation 3 to 4, and the 13 participating warps form the observed wait
+cycle.
 
-`notify_tma_completion` does not match a completion to the binding that produced
-it. `bind_tma_completion_to_sync_barrier` pushes per-warp `(barrier, tx_bytes)`
-bindings into a FIFO, and completion bytes are streamed across bindings, so one
-completion can straddle two barriers whenever a binding's `expected_tx` is not a
-whole multiple of the transfer size.
+The same structural problem exists even without the 24-KiB/16-KiB mismatch:
+`.e83` contains at least 40 parseable cases where LOAD completion UIDs arrive
+out of issue order. A completion-order FIFO cannot preserve
+TMA-command-to-barrier identity under that response ordering.
 
-The correct HW semantics: each UTMALDG credits its own completion mbarrier with
-its own transaction bytes. The binding and its completion must be linked
-explicitly (e.g. by TMA uid), not matched by a warp-level FIFO byte stream.
+The byte mismatch itself is not resolved by `.e83`. One of these must be proven
+from the source trace and descriptor data before changing accounting:
 
-### 5.3 Candidate fixes (not yet implemented)
+1. `0x96b0` really moves 24,576 bytes and its descriptor/geometry mapping is
+   wrong.
+2. The 24,576-byte expect count covers the 16,384-byte UTMALDG plus another
+   8,192-byte async producer that the simulator does not model.
+3. The TMA instruction has a distinct architectural completion-credit size
+   that must be carried separately from modeled memory traffic bytes.
 
-1. Key each TMA completion to the exact binding it came from (carry the TMA uid
-   / target barrier through completion) instead of a warp FIFO byte pour.
-2. Reject/omit a partial `applied` that would split one completion across two
-   bindings; a completion must land wholly on its own binding.
+The captured `semantic_raw=24576` is hardware runtime evidence; the
+descriptor-derived 16,384-byte command is simulator metadata. Do not silently
+choose either value or hardcode the affected PC/barrier.
 
-Either fix must preserve the existing per-barrier `expected_tx`/`completed_tx`
-accounting and phase-flip logic. The `INJECT_MISSING_WAIT` holds are not
-themselves wrong; they only exposed the credit-matching bug by reordering
-bindings vs completions.
+WaitBlock makes this invalid accounting architecturally visible by holding a
+modeled-not-ready warp. The byte mismatch is present before the final
+non-releasing hold set, but `.e83` does not justify the stronger claim that
+WaitBlock never changes the relative timing/order of bindings and completions.
+
+### 5.3 Required fix boundary (design review)
+
+The fix has two mandatory parts.
+
+1. Give every load `TMACommand` an exact completion binding before it enters the
+   asynchronous mover. Prefer the barrier identity carried by the TMA
+   instruction (`UTMALDG` implicit barrier register, `UBLKCP` explicit barrier
+   operand); otherwise assign a unique issue-time binding ID and carry it
+   through `TMATransferEntry`.
+2. On completion, update only that binding's `(kernel, CTA, barrier,
+   generation)` object. Never stream remaining bytes into another binding.
+   Completion order must be irrelevant.
+
+Before implementation can be called complete, resolve the 24-KiB/16-KiB
+contract above. Merely adding UID identity while crediting 16,384 bytes leaves
+`0x16c00` permanently at `16384/24576` and deadlocks earlier. Merely forbidding
+cross-binding spill is a useful fail-closed diagnostic, not a fix.
+
+Required guards and validation:
+
+- every completion-bearing TMA load owns exactly one explicit barrier binding;
+- a binding is claimed and completed exactly once;
+- completion key and generation match the object that was armed;
+- one completion never updates two barrier keys;
+- per-barrier completed bytes never exceed expected bytes;
+- CTA cleanup has no orphan binding or in-flight completion;
+- logs include TMA UID, TMA PC, barrier key/generation, memory bytes, and
+  completion-credit bytes;
+- tests cover equal-size binding, the current 24-KiB/16-KiB mismatch,
+  out-of-order UID completion, repeated barrier generations, and CTA cleanup;
+- K5 rerun requires the old cycle-50,173 replay failure to remain absent, all
+  released capsules to drain/close, no TMA binding invariant failure, no
+  WaitBlock watchdog, and a final grep-able `FINAL status=PASS`.
+
+## 6. Consolidated Batch B Design After `.e83`
+
+This section absorbs the complete TMA/barrier-timing work that was previously
+kept in `.trae/documents/SPIN_WAIT_FOLD_ROOT_CAUSE_PLAN.md`. It is authoritative
+for all work after `.e83`. Where an older SYNC, TMA, spin-fold, or Batch B
+document conflicts with this section, this section wins.
+
+The implementation objective is not to make the watchdog disappear. It is to
+restore exact ownership between every asynchronous TMA LOAD and the mbarrier
+generation it completes, then make WaitBlock observe that corrected state
+without introducing scheduler-order bias.
+
+### 6.1 Scope and current status
+
+| ID | Work item | Status after `.e83` |
+|---|---|---|
+| B0 | Exact TMA-command-to-barrier completion ownership and tx-size contract | **BLOCKING / NOT IMPLEMENTED** |
+| B1 | One SM-level WaitBlock release phase per cycle | **REQUIRED / NOT IMPLEMENTED** |
+| B2 | WaitBlock startup and provenance fail-fast checks | **MOSTLY IMPLEMENTED** |
+| B3 | Assert-before-clear lifecycle checks | **PARTIAL**: WaitBlock state guarded; TMA ownership cleanup missing |
+| B4 | Zero-active no-op and active required-payload checks | **IMPLEMENTED** |
+| B5 | Configurable watchdog/heartbeat and kernel-scoped counters | **REQUIRED / NOT IMPLEMENTED** |
+| B6 | WaitBlock-only non-mutating hold query | **PARTIAL**: SR-M0A path implemented; legacy metrics still need audit |
+| B7 | Fold/WaitBlock metric integrity and final reconciliation | **PARTIAL** |
+| D0 | Generic ISA-wide effect framework | **DEFERRED**; exact sidecar allow/proof sets remain authoritative |
+| D1 | Generic repeated-EXCH initialization epochs | **DEFERRED** for current FA3 one-EXCH-per-barrier contract |
+| D2 | Full trace regeneration | **CONDITIONAL**: required only if the existing trace does not carry exact TMA completion-barrier identity |
+
+No item in this section may weaken the existing WaitBlock generation,
+cursor/replay, semantic-work, or feature-off invariants.
+
+### 6.2 Unified state model
+
+The model must distinguish three objects that the current FIFO conflates:
+
+1. **Expected-tx announcement**
+   - Created by an active `SYNCS.ARRIVE_EXPECT_TX`.
+   - Identified by barrier key and current generation.
+   - Adds captured `semantic_raw` bytes to that barrier generation's
+     `expected_tx_bytes`.
+2. **TMA transfer**
+   - Created when a real LOAD instruction issues.
+   - Owns memory traffic geometry (`memory_bytes`, request count, source/dest).
+   - Owns one exact completion target.
+3. **Completion credit**
+   - Applied when that exact transfer completes.
+   - Carries a separately validated `credit_bytes` value.
+   - Updates only the transfer's bound barrier generation.
+
+Minimum target representation:
+
+```cpp
+struct TmaCompletionTarget {
+  bool valid = false;
+  HopperMBarrierKey key;
+  uint64_t barrier_generation = 0;
+  uint64_t binding_id = 0;
+  uint32_t credit_bytes = 0;
+};
+
+struct TMACommand {
+  // Existing command fields.
+  uint64_t tma_pc = 0;
+  uint32_t memory_bytes = 0;
+  TmaCompletionTarget completion;
+};
+```
+
+`memory_bytes` and `credit_bytes` are intentionally separate. They are equal by
+default, but a difference is legal only when static ISA evidence plus dynamic
+trace evidence explicitly proves that distinction. The current
+24,576/16,384 case has no such proof yet.
+
+The completion target key must include enough identity to reject stale reuse:
+
+```text
+trace kernel ID
+runtime kernel launch UID, or an equivalent asserted launch scope
+CTA instance/slot identity
+barrier address
+barrier generation
+```
+
+For current FA3, one EXCH per barrier and assert-before-reuse permit the existing
+`HopperMBarrierKey + generation` representation. A future repeated-EXCH design
+must add an explicit initialization epoch before relaxing that contract.
+
+### 6.3 Barrier identity source
+
+Completion routing must come from the TMA instruction, not from completion
+order and not from the most recently observed SYNCS.
+
+Required source rules:
+
+- `UTMALDG`: derive the implicit completion-barrier register from the
+  instruction-defined destination/register relation and capture its runtime
+  barrier address.
+- `UBLKCP`: capture the explicit completion-barrier operand.
+- `UTMAPF`/`UBLKPF`: prefetch only; no mbarrier completion target.
+- `UTMASTG`, `UTMAREDG`, and `UBLKRED`: store/reduce completion uses the
+  asynchronous store-group/`UTMACMDFLUSH` domain, not this load mbarrier path.
+- multicast or any instruction with more than one completion destination is
+  unsupported until its exact destination set and credit semantics are traced;
+  fail closed.
+
+Existing documentation claimed the runtime already implemented these rules.
+It does not. The current `TMACommand` has no completion-barrier field, and
+`notify_tma_completion()` receives only `(warp_id, bytes)`.
+
+Trace-data gate:
+
+1. Inspect the current protobuf payload for a separately captured TMA
+   completion-barrier value.
+2. If present, plumb it through `inst_trace_t`, `trace_warp_inst_t`, and
+   `TMACommand` without reinterpretation.
+3. If absent, extend the tracer/protobuf with a dedicated valid bit and 64-bit
+   runtime barrier address, then regenerate the trace.
+4. Do not reuse a descriptor handle, memory address, `sync_barrier_addr` from an
+   unrelated SYNCS occurrence, or PC-order inference as the completion target.
+
+The old no-regeneration preference is subordinate to this correctness gate.
+
+### 6.4 Expected-tx and transfer-size decision gate
+
+The `.e83` contract conflict must be resolved before enabling the new
+completion path:
+
+```text
+SYNCS at 0x9680:
+    barrier       = 0x16c00
+    expected_tx   = 24576
+
+UTMALDG at 0x96b0:
+    descriptor    = box_64x128xbf16
+    memory_bytes  = 16384
+    requests      = 128 x 128-byte AGU lines
+```
+
+Required evidence:
+
+- static SASS operands for `0x9680` and `0x96b0`;
+- dynamic operand values, including the TMA completion-barrier address;
+- `tma_pc_base_map.json`;
+- `tma_operand_resolver.json`;
+- `tma_descriptor_configs.json`;
+- the CTA121/warp0 source-trace interval from `0x9680` through the next
+  expect-tx/TMA pair;
+- any non-TMA async instruction capable of contributing `complete_tx`.
+
+Decision:
+
+```text
+if 0x96b0 is actually a 24576-byte transfer:
+    correct generic descriptor/geometry resolution
+    memory_bytes = credit_bytes = 24576
+
+else if another 8192-byte async producer targets the same barrier generation:
+    model that producer explicitly
+    each producer owns the same exact barrier key with its own credit_bytes
+
+else if ISA evidence proves memory_bytes != completion credit:
+    retain memory_bytes = 16384
+    carry the independently proven credit_bytes = 24576
+
+else:
+    abort at command binding with tx-contract-unresolved
+```
+
+No kernel ID, PC, barrier offset, or 8-KiB correction may be hardcoded.
+
+### 6.5 Issue-time binding algorithm
+
+`ARRIVE_EXPECT_TX` may create an event-scoped pending contract for validation,
+but a warp FIFO is not the routing authority.
+
+At each active LOAD issue:
+
+1. Build the normal `TMACommand`, including `tma_pc` and `memory_bytes`.
+2. Resolve the command's exact runtime completion-barrier address.
+3. Look up the barrier object for the same kernel, CTA, address, and current
+   generation.
+4. Resolve `credit_bytes` under Section 6.4.
+5. Assign a monotonically increasing `binding_id`.
+6. Store the complete target in `TMACommand` before enqueue.
+7. Increment event-driven assigned/outstanding counters for that exact barrier
+   generation.
+
+Required issue-time assertions:
+
+```text
+LOAD                         -> completion.valid
+PREFETCH / STORE / CONTROL   -> !completion.valid
+completion.key.cta           == command CTA
+completion.generation        == live barrier generation
+credit_bytes                 > 0
+assigned_credit_bytes        <= expected_tx_bytes
+one command                  -> one barrier key
+```
+
+Multiple LOAD commands may target one barrier generation only when every
+instruction independently resolves to that same key. A single non-multicast
+LOAD must never consume ranges belonging to different barriers.
+
+### 6.6 Completion algorithm
+
+Replace:
+
+```text
+notify_tma_completion(warp_id, completed_tx_bytes)
+```
+
+with a command-owned operation equivalent to:
+
+```text
+complete_tma_load(command.completion, command.memory_bytes)
+```
+
+On completion:
+
+1. Require a valid, not-yet-completed binding.
+2. Find the exact barrier object named by the command.
+3. Require the stored generation to equal the barrier's current generation.
+   A lower value is a stale completion; a higher value is impossible.
+4. Add exactly `credit_bytes` to that object.
+5. Assert `completed_tx_bytes <= expected_tx_bytes`.
+6. Mark the binding completed exactly once.
+7. Recompute readiness and phase flip for only that barrier.
+
+There is no loop over another barrier's pending credit and no leftover-byte
+spill. Completion order is therefore irrelevant.
+
+### 6.7 TMA ownership and lifecycle
+
+The following invariants hold at all times:
+
+```text
+bindings_created == bindings_completed + bindings_in_flight
+sum(assigned_credit for key/gen) <= expected_tx for key/gen
+sum(completed_credit for key/gen) <= assigned_credit for key/gen
+one binding_id is claimed once and completed once
+one non-multicast binding names one barrier key/generation
+no completion updates a different generation after a phase flip
+```
+
+At a wait that is about to hold, detect an impossible contract early:
+
+```text
+remaining_expected_tx > 0
+AND assigned outstanding credit for this key/generation == 0
+AND no supported producer can add credit
+    -> [TMA][abort] reason=unfulfillable-tx-contract
+```
+
+At CTA exit or warp-slot reuse, assert before clearing:
+
+```text
+no active WaitBlock hold
+no armed partial transition
+no deferred replay/progress owner
+no unassigned expected-tx contract for the CTA
+no TMA completion binding in flight for the CTA
+no completed-but-unapplied credit
+```
+
+Cleanup may erase state only after these assertions pass. It must never hide an
+orphan binding or stale completion.
+
+### 6.8 Deterministic WaitBlock release phase
+
+The current implementation calls `service_wait_block_release()` from each
+`Subcore::modify_warp_state()`. This lets subcore traversal order determine
+whether a same-cycle barrier change is observed immediately or one cycle later.
+
+Target SM-cycle order:
+
+```text
+1. advance shared pipelines, including TMA response/completion
+2. service WaitBlock release once for every hardware warp
+3. run all subcore issue phases
+4. arrivals issued by a subcore become visible to all releases next cycle
+```
+
+Required properties:
+
+- every warp is serviced exactly once per SM cycle;
+- all subcores observe the same cycle-start barrier snapshot;
+- a TMA completion visible at cycle start may release every matching warp that
+  cycle;
+- a SYNCS arrival issued during subcore issue cannot release a later-iterated
+  subcore in the same cycle;
+- moving the service point does not change trace cursors except through an
+  already-approved WaitBlock release action.
+
+### 6.9 Startup, payload, and provenance gates
+
+When `-wait_block_enable=1`, retain or enforce:
+
+- exact supported sidecar schema/version;
+- `validation_complete=true`, `failed=0`, non-empty runtime action maps;
+- unique `(trace_kernel_id, unique_function_id, action_pc)` keys;
+- complete static wait condition, effect, mask, join, and cursor proof;
+- sidecar CTA coverage equal to the selected trace grid;
+- fold and observe modes are mutually exclusive;
+- required enhanced trace, sync resolver, TMA metadata, and completion-target
+  payloads are present before kernel execution;
+- active action instructions with missing runtime payload abort unbudgeted;
+- zero-effective instructions are architectural no-ops and do not mutate
+  barrier, WaitBlock, cursor, or accounting state.
+
+The current v5 WaitBlock loader and zero-active path already implement most of
+this section. The new TMA completion-target payload must join the same
+fail-closed startup contract.
+
+### 6.10 Watchdog and kernel scope
+
+Replace hardcoded WaitBlock timing constants with explicit configuration:
+
+```text
+-wait_block_hold_watchdog_cycles 32000
+-wait_block_heartbeat_cycles      4096
+```
+
+Requirements:
+
+- print effective values in the startup banner;
+- use `{active, start_cycle}` rather than cycle zero as an inactive sentinel;
+- scope/reset WaitBlock totals, pace records, work counters, TMA binding
+  counters, and debug budgets per runtime kernel launch;
+- never inherit pending generations or exhausted log budgets across launches;
+- a provably unfulfillable TMA contract aborts immediately and is not delayed
+  until the WaitBlock watchdog;
+- increasing the watchdog threshold is not a correctness fix.
+
+The generic repeated-EXCH initialization epoch remains deferred because current
+FA3 proves one EXCH per barrier. Existing generation identity is nevertheless
+mandatory for every TMA completion binding.
+
+### 6.11 Pure hold query and scheduler accounting
+
+`peek_wait_block_hold_mode(warp_id)` is the authoritative non-mutating query for
+WaitBlock state. It inspects only `m_pending_sync_waits` and must never:
+
+- call a release service;
+- evaluate or mutate named BAR state;
+- call `waiting()`, `tma_flush`, cache access, or another stateful readiness
+  helper;
+- alter generation, counters, cursors, or scheduler order.
+
+The SR-M0A population rule is authoritative:
+
+```text
+selected
++ eligible_not_selected
++ wait_block_hold
++ blocked_with_valid_head
++ no_valid_instruction
++ drain
++ inactive
+== all hardware warp slots
+```
+
+For active warps:
+
+```text
+selected
++ eligible_not_selected
++ wait_block_hold
++ blocked_with_valid_head
++ no_valid_instruction
++ drain
+== active_warps
+```
+
+A WaitBlock hold is terminal for classification. Do not inspect a future
+IBuffer head, FU availability, or generic programmer-barrier state afterward.
+Legacy `mbarrier_spin` metrics that call a generic barrier predicate must be
+migrated to the pure query or explicitly marked non-authoritative.
+
+### 6.12 Metric contracts
+
+Keep these domains separate:
+
+1. **Issued wait outcomes**
+   - active wait instruction reports ready or not-ready once;
+   - skipped residual polls are not reconstructed as issued events.
+2. **Logical WaitBlock episodes**
+   - immediate fold;
+   - hold;
+   - release;
+   - skipped/folded occurrences.
+3. **TMA completion ownership**
+   - bindings created/assigned/completed/in-flight;
+   - memory bytes and completion-credit bytes;
+   - completion UID reorder observations;
+   - stale generation, missing identity, over-credit, under-coverage, and
+     cross-key application aborts.
+4. **Exclusive scheduler population**
+   - SR-M0A selected/eligible/blocked/no-valid/drain/WaitBlock classes.
+
+Required conservation equations:
+
+```text
+captured_poll_holds == captured_poll_releases
+partial_join_holds == partial_join_releases
+partial_deferred_occurrences
+    == partial_replayed_occurrences + partial_folded_occurrences
+TMA bindings created
+    == TMA bindings completed + TMA bindings in flight
+cross_barrier_completion_applications == 0
+```
+
+Instruction reconciliation uses matching units:
+
+```text
+fold-off retired warp instructions
+- fold-on retired warp instructions
+== WaitBlock skipped warp occurrences
+```
+
+Do not compare raw skipped warp occurrences directly with active-lane
+`gpu_sim_insn`.
+
+### 6.13 Diagnostics
+
+Every TMA binding event must be sufficient to reconstruct the causal chain:
+
+```text
+[TMABIND][assign]
+kernel_uid trace_kernel global_cta cta_slot sm warp
+uid tma_pc opcode barrier generation binding_id
+memory_bytes credit_bytes expected assigned outstanding
+
+[TMABIND][complete]
+same identity fields
+completion_cycle completed_before completed_after expected
+
+[TMABIND][abort]
+reason identity fields
+pending contracts and in-flight bindings for the affected warp/CTA
+```
+
+Required abort reasons include:
+
+```text
+missing-completion-target
+ambiguous-completion-target
+tx-contract-unresolved
+tx-contract-overassigned
+stale-barrier-generation
+duplicate-binding-completion
+cross-barrier-credit
+cta-cleanup-with-unassigned-credit
+cta-cleanup-with-inflight-completion
+```
+
+Heartbeat and abort output must remain bounded during normal execution, but
+fatal diagnostics are unbudgeted. Clean exit prints one grep-able aggregate:
+
+```text
+[TMABIND][FINAL] status=PASS
+bindings_created=N bindings_completed=N in_flight=0
+memory_bytes=X credit_bytes=Y
+uid_reorders=R cross_barrier_applications=0
+contract_mismatches=0 stale_generation=0
+```
+
+All accounting is event-driven. Do not add per-cycle maps, vectors, queues, or
+heap allocations. Per-command fields are fixed-size; per-barrier/warp
+containers are allocated with existing SM state.
+
+### 6.14 Implementation order
+
+1. **Evidence gate**
+   - determine whether the current trace already contains the TMA instruction's
+     runtime completion-barrier address;
+   - resolve the `0x96b0` 24-KiB/16-KiB contract;
+   - do not modify release semantics during this step.
+2. **Observation-only patch**
+   - report TMA PC, UID, resolved barrier, generation, memory bytes, and credit
+     bytes;
+   - verify K5/K10 binding coverage and no ambiguous identity.
+3. **Exact ownership**
+   - add fixed-size completion target fields to `TMACommand`;
+   - bind at issue/enqueue;
+   - update only the bound barrier at completion;
+   - remove anonymous FIFO completion consumption and cross-barrier spill.
+4. **Lifecycle**
+   - add assignment/completion conservation;
+   - assert no orphan state before CTA cleanup and warp reuse.
+5. **Release ordering**
+   - move release service to one SM-level cycle phase after TMA completion and
+     before all subcore issue.
+6. **Scope and metrics**
+   - add configurable watchdog/heartbeat values;
+   - reset launch-scoped counters/budgets;
+   - complete pure-query migration and metric reconciliation.
+7. **Verification**
+   - run focused tests, then K5 and K10 with the same binary, trace, and config
+     except for explicitly named feature gates.
+
+Do not combine the evidence gate with a guessed size correction. Do not
+increase the watchdog, force a barrier phase, drop a WaitBlock hold, or consume
+the next binding to manufacture progress.
+
+### 6.15 Verification matrix
+
+Focused tests:
+
+- one 16-KiB LOAD bound to one 16-KiB barrier;
+- two LOADs bound to the same barrier generation;
+- two barriers with same-warp LOAD completions returned in reverse UID order;
+- current 24-KiB expect/16-KiB transfer mismatch, which must fail before any
+  cross-barrier credit until its contract is resolved;
+- prefetch completion produces no mbarrier credit;
+- store/reduce completion affects only the `UTMACMDFLUSH` domain;
+- stale completion after phase advance aborts;
+- CTA cleanup with unassigned or in-flight ownership aborts;
+- feature off remains bit-identical.
+
+K5 post-fix acceptance:
+
+```text
+passes cycle 50173
+partial replay synthetic/reservation aborts = 0
+partial replay accounting/watchdog aborts = 0
+released capsules == replay drains == replay closes
+TMA binding coverage = 100%
+TMA cross-barrier applications = 0
+TMA contract mismatches = 0
+WaitBlock generation overshoots/watchdog aborts = 0
+clean kernel exit
+[WAITBLOCK][FINAL] status=PASS
+[TMABIND][FINAL] status=PASS
+```
+
+K10 regression acceptance:
+
+```text
+clean kernel exit
+no semantic TMA/BAR/memory-work loss
+no TMA binding/lifecycle abort
+WaitBlock holds/releases balanced
+SR-M0A population conservation PASS
+```
+
+Only after both runs pass may the `.e83` debugging session be closed and the
+older Batch B document be treated as historical rather than authoritative.
+
+### 6.16 Explicit deferrals and future extension rules
+
+The following work is not required for the current K5/K10 fix, but its boundary
+is part of the design.
+
+**Generic effect framework**
+
+The current sidecar's exact PC/effect allow sets remain authoritative. A future
+ISA-wide detector may classify wait observation, delay-only backoff,
+register/predicate def-use, memory space, async launch/completion, sync
+mutation, fence, control flow, and nondeterministic reads. Until that framework
+is separately reviewed, unknown instructions and effects remain unsafe and
+must fail closed.
+
+**Repeated EXCH initialization**
+
+Current FA3 validation assumes exactly one EXCH initialization per barrier. A
+future implementation may support repeated initialization only with:
+
+```text
+init_epoch++
+reset phase, generation, flip history, and per-phase counters
+remove consumed-generation state from the old epoch
+include init_epoch in pending waits and TMA completion targets
+```
+
+Reinitialization must abort when the old epoch has a pending wait, unassigned
+tx contract, in-flight TMA completion, or any state that cannot be separated
+from the new epoch. A completion from the old epoch must never update the new
+barrier object.
+
+**Trace regeneration**
+
+Reuse the current full trace only if it contains a distinct, validated runtime
+completion-barrier value for every completion-bearing TMA instruction. If that
+field is absent or aliases descriptor metadata, trace regeneration is a
+mandatory correctness prerequisite, not an optional optimization.

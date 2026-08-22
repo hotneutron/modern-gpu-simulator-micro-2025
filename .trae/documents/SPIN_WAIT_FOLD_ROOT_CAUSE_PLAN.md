@@ -306,7 +306,7 @@ Implementation control gates:
 
 | Stage | 내용 |
 |---|---|
-| Stage 0.1 | TMA completion UID별 exact credit. 먼저 기존 로그/트레이스로 same-warp UID inversion과 partial-consume 걸침 존재를 검증한 뒤 구현 범위 확정 |
+| Stage 0.1 | TMA completion UID별 exact barrier credit. Same-warp UID inversion뿐 아니라 TMA instruction의 barrier identity와 expect-tx/transfer-size contract를 검증한 뒤 구현 범위 확정 |
 | Stage 0.2 | fold release를 SM cycle-start 단일 phase로 이동 |
 | Stage 0.3 | fold startup/provenance fail-fast (`MINIMAL ONLY`) |
 | Stage 0.5 | lifecycle cleanup assert (`PARTIAL ONLY`) |
@@ -346,19 +346,45 @@ ground truth가 아니다.
   - uid7이 @8,400에 먼저 완료되지만 FIFO head `0x16c30`을 credit/flip
   - uid6은 @8,510에 완료되어 다음 `0x16c00`을 credit
 
-수정:
+`.e83` 재검증은 이 Stage가 현재 실패와 같은 **completion-to-barrier identity
+loss** 문제를 다룬다는 것을 확인했지만, 아래의 기존 partial-range 배정 설계만으로는
+SM121 watchdog을 해결할 수 없음을 추가로 증명했다.
 
-- `ARRIVE_EXPECT_TX`는 warp별 **unassigned credit ranges**를 issue order로 생성한다.
-- 각 real TMA LOAD가 enqueue될 때 자신의 `transfer_uid/total_bytes`를 pending range에
-  issue-order로 배정한다.
-  - 한 transfer가 여러 barrier range에 걸치거나
-  - 한 barrier expected bytes가 여러 transfer에서 채워지는 경우를 모두 지원
-- `TMATransferEntry`가 `vector<{barrier_key, bytes}> completion_credits`를 직접 보유한다.
-- completion은 UID에 붙은 exact credit vector만 적용한다. Completion order와 무관하다.
+- `.e83` 전체에는 parse 가능한 same-warp LOAD completion UID inversion이 최소
+  40회 있어 UID-owned binding은 여전히 필수다.
+- 그러나 abort한 SM121의 관련 LOAD completion은 uid6, uid7, uid8, uid9 순서로
+  완료된다. 이 CTA의 직접 trigger는 out-of-order completion이 아니다.
+- SM121 `0x16c00`은 expect-tx 24,576 bytes를 arm하지만 대응 uid7
+  `UTMALDG 0x96b0`은 descriptor에서 16,384 bytes로 모델링된다.
+- 현재 FIFO는 uid8 completion의 첫 8,192 bytes로 uid7의 stale `0x16c00`
+  range를 끝내고 나머지 8,192 bytes를 `0x16c38`에 적용한다.
+- 기존 제안처럼 한 transfer가 여러 barrier range에 걸치는 것을 허용하면 이
+  잘못된 배정을 completion time에서 issue time으로 옮길 뿐, 동일한 8-KiB offset과
+  terminal deadlock을 보존한다.
+
+수정 설계:
+
+- `ARRIVE_EXPECT_TX`의 warp별 unassigned range는 진단/검증에만 사용하고, completion
+  routing authority로 사용하지 않는다.
+- 각 real TMA LOAD가 issue/enqueue될 때 TMA instruction이 지정한 exact barrier
+  identity와 현재 generation을 `TMACommand`/`TMATransferEntry`에 저장한다.
+  - `UTMALDG`: instruction의 implicit completion-barrier register
+  - `UBLKCP`: explicit barrier operand
+- 한 barrier의 expected bytes를 여러 transfer가 채우는 것은 각 transfer가 같은
+  barrier identity를 명시할 때만 허용한다.
+- 하나의 non-multicast transfer가 서로 다른 barrier key를 가로질러 credit하는 것은
+  금지한다. 그런 동작이 필요한 ISA variant는 별도 trace proof가 있어야 한다.
+- completion은 UID가 소유한 exact `(kernel, CTA, barrier, generation)`에만 적용한다.
+  Completion order와 무관하다.
 - `notify_tma_completion(warp_id, bytes)`와 anonymous FIFO consumption을 제거한다.
-- transfer bytes가 unassigned로 남거나 pending range보다 부족/초과하면 hard assert한다.
+- expect-tx bytes와 modeled transfer bytes가 불일치하면 다른 barrier range에서
+  보충하지 말고 TMA PC, UID, barrier, generation, 두 byte 수를 출력하고 hard
+  abort한다. `0x96b0`의 24,576/16,384 mismatch는 descriptor mapping 오류, 누락된
+  8,192-byte async producer, 또는 별도 completion-credit 크기 중 무엇인지 trace
+  evidence로 먼저 결정한다.
 - `[TMADBG] load-mbarrier-credit`에
-  `uid/barrier/credit_bytes/remaining_for_barrier`를 출력한다.
+  `uid/tma_pc/barrier/generation/memory_bytes/credit_bytes/remaining_for_barrier`
+  를 출력한다.
 
 This correction is required before final timing signoff for TMA-credited barriers.
 It is not a prerequisite for diagnosing the `.e76` compound wait-control defect:

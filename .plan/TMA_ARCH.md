@@ -905,7 +905,13 @@ requests_total = requests_per_row * outer_iters              // count of 128B AG
 
 - `box_dim`, `element_size` come from the resolved descriptor config (tensor map).
 - `box_dim[0]` is the innermost (row) extent; the rest are outer iterations. This is why two transfers with equal `total_bytes` but different `box_dim[0]` aspect ratios produce **different** `requests_total` (AGU throughput depends on row shape, not just byte count).
-- Validated example (FA3): `box_dim=[64,128]`, `element_size=2` (bf16) → `total_bytes = 64*128*2 = 16384`; the FA3 `UTMALDG` site observed `bytes=24576`, `requests=768` (after the 32B-sector expansion, see below).
+- Validated geometry example (FA3): `box_dim=[64,128]`,
+  `element_size=2` (bf16) -> `total_bytes = 64*128*2 = 16384`,
+  `requests_total=128`, and `512` 32-byte sector responses. K5 logs `.e70`
+  through `.e83` consistently report this geometry for UTMALDG `0x96b0`.
+  Its paired mbarrier expect-tx value is nevertheless 24,576 bytes; that
+  completion-contract mismatch is unresolved and documented in
+  `WAIT_BLOCK.md` Section 5.2.
 
 **B. Covered-span source — `UBLKCP`, `UBLKPF`, `UBLKRED`** (1D bulk ops, no box geometry)
 
@@ -935,7 +941,16 @@ For reduce-store the moved region is read **and** written (`dst[i] += src[i]` ov
 
 ### Phase 3: GMEM -> SMEM TMA Data Movement  ✅ COMPLETED + VALIDATED
 
-**Status:** Implemented and validated on the FA3 backward trace. `UTMALDG` and `UBLKCP` issue real 32B-sector `mem_fetch`es through the shared interconnect to L2 (L1 bypassed), and completion drives the Phase 5 mbarrier path. Validation evidence: thousands of `complete uid=...` events with exact byte accounting (`bytes=24576` for the 192-request UTMALDG, `bytes=512` for the 4-request UBLKCP) and zero `CACHE-FILL-MISS` / assert / signal events. `UTMAPF`/`UBLKPF` are **not** covered here — they were moved to Phase 4.5 (see phase map).
+**Status:** Data movement is implemented and exercised on the FA3 trace.
+`UTMALDG` and `UBLKCP` issue real 32B-sector `mem_fetch`es through the shared
+interconnect to L2 (L1 bypassed), and completion drives the Phase 5 mbarrier
+path. Current K5 evidence reports 16,384 bytes, 128 AGU requests, and 512 sector
+responses for the `64x128` UTMALDG sites. The earlier claim that this same
+geometry produced 24,576 bytes and 768 sector responses was inconsistent with
+both the formula above and `.e70`-`.e83`; it is not retained as validation.
+The separate 24,576-byte expect-tx value paired with `0x96b0` remains under
+investigation. `UTMAPF`/`UBLKPF` are **not** covered here; they were moved to
+Phase 4.5 (see phase map).
 
 **Key implementation detail (L2-friendly issue):** the TMA mover emits each 128B AGU request as `SECTOR_CHUNCK_SIZE` (4) separate 32B sector mem_fetches, each carrying a single-bit `sector_mask` and matching `byte_mask`, exactly like a coalesced ldst request. This keeps the L2 from re-splitting the request (`breakdown_request_to_sector_requests` passes `data_size==32 && sector_mask.count()==1` unchanged), so one issued mf maps to exactly one response. AGU throughput remains modeled in 128B cache-line units (`requests_total`); only the wire-level mf granularity is 32B.
 
@@ -1132,9 +1147,20 @@ Test plan:
 
 ### Phase 5: TMA Completion / Barrier Model  ✅ COMPLETED (separate SYNC work)
 
-**Status:** Implemented and validated as a **separate, independent work stream** (the Hopper `SYNCS` mbarrier / synchronization model), not as part of this TMA architecture effort. It was completed and full-trace validated before Phase 3 of this plan. The TMA load completion implemented in Phase 3 simply *plugs into* the mbarrier `complete_tx` path that the SYNC work already provides.
+**Status:** The Hopper `SYNCS` barrier state and wait semantics were implemented
+as a separate work stream, but the TMA completion binding is not the exact
+instruction-derived mechanism previously claimed here. The current runtime
+queues `(barrier_key, pending_tx_bytes)` at `SYNCS.ARRIVE_EXPECT_TX` and later
+routes a LOAD completion by only `(warp_id, completed_tx_bytes)`.
 
-What the SYNC work delivered: `MBARRIER_OP`, address-keyed barrier objects keyed on `(trace_kernel_id, cta_id, barrier_addr)`, pending-wait tracking, classification by operand 2 (`semantic_raw`) rather than opcode suffix, bit31 phase-parity decode, the TMA-instruction→barrier-register binding rules (`dst_reg+1` for `UTMALDG`/`UTMAPF`, explicit 3rd operand for `UBLKCP`, none for stores), and the TMA-completion→barrier-progress connection.
+The SYNC work delivered `MBARRIER_OP`, address-keyed barrier objects keyed on
+`(trace_kernel_id, cta_id, barrier_addr)`, pending-wait tracking,
+`semantic_raw`-based arrive classification, bit31 phase-parity decode, and a
+TMA-completion-to-barrier progress path. The intended instruction-level rules
+(`dst_reg+1` for `UTMALDG`/`UTMAPF`, explicit third operand for `UBLKCP`) remain
+documented in `Full_sync_impl.md`, but are not represented in the current
+`TMACommand`. K5 `.e83` proves that the per-warp FIFO is insufficient; see
+`WAIT_BLOCK.md` Section 5.
 
 The store-side commit-group / wait-group completion (Phase 4, `UTMACMDFLUSH`) is a **separate** mechanism and is *not* covered by this mbarrier model.
 
