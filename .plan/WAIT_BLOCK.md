@@ -2222,3 +2222,85 @@ a correctness bug in the fixed reservation model; both remove latent hazards.
   slots with sequential canonical slots, breaking that identity. The server
   config already uses width 1; the guard aborts instead of silently corrupting
   replay ordering if the width is ever raised while a replay stream is active.
+
+## 5. Post-reservation run (.e83): reservation fixed, TMA tx-credit deadlock isolated
+
+The `.e83` K5 run built on the reservation fix. Result:
+
+- Reservation bug is fixed. The run passed the old `.e82` failure point at cycle
+  50,173 with `synthetic issue aborts = 0`, and completed 48 real
+  deferred-replay drains (`replay_occurrences > 0`) with zero partial-replay
+  accounting/watchdog aborts.
+- It then aborted at cycle 68,271 on a 32,000-cycle hold-watchdog for
+  `INJECT_MISSING_WAIT` block `wb_fid3_e0x5a50` (barrier `0x16c38`), i.e. the
+  independent all-live cross-warp deadlock predicted by 4.7.10. This is not a
+  partial-replay failure.
+
+### 5.1 Deadlock state (SM121, CTA 0, all 16 warps held)
+
+```text
+warp 4,7      block 0x5a50  barrier 0x16c38  exp/cur gen 5/4  arrive 0/1
+warp 12,13,14 block 0x13b0  barrier 0x16c38  exp/cur gen 5/4  arrive 0/1
+warp 8,9,10,11,15 block 0x74e0 barrier 0x16c50 exp/cur gen 5/4 arrive 0/1
+warp 5,6      block 0x5bc0  barrier 0x16c58  exp/cur gen 4/3  arrive 1/1 tx=8192/16384
+warp 0        poll 0xb370   barrier 0x16c60  exp/cur gen 4/3  arrive 2/3
+```
+
+The whole CTA is held, so no warp can supply the missing arrival/tx that another
+warp is waiting on.
+
+### 5.2 Root cause: TMA tx-credit misalignment in notify_tma_completion
+
+This is not a replay bug, not a trace bug, and not caused by the WaitBlock
+holds. It is a pre-existing bug in the simulator's TMA completion accounting.
+
+Evidence it is none of those three:
+
+- Replay: the deadlocked SM121 has zero partial-replay events. It never used
+  deferred replay.
+- Trace: every `bind_tma` and `arrive_expect_tx` on SM121 is internally
+  consistent -- each barrier binds and expects exactly its transfer size
+  (16384 for `0x16c30/38/50/58`, 24576 for `0x16c00`). The trace maps each
+  UTMALDG to its completion mbarrier 1:1.
+- WaitBlock holds: the misalignment starts at cycle 9,767, long before the
+  first `INJECT_MISSING_WAIT` hold at 38,122. The holds do not cause or reorder
+  it.
+
+The seed is `0x16c00`, whose `expected_tx = 24576` is not a multiple of the
+16384-byte transfer size. `notify_tma_completion` pours each completion's bytes
+into the per-warp FIFO front binding with `applied = min(remaining, pending)`:
+
+```text
+cyc=8182  0x16c00 applied=16384 -> 16384/24576
+cyc=9767  0x16c00 applied=8192  -> 24576/24576  (fills 0x16c00)
+cyc=9767  0x16c38 applied=8192  -> 8192/16384   (SAME completion spills 8192 here)
+```
+
+The second 16384-byte completion finishes `0x16c00` (needs only 8192) and the
+leftover 8192 overflows into the next binding (`0x16c38`). From that point every
+barrier is credited by the wrong transfer, permanently offset by 8192. ~25k
+cycles later `0x16c58` is left at `8192/16384`, never flips gen 3->4, and warps
+5,6 (expected_gen 4) hang; the whole CTA then jams behind them and the watchdog
+fires at 68,271.
+
+`notify_tma_completion` does not match a completion to the binding that produced
+it. `bind_tma_completion_to_sync_barrier` pushes per-warp `(barrier, tx_bytes)`
+bindings into a FIFO, and completion bytes are streamed across bindings, so one
+completion can straddle two barriers whenever a binding's `expected_tx` is not a
+whole multiple of the transfer size.
+
+The correct HW semantics: each UTMALDG credits its own completion mbarrier with
+its own transaction bytes. The binding and its completion must be linked
+explicitly (e.g. by TMA uid), not matched by a warp-level FIFO byte stream.
+
+### 5.3 Candidate fixes (not yet implemented)
+
+1. Key each TMA completion to the exact binding it came from (carry the TMA uid
+   / target barrier through completion) instead of a warp FIFO byte pour.
+2. Reject/omit a partial `applied` that would split one completion across two
+   bindings; a completion must land wholly on its own binding.
+
+Either fix must preserve the existing per-barrier `expected_tx`/`completed_tx`
+accounting and phase-flip logic. The `INJECT_MISSING_WAIT` holds are not
+themselves wrong; they only exposed the credit-matching bug by reordering
+bindings vs completions.
