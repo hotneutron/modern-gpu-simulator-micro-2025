@@ -107,6 +107,9 @@ struct inst_trace_t {
   uint64_t sync_barrier_addr;
   bool sync_has_semantic_raw;
   uint64_t sync_semantic_raw;
+  bool tma_completion_runtime_valid;
+  uint64_t tma_completion_barrier_addr;
+  uint32_t tma_completion_barrier_ureg_id;
   // Runtime values of register-form BAR.SYNC / BAR.ARV operands (Phase A capture).
   bool bar_runtime_valid;
   bool bar_runtime_has_id;

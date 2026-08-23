@@ -13,7 +13,9 @@ AN INDEPENDENT ALL-LIVE CROSS-WARP DEADLOCK; THE FETCH-BASE FIX AND REPLAY
 LIFECYCLE GUARDS ARE IMPLEMENTED; K5 `.e82` CONFIRMED SUCCESSFUL CAPSULE
 REPLAY/CLOSE BUT EXPOSED AN OUT-OF-ORDER REPLAY-DECODE RESERVATION GAP; K5
 `.e83` CONFIRMED THE RESERVATION FIX AND EXPOSED AN INDEPENDENT TMA
-COMPLETION-BINDING AND TX-SIZE CONTRACT FAILURE.
+COMPLETION-BINDING AND TX-SIZE CONTRACT FAILURE; POST-REVIEW K5/K10 TRACE
+ANALYSIS RESOLVED THE SIZE FAILURE AS A DESCRIPTOR-SITE MISCLASSIFICATION AND
+CONFIRMED THAT A DIRECT TMA COMPLETION-BARRIER TRACE FIELD REQUIRES RETRACING.
 
 This document is the authoritative, self-contained design and execution record
 for WaitBlock, partial replay, and the post-`.e83` TMA/barrier work. The linked
@@ -2314,19 +2316,24 @@ The same structural problem exists even without the 24-KiB/16-KiB mismatch:
 out of issue order. A completion-order FIFO cannot preserve
 TMA-command-to-barrier identity under that response ordering.
 
-The byte mismatch itself is not resolved by `.e83`. One of these must be proven
-from the source trace and descriptor data before changing accounting:
+The byte mismatch is not resolved by `.e83` alone. Post-review evidence in
+Section 6.4 resolves it as the first case below:
 
 1. `0x96b0` really moves 24,576 bytes and its descriptor/geometry mapping is
-   wrong.
+   wrong. **Confirmed.**
 2. The 24,576-byte expect count covers the 16,384-byte UTMALDG plus another
-   8,192-byte async producer that the simulator does not model.
+   8,192-byte async producer that the simulator does not model. **Rejected by
+   full K5 occurrence grouping.**
 3. The TMA instruction has a distinct architectural completion-credit size
    that must be carried separately from modeled memory traffic bytes.
+   **Not needed for this site.**
 
 The captured `semantic_raw=24576` is hardware runtime evidence; the
-descriptor-derived 16,384-byte command is simulator metadata. Do not silently
-choose either value or hardcode the affected PC/barrier.
+descriptor-derived 16,384-byte command is a medium-confidence simulator
+metadata mapping. The FA3 source-level transaction formula, kernel tile shape,
+and all dynamic occurrences independently prove that this is the 24,576-byte Q
+transfer. The resolver must fix the descriptor association generically; do not
+hardcode the affected PC/barrier.
 
 WaitBlock makes this invalid accounting architecturally visible by holding a
 modeled-not-ready warp. The byte mismatch is present before the final
@@ -2339,15 +2346,17 @@ The fix has two mandatory parts.
 
 1. Give every load `TMACommand` an exact completion binding before it enters the
    asynchronous mover. Prefer the barrier identity carried by the TMA
-   instruction (`UTMALDG` implicit barrier register, `UBLKCP` explicit barrier
-   operand); otherwise assign a unique issue-time binding ID and carry it
-   through `TMATransferEntry`.
+   instruction. Both observed `UTMALDG` and `UBLKCP` forms carry the completion
+   barrier in the high UReg of their first destination-state register pair.
+   Carry that runtime value and a unique issue-time binding ID through
+   `TMATransferEntry`.
 2. On completion, update only that binding's `(kernel, CTA, barrier,
    generation)` object. Never stream remaining bytes into another binding.
    Completion order must be irrelevant.
 
-Before implementation can be called complete, resolve the 24-KiB/16-KiB
-contract above. Merely adding UID identity while crediting 16,384 bytes leaves
+The 24-KiB/16-KiB contract is resolved in Section 6.4, but the corrected
+descriptor mapping and direct barrier payload are not implemented yet. Merely
+adding UID identity while retaining the 16,384-byte misclassification leaves
 `0x16c00` permanently at `16384/24576` and deadlocks earlier. Merely forbidding
 cross-binding spill is a useful fail-closed diagnostic, not a fix.
 
@@ -2383,7 +2392,7 @@ without introducing scheduler-order bias.
 
 | ID | Work item | Status after `.e83` |
 |---|---|---|
-| B0 | Exact TMA-command-to-barrier completion ownership and tx-size contract | **BLOCKING / NOT IMPLEMENTED** |
+| B0 | Exact TMA-command-to-barrier completion ownership and tx-size contract | **EVIDENCE RESOLVED / TRACE CAPTURE IMPLEMENTED / RUNTIME NOT IMPLEMENTED**; retrace required |
 | B1 | One SM-level WaitBlock release phase per cycle | **REQUIRED / NOT IMPLEMENTED** |
 | B2 | WaitBlock startup and provenance fail-fast checks | **MOSTLY IMPLEMENTED** |
 | B3 | Assert-before-clear lifecycle checks | **PARTIAL**: WaitBlock state guarded; TMA ownership cleanup missing |
@@ -2393,7 +2402,7 @@ without introducing scheduler-order bias.
 | B7 | Fold/WaitBlock metric integrity and final reconciliation | **PARTIAL** |
 | D0 | Generic ISA-wide effect framework | **DEFERRED**; exact sidecar allow/proof sets remain authoritative |
 | D1 | Generic repeated-EXCH initialization epochs | **DEFERRED** for current FA3 one-EXCH-per-barrier contract |
-| D2 | Full trace regeneration | **CONDITIONAL**: required only if the existing trace does not carry exact TMA completion-barrier identity |
+| D2 | Full trace regeneration | **REQUIRED**: the existing protobuf has no exact TMA completion-barrier field |
 
 No item in this section may weaken the existing WaitBlock generation,
 cursor/replay, semantic-work, or feature-off invariants.
@@ -2437,8 +2446,9 @@ struct TMACommand {
 
 `memory_bytes` and `credit_bytes` are intentionally separate. They are equal by
 default, but a difference is legal only when static ISA evidence plus dynamic
-trace evidence explicitly proves that distinction. The current
-24,576/16,384 case has no such proof yet.
+trace evidence explicitly proves that distinction. For K5 `0x96b0`, the
+post-review evidence instead proves that the descriptor mapping is wrong:
+after correction both values are 24,576.
 
 The completion target key must include enough identity to reject stale reuse:
 
@@ -2461,10 +2471,11 @@ order and not from the most recently observed SYNCS.
 
 Required source rules:
 
-- `UTMALDG`: derive the implicit completion-barrier register from the
-  instruction-defined destination/register relation and capture its runtime
-  barrier address.
-- `UBLKCP`: capture the explicit completion-barrier operand.
+- `UTMALDG`: the first destination-state operand `[URn]` is a register pair;
+  capture `URn+1`, the implicit completion-barrier address.
+- `UBLKCP`: the observed `UBLKCP.S.G [URn], [URm], URk` form also carries the
+  completion barrier in the high half `URn+1` of its first destination-state
+  pair. It does not have a separate textual barrier operand.
 - `UTMAPF`/`UBLKPF`: prefetch only; no mbarrier completion target.
 - `UTMASTG`, `UTMAREDG`, and `UBLKRED`: store/reduce completion uses the
   asynchronous store-group/`UTMACMDFLUSH` domain, not this load mbarrier path.
@@ -2476,23 +2487,41 @@ Existing documentation claimed the runtime already implemented these rules.
 It does not. The current `TMACommand` has no completion-barrier field, and
 `notify_tma_completion()` receives only `(warp_id, bytes)`.
 
-Trace-data gate:
+Trace-data gate result:
 
-1. Inspect the current protobuf payload for a separately captured TMA
-   completion-barrier value.
-2. If present, plumb it through `inst_trace_t`, `trace_warp_inst_t`, and
-   `TMACommand` without reinterpretation.
-3. If absent, extend the tracer/protobuf with a dedicated valid bit and 64-bit
-   runtime barrier address, then regenerate the trace.
-4. Do not reuse a descriptor handle, memory address, `sync_barrier_addr` from an
+1. `instruction.proto` currently has `sync` and `bar_runtime` payloads but no
+   TMA completion payload.
+2. Generic register values are not serialized into the replay protobuf.
+   `tma_runtime_operand_debug.jsonl` records the two TMA memory-reference
+   callbacks, but it does not preserve the first pair's high UReg as a
+   separately trustworthy barrier field.
+3. The static SASS proves the relationship. For K5:
+
+   ```text
+   R4  = R16 + 0x16800
+   UR8 = R3                    // destination
+   UR9 = R4                    // completion barrier
+   SYNCS ... [R16+0x16800]
+   UTMALDG.4D [UR8], ...
+   ```
+
+   K10 similarly uses the high half of each `UTMALDG`/`UBLKCP` destination
+   state pair for the same contract barrier.
+4. Extend the protobuf with a dedicated TMA completion payload containing a
+   valid bit and 64-bit runtime barrier address. The tracer must read `URn+1`
+   directly for each completion-bearing LOAD.
+5. Plumb the field through `inst_trace_t`, `trace_warp_inst_t`, and
+   `TMACommand`, then regenerate K5 and K10 traces.
+6. Do not reuse a descriptor handle, memory address, `sync_barrier_addr` from an
    unrelated SYNCS occurrence, or PC-order inference as the completion target.
 
-The old no-regeneration preference is subordinate to this correctness gate.
+The existing traces are sufficient to prove ordering and diagnose the size
+mapping, but not to provide the final command-owned runtime identity. Retracing
+is therefore mandatory for the production fix.
 
-### 6.4 Expected-tx and transfer-size decision gate
+### 6.4 Expected-tx and transfer-size decision
 
-The `.e83` contract conflict must be resolved before enabling the new
-completion path:
+The `.e83` contract conflict is resolved:
 
 ```text
 SYNCS at 0x9680:
@@ -2500,47 +2529,77 @@ SYNCS at 0x9680:
     expected_tx   = 24576
 
 UTMALDG at 0x96b0:
-    descriptor    = box_64x128xbf16
-    memory_bytes  = 16384
-    requests      = 128 x 128-byte AGU lines
+    current descriptor mapping = box_64x128xbf16
+    current modeled bytes       = 16384
+    architectural transaction   = 24576
 ```
 
-Required evidence:
+Evidence:
 
-- static SASS operands for `0x9680` and `0x96b0`;
-- dynamic operand values, including the TMA completion-barrier address;
-- `tma_pc_base_map.json`;
-- `tma_operand_resolver.json`;
-- `tma_descriptor_configs.json`;
-- the CTA121/warp0 source-trace interval from `0x9680` through the next
-  expect-tx/TMA pair;
-- any non-TMA async instruction capable of contributing `complete_tx`.
+- The trace kernel type is `FlashAttnFwdSm90` with
+  `TileShape_MNK=(192,128,64)` and BF16 elements.
+- FA3 defines
+  `TmaTransactionBytesQ = size(SmemLayoutQ) * sizeof(Element)`, where
+  `SmemLayoutQ` is `(M,K)`. This gives `192 * 64 * 2 = 24576`.
+- The producer calls `barrier_Q.arrive_and_expect_tx(TmaTransactionBytesQ)`
+  and then issues exactly one `tma_load_Q` using that barrier.
+- Across all 132 K5 CTAs, the full trace contains 5,112 completion-bearing
+  LOAD occurrences. Every contract is ordered and non-overlapping.
+- The `0x9680 -> 0x96b0` pair occurs 264 times. Every occurrence is
+  `expected=24576` followed by exactly one `UTMALDG`; no second 8-KiB producer,
+  unmatched LOAD, overwritten contract, or residual contract exists.
+- Every other K5 contract sums exactly to 16,384 bytes under current metadata.
+- The current `0x96b0` descriptor result is
+  `confidence=medium`; it is not direct descriptor-byte evidence.
+- K10 provides the required multi-producer control case. All 13,824 LOAD
+  occurrences close their contracts exactly:
+  - `16896 = UTMALDG(16384) + UBLKCP(512)`
+  - `32768 = UTMALDG(16384) + UTMALDG(16384)`
+- K5 `ufid=3` contains no static or runtime-observed multicast TMA.
 
-Decision:
+Conclusion:
 
 ```text
-if 0x96b0 is actually a 24576-byte transfer:
-    correct generic descriptor/geometry resolution
-    memory_bytes = credit_bytes = 24576
-
-else if another 8192-byte async producer targets the same barrier generation:
-    model that producer explicitly
-    each producer owns the same exact barrier key with its own credit_bytes
-
-else if ISA evidence proves memory_bytes != completion credit:
-    retain memory_bytes = 16384
-    carry the independently proven credit_bytes = 24576
-
-else:
-    abort at command binding with tx-contract-unresolved
+0x96b0 is the Q transaction.
+the 64x128 classification is wrong.
+resolve it to the unique rank-4 BF16 64x192 descriptor candidate.
+memory_bytes = credit_bytes = 24576.
 ```
 
-No kernel ID, PC, barrier offset, or 8-KiB correction may be hardcoded.
+The postprocessor must make this correction generically:
+
+1. Group completion-bearing LOADs by their exact traced barrier contract.
+2. Sum independently resolved command sizes for each contract.
+3. If a single descriptor-backed command underfills the contract, search only
+   the launch's proven descriptor candidates with the same rank/data type.
+4. Accept a correction only when exactly one candidate's box volume equals the
+   captured expected-tx bytes.
+5. Correct descriptor identity, base, geometry, `memory_bytes`, and
+   `credit_bytes` together.
+6. If zero or multiple candidates match, fail sidecar generation.
+
+No kernel ID, PC, barrier offset, descriptor handle ordering, or 8-KiB
+correction may be hardcoded.
 
 ### 6.5 Issue-time binding algorithm
 
-`ARRIVE_EXPECT_TX` may create an event-scoped pending contract for validation,
-but a warp FIFO is not the routing authority.
+`ARRIVE_EXPECT_TX` creates one event-scoped assignment contract. Warp issue is
+in-order, so the contract exists before its completion-bearing LOADs. The
+runtime barrier identity still comes from each LOAD's new traced completion
+payload; the contract validates command membership and byte conservation. A
+warp FIFO is not the completion routing authority.
+
+Contract rules:
+
+- `LOAD before ARRIVE_EXPECT_TX` aborts.
+- A new expect-tx while the previous contract has unassigned bytes aborts.
+- One contract may own multiple commands.
+- Each command owns exactly one barrier key/generation.
+- One command may not span contracts or barrier keys.
+- The sum of assigned command credits must equal the contract's
+  `expected_tx_bytes`.
+- K5 exercises one-command contracts; K10 exercises both
+  `UTMALDG + UBLKCP` and `UTMALDG + UTMALDG` contracts.
 
 At each active LOAD issue:
 
@@ -2548,10 +2607,13 @@ At each active LOAD issue:
 2. Resolve the command's exact runtime completion-barrier address.
 3. Look up the barrier object for the same kernel, CTA, address, and current
    generation.
-4. Resolve `credit_bytes` under Section 6.4.
-5. Assign a monotonically increasing `binding_id`.
-6. Store the complete target in `TMACommand` before enqueue.
-7. Increment event-driven assigned/outstanding counters for that exact barrier
+4. Require that address/generation to match the active assignment contract.
+5. Resolve `memory_bytes` and `credit_bytes` under Section 6.4.
+6. Require assigned bytes not to exceed the contract and close the assignment
+   contract only at exact equality.
+7. Assign a monotonically increasing `binding_id`.
+8. Store the complete target in `TMACommand` before enqueue.
+9. Increment event-driven assigned/outstanding counters for that exact barrier
    generation.
 
 Required issue-time assertions:
@@ -2839,47 +2901,61 @@ containers are allocated with existing SM state.
 
 ### 6.14 Implementation order
 
-1. **Evidence gate**
-   - determine whether the current trace already contains the TMA instruction's
-     runtime completion-barrier address;
-   - resolve the `0x96b0` 24-KiB/16-KiB contract;
-   - do not modify release semantics during this step.
-2. **Observation-only patch**
-   - report TMA PC, UID, resolved barrier, generation, memory bytes, and credit
-     bytes;
+1. **Evidence gate: complete**
+   - current protobuf has no TMA completion-barrier payload;
+   - K5/K10 ordering and contract aggregation are proven from the full traces;
+   - `0x96b0` is a 24-KiB Q transaction misclassified by medium-confidence
+     descriptor metadata;
+   - K5 has no multicast TMA.
+2. **Trace-schema patch complete; retrace pending**
+   - dedicated TMA completion payload is implemented;
+   - the tracer captures the high UReg of the first destination-state pair for
+     completion-bearing `UTMALDG` and `UBLKCP`;
+   - regenerate K5 and K10 traces;
+   - require 100% valid completion targets.
+3. **Postprocessor correction and observation**
+   - group commands by exact traced barrier contract;
+   - correct descriptor identity only through the unique rank/type/expected-byte
+     candidate rule from Section 6.4;
+   - report TMA PC, UID, barrier, generation, memory bytes, credit bytes, and
+     per-contract assigned total;
    - verify K5/K10 binding coverage and no ambiguous identity.
-3. **Exact ownership**
+4. **B0 exact ownership**
    - add fixed-size completion target fields to `TMACommand`;
    - bind at issue/enqueue;
    - update only the bound barrier at completion;
    - remove anonymous FIFO completion consumption and cross-barrier spill.
-4. **Lifecycle**
+5. **B0 lifecycle**
    - add assignment/completion conservation;
    - assert no orphan state before CTA cleanup and warp reuse.
-5. **Release ordering**
+6. **B0-only validation and commit**
+   - run focused tests, K5, and K10 without moving the WaitBlock release phase;
+   - retain the current B1 timing so a regression is attributable to B0.
+7. **B1 release ordering in a separate commit**
    - move release service to one SM-level cycle phase after TMA completion and
      before all subcore issue.
-6. **Scope and metrics**
+   - rerun focused timing checks, K5, and K10 independently.
+8. **Scope and metrics**
    - add configurable watchdog/heartbeat values;
    - reset launch-scoped counters/budgets;
    - complete pure-query migration and metric reconciliation.
-7. **Verification**
-   - run focused tests, then K5 and K10 with the same binary, trace, and config
-     except for explicitly named feature gates.
 
-Do not combine the evidence gate with a guessed size correction. Do not
+Do not combine B0 and B1 in one commit or one causal validation step. Do not
 increase the watchdog, force a barrier phase, drop a WaitBlock hold, or consume
-the next binding to manufacture progress.
+the next contract to manufacture progress.
 
 ### 6.15 Verification matrix
 
 Focused tests:
 
 - one 16-KiB LOAD bound to one 16-KiB barrier;
-- two LOADs bound to the same barrier generation;
+- one corrected 24-KiB Q LOAD bound to one 24-KiB barrier;
+- `UTMALDG(16384) + UBLKCP(512) = 16896` bound to one K10 barrier;
+- `UTMALDG(16384) + UTMALDG(16384) = 32768` bound to one K10 barrier;
 - two barriers with same-warp LOAD completions returned in reverse UID order;
-- current 24-KiB expect/16-KiB transfer mismatch, which must fail before any
-  cross-barrier credit until its contract is resolved;
+- a deliberately ambiguous descriptor candidate set fails sidecar generation;
+- a LOAD before expect-tx, a new contract before exact assignment equality, and
+  an under/over-assigned contract all abort;
 - prefetch completion produces no mbarrier credit;
 - store/reduce completion affects only the `UTMACMDFLUSH` domain;
 - stale completion after phase advance aborts;
@@ -2948,7 +3024,7 @@ barrier object.
 
 **Trace regeneration**
 
-Reuse the current full trace only if it contains a distinct, validated runtime
-completion-barrier value for every completion-bearing TMA instruction. If that
-field is absent or aliases descriptor metadata, trace regeneration is a
-mandatory correctness prerequisite, not an optional optimization.
+The current full trace does not contain a distinct runtime completion-barrier
+value for completion-bearing TMA instructions. Trace regeneration is therefore
+a mandatory correctness prerequisite. The existing trace remains valid as the
+ordering, aggregation, and descriptor-mismatch evidence baseline.

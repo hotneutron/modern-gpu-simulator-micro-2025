@@ -783,6 +783,10 @@ bool trace_warp_inst_t::parse_from_trace_struct(
   sync_barrier_addr = trace.sync_barrier_addr;
   sync_has_semantic_raw = trace.sync_has_semantic_raw;
   sync_semantic_raw = trace.sync_semantic_raw;
+  tma_completion_runtime_valid = trace.tma_completion_runtime_valid;
+  tma_completion_barrier_addr = trace.tma_completion_barrier_addr;
+  tma_completion_barrier_ureg_id =
+      trace.tma_completion_barrier_ureg_id;
   trace_kernel_id = kernel_trace_info->kernel_id;
   trace_masks_valid = true;
   trace_active_mask = trace.active_mask;

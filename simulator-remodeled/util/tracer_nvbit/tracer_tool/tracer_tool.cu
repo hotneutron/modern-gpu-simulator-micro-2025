@@ -446,6 +446,17 @@ struct bar_runtime_capture_site_info {
 };
 std::map<int, std::map<int, bar_runtime_capture_site_info>>
     bar_runtime_capture_sites_by_pc;
+struct tma_completion_runtime_capture_site_info {
+  tma_completion_runtime_capture_site_info()
+      : enabled(false),
+        barrier_callback_index(-1),
+        barrier_ureg_id(SECRET_UREG_DESC_NOT_USED) {}
+  bool enabled;
+  int barrier_callback_index;
+  uint32_t barrier_ureg_id;
+};
+std::map<int, std::map<int, tma_completion_runtime_capture_site_info>>
+    tma_completion_runtime_capture_sites_by_pc;
 uint64_t tma_memcpy_dump_id = 0;
 uint64_t tensor_map_encode_dump_id = 0;
 struct tma_desc_producer_candidate_t {
@@ -545,6 +556,12 @@ static bool is_tma_desc_consumer_opcode(const std::string &opcode) {
          opcode.rfind("UTMACMDFLUSH", 0) == 0 ||
          opcode.rfind("UTMAPF", 0) == 0 ||
          opcode.rfind("UTMAREDG", 0) == 0;
+}
+
+static bool is_tma_completion_bearing_load_opcode(
+    const std::string &opcode) {
+  return opcode.rfind("UTMALDG", 0) == 0 ||
+         opcode.rfind("UBLKCP", 0) == 0;
 }
 
 enum class sync_runtime_capture_kind {
@@ -2192,6 +2209,9 @@ void instrument_function_if_needed(CUcontext ctx, CUfunction func, int device_id
       uint32_t num_of_injects = 0;
       sync_runtime_capture_site_info sync_site_info;
       bar_runtime_capture_site_info bar_site_info;
+      tma_completion_runtime_capture_site_info tma_completion_site_info;
+      uint32_t tma_completion_barrier_ureg_id =
+          SECRET_UREG_DESC_NOT_USED;
 
       if(inst_parsed->is_tensor_core_op()) {
         inst_parsed->set_tensor_core_instruction_info();
@@ -2199,6 +2219,20 @@ void instrument_function_if_needed(CUcontext ctx, CUfunction func, int device_id
       for(int i = 0; i < instr->getNumOperands(); ++i){
         const InstrType::operand_t *op = instr->getOperand(i);
         std::string operand_str = op->str ? std::string(op->str) : "";
+        if (is_tma_completion_bearing_load_opcode(opcode_str) && i == 0) {
+          if (op->type != InstrType::OperandType::MREF ||
+              operand_str.rfind("[UR", 0) != 0) {
+            fprintf(stderr,
+                    "[TMA-COMPLETION] unsupported destination-state operand: "
+                    "function=%s pc=0x%x opcode=%s operand=%s\n",
+                    current_kernel_name.c_str(), vpc, opcode_str.c_str(),
+                    operand_str.c_str());
+            abort();
+          }
+          const uint32_t destination_ureg_id =
+              get_ur_register(operand_str);
+          tma_completion_barrier_ureg_id = destination_ureg_id + 1;
+        }
         sync_runtime_capture_site_info sync_operand_info =
             build_sync_runtime_capture_site_info(opcode_str, i, num_of_injects,
                                                  op->type, operand_str);
@@ -2291,6 +2325,25 @@ void instrument_function_if_needed(CUcontext ctx, CUfunction func, int device_id
           num_of_injects++;
         }
       }
+      if (is_tma_completion_bearing_load_opcode(opcode_str)) {
+        if (tma_completion_barrier_ureg_id ==
+            SECRET_UREG_DESC_NOT_USED) {
+          fprintf(stderr,
+                  "[TMA-COMPLETION] missing barrier UReg: function=%s "
+                  "pc=0x%x opcode=%s\n",
+                  current_kernel_name.c_str(), vpc, opcode_str.c_str());
+          abort();
+        }
+        tma_completion_site_info.enabled = true;
+        tma_completion_site_info.barrier_callback_index =
+            static_cast<int>(num_of_injects);
+        tma_completion_site_info.barrier_ureg_id =
+            tma_completion_barrier_ureg_id;
+        per_operand_type[num_of_injects] =
+            traced_operand_instrument(TRACED_REG_TYPE::UNIFORM, 1,
+                                      tma_completion_barrier_ureg_id);
+        num_of_injects++;
+      }
       /*
        * The replay protobuf has no generic register-value field. In compact
        * mode, keep only callbacks whose runtime values have a proven consumer:
@@ -2370,6 +2423,11 @@ void instrument_function_if_needed(CUcontext ctx, CUfunction func, int device_id
       if (bar_site_info.enabled) {
         bar_runtime_capture_sites_by_pc[next_candidate_unique_function_id][vpc] =
             bar_site_info;
+      }
+      if (tma_completion_site_info.enabled) {
+        tma_completion_runtime_capture_sites_by_pc
+            [next_candidate_unique_function_id][vpc] =
+                tma_completion_site_info;
       }
 
       if (lighter_tracer_sparse_reconstruct) {
@@ -3577,6 +3635,32 @@ void *recv_thread_fun(void *args) {
                 bar->set_count(static_cast<uint32_t>(
                     inst_trace_value_0(ma, first_lane)));
               }
+            }
+          }
+        }
+        auto tma_completion_function_it =
+            tma_completion_runtime_capture_sites_by_pc.find(
+                ma->unique_function_id);
+        if (tma_completion_function_it !=
+            tma_completion_runtime_capture_sites_by_pc.end()) {
+          auto tma_completion_pc_it =
+              tma_completion_function_it->second.find(ma->vpc);
+          if (tma_completion_pc_it !=
+              tma_completion_function_it->second.end()) {
+            const tma_completion_runtime_capture_site_info &tma_site =
+                tma_completion_pc_it->second;
+            int first_lane =
+                get_first_predicated_lane(ma->active_mask,
+                                          ma->predicate_mask);
+            if (first_lane >= 0 && ma->mem_type == MEM_TYPE::NONE &&
+                callback_index == static_cast<unsigned int>(
+                                      tma_site.barrier_callback_index)) {
+              dynamic_trace::instruction::tma_completion_runtime_info *tma =
+                  inst->mutable_tma_completion();
+              tma->set_valid(true);
+              tma->set_barrier_addr(
+                  inst_trace_value_0(ma, first_lane));
+              tma->set_barrier_ureg_id(tma_site.barrier_ureg_id);
             }
           }
         }

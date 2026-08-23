@@ -1239,6 +1239,9 @@ class inst_t {
   uint64_t sync_barrier_addr = 0;
   bool sync_has_semantic_raw = false;
   uint64_t sync_semantic_raw = 0;
+  bool tma_completion_runtime_valid = false;
+  uint64_t tma_completion_barrier_addr = 0;
+  uint32_t tma_completion_barrier_ureg_id = 0;
   uint32_t trace_kernel_id = 0;
   bool trace_masks_valid = false;
   uint32_t trace_active_mask = 0;

@@ -105,6 +105,9 @@ inst_trace_t::inst_trace_t() {
   sync_barrier_addr = 0;
   sync_has_semantic_raw = false;
   sync_semantic_raw = 0;
+  tma_completion_runtime_valid = false;
+  tma_completion_barrier_addr = 0;
+  tma_completion_barrier_ureg_id = 0;
   bar_runtime_valid = false;
   bar_runtime_has_id = false;
   bar_runtime_id = 0;
@@ -142,6 +145,9 @@ inst_trace_t::inst_trace_t(const inst_trace_t &b) {
   sync_barrier_addr = b.sync_barrier_addr;
   sync_has_semantic_raw = b.sync_has_semantic_raw;
   sync_semantic_raw = b.sync_semantic_raw;
+  tma_completion_runtime_valid = b.tma_completion_runtime_valid;
+  tma_completion_barrier_addr = b.tma_completion_barrier_addr;
+  tma_completion_barrier_ureg_id = b.tma_completion_barrier_ureg_id;
   bar_runtime_valid = b.bar_runtime_valid;
   bar_runtime_has_id = b.bar_runtime_has_id;
   bar_runtime_id = b.bar_runtime_id;
@@ -171,6 +177,9 @@ inst_trace_t::inst_trace_t(address_type pc, unsigned int unique_function_id, boo
   sync_barrier_addr = 0;
   sync_has_semantic_raw = false;
   sync_semantic_raw = 0;
+  tma_completion_runtime_valid = false;
+  tma_completion_barrier_addr = 0;
+  tma_completion_barrier_ureg_id = 0;
   bar_runtime_valid = false;
   bar_runtime_has_id = false;
   bar_runtime_id = 0;
@@ -327,6 +336,16 @@ bool inst_trace_t::parse_from_pb(dynamic_trace::instruction pb_inst,
       sync_runtime_valid && pb_inst.sync().has_semantic_raw();
   sync_semantic_raw =
       sync_has_semantic_raw ? pb_inst.sync().semantic_raw() : 0;
+  tma_completion_runtime_valid =
+      pb_inst.has_tma_completion() && pb_inst.tma_completion().valid();
+  tma_completion_barrier_addr =
+      tma_completion_runtime_valid
+          ? pb_inst.tma_completion().barrier_addr()
+          : 0;
+  tma_completion_barrier_ureg_id =
+      tma_completion_runtime_valid
+          ? pb_inst.tma_completion().barrier_ureg_id()
+          : 0;
   bar_runtime_valid = pb_inst.has_bar_runtime() && pb_inst.bar_runtime().valid();
   bar_runtime_has_id = bar_runtime_valid && pb_inst.bar_runtime().has_id();
   bar_runtime_id = bar_runtime_has_id ? pb_inst.bar_runtime().id() : 0;
@@ -551,6 +570,7 @@ void trace_parser::get_next_threadblock_traces(
     unsigned long long tracecheck_memref_lane_uses = 0;
     unsigned long long tracecheck_sync_runtime = 0;
     unsigned long long tracecheck_sync_semantic = 0;
+    unsigned long long tracecheck_tma_completion_runtime = 0;
     unsigned long long tracecheck_bar_runtime = 0;
     unsigned long long tracecheck_bar_id = 0;
     unsigned long long tracecheck_bar_count = 0;
@@ -608,6 +628,10 @@ void trace_parser::get_next_threadblock_traces(
             tracecheck_sync_semantic++;
           }
         }
+        if (pb_inst.has_tma_completion() &&
+            pb_inst.tma_completion().valid()) {
+          tracecheck_tma_completion_runtime++;
+        }
         if (pb_inst.has_bar_runtime() && pb_inst.bar_runtime().valid()) {
           tracecheck_bar_runtime++;
           if (pb_inst.bar_runtime().has_id()) {
@@ -635,6 +659,8 @@ void trace_parser::get_next_threadblock_traces(
               << " memref_lane_uses=" << tracecheck_memref_lane_uses
               << " sync_runtime=" << tracecheck_sync_runtime
               << " sync_semantic=" << tracecheck_sync_semantic
+              << " tma_completion_runtime="
+              << tracecheck_tma_completion_runtime
               << " bar_runtime=" << tracecheck_bar_runtime
               << " bar_id=" << tracecheck_bar_id
               << " bar_count=" << tracecheck_bar_count

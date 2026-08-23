@@ -62,7 +62,8 @@ MAX_LOOP_SPAN = 0x100  # a spin loop is short; guards against matching big loops
 # warps -> instruction wire layout, without touching the trace format or the
 # shared helper. instruction.proto fields: pc=1, active_mask=2, predicate_mask=3,
 # function_unique_id=4, sync=6 { valid=1, barrier_addr=2, has_semantic_raw=3,
-# semantic_raw=4 }.
+# semantic_raw=4 }, tma_completion=8 { valid=1, barrier_addr=2,
+# barrier_ureg_id=3 }.
 _rv = _ts._rv
 _skip = _ts._skip
 
@@ -77,6 +78,9 @@ def _inst_full(buf, s, e):
     sync_valid = False
     barrier_addr = None
     semantic_raw = None
+    tma_completion_valid = False
+    tma_completion_barrier_addr = None
+    tma_completion_barrier_ureg_id = None
     while i < e:
         tag, i = _rv(buf, i)
         f, w = tag >> 3, tag & 7
@@ -105,6 +109,23 @@ def _inst_full(buf, s, e):
                 else:
                     k = _skip(buf, k, w2)
             i = end
+        elif f == 8 and w == 2:                 # tma_completion_runtime_info
+            ln, j = _rv(buf, i)
+            end = j + ln
+            k = j
+            while k < end:
+                t2, k = _rv(buf, k)
+                f2, w2 = t2 >> 3, t2 & 7
+                if f2 == 1 and w2 == 0:         # valid
+                    v, k = _rv(buf, k)
+                    tma_completion_valid = bool(v)
+                elif f2 == 2 and w2 == 0:       # barrier_addr
+                    tma_completion_barrier_addr, k = _rv(buf, k)
+                elif f2 == 3 and w2 == 0:       # barrier_ureg_id
+                    tma_completion_barrier_ureg_id, k = _rv(buf, k)
+                else:
+                    k = _skip(buf, k, w2)
+            i = end
         else:
             i = _skip(buf, i, w)
     return {
@@ -115,6 +136,10 @@ def _inst_full(buf, s, e):
         "sync_valid": sync_valid,
         "barrier_addr": barrier_addr,
         "semantic_raw": semantic_raw,
+        "tma_completion_valid": tma_completion_valid,
+        "tma_completion_barrier_addr": tma_completion_barrier_addr,
+        "tma_completion_barrier_ureg_id":
+            tma_completion_barrier_ureg_id,
     }
 
 

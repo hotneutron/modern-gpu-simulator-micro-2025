@@ -29,4 +29,12 @@ message instruction {
     uint32 count = 5;
   }
   bar_runtime_info bar_runtime = 7;
+  // Completion-bearing TMA LOADs encode the mbarrier address in the high
+  // uniform register of their first destination-state register pair.
+  message tma_completion_runtime_info {
+    bool valid = 1;
+    uint64 barrier_addr = 2;
+    uint32 barrier_ureg_id = 3;
+  }
+  tma_completion_runtime_info tma_completion = 8;
 }
