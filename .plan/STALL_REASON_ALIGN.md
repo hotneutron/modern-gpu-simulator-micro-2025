@@ -2,26 +2,34 @@
 
 ## 0. Corrected conclusion
 
-The current FA3 bwd WaitBlock-v5 run remains close to HW in total cycles, but
-the stall-reason distribution is **not yet definition-matched**:
+The current `.o57` FA3 bwd WaitBlock-v5 run completes the SR-M0A
+active-warp population accounting, but the measured population envelope is
+**not yet aligned with HW**:
 
 - HW: `132,901` cycles
-- Sim `.o55`: `136,997` cycles (`+3.08%`)
-- Previous sim `.o48`: `134,817` cycles (`+1.44%`); `.o55` is
-  `+2,180` cycles (`+1.62%`) slower than `.o48`
+- Sim `.o57`: `138,749` cycles (`+4.40%`)
+- Sim `.o57` issued warp instructions: `19,911,524` (`-0.41%` vs HW)
+- Historical gate-off runs: `.o55 = 136,997` and `.o56 = 137,725` cycles
 
-The current verdict therefore has two separate parts:
+The current verdict therefore has three separate parts:
 
-- Macro timing and traced work are close: elapsed cycles differ by `3.08%`
-  and issued warp instructions by `-0.41%`.
-- HW stall-reason alignment is unproven. `.o55` does not contain the SR-M0
-  complete, mutually exclusive active-warp accounting required by Section 6.
+- **SR-M0A accounting correctness passes.** Population conservation, selected
+  and sampled reference deltas, kernel UID, unknown state, winner mismatch, and
+  L1C disagreement checks all pass with zero residual.
+- **HW population alignment does not pass.** Sim active warp-cycles per selected
+  instruction are `7.942641` versus HW `7.539490` (`+5.35%`). The dominant
+  population mismatch is sim `no_valid_instruction = 1.282321` versus HW
+  `no_instruction = 0.115050`.
+- **Timing-neutrality and host overhead remain unproven.** `.o57` is a valid
+  gate-on result, but it does not yet have a gate-off partner from the exact
+  same executable.
 
 The previous version of this document concluded that stall labeling was
 essentially correct and that the simulator had a proven `6.6x` FU-throughput
 implementation error. **That conclusion is retracted.**
 
-The current `.o55` measurements still compare two different state definitions:
+The historical `.o55` measurements still compare two different state
+definitions:
 
 - HW `smsp__average_warps_issue_stalled_*_per_issue_active` assigns one
   highest-priority state to each active warp each cycle. The states are
@@ -36,10 +44,10 @@ Consequently, current sim `fu_any = 3.350` and HW
 Neither their raw `6.84x` ratio nor the previous `.o48` `6.6x` ratio
 proves an FU timing-model error.
 
-The first problem to solve is the stall metric itself: construct a complete,
-mutually exclusive per-active-warp state accounting and preserve the
-provenance of trace-mode dependencies. Only the residual after that correction
-can be called an implementation error.
+SR-M0A solves the complete-population prerequisite. The next measurement
+problem is to explain the oversized frontend/no-valid population and to split
+the remaining blocked population through SR-M0B/SR-M1 before applying an
+exclusive NCU projection in SR-M2.
 
 The shared-memory `gpgpu_n_shmem_bkconflict` mismatch is also a metric-semantics
 problem, but a different one. Its `37-135x` raw ratio to HW must not be read as
@@ -63,21 +71,26 @@ Evidence:
 Run under audit:
 
 - Sim:
-  `simulator-remodeled/sim_run_12.8/flashattn-fa3-bf16-bwd-causal-b1-s2048-hd64-nh24/.../H100_80GB-OnlyKernel10/*.o55`
+  `simulator-remodeled/sim_run_12.8/flashattn-fa3-bf16-bwd-causal-b1-s2048-hd64-nh24/.../H100_80GB-OnlyKernel10/*.o57`
 - HW:
   `nv_reports/flashattn-fa3-bf16-bwd-causal-b1-s2048-hd64-nh24_full_rpt.ncu-rep`
 
-Run-integrity evidence for `.o55`:
+Run-integrity evidence for `.o57`:
 
 - all `384` CTAs completed;
 - all `384` `[WAITBLOCK][summary]` records report `status=PASS`;
 - aggregate WaitBlock watchdog and residual active-state counters are zero;
-- `.e55` has no fatal, abort, assertion-failure, or deadlock marker;
+- `.e57` has no fatal, abort, assertion-failure, or deadlock marker;
+- the printed configuration has
+  `-stall_reason_align_instrument_enable 1`;
+- `[STALLALIGN] FINAL status=PASS`, with population, selected, and sampled
+  deltas all zero;
 - the log ends with `GPGPU-Sim: *** exit detected ***`.
 
 The printed configuration replaces the old `spin_wait_fold_enable/debug`
-controls with `wait_block_enable/debug`. Therefore `.o55` is the current
-WaitBlock-v5 timing result, not a bit-identical rerun of `.o48`.
+controls with `wait_block_enable/debug`. `.o57` is the current instrumented
+WaitBlock-v5 result. `.o55` remains useful as a historical condition-incidence
+baseline, while `.o56` is a gate-off run from an older executable.
 
 ---
 
@@ -86,21 +99,21 @@ WaitBlock-v5 timing result, not a bit-identical rerun of `.o48`.
 The cycle comparison is supported by matched work and issue density, not just
 by the final elapsed-cycle scalar.
 
-| quantity | HW | Sim `.o55` | sim/HW |
+| quantity | HW | Sim `.o57` | sim/HW |
 |---|---:|---:|---:|
-| elapsed cycles | 132,901 | 136,997 | 1.0308 |
+| elapsed cycles | 132,901 | 138,749 | 1.0440 |
 | issued warp instructions | 19,993,658 | 19,911,524 | 0.9959 |
-| issued inst / scheduler / elapsed cycle | 0.284925 | 0.275270 | 0.9661 |
-| issue slots busy | 32.07% | 29.97% | contextual; denominator audit still required |
-| eligible warps / scheduler | 0.46 | 0.4409 | contextual; sim tail scan is approximate |
+| issued inst / scheduler / elapsed cycle | 0.284925 | 0.271795 | 0.9539 |
+| issue slots busy | 32.07% | 29.5987% | exact sim selected/sample ratio |
+| eligible warps / scheduler | 0.46 | 0.389465 | exact SR-M0A cycle-start population |
 
 The matched-basis identity is:
 
 ```text
 cycle ratio
 = work ratio x inverse issue-density ratio
-= 0.995892 x 1.035072
-= 1.030820
+= 0.995892 x 1.048309
+= 1.044003
 ```
 
 This does not prove that every internal timing mechanism is correct. Different
@@ -108,11 +121,55 @@ modeling errors can compensate. It does show that the aggregate scheduler
 readiness behavior is already close, so a claimed large internal error requires
 stronger evidence than the current overlapping reason counters.
 
-The sim's printed `ncu_no_eligible_pct = 70.03%` is intentionally not included
-as a matched metric. It is currently computed as
-`100% - ncu_issue_slots_busy_pct`, so it also includes non-issue causes other
-than "zero eligible warps." SR-M0 must replace this proxy with a direct
-per-scheduler eligible-warp population.
+The legacy printed `ncu_no_eligible_pct` remains a complement of issue-slot
+busy and is not used as a matched metric. `.o57` instead provides the direct
+SR-M0A eligible-warp accumulator shown above.
+
+### 2.1 `.o57` SR-M0A population result
+
+All SR-M0A self-consistency gates pass:
+
+```text
+population_sum       = 158,150,096
+active_warp_cycles   = 158,150,096
+population_delta     = 0
+selected             = 19,911,524
+issue_selected       = 19,911,524
+selected_delta       = 0
+sampled              = 67,271,591
+issue_evaluated      = 67,271,591
+sampled_delta        = 0
+unknown              = 0
+winner_mismatch      = 0
+L1C disagreements    = 0
+```
+
+The normalized population envelope is:
+
+| state | Sim `/ selected` | HW reference | interpretation |
+|---|---:|---:|---|
+| active total | 7.942641 | 7.539490 | Sim `+5.35%` |
+| selected | 1.000000 | 0.999982 | matched |
+| not selected, with issue | 0.315775 | 0.405119 | closest candidate; `-22.05%` |
+| not selected, without issue | 0.000043 | none | simulator scheduling residual |
+| no valid instruction | 1.282321 | 0.115050 | upper-bound candidate; `11.15x` |
+| drain | 0.001202 | 0.001395 | close in absolute magnitude |
+| WaitBlock + blocked-valid + no-head hold | 5.343301 | 6.017944 | blocker-envelope deficit `0.674643` |
+
+The dominant mismatch is the frontend/no-valid population. The older
+per-scheduler diagnostics are not definition-matched to SR-M0A, but localize
+the source:
+
+```text
+no-valid scheduler cycles                    6,092,100
+frontend waiting                             6,075,844  (99.73%)
+L0I response-queue wait                      5,105,338  (83.80%)
+stream prefetch issued but not ready         5,039,438  (82.72%)
+```
+
+Thus the next alignment investigation should preserve per-warp frontend
+provenance for `no_valid_instruction`; it should not retune FU timing based on
+the old overlapping counters.
 
 ---
 
@@ -1016,8 +1073,29 @@ existing `H100_80GB-OnlyKernel10` configuration for the instrumented Kernel 10
 run. The source-level option default remains off for other configurations.
 Reject any result whose echoed configuration shows
 `-stall_reason_align_instrument_enable 0` or whose output lacks the
-`[STALLALIGN] FINAL` line. The `.o56` run met both rejection conditions and is
-therefore a gate-off baseline, not an SR-M0A acceptance result.
+`[STALLALIGN] FINAL` line.
+
+`.o57` is the valid full gate-on result. One additional full run with only
+`-stall_reason_align_instrument_enable 0` is sufficient for the first paired
+timing-neutrality check if it reuses the exact `.o57` executable without a
+rebuild. Record the executable SHA-256 before and after, run the jobs
+sequentially so the generated config cannot be overwritten, and require
+identical simulated cycles, issued work, and completed CTAs.
+
+Do not use `.o56` as that paired baseline: it came from an older executable.
+Its single-run wall time is also unusually low:
+
+```text
+run   gate  simulated cycles  wall time
+.o55  off   136,997           23,452 s
+.o56  off   137,725           21,724 s
+.o57  on    138,749           23,506 s
+```
+
+`.o57/.o56` gives `+8.20%` wall time, while `.o57/.o55` gives only `+0.23%`.
+This spread is too large for an overhead verdict. Use the same-binary OFF/ON
+pair for the initial result; repeat in `OFF, ON, ON, OFF` order only if the
+measured overhead is near the `5%` gate or host noise remains material.
 
 Kernel 5 is not the first acceptance target because its existing cross-warp
 deadlock can terminate independently of the observer. It becomes a
