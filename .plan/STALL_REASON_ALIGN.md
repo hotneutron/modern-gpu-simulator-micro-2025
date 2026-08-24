@@ -20,9 +20,11 @@ The current verdict therefore has three separate parts:
   instruction are `7.942641` versus HW `7.539490` (`+5.35%`). The dominant
   population mismatch is sim `no_valid_instruction = 1.282321` versus HW
   `no_instruction = 0.115050`.
-- **Timing-neutrality and host overhead remain unproven.** `.o57` is a valid
-  gate-on result, but it does not yet have a gate-off partner from the exact
-  same executable.
+- **The first gate-on/off pair passes the host-overhead gate but not the strict
+  bit-identical gate.** `.o57` ON versus `.o58` OFF differs by only the SR-M0A
+  config option and has normalized section-time overhead `+0.052%`, but simulated
+  cycles differ by `122` (`+0.088%`). A repeated pair is required to separate
+  observer perturbation from existing parallel-run nondeterminism.
 
 The previous version of this document concluded that stall labeling was
 essentially correct and that the simulator had a proven `6.6x` FU-throughput
@@ -86,6 +88,10 @@ Run-integrity evidence for `.o57`:
 - `[STALLALIGN] FINAL status=PASS`, with population, selected, and sampled
   deltas all zero;
 - the log ends with `GPGPU-Sim: *** exit detected ***`.
+
+The paired `.o58` gate-off run also completes all `384` CTAs with `384`
+WaitBlock PASS summaries, no fatal/abort/deadlock marker, and no
+`[STALLALIGN]` output as expected.
 
 The printed configuration replaces the old `spin_wait_fold_enable/debug`
 controls with `wait_block_enable/debug`. `.o57` is the current instrumented
@@ -1075,27 +1081,45 @@ Reject any result whose echoed configuration shows
 `-stall_reason_align_instrument_enable 0` or whose output lacks the
 `[STALLALIGN] FINAL` line.
 
-`.o57` is the valid full gate-on result. One additional full run with only
-`-stall_reason_align_instrument_enable 0` is sufficient for the first paired
-timing-neutrality check if it reuses the exact `.o57` executable without a
-rebuild. Record the executable SHA-256 before and after, run the jobs
-sequentially so the generated config cannot be overwritten, and require
-identical simulated cycles, issued work, and completed CTAs.
+`.o57` is the valid full gate-on result and `.o58` is its first gate-off
+partner. Their echoed configuration blocks differ only in
+`-stall_reason_align_instrument_enable`, and both logs use the same executable
+path and build banner. The logs do not include a cryptographic executable
+hash, so byte identity additionally relies on the no-rebuild run procedure.
 
 Do not use `.o56` as that paired baseline: it came from an older executable.
-Its single-run wall time is also unusually low:
+The observed runs are:
 
 ```text
-run   gate  simulated cycles  wall time
-.o55  off   136,997           23,452 s
-.o56  off   137,725           21,724 s
-.o57  on    138,749           23,506 s
+run   gate  simulated cycles  issued lane inst  CTAs  wall time
+.o55  off   136,997           623,607,200       384   23,452 s
+.o56  off   137,725           623,607,200       384   21,724 s
+.o57  on    138,749           623,607,200       384   23,506 s
+.o58  off   138,627           623,607,200       384   23,474 s
 ```
 
-`.o57/.o56` gives `+8.20%` wall time, while `.o57/.o55` gives only `+0.23%`.
-This spread is too large for an overhead verdict. Use the same-binary OFF/ON
-pair for the initial result; repeat in `OFF, ON, ON, OFF` order only if the
-measured overhead is near the `5%` gate or host noise remains material.
+The `.o57/.o58` pair gives:
+
+```text
+ON - OFF simulated cycles                  +122  (+0.088%)
+ON - OFF wall time                          +32 s (+0.136%)
+ON - OFF section total time            +32,882.7 ms (+0.140%)
+normalized section time per simulated cycle              +0.052%
+```
+
+The host-performance acceptance target (`<= 5%`) passes comfortably. The
+strict timing-neutrality target does not pass because simulated cycles are not
+identical. Work and CTA completion are identical, both runs have `384`
+WaitBlock PASS summaries and zero abort/watchdog evidence, and `.o58`
+correctly has no `[STALLALIGN]` output with the gate off.
+
+Do not attribute the `122`-cycle difference to SR-M0A yet. The simulator runs
+the core stage with 64 OpenMP workers, and previous gate-off runs also show
+cycle/runtime variation. Run one more OFF/ON pair from an explicitly hashed
+unchanged executable. If the ON-minus-OFF cycle shift repeats with the same
+sign and magnitude, audit hidden observer side effects; otherwise classify it
+as parallel-run nondeterminism and retain the measured `+0.052%` host-overhead
+result.
 
 Kernel 5 is not the first acceptance target because its existing cross-warp
 deadlock can terminate independently of the observer. It becomes a
