@@ -3044,8 +3044,10 @@ containers are allocated with existing SM state.
 2. **B0-A UBLKCP sidecar repair**
    - select operand 3 by its static callback role, not by maximum uniform value;
    - regenerate sidecars from the existing raw trace;
-   - require all 9 observed K10 UBLKCP static sites and all 7,296 dynamic
+   - require all 8 K10 UBLKCP static sites and all 6,528 K10 dynamic
      occurrences to report operand-3 command bytes and tile bytes of 512;
+   - require the separate kernel-11 UBLKCP site and its 384 occurrences to
+     report 32,768 bytes;
    - require zero selections of the hidden completion callback as a size source.
 3. **B0-B descriptor identity and byte restoration**
    - introduce kernel-aware TMA metadata keys;
@@ -3098,8 +3100,10 @@ Focused tests:
 
 - UBLKCP callback-role selection ignores the hidden completion callback and
   yields `operand3_raw=32`, `covered_bytes=tile_bytes=512`;
-- K10 reports 9/9 UBLKCP static sites and 7,296/7,296 dynamic occurrences with
+- K10 reports 8/8 UBLKCP static sites and 6,528/6,528 dynamic occurrences with
   512-byte command/tile sizes;
+- kernel 11 reports 1/1 UBLKCP site and 384/384 occurrences with 32,768-byte
+  command/tile sizes;
 - a missing or ambiguous kernel-aware UTMACCTL chain fails sidecar generation;
 - `chain_resolved == sites_total`, `ambiguous=0`, `unresolved=0`,
   `direct_authority=0`, and `pool_authority=0`;

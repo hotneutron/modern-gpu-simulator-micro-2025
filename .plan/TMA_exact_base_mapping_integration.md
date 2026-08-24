@@ -167,9 +167,9 @@ the architectural operand-3 callback index from `tma_operand_resolver.json`
 instead of taking the maximum of all uniform callbacks. The hidden TMA
 completion callback added at `9e92fe9` is not a size operand. Regenerate the
 sidecars from the existing raw trace and require
-`UBLKCP covered_bytes == tile_bytes == 512` for all 9 K10 static sites and all
-7,296 K10 dynamic occurrences, with zero completion callbacks selected as size
-sources.
+`UBLKCP covered_bytes == tile_bytes == 512` for all 8 K10 static sites and all
+6,528 K10 dynamic occurrences. The separate kernel-11 site has 384 occurrences
+at 32,768 bytes. Require zero completion callbacks selected as size sources.
 
 0. **Fix `extract_tma_descriptor_offsets.py` (prerequisite)**: (a) add `UMOV URd,imm` modeling in `build_defs()` → a umov terminus returns `None` in `trace_offset()` (constant dead-end); (b) on accepting `resolved`, add a **struct-bounds guard** (`0 ≤ offset < struct_size(uid)`, struct_size from `tma_launch_param_dump.csv`). → removes the executed-UBLKRED bogus offset 0x30d96; UBLKRED honestly falls to unresolved.
 1. Extend `build_tma_pc_base_map.py`:
