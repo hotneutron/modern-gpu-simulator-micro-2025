@@ -67,12 +67,13 @@ struct TMADescriptorConfigMetadata {
 };
 
 struct TMAOperandLookupKey {
+  unsigned int trace_kernel_id = ~0u;
   unsigned int unique_function_id = 0;
   uint64_t pc = 0;
 
   bool operator<(const TMAOperandLookupKey &other) const {
-    return std::tie(unique_function_id, pc) <
-           std::tie(other.unique_function_id, other.pc);
+    return std::tie(trace_kernel_id, unique_function_id, pc) <
+           std::tie(other.trace_kernel_id, other.unique_function_id, other.pc);
   }
 };
 
@@ -108,17 +109,18 @@ struct TMAResolvedSiteMetadata {
   TMADescriptorConfigMetadata descriptor_config;
 };
 
-// Exact per-site descriptor binding recovered offline (build_tma_pc_base_map.py). Keyed
-// by (unique_function_id, pc) — the identity that is still live at build_tma_command,
-// before the mover loses it. Supersedes the handle_hi->config_id heuristic: carries the
-// real GMEM base plus the full descriptor shape so no config_id join is needed.
+// Exact per-site descriptor binding recovered offline
+// (build_tma_pc_base_map.py). Version-2 records are keyed by
+// (trace_kernel_id, unique_function_id, pc), which prevents static variants
+// sharing a function id and PC from overwriting each other.
 struct TMABaseLookupKey {
+  unsigned int trace_kernel_id = ~0u;
   unsigned int unique_function_id = 0;
   uint64_t pc = 0;
 
   bool operator<(const TMABaseLookupKey &other) const {
-    return std::tie(unique_function_id, pc) <
-           std::tie(other.unique_function_id, other.pc);
+    return std::tie(trace_kernel_id, unique_function_id, pc) <
+           std::tie(other.trace_kernel_id, other.unique_function_id, other.pc);
   }
 };
 
@@ -150,15 +152,22 @@ struct TMABaseRecord {
   // The mover spreads transfers as global_base + (visit%num_tiles)*tile_bytes.
   uint32_t tile_bytes_operand = 0;
   uint32_t num_tiles = 0;
-  std::string source;  // "direct" | "chain" | "prefetch" | "pool" | "operand_raw_pointer"
+  std::string source;  // "utmacctl_chain" | "utmacctl_prefetch_edge" |
+                       // "operand_raw_pointer"
 };
 
 struct TMASidecarMetadataDB {
+  unsigned int base_map_version = 0;
+  unsigned int operand_map_version = 0;
+  bool completion_contracts_validated = false;
   std::map<std::string, TMADescriptorConfigMetadata> descriptor_configs;
   std::map<TMAOperandLookupKey, TMAOperandSiteRecord> operand_site_records;
   std::map<TMABaseLookupKey, TMABaseRecord> base_records;
 
   void clear() {
+    base_map_version = 0;
+    operand_map_version = 0;
+    completion_contracts_validated = false;
     descriptor_configs.clear();
     operand_site_records.clear();
     base_records.clear();

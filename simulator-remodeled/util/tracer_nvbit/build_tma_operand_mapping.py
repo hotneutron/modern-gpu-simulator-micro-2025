@@ -6,6 +6,38 @@ import re
 from pathlib import Path
 
 
+def normalize_runtime_kernel_name(name):
+    return re.sub(r"___[0-9]+$", "", name or "")
+
+
+def load_runtime_kernel_names(extra_info_dir: Path, runtime_rows):
+    info_path = extra_info_dir / "enhanced_execution_info.json"
+    data = json.loads(info_path.read_text())
+    names_by_uid = {}
+    for kernel in data.get("kernels", []):
+        uid = kernel.get("unique_function_id")
+        name = normalize_runtime_kernel_name(kernel.get("kernel_name"))
+        old = names_by_uid.get(uid)
+        if old is not None and old != name:
+            raise SystemExit(
+                f"ambiguous enhanced kernel name for uid={uid}: {old} vs {name}"
+            )
+        names_by_uid[uid] = name
+    result = {}
+    for row in runtime_rows:
+        kernel_id = row.get("kernel_id")
+        uid = row.get("unique_function_id")
+        if kernel_id is None or uid is None:
+            continue
+        name = names_by_uid.get(uid)
+        if not name:
+            raise SystemExit(
+                f"missing enhanced kernel name for trace_kernel={kernel_id} uid={uid}"
+            )
+        result[(int(kernel_id), uid)] = name
+    return result
+
+
 def parse_jsonl(path: Path):
     rows = []
     with path.open() as fh:
@@ -17,13 +49,17 @@ def parse_jsonl(path: Path):
     return rows
 
 
-def collect_tma_entries(node, current_unique_function_id=None, entries=None):
+def collect_tma_entries(node, current_unique_function_id=None,
+                        current_function_name=None, entries=None):
     if entries is None:
         entries = []
     if isinstance(node, dict):
         next_unique_function_id = current_unique_function_id
+        next_function_name = current_function_name
         if "unique_function_id" in node and node["unique_function_id"] is not None:
             next_unique_function_id = node["unique_function_id"]
+        if "function_name" in node and node["function_name"]:
+            next_function_name = node["function_name"]
         # Only collect real instruction-site records from tma_discovery.json.
         # Nested producer-search/debug candidate objects also carry pc/opcode/text,
         # but they are not executable TMA sites and must not participate in
@@ -40,6 +76,7 @@ def collect_tma_entries(node, current_unique_function_id=None, entries=None):
         ):
             entries.append({
                 "unique_function_id": next_unique_function_id,
+                "function_name": next_function_name,
                 "pc_hex": node["pc_hex"],
                 "opcode": node["opcode"],
                 "text": node["text"],
@@ -49,10 +86,14 @@ def collect_tma_entries(node, current_unique_function_id=None, entries=None):
                 "support_regs": node.get("support_regs", []),
             })
         for value in node.values():
-            collect_tma_entries(value, next_unique_function_id, entries)
+            collect_tma_entries(
+                value, next_unique_function_id, next_function_name, entries
+            )
     elif isinstance(node, list):
         for value in node:
-            collect_tma_entries(value, current_unique_function_id, entries)
+            collect_tma_entries(
+                value, current_unique_function_id, current_function_name, entries
+            )
     return entries
 
 
@@ -82,15 +123,11 @@ def config_id_from_base_map_entry(entry):
 
 
 def load_descriptor_refs(extra_info_dir: Path):
-    """Descriptor bindings per (uid, pc, opcode), sourced from the EXACT (uid,pc) base
-    map (tma_pc_base_map.json) instead of the retired handle_hi heuristic resolver.
+    """Descriptor bindings sourced from the kernel-aware base map.
 
-    Each base-map entry already carries base + full descriptor fields for the precise
-    site, so this yields exactly the sites that are truly descriptor-addressed
-    (UTMALDG/UTMASTG/UTMACCTL.PF). UBLKRED is intentionally absent (it is operand/raw-
-    pointer addressed, proven by the 0/9 in-struct diagnostic), so it correctly falls
-    back to the bulk operand form. Falls back to the old resolver only if the base map
-    is missing, for backward compatibility."""
+    Each version-2 entry carries one exact
+    (trace_kernel_id, uid, pc) descriptor. UBLKRED/UBLKCP remain
+    operand-addressed. A version-1 resolver remains readable for old traces."""
     base_map_path = extra_info_dir / "tma_pc_base_map.json"
     if base_map_path.exists():
         return _load_descriptor_refs_from_base_map(base_map_path)
@@ -103,14 +140,22 @@ def _load_descriptor_refs_from_base_map(path: Path):
     for key_str, entry in data.get("map", {}).items():
         if entry.get("operand_addressed"):
             continue  # not tensormap-addressed (e.g. UBLKRED)
-        uid_str, _, pc_hex = key_str.partition(":")
+        key_parts = key_str.split(":")
+        if len(key_parts) == 3:
+            kernel_id_str, uid_str, pc_hex = key_parts
+            kernel_id = int(kernel_id_str)
+        elif len(key_parts) == 2:
+            uid_str, pc_hex = key_parts
+            kernel_id = None
+        else:
+            raise SystemExit(f"invalid TMA base-map key: {key_str}")
         try:
             uid = int(uid_str)
         except ValueError:
             uid = uid_str
         config_id = config_id_from_base_map_entry(entry)
         # opcode is unknown here; key on opcode=None and match by (uid, pc) downstream.
-        mapping[(uid, pc_hex, None)] = {
+        mapping[(kernel_id, uid, pc_hex, None)] = {
             "config_ids": [config_id],
             "desc_reg_ids": [],
             "base_hex": entry.get("base_hex"),
@@ -126,7 +171,12 @@ def _load_descriptor_refs_from_resolver(extra_info_dir: Path):
     data = json.loads(path.read_text())
     mapping = {}
     for entry in data.get("resolver", []):
-        key = (entry.get("unique_function_id"), entry.get("pc_hex"), entry.get("opcode"))
+        key = (
+            entry.get("trace_kernel_id"),
+            entry.get("unique_function_id"),
+            entry.get("pc_hex"),
+            entry.get("opcode"),
+        )
         mapping.setdefault(key, {
             "config_ids": set(),
             "desc_reg_ids": set(),
@@ -145,52 +195,60 @@ def _load_descriptor_refs_from_resolver(extra_info_dir: Path):
     return normalized
 
 
-def lookup_descriptor_ref(descriptor_refs, resolved_uid, entry):
+def lookup_descriptor_ref(descriptor_refs, trace_kernel_id, resolved_uid, entry):
     """Find a descriptor binding for a discovery site.
 
-    Base-map bindings are keyed (uid, pc, None) — opcode-agnostic but uid-SPECIFIC. They
-    must be matched by exact (uid, pc): pcs repeat across kernels, so a pc-only match
-    would attach one kernel's descriptor to a different kernel's instruction. Legacy
-    resolver bindings are keyed (uid, pc, opcode); for backward compat those still allow
-    the historical pc+opcode fallback (opcode disambiguates them)."""
+    Version-2 base-map bindings require an exact
+    (trace_kernel_id, uid, pc) match. Legacy records use trace_kernel_id=None."""
     pc_hex = entry["pc_hex"]
     opcode = entry["opcode"]
     for uid in (resolved_uid, entry.get("unique_function_id")):
         if uid is None:
             continue
-        hit = descriptor_refs.get((uid, pc_hex, opcode))  # legacy exact
+        hit = descriptor_refs.get(
+            (trace_kernel_id, uid, pc_hex, opcode)
+        )
         if hit is not None:
             return hit
-        hit = descriptor_refs.get((uid, pc_hex, None))     # base-map exact (uid,pc)
+        hit = descriptor_refs.get(
+            (trace_kernel_id, uid, pc_hex, None)
+        )
+        if hit is not None:
+            return hit
+        hit = descriptor_refs.get((None, uid, pc_hex, opcode))
+        if hit is not None:
+            return hit
+        hit = descriptor_refs.get((None, uid, pc_hex, None))
         if hit is not None:
             return hit
     # Legacy-only fallback: discovery uid unknown, match by pc+opcode. Restricted to keyed
     # opcodes (op == opcode); base-map (op is None) is deliberately excluded here to avoid
     # cross-kernel pc collisions.
-    for (ufid, pc, op), value in descriptor_refs.items():
-        if op is not None and pc == pc_hex and op == opcode:
+    for (kernel_id, ufid, pc, op), value in descriptor_refs.items():
+        if kernel_id is None and op is not None and pc == pc_hex and op == opcode:
             return value
     return None
 
 
 def build_function_descriptor_index(descriptor_refs):
     grouped = {}
-    for (unique_function_id, pc_hex, opcode), descriptor_ref in descriptor_refs.items():
+    for (trace_kernel_id, unique_function_id, pc_hex, opcode), descriptor_ref in descriptor_refs.items():
         if unique_function_id is None:
             continue
-        grouped.setdefault(unique_function_id, {
+        key = (trace_kernel_id, unique_function_id)
+        grouped.setdefault(key, {
             "config_ids": set(),
             "desc_reg_ids": set(),
             "source_pcs": set(),
         })
         for config_id in descriptor_ref.get("config_ids", []):
-            grouped[unique_function_id]["config_ids"].add(config_id)
+            grouped[key]["config_ids"].add(config_id)
         for desc_reg_id in descriptor_ref.get("desc_reg_ids", []):
-            grouped[unique_function_id]["desc_reg_ids"].add(desc_reg_id)
-        grouped[unique_function_id]["source_pcs"].add(pc_hex)
+            grouped[key]["desc_reg_ids"].add(desc_reg_id)
+        grouped[key]["source_pcs"].add(pc_hex)
     normalized = {}
-    for unique_function_id, value in grouped.items():
-        normalized[unique_function_id] = {
+    for key, value in grouped.items():
+        normalized[key] = {
             "config_ids": sorted(value["config_ids"]),
             "desc_reg_ids": sorted(value["desc_reg_ids"]),
             "source_pcs": sorted(value["source_pcs"], key=parse_pc_hex),
@@ -202,6 +260,7 @@ def build_runtime_groups(runtime_rows):
     grouped = {}
     for row in runtime_rows:
         key = (
+            row.get("kernel_id"),
             row.get("unique_function_id"),
             row.get("pc_hex"),
             row.get("opcode"),
@@ -249,20 +308,36 @@ def keep_nontrivial_sample_field(samples):
     return any(sample not in (0, None) for sample in samples)
 
 
-def find_matching_runtime_keys(runtime_groups, unique_function_id, pc_hex, opcode):
+def find_matching_runtime_keys(runtime_groups, trace_kernel_id,
+                               unique_function_id, pc_hex, opcode):
     direct = sorted(
         key for key in runtime_groups
-        if key[0] == unique_function_id and key[1] == pc_hex and key[2] == opcode
+        if key[0] == trace_kernel_id and key[1] == unique_function_id
+        and key[2] == pc_hex and key[3] == opcode
     )
-    if direct:
-        return direct
-    if unique_function_id is None:
-        by_pc = sorted(
-            key for key in runtime_groups
-            if key[1] == pc_hex and key[2] == opcode
-        )
-        return by_pc
-    return []
+    return direct
+
+
+def is_hidden_tma_completion_callback(opcode, operands, callback):
+    if not opcode.startswith(("UTMALDG", "UBLKCP")) or not operands:
+        return False
+    callback_index = callback.get("callback_index")
+    if callback_index is None:
+        return False
+    first_regs = operands[0].get("reg_ids", [])
+    if len(first_regs) != 1:
+        return False
+    completion_ureg = first_regs[0] + 1
+    if not (
+        callback.get("operand_type") == "UNIFORM"
+        and callback.get("operand_reg_ids") == [completion_ureg]
+    ):
+        return False
+    if callback_index < len(operands):
+        architectural_regs = operands[callback_index].get("reg_ids", [])
+        if architectural_regs == callback.get("operand_reg_ids"):
+            return False
+    return True
 
 
 def infer_operand_kinds(entry):
@@ -626,8 +701,9 @@ def build_utmapf_descriptor_link(entry, resolver_entries, function_descriptor_in
             "reason": "missing_runtime_operand_1",
         }
     unique_function_id = entry.get("unique_function_id")
+    trace_kernel_id = entry.get("trace_kernel_id")
     current_pc = parse_pc_hex(entry.get("pc_hex"))
-    if unique_function_id is None or current_pc is None:
+    if trace_kernel_id is None or unique_function_id is None or current_pc is None:
         return {
             "status": "unresolved",
             "match_rule": "exact_forward_utmaldg_operand_1",
@@ -638,6 +714,8 @@ def build_utmapf_descriptor_link(entry, resolver_entries, function_descriptor_in
         if not other["opcode"].startswith("UTMALDG"):
             continue
         if other.get("unique_function_id") != unique_function_id:
+            continue
+        if other.get("trace_kernel_id") != trace_kernel_id:
             continue
         other_pc = parse_pc_hex(other.get("pc_hex"))
         if other_pc is None or other_pc <= current_pc:
@@ -676,7 +754,9 @@ def build_utmapf_descriptor_link(entry, resolver_entries, function_descriptor_in
             "source": "matched_consumer_descriptor_ref",
         }
     else:
-        function_descriptor_ref = function_descriptor_index.get(unique_function_id, {})
+        function_descriptor_ref = function_descriptor_index.get(
+            (trace_kernel_id, unique_function_id), {}
+        )
         if len(function_descriptor_ref.get("config_ids", [])) != 1:
             return {
                 "status": "unresolved",
@@ -719,31 +799,83 @@ def build_resolver(extra_info_dir: Path):
     descriptor_refs = load_descriptor_refs(extra_info_dir)
     function_descriptor_index = build_function_descriptor_index(descriptor_refs)
     runtime_rows = parse_jsonl(runtime_path)
+    runtime_kernel_names = load_runtime_kernel_names(
+        extra_info_dir, runtime_rows
+    )
     runtime_groups = build_runtime_groups(runtime_rows)
 
-    resolver = []
+    static_entries = {}
     for entry in discovery_entries:
-        key = (entry["unique_function_id"], entry["pc_hex"], entry["opcode"])
+        key = (
+            entry.get("function_name"),
+            entry.get("pc_hex"),
+            entry.get("opcode"),
+        )
+        old = static_entries.get(key)
+        if old is not None and old.get("text") != entry.get("text"):
+            raise SystemExit(f"ambiguous static TMA instruction: key={key}")
+        static_entries[key] = entry
+
+    runtime_sites = sorted({
+        (key[0], key[1], key[2], key[3])
+        for key in runtime_groups
+    })
+    resolver = []
+    hidden_completion_events_ignored = 0
+    hidden_completion_sites = 0
+    for trace_kernel_id, resolved_unique_function_id, pc_hex, opcode in runtime_sites:
+        function_name = runtime_kernel_names.get(
+            (trace_kernel_id, resolved_unique_function_id)
+        )
+        entry = static_entries.get((function_name, pc_hex, opcode))
+        if entry is None:
+            raise SystemExit(
+                "missing exact static TMA instruction for runtime site: "
+                f"trace_kernel={trace_kernel_id} "
+                f"uid={resolved_unique_function_id} pc={pc_hex} "
+                f"opcode={opcode} function={function_name}"
+            )
         operands = parse_operands_from_text(entry["opcode"], entry["text"])
         callback_groups = []
         matched_runtime_keys = find_matching_runtime_keys(
-            runtime_groups, entry["unique_function_id"], entry["pc_hex"],
-            entry["opcode"]
+            runtime_groups, trace_kernel_id, resolved_unique_function_id,
+            pc_hex, opcode
         )
+        hidden_callbacks = 0
         for matched_key in matched_runtime_keys:
             callback_group = dict(runtime_groups[matched_key])
-            callback_index = matched_key[3]
-            if callback_index < len(operands):
-                callback_group["operand_position"] = callback_index + 1
-                callback_group["operand_text"] = operands[callback_index]["text"]
+            callback_index = matched_key[4]
+            if is_hidden_tma_completion_callback(
+                    opcode, operands, callback_group):
+                hidden_callbacks += 1
+                hidden_completion_events_ignored += callback_group["sample_count"]
+                continue
+            if callback_index >= len(operands):
+                if opcode.startswith(("UTMALDG", "UBLKCP")):
+                    raise SystemExit(
+                        "unexpected auxiliary TMA callback: "
+                        f"trace_kernel={trace_kernel_id} "
+                        f"uid={resolved_unique_function_id} pc={pc_hex} "
+                        f"opcode={opcode} callback_index={callback_index} "
+                        f"operand_count={len(operands)}"
+                    )
+                callback_groups.append(callback_group)
+                continue
+            callback_group["operand_position"] = callback_index + 1
+            callback_group["operand_text"] = operands[callback_index]["text"]
             callback_groups.append(callback_group)
-        resolved_unique_function_id = entry["unique_function_id"]
-        if resolved_unique_function_id is None and matched_runtime_keys:
-            unique_function_ids = sorted({matched_key[0] for matched_key in matched_runtime_keys if matched_key[0] is not None})
-            if len(unique_function_ids) == 1:
-                resolved_unique_function_id = unique_function_ids[0]
+        if opcode.startswith(("UTMALDG", "UBLKCP")):
+            if hidden_callbacks != 1:
+                raise SystemExit(
+                    "completion-bearing TMA site must have exactly one hidden "
+                    "completion callback: "
+                    f"trace_kernel={trace_kernel_id} "
+                    f"uid={resolved_unique_function_id} pc={pc_hex} "
+                    f"opcode={opcode} callbacks={hidden_callbacks}"
+                )
+            hidden_completion_sites += 1
         descriptor_ref = lookup_descriptor_ref(
-            descriptor_refs, resolved_unique_function_id, entry
+            descriptor_refs, trace_kernel_id, resolved_unique_function_id, entry
         )
         inferred_operand_kinds = infer_operand_kinds({
             "opcode": entry["opcode"],
@@ -751,13 +883,20 @@ def build_resolver(extra_info_dir: Path):
             "descriptor_ref": descriptor_ref,
         })
         resolver_entry = {
+            "trace_kernel_id": trace_kernel_id,
             "unique_function_id": resolved_unique_function_id,
+            "kernel_name": normalize_runtime_kernel_name(function_name),
             "pc_hex": entry["pc_hex"],
             "opcode": entry["opcode"],
             "text": entry["text"],
             "role": entry["role"],
             "runtime_observed": bool(callback_groups),
             "operand_form": infer_operand_form(entry["opcode"], descriptor_ref),
+            "mapping_method": (
+                descriptor_ref.get("source")
+                if descriptor_ref else "kernel_aware_runtime_operands"
+            ),
+            "confidence": "high",
             "operands": build_operand_entries(operands, inferred_operand_kinds),
             "support_regs": entry.get("support_regs", []),
             "desc_refs": entry.get("desc_refs", []),
@@ -782,11 +921,35 @@ def build_resolver(extra_info_dir: Path):
         descriptor_link = build_utmapf_descriptor_link(resolver_entry, resolver, function_descriptor_index)
         if descriptor_link:
             resolver_entry["descriptor_link"] = descriptor_link
+    resolver_keys = [
+        (
+            entry["trace_kernel_id"],
+            entry["unique_function_id"],
+            entry["pc_hex"],
+        )
+        for entry in resolver
+    ]
+    duplicate_keys = len(resolver_keys) - len(set(resolver_keys))
     return {
-        "version": 1,
+        "version": 2,
+        "key_fields": [
+            "trace_kernel_id", "unique_function_id", "pc_hex"
+        ],
         "source": {
             "discovery_entries": len(discovery_entries),
+            "runtime_sites": len(runtime_sites),
             "runtime_events": len(runtime_rows),
+            "hidden_completion_events_ignored":
+                hidden_completion_events_ignored,
+            "hidden_completion_sites": hidden_completion_sites,
+        },
+        "validation_complete": (
+            len(resolver) == len(runtime_sites) and duplicate_keys == 0
+        ),
+        "validation": {
+            "runtime_sites": len(runtime_sites),
+            "resolver_records": len(resolver),
+            "duplicate_keys": duplicate_keys,
         },
         "resolver": resolver,
     }
@@ -858,6 +1021,23 @@ def main():
     verify_descriptor_required_sites_or_fail(payload)
     resolver_out = args.resolver_out or (extra_info_dir / "tma_operand_resolver.json")
     resolver_out.write_text(json.dumps(payload, indent=2) + "\n")
+    validation = payload["validation"]
+    if not payload["validation_complete"]:
+        print(
+            "FINAL status=FAIL "
+            f"runtime_sites={validation['runtime_sites']} "
+            f"resolver_records={validation['resolver_records']} "
+            f"duplicate_keys={validation['duplicate_keys']}"
+        )
+        raise SystemExit("TMA operand resolver validation failed")
+    print(
+        "FINAL status=PASS "
+        f"runtime_sites={validation['runtime_sites']} "
+        f"resolver_records={validation['resolver_records']} "
+        f"duplicate_keys={validation['duplicate_keys']} "
+        f"hidden_completion_events_ignored="
+        f"{payload['source']['hidden_completion_events_ignored']}"
+    )
 
 
 if __name__ == "__main__":

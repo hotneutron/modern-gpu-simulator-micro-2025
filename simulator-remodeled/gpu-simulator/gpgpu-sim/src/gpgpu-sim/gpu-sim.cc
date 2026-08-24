@@ -380,25 +380,126 @@ void load_tma_descriptor_configs(const std::filesystem::path &extra_info_dir,
 void load_tma_pc_base_map(const std::filesystem::path &extra_info_dir,
                           TMASidecarMetadataDB &db) {
   rapidjson::Document doc;
-  if (!load_tma_json_document(extra_info_dir / "tma_pc_base_map.json", doc)) {
+  const std::filesystem::path path =
+      extra_info_dir / "tma_pc_base_map.json";
+  if (!load_tma_json_document(path, doc)) {
     return;
   }
   if (!doc.HasMember("map") || !doc["map"].IsObject()) {
     return;
   }
+  const unsigned int version =
+      doc.HasMember("version")
+          ? static_cast<unsigned int>(parse_tma_json_uint(doc["version"]))
+          : 1;
+  db.base_map_version = version;
+  if (version >= 2 &&
+      (!doc.HasMember("validation_complete") ||
+       !doc["validation_complete"].IsBool() ||
+       !doc["validation_complete"].GetBool())) {
+    std::cerr << "[TMA][BaseMap][FATAL] version-" << version
+              << " sidecar is not validation_complete: " << path.string()
+              << std::endl;
+    abort();
+  }
+  if (version >= 2) {
+    if (!doc.HasMember("validation") || !doc["validation"].IsObject()) {
+      std::cerr << "[TMA][BaseMap][FATAL] version-" << version
+                << " sidecar has no validation summary: " << path.string()
+                << std::endl;
+      abort();
+    }
+    const rapidjson::Value &validation = doc["validation"];
+    const uint64_t sites_total =
+        validation.HasMember("sites_total")
+            ? parse_tma_json_uint(validation["sites_total"])
+            : 0;
+    const uint64_t chain_resolved =
+        validation.HasMember("chain_resolved")
+            ? parse_tma_json_uint(validation["chain_resolved"])
+            : 0;
+    const uint64_t ambiguous =
+        validation.HasMember("ambiguous")
+            ? parse_tma_json_uint(validation["ambiguous"])
+            : 1;
+    const uint64_t unresolved =
+        validation.HasMember("unresolved")
+            ? parse_tma_json_uint(validation["unresolved"])
+            : 1;
+    const uint64_t direct_authority =
+        validation.HasMember("direct_authority")
+            ? parse_tma_json_uint(validation["direct_authority"])
+            : 1;
+    const uint64_t pool_authority =
+        validation.HasMember("pool_authority")
+            ? parse_tma_json_uint(validation["pool_authority"])
+            : 1;
+    if (sites_total == 0 || chain_resolved != sites_total ||
+        ambiguous != 0 || unresolved != 0 || direct_authority != 0 ||
+        pool_authority != 0) {
+      std::cerr << "[TMA][BaseMap][FATAL] invalid kernel-aware validation "
+                << "sites_total=" << sites_total
+                << " chain_resolved=" << chain_resolved
+                << " ambiguous=" << ambiguous
+                << " unresolved=" << unresolved
+                << " direct_authority=" << direct_authority
+                << " pool_authority=" << pool_authority << " path="
+                << path.string() << std::endl;
+      abort();
+    }
+  }
   for (auto it = doc["map"].MemberBegin(); it != doc["map"].MemberEnd(); ++it) {
-    // Key format is "uid:pc_hex" (e.g. "8:0x90a0"). Split on ':'.
+    // Version 2 key: "trace_kernel_id:uid:pc_hex". Version 1 records remain
+    // readable under a wildcard trace-kernel ID for old traces.
     std::string key = it->name.GetString();
-    std::string::size_type colon = key.find(':');
-    if (colon == std::string::npos) {
+    std::string::size_type first_colon = key.find(':');
+    if (first_colon == std::string::npos) {
       continue;
     }
+    std::string::size_type second_colon = key.find(':', first_colon + 1);
+    unsigned int trace_kernel_id = ~0u;
+    std::string uid_text;
+    std::string pc_text;
+    if (second_colon == std::string::npos) {
+      if (version >= 2) {
+        std::cerr << "[TMA][BaseMap][FATAL] version-" << version
+                  << " has legacy key '" << key << "' in " << path.string()
+                  << std::endl;
+        abort();
+      }
+      uid_text = key.substr(0, first_colon);
+      pc_text = key.substr(first_colon + 1);
+    } else {
+      trace_kernel_id = static_cast<unsigned int>(
+          std::strtoul(key.substr(0, first_colon).c_str(), nullptr, 0));
+      uid_text =
+          key.substr(first_colon + 1, second_colon - first_colon - 1);
+      pc_text = key.substr(second_colon + 1);
+    }
     unsigned int unique_function_id = static_cast<unsigned int>(
-        std::strtoul(key.substr(0, colon).c_str(), nullptr, 0));
-    uint64_t pc = std::strtoull(key.substr(colon + 1).c_str(), nullptr, 0);
+        std::strtoul(uid_text.c_str(), nullptr, 0));
+    uint64_t pc = std::strtoull(pc_text.c_str(), nullptr, 0);
     const rapidjson::Value &entry = it->value;
     if (!entry.IsObject()) {
+      if (version >= 2) {
+        std::cerr << "[TMA][BaseMap][FATAL] non-object record for key='"
+                  << key << "' in " << path.string() << std::endl;
+        abort();
+      }
       continue;
+    }
+    if (version >= 2) {
+      if (!entry.HasMember("trace_kernel_id") ||
+          !entry.HasMember("unique_function_id") ||
+          !entry.HasMember("pc_hex") ||
+          parse_tma_json_uint(entry["trace_kernel_id"]) != trace_kernel_id ||
+          parse_tma_json_uint(entry["unique_function_id"]) !=
+              unique_function_id ||
+          parse_tma_json_uint(entry["pc_hex"]) != pc) {
+        std::cerr << "[TMA][BaseMap][FATAL] key/value identity mismatch for '"
+                  << key << "' in " << path.string() << std::endl;
+        abort();
+      }
     }
     TMABaseRecord record;
     if (entry.HasMember("operand_addressed") &&
@@ -469,15 +570,37 @@ void load_tma_pc_base_map(const std::filesystem::path &extra_info_dir,
     if (entry.HasMember("source") && entry["source"].IsString()) {
       record.source = entry["source"].GetString();
     }
-    db.base_records[TMABaseLookupKey{unique_function_id, pc}] = record;
+    if (version >= 2) {
+      const bool valid_source =
+          record.operand_addressed
+              ? record.source == "operand_raw_pointer"
+              : (record.source == "utmacctl_chain" ||
+                 record.source == "utmacctl_prefetch_edge");
+      if (!valid_source) {
+        std::cerr << "[TMA][BaseMap][FATAL] non-authoritative source='"
+                  << record.source << "' for key='" << key << "' in "
+                  << path.string() << std::endl;
+        abort();
+      }
+    }
+    const TMABaseLookupKey lookup_key{
+        trace_kernel_id, unique_function_id, pc};
+    if (!db.base_records.emplace(lookup_key, record).second) {
+      std::cerr << "[TMA][BaseMap][FATAL] duplicate key trace_kernel="
+                << trace_kernel_id << " uid=" << unique_function_id
+                << " pc=0x" << std::hex << pc << std::dec << " in "
+                << path.string() << std::endl;
+      abort();
+    }
   }
 }
 
 void load_tma_operand_resolver(const std::filesystem::path &extra_info_dir,
                                TMASidecarMetadataDB &db) {
   rapidjson::Document doc;
-  if (!load_tma_json_document(extra_info_dir / "tma_operand_resolver.json",
-                              doc)) {
+  const std::filesystem::path path =
+      extra_info_dir / "tma_operand_resolver.json";
+  if (!load_tma_json_document(path, doc)) {
     return;
   }
   if (!doc.HasMember("resolver")) {
@@ -487,22 +610,101 @@ void load_tma_operand_resolver(const std::filesystem::path &extra_info_dir,
   if (!resolver.IsArray()) {
     return;
   }
+  const unsigned int version =
+      doc.HasMember("version")
+          ? static_cast<unsigned int>(parse_tma_json_uint(doc["version"]))
+          : 1;
+  db.operand_map_version = version;
+  if (version >= 2 &&
+      (!doc.HasMember("validation_complete") ||
+       !doc["validation_complete"].IsBool() ||
+       !doc["validation_complete"].GetBool())) {
+    std::cerr << "[TMA][OperandMap][FATAL] version-" << version
+              << " sidecar is not validation_complete: " << path.string()
+              << std::endl;
+    abort();
+  }
+  if (version >= 2) {
+    if (!doc.HasMember("validation") || !doc["validation"].IsObject()) {
+      std::cerr << "[TMA][OperandMap][FATAL] version-" << version
+                << " sidecar has no validation summary: " << path.string()
+                << std::endl;
+      abort();
+    }
+    const rapidjson::Value &validation = doc["validation"];
+    const uint64_t runtime_sites =
+        validation.HasMember("runtime_sites")
+            ? parse_tma_json_uint(validation["runtime_sites"])
+            : 0;
+    const uint64_t resolver_records =
+        validation.HasMember("resolver_records")
+            ? parse_tma_json_uint(validation["resolver_records"])
+            : 0;
+    const uint64_t duplicate_keys =
+        validation.HasMember("duplicate_keys")
+            ? parse_tma_json_uint(validation["duplicate_keys"])
+            : 1;
+    if (runtime_sites == 0 || runtime_sites != resolver.Size() ||
+        resolver_records != resolver.Size() || duplicate_keys != 0) {
+      std::cerr << "[TMA][OperandMap][FATAL] invalid validation summary "
+                << "runtime_sites=" << runtime_sites
+                << " resolver_records=" << resolver_records
+                << " actual_records=" << resolver.Size()
+                << " duplicate_keys=" << duplicate_keys << " path="
+                << path.string() << std::endl;
+      abort();
+    }
+  }
   for (const auto &entry : resolver.GetArray()) {
     if (!entry.IsObject() || !entry.HasMember("unique_function_id") ||
         entry["unique_function_id"].IsNull() ||
         !entry.HasMember("pc_hex") || !entry["pc_hex"].IsString()) {
+      if (version >= 2) {
+        std::cerr << "[TMA][OperandMap][FATAL] malformed version-" << version
+                  << " record in " << path.string() << std::endl;
+        abort();
+      }
       continue;
     }
     unsigned int unique_function_id =
         static_cast<unsigned int>(parse_tma_json_uint(
             entry["unique_function_id"]));
+    unsigned int trace_kernel_id =
+        entry.HasMember("trace_kernel_id")
+            ? static_cast<unsigned int>(
+                  parse_tma_json_uint(entry["trace_kernel_id"]))
+            : ~0u;
+    if (version >= 2 && trace_kernel_id == ~0u) {
+      std::cerr << "[TMA][OperandMap][FATAL] version-" << version
+                << " record has no trace_kernel_id in " << path.string()
+                << std::endl;
+      abort();
+    }
     uint64_t pc = std::strtoull(entry["pc_hex"].GetString(), nullptr, 0);
+    const TMAOperandLookupKey lookup_key{
+        trace_kernel_id, unique_function_id, pc};
+    if (version >= 2 &&
+        db.operand_site_records.count(lookup_key) != 0) {
+      std::cerr << "[TMA][OperandMap][FATAL] duplicate key trace_kernel="
+                << trace_kernel_id << " uid=" << unique_function_id
+                << " pc=0x" << std::hex << pc << std::dec << " in "
+                << path.string() << std::endl;
+      abort();
+    }
     TMAOperandSiteRecord &record =
-        db.operand_site_records[TMAOperandLookupKey{unique_function_id, pc}];
+        db.operand_site_records[lookup_key];
     std::string opcode = entry.HasMember("opcode") && entry["opcode"].IsString()
                              ? entry["opcode"].GetString()
                              : "";
     TMAOpcodeFamily opcode_family = parse_tma_opcode_family_string(opcode);
+    if (entry.HasMember("mapping_method") &&
+        entry["mapping_method"].IsString()) {
+      record.mapping_method = entry["mapping_method"].GetString();
+    }
+    if (entry.HasMember("confidence")) {
+      record.resolver_confidence =
+          parse_tma_confidence_score(entry["confidence"]);
+    }
     if (entry.HasMember("runtime_observed")) {
       record.runtime_observed = entry["runtime_observed"].IsBool() &&
                                 entry["runtime_observed"].GetBool();
@@ -568,6 +770,91 @@ void load_tma_operand_resolver(const std::filesystem::path &extra_info_dir,
       }
     }
   }
+}
+
+void load_tma_completion_contract_validation(
+    const std::filesystem::path &extra_info_dir, TMASidecarMetadataDB &db) {
+  if (db.base_map_version < 2) {
+    return;
+  }
+  rapidjson::Document doc;
+  const std::filesystem::path path =
+      extra_info_dir / "tma_completion_contracts.json";
+  if (!load_tma_json_document(path, doc) ||
+      !doc.HasMember("validation_complete") ||
+      !doc["validation_complete"].IsBool() ||
+      !doc["validation_complete"].GetBool() ||
+      !doc.HasMember("summary") || !doc["summary"].IsObject()) {
+    std::cerr << "[TMA][Contract][FATAL] missing or invalid validated "
+                 "completion contract sidecar: "
+              << path.string() << std::endl;
+    abort();
+  }
+  const uint64_t version =
+      doc.HasMember("version") ? parse_tma_json_uint(doc["version"]) : 0;
+  const uint64_t source_base_map_version =
+      doc.HasMember("source_base_map_version")
+          ? parse_tma_json_uint(doc["source_base_map_version"])
+          : 0;
+  const uint64_t source_operand_map_version =
+      doc.HasMember("source_operand_map_version")
+          ? parse_tma_json_uint(doc["source_operand_map_version"])
+          : 0;
+  const rapidjson::Value &summary = doc["summary"];
+  const uint64_t kernels =
+      summary.HasMember("kernels")
+          ? parse_tma_json_uint(summary["kernels"])
+          : 0;
+  const uint64_t contracts =
+      summary.HasMember("contracts")
+          ? parse_tma_json_uint(summary["contracts"])
+          : 0;
+  const uint64_t completion_loads =
+      summary.HasMember("completion_loads")
+          ? parse_tma_json_uint(summary["completion_loads"])
+          : 0;
+  const uint64_t expected_bytes =
+      summary.HasMember("expected_bytes")
+          ? parse_tma_json_uint(summary["expected_bytes"])
+          : 0;
+  const uint64_t assigned_bytes =
+      summary.HasMember("assigned_bytes")
+          ? parse_tma_json_uint(summary["assigned_bytes"])
+          : 0;
+  const uint64_t metadata_records_checked =
+      summary.HasMember("metadata_records_checked")
+          ? parse_tma_json_uint(summary["metadata_records_checked"])
+          : 0;
+  const uint64_t errors =
+      summary.HasMember("errors")
+          ? parse_tma_json_uint(summary["errors"])
+          : 1;
+  if (version != 2 || source_base_map_version != db.base_map_version ||
+      source_operand_map_version != db.operand_map_version ||
+      kernels == 0 || contracts == 0 || completion_loads == 0 ||
+      expected_bytes != assigned_bytes || errors != 0) {
+    std::cerr << "[TMA][Contract][FATAL] invalid completion contracts "
+              << "version=" << version
+              << " source_base_map_version=" << source_base_map_version
+              << " loaded_base_map_version=" << db.base_map_version
+              << " source_operand_map_version=" << source_operand_map_version
+              << " loaded_operand_map_version=" << db.operand_map_version
+              << " kernels=" << kernels << " contracts=" << contracts
+              << " completion_loads=" << completion_loads
+              << " expected_bytes=" << expected_bytes
+              << " assigned_bytes=" << assigned_bytes
+              << " errors=" << errors << " path=" << path.string()
+              << std::endl;
+    abort();
+  }
+  if (metadata_records_checked != db.base_records.size()) {
+    std::cerr << "[TMA][Contract][FATAL] stale metadata validation "
+              << "checked_records=" << metadata_records_checked
+              << " loaded_records=" << db.base_records.size() << " path="
+              << path.string() << std::endl;
+    abort();
+  }
+  db.completion_contracts_validated = true;
 }
 
 SyncInstructionKind parse_sync_instruction_kind_string(const std::string &kind) {
@@ -1847,11 +2134,11 @@ void gpgpu_sim::parse_extra_trace_info(std::string filepath, bool is_extra_trace
     std::filesystem::path extra_info_dir = metadata_path.parent_path();
     load_tma_descriptor_configs(extra_info_dir, m_tma_sidecar_db);
     load_tma_pc_base_map(extra_info_dir, m_tma_sidecar_db);
-    // The exact (uid,pc) base map is the sole descriptor-address source; the legacy
-    // handle_hi descriptor resolver has been removed (M3). config_id / box_dim still
-    // flow through the operand resolver's linked_config_id -> descriptor_configs join.
+    // Version-2 sidecars use the kernel-aware (trace_kernel_id,uid,pc) key.
+    // Legacy version-1 records remain readable through a wildcard kernel ID.
     load_tma_operand_resolver(extra_info_dir, m_tma_sidecar_db);
     load_sync_operand_resolver(extra_info_dir, m_sync_sidecar_db);
+    load_tma_completion_contract_validation(extra_info_dir, m_tma_sidecar_db);
     if (m_shader_config->wait_block_enable) {
       load_wait_block_sidecar_v5(
           extra_info_dir, m_extra_trace_info, m_wait_block_sidecar_db);
@@ -1885,7 +2172,14 @@ void gpgpu_sim::parse_extra_trace_info(std::string filepath, bool is_extra_trace
                 << " operand_sites="
                 << m_tma_sidecar_db.operand_site_records.size()
                 << " base_records="
-                << m_tma_sidecar_db.base_records.size() << std::endl;
+                << m_tma_sidecar_db.base_records.size()
+                << " base_map_version="
+                << m_tma_sidecar_db.base_map_version
+                << " operand_map_version="
+                << m_tma_sidecar_db.operand_map_version
+                << " contracts_validated="
+                << (m_tma_sidecar_db.completion_contracts_validated ? 1 : 0)
+                << std::endl;
     }
     if (m_shader_config->sync_debug_enable ||
         m_shader_config->trimchk_percta_log_enable ||
@@ -1912,12 +2206,17 @@ void gpgpu_sim::parse_extra_trace_info(std::string filepath, bool is_extra_trace
 }
 // MOD. End. Improved tracer
 
-bool gpgpu_sim::lookup_tma_site_metadata(unsigned int unique_function_id,
+bool gpgpu_sim::lookup_tma_site_metadata(unsigned int trace_kernel_id,
+                                         unsigned int unique_function_id,
                                          address_type pc,
                                          TMAResolvedSiteMetadata &metadata) const {
   metadata = TMAResolvedSiteMetadata();
   auto it_operand = m_tma_sidecar_db.operand_site_records.find(
-      TMAOperandLookupKey{unique_function_id, pc});
+      TMAOperandLookupKey{trace_kernel_id, unique_function_id, pc});
+  if (it_operand == m_tma_sidecar_db.operand_site_records.end()) {
+    it_operand = m_tma_sidecar_db.operand_site_records.find(
+        TMAOperandLookupKey{~0u, unique_function_id, pc});
+  }
   if (it_operand != m_tma_sidecar_db.operand_site_records.end()) {
     const TMAOperandSiteRecord &operand_record = it_operand->second;
     metadata.valid = true;
@@ -1945,11 +2244,18 @@ bool gpgpu_sim::lookup_tma_site_metadata(unsigned int unique_function_id,
   return metadata.valid;
 }
 
-bool gpgpu_sim::lookup_tma_base_record(unsigned int unique_function_id,
+bool gpgpu_sim::lookup_tma_base_record(unsigned int trace_kernel_id,
+                                       unsigned int unique_function_id,
                                        address_type pc,
                                        TMABaseRecord &record) const {
   auto it = m_tma_sidecar_db.base_records.find(
-      TMABaseLookupKey{unique_function_id, static_cast<uint64_t>(pc)});
+      TMABaseLookupKey{trace_kernel_id, unique_function_id,
+                       static_cast<uint64_t>(pc)});
+  if (it == m_tma_sidecar_db.base_records.end()) {
+    it = m_tma_sidecar_db.base_records.find(
+        TMABaseLookupKey{~0u, unique_function_id,
+                         static_cast<uint64_t>(pc)});
+  }
   if (it == m_tma_sidecar_db.base_records.end()) {
     return false;
   }

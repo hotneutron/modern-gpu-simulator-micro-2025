@@ -292,8 +292,8 @@ def build_tma_descriptor_mapping_if_available(trace_folder):
         [sys.executable, mapping_script, extra_info_dir, "--configs-only"],
         check=True,
     )
-    # Exact (uid,pc) -> real GMEM base + full descriptor fields. Strict: fail if any
-    # descriptor LDG/STG site is unresolved or falls back to the pool.
+    # Exact (trace_kernel_id,uid,pc) -> real GMEM base + full descriptor fields.
+    # Strict: fail if any descriptor site lacks one unambiguous UTMACCTL chain.
     base_map_inputs = [
         os.path.join(extra_info_dir, "tma_launch_param_dump.csv"),
         os.path.join(extra_info_dir, "tensor_map_encode_dump.csv"),
@@ -326,6 +326,30 @@ def build_sync_operand_mapping_if_available(trace_folder):
         return
     sync_script = os.path.join(this_directory, "build_sync_operand_mapping.py")
     subprocess.run([sys.executable, sync_script, extra_info_dir], check=True)
+
+
+def validate_tma_completion_contracts_if_available(trace_folder):
+    extra_info_dir = os.path.join(trace_folder, "extra_info")
+    inputs = [
+        os.path.join(extra_info_dir, "tma_pc_base_map.json"),
+        os.path.join(extra_info_dir, "tma_operand_resolver.json"),
+        os.path.join(extra_info_dir, "sync_operand_resolver.json"),
+    ]
+    if not all(os.path.exists(path) for path in inputs):
+        return
+    validator = os.path.join(
+        this_directory, "validate_tma_completion_contracts.py"
+    )
+    subprocess.run(
+        [
+            sys.executable,
+            validator,
+            "--traces",
+            trace_folder,
+            "--strict",
+        ],
+        check=True,
+    )
 
 
 def build_spin_wait_sidecar(trace_folder):
@@ -571,6 +595,9 @@ for bench in benchmarks:
                 build_tma_descriptor_mapping_if_available(this_trace_folder)
                 build_tma_operand_mapping_if_available(this_trace_folder)
                 build_sync_operand_mapping_if_available(this_trace_folder)
+                validate_tma_completion_contracts_if_available(
+                    this_trace_folder
+                )
             if trim_spin_enabled:
                 spin_trim_run_dir(this_run_dir)
             if not warp_lifetime_only:
