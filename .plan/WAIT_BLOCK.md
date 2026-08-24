@@ -15,7 +15,9 @@ REPLAY/CLOSE BUT EXPOSED AN OUT-OF-ORDER REPLAY-DECODE RESERVATION GAP; K5
 `.e83` CONFIRMED THE RESERVATION FIX AND EXPOSED AN INDEPENDENT TMA
 COMPLETION-BINDING AND TX-SIZE CONTRACT FAILURE; POST-REVIEW K5/K10 TRACE
 ANALYSIS RESOLVED THE SIZE FAILURE AS A DESCRIPTOR-SITE MISCLASSIFICATION AND
-CONFIRMED THAT A DIRECT TMA COMPLETION-BARRIER TRACE FIELD REQUIRES RETRACING.
+CONFIRMED THAT A DIRECT TMA COMPLETION-BARRIER TRACE FIELD REQUIRES RETRACING;
+THE RETRACE AT `9e92fe9` IS COMPLETE AND VALIDATES 100% COMPLETION-TARGET
+COVERAGE; RUNTIME B0 AND B1 CHANGES REMAIN UNIMPLEMENTED.
 
 This document is the authoritative, self-contained design and execution record
 for WaitBlock, partial replay, and the post-`.e83` TMA/barrier work. The linked
@@ -2392,7 +2394,10 @@ without introducing scheduler-order bias.
 
 | ID | Work item | Status after `.e83` |
 |---|---|---|
-| B0 | Exact TMA-command-to-barrier completion ownership and tx-size contract | **EVIDENCE RESOLVED / TRACE CAPTURE IMPLEMENTED / RUNTIME NOT IMPLEMENTED**; retrace required |
+| B0-A | Repair UBLKCP sidecar callback-role selection | **REQUIRED / NOT IMPLEMENTED**; current retrace contaminates raw-pointer tiling metadata with the new completion callback |
+| B0-B | Kernel-aware descriptor identity and K5 tx-size restoration | **ROOT CAUSE RESOLVED / KERNEL-AWARE MAPPING PROOF PENDING** |
+| B0-C | Size-only K5/K10 byte-conservation diagnostic with existing FIFO/release order | **READY AFTER B0-A/B**; kernel completion is diagnostic, not a correctness gate |
+| B0-D | Exact TMA-command-to-barrier completion ownership | **TRACE READY / RUNTIME NOT IMPLEMENTED** |
 | B1 | One SM-level WaitBlock release phase per cycle | **REQUIRED / NOT IMPLEMENTED** |
 | B2 | WaitBlock startup and provenance fail-fast checks | **MOSTLY IMPLEMENTED** |
 | B3 | Assert-before-clear lifecycle checks | **PARTIAL**: WaitBlock state guarded; TMA ownership cleanup missing |
@@ -2402,10 +2407,25 @@ without introducing scheduler-order bias.
 | B7 | Fold/WaitBlock metric integrity and final reconciliation | **PARTIAL** |
 | D0 | Generic ISA-wide effect framework | **DEFERRED**; exact sidecar allow/proof sets remain authoritative |
 | D1 | Generic repeated-EXCH initialization epochs | **DEFERRED** for current FA3 one-EXCH-per-barrier contract |
-| D2 | Full trace regeneration | **REQUIRED**: the existing protobuf has no exact TMA completion-barrier field |
+| D2 | Full trace regeneration | **COMPLETE** at tracer commit `9e92fe9`; K5/K10 payload coverage validated |
 
 No item in this section may weaken the existing WaitBlock generation,
 cursor/replay, semantic-work, or feature-off invariants.
+
+Terms used throughout this section:
+
+- **descriptor**: the 128-byte `CUtensorMap` metadata that defines a tensor's
+  base, shape, strides, and element type;
+- **runtime TMA-state offset**: the low bits extracted from the executed
+  descriptor-family instruction's runtime state operand;
+- **struct descriptor offset**: the byte position at which an exact 128-byte
+  encoded descriptor blob occurs in the captured kernel-parameter struct;
+- **direct mapping**: the old shortcut that equates a runtime TMA-state offset
+  with a numerically equal struct descriptor offset, without a data-flow edge;
+- **chain mapping**: a mapping that follows a captured `UTMACCTL.PF` source and
+  destination relation from one exact struct descriptor to a runtime TMA state;
+- **transaction contract**: one active `ARRIVE_EXPECT_TX` byte declaration plus
+  the completion-bearing LOAD commands that name the same runtime barrier.
 
 ### 6.2 Unified state model
 
@@ -2443,6 +2463,13 @@ struct TMACommand {
   TmaCompletionTarget completion;
 };
 ```
+
+The scalar `TmaCompletionTarget` is intentional for the currently supported
+non-multicast subset. It must not be treated as a permanent one-target ISA
+restriction. A future multicast implementation replaces it with a bounded
+inline target array plus a target count; it must not introduce per-cycle heap
+allocation. Until the destination set and credit partition are traced,
+multicast remains fail-closed.
 
 `memory_bytes` and `credit_bytes` are intentionally separate. They are equal by
 default, but a difference is legal only when static ISA evidence plus dynamic
@@ -2487,15 +2514,12 @@ Existing documentation claimed the runtime already implemented these rules.
 It does not. The current `TMACommand` has no completion-barrier field, and
 `notify_tma_completion()` receives only `(warp_id, bytes)`.
 
-Trace-data gate result:
+Trace-data gate history and final result:
 
-1. `instruction.proto` currently has `sync` and `bar_runtime` payloads but no
-   TMA completion payload.
-2. Generic register values are not serialized into the replay protobuf.
-   `tma_runtime_operand_debug.jsonl` records the two TMA memory-reference
-   callbacks, but it does not preserve the first pair's high UReg as a
-   separately trustworthy barrier field.
-3. The static SASS proves the relationship. For K5:
+1. The pre-`9e92fe9` protobuf had `sync` and `bar_runtime` payloads but no TMA
+   completion payload. Generic register values and
+   `tma_runtime_operand_debug.jsonl` were not a trustworthy replacement.
+2. The static SASS proved the relationship. For K5:
 
    ```text
    R4  = R16 + 0x16800
@@ -2507,17 +2531,27 @@ Trace-data gate result:
 
    K10 similarly uses the high half of each `UTMALDG`/`UBLKCP` destination
    state pair for the same contract barrier.
-4. Extend the protobuf with a dedicated TMA completion payload containing a
-   valid bit and 64-bit runtime barrier address. The tracer must read `URn+1`
-   directly for each completion-bearing LOAD.
-5. Plumb the field through `inst_trace_t`, `trace_warp_inst_t`, and
-   `TMACommand`, then regenerate K5 and K10 traces.
+3. Commit `9e92fe9` added a dedicated payload with a valid bit, the 64-bit
+   runtime barrier address, and the captured high-UReg ID. The field is plumbed
+   through `inst_trace_t` and `trace_warp_inst_t`; `TMACommand` ownership is
+   intentionally deferred to B0-D.
+4. The regenerated trace manifest reports `git_sha=9e92fe9` and
+   `compact_wire,prune_operands`. All 132 K5 CTAs and 384 K10 CTAs parse.
+5. Every active completion-bearing LOAD contains the payload:
+
+   ```text
+   K5:  5,112 / 5,112, missing=0
+   K10: 13,824 / 13,824, missing=0
+   LOAD payload barrier vs active expect-tx barrier mismatches=0
+   LOAD before an active contract=0
+   ```
+
 6. Do not reuse a descriptor handle, memory address, `sync_barrier_addr` from an
    unrelated SYNCS occurrence, or PC-order inference as the completion target.
 
-The existing traces are sufficient to prove ordering and diagnose the size
-mapping, but not to provide the final command-owned runtime identity. Retracing
-is therefore mandatory for the production fix.
+The regenerated trace is sufficient for B0-A through B0-D. No additional
+hardware retrace is required unless a later schema change is separately
+approved.
 
 ### 6.4 Expected-tx and transfer-size decision
 
@@ -2549,8 +2583,8 @@ Evidence:
   `expected=24576` followed by exactly one `UTMALDG`; no second 8-KiB producer,
   unmatched LOAD, overwritten contract, or residual contract exists.
 - Every other K5 contract sums exactly to 16,384 bytes under current metadata.
-- The current `0x96b0` descriptor result is
-  `confidence=medium`; it is not direct descriptor-byte evidence.
+- The current `0x96b0` descriptor result is not an exact descriptor identity.
+  It came from the old direct mapping defined below.
 - K10 provides the required multi-producer control case. All 13,824 LOAD
   occurrences close their contracts exactly:
   - `16896 = UTMALDG(16384) + UBLKCP(512)`
@@ -2562,24 +2596,105 @@ Conclusion:
 ```text
 0x96b0 is the Q transaction.
 the 64x128 classification is wrong.
-resolve it to the unique rank-4 BF16 64x192 descriptor candidate.
+the repaired kernel-aware chain must either resolve it unambiguously to encode
+0, the rank-4 BF16 64x192 descriptor, or abort; expected-tx independently
+validates encode 0 as the only byte-compatible candidate.
 memory_bytes = credit_bytes = 24576.
 ```
 
-The postprocessor must make this correction generically:
+The descriptor identity failure is now understood more precisely. The old
+postprocessor uses these two concepts:
 
-1. Group completion-bearing LOADs by their exact traced barrier contract.
-2. Sum independently resolved command sizes for each contract.
-3. If a single descriptor-backed command underfills the contract, search only
-   the launch's proven descriptor candidates with the same rank/data type.
-4. Accept a correction only when exactly one candidate's box volume equals the
-   captured expected-tx bytes.
-5. Correct descriptor identity, base, geometry, `memory_bytes`, and
+```text
+direct:
+    runtime TMA-state offset numerically equals struct descriptor offset
+    no instruction-level copy relation proves the identity
+
+chain:
+    struct descriptor -> UTMACCTL.PF source/destination
+                      -> runtime TMA state -> descriptor-family command
+```
+
+For K5 `0x96b0`, runtime state offset `0x400` produces conflicting candidates:
+
+```text
+old direct shortcut:
+    struct 0x400 -> encode 8 -> 64x128 BF16 -> 16,384 bytes
+
+UTMACCTL relation:
+    struct 0x1c0 -> runtime state 0x400
+    encode 0 -> 64x192 BF16 -> 24,576 bytes
+```
+
+`build_tma_pc_base_map.py` currently checks direct before chain, so it silently
+selects encode 8. The old `23/23 exact` claim measured deterministic coverage,
+not semantic descriptor identity. It did not compare both candidate sources.
+
+Aggregated over the regenerated K5/K10 trace, the direct-vs-chain divergence is
+not isolated to `0x96b0`:
+
+```text
+descriptor-family sites examined = 23
+at least one chain candidate      = 23
+direct candidate present         = 10
+direct-only sites                = 0
+selected direct/chain agreement  = 0
+selected direct/chain conflicts  = 10
+pre-overwrite candidates/state   = 2 or 3
+```
+
+Every site the direct shortcut could reach also has a chain candidate, no site
+depends on direct alone, and on every one of the 10 overlaps the two sources
+disagree. This is why direct cannot be retained even as a tie-breaker. The
+matching per-site derivation is in `TMA_BASE_ADDR.md` §2.29 and
+`TMA_exact_base_mapping_integration.md` M0.
+
+The current chain output is not yet an authority either. Its keys omit
+`trace_kernel_id`; repeated `(unique_function_id, pc)` records from different
+trace-kernel variants are merged, and a single `state offset -> descriptor`
+entry overwrites earlier candidates. Before that overwrite, each observed
+aggregate state key currently has two or three descriptor candidates. Therefore
+B0-B must:
+
+1. key static and runtime TMA metadata by
+   `(trace_kernel_id, unique_function_id, pc)`;
+2. preserve every `UTMACCTL.PF` source/destination edge until the dynamic kernel
+   variant is selected;
+3. require one exact descriptor for every executed descriptor-family site;
+4. remove direct numeric equality and pool assignment as routing authorities;
+5. abort on missing, duplicate, or conflicting chain identity (the **ambiguity
+   gate**: a site resolves only if exactly one chain candidate survives kernel
+   variant selection, otherwise sidecar generation fails closed);
+6. use the independently captured transaction contract only to validate
+   `descriptor bytes == expected_tx`, never as the primary identity selector;
+7. correct descriptor identity, base, geometry, `memory_bytes`, and
    `credit_bytes` together.
-6. If zero or multiple candidates match, fail sidecar generation.
+
+The ambiguity gate is absolute: if two chain candidates survive
+kernel-variant selection, `expected_tx` must not select the candidate whose
+size happens to match. Sidecar generation aborts even when exactly one
+candidate is byte-compatible.
 
 No kernel ID, PC, barrier offset, descriptor handle ordering, or 8-KiB
 correction may be hardcoded.
+
+There is a separate B0-A sidecar regression in the regenerated trace.
+`build_tma_pc_base_map.py` currently treats the maximum value among all
+`UNIFORM` callbacks as the UBLKCP span. The new hidden completion callback is
+also `UNIFORM`, so a barrier address is multiplied by 16:
+
+```text
+architectural operand-3 callback: raw=32 -> 512 bytes
+completion callback:              raw=0x31010
+incorrect base-map tile bytes:    0x31010 * 16 = 3,211,520
+```
+
+The simulator's command-size path remains correct because
+`tma_operand_resolver.json` identifies operand 3 and supplies 512 bytes.
+However, the corrupted base-map value changes raw-pointer mock tiling. B0-A
+must select the statically identified operand-3 callback, assert
+`covered_bytes == operand3_raw * 16`, and regenerate sidecars from the existing
+raw trace before either K10 regression or B0-D. It does not require retracing.
 
 ### 6.5 Issue-time binding algorithm
 
@@ -2588,6 +2703,9 @@ in-order, so the contract exists before its completion-bearing LOADs. The
 runtime barrier identity still comes from each LOAD's new traced completion
 payload; the contract validates command membership and byte conservation. A
 warp FIFO is not the completion routing authority.
+
+This algorithm belongs to B0-D. B0-C intentionally retains the current FIFO to
+isolate the causal effect of restoring the missing K5 bytes.
 
 Contract rules:
 
@@ -2632,7 +2750,11 @@ Multiple LOAD commands may target one barrier generation only when every
 instruction independently resolves to that same key. A single non-multicast
 LOAD must never consume ranges belonging to different barriers.
 
-### 6.6 Completion algorithm
+### 6.6 Completion algorithm (B0-D only)
+
+This section is not part of the B0-C size-only diagnostic. B0-C retains
+`notify_tma_completion(warp_id, completed_tx_bytes)` and the legacy FIFO
+unchanged.
 
 Replace:
 
@@ -2722,6 +2844,13 @@ Required properties:
 - moving the service point does not change trace cursors except through an
   already-approved WaitBlock release action.
 
+B1 validation must compare normal and reversed subcore traversal using the same
+trace and configuration. Both traversals must produce the same ordered
+`(cycle, warp, barrier, generation)` release fingerprint and the same final
+kernel cycle. A completion present in the cycle-start snapshot may release in
+that cycle; an arrival issued during subcore issue may release no warp until
+the next cycle.
+
 ### 6.9 Startup, payload, and provenance gates
 
 When `-wait_block_enable=1`, retain or enforce:
@@ -2734,6 +2863,12 @@ When `-wait_block_enable=1`, retain or enforce:
 - fold and observe modes are mutually exclusive;
 - required enhanced trace, sync resolver, TMA metadata, and completion-target
   payloads are present before kernel execution;
+- exact-mode TMA metadata uses
+  `(trace_kernel_id, unique_function_id, pc)` keys;
+- every executed descriptor-family site has one unambiguous chain-derived
+  descriptor and no direct/pool routing dependency;
+- every UBLKCP command has one statically identified operand-3 callback and its
+  base-map tile size equals its operand-resolver command size;
 - active action instructions with missing runtime payload abort unbudgeted;
 - zero-effective instructions are architectural no-ops and do not mutate
   barrier, WaitBlock, cursor, or accounting state.
@@ -2901,41 +3036,54 @@ containers are allocated with existing SM state.
 
 ### 6.14 Implementation order
 
-1. **Evidence gate: complete**
-   - current protobuf has no TMA completion-barrier payload;
-   - K5/K10 ordering and contract aggregation are proven from the full traces;
-   - `0x96b0` is a 24-KiB Q transaction misclassified by medium-confidence
-     descriptor metadata;
+1. **Evidence and retrace gates: complete**
+   - completion payload capture is implemented at `9e92fe9`;
+   - K5/K10 payload coverage is 100%, with zero barrier mismatch;
+   - K5 `0x96b0` is a 24-KiB Q transaction mapped to the wrong descriptor;
    - K5 has no multicast TMA.
-2. **Trace-schema patch complete; retrace pending**
-   - dedicated TMA completion payload is implemented;
-   - the tracer captures the high UReg of the first destination-state pair for
-     completion-bearing `UTMALDG` and `UBLKCP`;
-   - regenerate K5 and K10 traces;
-   - require 100% valid completion targets.
-3. **Postprocessor correction and observation**
-   - group commands by exact traced barrier contract;
-   - correct descriptor identity only through the unique rank/type/expected-byte
-     candidate rule from Section 6.4;
-   - report TMA PC, UID, barrier, generation, memory bytes, credit bytes, and
-     per-contract assigned total;
-   - verify K5/K10 binding coverage and no ambiguous identity.
-4. **B0 exact ownership**
+2. **B0-A UBLKCP sidecar repair**
+   - select operand 3 by its static callback role, not by maximum uniform value;
+   - regenerate sidecars from the existing raw trace;
+   - require all 9 observed K10 UBLKCP static sites and all 7,296 dynamic
+     occurrences to report operand-3 command bytes and tile bytes of 512;
+   - require zero selections of the hidden completion callback as a size source.
+3. **B0-B descriptor identity and byte restoration**
+   - introduce kernel-aware TMA metadata keys;
+   - preserve and validate UTMACCTL source/destination edges;
+   - prohibit direct/pool routing authority;
+   - regenerate consistent base-map and operand-resolver metadata;
+   - print `sites_total`, `chain_resolved`, `ambiguous`, `unresolved`,
+     `direct_authority`, and `pool_authority`; require
+     `chain_resolved == sites_total` and every failure count to be zero;
+   - record the historical aggregate baseline of 23 sites, 10 direct overlaps,
+     and 10 selected conflicts as diagnostic drift data, not as a success gate;
+   - require K5 `0x96b0` to form a 24-KiB command with 192 128-byte AGU
+     requests and 768 32-byte sector requests.
+4. **B0-C size-only byte-conservation diagnostic**
+   - retain the current per-warp FIFO, completion API, and release timing;
+   - make command formation, request count, and expected-minus-produced byte
+     conservation the primary acceptance criteria;
+   - record clean exit, watchdog location, and cycle count as diagnostic
+     outcomes only because changed transfer latency may expose FIFO misrouting;
+   - do not interpret either a clean exit or a new failure as proof that the
+     legacy FIFO is correct or that byte restoration is insufficient.
+5. **B0-D exact ownership**
    - add fixed-size completion target fields to `TMACommand`;
    - bind at issue/enqueue;
    - update only the bound barrier at completion;
    - remove anonymous FIFO completion consumption and cross-barrier spill.
-5. **B0 lifecycle**
+6. **B0-D lifecycle**
    - add assignment/completion conservation;
    - assert no orphan state before CTA cleanup and warp reuse.
-6. **B0-only validation and commit**
+7. **B0-D validation and separate commit**
    - run focused tests, K5, and K10 without moving the WaitBlock release phase;
    - retain the current B1 timing so a regression is attributable to B0.
-7. **B1 release ordering in a separate commit**
+8. **B1 release ordering in a separate commit**
    - move release service to one SM-level cycle phase after TMA completion and
      before all subcore issue.
-   - rerun focused timing checks, K5, and K10 independently.
-8. **Scope and metrics**
+   - rerun normal and reversed subcore traversal, focused timing checks, K5,
+     and K10 independently.
+9. **Scope and metrics**
    - add configurable watchdog/heartbeat values;
    - reset launch-scoped counters/budgets;
    - complete pure-query migration and metric reconciliation.
@@ -2948,6 +3096,17 @@ the next contract to manufacture progress.
 
 Focused tests:
 
+- UBLKCP callback-role selection ignores the hidden completion callback and
+  yields `operand3_raw=32`, `covered_bytes=tile_bytes=512`;
+- K10 reports 9/9 UBLKCP static sites and 7,296/7,296 dynamic occurrences with
+  512-byte command/tile sizes;
+- a missing or ambiguous kernel-aware UTMACCTL chain fails sidecar generation;
+- `chain_resolved == sites_total`, `ambiguous=0`, `unresolved=0`,
+  `direct_authority=0`, and `pool_authority=0`;
+- direct and chain candidates are reported before selection, and direct/pool
+  candidates cannot become exact-mode routing authorities;
+- K5 size-only mode forms `0x96b0` as 24,576 bytes, 192 AGU requests, and 768
+  sector requests while retaining the legacy completion FIFO;
 - one 16-KiB LOAD bound to one 16-KiB barrier;
 - one corrected 24-KiB Q LOAD bound to one 24-KiB barrier;
 - `UTMALDG(16384) + UBLKCP(512) = 16896` bound to one K10 barrier;
@@ -2962,7 +3121,26 @@ Focused tests:
 - CTA cleanup with unassigned or in-flight ownership aborts;
 - feature off remains bit-identical.
 
-K5 post-fix acceptance:
+Size-only B0-C primary acceptance:
+
+```text
+K5 0x96b0 commands=264
+K5 0x96b0 memory_bytes=completion_input_bytes=24576
+K5 global expected-minus-produced byte deficit=0
+K10 UBLKCP bytes=512
+K10 16896=16384+512 contracts PASS
+K10 32768=16384+16384 contracts PASS
+```
+
+B0-C also records whether K5 passes cycles 50,173 and 68,271, its final cycle,
+any watchdog signature, and every descriptor site whose base or shape differs
+from the legacy direct-first map. These are diagnostic observations, not B0-C
+pass/fail criteria. The additional 8 KiB and any corrected base change transfer
+latency and may expose the independent completion-order bug. Therefore a clean
+run supports, but does not alone prove, the missing-byte causal hypothesis; a
+changed failure does not invalidate a byte-conservation PASS.
+
+B0-D final K5 acceptance:
 
 ```text
 passes cycle 50173
@@ -2978,7 +3156,7 @@ clean kernel exit
 [TMABIND][FINAL] status=PASS
 ```
 
-K10 regression acceptance:
+B0-D final K10 regression acceptance:
 
 ```text
 clean kernel exit
@@ -2987,6 +3165,23 @@ no TMA binding/lifecycle abort
 WaitBlock holds/releases balanced
 SR-M0A population conservation PASS
 ```
+
+B1-specific acceptance:
+
+```text
+feature-off run == B0-D baseline
+normal traversal release fingerprint == reversed traversal release fingerprint
+normal traversal final cycle == reversed traversal final cycle
+every hardware warp serviced exactly once per SM cycle
+cycle-start completion may release in the current cycle
+issue-phase arrival releases no warp before the next cycle
+trace cursor, semantic work, and conservation summaries unchanged
+```
+
+Record the total-cycle delta from the B0-D baseline, but do not impose an
+unsupported fixed percentage or direction. A performance threshold may be
+added only after repeated unchanged-binary runs establish a measurement
+envelope.
 
 Only after both runs pass may the `.e83` debugging session be closed and the
 older Batch B document be treated as historical rather than authoritative.
@@ -3022,9 +3217,36 @@ tx contract, in-flight TMA completion, or any state that cannot be separated
 from the new epoch. A completion from the old epoch must never update the new
 barrier object.
 
+**Multicast TMA completion**
+
+Current FA3 K5/K10 contains no supported completion-bearing multicast command,
+so B0-D deliberately uses one inline completion target per command and rejects
+multicast. Future support must change the carrier to a bounded inline
+target-array representation, with one explicit barrier key/generation and
+credit share per destination. It must preserve total-credit conservation and
+must not allocate dynamically in the cycle path.
+
 **Trace regeneration**
 
-The current full trace does not contain a distinct runtime completion-barrier
-value for completion-bearing TMA instructions. Trace regeneration is therefore
-a mandatory correctness prerequisite. The existing trace remains valid as the
-ordering, aggregation, and descriptor-mismatch evidence baseline.
+The pre-`9e92fe9` trace did not contain a distinct runtime
+completion-barrier value. The regenerated trace now contains that payload with
+100% K5/K10 coverage and is the production evidence source. B0-A and B0-B
+require offline sidecar regeneration from this raw trace, not another hardware
+trace run.
+
+### 6.17 Document ownership
+
+This section remains the only self-contained execution plan:
+
+| Document | Responsibility after `.e83` |
+|---|---|
+| `WAIT_BLOCK.md` | Authoritative evidence, Stage B0-A through B1 order, invariants, and acceptance |
+| `TMA_BASE_ADDR.md` | Historical derivation plus the corrected descriptor-identity evidence |
+| `TMA_exact_base_mapping_integration.md` | Detailed sidecar/schema and simulator metadata integration |
+| `TMA_ISA.md` | Stable per-opcode operand and byte-source semantics |
+| `TMA_ARCH.md` | Stable TMA command, mover, and completion architecture |
+| `TMA_LATENCY_INJECTION_H100.md` | Historical performance evidence; K5 timing is provisional until B0-C |
+| `.trae/documents/SPIN_WAIT_FOLD_ROOT_CAUSE_PLAN.md` | Historical Batch A/early Batch B record |
+
+Supporting documents must link here rather than duplicate the implementation
+order. If a supporting document conflicts with this section, this section wins.

@@ -1,5 +1,17 @@
 # Opt 7 — TMA transfer latency / injection over-modeling
 
+> **Post-`.e83` validity note (2026-08-24).** The measurements below remain
+> historical evidence for queue and injection behavior of the binaries that
+> produced them, but they are not final timing baselines. K5 `UTMALDG 0x96b0`
+> was modeled as 16,384 bytes through a non-authoritative direct descriptor
+> mapping; its Q transaction is 24,576 bytes. K5 timing must therefore be
+> re-baselined after the size-only correction in `WAIT_BLOCK.md` Section 6.
+> K10 command-byte contracts remain exact, including
+> `UTMALDG(16,384)+UBLKCP(512)=16,896`, but descriptor base identity remains
+> provisional until the kernel-aware UTMACCTL chain is validated. Also repair
+> the regenerated trace's UBLKCP base-map tile metadata before using it for a
+> new K10 run; the old runs predate that completion-callback contamination.
+
 > **Current decision.** This plan still uses the evidence from the address-hotspot / sector-merge
 > and injection-bandwidth analyses, but implementation must be split into separately-gated
 > experiments:
@@ -2168,6 +2180,13 @@ All knobs default to 1 (bit-identical); the H100 config enables them:
   config left at 32B.
 
 ### Measured result (on the Opt 6 realistic-address baseline)
+
+> **K5 figures are pre-correction (see the Post-`.e83` note at the top).** Every
+> FWD K5 cycle in this table was produced with `0x96b0` modeled at 16,384 bytes.
+> The 24,576-byte size restoration (`WAIT_BLOCK.md` §6, B0-C) has not been folded
+> in, so the K5 column below is a historical queue/interconnect baseline, not a
+> final timing result. BWD K10 command bytes are exact and unaffected.
+
 | | FWD K5 | BWD K10 | HW |
 |---|---|---|---|
 | Opt 6 baseline (no queue levers) | 145,855 | 290,572 | — |

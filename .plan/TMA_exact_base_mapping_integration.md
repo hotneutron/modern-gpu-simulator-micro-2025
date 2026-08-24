@@ -1,12 +1,27 @@
 # TMA Exact Base-Mapping Integration Plan (remove heuristics → exact mapping)
 
+> **Post-`.e83` status correction (2026-08-24).** This document records the
+> original real-base integration work. Its `direct + chain = 23/23 exact`
+> conclusion is superseded by
+> [`WAIT_BLOCK.md` Section 6](WAIT_BLOCK.md#6-consolidated-batch-b-design-after-e83).
+> The old `direct` path is a numeric-offset shortcut, not an identity proof.
+> The old chain also merges trace-kernel variants under `(uid,pc)`. Current
+> evidence requires a kernel-aware, ambiguity-free UTMACCTL chain before a
+> descriptor mapping may be called exact.
+
 ## Context (why this work)
 
 The simulator currently synthesizes the TMA transfer address:
 `agu_base = (transfer_uid << 20) + agu_index*128` ([tma_unit_sm.cc:637](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/tma_unit_sm.cc#L637)).
 Because `transfer_uid` is unique per transfer, **every transfer gets a different address**, so L2 locality is fake (repeated reads of the same tensor never hit). Real HW reads the tensor's **real GMEM base** from the CUtensorMap descriptor and computes `addr = base + Σ coord·stride`, so repeated accesses hit in L2. HW L2 hit targets: fwd ~70%, bwd ~82%.
 
-We have **already solved** exact base recovery. `build_tma_pc_base_map.py` produces `tma_pc_base_map.json`, giving each descriptor op's `(uid,pc) → exact real base`. On FA3: **23/23 mapped**, zero heuristic fallback (direct + UTMACCTL prefetch-chain cover 100%). This plan (A) wires that exact mapping into the trace-gen pipeline, (B) makes the simulator use the real base instead of the synthetic one, and (C) removes the old handle_hi heuristic.
+The original implementation produced `tma_pc_base_map.json` for all 23
+descriptor sites. That result proves deterministic coverage, not exact
+identity: 10 sites have both direct and chain candidates, and all 10 disagree.
+There are no direct-only sites in the regenerated trace. The revised plan
+(A) repairs callback and key identity, (B) emits an ambiguity-free
+kernel-aware descriptor map, (C) restores K5 transfer bytes in isolation, and
+(D) then continues with the completion-ownership work in `WAIT_BLOCK.md`.
 
 Core principle (user requirement): **every opcode the old heuristic mapped a descriptor to must also be covered by the new pipeline.** The data-confirmed per-opcode handling is in §"Per-opcode handling" below.
 
@@ -14,15 +29,20 @@ Core principle (user requirement): **every opcode the old heuristic mapped a des
 
 | opcode | desc_refs | new-mapping handling | evidence |
 |---|---|---|---|
-| **UTMALDG**(.4D) | yes | ci=0 SMEM-window offset = tensor ID → direct/chain → real base | already in `DESC_OPS`, included in 23/23 |
-| **UTMASTG**(.4D/.5D) | yes | same (ci=0 SMEM window) | already in `DESC_OPS` |
+| **UTMALDG**(.4D) | yes | kernel-aware UTMACCTL source/destination chain → exact 128B descriptor | current direct/chain output requires correction |
+| **UTMASTG**(.4D/.5D) | yes | same kernel-aware chain rule | current direct/chain output requires correction |
 | **UBLKRED**.G.S.ADD.F32 | yes (but bare handle) | **NOT a tensormap descriptor → synthetic base in M1, size exact via covered_bytes. M2.5 upgrades base to real (raw-ptr from param blob) + mock tiling (§M2.5).** The executed sites (0x90a0 etc., 6 total) set `desc[UR16]` via `UMOV UR16,0x0`+`UMOV UR17,0x14f00000` = a bare handle. dst is a raw dQaccum GMEM pointer (`c[0x0][0x280]/0x2a0`) + dynamic tile offset | executed: 0x90a0/0x91d0/0x94e0/0x95b0/0x96f0/0x97c0. The extractor's offset 0x30d96 is a **false positive** from unmodeled UMOV (outside the 0x700 struct). Only `covered_bytes` (operand-3) is exact |
 | UBLKCP.S.G | no | not a tensormap (desc_valid=false). Synthetic base in M1; **M2.5 = per-pc real base + mock tiling (§M2.5)**; size from covered_bytes | ci=0/ci=1 are raw addrs, not tensor IDs |
 | **UTMACCTL.PF** | prologue | **exact mapping target (for prefetch modeling).** prologue `UIADD3 URx, param_base, off` (off ∈ {0xb0,0x170,0x230,0x2f0,0x4f0,0x5b0}) → `off−0x30` = struct slot → base. clean 6→6 | must know which tensor is prefetched (user requirement). single-source ⇒ no ambiguity |
 | UTMAPF | — | **absent in the bwd kernel (count=0).** No UTMACCTL.PF→UTMAPF→UTMALDG three-step | grep-confirmed |
 | UTMACMDFLUSH | no | not mapped | control-only (matches user expectation) |
 
-**Unifying rule**: base-map targets = **only sites that reach a 128B tensormap descriptor in the struct**. UTMALDG/UTMASTG (runtime SMEM-window offset) and UTMACCTL.PF (prologue param offset) qualify. UBLKRED/UBLKCP are raw GMEM pointers + dynamic offsets, so **their base is synthetic in M1; M2.5 upgrades them to a real base read offline from the by-value param struct + mock tiling (§M2.5)**, while size (covered_bytes) is exact throughout. UTMACMDFLUSH issues no data request.
+**Unifying rule**: base-map targets are only sites connected to one exact 128B
+tensormap descriptor by a kernel-aware UTMACCTL data-flow edge.
+UTMALDG/UTMASTG and UTMACCTL.PF qualify after that proof. Numeric equality
+between a runtime state offset and a struct offset does not qualify.
+UBLKRED/UBLKCP are raw GMEM pointers plus dynamic offsets, so they remain on
+the operand-addressed M2.5 path. UTMACMDFLUSH issues no data request.
 
 **Required extractor fix (remove the UBLKRED false-positive)**: `extract_tma_descriptor_offsets.py`'s `build_defs()` does not model `UMOV`, so for executed UBLKRED (0x90a0 etc.) it skips the live `UMOV UR16,0x0` and walks a stale UIADD3, fabricating a **bogus offset (0x30d96, outside the 0x700 struct)**. Fix: (1) model `UMOV URd,imm` as a def → a umov terminus returns `None` (dead-end) in `trace_offset()`; (2) **struct-bounds guard**: accept `resolved` only when `0 ≤ offset < struct_size(uid)` (else `offset_outside_param_struct`). Then UBLKRED honestly falls to "unresolved," leaving only UTMALDG/UTMACCTL.
 
@@ -32,13 +52,18 @@ Core principle (user requirement): **every opcode the old heuristic mapped a des
 
 | opcode | **dest (GMEM address) source** | **size source** | simulator path |
 |---|---|---|---|
-| **UTMALDG/UTMASTG** | operand ci=0 = SMEM descriptor window (`0x72..04c0`), whose **low16 = tensor ID (0x4c0)** → base-map lookup → **descriptor qword0 = real base** | descriptor **box_dim × element_size** (no span operand; no ci=2) | build_tma_command: (uid,pc)→base map→`global_base`+box. mover: `base + agu_index*128` |
+| **UTMALDG/UTMASTG** | runtime state offset joined through a kernel-aware UTMACCTL edge to one exact struct descriptor → **descriptor qword0 = real base** | descriptor **box_dim × element_size** | build_tma_command: `(trace_kernel_id,uid,pc)`→base map→`global_base`+box. mover: `base + agu_index*128` |
 | **UTMACCTL.PF** (bwd) / **UTMAPF.L2** (fwd) | prologue `param_base+off` → `off−0x30` = struct slot → **descriptor qword0** (the prefetched tensor) | prefetch (whole) — descriptor box | emit per-pc into base map → which tensor the prefetch warms |
 | **UBLKRED** | **dest = raw dQaccum GMEM ptr**. desc is a bare handle (no base). synthetic in M1; **M2.5 = real base (offline from `launch_param_blobs`) + mock tiling** | operand **ci=2 span** (`0x400*16 = 16384B`) → covered_bytes | size exact from operand; base synthetic in M1, real in M2.5 |
 | **UBLKCP** | GMEM addr (distinct per transfer) + SMEM cursor — not a tensormap. **measured cb: GMEM=cb0, SMEM=cb1, span=cb2** | operand **ci=2 span** (`0x20*16 = 512B`) → covered_bytes | size exact; base synthetic in M1, **M2.5 = per-pc real base + mock tiling** |
 | **UTMACMDFLUSH** | none | none | control, no data request |
 
-**Summary:** dest is obtained (a) **through the descriptor** (UTMALDG/UTMASTG/UTMACCTL — the base map provides it exactly), or (b) via a **raw pointer** (UBLKRED/UBLKCP — synthetic in M1; **real base in M2.5**, read offline from the by-value param struct in `launch_param_blobs`). size comes from (a) the **descriptor box** (UTMALDG family) or (b) the **operand span ci=2** (bulk family), **both already present in the trace and therefore exact**. Net: **size is exact for every op; dest is exact for the descriptor family in M1 and for UBLKRED/UBLKCP in M2.5**.
+**Summary:** descriptor-family destination and size become exact only after the
+kernel-aware chain has selected one descriptor. Bulk-family command size comes
+from the statically identified operand-3 callback. The regenerated trace
+exposed a postprocessor bug that accidentally included the new completion
+callback in UBLKCP raw-pointer tiling; repair that callback selection before
+using the new sidecar for simulation.
 
 ## Per-opcode **transfer size** (how much moves) — basis for issuing data requests
 
@@ -53,8 +78,13 @@ base (address) and size (amount) are **separate data**. base decides "where," si
 
 **Key gap (raised by the user — captured in the plan):** the descriptor family's size comes from `box_dim/element_size` (= `descriptor_config`), but the key that attaches that config to a site is **`config_id` via the handle_hi resolver**. Removing the handle_hi resolver in M3 breaks **not only base but also the size path (= the config link)**. So the new mapping must provide not only base but also the **(uid,pc) → config_id (or box_dim/element_size directly)** link.
 
-**Resolution (added to M1 Part A):** `build_tma_pc_base_map.py` already knows each (uid,pc)'s tensor (SMEM offset → struct descriptor), so **parse box_dim·element_size directly from that 128B struct descriptor** and carry it in the base-map entry. That is, extend each `tma_pc_base_map.json` entry to `{base_hex, box_dim[], element_size, element_stride[], source}`. Then:
-- descriptor family: (uid,pc) → base **and** box/element_size via one path → no handle_hi/config_id needed.
+**Resolution (reopened after `.e83`):** `build_tma_pc_base_map.py` must first
+prove each `(trace_kernel_id,uid,pc)` maps through one UTMACCTL edge to one
+128B descriptor. It then carries that descriptor's
+`base_hex`, `box_dim`, `element_size`, strides, and policy fields in the map.
+Then:
+- descriptor family: `(trace_kernel_id,uid,pc)` → base and shape through one
+  proven chain; no handle_hi/config_id or numeric direct join is needed.
 - UBLKRED/UBLKCP: size still uses operand covered_bytes (the real value in the trace) — unchanged. The base map marks them `source=operand_addressed` only.
 
 This lets `tma_descriptor_configs.json` (box/stride) itself stay in M1 (coexisting with the config_id path initially), while **removing the handle_hi resolver in M3 is safe because size is now covered by the new base map**. strides (for coord math, M2) come from the same struct descriptor, so this extension is also the prerequisite for M2.
@@ -79,18 +109,29 @@ UBLKRED/UBLKCP (`operand_addressed`) carry no descriptor fields and use only tra
 
 With this extension, §transfer size's box/element_size is automatically included (same row), and M2's coord-math global_strides/element_strides are also secured. Net: **one (uid,pc)→exact descriptor path replaces everything the handle_hi path supplied**.
 
-## pool vs exact — answer to the user's question
+## Historical direct/chain/pool result and correction
 
-**Every descriptor op (UTMALDG/UTMASTG) knows the exact addr (and all fields). pool is not used.** Server re-verification on the latest trace (M0):
+The original report was:
 ```
 uid3: direct=6 chain=5 pool=0 unresolved=0
 uid8: direct=4 chain=8 pool=0 unresolved=0   → 23/23, pool=0
 ```
-- **direct**: runtime SMEM offset == struct descriptor slot → that 128B directly → exact.
-- **chain**: UTMACCTL.PF copies struct→SMEM (param_source−0x30==slot) → that 128B → exact.
-- **pool**: the earlier fallback that "deterministically assigns from a per-kernel base pool when a SMEM offset matches neither direct nor chain." **0 occurrences in this data** — i.e. never fires. Keep it in the code as a locality safety net (same SMEM offset = same base), but make the strict gate fail if pool is used, to enforce "100% exact mapping."
 
-In short: **descriptor ops (UTMALDG/UTMASTG) + UTMACCTL.PF pin the 128B tensormap byte-for-byte → all fields exact, pool unused.** **UBLKRED/UBLKCP do not use a tensormap descriptor** (UBLKRED desc = UMOV bare handle, base = raw dQaccum GMEM pointer + dynamic offset). In M1 keep base synthetic, size exact via covered_bytes. **M2.5 makes their base real** by reading the raw pointer offline from the by-value param struct (`launch_param_blobs/*.bin`) — a *tensormap* mapping is impossible (proven), but the raw pointer itself is a plain GMEM base and is already captured. Verified on the local trace (§M2.5).
+- **direct** means only `runtime_state_offset == struct_offset`; no
+  instruction-level edge connects those coordinate spaces.
+- **chain** follows an UTMACCTL source/destination edge, but the current
+  `(uid,pc)` implementation merges trace-kernel variants and overwrites
+  candidates.
+- **pool** assigns an arbitrary stable candidate and is never an identity
+  authority.
+
+The regenerated trace gives every descriptor site at least one chain candidate,
+with 10 direct overlaps and zero direct-only sites. In the current overwritten
+single-entry output, all 10 overlaps disagree. Before overwrite, each aggregate
+state key has two or three chain candidates because trace-kernel variants were
+merged. Exact mode must therefore remove direct and pool authority, add
+`trace_kernel_id` to every sidecar/runtime key, retain all candidates until
+variant selection, and abort unless one chain remains.
 
 ## Architecture: data flow and injection point
 
@@ -105,21 +146,41 @@ Key constraint: `mover_issue_requests` ([tma_unit_sm.cc:578](file:///Users/byted
 
 ## Milestones
 
-### M0 — re-verification (read-only, no build) — DONE
-- `build_tma_pc_base_map.py` server re-verification: `mapped: 23, direct+chain, pool=0, locality OK` ✓
+### M0 — re-verification reopened after `.e83`
+- Historical result: 23/23 deterministic mappings, not exact identities.
+- Current result: at least one chain candidate for 23/23 sites, direct overlaps
+  10, selected direct/chain agreement 0, selected conflicts 10, direct-only 0,
+  and two or three candidates per aggregate state before overwrite.
+- Required result: emit a nonzero kernel-aware `sites_total=N`, then require
+  `chain_resolved=N`, `ambiguous=0`, `unresolved=0`,
+  `direct_authority=0`, and `pool_authority=0`. The historical `N=23` and
+  `changed_vs_direct=10` values are diagnostic baselines, not fixed success
+  criteria, because adding `trace_kernel_id` can split an old aggregate site.
 - UBLKRED characterized (done): executed sites are not tensormap descriptors. desc is a UMOV bare handle, base is a raw GMEM pointer. The extractor offset is a UMOV-unmodeled false positive. → M1 excludes base, size from covered_bytes.
 - UTMACCTL.PF characterized (done): prologue `param_base+off` (6), `off−0x30` = struct slot → the prefetched tensor is exactly mappable.
 
 ### M1 — base-only simulator injection + trace-gen integration
 
 **Part A (Python)**
+Before descriptor-family work, repair `runtime_ublk_operands()` so it obtains
+the architectural operand-3 callback index from `tma_operand_resolver.json`
+instead of taking the maximum of all uniform callbacks. The hidden TMA
+completion callback added at `9e92fe9` is not a size operand. Regenerate the
+sidecars from the existing raw trace and require
+`UBLKCP covered_bytes == tile_bytes == 512` for all 9 K10 static sites and all
+7,296 K10 dynamic occurrences, with zero completion callbacks selected as size
+sources.
+
 0. **Fix `extract_tma_descriptor_offsets.py` (prerequisite)**: (a) add `UMOV URd,imm` modeling in `build_defs()` → a umov terminus returns `None` in `trace_offset()` (constant dead-end); (b) on accepting `resolved`, add a **struct-bounds guard** (`0 ≤ offset < struct_size(uid)`, struct_size from `tma_launch_param_dump.csv`). → removes the executed-UBLKRED bogus offset 0x30d96; UBLKRED honestly falls to unresolved.
 1. Extend `build_tma_pc_base_map.py`:
-   - UTMALDG/UTMASTG/UTMAREDG: keep the existing SMEM-offset direct/chain path.
+   - UTMALDG/UTMASTG/UTMAREDG: replace direct/chain selection with a
+     kernel-aware, ambiguity-free UTMACCTL edge join.
    - **Add UTMACCTL.PF emit**: output the prologue `prefetch_sites` (uid,pc)→`off−0x30`=struct slot→base as **per-pc entries** (currently only consumed as a chain linker, not emitted). Lets the simulator know which tensor each prefetch warms. clean 6→6.
    - **Carry size fields (§transfer size)**: parse `box_dim[]`·`element_size`·`element_stride[]`·`global_strides[]` from the 128B struct descriptor each (uid,pc) points to, and record them in the entry → the descriptor family gets size (and M2 strides) without handle_hi/config_id.
    - **UBLKRED/UBLKCP**: not added to the base map (not tensormaps). Simulator keeps synthetic; size from covered_bytes (operand-3, §Part A-3).
-   - **strict gate**: if any base-map target site (UTMALDG/UTMASTG/UTMACCTL.PF) fails to resolve to an exact base, `SystemExit`. Also fail if pool is used (enforce 100% exact). UBLKRED is not a gate target (synthetic is fine).
+   - **strict gate**: if any base-map target site fails to resolve through
+     exactly one chain, `SystemExit`. Direct and pool cannot satisfy the gate.
+     UBLKRED is not a descriptor-chain gate target.
    - **UBLKRED 1:1-absence diagnostic (for proof)**: attempt, per executed UBLKRED, to reach an in-struct slot → **0 resolved** is the expected result (desc = umov dead-end, dst = c[0x0][0x280]/0x2a0). That null is the evidence that "UBLKRED cannot be 1:1-mapped to a tensormap."
 2. Add `--configs-only` to `build_tma_descriptor_mapping.py`: emit only `tma_descriptor_configs.json` (box_dim/strides/swizzle — still needed by the simulator), and stop emitting `tma_descriptor_resolver.json` (handle_hi heuristic).
 3. `build_tma_operand_mapping.py`: drop the resolver dependence in `load_descriptor_refs` ([:77](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/util/tracer_nvbit/build_tma_operand_mapping.py#L77)); switch the descriptor-required check to be based on `tma_pc_base_map.json`. Keep the covered_bytes (operand-3) extraction path for UBLKRED/UBLKCP — that is where size comes from.
@@ -127,8 +188,8 @@ Key constraint: `mover_issue_requests` ([tma_unit_sm.cc:578](file:///Users/byted
    `discover_tma_producers` → `extract_tma_descriptor_offsets` (fixed) → `build_tma_descriptor_mapping --configs-only` → `build_tma_pc_base_map` (new, strict gate) → `build_tma_operand_mapping` (rewired) → `build_sync_operand_mapping` (kept). Guard each step with `os.path.exists`.
 
 **Part B (C++)**
-1. [tma_types.h](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/tma_types.h): add `TMABaseLookupKey{uid,pc}` + `TMABaseRecord{has_static_base, global_base, operand_addressed, box_dim[5], element_size, element_stride[5]}` (base and size in one record), add a `base_records` map to `TMASidecarMetadataDB` ([:128](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/tma_types.h#L128)). Add carrier fields to `TMACommand` ([:236](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/tma_types.h#L236)): `uint64_t global_base; bool has_real_base;` (coords[5]·box_dim already exist).
-2. [gpu-sim.cc](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/gpu-sim.cc): new `load_tma_pc_base_map` (split key `"uid:pc"`, uid base-10, pc base-0; also load box_dim/element_size). Call it from `parse_extra_trace_info` ([:629](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/gpu-sim.cc#L629)).
+1. [tma_types.h](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/tma_types.h): use `TMABaseLookupKey{trace_kernel_id,uid,pc}` + `TMABaseRecord{has_static_base, global_base, operand_addressed, box_dim[5], element_size, element_stride[5]}` and retain fixed carrier fields on `TMACommand`.
+2. [gpu-sim.cc](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/gpu-sim.cc): load the kernel-aware key and require exact-mode sidecar schema/version and ambiguity summary before execution.
 3. `build_tma_command` ([:344](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/tma_unit_sm.cc#L344)): look up `TMABaseRecord` by (uid,pc). For static base, set `cmd.global_base=rec.global_base` **and `cmd.box_dim/element_size=rec.*`** → compute `total_bytes/requests_total` from the new record (reuse the existing [:384-386](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/tma_unit_sm.cc#L384) formulas). For operand_addressed (UBLKRED/UBLKCP), base stays synthetic and size uses covered_bytes (keep the existing [:391-401](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/tma_unit_sm.cc#L391) path). Set `cmd.has_real_base=true` for descriptor sites. **In M1 keep the config_id path coexisting** (cross-check that size matches the old path); remove the config_id path in M3.
 4. `mover_issue_requests` ([:637](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/tma_unit_sm.cc#L637)): if the flag is on and has_real_base, `agu_base = cmd.global_base + agu_index*MAX_MEMORY_ACCESS_SIZE`; else the existing synthetic. [:678](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/tma_unit_sm.cc#L678) addr computation unchanged.
 5. Feature flag `-tma_real_base_addr_enable` (default off): off ⇒ bit-identical to today. Add a bool to `shader_core_config`.
@@ -141,16 +202,31 @@ Key constraint: `mover_issue_requests` ([tma_unit_sm.cc:578](file:///Users/byted
 ### M2 — coordinates (later, needs a tracer mini-spike)
 per-transfer coords are not captured today (§0). To complete `addr = base + Σ coord·stride`, add coord capture + combine with `element_stride[]` (already carried in the base map in M1). UBLKRED needs no coords (operand_addressed).
 
-## M1 verification results (FA3 fwd K5 + bwd K10, real-base flag on) — DONE
+## Historical M1 run results (FA3 fwd K5 + bwd K10)
 
-Both kernels ran to completion with `-tma_real_base_addr_enable 1` (+ debug on), **no assert/crash**, size cross-check passed, base map loaded (`base_records=33`). Real-base coverage is exactly as designed:
+Both kernels ran to completion with `-tma_real_base_addr_enable 1` (+ debug on),
+**no assert/crash**, the then-current size cross-check passed, and the base map
+loaded (`base_records=33`). Lookup coverage was:
 
 | kernel | uid | real_base coverage | L2_TMA_true_hit_rate | HW target |
 |---|---|---|---|---|
 | fwd K5 | 3 | UTMALDG 9 / UTMASTG 1 / UTMAPF 1 = 100%; synthetic = 0 | **0.9972** | ~0.70 |
 | bwd K10 | 8 | UTMALDG 10 / UTMASTG 2 = 100%; UBLKRED 6 = synthetic (operand_addressed) | **0.9785** | ~0.82 |
 
-**Base mapping is correct** (asserts would have caught any gap). The hit-rate over-estimation is the **predicted M1 limitation** (§ "locality over-estimation"): no coord offset yet.
+**Post-`.e83` correction:** the run proved that every lookup returned a record
+and that the two then-current metadata paths agreed. It did not prove
+descriptor identity because both paths consumed the same direct-first map.
+These timing and L2 results remain historical until B0-B regenerates the map
+from kernel-aware, ambiguity-free chain records. The hit-rate over-estimation
+was also affected by the known absence of real coordinates.
+
+> **Note on two fwd-K5 M1 figures.** This table reports **0.9972**, from the
+> earliest base-only run (`base_records=33`, first-request analysis below). The
+> later M2/M2.5 comparison table and `TMA_BASE_ADDR.md` §4.1 report the fwd-K5
+> "M1 base-only" baseline as **0.9854** — a separate re-measurement on the
+> M2-comparison build, not a restatement of this run. Both are historical and
+> superseded by the B0-B regeneration; the ~0.012 difference is build/context
+> drift, not a corrected value.
 
 **Root cause confirmed by first-request address analysis (both kernels):** real-base descriptor tensors collapse to **one address per tensor** because `agu_base = global_base + agu_index*128` has no tile coordinate (`agu_index` is the 0..requests_total-1 index *within one transfer*, identical across transfers).
 - fwd K5: 5112 UTMALDG transfers → **2 distinct addresses** (K base, V base). The whole 6 MB tensor's 384 tiles collapse to the first 16 KB tile → 383 tiles' cold misses vanish → 0.9972.

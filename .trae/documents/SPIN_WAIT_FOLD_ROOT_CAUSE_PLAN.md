@@ -1,5 +1,12 @@
 # Spin-wait fold root-cause 확인 및 수정 계획
 
+> **Historical document after `.e83`.** This file preserves the Batch A and
+> early Batch B investigation. The authoritative post-`.e83` design, current
+> trace evidence, descriptor-size repair, exact TMA completion ownership, and
+> B1 release ordering are consolidated in
+> [`.plan/WAIT_BLOCK.md` Section 6](../../.plan/WAIT_BLOCK.md#6-consolidated-batch-b-design-after-e83).
+> Where this document conflicts with that section, `WAIT_BLOCK.md` wins.
+
 ## Summary
 
 Batch A fixed the confirmed immediate-ready defect: a ready foldable primary wait
@@ -369,7 +376,8 @@ SM121 watchdog을 해결할 수 없음을 추가로 증명했다.
 - 각 real TMA LOAD가 issue/enqueue될 때 TMA instruction이 지정한 exact barrier
   identity와 현재 generation을 `TMACommand`/`TMATransferEntry`에 저장한다.
   - `UTMALDG`: instruction의 implicit completion-barrier register
-  - `UBLKCP`: explicit barrier operand
+  - `UBLKCP`: first destination-state register pair의 high UReg에 있는
+    implicit completion-barrier register
 - 한 barrier의 expected bytes를 여러 transfer가 채우는 것은 각 transfer가 같은
   barrier identity를 명시할 때만 허용한다.
 - 하나의 non-multicast transfer가 서로 다른 barrier key를 가로질러 credit하는 것은
@@ -379,9 +387,9 @@ SM121 watchdog을 해결할 수 없음을 추가로 증명했다.
 - `notify_tma_completion(warp_id, bytes)`와 anonymous FIFO consumption을 제거한다.
 - expect-tx bytes와 modeled transfer bytes가 불일치하면 다른 barrier range에서
   보충하지 말고 TMA PC, UID, barrier, generation, 두 byte 수를 출력하고 hard
-  abort한다. `0x96b0`의 24,576/16,384 mismatch는 descriptor mapping 오류, 누락된
-  8,192-byte async producer, 또는 별도 completion-credit 크기 중 무엇인지 trace
-  evidence로 먼저 결정한다.
+  abort한다. 후속 retrace 분석은 `0x96b0`을 64x192 BF16 Q descriptor 대신
+  64x128 BF16 descriptor로 연결한 mapping identity 오류로 확정했다.
+  `memory_bytes`와 `credit_bytes`는 모두 24,576이어야 한다.
 - `[TMADBG] load-mbarrier-credit`에
   `uid/tma_pc/barrier/generation/memory_bytes/credit_bytes/remaining_for_barrier`
   를 출력한다.

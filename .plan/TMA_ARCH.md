@@ -1,5 +1,11 @@
 # TMA Architectural Plan for the Remodeled Simulator
 
+> **Post-`.e83` authority note.** This document owns stable TMA architecture
+> contracts. The evidence, staged repair order, and K5/K10 acceptance criteria
+> for descriptor-size restoration and exact mbarrier completion ownership live
+> in [`WAIT_BLOCK.md` Section 6](WAIT_BLOCK.md#6-consolidated-batch-b-design-after-e83)
+> and override older completion/base-mapping claims here.
+
 ## Goal
 
 Add a **new TMA architectural component** to the remodeled simulator so that Hopper/Blackwell-style TMA instructions use a **dedicated datapath and execution domain**, while non-TMA instructions continue to use the existing remodeled LD/ST path unchanged.
@@ -905,13 +911,13 @@ requests_total = requests_per_row * outer_iters              // count of 128B AG
 
 - `box_dim`, `element_size` come from the resolved descriptor config (tensor map).
 - `box_dim[0]` is the innermost (row) extent; the rest are outer iterations. This is why two transfers with equal `total_bytes` but different `box_dim[0]` aspect ratios produce **different** `requests_total` (AGU throughput depends on row shape, not just byte count).
-- Validated geometry example (FA3): `box_dim=[64,128]`,
-  `element_size=2` (bf16) -> `total_bytes = 64*128*2 = 16384`,
-  `requests_total=128`, and `512` 32-byte sector responses. K5 logs `.e70`
-  through `.e83` consistently report this geometry for UTMALDG `0x96b0`.
-  Its paired mbarrier expect-tx value is nevertheless 24,576 bytes; that
-  completion-contract mismatch is unresolved and documented in
-  `WAIT_BLOCK.md` Section 5.2.
+- The historical K5 `0x96b0` mapping to `box_dim=[64,128]` was wrong. The
+  postprocessor's direct numeric-offset shortcut selected encode 8 before
+  examining the UTMACCTL relation. The independent transaction contract and
+  FA3 Q geometry require `box_dim=[64,192]`, `element_size=2`,
+  `total_bytes=24,576`, `requests_total=192`, and 768 32-byte sector
+  responses. The kernel-aware mapping repair and size-only validation are
+  specified in `WAIT_BLOCK.md` Section 6.4.
 
 **B. Covered-span source — `UBLKCP`, `UBLKPF`, `UBLKRED`** (1D bulk ops, no box geometry)
 
@@ -925,6 +931,13 @@ requests_total = ceil( covered_bytes / 128 )
 - `covered_bytes` is taken from `metadata.covered_bytes` (operand-3 decode), **not** recomputed from box geometry. For the non-descriptor bulk form the decode is `covered_bytes = operand_3 * 16` (16B units); for descriptor-backed `UBLKRED` the raw operand-3 value is preserved and `covered_bytes` is supplied by the resolver (the bulk `operand_3 * 16` formula is **not** assumed for the descriptor-backed form). See [TMA_TRACING.md](file:///home/jihyun/project/modern-gpu-simulator-micro-2025/.plan/TMA_TRACING.md) "Bulk `UBLKRED` Follow-up Findings".
 - Asserts enforce `total_bytes == covered_bytes` and `requests_total == ceil(covered_bytes/128)` for `UBLKCP`/`UBLKPF` and descriptor-backed `UBLKRED`.
 - Validated example (FA3): `UBLKCP` site observed `bytes=512`, `requests=16`.
+- Do not confuse command `covered_bytes` with similarly named raw-pointer
+  tiling fields in `tma_pc_base_map.json`. Command bytes come from the
+  statically identified operand-3 callback. The retrace at `9e92fe9` added a
+  hidden completion callback; the current base-map builder's
+  `max(all UNIFORM callbacks)` rule mistakes that barrier address for the span.
+  Repair the sidecar and require its tile size to equal the operand-resolver
+  command size before simulation.
 
 **Wire-level expansion (issue granularity).** `requests_total` counts **128B** AGU line requests (the address-generation throughput unit). At issue, the mover expands each 128B request into `SECTOR_CHUNCK_SIZE` (= 4) separate **32B** sector `mem_fetch`es, so the count of issued sector mfs is `requests_total * 4`. Byte accounting uses 32B per sector mf. AGU timing is still modeled in 128B units; only the wire granularity is 32B (L2-friendly, see Phase 3).
 
@@ -939,18 +952,27 @@ requests_total = ceil( covered_bytes / 128 )
 
 For reduce-store the moved region is read **and** written (`dst[i] += src[i]` over the covered region), so read bytes = write bytes = `covered_bytes`. This is an elementwise reduce-store, **not** a many-to-one atomic (see Phase 4 reduction model).
 
-### Phase 3: GMEM -> SMEM TMA Data Movement  ✅ COMPLETED + VALIDATED
+### Phase 3: GMEM -> SMEM TMA Data Movement  ✅ COMPLETED + VALIDATED (K5 `0x96b0` size restoration pending — B0-B/B0-C)
 
-**Status:** Data movement is implemented and exercised on the FA3 trace.
-`UTMALDG` and `UBLKCP` issue real 32B-sector `mem_fetch`es through the shared
-interconnect to L2 (L1 bypassed), and completion drives the Phase 5 mbarrier
-path. Current K5 evidence reports 16,384 bytes, 128 AGU requests, and 512 sector
-responses for the `64x128` UTMALDG sites. The earlier claim that this same
-geometry produced 24,576 bytes and 768 sector responses was inconsistent with
-both the formula above and `.e70`-`.e83`; it is not retained as validation.
-The separate 24,576-byte expect-tx value paired with `0x96b0` remains under
-investigation. `UTMAPF`/`UBLKPF` are **not** covered here; they were moved to
-Phase 4.5 (see phase map).
+**Status:** The data-movement *mechanism* is implemented and exercised on the
+FA3 trace. `UTMALDG` and `UBLKCP` issue real 32B-sector `mem_fetch`es through
+the shared interconnect to L2 (L1 bypassed), and completion drives the Phase 5
+mbarrier path. The K5 `0x96b0` transfer size is the one known-wrong quantity:
+the current runtime still consumes the old direct-first `(uid,pc)` base map,
+which misclassified the site as `64x128` (encode 8) and therefore models
+16,384 bytes, 128 AGU requests, and 512 sector responses. That is a historical
+artifact, not the validated contract. The kernel-aware UTMACCTL chain and the
+independent expect-tx transaction contract identify encode 0, the `64x192` Q
+descriptor, as the required result: 24,576 bytes, 192 AGU requests, and 768
+32-byte sector responses. The repaired kernel-aware chain must leave encode 0
+as the single candidate or fail closed; expect-tx may validate but must not
+break an identity tie. The earlier reasoning that rejected 24,576/768 held the
+`64x128` geometry fixed and so found the number arithmetically inconsistent;
+the actual defect is the misidentified geometry, under which 24,576/768 is
+exactly consistent. Restoring the 24,576-byte model is the B0-B map
+regeneration, checked by the B0-C byte-conservation diagnostic in
+`WAIT_BLOCK.md` Section 6.4. `UTMAPF`/`UBLKPF` are **not** covered here; they
+were moved to Phase 4.5 (see phase map).
 
 **Key implementation detail (L2-friendly issue):** the TMA mover emits each 128B AGU request as `SECTOR_CHUNCK_SIZE` (4) separate 32B sector mem_fetches, each carrying a single-bit `sector_mask` and matching `byte_mask`, exactly like a coalesced ldst request. This keeps the L2 from re-splitting the request (`breakdown_request_to_sector_requests` passes `data_size==32 && sector_mask.count()==1` unchanged), so one issued mf maps to exactly one response. AGU throughput remains modeled in 128B cache-line units (`requests_total`); only the wire-level mf granularity is 32B.
 
@@ -1145,7 +1167,7 @@ Test plan:
 - Store/reduce accounting: `store-outstanding++ == store-outstanding-- == 7296` (no leak). Flush stall: `flush-wait-enter == flush-wait-release == 1987` (every UTMACMDFLUSH stall released; no hang).
 - Prefetch: `prefetch-issue == prefetch-complete == 0` — **`UTMAPF` never executed at runtime in this whole trace.** The mis-credit fix (Task 1) is therefore a latent-bug closure with no effect on FA3 bwd accuracy; its positive path (prefetch issuing real L2 traffic with zero mbarrier credit) is **still unverified** and requires the dedicated `UTMAPF` micro-trace below.
 
-### Phase 5: TMA Completion / Barrier Model  ✅ COMPLETED (separate SYNC work)
+### Phase 5: TMA Completion / Barrier Model — partial, B0-D pending
 
 **Status:** The Hopper `SYNCS` barrier state and wait semantics were implemented
 as a separate work stream, but the TMA completion binding is not the exact
@@ -1157,12 +1179,19 @@ The SYNC work delivered `MBARRIER_OP`, address-keyed barrier objects keyed on
 `(trace_kernel_id, cta_id, barrier_addr)`, pending-wait tracking,
 `semantic_raw`-based arrive classification, bit31 phase-parity decode, and a
 TMA-completion-to-barrier progress path. The intended instruction-level rules
-(`dst_reg+1` for `UTMALDG`/`UTMAPF`, explicit third operand for `UBLKCP`) remain
-documented in `Full_sync_impl.md`, but are not represented in the current
-`TMACommand`. K5 `.e83` proves that the per-warp FIFO is insufficient; see
-`WAIT_BLOCK.md` Section 5.
+use the high half of the first destination-state register pair for observed
+completion-bearing `UTMALDG` and `UBLKCP`. `UTMAPF`/`UBLKPF` are prefetches and
+have no completion target. Commit `9e92fe9` captures the runtime target in the
+trace, but it is not represented in the current `TMACommand`. K5 `.e83` proves
+that the per-warp FIFO is insufficient; see `WAIT_BLOCK.md` Sections 5 and 6.
 
 The store-side commit-group / wait-group completion (Phase 4, `UTMACMDFLUSH`) is a **separate** mechanism and is *not* covered by this mbarrier model.
+
+The B0-D carrier is scalar only for the currently supported non-multicast
+subset. Multicast remains fail-closed. Future multicast support must use a
+bounded inline destination array plus a target count and an explicit credit
+share per barrier generation; it must not add dynamic allocation to the cycle
+path.
 
 **Reference documents (SYNC work, maintained separately from this plan):**
 
