@@ -506,8 +506,7 @@ class SM : public core_t, public shader_core_ctx_wrapper {
   std::vector<HopperPartialWaitArm> m_partial_wait_arms;
   std::vector<HopperPartialReplayProgress> m_partial_replay_progress;
   std::vector<std::set<std::string>> m_partial_joined_regions;
-  std::vector<HopperTmaAssignmentContract>
-      m_tma_assignment_contracts_per_warp;
+  std::vector<uint32_t> m_tma_open_contracts_per_warp;
   std::vector<uint32_t> m_tma_outstanding_bindings_per_warp;
   std::vector<uint64_t> m_tma_max_completed_transfer_uid_per_warp;
   uint64_t m_next_tma_contract_id = 1;
@@ -515,6 +514,7 @@ class SM : public core_t, public shader_core_ctx_wrapper {
   uint64_t m_tma_binding_launch_uid = 0;
   uint64_t m_tma_contracts_opened = 0;
   uint64_t m_tma_contracts_fully_assigned = 0;
+  uint32_t m_tma_max_open_contracts_per_warp = 0;
   uint64_t m_tma_bindings_created = 0;
   uint64_t m_tma_bindings_completed = 0;
   uint64_t m_tma_assigned_credit_bytes = 0;

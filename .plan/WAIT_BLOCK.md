@@ -2396,13 +2396,13 @@ without introducing scheduler-order bias.
 
 ### 6.1 Scope and current status
 
-| ID | Work item | Current status after B0-C |
+| ID | Work item | Current status after `.e85`/`.e61` |
 |---|---|---|
 | B0-A | Repair UBLKCP sidecar callback-role selection | **IMPLEMENTED / VALIDATED** at `0f7cbc2`; K10 is 8 sites/6,528 occurrences at 512 bytes, and kernel 11 is 1 site/384 occurrences at 32,768 bytes |
 | B0-B | Kernel-aware descriptor identity and K5 tx-size restoration | **IMPLEMENTED / VALIDATED** at `0f7cbc2`; chain 23/23, ambiguity 0, K5 `0x96b0` = 24,576 bytes, 192 128-byte AGU requests, and 768 32-byte sector requests |
 | B0-C | Size-only K5/K10 byte-conservation diagnostic with existing FIFO/release order | **COMPLETE**; byte contract PASS, K10 clean exit at 138,456 cycles, K5 runtime size PASS but all-live WaitBlock abort at cycle 68,176 |
-| B0-D | Exact TMA-command-to-barrier completion ownership | **IMPLEMENTED / SERVER BUILD-RUN PENDING**; command-owned target, exact completion, lifecycle guards, and TMABIND diagnostics are implemented |
-| B0-E | K5 all-live cross-warp WaitBlock cycle (`0xb370`/`0x16c60`) | **DESIGN PENDING AFTER B0-D**; related to the `.e76` shared-barrier/compound-wait problem class, but identical root cause is not proven |
+| B0-D | Exact TMA-command-to-barrier completion ownership | **OVERLAP REPAIR IMPLEMENTED LOCALLY / SERVER RERUN PENDING**; `.e85` validates exact out-of-order completion, while `.e61` invalidates the original one-slot assignment model |
+| B0-E | K5 all-live cross-warp WaitBlock cycle (`0xb370`/`0x16c60`) | **EVIDENCE CONFIRMED / DESIGN PENDING AFTER B0-D**; `.e85` reproduces the ownership-clean 13-warp cycle, related to the `.e76` problem class but not proven identical |
 | B1 | One SM-level WaitBlock release phase per cycle | **REQUIRED / NOT IMPLEMENTED** |
 | B2 | WaitBlock startup and provenance fail-fast checks | **MOSTLY IMPLEMENTED** |
 | B3 | Assert-before-clear lifecycle checks | **IMPLEMENTED for WaitBlock and B0-D TMA ownership**; broader non-ownership cleanup audit remains partial |
@@ -2483,35 +2483,38 @@ not add a second mutable copy named `memory_bytes`. Completion code receives
 both `total_bytes` and `completion.credit_bytes` and asserts equality for the
 current FA3 subset.
 
-`ARRIVE_EXPECT_TX` assignment and barrier-generation accounting use:
+`ARRIVE_EXPECT_TX` assignment identity lives in the exact barrier object:
 
 ```cpp
-struct HopperTmaAssignmentContract {
-  bool valid = false;  // still accepting command assignments
-  HopperMBarrierKey key;
-  uint64_t barrier_generation = 0;
-  uint64_t kernel_launch_uid = 0;
-  uint32_t global_cta_id = 0;
-  uint64_t contract_id = 0;
-};
-
 // Additional fields in HopperMBarrierObject, reset only on phase flip.
 uint64_t tx_contract_id = 0;
 bool assignment_open = false;
+uint32_t assignment_owner_warp_id = ~0u;
+uint64_t assignment_generation = ~0ull;
+uint64_t assignment_kernel_launch_uid = 0;
+uint32_t assignment_global_cta_id = ~0u;
 uint32_t assigned_tx_bytes = 0;
 uint32_t outstanding_tma_bindings = 0;
 ```
 
-There is one fixed per-warp `HopperTmaAssignmentContract` slot for the
-currently unassigned contract. It becomes invalid as soon as assigned bytes
-equal expected bytes; already assigned commands retain their targets and may
-complete later in any order. Multiple fully assigned contracts may therefore
-be in flight concurrently without a completion FIFO. The mirrored
-barrier-local `assignment_open` bit must agree with the owning per-warp slot;
-it provides an O(1) unfulfillable-contract and cleanup check without scanning
-all warps. A separate fixed per-warp outstanding-binding counter remains live
-after the assignment slot closes; warp-slot reset requires this counter to be
-zero so an in-flight command cannot outlive its owner slot.
+Different barrier keys owned by one warp may have open contracts
+simultaneously. This is required by K10: the warp can dispatch the LOADs for
+`0x31010`, then execute `ARRIVE_EXPECT_TX` for `0x31000` before the older LOADs
+reach the shared TMA unit's claim point. The LOAD payload selects the exact
+barrier-local contract; neither assignment nor completion uses a FIFO.
+
+Two fixed per-warp counters support lifecycle checks without becoming routing
+authority:
+
+```cpp
+open_contracts_per_warp[warp]
+outstanding_bindings_per_warp[warp]
+```
+
+The open count increments at `ARRIVE_EXPECT_TX` and decrements only when that
+barrier's assigned bytes equal expected bytes. The outstanding count remains
+live after assignment closes and decrements at command completion. Warp-slot
+reset requires both to be zero.
 
 Launch identity is read from the command owner warp's stamped kernel UID, not
 from the SM's mutable current-kernel pointer. The current launch-scoped
@@ -2761,11 +2764,12 @@ sidecars. It did not require retracing.
 
 ### 6.5 Issue-time binding algorithm
 
-`ARRIVE_EXPECT_TX` creates one event-scoped assignment contract. Warp issue is
-in-order, so the contract exists before its completion-bearing LOADs. The
-runtime barrier identity still comes from each LOAD's new traced completion
-payload; the contract validates command membership and byte conservation. A
-warp FIFO is not the completion routing authority.
+`ARRIVE_EXPECT_TX` creates one barrier-local assignment contract. Trace
+instructions are in program order, but sync execution and shared-TMA-unit
+claim are different pipeline points. A later ARRIVE may therefore execute
+while earlier LOAD instructions are still in the TMA pipeline. The runtime
+barrier identity comes from each LOAD's traced completion payload and selects
+the matching barrier-local contract directly.
 
 This algorithm belongs to B0-D. B0-C intentionally retains the current FIFO to
 isolate the causal effect of restoring the missing K5 bytes.
@@ -2773,7 +2777,10 @@ isolate the causal effect of restoring the missing K5 bytes.
 Contract rules:
 
 - `LOAD before ARRIVE_EXPECT_TX` aborts.
-- A new expect-tx while the previous contract has unassigned bytes aborts.
+- A new expect-tx for the same barrier generation while that barrier has
+  residual contract state aborts.
+- A new expect-tx for a different barrier key is allowed even when the same
+  warp owns another open contract.
 - zero-active or predicated-off instructions create neither a contract nor a
   command target;
 - the current supported subset requires the LOAD issuer warp to equal the
@@ -2793,13 +2800,12 @@ At each active `ARRIVE_EXPECT_TX`:
    and the SYNCS runtime barrier address.
 2. Capture the current barrier generation, runtime kernel launch UID, and
    global CTA ID.
-3. Require the issuing warp's prior assignment contract to be invalid. A
-   fully assigned but not-yet-completed older contract is allowed because its
-   commands already own fixed targets.
-4. Require the barrier generation to have no existing tx contract or residual
+3. Require only this exact barrier generation to have no tx contract or residual
    expected/assigned/completed/outstanding state.
-5. Allocate a monotonically increasing `contract_id`, record
-   `expected_tx_bytes`, and open the per-warp assignment contract.
+4. Allocate a monotonically increasing `contract_id`, record owner warp,
+   generation, launch UID, global CTA ID, and `expected_tx_bytes` in the
+   barrier object.
+5. Increment `open_contracts_per_warp[owner]`.
 
 At each active LOAD issue, inside `tma_unit_sm::issue()` and before the command
 is pushed into `m_command_queue`:
@@ -2810,16 +2816,16 @@ is pushed into `m_command_queue`:
    address, and a valid captured high-UReg ID.
 3. Build the completion key from the LOAD payload's barrier address plus the
    command's trace-kernel and current CTA identity.
-4. Require that key, current generation, launch UID, and global CTA ID to match
-   the issuing warp's open assignment contract.
+4. Find that exact barrier without creating it; require its assignment to be
+   open and its owner warp, generation, launch UID, and global CTA ID to match.
 5. Set `credit_bytes=total_bytes`; any future difference requires a separately
    approved traced rule.
 6. Require `assigned_tx_bytes + credit_bytes <= expected_tx_bytes`.
 7. Allocate a monotonically increasing `binding_id`, copy the complete target
    into `TMACommand`, and increment assigned/outstanding accounting.
-8. Close the per-warp assignment contract only when assigned bytes equal
-   expected bytes. Otherwise leave it open for the next LOAD in the same
-   contract.
+8. Close only that barrier-local assignment when assigned bytes equal expected
+   bytes and decrement its owner's open-contract count. Otherwise leave that
+   barrier open for the next LOAD in the same contract.
 9. Push the command only after all assertions and accounting succeed.
 
 This placement is required. Binding at `enqueue_issued_commands()` is too late
@@ -2917,6 +2923,9 @@ The following invariants hold at all times:
 
 ```text
 bindings_created == bindings_completed + bindings_in_flight
+contracts_opened - contracts_fully_assigned == count(barrier.assignment_open)
+sum(open_contracts_per_warp) == count(barrier.assignment_open)
+sum(outstanding_bindings_per_warp) == sum(barrier.outstanding_tma_bindings)
 sum(assigned_credit for key/gen) <= expected_tx for key/gen
 sum(completed_credit for key/gen) <= assigned_credit for key/gen
 one binding_id is claimed once and completed once
@@ -2937,9 +2946,10 @@ AND (
     -> [TMABIND][abort] reason=unfulfillable-tx-contract
 ```
 
-An open assignment contract is not itself an error: its next in-order LOAD may
-still provide the missing assignment. The abort only fires when accounting
-proves that no future supported command can satisfy the current generation.
+An open assignment contract is not itself an error: an earlier LOAD may still
+be traveling through the TMA pipeline and claim it later. The abort only fires
+when accounting proves that no future supported command can satisfy the
+current generation.
 
 At CTA exit or warp-slot reuse, assert before clearing:
 
@@ -2947,7 +2957,8 @@ At CTA exit or warp-slot reuse, assert before clearing:
 no active WaitBlock hold
 no armed partial transition
 no deferred replay/progress owner
-no open per-warp assignment contract for the CTA
+no barrier-local open assignment contract for the CTA
+open_contracts_per_warp[reused warp] == 0
 no outstanding command-owned binding for a reused warp slot
 for every CTA barrier: assignment_open == false
 for every CTA barrier: expected_tx == assigned_tx == completed_tx
@@ -2966,6 +2977,7 @@ Per-SM, launch-scoped diagnostics must report:
 ```text
 contracts_opened
 contracts_fully_assigned
+max_open_contracts_per_warp
 bindings_created
 bindings_completed
 assigned_credit_bytes
@@ -3260,16 +3272,18 @@ containers are allocated with existing SM state.
    - keep existing `TMACommand::total_bytes` as memory bytes and require
      `completion.credit_bytes == total_bytes` for current FA3.
 6. **B0-D lifecycle**
-   - add per-barrier assigned/outstanding accounting and fixed per-warp open
-     assignment-contract state;
-   - retain a per-warp outstanding-binding count after assignment closes so
-     warp-slot reuse cannot hide an in-flight completion;
+   - keep assignment identity in each barrier object so one warp may own
+     multiple open contracts for different exact keys;
+   - use fixed per-warp open-contract and outstanding-binding counts only for
+     lifecycle/accounting checks, never for target selection;
    - guard local CTA-slot reuse with runtime launch UID, global CTA ID,
      generation, and monotonic contract/binding IDs;
    - assert no orphan state before CTA cleanup, whole-SM reset, and warp reuse.
 7. **B0-D validation and separate commit**
    - run focused tests, K5, and K10 without moving the WaitBlock release phase;
    - retain the current B1 timing so a regression is attributable to B0.
+   - require K10 to observe `max_open_contracts_per_warp >= 2`, proving the
+     `0x31010`/`0x31000` overlap was exercised rather than optimized away;
    - do not assume B0-D alone must make K5 exit: the `.e84` terminal SM has
      clean, in-order TMA completion accounting and a separate all-live
      WaitBlock cycle.
@@ -3421,16 +3435,67 @@ stale_generation = 0
 launch_or_cta_mismatch = 0
 duplicate_completion = 0
 orphan_cleanup = 0
-SM84 UID 7 -> only 0x16c00/24576
-SM84 UID 6 -> only 0x16c30/16384
+an observed UID inversion routes each command only to its payload target
+.e85 SM86 UID 7 -> only 0x16c00/24576
+.e85 SM86 UID 6 -> only 0x16c30/16384
 clean focused/K10 runs: every participating SM emits [TMABIND][FINAL] status=PASS
 K5 WaitBlock abort: aborting SM emits [TMABIND][snapshot] with no ownership error
 ```
+
+B0-D first runtime validation at `4de5c80` produced two distinct results.
+
+K5 `.e85` validates the exact completion half of B0-D:
+
+```text
+contract-open/assign/enqueue/complete events = 4,167 each
+logged assigned/completed credit            = 69,894,144 bytes each
+TMABIND ownership aborts                    = 0
+observed UID inversions                      = 3
+SM124 terminal ownership snapshot           = PASS
+```
+
+In particular, SM86 completes UID 7 before UID 6 and still applies UID 7 only
+to `0x16c00` with 24,576 bytes and UID 6 only to `0x16c30` with 16,384 bytes.
+The old 16-KiB-plus-8-KiB spill does not occur. K5 then reaches the independent
+13-warp SM124 WaitBlock cycle at 68,240; the aborting SM reports no open
+contract, in-flight binding, byte mismatch, stale generation, or ownership
+error.
+
+K10 `.e61` invalidates the original one-slot assignment representation before
+any LOAD is claimed:
+
+```text
+cycle 5590: ARRIVE_EXPECT_TX 0x31010 expected=16896 opens contract 1
+cycle 5633: ARRIVE_EXPECT_TX 0x31000 expected=32768 reaches sync execution
+             while contract 1 is still waiting for its LOADs to reach TMA issue
+result:      previous-contract-unassigned abort
+```
+
+The dynamic trace remains correctly ordered:
+
+```text
+ARRIVE 0x31010
+UTMALDG 0xa240 -> 0x31010
+UBLKCP  0xa260 -> 0x31010
+ARRIVE 0x31000
+UTMALDG 0xa320 -> 0x31000
+UTMALDG 0xa330 -> 0x31000
+```
+
+The overlap is caused by different pipeline service points, not missing trace
+ordering: sync execution can process the later ARRIVE before the older LOADs
+reach `tma_unit_sm::issue()`. The barrier-local repair above permits both exact
+contracts to remain open and lets each LOAD payload select its own contract.
 
 B0-D final K10 regression acceptance:
 
 ```text
 clean kernel exit
+max_open_contracts_per_warp >= 2
+0x31010: 16384 + 512 == 16896
+0x31000: 16384 + 16384 == 32768
+contracts=6912, bindings=13824
+expected_credit=completed_credit=122880000
 no semantic TMA/BAR/memory-work loss
 no TMA binding/lifecycle abort
 WaitBlock holds/releases balanced

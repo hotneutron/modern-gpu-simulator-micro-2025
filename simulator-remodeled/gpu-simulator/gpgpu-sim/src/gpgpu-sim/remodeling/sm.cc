@@ -311,7 +311,7 @@ SM::SM(unsigned int num_subcores, gpgpu_sim *gpu, simt_core_cluster *cluster,
   m_partial_wait_arms.resize(config->max_warps_per_shader);
   m_partial_replay_progress.resize(config->max_warps_per_shader);
   m_partial_joined_regions.resize(config->max_warps_per_shader);
-  m_tma_assignment_contracts_per_warp.resize(config->max_warps_per_shader);
+  m_tma_open_contracts_per_warp.resize(config->max_warps_per_shader, 0);
   m_tma_outstanding_bindings_per_warp.resize(
       config->max_warps_per_shader, 0);
   m_tma_max_completed_transfer_uid_per_warp.resize(
@@ -498,14 +498,16 @@ void SM::debug_log_wait_block_event(const char *event,
 }
 
 void SM::debug_dump_tma_binding_snapshot(const char *reason) const {
-  uint64_t open_contracts = 0;
-  for (const auto &contract : m_tma_assignment_contracts_per_warp) {
-    if (contract.valid) {
-      ++open_contracts;
-    }
+  uint64_t warp_open_contracts = 0;
+  for (uint32_t count : m_tma_open_contracts_per_warp) {
+    warp_open_contracts += count;
   }
+  uint64_t barrier_open_contracts = 0;
   uint64_t barrier_outstanding = 0;
   for (const auto &entry : m_hopper_mbarriers) {
+    if (entry.second.assignment_open) {
+      ++barrier_open_contracts;
+    }
     barrier_outstanding += entry.second.outstanding_tma_bindings;
   }
   uint64_t warp_outstanding = 0;
@@ -517,8 +519,12 @@ void SM::debug_dump_tma_binding_snapshot(const char *reason) const {
           ? m_tma_bindings_created - m_tma_bindings_completed
           : 0;
   const bool accounting_valid =
+      m_tma_contracts_opened >= m_tma_contracts_fully_assigned &&
+      m_tma_contracts_opened - m_tma_contracts_fully_assigned ==
+          barrier_open_contracts &&
       m_tma_bindings_created >= m_tma_bindings_completed &&
       m_tma_assigned_credit_bytes >= m_tma_completed_credit_bytes &&
+      warp_open_contracts == barrier_open_contracts &&
       bindings_in_flight == barrier_outstanding &&
       barrier_outstanding == warp_outstanding;
   const bool no_failures =
@@ -533,7 +539,10 @@ void SM::debug_dump_tma_binding_snapshot(const char *reason) const {
             << " contracts_opened=" << m_tma_contracts_opened
             << " contracts_fully_assigned="
             << m_tma_contracts_fully_assigned
-            << " open_contracts=" << open_contracts
+            << " open_contracts=" << barrier_open_contracts
+            << " warp_open_contracts=" << warp_open_contracts
+            << " max_open_contracts_per_warp="
+            << m_tma_max_open_contracts_per_warp
             << " bindings_created=" << m_tma_bindings_created
             << " bindings_completed=" << m_tma_bindings_completed
             << " bindings_in_flight=" << bindings_in_flight
@@ -559,14 +568,16 @@ void SM::debug_dump_tma_binding_counters() const {
       m_tma_duplicate_completion == 0 && m_tma_orphan_cleanup == 0) {
     return;
   }
-  uint64_t open_contracts = 0;
-  for (const auto &contract : m_tma_assignment_contracts_per_warp) {
-    if (contract.valid) {
-      ++open_contracts;
-    }
+  uint64_t warp_open_contracts = 0;
+  for (uint32_t count : m_tma_open_contracts_per_warp) {
+    warp_open_contracts += count;
   }
+  uint64_t barrier_open_contracts = 0;
   uint64_t barrier_outstanding = 0;
   for (const auto &entry : m_hopper_mbarriers) {
+    if (entry.second.assignment_open) {
+      ++barrier_open_contracts;
+    }
     barrier_outstanding += entry.second.outstanding_tma_bindings;
   }
   uint64_t warp_outstanding = 0;
@@ -579,7 +590,7 @@ void SM::debug_dump_tma_binding_counters() const {
           : 0;
   const bool pass =
       m_tma_contracts_opened == m_tma_contracts_fully_assigned &&
-      open_contracts == 0 &&
+      warp_open_contracts == 0 && barrier_open_contracts == 0 &&
       m_tma_bindings_created == m_tma_bindings_completed &&
       bindings_in_flight == 0 && barrier_outstanding == 0 &&
       warp_outstanding == 0 &&
@@ -594,7 +605,10 @@ void SM::debug_dump_tma_binding_counters() const {
             << " contracts_opened=" << m_tma_contracts_opened
             << " contracts_fully_assigned="
             << m_tma_contracts_fully_assigned
-            << " open_contracts=" << open_contracts
+            << " open_contracts=" << barrier_open_contracts
+            << " warp_open_contracts=" << warp_open_contracts
+            << " max_open_contracts_per_warp="
+            << m_tma_max_open_contracts_per_warp
             << " bindings_created=" << m_tma_bindings_created
             << " bindings_completed=" << m_tma_bindings_completed
             << " bindings_in_flight=" << bindings_in_flight
@@ -2110,28 +2124,22 @@ void SM::reinit(unsigned start_thread, unsigned end_thread,
     }
   }
   for (unsigned i = first_warp;
-       i < end_warp && i < m_tma_assignment_contracts_per_warp.size(); ++i) {
-    const HopperTmaAssignmentContract &contract =
-        m_tma_assignment_contracts_per_warp[i];
+       i < end_warp && i < m_tma_open_contracts_per_warp.size(); ++i) {
+    const uint32_t open_contracts = m_tma_open_contracts_per_warp[i];
     const uint32_t outstanding =
         i < m_tma_outstanding_bindings_per_warp.size()
             ? m_tma_outstanding_bindings_per_warp[i]
             : 0;
-    if (!contract.valid && outstanding == 0) {
+    if (open_contracts == 0 && outstanding == 0) {
       continue;
     }
     ++m_tma_orphan_cleanup;
     std::cerr << "[TMABIND][abort][SM" << m_sm_id << "] cyc="
               << get_current_gpu_cycle()
               << " reason=warp-slot-reuse-with-active-ownership"
-              << " warp=" << i << " contract_id=" << contract.contract_id
-              << " contract_valid=" << contract.valid
-              << " outstanding=" << outstanding
-              << " trace_kernel=" << contract.key.trace_kernel_id
-              << " global_cta=" << contract.global_cta_id
-              << " cta_slot=" << contract.key.cta_id << " barrier=0x"
-              << format_hex_u64(contract.key.barrier_addr)
-              << " generation=" << contract.barrier_generation << std::endl;
+              << " warp=" << i
+              << " open_contracts=" << open_contracts
+              << " outstanding=" << outstanding << std::endl;
     debug_dump_tma_binding_snapshot("warp-slot-reuse");
     abort();
   }
@@ -2193,9 +2201,8 @@ void SM::reinit(unsigned start_thread, unsigned end_thread,
     if (i < m_partial_joined_regions.size()) {
       m_partial_joined_regions[i].clear();
     }
-    if (i < m_tma_assignment_contracts_per_warp.size()) {
-      m_tma_assignment_contracts_per_warp[i] =
-          HopperTmaAssignmentContract();
+    if (i < m_tma_open_contracts_per_warp.size()) {
+      m_tma_open_contracts_per_warp[i] = 0;
     }
     if (i < m_tma_outstanding_bindings_per_warp.size()) {
       m_tma_outstanding_bindings_per_warp[i] = 0;
@@ -2496,12 +2503,12 @@ void SM::set_kernel(kernel_info_t *k) {
   if (m_tma_binding_launch_uid != 0 &&
       m_tma_binding_launch_uid != next_launch_uid) {
     for (unsigned int warp_id = 0;
-         warp_id < m_tma_assignment_contracts_per_warp.size(); ++warp_id) {
-      const HopperTmaAssignmentContract &contract =
-          m_tma_assignment_contracts_per_warp[warp_id];
+         warp_id < m_tma_open_contracts_per_warp.size(); ++warp_id) {
+      const uint32_t open_contracts =
+          m_tma_open_contracts_per_warp[warp_id];
       const uint32_t outstanding =
           m_tma_outstanding_bindings_per_warp[warp_id];
-      if (contract.valid || outstanding != 0) {
+      if (open_contracts != 0 || outstanding != 0) {
         ++m_tma_orphan_cleanup;
         std::cerr << "[TMABIND][abort][SM" << m_sm_id << "] cyc="
                   << get_current_gpu_cycle()
@@ -2509,8 +2516,7 @@ void SM::set_kernel(kernel_info_t *k) {
                   << " old_launch=" << m_tma_binding_launch_uid
                   << " next_launch=" << next_launch_uid
                   << " warp=" << warp_id
-                  << " contract_valid=" << contract.valid
-                  << " contract_id=" << contract.contract_id
+                  << " open_contracts=" << open_contracts
                   << " outstanding=" << outstanding << std::endl;
         debug_dump_tma_binding_snapshot(
             "kernel-switch-active-warp-ownership");
@@ -2542,6 +2548,7 @@ void SM::set_kernel(kernel_info_t *k) {
     debug_dump_tma_binding_counters();
     m_tma_contracts_opened = 0;
     m_tma_contracts_fully_assigned = 0;
+    m_tma_max_open_contracts_per_warp = 0;
     m_tma_bindings_created = 0;
     m_tma_bindings_completed = 0;
     m_tma_assigned_credit_bytes = 0;
@@ -2553,6 +2560,8 @@ void SM::set_kernel(kernel_info_t *k) {
     m_tma_launch_or_cta_mismatch = 0;
     m_tma_duplicate_completion = 0;
     m_tma_orphan_cleanup = 0;
+    std::fill(m_tma_open_contracts_per_warp.begin(),
+              m_tma_open_contracts_per_warp.end(), 0);
     std::fill(m_tma_outstanding_bindings_per_warp.begin(),
               m_tma_outstanding_bindings_per_warp.end(), 0);
     std::fill(m_tma_max_completed_transfer_uid_per_warp.begin(),
@@ -3948,7 +3957,11 @@ void SM::recompute_sync_barrier_ready_and_maybe_flip_phase(
        barrier.assigned_tx_bytes != barrier.expected_tx_bytes ||
        barrier.completed_tx_bytes != barrier.assigned_tx_bytes ||
        barrier.outstanding_tma_bindings != 0 ||
-       barrier.tx_contract_id == 0)) {
+       barrier.tx_contract_id == 0 ||
+       barrier.assignment_owner_warp_id == ~0u ||
+       barrier.assignment_generation != barrier.gen ||
+       barrier.assignment_kernel_launch_uid == 0 ||
+       barrier.assignment_global_cta_id == ~0u)) {
     ++m_tma_contract_mismatches;
     std::cerr << "[TMABIND][abort][SM" << m_sm_id << "] cyc="
               << get_current_gpu_cycle()
@@ -3957,6 +3970,9 @@ void SM::recompute_sync_barrier_ready_and_maybe_flip_phase(
               << " generation=" << barrier.gen
               << " contract_id=" << barrier.tx_contract_id
               << " assignment_open=" << barrier.assignment_open
+              << " owner_warp=" << barrier.assignment_owner_warp_id
+              << " assignment_generation="
+              << barrier.assignment_generation
               << " expected=" << barrier.expected_tx_bytes
               << " assigned=" << barrier.assigned_tx_bytes
               << " completed=" << barrier.completed_tx_bytes
@@ -4000,6 +4016,10 @@ void SM::recompute_sync_barrier_ready_and_maybe_flip_phase(
   barrier.outstanding_tma_bindings = 0;
   barrier.tx_contract_id = 0;
   barrier.assignment_open = false;
+  barrier.assignment_owner_warp_id = ~0u;
+  barrier.assignment_generation = ~0ull;
+  barrier.assignment_kernel_launch_uid = 0;
+  barrier.assignment_global_cta_id = ~0u;
   barrier.ready = false;
 }
 
@@ -4657,6 +4677,10 @@ void SM::handle_sync_instruction(warp_inst_t &inst, unsigned int warp_id) {
       barrier.outstanding_tma_bindings = 0;
       barrier.tx_contract_id = 0;
       barrier.assignment_open = false;
+      barrier.assignment_owner_warp_id = ~0u;
+      barrier.assignment_generation = ~0ull;
+      barrier.assignment_kernel_launch_uid = 0;
+      barrier.assignment_global_cta_id = ~0u;
       barrier.ready = false;
       debug_log_sync_event(
           "exch warp=" + std::to_string(warp_id) + " cta=" +
@@ -4802,28 +4826,6 @@ void SM::clear_sync_barrier_state_for_cta(unsigned int cta_id) {
         HopperPartialReplayProgress();
     m_partial_joined_regions[warp_id].clear();
   }
-  for (unsigned warp_id = 0;
-       warp_id < m_tma_assignment_contracts_per_warp.size(); ++warp_id) {
-    const HopperTmaAssignmentContract &contract =
-        m_tma_assignment_contracts_per_warp[warp_id];
-    if (!contract.valid || contract.key.cta_id != cta_id) {
-      continue;
-    }
-    ++m_tma_orphan_cleanup;
-    std::cerr << "[TMABIND][abort][SM" << m_sm_id << "] cyc="
-              << get_current_gpu_cycle()
-              << " reason=cta-cleanup-with-unassigned-credit"
-              << " warp=" << warp_id
-              << " contract_id=" << contract.contract_id
-              << " trace_kernel=" << contract.key.trace_kernel_id
-              << " global_cta=" << contract.global_cta_id
-              << " cta_slot=" << contract.key.cta_id << " barrier=0x"
-              << format_hex_u64(contract.key.barrier_addr)
-              << " generation=" << contract.barrier_generation << std::endl;
-    debug_dump_tma_binding_snapshot(
-        "cta-cleanup-with-unassigned-credit");
-    abort();
-  }
   for (auto it = m_hopper_mbarriers.begin(); it != m_hopper_mbarriers.end();) {
     if (it->first.cta_id == cta_id) {
       const HopperMBarrierObject &barrier = it->second;
@@ -4872,7 +4874,7 @@ void SM::clear_sync_barrier_state_for_cta(unsigned int cta_id) {
 void SM::open_tma_assignment_contract(unsigned int warp_id,
                                       const HopperMBarrierKey &key,
                                       uint32_t expected_tx_bytes) {
-  if (warp_id >= m_tma_assignment_contracts_per_warp.size() ||
+  if (warp_id >= m_tma_open_contracts_per_warp.size() ||
       key.cta_id >= MAX_CTA_PER_SHADER || expected_tx_bytes == 0) {
     ++m_tma_contract_mismatches;
     std::cerr << "[TMABIND][abort][SM" << m_sm_id << "] cyc="
@@ -4886,16 +4888,12 @@ void SM::open_tma_assignment_contract(unsigned int warp_id,
     abort();
   }
 
-  HopperTmaAssignmentContract &contract =
-      m_tma_assignment_contracts_per_warp[warp_id];
   auto barrier_it = m_hopper_mbarriers.find(key);
-  if (contract.valid || barrier_it == m_hopper_mbarriers.end()) {
+  if (barrier_it == m_hopper_mbarriers.end()) {
     ++m_tma_contract_mismatches;
     std::cerr << "[TMABIND][abort][SM" << m_sm_id << "] cyc="
               << get_current_gpu_cycle()
-              << " reason="
-              << (contract.valid ? "previous-contract-unassigned"
-                                 : "contract-barrier-missing")
+              << " reason=contract-barrier-missing"
               << " warp=" << warp_id << " trace_kernel="
               << key.trace_kernel_id << " cta=" << key.cta_id
               << " barrier=0x" << format_hex_u64(key.barrier_addr)
@@ -4908,7 +4906,11 @@ void SM::open_tma_assignment_contract(unsigned int warp_id,
   if (barrier.assignment_open || barrier.tx_contract_id != 0 ||
       barrier.expected_tx_bytes != 0 || barrier.assigned_tx_bytes != 0 ||
       barrier.completed_tx_bytes != 0 ||
-      barrier.outstanding_tma_bindings != 0) {
+      barrier.outstanding_tma_bindings != 0 ||
+      barrier.assignment_owner_warp_id != ~0u ||
+      barrier.assignment_generation != ~0ull ||
+      barrier.assignment_kernel_launch_uid != 0 ||
+      barrier.assignment_global_cta_id != ~0u) {
     ++m_tma_contract_mismatches;
     std::cerr << "[TMABIND][abort][SM" << m_sm_id << "] cyc="
               << get_current_gpu_cycle()
@@ -4917,6 +4919,7 @@ void SM::open_tma_assignment_contract(unsigned int warp_id,
               << key.trace_kernel_id << " cta=" << key.cta_id
               << " barrier=0x" << format_hex_u64(key.barrier_addr)
               << " generation=" << barrier.gen
+              << " owner_warp=" << barrier.assignment_owner_warp_id
               << " expected=" << barrier.expected_tx_bytes
               << " assigned=" << barrier.assigned_tx_bytes
               << " completed=" << barrier.completed_tx_bytes
@@ -4953,19 +4956,20 @@ void SM::open_tma_assignment_contract(unsigned int warp_id,
   }
 
   const uint64_t contract_id = m_next_tma_contract_id++;
-  contract.valid = true;
-  contract.key = key;
-  contract.barrier_generation = barrier.gen;
-  contract.kernel_launch_uid = launch_uid;
-  contract.global_cta_id = global_cta_id;
-  contract.contract_id = contract_id;
-
   barrier.tx_contract_id = contract_id;
   barrier.assignment_open = true;
+  barrier.assignment_owner_warp_id = warp_id;
+  barrier.assignment_generation = barrier.gen;
+  barrier.assignment_kernel_launch_uid = launch_uid;
+  barrier.assignment_global_cta_id = global_cta_id;
   barrier.expected_tx_bytes = expected_tx_bytes;
   barrier.assigned_tx_bytes = 0;
   barrier.completed_tx_bytes = 0;
   barrier.outstanding_tma_bindings = 0;
+  ++m_tma_open_contracts_per_warp[warp_id];
+  m_tma_max_open_contracts_per_warp =
+      std::max(m_tma_max_open_contracts_per_warp,
+               m_tma_open_contracts_per_warp[warp_id]);
   ++m_tma_contracts_opened;
 
   debug_log_tma_binding_event(
@@ -4978,7 +4982,9 @@ void SM::open_tma_assignment_contract(unsigned int warp_id,
           format_hex_u64(key.barrier_addr) +
           " generation=" + std::to_string(barrier.gen) +
           " contract_id=" + std::to_string(contract_id) +
-          " expected=" + std::to_string(expected_tx_bytes));
+          " expected=" + std::to_string(expected_tx_bytes) +
+          " warp_open_contracts=" +
+          std::to_string(m_tma_open_contracts_per_warp[warp_id]));
 }
 
 void SM::claim_tma_completion_target(const warp_inst_t &inst,
@@ -5003,7 +5009,7 @@ void SM::claim_tma_completion_target(const warp_inst_t &inst,
       inst.tma_completion_barrier_addr == 0 ||
       (inst.tma_completion_barrier_addr & 0x7) != 0 ||
       inst.tma_completion_barrier_ureg_id == 0 ||
-      warp_id >= m_tma_assignment_contracts_per_warp.size() ||
+      warp_id >= m_tma_open_contracts_per_warp.size() ||
       cmd.total_bytes == 0 ||
       cmd.warp_id != warp_id || cmd.sm_id != m_sm_id ||
       cmd.trace_kernel_id != inst.trace_kernel_id ||
@@ -5032,8 +5038,6 @@ void SM::claim_tma_completion_target(const warp_inst_t &inst,
     abort();
   }
 
-  HopperTmaAssignmentContract &contract =
-      m_tma_assignment_contracts_per_warp[warp_id];
   HopperMBarrierKey key;
   key.trace_kernel_id = inst.trace_kernel_id;
   key.cta_id = cmd.cta_id;
@@ -5041,16 +5045,31 @@ void SM::claim_tma_completion_target(const warp_inst_t &inst,
   const uint64_t launch_uid = m_physical_warp[warp_id]->m_kernel_id;
   const uint32_t global_cta_id = get_global_cta_id(cmd.cta_id);
 
-  if (launch_uid == 0 || !contract.valid || !(contract.key == key) ||
-      contract.kernel_launch_uid != launch_uid ||
-      contract.global_cta_id != global_cta_id) {
+  auto barrier_it = m_hopper_mbarriers.find(key);
+  if (barrier_it == m_hopper_mbarriers.end()) {
     ++m_tma_contract_mismatches;
-    if (contract.valid && !(contract.key == key)) {
-      ++m_tma_cross_barrier_applications;
-    }
-    if (contract.valid &&
-        (contract.kernel_launch_uid != launch_uid ||
-         contract.global_cta_id != global_cta_id)) {
+    std::cerr << "[TMABIND][abort][SM" << m_sm_id << "] cyc="
+              << get_current_gpu_cycle()
+              << " reason=claim-barrier-missing"
+              << " trace_kernel=" << inst.trace_kernel_id
+              << " global_cta=" << global_cta_id
+              << " cta_slot=" << cmd.cta_id << " warp=" << warp_id
+              << " pc=0x" << format_hex_u64(inst.pc)
+              << " payload_barrier=0x"
+              << format_hex_u64(key.barrier_addr) << std::endl;
+    debug_dump_tma_binding_snapshot("claim-barrier-missing");
+    abort();
+  }
+
+  HopperMBarrierObject &barrier = barrier_it->second;
+  if (launch_uid == 0 || !barrier.assignment_open ||
+      barrier.assignment_owner_warp_id != warp_id ||
+      barrier.assignment_kernel_launch_uid != launch_uid ||
+      barrier.assignment_global_cta_id != global_cta_id ||
+      m_tma_open_contracts_per_warp[warp_id] == 0) {
+    ++m_tma_contract_mismatches;
+    if (barrier.assignment_kernel_launch_uid != launch_uid ||
+        barrier.assignment_global_cta_id != global_cta_id) {
       ++m_tma_launch_or_cta_mismatch;
     }
     std::cerr << "[TMABIND][abort][SM" << m_sm_id << "] cyc="
@@ -5062,45 +5081,31 @@ void SM::claim_tma_completion_target(const warp_inst_t &inst,
               << " pc=0x" << format_hex_u64(inst.pc)
               << " payload_barrier=0x"
               << format_hex_u64(key.barrier_addr)
-              << " contract_valid=" << contract.valid;
-    if (contract.valid) {
-      std::cerr << " contract_barrier=0x"
-                << format_hex_u64(contract.key.barrier_addr)
-                << " contract_generation=" << contract.barrier_generation
-                << " contract_id=" << contract.contract_id;
-    }
-    std::cerr << std::endl;
+              << " assignment_open=" << barrier.assignment_open
+              << " owner_warp=" << barrier.assignment_owner_warp_id
+              << " assignment_launch="
+              << barrier.assignment_kernel_launch_uid
+              << " assignment_global_cta="
+              << barrier.assignment_global_cta_id
+              << " contract_id=" << barrier.tx_contract_id
+              << " warp_open_contracts="
+              << m_tma_open_contracts_per_warp[warp_id]
+              << std::endl;
     debug_dump_tma_binding_snapshot("tx-contract-unresolved");
     abort();
   }
 
-  auto barrier_it = m_hopper_mbarriers.find(key);
-  if (barrier_it == m_hopper_mbarriers.end()) {
+  if (barrier.assignment_generation != barrier.gen ||
+      barrier.tx_contract_id == 0) {
     ++m_tma_contract_mismatches;
-    std::cerr << "[TMABIND][abort][SM" << m_sm_id << "] cyc="
-              << get_current_gpu_cycle()
-              << " reason=claim-barrier-missing"
-              << " contract_id=" << contract.contract_id
-              << " barrier=0x" << format_hex_u64(key.barrier_addr)
-              << std::endl;
-    debug_dump_tma_binding_snapshot("claim-barrier-missing");
-    abort();
-  }
-
-  HopperMBarrierObject &barrier = barrier_it->second;
-  if (contract.barrier_generation != barrier.gen ||
-      barrier.tx_contract_id != contract.contract_id ||
-      !barrier.assignment_open) {
-    ++m_tma_contract_mismatches;
-    if (contract.barrier_generation != barrier.gen) {
+    if (barrier.assignment_generation != barrier.gen) {
       ++m_tma_stale_generation;
     }
     std::cerr << "[TMABIND][abort][SM" << m_sm_id << "] cyc="
               << get_current_gpu_cycle()
               << " reason=claim-contract-state-mismatch"
-              << " contract_id=" << contract.contract_id
-              << " barrier_contract_id=" << barrier.tx_contract_id
-              << " contract_generation=" << contract.barrier_generation
+              << " contract_id=" << barrier.tx_contract_id
+              << " contract_generation=" << barrier.assignment_generation
               << " barrier_generation=" << barrier.gen
               << " assignment_open=" << barrier.assignment_open << std::endl;
     debug_dump_tma_binding_snapshot("claim-contract-state-mismatch");
@@ -5114,7 +5119,7 @@ void SM::claim_tma_completion_target(const warp_inst_t &inst,
     std::cerr << "[TMABIND][abort][SM" << m_sm_id << "] cyc="
               << get_current_gpu_cycle()
               << " reason=tx-contract-overassigned"
-              << " contract_id=" << contract.contract_id
+              << " contract_id=" << barrier.tx_contract_id
               << " expected=" << barrier.expected_tx_bytes
               << " assigned_before=" << barrier.assigned_tx_bytes
               << " credit=" << cmd.total_bytes << std::endl;
@@ -5130,7 +5135,7 @@ void SM::claim_tma_completion_target(const warp_inst_t &inst,
   target.global_cta_id = global_cta_id;
   target.owner_warp_id = warp_id;
   target.source_barrier_ureg_id = inst.tma_completion_barrier_ureg_id;
-  target.contract_id = contract.contract_id;
+  target.contract_id = barrier.tx_contract_id;
   target.binding_id = m_next_tma_binding_id++;
   target.credit_bytes = cmd.total_bytes;
   cmd.completion = target;
@@ -5142,8 +5147,18 @@ void SM::claim_tma_completion_target(const warp_inst_t &inst,
   m_tma_assigned_credit_bytes += target.credit_bytes;
 
   if (barrier.assigned_tx_bytes == barrier.expected_tx_bytes) {
+    if (m_tma_open_contracts_per_warp[warp_id] == 0) {
+      ++m_tma_contract_mismatches;
+      std::cerr << "[TMABIND][abort][SM" << m_sm_id << "] cyc="
+                << get_current_gpu_cycle()
+                << " reason=open-contract-counter-underflow"
+                << " warp=" << warp_id
+                << " contract_id=" << barrier.tx_contract_id << std::endl;
+      debug_dump_tma_binding_snapshot("open-contract-counter-underflow");
+      abort();
+    }
     barrier.assignment_open = false;
-    contract = HopperTmaAssignmentContract();
+    --m_tma_open_contracts_per_warp[warp_id];
     ++m_tma_contracts_fully_assigned;
   }
 
@@ -5165,7 +5180,9 @@ void SM::claim_tma_completion_target(const warp_inst_t &inst,
           " expected=" + std::to_string(barrier.expected_tx_bytes) +
           " assigned=" + std::to_string(barrier.assigned_tx_bytes) +
           " outstanding=" +
-          std::to_string(barrier.outstanding_tma_bindings));
+          std::to_string(barrier.outstanding_tma_bindings) +
+          " warp_open_contracts=" +
+          std::to_string(m_tma_open_contracts_per_warp[warp_id]));
 }
 
 void SM::complete_tma_load(TmaCompletionTarget &target,
@@ -5232,7 +5249,8 @@ void SM::complete_tma_load(TmaCompletionTarget &target,
   }
 
   HopperMBarrierObject &barrier = barrier_it->second;
-  if (target.barrier_generation != barrier.gen) {
+  if (target.barrier_generation != barrier.gen ||
+      target.barrier_generation != barrier.assignment_generation) {
     ++m_tma_stale_generation;
     std::cerr << "[TMABIND][abort][SM" << m_sm_id << "] cyc="
               << get_current_gpu_cycle()
@@ -5240,7 +5258,9 @@ void SM::complete_tma_load(TmaCompletionTarget &target,
               << " transfer_uid=" << transfer_uid
               << " binding_id=" << target.binding_id
               << " target_generation=" << target.barrier_generation
-              << " barrier_generation=" << barrier.gen << std::endl;
+              << " barrier_generation=" << barrier.gen
+              << " assignment_generation="
+              << barrier.assignment_generation << std::endl;
     debug_dump_tma_binding_snapshot("stale-barrier-generation");
     abort();
   }
@@ -5250,6 +5270,10 @@ void SM::complete_tma_load(TmaCompletionTarget &target,
       target.credit_bytes;
   if (target.contract_id == 0 ||
       target.contract_id != barrier.tx_contract_id ||
+      target.owner_warp_id != barrier.assignment_owner_warp_id ||
+      target.kernel_launch_uid !=
+          barrier.assignment_kernel_launch_uid ||
+      target.global_cta_id != barrier.assignment_global_cta_id ||
       memory_bytes != target.credit_bytes ||
       completed_after > barrier.assigned_tx_bytes ||
       barrier.assigned_tx_bytes > barrier.expected_tx_bytes ||
@@ -5263,6 +5287,9 @@ void SM::complete_tma_load(TmaCompletionTarget &target,
               << " binding_id=" << target.binding_id
               << " target_contract=" << target.contract_id
               << " barrier_contract=" << barrier.tx_contract_id
+              << " target_warp=" << target.owner_warp_id
+              << " barrier_owner_warp="
+              << barrier.assignment_owner_warp_id
               << " memory_bytes=" << memory_bytes
               << " credit_bytes=" << target.credit_bytes
               << " expected=" << barrier.expected_tx_bytes

@@ -424,6 +424,10 @@ struct HopperMBarrierObject {
   uint32_t outstanding_tma_bindings = 0;
   uint64_t tx_contract_id = 0;
   bool assignment_open = false;
+  uint32_t assignment_owner_warp_id = ~0u;
+  uint64_t assignment_generation = ~0ull;
+  uint64_t assignment_kernel_launch_uid = 0;
+  uint32_t assignment_global_cta_id = ~0u;
   uint32_t phase = 0;
   bool ready = false;
   // Monotonically increasing phase generation. WaitBlock uses it to distinguish
@@ -501,15 +505,6 @@ struct HopperMBarrierPendingWait {
   uint64_t expected_gen = 0;
   uint64_t hold_start_cycle = 0;
   uint64_t last_heartbeat_cycle = 0;
-};
-
-struct HopperTmaAssignmentContract {
-  bool valid = false;
-  HopperMBarrierKey key;
-  uint64_t barrier_generation = 0;
-  uint64_t kernel_launch_uid = 0;
-  uint32_t global_cta_id = 0;
-  uint64_t contract_id = 0;
 };
 
 struct TmaCompletionTarget {
