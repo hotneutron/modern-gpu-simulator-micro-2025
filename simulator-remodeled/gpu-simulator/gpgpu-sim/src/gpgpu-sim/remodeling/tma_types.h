@@ -408,22 +408,27 @@ struct HopperMBarrierKey {
     return std::tie(trace_kernel_id, cta_id, barrier_addr) <
            std::tie(other.trace_kernel_id, other.cta_id, other.barrier_addr);
   }
+
+  bool operator==(const HopperMBarrierKey &other) const {
+    return trace_kernel_id == other.trace_kernel_id &&
+           cta_id == other.cta_id && barrier_addr == other.barrier_addr;
+  }
 };
 
 struct HopperMBarrierObject {
   uint32_t expected_arrive_count = 0;
   uint32_t arrive_count = 0;
   uint32_t expected_tx_bytes = 0;
+  uint32_t assigned_tx_bytes = 0;
   uint32_t completed_tx_bytes = 0;
+  uint32_t outstanding_tma_bindings = 0;
+  uint64_t tx_contract_id = 0;
+  bool assignment_open = false;
   uint32_t phase = 0;
   bool ready = false;
-  // [Spin-wait fold audit] Monotonically-increasing generation: gen++ on
-  // every phase flip, NEVER reset. The 1-bit `phase` above stays the sole driver
-  // of the (bit-identical) non-fold issue logic; `gen` is read ONLY by the
-  // fold-path generation audit, which needs to tell "my flip already passed"
-  // (gen > expected) from "not yet" (gen < expected) — a distinction 1-bit parity
-  // cannot make on a low-flip cross-warp barrier. See
-  // .plan/SPIN_WAIT_SIM_MODELING.md 13.4/13.5.
+  // Monotonically increasing phase generation. WaitBlock uses it to distinguish
+  // "already passed" from "not yet"; TMA completion targets pin it at issue so
+  // a late completion cannot update a reused barrier phase.
   uint64_t gen = 0;
   // Last two flip coordinates are diagnostic-only. They make a poison audit
   // self-contained: expected/current generations can be correlated with the
@@ -498,9 +503,27 @@ struct HopperMBarrierPendingWait {
   uint64_t last_heartbeat_cycle = 0;
 };
 
-struct HopperMBarrierPendingTxBinding {
+struct HopperTmaAssignmentContract {
+  bool valid = false;
   HopperMBarrierKey key;
-  uint32_t pending_tx_bytes = 0;
+  uint64_t barrier_generation = 0;
+  uint64_t kernel_launch_uid = 0;
+  uint32_t global_cta_id = 0;
+  uint64_t contract_id = 0;
+};
+
+struct TmaCompletionTarget {
+  bool valid = false;
+  bool completed = false;
+  HopperMBarrierKey key;
+  uint64_t barrier_generation = 0;
+  uint64_t kernel_launch_uid = 0;
+  uint32_t global_cta_id = 0;
+  uint32_t owner_warp_id = 0;
+  uint32_t source_barrier_ureg_id = 0;
+  uint64_t contract_id = 0;
+  uint64_t binding_id = 0;
+  uint32_t credit_bytes = 0;
 };
 
 struct TMACommand {
@@ -508,6 +531,9 @@ struct TMACommand {
   uint32_t cta_id = 0;
   uint32_t sm_id = 0;
   uint32_t subcore_id = 0;
+  uint32_t trace_kernel_id = 0;
+  uint32_t unique_function_id = 0;
+  uint64_t tma_pc = 0;
   TMAOpcodeFamily opcode_family = TMAOpcodeFamily::UNKNOWN;
   TMADirection direction = TMADirection::NONE;
   TMATransferType transfer_type = TMATransferType::UNKNOWN;
@@ -541,6 +567,7 @@ struct TMACommand {
   // build_tma_command from the per-base visit counter; only meaningful when
   // has_real_base is true. tile_bytes = Πbox_dim·element_size (one tile's byte span).
   uint64_t tile_offset_bytes = 0;
+  TmaCompletionTarget completion;
 };
 
 struct TMATransferEntry {

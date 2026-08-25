@@ -2401,11 +2401,11 @@ without introducing scheduler-order bias.
 | B0-A | Repair UBLKCP sidecar callback-role selection | **IMPLEMENTED / VALIDATED** at `0f7cbc2`; K10 is 8 sites/6,528 occurrences at 512 bytes, and kernel 11 is 1 site/384 occurrences at 32,768 bytes |
 | B0-B | Kernel-aware descriptor identity and K5 tx-size restoration | **IMPLEMENTED / VALIDATED** at `0f7cbc2`; chain 23/23, ambiguity 0, K5 `0x96b0` = 24,576 bytes, 192 128-byte AGU requests, and 768 32-byte sector requests |
 | B0-C | Size-only K5/K10 byte-conservation diagnostic with existing FIFO/release order | **COMPLETE**; byte contract PASS, K10 clean exit at 138,456 cycles, K5 runtime size PASS but all-live WaitBlock abort at cycle 68,176 |
-| B0-D | Exact TMA-command-to-barrier completion ownership | **DESIGN COMPLETE / RUNTIME NOT IMPLEMENTED**; `.e84` directly observes one corrected 24-KiB command split across stale FIFO bindings on SM84 |
+| B0-D | Exact TMA-command-to-barrier completion ownership | **IMPLEMENTED / SERVER BUILD-RUN PENDING**; command-owned target, exact completion, lifecycle guards, and TMABIND diagnostics are implemented |
 | B0-E | K5 all-live cross-warp WaitBlock cycle (`0xb370`/`0x16c60`) | **DESIGN PENDING AFTER B0-D**; related to the `.e76` shared-barrier/compound-wait problem class, but identical root cause is not proven |
 | B1 | One SM-level WaitBlock release phase per cycle | **REQUIRED / NOT IMPLEMENTED** |
 | B2 | WaitBlock startup and provenance fail-fast checks | **MOSTLY IMPLEMENTED** |
-| B3 | Assert-before-clear lifecycle checks | **PARTIAL**: WaitBlock state guarded; TMA ownership cleanup missing |
+| B3 | Assert-before-clear lifecycle checks | **IMPLEMENTED for WaitBlock and B0-D TMA ownership**; broader non-ownership cleanup audit remains partial |
 | B4 | Zero-active no-op and active required-payload checks | **IMPLEMENTED** |
 | B5 | Configurable watchdog/heartbeat and kernel-scoped counters | **REQUIRED / NOT IMPLEMENTED** |
 | B6 | WaitBlock-only non-mutating hold query | **PARTIAL**: SR-M0A path implemented; legacy metrics still need audit |
@@ -2462,6 +2462,7 @@ struct TmaCompletionTarget {
   uint64_t barrier_generation = 0;
   uint64_t kernel_launch_uid = 0;
   uint32_t global_cta_id = 0;
+  uint32_t owner_warp_id = 0;
   uint32_t source_barrier_ureg_id = 0;
   uint64_t contract_id = 0;
   uint64_t binding_id = 0;
@@ -2508,7 +2509,16 @@ complete later in any order. Multiple fully assigned contracts may therefore
 be in flight concurrently without a completion FIFO. The mirrored
 barrier-local `assignment_open` bit must agree with the owning per-warp slot;
 it provides an O(1) unfulfillable-contract and cleanup check without scanning
-all warps.
+all warps. A separate fixed per-warp outstanding-binding counter remains live
+after the assignment slot closes; warp-slot reset requires this counter to be
+zero so an in-flight command cannot outlive its owner slot.
+
+Launch identity is read from the command owner warp's stamped kernel UID, not
+from the SM's mutable current-kernel pointer. The current launch-scoped
+diagnostic accumulator supports one TMA-bearing launch per SM at a time;
+a second concurrent TMA-bearing launch fails closed until counters are split
+per launch. This does not affect the current FA3 configuration, where
+`gpgpu_concurrent_kernel_sm=0`.
 
 The scalar `TmaCompletionTarget` is intentional for the currently supported
 non-multicast subset. It must not be treated as a permanent one-target ISA
@@ -2924,7 +2934,7 @@ AND (
   OR
   assigned_tx == expected_tx AND outstanding_tma_bindings == 0
 )
-    -> [TMA][abort] reason=unfulfillable-tx-contract
+    -> [TMABIND][abort] reason=unfulfillable-tx-contract
 ```
 
 An open assignment contract is not itself an error: its next in-order LOAD may
@@ -2938,6 +2948,7 @@ no active WaitBlock hold
 no armed partial transition
 no deferred replay/progress owner
 no open per-warp assignment contract for the CTA
+no outstanding command-owned binding for a reused warp slot
 for every CTA barrier: assignment_open == false
 for every CTA barrier: expected_tx == assigned_tx == completed_tx
 for every CTA barrier: outstanding_tma_bindings == 0
@@ -3251,6 +3262,8 @@ containers are allocated with existing SM state.
 6. **B0-D lifecycle**
    - add per-barrier assigned/outstanding accounting and fixed per-warp open
      assignment-contract state;
+   - retain a per-warp outstanding-binding count after assignment closes so
+     warp-slot reuse cannot hide an in-flight completion;
    - guard local CTA-slot reuse with runtime launch UID, global CTA ID,
      generation, and monotonic contract/binding IDs;
    - assert no orphan state before CTA cleanup, whole-SM reset, and warp reuse.

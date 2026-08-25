@@ -3,6 +3,7 @@
 #include <cassert>
 #include <iostream>
 #include <set>
+#include <sstream>
 #include <tuple>
 
 #include "../../abstract_hardware_model.h"
@@ -11,6 +12,12 @@
 #include "sm.h"
 
 namespace {
+
+std::string format_tma_hex(uint64_t value) {
+  std::ostringstream stream;
+  stream << std::hex << value;
+  return stream.str();
+}
 
 TMADirection classify_tma_direction(const warp_inst_t &inst) {
   if (inst.op == TMA_LOAD_OP) {
@@ -371,6 +378,7 @@ void tma_unit_sm::issue(register_set_uniptr &source_reg) {
   if (ready_inst != nullptr) {
     if (ready_inst->active_count() > 0) {
       TMACommand cmd = build_tma_command(*ready_inst);
+      m_sm->claim_tma_completion_target(*ready_inst, cmd);
       m_command_queue.push(cmd);
       ++m_stat_commands_issued;
     }
@@ -402,6 +410,9 @@ TMACommand tma_unit_sm::build_tma_command(const warp_inst_t &inst) const {
   cmd.warp_id = inst.warp_id();
   cmd.sm_id = m_sm->get_sid();
   cmd.subcore_id = inst.get_subcore_id();
+  cmd.trace_kernel_id = inst.trace_kernel_id;
+  cmd.unique_function_id = inst.unique_function_id;
+  cmd.tma_pc = inst.pc;
   if (m_sm->get_shd_warp(inst.warp_id()) != nullptr) {
     cmd.cta_id = m_sm->get_shd_warp(inst.warp_id())->get_cta_id();
   }
@@ -693,7 +704,22 @@ void tma_unit_sm::enqueue_issued_commands() {
       " dir=" + std::to_string(static_cast<int>(entry.cmd.direction)) +
       " ttype=" + std::to_string(static_cast<int>(entry.cmd.transfer_type)) +
       " requests_total=" + std::to_string(entry.cmd.requests_total) +
-      " total_bytes=" + std::to_string(entry.cmd.total_bytes));
+      " total_bytes=" + std::to_string(entry.cmd.total_bytes) +
+      " binding_id=" +
+      std::to_string(entry.cmd.completion.binding_id));
+  if (entry.cmd.completion.valid) {
+    m_sm->debug_log_tma_binding_event(
+        "enqueue",
+        "transfer_uid=" + std::to_string(entry.transfer_uid) +
+            " contract_id=" +
+            std::to_string(entry.cmd.completion.contract_id) +
+            " binding_id=" +
+            std::to_string(entry.cmd.completion.binding_id) +
+            " barrier=0x" +
+            format_tma_hex(entry.cmd.completion.key.barrier_addr) +
+            " generation=" +
+            std::to_string(entry.cmd.completion.barrier_generation));
+  }
 }
 
 void tma_unit_sm::advance_in_flight_transfers() {
@@ -1048,7 +1074,8 @@ void tma_unit_sm::mover_on_response(TMATransferEntry &entry, mem_fetch *mf,
     // completion uses the bulk async-group (commit-group / wait-group)
     // mechanism, modeled separately by the UTMACMDFLUSH warp-stall.
     if (entry.cmd.transfer_type == TMATransferType::LOAD) {
-      m_sm->notify_tma_completion(entry.cmd.warp_id, entry.cmd.total_bytes);
+      m_sm->complete_tma_load(entry.cmd.completion, entry.cmd.total_bytes,
+                              entry.transfer_uid);
       // Symmetric with the prefetch branch's "mbarrier_credited=0": make the
       // producer->consumer handshake observable. A real load credits the
       // consumer mbarrier's transaction-count (complete_tx) with total_bytes,
@@ -1057,14 +1084,16 @@ void tma_unit_sm::mover_on_response(TMATransferEntry &entry, mem_fetch *mf,
           "load-mbarrier-credit uid=" + std::to_string(entry.transfer_uid) +
           " warp=" + std::to_string(entry.cmd.warp_id) +
           " bytes=" + std::to_string(entry.cmd.total_bytes) +
+          " binding_id=" +
+          std::to_string(entry.cmd.completion.binding_id) +
           " mbarrier_credited=1"
           " cycle=" + std::to_string(current_cycle));
     } else if (entry.cmd.transfer_type == TMATransferType::PREFETCH) {
       // Fire-and-forget prefetch: data has landed in L2/SMEM-staging but there
       // is no consumer barrier to signal. Just log and retire silently.
       // ttype is logged so the trace can prove this transfer took the PREFETCH
-      // branch and therefore did NOT call notify_tma_completion (the latent bug
-      // this branch closes).
+      // branch and therefore did not apply a command-owned mbarrier completion
+      // target.
       m_sm->debug_log_tma_event(
           "prefetch-complete uid=" + std::to_string(entry.transfer_uid) +
           " warp=" + std::to_string(entry.cmd.warp_id) +

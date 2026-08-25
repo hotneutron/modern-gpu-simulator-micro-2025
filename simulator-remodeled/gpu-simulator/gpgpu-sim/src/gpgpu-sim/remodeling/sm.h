@@ -37,7 +37,6 @@
 #include <utility>
 #include <vector>
 #include <stack>
-#include <deque>
 #include <memory>
 #include "ldst_unit_sm.h"
 
@@ -432,12 +431,18 @@ class SM : public core_t, public shader_core_ctx_wrapper {
   // Current monotonic generation of a barrier (0 if the object does not exist).
   uint64_t sync_barrier_gen(const HopperMBarrierKey &key) const;
   void clear_sync_barrier_state_for_cta(unsigned int cta_id);
-  void bind_tma_completion_to_sync_barrier(unsigned int warp_id,
-                                           const HopperMBarrierKey &key,
-                                           uint32_t tx_bytes);
-  void notify_tma_completion(unsigned int warp_id, uint32_t completed_tx_bytes);
+  void open_tma_assignment_contract(unsigned int warp_id,
+                                    const HopperMBarrierKey &key,
+                                    uint32_t expected_tx_bytes);
+  void claim_tma_completion_target(const warp_inst_t &inst, TMACommand &cmd);
+  void complete_tma_load(TmaCompletionTarget &target, uint32_t memory_bytes,
+                         uint64_t transfer_uid);
+  void debug_dump_tma_binding_snapshot(const char *reason) const;
+  void debug_dump_tma_binding_counters() const;
   void debug_log_sync_event(const std::string &message);
   void debug_log_tma_event(const std::string &message);
+  void debug_log_tma_binding_event(const char *event,
+                                   const std::string &message);
   void debug_log_wait_block_event(const char *event,
                                   const std::string &message);
   void debug_dump_sync_counters() const;
@@ -501,8 +506,26 @@ class SM : public core_t, public shader_core_ctx_wrapper {
   std::vector<HopperPartialWaitArm> m_partial_wait_arms;
   std::vector<HopperPartialReplayProgress> m_partial_replay_progress;
   std::vector<std::set<std::string>> m_partial_joined_regions;
-  std::vector<std::deque<HopperMBarrierPendingTxBinding>>
-      m_pending_tma_barrier_binds_per_warp;
+  std::vector<HopperTmaAssignmentContract>
+      m_tma_assignment_contracts_per_warp;
+  std::vector<uint32_t> m_tma_outstanding_bindings_per_warp;
+  std::vector<uint64_t> m_tma_max_completed_transfer_uid_per_warp;
+  uint64_t m_next_tma_contract_id = 1;
+  uint64_t m_next_tma_binding_id = 1;
+  uint64_t m_tma_binding_launch_uid = 0;
+  uint64_t m_tma_contracts_opened = 0;
+  uint64_t m_tma_contracts_fully_assigned = 0;
+  uint64_t m_tma_bindings_created = 0;
+  uint64_t m_tma_bindings_completed = 0;
+  uint64_t m_tma_assigned_credit_bytes = 0;
+  uint64_t m_tma_completed_credit_bytes = 0;
+  uint64_t m_tma_uid_reorders = 0;
+  uint64_t m_tma_cross_barrier_applications = 0;
+  uint64_t m_tma_contract_mismatches = 0;
+  uint64_t m_tma_stale_generation = 0;
+  uint64_t m_tma_launch_or_cta_mismatch = 0;
+  uint64_t m_tma_duplicate_completion = 0;
+  uint64_t m_tma_orphan_cleanup = 0;
   // Initialized from shader_core_config in SM::SM(); 0 disables logging.
   uint64_t m_sync_debug_print_budget = 0;
   uint64_t m_sync_debug_skip_runtime_budget = 0;
