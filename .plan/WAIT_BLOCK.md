@@ -4680,10 +4680,12 @@ The local trace-side implementation is complete:
   artifact, protobuf, schema-v5 WaitBlock sidecar, sync metadata, and B0-D TMA
   contract metadata. It emits a separate schema-v6 candidate sidecar only
   after complete finite coverage.
-- `run_hw_trace.py` enables this path only with `SYNC_EVENT_ORDER=1`, requires
-  `SYNC_EVENT_ORDER_BASELINE_TRACES`, keeps the feature-off run-directory
-  artifacts unchanged, and runs join/candidate generation after existing
-  metadata validation.
+- `run_hw_trace.py` enables this path only with `SYNC_EVENT_ORDER=1`, derives
+  the baseline from the same benchmark/config run without the
+  `-sync-order-v1` suffix, keeps
+  `SYNC_EVENT_ORDER_BASELINE_TRACES` as an optional override, preserves
+  feature-off run-directory artifacts, and runs join/candidate generation
+  after existing metadata validation.
 
 Local Python syntax checks, ABI layout checks, and 20 focused unit tests pass.
 The NVBit/CUDA build and K5/K10 capture have deliberately not been run locally;
