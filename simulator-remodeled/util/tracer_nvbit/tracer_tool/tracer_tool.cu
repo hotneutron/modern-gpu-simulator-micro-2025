@@ -628,6 +628,14 @@ static SYNC_ORDER_EVENT_KIND get_sync_order_event_kind(
   return SYNC_ORDER_EVENT_END_OF_KERNEL;
 }
 
+static bool sync_order_event_uses_before_after(
+    SYNC_ORDER_EVENT_KIND kind) {
+  return kind == SYNC_ORDER_EVENT_EXCH ||
+         kind == SYNC_ORDER_EVENT_ARRIVE ||
+         kind == SYNC_ORDER_EVENT_PHASECHK ||
+         kind == SYNC_ORDER_EVENT_TMA_COMPLETION;
+}
+
 static const char *sync_order_event_kind_name(
     SYNC_ORDER_EVENT_KIND kind) {
   switch (kind) {
@@ -2798,8 +2806,14 @@ void instrument_function_if_needed(CUcontext ctx, CUfunction func, int device_id
             get_sync_order_event_kind(opcode_str);
         if (event_kind != SYNC_ORDER_EVENT_END_OF_KERNEL) {
           assert(ctx_state->sync_order_registry != nullptr);
+          const bool use_before_after =
+              sync_order_event_uses_before_after(event_kind);
           nvbit_insert_call(
-              instr, "record_sync_order_begin", IPOINT_BEFORE);
+              instr,
+              use_before_after
+                  ? "record_sync_order_begin"
+                  : "record_sync_order_point",
+              IPOINT_BEFORE);
           nvbit_add_call_arg_guard_pred_val(instr);
           nvbit_add_call_arg_const_val32(
               instr, next_candidate_unique_function_id);
@@ -2812,19 +2826,22 @@ void instrument_function_if_needed(CUcontext ctx, CUfunction func, int device_id
               reinterpret_cast<uint64_t>(
                   ctx_state->sync_order_registry));
 
-          nvbit_insert_call(
-              instr, "record_sync_order_end", IPOINT_AFTER);
-          nvbit_add_call_arg_guard_pred_val(instr);
-          nvbit_add_call_arg_const_val32(
-              instr, next_candidate_unique_function_id);
-          nvbit_add_call_arg_const_val32(
-              instr, static_cast<uint32_t>(instr->getOffset()));
-          nvbit_add_call_arg_const_val32(
-              instr, static_cast<uint32_t>(event_kind));
-          nvbit_add_call_arg_const_val64(
-              instr,
-              reinterpret_cast<uint64_t>(
-                  ctx_state->sync_order_registry));
+          if (use_before_after) {
+            nvbit_insert_call(
+                instr, "record_sync_order_end", IPOINT_AFTER);
+            nvbit_add_call_arg_guard_pred_val(instr);
+            nvbit_add_call_arg_const_val32(
+                instr, next_candidate_unique_function_id);
+            nvbit_add_call_arg_const_val32(
+                instr,
+                static_cast<uint32_t>(instr->getOffset()));
+            nvbit_add_call_arg_const_val32(
+                instr, static_cast<uint32_t>(event_kind));
+            nvbit_add_call_arg_const_val64(
+                instr,
+                reinterpret_cast<uint64_t>(
+                    ctx_state->sync_order_registry));
+          }
         }
       }
       cnt++;

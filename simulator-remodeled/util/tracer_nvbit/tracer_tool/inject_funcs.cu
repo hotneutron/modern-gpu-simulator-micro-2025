@@ -391,10 +391,52 @@ static __device__ __forceinline__ bool get_sync_order_location(
   return true;
 }
 
+static __device__ __forceinline__ void store_sync_order_record(
+    sync_order_registry_t *registry, sync_order_launch_slot_t *slot,
+    unsigned int linear_cta_id, const sync_order_record_t &record) {
+  unsigned long long *cta_record_counts =
+      reinterpret_cast<unsigned long long *>(
+          slot->cta_record_count_ptr);
+  const unsigned long long local_record_index =
+      atomicAdd(&cta_record_counts[linear_cta_id], 1ULL);
+  if (local_record_index >= slot->records_per_cta) {
+    atomicAdd(
+        reinterpret_cast<unsigned long long *>(
+            &slot->overflow_records),
+        1ULL);
+    atomicOr(&registry->error_flags,
+             static_cast<unsigned int>(
+                 SYNC_ORDER_ERROR_BUFFER_OVERFLOW));
+    return;
+  }
+
+  const unsigned long long record_index =
+      static_cast<unsigned long long>(linear_cta_id) *
+          slot->records_per_cta +
+      local_record_index;
+  if (record_index >= slot->record_capacity) {
+    atomicAdd(
+        reinterpret_cast<unsigned long long *>(
+            &slot->overflow_records),
+        1ULL);
+    atomicOr(&registry->error_flags,
+             static_cast<unsigned int>(
+                 SYNC_ORDER_ERROR_BUFFER_OVERFLOW));
+    return;
+  }
+  sync_order_record_t *record_buffer =
+      reinterpret_cast<sync_order_record_t *>(
+          slot->record_buffer_ptr);
+  record_buffer[record_index] = record;
+  __threadfence();
+}
+
 extern "C" __device__ __noinline__ void record_sync_order_begin(
     int32_t pred, uint32_t unique_function_id, uint32_t vpc,
     uint32_t event_kind, uint64_t pregistry) {
   const unsigned int active_mask = __activemask();
+  const unsigned int predicate_mask =
+      __ballot_sync(active_mask, pred);
   const int lane_id = get_laneid();
   const int first_lane_id = __ffs(active_mask) - 1;
   if (lane_id != first_lane_id) {
@@ -428,7 +470,7 @@ extern "C" __device__ __noinline__ void record_sync_order_begin(
   scratch->unique_function_id = unique_function_id;
   scratch->vpc = vpc;
   scratch->active_mask = active_mask;
-  scratch->predicate_mask = __ballot_sync(active_mask, pred);
+  scratch->predicate_mask = predicate_mask;
   scratch->sm_id = get_smid();
   scratch->begin_seq =
       atomicAdd(&cta_seq[linear_cta_id], 1ULL) + 1ULL;
@@ -502,43 +544,67 @@ extern "C" __device__ __noinline__ void record_sync_order_end(
   record.end_seq =
       atomicAdd(&cta_seq[linear_cta_id], 1ULL) + 1ULL;
 
-  unsigned long long *cta_record_counts =
-      reinterpret_cast<unsigned long long *>(
-          slot->cta_record_count_ptr);
-  const unsigned long long local_record_index =
-      atomicAdd(&cta_record_counts[linear_cta_id], 1ULL);
-  if (local_record_index >= slot->records_per_cta) {
-    atomicAdd(
-        reinterpret_cast<unsigned long long *>(
-            &slot->overflow_records),
-        1ULL);
-    atomicOr(&registry->error_flags,
-             static_cast<unsigned int>(
-                 SYNC_ORDER_ERROR_BUFFER_OVERFLOW));
-    atomicExch(&scratch->state, 0u);
-    return;
-  }
-  sync_order_record_t *record_buffer =
-      reinterpret_cast<sync_order_record_t *>(
-          slot->record_buffer_ptr);
-  const unsigned long long record_index =
-      static_cast<unsigned long long>(linear_cta_id) *
-          slot->records_per_cta +
-      local_record_index;
-  if (record_index >= slot->record_capacity) {
-    atomicAdd(
-        reinterpret_cast<unsigned long long *>(
-            &slot->overflow_records),
-        1ULL);
-    atomicOr(&registry->error_flags,
-             static_cast<unsigned int>(
-                 SYNC_ORDER_ERROR_BUFFER_OVERFLOW));
-    atomicExch(&scratch->state, 0u);
-    return;
-  }
-  record_buffer[record_index] = record;
-  __threadfence();
+  store_sync_order_record(
+      registry, slot, linear_cta_id, record);
   atomicExch(&scratch->state, 0u);
+}
+
+extern "C" __device__ __noinline__ void record_sync_order_point(
+    int32_t pred, uint32_t unique_function_id, uint32_t vpc,
+    uint32_t event_kind, uint64_t pregistry) {
+  const unsigned int active_mask = __activemask();
+  const unsigned int predicate_mask =
+      __ballot_sync(active_mask, pred);
+  const int lane_id = get_laneid();
+  const int first_lane_id = __ffs(active_mask) - 1;
+  if (lane_id != first_lane_id) {
+    return;
+  }
+
+  sync_order_registry_t *registry =
+      reinterpret_cast<sync_order_registry_t *>(pregistry);
+  sync_order_launch_slot_t *slot =
+      get_sync_order_launch_slot(registry);
+  if (slot == nullptr) {
+    return;
+  }
+
+  unsigned int linear_cta_id = 0;
+  unsigned int warp_id = 0;
+  sync_order_warp_scratch_t *unused_scratch = nullptr;
+  if (!get_sync_order_location(
+          registry, slot, &linear_cta_id, &warp_id,
+          &unused_scratch)) {
+    return;
+  }
+
+  unsigned long long *cta_seq =
+      reinterpret_cast<unsigned long long *>(slot->cta_seq_ptr);
+  sync_order_record_t record;
+  record.record_size = sizeof(sync_order_record_t);
+  record.record_version = SYNC_ORDER_RECORD_VERSION;
+  record.event_kind = static_cast<uint16_t>(event_kind);
+  record.device_id = slot->device_id;
+  record.stream_id = slot->stream_id;
+  record.trace_kernel_id = slot->trace_kernel_id;
+  record.reserved = 0;
+  record.launch_uid = slot->launch_uid;
+  record.cta_id_x = blockIdx.x;
+  record.cta_id_y = blockIdx.y;
+  record.cta_id_z = blockIdx.z;
+  record.linear_cta_id = linear_cta_id;
+  record.warp_id_tb = warp_id;
+  record.sm_id = get_smid();
+  record.unique_function_id = unique_function_id;
+  record.vpc = vpc;
+  record.active_mask = active_mask;
+  record.predicate_mask = predicate_mask;
+  record.begin_seq =
+      atomicAdd(&cta_seq[linear_cta_id], 1ULL) + 1ULL;
+  record.end_seq =
+      atomicAdd(&cta_seq[linear_cta_id], 1ULL) + 1ULL;
+  store_sync_order_record(
+      registry, slot, linear_cta_id, record);
 }
 
 /* FA3 warp lifetime timestamp. Injected before SASS EXIT by either the

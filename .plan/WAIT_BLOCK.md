@@ -4426,7 +4426,7 @@ SYNC_EVENT_ORDER=0|1
 `SYNC_EVENT_ORDER=0` must add no callback, channel, allocation, schema field, or
 output difference. Existing trace artifacts must remain byte-identical.
 
-When enabled, bracket every dynamic occurrence in this opcode-derived event
+When enabled, capture every dynamic occurrence in this opcode-derived event
 set:
 
 ```text
@@ -4438,13 +4438,24 @@ WARPSYNC / WARPGROUP synchronization
 completion-bearing UTMALDG / UBLKCP
 ```
 
-The first active lane records:
+All active lanes must execute any warp collective used by the callback before
+the first active lane is selected to publish the record. In particular,
+`__ballot_sync(active_mask, pred)` must execute before non-publishing lanes
+return.
+
+Nonblocking semantic events use a full interval:
 
 ```text
 begin_seq = atomicAdd(&cta_event_seq[linear_cta_id], 1)  // IPOINT_BEFORE
 target instruction
 end_seq   = atomicAdd(&cta_event_seq[linear_cta_id], 1)  // IPOINT_AFTER
 ```
+
+This applies to `SYNCS.EXCH*`, `SYNCS.ARRIVE*`, `SYNCS.PHASECHK*`, and
+completion-bearing `UTMALDG`/`UBLKCP`. Potentially blocking synchronization
+instructions (`BAR.SYNC`, `BAR.ARV`, `WARPSYNC`, and `WARPGROUP*`) must not
+carry an `IPOINT_AFTER` callback. They emit an adjacent begin/end point interval
+from one `IPOINT_BEFORE` callback.
 
 The counter is CTA-local. The endpoints define only a partial order:
 
@@ -4637,9 +4648,11 @@ Candidate-set `>=` semantics must never be used for TMA completion ownership.
      record.
    - Do not modify the existing instruction channel decoder.
    - Do not make GPU progress depend on a host receiver.
-5. **Before/after instrumentation**
+5. **Interval/point instrumentation**
    - Select events only by decoded opcode class.
-   - Emit complete begin/end pairs for active and predicated-off occurrences.
+   - Emit complete begin/end pairs for nonblocking semantic occurrences.
+   - Emit before-only point intervals for potentially blocking synchronization.
+   - Execute callback warp collectives before selecting the publishing lane.
 6. **Raw join and immutable identity**
    - Write `sync_event_order.jsonl`.
    - Require bijection with raw protobuf and stamp identity before transforms.
@@ -4677,8 +4690,9 @@ The local trace-side implementation is complete:
   stable launch registry, CTA counters, per-warp begin scratch, and explicit
   device error flags.
 - `tracer_tool/inject_funcs.cu` records one CTA-local `begin_seq/end_seq`
-  interval per selected semantic occurrence and writes it directly into the
-  bounded launch-owned record buffer.
+  interval per selected semantic occurrence, executes ballot participation
+  across the full active mask, and writes the record directly into the bounded
+  launch-owned buffer.
 - `tracer_tool/tracer_tool.cu` implements default-off configuration, opcode
   selection, registry acquire/retire, post-synchronization raw JSONL dumping,
   buffer capacity/overflow validation, and fail-closed launch checks.
@@ -4706,13 +4720,20 @@ The NVBit/CUDA build and K5/K10 capture have deliberately not been run locally;
 the user-owned server run and the trace acceptance checks below remain pending.
 No simulator source or configuration has been changed.
 
-The first server attempt with the separate `sync_order_channel` transport
-failed the trace gate: after 17 hours the FA3 process still consumed 99-100%
-GPU, no threadblock protobuf had completed, and
+The first server attempt failed the trace gate: after 17 hours the FA3 process
+still consumed 99-100% GPU, no threadblock protobuf had completed, and
 `sync_event_order.raw.jsonl` remained empty. The GPU was still inside the
-instrumented benchmark, so offline processing was not involved. That transport
-made GPU progress depend on host channel drain and is superseded by the
-launch-owned managed buffer above. The server rerun remains pending.
+instrumented benchmark, so offline processing was not involved. A managed
+buffer rerun then remained in kernel 1 beyond 15 minutes even though that
+kernel has only one `BAR.SYNC` and one `WARPSYNC` order site. Static inspection
+found the deterministic deadlock: `record_sync_order_begin()` selected the
+first lane before calling `__ballot_sync(active_mask, pred)`, so the collective
+waited for active lanes that had already returned. The callback now executes
+the ballot on every active lane before electing the publisher. The earlier
+channel transport is also removed because its bounded `push()` unnecessarily
+coupled GPU progress to host drain, but runtime evidence did not establish it
+as the first blocking instruction. Potentially blocking synchronization sites
+now use before-only point capture to avoid relying on `IPOINT_AFTER`.
 
 **Decision gate after Stage T**
 

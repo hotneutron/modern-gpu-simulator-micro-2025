@@ -278,17 +278,50 @@ class ManagedOrderTransportSourceTest(unittest.TestCase):
         inject_source = (
             TRACER_DIR / "tracer_tool/inject_funcs.cu"
         ).read_text()
+        order_begin = inject_source.split(
+            'extern "C" __device__ __noinline__ '
+            "void record_sync_order_begin(", 1
+        )[1].split(
+            'extern "C" __device__ __noinline__ '
+            "void record_sync_order_end(", 1
+        )[0]
         order_end = inject_source.split(
             'extern "C" __device__ __noinline__ '
             "void record_sync_order_end(", 1
         )[1].split(
+            'extern "C" __device__ __noinline__ '
+            "void record_sync_order_point(", 1
+        )[0]
+        order_point = inject_source.split(
+            'extern "C" __device__ __noinline__ '
+            "void record_sync_order_point(", 1
+        )[1].split(
             "/* FA3 warp lifetime timestamp.", 1
+        )[0]
+        store_record = inject_source.split(
+            "static __device__ __forceinline__ "
+            "void store_sync_order_record(", 1
+        )[1].split(
+            'extern "C" __device__ __noinline__ '
+            "void record_sync_order_begin(", 1
         )[0]
 
         self.assertNotIn("channel_dev->push", order_end)
-        self.assertIn("record_buffer[record_index] = record", order_end)
-        self.assertIn("cta_record_counts[linear_cta_id]", order_end)
-        self.assertIn("SYNC_ORDER_ERROR_BUFFER_OVERFLOW", order_end)
+        self.assertNotIn("channel_dev->push", store_record)
+        self.assertIn(
+            "record_buffer[record_index] = record", store_record)
+        self.assertIn(
+            "cta_record_counts[linear_cta_id]", store_record)
+        self.assertIn(
+            "SYNC_ORDER_ERROR_BUFFER_OVERFLOW", store_record)
+        self.assertLess(
+            order_begin.index("__ballot_sync"),
+            order_begin.index("lane_id != first_lane_id"),
+        )
+        self.assertLess(
+            order_point.index("__ballot_sync"),
+            order_point.index("lane_id != first_lane_id"),
+        )
 
     def test_host_transport_has_no_second_channel_receiver(self):
         tracer_source = (
@@ -301,6 +334,17 @@ class ManagedOrderTransportSourceTest(unittest.TestCase):
         self.assertNotIn("sync_order_channel", tracer_source)
         self.assertNotIn("sync_order_recv_thread_fun", tracer_source)
         self.assertIn("SYNC_EVENT_ORDER_RECORDS_PER_CTA", tracer_source)
+        self.assertIn("record_sync_order_point", tracer_source)
+        self.assertIn("sync_order_event_uses_before_after", tracer_source)
+        interval_policy = tracer_source.split(
+            "static bool sync_order_event_uses_before_after(", 1
+        )[1].split(
+            "static const char *sync_order_event_kind_name(", 1
+        )[0]
+        self.assertIn("SYNC_ORDER_EVENT_PHASECHK", interval_policy)
+        self.assertIn("SYNC_ORDER_EVENT_TMA_COMPLETION", interval_policy)
+        self.assertNotIn("SYNC_ORDER_EVENT_BAR_SYNC", interval_policy)
+        self.assertNotIn("SYNC_ORDER_EVENT_WARP_SYNC", interval_policy)
         self.assertIn("cta_record_count_ptr", common_source)
         self.assertIn("record_buffer_ptr", common_source)
         self.assertIn("overflow_records", common_source)
