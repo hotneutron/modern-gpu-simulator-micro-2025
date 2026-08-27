@@ -99,10 +99,10 @@ enum class RecvThreadState {
 
 struct CTXstate {
   /* context id */
-  int id;
+  int id = -1;
 
   /* Channel used to communicate from GPU to CPU receiving thread */
-  ChannelDev* channel_dev;
+  ChannelDev* channel_dev = nullptr;
   ChannelHost channel_host;
 
   // After initialization, set it to WORKING to make recv thread get data,
@@ -115,6 +115,17 @@ struct CTXstate {
   std::atomic<uint64_t> received_records_per_kernel{0};
   std::atomic<uint64_t> sparse_retained_instructions_per_kernel{0};
   std::atomic<uint64_t> sparse_reconstructed_instructions_per_kernel{0};
+
+  /* Independent semantic-event order transport. It exists only when
+   * SYNC_EVENT_ORDER=1. */
+  int sync_order_channel_id = -1;
+  ChannelDev* sync_order_channel_dev = nullptr;
+  ChannelHost sync_order_channel_host;
+  sync_order_registry_t* sync_order_registry = nullptr;
+  std::atomic<RecvThreadState> sync_order_recv_thread_done{
+      RecvThreadState::STOP};
+  std::atomic<bool> sync_order_receiving{false};
+  std::atomic<uint64_t> sync_order_received_records_per_kernel{0};
 };
 
 /* lock */
@@ -164,6 +175,14 @@ unsigned int warp_lifetime_warps_per_cta = 0;
 int warp_lifetime_kernel_id = 0;
 std::string warp_lifetime_kernel_name;
 
+/* CTA-local semantic-event order capture. Disabled by default and allocated
+ * only when explicitly enabled. */
+int sync_event_order_enabled = 0;
+int sync_order_launch_slots = 1;
+uint64_t next_sync_order_launch_uid = 1;
+std::ofstream sync_order_raw_output;
+pthread_mutex_t sync_order_output_mutex;
+
 /* Should we terminate the program once we are done tracing? */
 int terminate_after_limit_number_of_kernels_reached = 0;
 int user_defined_folders = 0;
@@ -180,6 +199,27 @@ static std::string trim_config_token(const std::string &value) {
     end--;
   }
   return value.substr(begin, end - begin);
+}
+
+static int parse_strict_integer_config(
+    const char *name, int default_value, int minimum, int maximum) {
+  const char *raw = getenv(name);
+  if (raw == nullptr) {
+    return default_value;
+  }
+  if (*raw == '\0') {
+    fprintf(stderr, "%s must not be empty\n", name);
+    abort();
+  }
+  char *end = nullptr;
+  const long parsed = strtol(raw, &end, 10);
+  if (end == raw || *end != '\0' || parsed < minimum ||
+      parsed > maximum) {
+    fprintf(stderr, "%s must be an integer in [%d,%d], got '%s'\n",
+            name, minimum, maximum, raw);
+    abort();
+  }
+  return static_cast<int>(parsed);
 }
 
 [[noreturn]] static void lighter_tracer_config_error(
@@ -562,6 +602,60 @@ static bool is_tma_completion_bearing_load_opcode(
     const std::string &opcode) {
   return opcode.rfind("UTMALDG", 0) == 0 ||
          opcode.rfind("UBLKCP", 0) == 0;
+}
+
+static SYNC_ORDER_EVENT_KIND get_sync_order_event_kind(
+    const std::string &opcode) {
+  if (opcode.rfind("SYNCS.EXCH", 0) == 0) {
+    return SYNC_ORDER_EVENT_EXCH;
+  }
+  if (opcode.rfind("SYNCS.ARRIVE", 0) == 0) {
+    return SYNC_ORDER_EVENT_ARRIVE;
+  }
+  if (opcode.rfind("SYNCS.PHASECHK", 0) == 0) {
+    return SYNC_ORDER_EVENT_PHASECHK;
+  }
+  if (opcode.rfind("BAR.SYNC", 0) == 0) {
+    return SYNC_ORDER_EVENT_BAR_SYNC;
+  }
+  if (opcode.rfind("BAR.ARV", 0) == 0) {
+    return SYNC_ORDER_EVENT_BAR_ARRIVE;
+  }
+  if (opcode.rfind("WARPSYNC", 0) == 0) {
+    return SYNC_ORDER_EVENT_WARP_SYNC;
+  }
+  if (opcode.rfind("WARPGROUP", 0) == 0) {
+    return SYNC_ORDER_EVENT_WARPGROUP_SYNC;
+  }
+  if (is_tma_completion_bearing_load_opcode(opcode)) {
+    return SYNC_ORDER_EVENT_TMA_COMPLETION;
+  }
+  return SYNC_ORDER_EVENT_END_OF_KERNEL;
+}
+
+static const char *sync_order_event_kind_name(
+    SYNC_ORDER_EVENT_KIND kind) {
+  switch (kind) {
+    case SYNC_ORDER_EVENT_EXCH:
+      return "SYNCS_EXCH";
+    case SYNC_ORDER_EVENT_ARRIVE:
+      return "SYNCS_ARRIVE";
+    case SYNC_ORDER_EVENT_PHASECHK:
+      return "SYNCS_PHASECHK";
+    case SYNC_ORDER_EVENT_BAR_SYNC:
+      return "BAR_SYNC";
+    case SYNC_ORDER_EVENT_BAR_ARRIVE:
+      return "BAR_ARRIVE";
+    case SYNC_ORDER_EVENT_WARP_SYNC:
+      return "WARP_SYNC";
+    case SYNC_ORDER_EVENT_WARPGROUP_SYNC:
+      return "WARPGROUP_SYNC";
+    case SYNC_ORDER_EVENT_TMA_COMPLETION:
+      return "TMA_COMPLETION";
+    case SYNC_ORDER_EVENT_END_OF_KERNEL:
+      return "END_OF_KERNEL";
+  }
+  return "UNKNOWN";
 }
 
 enum class sync_runtime_capture_kind {
@@ -1939,10 +2033,21 @@ void nvbit_at_init() {
       warp_lifetime_sidecar, "WARP_LIFETIME_SIDECAR", 0,
       "Record clock64 at SASS EXIT while retaining the full dynamic trace "
       "and normal TMA/sync capture");
+  sync_event_order_enabled = parse_strict_integer_config(
+      "SYNC_EVENT_ORDER", 0, 0, 1);
+  sync_order_launch_slots = parse_strict_integer_config(
+      "SYNC_EVENT_ORDER_MAX_LAUNCHES", 1, 1,
+      static_cast<int>(SYNC_ORDER_MAX_LAUNCH_SLOTS));
   if (warp_lifetime_only && warp_lifetime_sidecar) {
     fprintf(stderr,
             "WARP_LIFETIME_ONLY and WARP_LIFETIME_SIDECAR are mutually "
             "exclusive\n");
+    abort();
+  }
+  if (warp_lifetime_only && sync_event_order_enabled) {
+    fprintf(stderr,
+            "SYNC_EVENT_ORDER=1 is incompatible with "
+            "WARP_LIFETIME_ONLY=1\n");
     abort();
   }
   resolve_lighter_tracer_config();
@@ -1975,6 +2080,9 @@ void nvbit_at_init() {
   GET_VAR_INT(threshold_unique_kernel_checking, "THRESHOLD_UNIQUE_KERNEL_CHECKING", 10,
               "Number of instructions used to check if kernels with the same name are different");
   printf("[TRACE-PRUNE] enabled=%d\n", prune_operands_enabled);
+  printf("[SYNC-ORDER] enabled=%d version=%u launch_slots=%d\n",
+         sync_event_order_enabled, SYNC_ORDER_RECORD_VERSION,
+         sync_order_launch_slots);
   GET_VAR_INT(incremental_flush_threshold, "INCREMENTAL_FLUSH_THRESHOLD", 0,
               "Flush threadblocks to disk when instruction count exceeds this threshold. "
               "0 = disabled (default). Recommended: 50000-100000 for large kernels.");
@@ -2015,6 +2123,7 @@ void nvbit_at_init() {
   pthread_mutexattr_init(&attr);
   pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
   pthread_mutex_init(&mutex, &attr);
+  pthread_mutex_init(&sync_order_output_mutex, nullptr);
 }
 
 // Key is unique function ID. The next key is PC and finally the Value is the datawidh of the opcode ID of the instruction.
@@ -2682,6 +2791,41 @@ void instrument_function_if_needed(CUcontext ctx, CUfunction func, int device_id
           mref_index++;
         }
       }
+
+      if (sync_event_order_enabled) {
+        const SYNC_ORDER_EVENT_KIND event_kind =
+            get_sync_order_event_kind(opcode_str);
+        if (event_kind != SYNC_ORDER_EVENT_END_OF_KERNEL) {
+          assert(ctx_state->sync_order_registry != nullptr);
+          nvbit_insert_call(
+              instr, "record_sync_order_begin", IPOINT_BEFORE);
+          nvbit_add_call_arg_guard_pred_val(instr);
+          nvbit_add_call_arg_const_val32(
+              instr, next_candidate_unique_function_id);
+          nvbit_add_call_arg_const_val32(
+              instr, static_cast<uint32_t>(instr->getOffset()));
+          nvbit_add_call_arg_const_val32(
+              instr, static_cast<uint32_t>(event_kind));
+          nvbit_add_call_arg_const_val64(
+              instr,
+              reinterpret_cast<uint64_t>(
+                  ctx_state->sync_order_registry));
+
+          nvbit_insert_call(
+              instr, "record_sync_order_end", IPOINT_AFTER);
+          nvbit_add_call_arg_guard_pred_val(instr);
+          nvbit_add_call_arg_const_val32(
+              instr, next_candidate_unique_function_id);
+          nvbit_add_call_arg_const_val32(
+              instr, static_cast<uint32_t>(instr->getOffset()));
+          nvbit_add_call_arg_const_val32(
+              instr, static_cast<uint32_t>(event_kind));
+          nvbit_add_call_arg_const_val64(
+              instr,
+              reinterpret_cast<uint64_t>(
+                  ctx_state->sync_order_registry));
+        }
+      }
       cnt++;
     }
 
@@ -2761,6 +2905,200 @@ __global__ void flush_channel(ChannelDev* ch_dev, int compact_transport) {
 
   /* flush channel */
   ch_dev->flush();
+}
+
+__global__ void flush_sync_order_channel(ChannelDev* ch_dev) {
+  sync_order_record_t record = {};
+  record.record_size = sizeof(sync_order_record_t);
+  record.record_version = SYNC_ORDER_RECORD_VERSION;
+  record.event_kind = SYNC_ORDER_EVENT_END_OF_KERNEL;
+  ch_dev->push(&record, sizeof(sync_order_record_t));
+  ch_dev->flush();
+}
+
+static sync_order_launch_slot_t *acquire_sync_order_launch(
+    CTXstate *ctx_state, int device_id, int trace_kernel_id, int stream_id,
+    const cuLaunchKernel_params *params) {
+  assert(sync_event_order_enabled);
+  assert(ctx_state->sync_order_registry != nullptr);
+  sync_order_registry_t *registry = ctx_state->sync_order_registry;
+  if (registry->active_slot != -1) {
+    fprintf(stderr,
+            "[SYNC-ORDER] concurrent/reentrant launch is unsupported: "
+            "active_slot=%d kernel=%d\n",
+            registry->active_slot, trace_kernel_id);
+    abort();
+  }
+
+  int slot_index = -1;
+  for (int i = 0; i < sync_order_launch_slots; ++i) {
+    if (registry->slots[i].state == 0u) {
+      slot_index = i;
+      break;
+    }
+  }
+  if (slot_index < 0) {
+    fprintf(stderr,
+            "[SYNC-ORDER] launch registry exhausted: capacity=%d "
+            "kernel=%d\n",
+            sync_order_launch_slots, trace_kernel_id);
+    abort();
+  }
+
+  const uint64_t num_ctas =
+      static_cast<uint64_t>(params->gridDimX) * params->gridDimY *
+      params->gridDimZ;
+  const uint64_t num_threads =
+      static_cast<uint64_t>(params->blockDimX) * params->blockDimY *
+      params->blockDimZ;
+  const uint64_t warps_per_cta = (num_threads + 31u) / 32u;
+  if (num_ctas == 0 || num_ctas > UINT32_MAX ||
+      warps_per_cta == 0 ||
+      warps_per_cta > SYNC_ORDER_MAX_WARPS_PER_CTA) {
+    fprintf(stderr,
+            "[SYNC-ORDER] launch dimensions unsupported: ctas=%llu "
+            "warps_per_cta=%llu kernel=%d\n",
+            static_cast<unsigned long long>(num_ctas),
+            static_cast<unsigned long long>(warps_per_cta),
+            trace_kernel_id);
+    abort();
+  }
+  const uint64_t scratch_entries = num_ctas * warps_per_cta;
+  if (scratch_entries >
+      SIZE_MAX / sizeof(sync_order_warp_scratch_t)) {
+    fprintf(stderr,
+            "[SYNC-ORDER] scratch size overflow: entries=%llu kernel=%d\n",
+            static_cast<unsigned long long>(scratch_entries),
+            trace_kernel_id);
+    abort();
+  }
+
+  sync_order_launch_slot_t *slot = &registry->slots[slot_index];
+  if (slot->cta_seq_ptr != 0 || slot->warp_scratch_ptr != 0) {
+    fprintf(stderr,
+            "[SYNC-ORDER] stale registry slot reuse: slot=%d kernel=%d\n",
+            slot_index, trace_kernel_id);
+    abort();
+  }
+
+  const bool prior_skip_callback = skip_callback_flag;
+  skip_callback_flag = true;
+  CUDA_SAFECALL(cuMemAllocManaged(
+      reinterpret_cast<CUdeviceptr *>(&slot->cta_seq_ptr),
+      num_ctas * sizeof(uint64_t), CU_MEM_ATTACH_GLOBAL));
+  CUDA_SAFECALL(cuMemAllocManaged(
+      reinterpret_cast<CUdeviceptr *>(&slot->warp_scratch_ptr),
+      scratch_entries * sizeof(sync_order_warp_scratch_t),
+      CU_MEM_ATTACH_GLOBAL));
+  CUDA_SAFECALL(cuMemsetD8(
+      static_cast<CUdeviceptr>(slot->cta_seq_ptr), 0,
+      num_ctas * sizeof(uint64_t)));
+  CUDA_SAFECALL(cuMemsetD8(
+      static_cast<CUdeviceptr>(slot->warp_scratch_ptr), 0,
+      scratch_entries * sizeof(sync_order_warp_scratch_t)));
+  skip_callback_flag = prior_skip_callback;
+
+  if (next_sync_order_launch_uid == 0) {
+    fprintf(stderr, "[SYNC-ORDER] launch UID overflow\n");
+    abort();
+  }
+  slot->device_id = static_cast<uint32_t>(device_id);
+  slot->stream_id = static_cast<uint32_t>(stream_id);
+  slot->trace_kernel_id = static_cast<uint32_t>(trace_kernel_id);
+  slot->launch_uid = next_sync_order_launch_uid++;
+  slot->grid_dim_x = params->gridDimX;
+  slot->grid_dim_y = params->gridDimY;
+  slot->grid_dim_z = params->gridDimZ;
+  slot->num_ctas = static_cast<uint32_t>(num_ctas);
+  slot->warps_per_cta = static_cast<uint32_t>(warps_per_cta);
+  slot->emitted_records = 0;
+  slot->state = 1u;
+  registry->error_flags = 0;
+  __sync_synchronize();
+  registry->active_slot = slot_index;
+
+  ctx_state->sync_order_received_records_per_kernel.store(
+      0, std::memory_order_relaxed);
+  ctx_state->sync_order_receiving.store(
+      true, std::memory_order_release);
+  printf("[SYNC-ORDER] launch_begin uid=%llu kernel=%d slot=%d "
+         "ctas=%u warps_per_cta=%u\n",
+         static_cast<unsigned long long>(slot->launch_uid),
+         trace_kernel_id, slot_index, slot->num_ctas,
+         slot->warps_per_cta);
+  return slot;
+}
+
+static void release_sync_order_launch(CTXstate *ctx_state) {
+  assert(sync_event_order_enabled);
+  sync_order_registry_t *registry = ctx_state->sync_order_registry;
+  const int slot_index = registry->active_slot;
+  if (slot_index < 0 || slot_index >= sync_order_launch_slots) {
+    fprintf(stderr,
+            "[SYNC-ORDER] missing active launch at kernel exit: slot=%d\n",
+            slot_index);
+    abort();
+  }
+  sync_order_launch_slot_t *slot = &registry->slots[slot_index];
+  const uint64_t received =
+      ctx_state->sync_order_received_records_per_kernel.load(
+          std::memory_order_acquire);
+  if (registry->error_flags != 0 || slot->emitted_records != received) {
+    fprintf(stderr,
+            "[SYNC-ORDER] launch validation failed: uid=%llu kernel=%u "
+            "error_flags=0x%x emitted=%llu received=%llu\n",
+            static_cast<unsigned long long>(slot->launch_uid),
+            slot->trace_kernel_id, registry->error_flags,
+            static_cast<unsigned long long>(slot->emitted_records),
+            static_cast<unsigned long long>(received));
+    abort();
+  }
+
+  const uint64_t scratch_entries =
+      static_cast<uint64_t>(slot->num_ctas) * slot->warps_per_cta;
+  const sync_order_warp_scratch_t *scratch =
+      reinterpret_cast<const sync_order_warp_scratch_t *>(
+          slot->warp_scratch_ptr);
+  for (uint64_t i = 0; i < scratch_entries; ++i) {
+    if (scratch[i].state != 0u) {
+      fprintf(stderr,
+              "[SYNC-ORDER] unterminated interval: uid=%llu kernel=%u "
+              "scratch=%llu state=%u\n",
+              static_cast<unsigned long long>(slot->launch_uid),
+              slot->trace_kernel_id,
+              static_cast<unsigned long long>(i), scratch[i].state);
+      abort();
+    }
+  }
+  const uint64_t *cta_seq =
+      reinterpret_cast<const uint64_t *>(slot->cta_seq_ptr);
+  for (uint32_t cta = 0; cta < slot->num_ctas; ++cta) {
+    if ((cta_seq[cta] & 1ULL) != 0) {
+      fprintf(stderr,
+              "[SYNC-ORDER] odd endpoint count: uid=%llu kernel=%u "
+              "cta=%u seq=%llu\n",
+              static_cast<unsigned long long>(slot->launch_uid),
+              slot->trace_kernel_id, cta,
+              static_cast<unsigned long long>(cta_seq[cta]));
+      abort();
+    }
+  }
+
+  printf("[SYNC-ORDER] launch_end uid=%llu kernel=%u records=%llu\n",
+         static_cast<unsigned long long>(slot->launch_uid),
+         slot->trace_kernel_id,
+         static_cast<unsigned long long>(received));
+  registry->active_slot = -1;
+  slot->state = 0u;
+  const bool prior_skip_callback = skip_callback_flag;
+  skip_callback_flag = true;
+  CUDA_SAFECALL(cuMemFree(
+      static_cast<CUdeviceptr>(slot->cta_seq_ptr)));
+  CUDA_SAFECALL(cuMemFree(
+      static_cast<CUdeviceptr>(slot->warp_scratch_ptr)));
+  skip_callback_flag = prior_skip_callback;
+  slot->cta_seq_ptr = 0;
+  slot->warp_scratch_ptr = 0;
 }
 
 static void reset_warp_lifetime_capture(
@@ -2902,6 +3240,18 @@ void nvbit_at_cuda_event(CUcontext ctx, int is_exit, nvbit_api_cuda_t cbid,
 
     create_folder(traces_path.c_str());
     create_folder(extrainfo_path.c_str());
+    if (sync_event_order_enabled) {
+      sync_order_raw_output.open(
+          extrainfo_path + "/sync_event_order.raw.jsonl",
+          std::ios::out | std::ios::trunc);
+      if (!sync_order_raw_output.is_open()) {
+        fprintf(stderr,
+                "[SYNC-ORDER] failed to create raw order artifact: %s\n",
+                (extrainfo_path +
+                 "/sync_event_order.raw.jsonl").c_str());
+        abort();
+      }
+    }
     if (enable_tma_desc) {
       create_folder(tma_htod_blob_path.c_str());
       create_folder(tensor_map_blob_path.c_str());
@@ -3076,6 +3426,11 @@ void nvbit_at_cuda_event(CUcontext ctx, int is_exit, nvbit_api_cuda_t cbid,
         block_dim->set_x(p->blockDimX);
         block_dim->set_y(p->blockDimY);
         block_dim->set_z(p->blockDimZ);
+        if (sync_event_order_enabled) {
+          acquire_sync_order_launch(
+              ctx_state, device_id, kernel_id[device_id],
+              current_stream_id[device_id], p);
+        }
       }
 
       // This will be a relative path to the traces file
@@ -3130,6 +3485,10 @@ void nvbit_at_cuda_event(CUcontext ctx, int is_exit, nvbit_api_cuda_t cbid,
       /* issue flush of channel so we are sure all the memory accesses
        * have been pushed */
       flush_channel<<<1, 1>>>(ctx_state->channel_dev, compact_wire_enabled);
+      if (sync_event_order_enabled && !stop_report[device_id]) {
+        flush_sync_order_channel<<<1, 1>>>(
+            ctx_state->sync_order_channel_dev);
+      }
       cudaDeviceSynchronize();
       assert(cudaGetLastError() == cudaSuccess);
 
@@ -3140,6 +3499,13 @@ void nvbit_at_cuda_event(CUcontext ctx, int is_exit, nvbit_api_cuda_t cbid,
        * current kernel */
       while (recv_thread_receiving[ctx]) {
         pthread_yield();
+      }
+      if (sync_event_order_enabled && !stop_report[device_id]) {
+        while (ctx_state->sync_order_receiving.load(
+            std::memory_order_acquire)) {
+          pthread_yield();
+        }
+        release_sync_order_launch(ctx_state);
       }
 
       /* Phase 0b (TMA_BASE_ADDR.md §2.13): the kernel is fully done and the channel
@@ -3384,6 +3750,158 @@ static uint32_t validated_inst_trace_record_size(const char *data,
     }
   }
   return record->record_size;
+}
+
+static const sync_order_record_t *validated_sync_order_record(
+    const char *data, uint32_t available_bytes) {
+  if (available_bytes < sizeof(sync_order_record_t)) {
+    std::cerr << "[SYNC-ORDER] truncated record: available="
+              << available_bytes << " required="
+              << sizeof(sync_order_record_t) << std::endl;
+    abort();
+  }
+  const sync_order_record_t *record =
+      reinterpret_cast<const sync_order_record_t *>(data);
+  if (record->record_size != sizeof(sync_order_record_t) ||
+      record->record_version != SYNC_ORDER_RECORD_VERSION) {
+    std::cerr << "[SYNC-ORDER] invalid wire header: size="
+              << record->record_size << " version="
+              << record->record_version << std::endl;
+    abort();
+  }
+  if (record->event_kind >
+      static_cast<uint16_t>(SYNC_ORDER_EVENT_TMA_COMPLETION)) {
+    std::cerr << "[SYNC-ORDER] unknown event kind "
+              << record->event_kind << std::endl;
+    abort();
+  }
+  if (record->event_kind != SYNC_ORDER_EVENT_END_OF_KERNEL &&
+      (record->launch_uid == 0 || record->begin_seq == 0 ||
+       record->end_seq <= record->begin_seq)) {
+    std::cerr << "[SYNC-ORDER] invalid event identity/interval: uid="
+              << record->launch_uid << " begin=" << record->begin_seq
+              << " end=" << record->end_seq << std::endl;
+    abort();
+  }
+  if (record->event_kind != SYNC_ORDER_EVENT_END_OF_KERNEL &&
+      (record->reserved != 0 ||
+       (record->predicate_mask & ~record->active_mask) != 0)) {
+    std::cerr << "[SYNC-ORDER] invalid reserved field or mask relation"
+              << std::endl;
+    abort();
+  }
+  return record;
+}
+
+void *sync_order_recv_thread_fun(void *args) {
+  CUcontext ctx = reinterpret_cast<CUcontext>(args);
+  pthread_mutex_lock(&mutex);
+  assert(ctx_state_map.find(ctx) != ctx_state_map.end());
+  CTXstate *ctx_state = ctx_state_map[ctx];
+  ChannelHost *channel_host = &ctx_state->sync_order_channel_host;
+  pthread_mutex_unlock(&mutex);
+
+  char *recv_buffer = static_cast<char *>(malloc(CHANNEL_SIZE));
+  if (recv_buffer == nullptr) {
+    fprintf(stderr, "[SYNC-ORDER] receiver allocation failed\n");
+    abort();
+  }
+  uint64_t total_records = 0;
+  uint64_t kernel_records = 0;
+
+  while (ctx_state->sync_order_recv_thread_done.load(
+             std::memory_order_acquire) ==
+         RecvThreadState::WORKING) {
+    const uint32_t received_bytes =
+        channel_host->recv(recv_buffer, CHANNEL_SIZE);
+    if (received_bytes == 0) {
+      continue;
+    }
+    uint32_t offset = 0;
+    std::ostringstream batch;
+    bool saw_end = false;
+    while (offset < received_bytes) {
+      const sync_order_record_t *record =
+          validated_sync_order_record(
+              &recv_buffer[offset], received_bytes - offset);
+      offset += sizeof(sync_order_record_t);
+      if (record->event_kind == SYNC_ORDER_EVENT_END_OF_KERNEL) {
+        if (offset != received_bytes) {
+          fprintf(stderr,
+                  "[SYNC-ORDER] records found after end-of-kernel token\n");
+          abort();
+        }
+        ctx_state->sync_order_received_records_per_kernel.store(
+            kernel_records, std::memory_order_release);
+        kernel_records = 0;
+        ctx_state->sync_order_receiving.store(
+            false, std::memory_order_release);
+        saw_end = true;
+        break;
+      }
+
+      batch << "{"
+            << "\"record_version\":" << record->record_version << ","
+            << "\"record_kind\":\"SYNC_EVENT_ORDER\","
+            << "\"launch_uid\":" << record->launch_uid << ","
+            << "\"device_id\":" << record->device_id << ","
+            << "\"stream_id\":" << record->stream_id << ","
+            << "\"trace_kernel_id\":" << record->trace_kernel_id << ","
+            << "\"cta_x\":" << record->cta_id_x << ","
+            << "\"cta_y\":" << record->cta_id_y << ","
+            << "\"cta_z\":" << record->cta_id_z << ","
+            << "\"linear_cta_id\":" << record->linear_cta_id << ","
+            << "\"warp_id\":" << record->warp_id_tb << ","
+            << "\"sm_id\":" << record->sm_id << ","
+            << "\"unique_function_id\":"
+            << record->unique_function_id << ","
+            << "\"pc\":" << record->vpc << ","
+            << "\"event_kind\":\""
+            << sync_order_event_kind_name(
+                   static_cast<SYNC_ORDER_EVENT_KIND>(
+                       record->event_kind))
+            << "\","
+            << "\"active_mask\":" << record->active_mask << ","
+            << "\"predicate_mask\":" << record->predicate_mask << ","
+            << "\"begin_seq\":" << record->begin_seq << ","
+            << "\"end_seq\":" << record->end_seq
+            << "}\n";
+      kernel_records++;
+      total_records++;
+    }
+
+    const std::string serialized = batch.str();
+    if (!serialized.empty()) {
+      pthread_mutex_lock(&sync_order_output_mutex);
+      if (!sync_order_raw_output.is_open()) {
+        fprintf(stderr,
+                "[SYNC-ORDER] raw artifact is not open\n");
+        abort();
+      }
+      sync_order_raw_output << serialized;
+      if (!sync_order_raw_output.good()) {
+        fprintf(stderr,
+                "[SYNC-ORDER] failed writing raw artifact\n");
+        abort();
+      }
+      if (saw_end) {
+        sync_order_raw_output.flush();
+      }
+      pthread_mutex_unlock(&sync_order_output_mutex);
+    } else if (saw_end) {
+      pthread_mutex_lock(&sync_order_output_mutex);
+      sync_order_raw_output.flush();
+      pthread_mutex_unlock(&sync_order_output_mutex);
+    }
+  }
+
+  free(recv_buffer);
+  printf("[SYNC-ORDER] receiver_records=%llu output=%s\n",
+         static_cast<unsigned long long>(total_records),
+         (extrainfo_path + "/sync_event_order.raw.jsonl").c_str());
+  ctx_state->sync_order_recv_thread_done.store(
+      RecvThreadState::FINISHED, std::memory_order_release);
+  return nullptr;
 }
 
 void *recv_thread_fun(void *args) {
@@ -4345,9 +4863,46 @@ void init_context_state(CUcontext ctx) {
   ctx_state->recv_thread_done = RecvThreadState::WORKING;
   CUDA_SAFECALL(cuMemAllocManaged(reinterpret_cast<CUdeviceptr *>(&ctx_state->channel_dev),
                                   sizeof(ChannelDev), CU_MEM_ATTACH_GLOBAL));
-  ctx_state->channel_host.init((int)ctx_state_map.size() - 1, CHANNEL_SIZE,
+  ctx_state->id = static_cast<int>(ctx_state_map.size()) - 1;
+  ctx_state->channel_host.init(ctx_state->id, CHANNEL_SIZE,
                                ctx_state->channel_dev, recv_thread_fun, ctx);
   nvbit_set_tool_pthread(ctx_state->channel_host.get_thread());
+  if (sync_event_order_enabled) {
+    ctx_state->sync_order_channel_id = ctx_state->id + num_devices;
+    ctx_state->sync_order_recv_thread_done.store(
+        RecvThreadState::WORKING, std::memory_order_release);
+    CUDA_SAFECALL(cuMemAllocManaged(
+        reinterpret_cast<CUdeviceptr *>(
+            &ctx_state->sync_order_channel_dev),
+        sizeof(ChannelDev), CU_MEM_ATTACH_GLOBAL));
+    ctx_state->sync_order_channel_host.init(
+        ctx_state->sync_order_channel_id, CHANNEL_SIZE,
+        ctx_state->sync_order_channel_dev,
+        sync_order_recv_thread_fun, ctx);
+    nvbit_set_tool_pthread(
+        ctx_state->sync_order_channel_host.get_thread());
+
+    CUDA_SAFECALL(cuMemAllocManaged(
+        reinterpret_cast<CUdeviceptr *>(
+            &ctx_state->sync_order_registry),
+        sizeof(sync_order_registry_t), CU_MEM_ATTACH_GLOBAL));
+    CUDA_SAFECALL(cuMemsetD8(
+        reinterpret_cast<CUdeviceptr>(
+            ctx_state->sync_order_registry),
+        0, sizeof(sync_order_registry_t)));
+    ctx_state->sync_order_registry->magic =
+        SYNC_ORDER_REGISTRY_MAGIC;
+    ctx_state->sync_order_registry->version =
+        SYNC_ORDER_REGISTRY_VERSION;
+    ctx_state->sync_order_registry->slot_capacity =
+        static_cast<uint32_t>(sync_order_launch_slots);
+    ctx_state->sync_order_registry->active_slot = -1;
+    ctx_state->sync_order_registry->order_channel_dev =
+        reinterpret_cast<uint64_t>(
+            ctx_state->sync_order_channel_dev);
+    ctx_state->sync_order_receiving.store(
+        false, std::memory_order_relaxed);
+  }
 }
 
 void nvbit_tool_init(CUcontext ctx) {
@@ -4399,10 +4954,35 @@ void nvbit_at_ctx_term(CUcontext ctx) {
   while (ctx_state->recv_thread_done != RecvThreadState::FINISHED);
   ctx_state->channel_host.destroy(false);
   CUDA_SAFECALL(cuMemFree(reinterpret_cast<CUdeviceptr>(ctx_state->channel_dev)));
+  if (sync_event_order_enabled) {
+    if (ctx_state->sync_order_registry->active_slot != -1) {
+      fprintf(stderr,
+              "[SYNC-ORDER] context terminated with live launch slot=%d\n",
+              ctx_state->sync_order_registry->active_slot);
+      abort();
+    }
+    ctx_state->sync_order_recv_thread_done.store(
+        RecvThreadState::STOP, std::memory_order_release);
+    while (ctx_state->sync_order_recv_thread_done.load(
+               std::memory_order_acquire) !=
+           RecvThreadState::FINISHED);
+    ctx_state->sync_order_channel_host.destroy(false);
+    CUDA_SAFECALL(cuMemFree(
+        reinterpret_cast<CUdeviceptr>(
+            ctx_state->sync_order_channel_dev)));
+    CUDA_SAFECALL(cuMemFree(
+        reinterpret_cast<CUdeviceptr>(
+            ctx_state->sync_order_registry)));
+  }
   if (pending_devices_to_finish == 0 && warp_lifetime_capture != nullptr) {
     CUDA_SAFECALL(cuMemFree(
         reinterpret_cast<CUdeviceptr>(warp_lifetime_capture)));
     warp_lifetime_capture = nullptr;
+  }
+  if (pending_devices_to_finish == 0 &&
+      sync_order_raw_output.is_open()) {
+    sync_order_raw_output.flush();
+    sync_order_raw_output.close();
   }
   skip_callback_flag = false;
   delete ctx_state;

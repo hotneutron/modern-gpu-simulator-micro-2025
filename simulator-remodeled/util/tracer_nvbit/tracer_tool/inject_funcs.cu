@@ -312,6 +312,203 @@ extern "C" __device__ __noinline__ void instrument_inst_compact(
   }
 }
 
+static __device__ __forceinline__ sync_order_launch_slot_t *
+get_sync_order_launch_slot(sync_order_registry_t *registry) {
+  if (registry == nullptr) {
+    return nullptr;
+  }
+  if (registry->magic != SYNC_ORDER_REGISTRY_MAGIC ||
+      registry->version != SYNC_ORDER_REGISTRY_VERSION) {
+    atomicOr(&registry->error_flags,
+             static_cast<unsigned int>(
+                 SYNC_ORDER_ERROR_INVALID_LAUNCH_SLOT));
+    return nullptr;
+  }
+  const int slot_index = registry->active_slot;
+  if (slot_index < 0) {
+    atomicOr(&registry->error_flags,
+             static_cast<unsigned int>(
+                 SYNC_ORDER_ERROR_NO_ACTIVE_LAUNCH));
+    return nullptr;
+  }
+  if (static_cast<unsigned int>(slot_index) >= registry->slot_capacity ||
+      static_cast<unsigned int>(slot_index) >=
+          SYNC_ORDER_MAX_LAUNCH_SLOTS) {
+    atomicOr(&registry->error_flags,
+             static_cast<unsigned int>(
+                 SYNC_ORDER_ERROR_INVALID_LAUNCH_SLOT));
+    return nullptr;
+  }
+  sync_order_launch_slot_t *slot = &registry->slots[slot_index];
+  if (slot->state != 1u || slot->cta_seq_ptr == 0 ||
+      slot->warp_scratch_ptr == 0) {
+    atomicOr(&registry->error_flags,
+             static_cast<unsigned int>(
+                 SYNC_ORDER_ERROR_INVALID_LAUNCH_SLOT));
+    return nullptr;
+  }
+  return slot;
+}
+
+static __device__ __forceinline__ bool get_sync_order_location(
+    sync_order_registry_t *registry, sync_order_launch_slot_t *slot,
+    unsigned int *linear_cta_id, unsigned int *warp_id,
+    sync_order_warp_scratch_t **scratch) {
+  const unsigned long long linear_cta =
+      (static_cast<unsigned long long>(blockIdx.z) * gridDim.y +
+       blockIdx.y) *
+          gridDim.x +
+      blockIdx.x;
+  if (linear_cta >= slot->num_ctas) {
+    atomicOr(&registry->error_flags,
+             static_cast<unsigned int>(
+                 SYNC_ORDER_ERROR_CTA_OUT_OF_RANGE));
+    return false;
+  }
+
+  const unsigned int linear_tid =
+      threadIdx.z * blockDim.y * blockDim.x +
+      threadIdx.y * blockDim.x + threadIdx.x;
+  const unsigned int warp = linear_tid / 32;
+  if (warp >= slot->warps_per_cta ||
+      warp >= SYNC_ORDER_MAX_WARPS_PER_CTA) {
+    atomicOr(&registry->error_flags,
+             static_cast<unsigned int>(
+                 SYNC_ORDER_ERROR_WARP_OUT_OF_RANGE));
+    return false;
+  }
+
+  sync_order_warp_scratch_t *scratch_base =
+      reinterpret_cast<sync_order_warp_scratch_t *>(
+          slot->warp_scratch_ptr);
+  *linear_cta_id = static_cast<unsigned int>(linear_cta);
+  *warp_id = warp;
+  *scratch =
+      &scratch_base[linear_cta * slot->warps_per_cta + warp];
+  return true;
+}
+
+extern "C" __device__ __noinline__ void record_sync_order_begin(
+    int32_t pred, uint32_t unique_function_id, uint32_t vpc,
+    uint32_t event_kind, uint64_t pregistry) {
+  const unsigned int active_mask = __activemask();
+  const int lane_id = get_laneid();
+  const int first_lane_id = __ffs(active_mask) - 1;
+  if (lane_id != first_lane_id) {
+    return;
+  }
+
+  sync_order_registry_t *registry =
+      reinterpret_cast<sync_order_registry_t *>(pregistry);
+  sync_order_launch_slot_t *slot =
+      get_sync_order_launch_slot(registry);
+  if (slot == nullptr) {
+    return;
+  }
+
+  unsigned int linear_cta_id = 0;
+  unsigned int warp_id = 0;
+  sync_order_warp_scratch_t *scratch = nullptr;
+  if (!get_sync_order_location(registry, slot, &linear_cta_id,
+                               &warp_id, &scratch)) {
+    return;
+  }
+  if (atomicCAS(&scratch->state, 0u, 1u) != 0u) {
+    atomicOr(&registry->error_flags,
+             static_cast<unsigned int>(SYNC_ORDER_ERROR_NESTED_BEGIN));
+    return;
+  }
+
+  unsigned long long *cta_seq =
+      reinterpret_cast<unsigned long long *>(slot->cta_seq_ptr);
+  scratch->event_kind = event_kind;
+  scratch->unique_function_id = unique_function_id;
+  scratch->vpc = vpc;
+  scratch->active_mask = active_mask;
+  scratch->predicate_mask = __ballot_sync(active_mask, pred);
+  scratch->sm_id = get_smid();
+  scratch->begin_seq =
+      atomicAdd(&cta_seq[linear_cta_id], 1ULL) + 1ULL;
+  __threadfence();
+  atomicExch(&scratch->state, 2u);
+}
+
+extern "C" __device__ __noinline__ void record_sync_order_end(
+    int32_t pred, uint32_t unique_function_id, uint32_t vpc,
+    uint32_t event_kind, uint64_t pregistry) {
+  const unsigned int active_mask = __activemask();
+  const int lane_id = get_laneid();
+  const int first_lane_id = __ffs(active_mask) - 1;
+  if (lane_id != first_lane_id) {
+    return;
+  }
+  (void)pred;
+
+  sync_order_registry_t *registry =
+      reinterpret_cast<sync_order_registry_t *>(pregistry);
+  sync_order_launch_slot_t *slot =
+      get_sync_order_launch_slot(registry);
+  if (slot == nullptr) {
+    return;
+  }
+
+  unsigned int linear_cta_id = 0;
+  unsigned int warp_id = 0;
+  sync_order_warp_scratch_t *scratch = nullptr;
+  if (!get_sync_order_location(registry, slot, &linear_cta_id,
+                               &warp_id, &scratch)) {
+    return;
+  }
+  if (atomicCAS(&scratch->state, 2u, 3u) != 2u) {
+    atomicOr(&registry->error_flags,
+             static_cast<unsigned int>(SYNC_ORDER_ERROR_MISSING_BEGIN));
+    return;
+  }
+  if (scratch->event_kind != event_kind ||
+      scratch->unique_function_id != unique_function_id ||
+      scratch->vpc != vpc) {
+    atomicOr(&registry->error_flags,
+             static_cast<unsigned int>(
+                 SYNC_ORDER_ERROR_IDENTITY_MISMATCH));
+    atomicExch(&scratch->state, 0u);
+    return;
+  }
+
+  unsigned long long *cta_seq =
+      reinterpret_cast<unsigned long long *>(slot->cta_seq_ptr);
+  sync_order_record_t record;
+  record.record_size = sizeof(sync_order_record_t);
+  record.record_version = SYNC_ORDER_RECORD_VERSION;
+  record.event_kind = static_cast<uint16_t>(event_kind);
+  record.device_id = slot->device_id;
+  record.stream_id = slot->stream_id;
+  record.trace_kernel_id = slot->trace_kernel_id;
+  record.reserved = 0;
+  record.launch_uid = slot->launch_uid;
+  record.cta_id_x = blockIdx.x;
+  record.cta_id_y = blockIdx.y;
+  record.cta_id_z = blockIdx.z;
+  record.linear_cta_id = linear_cta_id;
+  record.warp_id_tb = warp_id;
+  record.sm_id = scratch->sm_id;
+  record.unique_function_id = unique_function_id;
+  record.vpc = vpc;
+  record.active_mask = scratch->active_mask;
+  record.predicate_mask = scratch->predicate_mask;
+  record.begin_seq = scratch->begin_seq;
+  record.end_seq =
+      atomicAdd(&cta_seq[linear_cta_id], 1ULL) + 1ULL;
+
+  ChannelDev *channel_dev =
+      reinterpret_cast<ChannelDev *>(registry->order_channel_dev);
+  channel_dev->push(&record, sizeof(sync_order_record_t));
+  atomicAdd(
+      reinterpret_cast<unsigned long long *>(&slot->emitted_records),
+      1ULL);
+  __threadfence();
+  atomicExch(&scratch->state, 0u);
+}
+
 /* FA3 warp lifetime timestamp. Injected before SASS EXIT by either the
  * EXIT-only probe or the full-trace sidecar. A predicated EXIT can execute more
  * than once as lanes leave; the same warp writes its slot in program order, so

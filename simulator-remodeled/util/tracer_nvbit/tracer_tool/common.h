@@ -128,6 +128,115 @@ static_assert(INST_TRACE_MEMORY_SIZE == 360,
               "unexpected memory inst trace wire size");
 #endif
 
+/*
+ * Independent CTA-local semantic-event ordering transport.
+ *
+ * This ABI is intentionally separate from inst_trace_t.  The instruction
+ * receiver must never interpret an order record, and feature-off runs never
+ * allocate or initialize this transport.
+ */
+#define SYNC_ORDER_RECORD_VERSION 1u
+#define SYNC_ORDER_REGISTRY_VERSION 1u
+#define SYNC_ORDER_REGISTRY_MAGIC 0x534f5244u
+#define SYNC_ORDER_MAX_LAUNCH_SLOTS 8u
+#define SYNC_ORDER_MAX_WARPS_PER_CTA 32u
+
+enum SYNC_ORDER_EVENT_KIND {
+  SYNC_ORDER_EVENT_END_OF_KERNEL = 0,
+  SYNC_ORDER_EVENT_EXCH = 1,
+  SYNC_ORDER_EVENT_ARRIVE = 2,
+  SYNC_ORDER_EVENT_PHASECHK = 3,
+  SYNC_ORDER_EVENT_BAR_SYNC = 4,
+  SYNC_ORDER_EVENT_BAR_ARRIVE = 5,
+  SYNC_ORDER_EVENT_WARP_SYNC = 6,
+  SYNC_ORDER_EVENT_WARPGROUP_SYNC = 7,
+  SYNC_ORDER_EVENT_TMA_COMPLETION = 8,
+};
+
+enum SYNC_ORDER_ERROR_FLAGS {
+  SYNC_ORDER_ERROR_NO_ACTIVE_LAUNCH = 1u << 0,
+  SYNC_ORDER_ERROR_INVALID_LAUNCH_SLOT = 1u << 1,
+  SYNC_ORDER_ERROR_CTA_OUT_OF_RANGE = 1u << 2,
+  SYNC_ORDER_ERROR_WARP_OUT_OF_RANGE = 1u << 3,
+  SYNC_ORDER_ERROR_NESTED_BEGIN = 1u << 4,
+  SYNC_ORDER_ERROR_MISSING_BEGIN = 1u << 5,
+  SYNC_ORDER_ERROR_IDENTITY_MISMATCH = 1u << 6,
+};
+
+typedef struct {
+  uint32_t record_size;
+  uint16_t record_version;
+  uint16_t event_kind;
+  uint32_t device_id;
+  uint32_t stream_id;
+  uint32_t trace_kernel_id;
+  uint32_t reserved;
+  uint64_t launch_uid;
+  uint32_t cta_id_x;
+  uint32_t cta_id_y;
+  uint32_t cta_id_z;
+  uint32_t linear_cta_id;
+  uint32_t warp_id_tb;
+  uint32_t sm_id;
+  uint32_t unique_function_id;
+  uint32_t vpc;
+  uint32_t active_mask;
+  uint32_t predicate_mask;
+  uint64_t begin_seq;
+  uint64_t end_seq;
+} sync_order_record_t;
+
+typedef struct {
+  uint32_t state;
+  uint32_t event_kind;
+  uint32_t unique_function_id;
+  uint32_t vpc;
+  uint32_t active_mask;
+  uint32_t predicate_mask;
+  uint32_t sm_id;
+  uint32_t reserved;
+  uint64_t begin_seq;
+} sync_order_warp_scratch_t;
+
+typedef struct {
+  uint32_t state;
+  uint32_t device_id;
+  uint32_t stream_id;
+  uint32_t trace_kernel_id;
+  uint64_t launch_uid;
+  uint32_t grid_dim_x;
+  uint32_t grid_dim_y;
+  uint32_t grid_dim_z;
+  uint32_t num_ctas;
+  uint32_t warps_per_cta;
+  uint32_t reserved;
+  uint64_t cta_seq_ptr;
+  uint64_t warp_scratch_ptr;
+  uint64_t emitted_records;
+} sync_order_launch_slot_t;
+
+typedef struct {
+  uint32_t magic;
+  uint32_t version;
+  uint32_t slot_capacity;
+  int32_t active_slot;
+  uint32_t error_flags;
+  uint32_t reserved;
+  uint64_t order_channel_dev;
+  sync_order_launch_slot_t slots[SYNC_ORDER_MAX_LAUNCH_SLOTS];
+} sync_order_registry_t;
+
+#ifdef __cplusplus
+static_assert(sizeof(sync_order_record_t) == 88,
+              "unexpected sync order wire size");
+static_assert(sizeof(sync_order_warp_scratch_t) == 40,
+              "unexpected sync order scratch size");
+static_assert(sizeof(sync_order_launch_slot_t) == 72,
+              "unexpected sync order launch slot size");
+static_assert(sizeof(sync_order_registry_t) == 608,
+              "unexpected sync order registry size");
+#endif
+
 /* EXIT timestamp capture for FA3 producer/consumer lifetime, shared by the
  * EXIT-only probe and the full-trace sidecar. The current workload uses at most
  * 384 CTAs and 16 warps/CTA; the larger fixed bounds keep the tool reusable

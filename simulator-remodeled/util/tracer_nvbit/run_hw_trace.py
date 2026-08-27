@@ -191,6 +191,33 @@ if warp_lifetime_only and warp_lifetime_sidecar:
     raise RuntimeError(
         "WARP_LIFETIME_ONLY and WARP_LIFETIME_SIDECAR are mutually exclusive"
     )
+sync_event_order_raw = os.getenv("SYNC_EVENT_ORDER", "0").strip()
+if sync_event_order_raw not in ("0", "1"):
+    raise RuntimeError("SYNC_EVENT_ORDER must be exactly 0 or 1")
+sync_event_order_enabled = sync_event_order_raw == "1"
+sync_event_order_baseline = os.getenv(
+    "SYNC_EVENT_ORDER_BASELINE_TRACES"
+)
+if sync_event_order_enabled and warp_lifetime_only:
+    raise RuntimeError(
+        "SYNC_EVENT_ORDER=1 is incompatible with WARP_LIFETIME_ONLY=1"
+    )
+if sync_event_order_enabled and not sync_event_order_baseline:
+    raise RuntimeError(
+        "SYNC_EVENT_ORDER=1 requires "
+        "SYNC_EVENT_ORDER_BASELINE_TRACES=<existing traces directory>"
+    )
+if sync_event_order_enabled:
+    sync_event_order_baseline = os.path.abspath(
+        os.path.expanduser(
+            os.path.expandvars(sync_event_order_baseline)
+        )
+    )
+    if not os.path.isdir(sync_event_order_baseline):
+        raise RuntimeError(
+            "SYNC_EVENT_ORDER_BASELINE_TRACES is not a directory: {0}".
+            format(sync_event_order_baseline)
+        )
 # Spin-trim post-step: when TRIM_SPIN=1, after the normal full run + trace
 # post-processing, move the full trace aside to "<run>.fullrun" and write a
 # spin-trimmed copy back to the original "<run>" location (so the simulator
@@ -226,6 +253,11 @@ if trim_spin_enabled and not trim_spin_ncu_rep:
 if trim_spin_enabled and (warp_lifetime_only or warp_lifetime_sidecar):
     raise RuntimeError(
         "TRIM_SPIN is incompatible with WARP_LIFETIME_ONLY / WARP_LIFETIME_SIDECAR"
+    )
+if trim_spin_enabled and sync_event_order_enabled:
+    raise RuntimeError(
+        "TRIM_SPIN=1 is incompatible with SYNC_EVENT_ORDER=1; "
+        "ordered identities must join the unmodified protobuf"
     )
 # MOD. End. Improved tracer
 
@@ -328,6 +360,32 @@ def build_sync_operand_mapping_if_available(trace_folder):
     subprocess.run([sys.executable, sync_script, extra_info_dir], check=True)
 
 
+def build_sync_event_order(trace_folder):
+    extra_info_dir = os.path.join(trace_folder, "extra_info")
+    raw_path = os.path.join(
+        extra_info_dir, "sync_event_order.raw.jsonl"
+    )
+    if not os.path.isfile(raw_path):
+        raise RuntimeError(
+            "SYNC_EVENT_ORDER=1 but raw order artifact is missing: {0}".
+            format(raw_path)
+        )
+    command = [
+        sys.executable,
+        os.path.join(this_directory, "build_sync_event_order.py"),
+        "--traces",
+        trace_folder,
+    ]
+    if sync_event_order_baseline:
+        command.extend([
+            "--baseline-traces",
+            os.path.abspath(os.path.expanduser(
+                os.path.expandvars(sync_event_order_baseline)
+            )),
+        ])
+    subprocess.run(command, check=True)
+
+
 def validate_tma_completion_contracts_if_available(trace_folder):
     extra_info_dir = os.path.join(trace_folder, "extra_info")
     inputs = [
@@ -379,6 +437,21 @@ def build_spin_wait_sidecar(trace_folder):
             "--validate-ctas",
             "all",
             "--strict",
+        ],
+        check=True,
+    )
+
+
+def build_waitblock_candidate_sidecar(trace_folder):
+    subprocess.run(
+        [
+            sys.executable,
+            os.path.join(
+                this_directory,
+                "build_waitblock_candidate_sidecar.py",
+            ),
+            "--traces",
+            trace_folder,
         ],
         check=True,
     )
@@ -438,7 +511,10 @@ for bench in benchmarks:
     for argpair in argslist:
         args = argpair["args"]
         extra_env = argpair.get("env", {})
-        conflicting_config_keys = {"LIGHTER_TRACER"} & set(extra_env)
+        conflicting_config_keys = {
+            "LIGHTER_TRACER", "SYNC_EVENT_ORDER",
+            "SYNC_EVENT_ORDER_BASELINE_TRACES",
+        } & set(extra_env)
         if conflicting_config_keys:
             raise RuntimeError(
                 "benchmark environment cannot override tracer selection: {0}".format(
@@ -454,6 +530,8 @@ for bench in benchmarks:
             lifetime_kernel = os.getenv("DYNAMIC_KERNEL_LIMIT_START", "all")
             argument_folder += "-fulltrace-lifetime-k" + lifetime_kernel
         argument_folder += lighter_tracer_config.artifact_suffix
+        if sync_event_order_enabled:
+            argument_folder += "-sync-order-v1"
         run_name = os.path.join(benchmark_name, argument_folder)
 
         # MOD. Begin. Improved tracer
@@ -474,9 +552,10 @@ for bench in benchmarks:
 
         this_trace_folder = os.path.join(this_run_dir, "traces")
         if os.path.exists(this_run_dir):
-            if lighter_tracer_config.features:
+            if (lighter_tracer_config.features
+                    or sync_event_order_enabled):
                 raise RuntimeError(
-                    "refusing to overwrite existing lighter trace directory: "
+                    "refusing to overwrite existing configured trace directory: "
                     "{0}".format(this_run_dir)
                 )
         else:
@@ -501,6 +580,13 @@ for bench in benchmarks:
             "artifact_suffix": lighter_tracer_config.artifact_suffix,
             "git_sha": git_sha,
         }
+        if sync_event_order_enabled:
+            config_manifest.update({
+                "sync_event_order": True,
+                "sync_event_order_version": 1,
+                "sync_event_order_baseline_traces":
+                    sync_event_order_baseline,
+            })
         with open(
             os.path.join(this_run_dir, "lighter_tracer_config.json"),
             "w",
@@ -541,6 +627,8 @@ for bench in benchmarks:
         env_exports += "export LIGHTER_TRACER={0}; ".format(
             shlex.quote(lighter_tracer_config.canonical)
         )
+        if sync_event_order_enabled:
+            env_exports += "export SYNC_EVENT_ORDER=1; "
 
         if options.terminate_upon_limit:
             sh_contents += "export TERMINATE_UPON_LIMIT=1; "
@@ -598,7 +686,13 @@ for bench in benchmarks:
                 validate_tma_completion_contracts_if_available(
                     this_trace_folder
                 )
+                if sync_event_order_enabled:
+                    build_sync_event_order(this_trace_folder)
             if trim_spin_enabled:
                 spin_trim_run_dir(this_run_dir)
             if not warp_lifetime_only:
                 build_spin_wait_sidecar(this_trace_folder)
+                if sync_event_order_enabled:
+                    build_waitblock_candidate_sidecar(
+                        this_trace_folder
+                    )
