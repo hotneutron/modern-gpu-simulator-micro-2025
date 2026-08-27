@@ -208,11 +208,6 @@ if sync_event_order_baseline_override:
             os.path.expandvars(sync_event_order_baseline_override)
         )
     )
-    if not os.path.isdir(sync_event_order_baseline_override):
-        raise RuntimeError(
-            "SYNC_EVENT_ORDER_BASELINE_TRACES is not a directory: {0}".
-            format(sync_event_order_baseline_override)
-        )
 # Spin-trim post-step: when TRIM_SPIN=1, after the normal full run + trace
 # post-processing, move the full trace aside to "<run>.fullrun" and write a
 # spin-trimmed copy back to the original "<run>" location (so the simulator
@@ -355,7 +350,7 @@ def build_sync_operand_mapping_if_available(trace_folder):
     subprocess.run([sys.executable, sync_script, extra_info_dir], check=True)
 
 
-def build_sync_event_order(trace_folder, baseline_trace_folder):
+def build_sync_event_order(trace_folder, baseline_trace_folder=None):
     extra_info_dir = os.path.join(trace_folder, "extra_info")
     raw_path = os.path.join(
         extra_info_dir, "sync_event_order.raw.jsonl"
@@ -371,10 +366,11 @@ def build_sync_event_order(trace_folder, baseline_trace_folder):
         "--traces",
         trace_folder,
     ]
-    command.extend([
-        "--baseline-traces",
-        baseline_trace_folder,
-    ])
+    if baseline_trace_folder:
+        command.extend([
+            "--baseline-traces",
+            baseline_trace_folder,
+        ])
     subprocess.run(command, check=True)
 
 
@@ -522,9 +518,6 @@ for bench in benchmarks:
             lifetime_kernel = os.getenv("DYNAMIC_KERNEL_LIMIT_START", "all")
             argument_folder += "-fulltrace-lifetime-k" + lifetime_kernel
         argument_folder += lighter_tracer_config.artifact_suffix
-        baseline_run_name = os.path.join(
-            benchmark_name, argument_folder
-        )
         if sync_event_order_enabled:
             argument_folder += "-sync-order-v1"
         run_name = os.path.join(benchmark_name, argument_folder)
@@ -543,24 +536,6 @@ for bench in benchmarks:
         this_run_dir = os.path.abspath(
             os.path.expandvars(os.path.join(trace_version_root, run_name))
         )
-        sync_event_order_baseline = None
-        if sync_event_order_enabled:
-            sync_event_order_baseline = (
-                sync_event_order_baseline_override
-                or os.path.abspath(os.path.expandvars(os.path.join(
-                    trace_version_root, baseline_run_name, "traces"
-                )))
-            )
-            if sync_event_order_baseline == os.path.join(
-                    this_run_dir, "traces"):
-                raise RuntimeError(
-                    "ordered trace output cannot also be its baseline"
-                )
-            if not os.path.isdir(sync_event_order_baseline):
-                raise RuntimeError(
-                    "derived SYNC_EVENT_ORDER baseline does not exist: "
-                    "{0}".format(sync_event_order_baseline)
-                )
         # MOD. End. Improved tracer
 
         this_trace_folder = os.path.join(this_run_dir, "traces")
@@ -598,7 +573,7 @@ for bench in benchmarks:
                 "sync_event_order": True,
                 "sync_event_order_version": 1,
                 "sync_event_order_baseline_traces":
-                    sync_event_order_baseline,
+                    sync_event_order_baseline_override,
             })
         with open(
             os.path.join(this_run_dir, "lighter_tracer_config.json"),
@@ -702,7 +677,7 @@ for bench in benchmarks:
                 if sync_event_order_enabled:
                     build_sync_event_order(
                         this_trace_folder,
-                        sync_event_order_baseline,
+                        sync_event_order_baseline_override,
                     )
             if trim_spin_enabled:
                 spin_trim_run_dir(this_run_dir)
