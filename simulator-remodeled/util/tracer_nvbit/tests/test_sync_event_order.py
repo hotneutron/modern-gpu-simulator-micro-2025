@@ -273,5 +273,38 @@ class CandidateIntervalTest(unittest.TestCase):
         )
 
 
+class ManagedOrderTransportSourceTest(unittest.TestCase):
+    def test_order_transport_has_no_device_channel_push(self):
+        inject_source = (
+            TRACER_DIR / "tracer_tool/inject_funcs.cu"
+        ).read_text()
+        order_end = inject_source.split(
+            'extern "C" __device__ __noinline__ '
+            "void record_sync_order_end(", 1
+        )[1].split(
+            "/* FA3 warp lifetime timestamp.", 1
+        )[0]
+
+        self.assertNotIn("channel_dev->push", order_end)
+        self.assertIn("record_buffer[record_index] = record", order_end)
+        self.assertIn("cta_record_counts[linear_cta_id]", order_end)
+        self.assertIn("SYNC_ORDER_ERROR_BUFFER_OVERFLOW", order_end)
+
+    def test_host_transport_has_no_second_channel_receiver(self):
+        tracer_source = (
+            TRACER_DIR / "tracer_tool/tracer_tool.cu"
+        ).read_text()
+        common_source = (
+            TRACER_DIR / "tracer_tool/common.h"
+        ).read_text()
+
+        self.assertNotIn("sync_order_channel", tracer_source)
+        self.assertNotIn("sync_order_recv_thread_fun", tracer_source)
+        self.assertIn("SYNC_EVENT_ORDER_RECORDS_PER_CTA", tracer_source)
+        self.assertIn("cta_record_count_ptr", common_source)
+        self.assertIn("record_buffer_ptr", common_source)
+        self.assertIn("overflow_records", common_source)
+
+
 if __name__ == "__main__":
     unittest.main()

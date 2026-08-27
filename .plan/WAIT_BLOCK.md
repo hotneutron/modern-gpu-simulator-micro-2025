@@ -4459,9 +4459,10 @@ Do not use `clock64`, host receive order, or a device-global counter.
 ###### V2 transport and launch lifetime
 
 Exact-ticket v1 mixed a new record into a channel whose decoder expected only
-the existing instruction record. V2 uses a separate fixed-record
-`sync_order_channel` and writes `extra_info/sync_event_order.jsonl`. The
-instruction channel and protobuf stream are unchanged until the offline join.
+the existing instruction record. V2 uses a separate bounded per-launch managed
+record buffer and writes `extra_info/sync_event_order.raw.jsonl` only after the
+kernel has synchronized. The instruction channel and protobuf stream are
+unchanged until the offline join.
 
 The instrumented callback must not embed a per-launch allocation pointer. Use
 one tracer-lifetime launch-context registry:
@@ -4469,14 +4470,21 @@ one tracer-lifetime launch-context registry:
 ```text
 stable registry address embedded once
 launch_uid selects one live registry slot
-slot owns the launch's CTA counter slice and per-warp begin scratch
+slot owns the launch's CTA counter slice, per-warp begin scratch,
+and bounded order-record buffer
 slot contents reset before launch
-slot retired only after kernel synchronization and channel drain
+slot retired only after kernel synchronization, validation, and host dump
 ```
 
 The registry has a configured concurrent-launch capacity and fails closed on
-slot exhaustion, duplicate launch UID, grid overflow, or stale-slot reuse. Its
-base address never changes after instrumentation.
+slot exhaustion, duplicate launch UID, grid overflow, record-buffer overflow,
+or stale-slot reuse. Its base address never changes after instrumentation.
+Device callbacks never wait for a host consumer. They reserve one bounded
+CTA-local record index, write the fixed-size record directly, and set an
+overflow error instead of spinning when capacity is exhausted. The record
+counter is CTA-local rather than one contended device-global counter.
+`SYNC_EVENT_ORDER_RECORDS_PER_CTA` controls the per-CTA partition and
+`SYNC_EVENT_ORDER_MAX_RECORDS` caps total launch allocation.
 
 Each order record contains:
 
@@ -4625,8 +4633,10 @@ Candidate-set `>=` semantics must never be used for TMA completion ownership.
    - Implement tracer-lifetime registry allocation.
    - Add launch slot acquire/reset/retire and overflow/stale-slot aborts.
 4. **Separate order transport**
-   - Add `sync_order_channel` and versioned fixed-size order record.
+   - Add a bounded per-launch managed buffer and versioned fixed-size order
+     record.
    - Do not modify the existing instruction channel decoder.
+   - Do not make GPU progress depend on a host receiver.
 5. **Before/after instrumentation**
    - Select events only by decoded opcode class.
    - Emit complete begin/end pairs for active and predicated-off occurrences.
@@ -4659,7 +4669,7 @@ Candidate-set `>=` semantics must never be used for TMA completion ownership.
       candidate sets.
     - Record the trace-stage verdict before any simulator file is touched.
 
-**Stage T implementation checkpoint (2026-08-26)**
+**Stage T implementation checkpoint (2026-08-27)**
 
 The local trace-side implementation is complete:
 
@@ -4667,11 +4677,11 @@ The local trace-side implementation is complete:
   stable launch registry, CTA counters, per-warp begin scratch, and explicit
   device error flags.
 - `tracer_tool/inject_funcs.cu` records one CTA-local `begin_seq/end_seq`
-  interval per selected semantic occurrence and emits it only on the separate
-  order channel.
+  interval per selected semantic occurrence and writes it directly into the
+  bounded launch-owned record buffer.
 - `tracer_tool/tracer_tool.cu` implements default-off configuration, opcode
-  selection, registry acquire/retire, independent channel receive/drain, raw
-  JSONL output, record-count reconciliation, and fail-closed launch checks.
+  selection, registry acquire/retire, post-synchronization raw JSONL dumping,
+  buffer capacity/overflow validation, and fail-closed launch checks.
 - `build_sync_event_order.py` validates intervals and masks, requires a
   bijective protobuf join, stamps immutable occurrence identity, records input
   digests, and optionally requires byte-identical protobuf trees against an
@@ -4691,10 +4701,18 @@ The local trace-side implementation is complete:
   gate remains pending until that fingerprint is compared with an accepted
   baseline.
 
-Local Python syntax checks, ABI layout checks, and 20 focused unit tests pass.
+Local Python syntax checks, ABI layout checks, and 22 focused unit tests pass.
 The NVBit/CUDA build and K5/K10 capture have deliberately not been run locally;
 the user-owned server run and the trace acceptance checks below remain pending.
 No simulator source or configuration has been changed.
+
+The first server attempt with the separate `sync_order_channel` transport
+failed the trace gate: after 17 hours the FA3 process still consumed 99-100%
+GPU, no threadblock protobuf had completed, and
+`sync_event_order.raw.jsonl` remained empty. The GPU was still inside the
+instrumented benchmark, so offline processing was not involved. That transport
+made GPU progress depend on host channel drain and is superseded by the
+launch-owned managed buffer above. The server rerun remains pending.
 
 **Decision gate after Stage T**
 
@@ -4735,7 +4753,8 @@ approval. Its future order is:
 ```text
 SYNC_EVENT_ORDER=0 is byte-identical
 no application/kernel/PC/barrier/generation hardcoding
-separate order channel cannot be decoded as an instruction record
+separate order buffer cannot enter the instruction channel decoder
+record-buffer overflow count is zero
 launch registry pointer remains stable across reinstrumented launches
 all begin/end pairs and raw joins are bijective
 all overlapping intervals retain every legal order

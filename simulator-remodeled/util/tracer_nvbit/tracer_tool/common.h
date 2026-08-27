@@ -161,6 +161,7 @@ enum SYNC_ORDER_ERROR_FLAGS {
   SYNC_ORDER_ERROR_NESTED_BEGIN = 1u << 4,
   SYNC_ORDER_ERROR_MISSING_BEGIN = 1u << 5,
   SYNC_ORDER_ERROR_IDENTITY_MISMATCH = 1u << 6,
+  SYNC_ORDER_ERROR_BUFFER_OVERFLOW = 1u << 7,
 };
 
 typedef struct {
@@ -212,7 +213,11 @@ typedef struct {
   uint32_t reserved;
   uint64_t cta_seq_ptr;
   uint64_t warp_scratch_ptr;
-  uint64_t emitted_records;
+  uint64_t cta_record_count_ptr;
+  uint64_t record_buffer_ptr;
+  uint64_t record_capacity;
+  uint64_t records_per_cta;
+  uint64_t overflow_records;
 } sync_order_launch_slot_t;
 
 typedef struct {
@@ -222,7 +227,6 @@ typedef struct {
   int32_t active_slot;
   uint32_t error_flags;
   uint32_t reserved;
-  uint64_t order_channel_dev;
   sync_order_launch_slot_t slots[SYNC_ORDER_MAX_LAUNCH_SLOTS];
 } sync_order_registry_t;
 
@@ -231,9 +235,9 @@ static_assert(sizeof(sync_order_record_t) == 88,
               "unexpected sync order wire size");
 static_assert(sizeof(sync_order_warp_scratch_t) == 40,
               "unexpected sync order scratch size");
-static_assert(sizeof(sync_order_launch_slot_t) == 72,
+static_assert(sizeof(sync_order_launch_slot_t) == 104,
               "unexpected sync order launch slot size");
-static_assert(sizeof(sync_order_registry_t) == 608,
+static_assert(sizeof(sync_order_registry_t) == 856,
               "unexpected sync order registry size");
 #endif
 

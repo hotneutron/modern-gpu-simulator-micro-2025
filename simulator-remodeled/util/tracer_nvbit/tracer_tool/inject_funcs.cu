@@ -341,7 +341,10 @@ get_sync_order_launch_slot(sync_order_registry_t *registry) {
   }
   sync_order_launch_slot_t *slot = &registry->slots[slot_index];
   if (slot->state != 1u || slot->cta_seq_ptr == 0 ||
-      slot->warp_scratch_ptr == 0) {
+      slot->warp_scratch_ptr == 0 ||
+      slot->cta_record_count_ptr == 0 ||
+      slot->record_buffer_ptr == 0 ||
+      slot->record_capacity == 0) {
     atomicOr(&registry->error_flags,
              static_cast<unsigned int>(
                  SYNC_ORDER_ERROR_INVALID_LAUNCH_SLOT));
@@ -499,12 +502,41 @@ extern "C" __device__ __noinline__ void record_sync_order_end(
   record.end_seq =
       atomicAdd(&cta_seq[linear_cta_id], 1ULL) + 1ULL;
 
-  ChannelDev *channel_dev =
-      reinterpret_cast<ChannelDev *>(registry->order_channel_dev);
-  channel_dev->push(&record, sizeof(sync_order_record_t));
-  atomicAdd(
-      reinterpret_cast<unsigned long long *>(&slot->emitted_records),
-      1ULL);
+  unsigned long long *cta_record_counts =
+      reinterpret_cast<unsigned long long *>(
+          slot->cta_record_count_ptr);
+  const unsigned long long local_record_index =
+      atomicAdd(&cta_record_counts[linear_cta_id], 1ULL);
+  if (local_record_index >= slot->records_per_cta) {
+    atomicAdd(
+        reinterpret_cast<unsigned long long *>(
+            &slot->overflow_records),
+        1ULL);
+    atomicOr(&registry->error_flags,
+             static_cast<unsigned int>(
+                 SYNC_ORDER_ERROR_BUFFER_OVERFLOW));
+    atomicExch(&scratch->state, 0u);
+    return;
+  }
+  sync_order_record_t *record_buffer =
+      reinterpret_cast<sync_order_record_t *>(
+          slot->record_buffer_ptr);
+  const unsigned long long record_index =
+      static_cast<unsigned long long>(linear_cta_id) *
+          slot->records_per_cta +
+      local_record_index;
+  if (record_index >= slot->record_capacity) {
+    atomicAdd(
+        reinterpret_cast<unsigned long long *>(
+            &slot->overflow_records),
+        1ULL);
+    atomicOr(&registry->error_flags,
+             static_cast<unsigned int>(
+                 SYNC_ORDER_ERROR_BUFFER_OVERFLOW));
+    atomicExch(&scratch->state, 0u);
+    return;
+  }
+  record_buffer[record_index] = record;
   __threadfence();
   atomicExch(&scratch->state, 0u);
 }
