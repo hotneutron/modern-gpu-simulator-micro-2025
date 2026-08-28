@@ -21,13 +21,12 @@ COVERAGE; B0-A/B/C ARE COMPLETE; B0-D EXACT COMPLETION OWNERSHIP AND ITS
 BARRIER-LOCAL ASSIGNMENT-OVERLAP REPAIR ARE COMPLETE AND VALIDATED; K5 `.e85`
 VALIDATES OWNERSHIP-CLEAN OUT-OF-ORDER COMPLETION; K10 `.e62` COMPLETES ALL
 384 CTAS WITH CLEAN WAITBLOCK AND TMABIND SUMMARIES; K5 `.e85` ALSO CONFIRMS A
-SEPARATE ALL-LIVE CROSS-WARP WAITBLOCK CYCLE; B0-E IS REOPENED ON A
-CTA-ORDERED CANDIDATE-SET TICKET DESIGN AFTER TRACE-ONLY CAUSAL PRUNING PROVED
-THAT CROSS-WARP ORDER IS THE MISSING INPUT; THE EARLIER EXACT-TICKET V1 REMAINS
-REJECTED; THE TRACE-GENERATION/OFFLINE-PROOF STAGE IS IMPLEMENTED LOCALLY AND
-AWAITS THE SERVER TRACE GATE; SIMULATOR CHANGES ARE FROZEN UNTIL THAT STAGE
-PASSES AND A SEPARATE IMPLEMENTATION APPROVAL IS GIVEN; RETRACE AND B1 REMAIN
-PENDING.
+SEPARATE ALL-LIVE CROSS-WARP WAITBLOCK CYCLE; THE POST-`951b058` CTA-ORDERED
+CANDIDATE-SET EXPERIMENT COMPLETED CAPTURE/JOIN BUT FAILED BOTH ITS V2
+CANDIDATE GATE AND ITS V3 MUST-DEPENDENCY PRECHECK; THAT EXPERIMENT IS CLOSED
+AND ITS CODE IS REVERTED; B0-E RETURNS TO THE `951b058` BASELINE FOR
+PRODUCER/CONSUMER TIMING-DIVERGENCE AND GLOBAL PARK-SAFETY ANALYSIS;
+IMPLEMENTATION AND B1 REMAIN PENDING.
 
 This document is the authoritative, self-contained design and execution record
 for WaitBlock, partial replay, and the post-`.e83` TMA/barrier work. The linked
@@ -35,6 +34,15 @@ for WaitBlock, partial replay, and the post-`.e83` TMA/barrier work. The linked
 [`SPIN_WAIT_POSTPROCESS.md`](SPIN_WAIT_POSTPROCESS.md), and older `.trae`
 planning documents are historical/supporting material only; they are not
 required to implement or validate this document.
+
+Current B0-E authority is intentionally narrow:
+
+1. B0-D at `39abefb` plus K5 `.e85` and K10 `.e62` is the fixed correctness
+   baseline.
+2. The post-`951b058` ordered-candidate experiment is historical evidence only.
+3. The next authorized work is the first-divergence and global park-safety
+   analysis under the gates in section 6.15. No new trace schema or simulator
+   release heuristic is authorized.
 
 **Debug record:** [`../debug-k10-wait-fold-deadlock.md`](../debug-k10-wait-fold-deadlock.md).
 
@@ -2412,7 +2420,7 @@ without introducing scheduler-order bias.
 | B0-B | Kernel-aware descriptor identity and K5 tx-size restoration | **IMPLEMENTED / VALIDATED** at `0f7cbc2`; chain 23/23, ambiguity 0, K5 `0x96b0` = 24,576 bytes, 192 128-byte AGU requests, and 768 32-byte sector requests |
 | B0-C | Size-only K5/K10 byte-conservation diagnostic with existing FIFO/release order | **COMPLETE**; byte contract PASS, K10 clean exit at 138,456 cycles, K5 runtime size PASS but all-live WaitBlock abort at cycle 68,176 |
 | B0-D | Exact TMA-command-to-barrier completion ownership | **COMPLETE / VALIDATED** at `39abefb`; `.e85` validates ownership-clean out-of-order completion, and K10 `.e62` completes 384/384 CTAs with 132/132 clean SM-level TMABIND final records after exercising two simultaneous open contracts per warp |
-| B0-E | K5 all-live cross-warp WaitBlock cycle (`0xb370`/`0x16c60`) | **TRACE STAGE IMPLEMENTED LOCALLY / SERVER GATE PENDING / SIMULATOR STAGE FROZEN**; generate and validate CTA-local ordered K5/K10 traces next; keep/revert the isolated trace change based on that gate, and begin simulator work only after a separate approval |
+| B0-E | K5 all-live cross-warp WaitBlock cycle (`0xb370`/`0x16c60`) | **ORDERED-CANDIDATE EXPERIMENT CLOSED / CODE REVERTED TO `951b058` / ROOT-CAUSE ANALYSIS REOPENED**; v2 retained generation 5 and the v3 precheck could not prove that B60 generation 4 depends on the target wait; proceed with first-divergence and global park-safety analysis |
 | B1 | One SM-level WaitBlock release phase per cycle | **REQUIRED / NOT IMPLEMENTED** |
 | B2 | WaitBlock startup and provenance fail-fast checks | **MOSTLY IMPLEMENTED** |
 | B3 | Assert-before-clear lifecycle checks | **IMPLEMENTED for WaitBlock and B0-D TMA ownership**; broader non-ownership cleanup audit remains partial |
@@ -3543,10 +3551,9 @@ TMA baseline. It does not mean reproducing the retired legacy FIFO.
 
 #### B0-E evidence and next-session handoff (`K5 .e85`, `K10 .e62` final)
 
-This subsection records the B0-E evidence and the design history before
-implementation. The exact-ticket v1 subsection is retained as a rejected
-alternative. The candidate-set v2 subsection added after the review
-dispositions is the current implementation authority.
+This subsection records the evidence and current B0-E design boundary before
+implementation. The ordered-ticket subsection and the later post-`951b058`
+experiment record are historical evidence, not implementation authority.
 
 **B0-D final validation**
 
@@ -3747,10 +3754,8 @@ generation that produced the captured ready result.
 
 Status: **REJECTED / RETAINED AS A FAIL-CLOSED ALTERNATIVE**. This subsection
 does not authorize implementation. Its transport, per-launch pointer
-lifecycle, and resolver-premise blockers are recorded for completeness. This
-was the disposition before candidate-set v2 separated transport, stabilized
-launch lifetime, and removed the unnecessary singleton-generation
-requirement.
+lifecycle, and resolver-premise blockers are recorded for completeness. The
+approved B0-E direction is timing realignment plus global park safety.
 
 The correction targets the information loss common to both the historical
 pre-WaitBlock stale-poll failure and the current all-live cycle. The compact
@@ -4243,9 +4248,8 @@ the first five. Their dispositions:
   and the contract-count `{n-1,n}` premise (issue 8) remain valid
   implementation blockers and are independent of the direction chosen below.
 
-**Historical direction, superseded by the candidate-set v2 decision below:
-realign simulator timing to hardware. Removing the generation counter remains
-at most a secondary cleanup and is NOT a deadlock fix.**
+**Preferred direction: realign simulator timing to hardware. Removing the
+generation counter is at most a secondary cleanup; it is NOT a deadlock fix.**
 
 Critical correction (2026-08-26): an earlier draft of this section claimed that
 retiring the WaitBlock generation audit would make the deadlock "abort go away."
@@ -4303,525 +4307,153 @@ Direction, corrected:
 - Retiring the Role 2a audit is optional cleanup that may follow, and only
   changes an abort into a hang; it must not be presented as resolving the cycle.
 - Role 2b (TMA completion identity) stays intact regardless.
-- The exact-ticket v1 design above remains recorded as the rejected
-  fail-closed alternative. It does not reject the candidate-set v2 design
-  below.
+- The ordered-ticket design above remains recorded as the rejected fail-closed
+  alternative.
 
-The timing-divergence and park-safety analysis remains valid supporting
-evidence, but it no longer supplies sufficient authority for B0-E runtime
-release. Candidate-set v2 below requires a new ordered trace and remains
-separate from B1.
+##### Post-`951b058` ordered candidate-set experiment (closed and reverted)
 
-##### B0-E revised decision: CTA-ordered candidate-set tickets (v2)
+This experiment tested whether stronger CTA-local trace ordering could recover
+a complete set of legal release generations without an application, kernel,
+PC, CTA, barrier, warp, occurrence, or generation special case. It comprised
+the five commits from `9ee8f35` through `97c1bae`: ordered event capture,
+offline joining, candidate generation, baseline-path handling, managed-buffer
+transport, and the callback deadlock correction. Simulator source and
+configuration remained frozen throughout.
 
-Status: **TRACE STAGE IMPLEMENTED LOCALLY / SERVER GATE PENDING / SIMULATOR
-STAGE FROZEN**. This subsection supersedes the preferred-direction paragraph
-immediately above and is the current B0-E design authority. Only trace capture,
-offline join, and candidate sidecar generation are authorized now. Simulator
-loader/runtime changes require the accepted ordered trace plus a separate user
-approval. This does not revive exact-ticket v1.
+**Capture and conservation result**
 
-The design changed for two reasons:
-
-1. Timing realignment cannot be the correctness mechanism. A trace-driven
-   simulator necessarily chooses a different cross-warp schedule from the
-   captured HW execution, so another narrow one-bit phase window can be missed
-   after any one calibration.
-2. Exact generation uniqueness is stronger than release requires. If a wait's
-   complete legal candidate set is `{1,3}` and the live generation is 4, every
-   legal target has completed even though the source trace cannot distinguish
-   generation 1 from generation 3.
-
-The release test is therefore based on a complete candidate set `S`, not on a
-guessed scalar:
+The final ordered K5/K10 run completed all 11 kernels:
 
 ```text
-current_gen < min(S)
-    DEFINITELY_NOT_COMPLETE
+order records            = 1,635,080
+protobuf semantic events = 1,635,080
+joined events             = 1,635,080
+join bijective            = true
+record overflow           = 0
 
-current_gen >= max(S)
-    DEFINITELY_COMPLETE
-
-min(S) <= current_gen < max(S)
-    MIXED
+TMA contracts             = 12,408
+completion-bearing LOADs  = 19,320
+expected/assigned bytes   = 221,380,608 / 221,380,608
+TMA errors                = 0
 ```
 
-`DEFINITELY_COMPLETE` is a must-complete proof. It does not select the smallest,
-largest, nearest, or latest candidate. `MIXED` may hold only when `max(S)` is
-proven reachable without semantic work behind that hold; otherwise it aborts
-as `AMBIGUOUS_UNREACHABLE`.
-
-The candidate rule is consulted only when native phase readiness says
-not-ready. A native-ready wait continues immediately:
+The non-PHASECHK semantic multisets were conserved globally:
 
 ```text
-phase != wait_parity
-    release by native Hopper parity semantics
-
-phase == wait_parity && current_gen >= max(S)
-    release as a captured completion whose entire legal set is in the past
-
-phase == wait_parity && current_gen < max(S)
-    hold only with max-candidate reachability proof
+K5  non-PHASECHK semantic events = 268,536 / 268,536
+K10 non-PHASECHK semantic events = 448,128 / 448,128
 ```
 
-This prevents the original trace-replay fast-producer failure: waits do not
-unconditionally pass. It also prevents the `.e85` stale-window rebinding from
-silently changing an already completed occurrence into the next generation.
-
-**Trace-only causal-pruning result**
-
-A proof-only resolver was run over the existing protobuf, SASS metadata, and
-schema-v5 sidecar. It does not read `.e76`, `.e85`, `.e62`, or any simulator
-log. Its inventory is complete:
+The instrumentation nevertheless changed timing-sensitive polling and K5
+persistent work placement:
 
 ```text
-K5  semantic WaitBlock actions = 26,934 / 26,934
-K10 semantic WaitBlock actions = 60,829 / 60,829
-total                           = 87,763 / 87,763
+                         baseline   ordered   delta
+K5 PHASECHK               235,692   196,342  -39,350
+K10 PHASECHK              623,254   507,330 -115,924
+K5 actionable waits        26,934    26,956      +22
+K10 actionable waits       60,829    60,856      +27
+K5 per-warp non-poll mismatches              364 / 2,112
+K10 per-warp non-poll mismatches               0 / 4,608
 ```
 
-It can build finite parity/capacity supersets, but sound causal pruning removes
-no candidate because the existing trace has no cross-warp event order:
+Consequently, the ordered run could validate capture completeness and global
+semantic conservation, but it could not transfer per-CTA/per-warp wait
+identities or causal authority back to the baseline trace.
+
+**V2 result**
+
+The timestamp-only candidate resolver covered all 87,812 ordered actions and
+failed closed without simulator-log input. For the critical ordered occurrence:
 
 ```text
-K5:
-  cross-warp TMA contract order unresolved = 111,765 candidate relations
-  optimistic ARRIVE supply remains         =   8,061 candidate relations
-
-K10:
-  cross-warp TMA contract order unresolved = 150,493 candidate relations
-  optimistic ARRIVE supply remains         =  17,208 candidate relations
+K5 CTA124 warp12 0x74e0 / barrier 0x16c50
+candidate set = {1,3,5}
 ```
 
-For CTA124 warp12 `0x74e0/0x16c50`, the automatic trace-only superset remains
-`{1,3,5,7,9}`. The earlier `{1,3}` reduction used the `.e85` terminal simulator
-state and is validation evidence, not information that sidecar generation may
-consume. Therefore the current trace cannot authorize candidate-set runtime
-behavior. A new trace with CTA-local logical event order is required.
+The `.e85` baseline is stuck at `current_gen=4`, so this set does not authorize
+the required must-complete release. V2 therefore did not solve B0-E.
 
-**No application-specific rules**
+**V3 hypothesis and pre-implementation audit**
 
-The implementation must not contain application names, kernel IDs, PCs,
-barrier addresses, CTA IDs, warp IDs, occurrence counts, or generation
-constants. Discovery is driven exclusively by:
-
-- SASS opcode and operand semantics;
-- protobuf dynamic occurrences and masks;
-- sidecar CFG/action identity;
-- runtime barrier addresses and payloads;
-- CTA-local logical order records.
-
-Unsupported opcode shapes or unresolved identities abort sidecar generation.
-There is no FA3-specific fallback table.
-
-###### V2 trace-order capture
-
-Add an independent, default-off configuration:
+V3 proposed rebuilding canonical events from the baseline trace, using the
+ordered trace only for global conservation, deriving phase-token lower bounds
+with reviewed scalar/uniform ALU semantics, and testing each candidate with a
+candidate-specific graph/CSP. Its critical candidate-5 hypothesis required
+this must-dependency:
 
 ```text
-SYNC_EVENT_ORDER=0|1
+W_consumer(B50)
+  -> A_consumer(B60)
+  -> R(B60,4)
+  -> W_producer(B60)
+  -> C_producer(B50,5)
 ```
 
-`SYNC_EVENT_ORDER=0` must add no callback, channel, allocation, schema field, or
-output difference. Existing trace artifacts must remain byte-identical.
-
-When enabled, capture every dynamic occurrence in this opcode-derived event
-set:
+The pre-implementation CTA124 audit invalidated the required middle edge:
 
 ```text
-SYNCS.EXCH*
-SYNCS.ARRIVE*
-SYNCS.PHASECHK*
-BAR.SYNC / BAR.ARV
-WARPSYNC / WARPGROUP synchronization
-completion-bearing UTMALDG / UBLKCP
+B60 expected_arrive = (0x200000 - 0x1ffffa) / 2 = 3
+B60 contributing warps = {4,8,12}
+effective B60 ARRIVEs per contributing warp = 9
+effective B60 ARRIVEs available before the target continuation = 4 per warp
 ```
 
-All active lanes must execute any warp collective used by the callback before
-the first active lane is selected to publish the record. In particular,
-`__ballot_sync(active_mask, pred)` must execute before non-publishing lanes
-return.
+Warp 12's first four contributions are in same-warp program order before its
+target B50 wait. Warps 4 and 8 are cross-warp unordered relative to that wait,
+so a legal topological assignment may place their first four contributions
+before it as well. Thus one legal provider assignment can reach `R(B60,4)`
+without the target wait continuation. Proving that the producer wait has
+minimum generation 4 would not prove that generation 4 depends on the consumer
+wait.
 
-Nonblocking semantic events use a full interval:
+Candidate pruning requires every legal assignment to be unsatisfiable. Because
+the baseline evidence does not exclude this acyclic assignment, a sound solver
+must retain candidate 5 or return unresolved; it cannot emit the proposed
+`SELF_DEPENDENT_RELEASE_SCC`. Adding an ordered timestamp, simulator terminal
+state, PC rule, or manually injected edge would violate the input boundary and
+fail-closed policy.
 
-```text
-begin_seq = atomicAdd(&cta_event_seq[linear_cta_id], 1)  // IPOINT_BEFORE
-target instruction
-end_seq   = atomicAdd(&cta_event_seq[linear_cta_id], 1)  // IPOINT_AFTER
-```
+**Disposition**
 
-This applies to `SYNCS.EXCH*`, `SYNCS.ARRIVE*`, `SYNCS.PHASECHK*`, and
-completion-bearing `UTMALDG`/`UBLKCP`. Potentially blocking synchronization
-instructions (`BAR.SYNC`, `BAR.ARV`, `WARPSYNC`, and `WARPGROUP*`) must not
-carry an `IPOINT_AFTER` callback. They emit an adjacent begin/end point interval
-from one `IPOINT_BEFORE` callback.
+- No schema-v7 sidecar or simulator consumer was produced.
+- The incomplete canonicalizer/symbolic prototype is discarded.
+- The five Stage T commits from `9ee8f35` through `97c1bae` are reverted from
+  the working code to the `951b058` state.
+- Ordered trace artifacts may be retained as diagnostic evidence, but are not
+  production inputs and do not justify another retrace.
+- Do not resume candidate-set pruning unless new baseline-authoritative
+  semantics prove a must-edge that excludes the independent B60 generation-4
+  assignment without simulator logs or hardcoded identities.
 
-The counter is CTA-local. The endpoints define only a partial order:
+The concrete next step is still to locate the first producer/consumer timing
+divergence (the ~2K-cycle skew where warp 0 reissues the next `0x16c50`
+contract before the consumer reaches `0x74e0`) and the whole-warp park sites
+that block producer ARRIVEs. This is a divergence and park-safety hunt, not a
+new trace schema, and is deliberately separated from B1.
 
-```text
-A.end_seq < B.begin_seq  -> A definitely precedes B
-B.end_seq < A.begin_seq  -> B definitely precedes A
-otherwise                -> intervals overlap; both orders remain legal
-```
-
-Do not use `clock64`, host receive order, or a device-global counter.
-
-###### V2 transport and launch lifetime
-
-Exact-ticket v1 mixed a new record into a channel whose decoder expected only
-the existing instruction record. V2 uses a separate bounded per-launch managed
-record buffer and writes `extra_info/sync_event_order.raw.jsonl` only after the
-kernel has synchronized. The instruction channel and protobuf stream are
-unchanged until the offline join.
-
-The instrumented callback must not embed a per-launch allocation pointer. Use
-one tracer-lifetime launch-context registry:
-
-```text
-stable registry address embedded once
-launch_uid selects one live registry slot
-slot owns the launch's CTA counter slice, per-warp begin scratch,
-and bounded order-record buffer
-slot contents reset before launch
-slot retired only after kernel synchronization, validation, and host dump
-```
-
-The registry has a configured concurrent-launch capacity and fails closed on
-slot exhaustion, duplicate launch UID, grid overflow, record-buffer overflow,
-or stale-slot reuse. Its base address never changes after instrumentation.
-Device callbacks never wait for a host consumer. They reserve one bounded
-CTA-local record index, write the fixed-size record directly, and set an
-overflow error instead of spinning when capacity is exhausted. The record
-counter is CTA-local rather than one contended device-global counter.
-`SYNC_EVENT_ORDER_RECORDS_PER_CTA` controls the per-CTA partition and
-`SYNC_EVENT_ORDER_MAX_RECORDS` caps total launch allocation.
-
-Each order record contains:
-
-```text
-record version and kind
-launch UID and trace kernel ID
-CTA x/y/z and linear global CTA
-CTA-local warp and capture SM
-function ID and PC
-active and predicate masks
-semantic event kind
-begin_seq and end_seq
-captured wait result when available
-```
-
-Runtime barrier address, wait state, and TMA completion target remain owned by
-the protobuf occurrence. The raw join key is:
-
-```text
-launch UID, CTA, warp, function, PC, per-PC occurrence ordinal
-```
-
-The ordinal is bootstrap-only. A bijective raw join stamps immutable
-`trace_event_id`, `source_warp_instruction_index`, `begin_seq`, and `end_seq`
-before trimming or sparse reconstruction. Retained instructions are never
-renumbered, and reconstructed instructions never invent order identity.
-
-###### V2 candidate-set resolver
-
-The resolver consumes only SASS, protobuf, the validated WaitBlock sidecar, and
-`sync_event_order.jsonl`. Simulator logs are prohibited inputs.
-
-For each CTA:
-
-1. Validate one SM identity, unique sequence endpoints, `begin < end`, per-warp
-   non-overlap, and a bijective order-event/protobuf join.
-2. Replay `EXCH`, ordered count ARRIVEs, TMA contract opens, and
-   completion-bearing LOAD issues as a partial order.
-3. Recover captured ready/miss outcomes from the destination predicate or the
-   already validated following branch path.
-4. Group captured polling iterations into one semantic wait episode.
-5. Enumerate every barrier release generation compatible with parity,
-   contract lifecycle, wait result, and all legal orderings of overlapping
-   intervals.
-6. Remove a candidate only when every legal ordering proves it impossible.
-   A candidate requiring an event downstream of the wait is removed.
-7. Emit the union of surviving generations as the complete candidate set `S`.
-8. Emit `min(S)`, `max(S)`, and proof that `max(S)` does or does not require
-   semantic work behind the wait.
-
-Resolver outcomes:
-
-```text
-empty set                 -> INCONSISTENT_TRACE
-finite complete set       -> emit candidate-set ticket
-unbounded/incomplete set  -> UNSUPPORTED_ORDERING
-unsafe mixed maximum      -> AMBIGUOUS_UNREACHABLE
-```
-
-Unlike v1, a multi-element set is not automatically an error. The resolver
-never collapses it with a tie-break.
-
-###### V2 sidecar identity
-
-Each schema-v6 ticket contains:
-
-```json
-{
-  "trace_kernel_id": 5,
-  "global_cta_id": 124,
-  "warp_id": 12,
-  "unique_function_id": 3,
-  "block_id": "wb_fid3_e0x74e0",
-  "trace_event_id": 1234,
-  "canonical_occurrence_index": 4256,
-  "barrier_addr": 93264,
-  "wait_parity": 0,
-  "captured_result": "READY",
-  "candidate_generations": [1, 3],
-  "min_candidate": 1,
-  "max_candidate": 3,
-  "max_reachable_without_wait": true,
-  "proof": "CTA_EVENT_ORDER_CANDIDATE_SET_V2"
-}
-```
-
-The trace stage may publish a schema-v6 sidecar only when every active
-WaitBlock action has exactly one identity-matched ticket. Missing, duplicate,
-mismatched, or incomplete tickets fail sidecar generation; partial output must
-not be promoted as a simulator input.
-
-###### V2 simulator contract (design only; currently frozen)
-
-This subsection defines the intended consumer contract so the trace artifact is
-designed against a concrete interface. It does not authorize any simulator
-source, loader, runtime, test-baseline, or configuration change during the
-trace stage. After the trace gate passes, simulator implementation still
-requires a separate explicit approval.
-
-The future simulator stage will add immutable event/canonical identity to
-`trace_warp_inst_t` and preserve it through fetch, trim, sparse reconstruction,
-IBuffer rollback, partial replay, reservation, and cursor commit.
-
-At a WaitBlock action:
-
-```text
-native phase ready
-    release normally
-
-native phase not ready and current_gen >= max_candidate
-    release as DEFINITELY_COMPLETE
-    increment waitblock_candidate_set_stale_releases
-
-native phase not ready and current_gen < max_candidate
-    hold only if max_reachable_without_wait
-
-native phase not ready and max is not independently reachable
-    abort AMBIGUOUS_UNREACHABLE
-```
-
-The pending hold stores the immutable ticket identity and `max_candidate`.
-Release never recomputes candidates from live parity.
-
-B0-D remains exact and separate:
-
-```text
-TMA completion generation == live barrier generation
-```
-
-Candidate-set `>=` semantics must never be used for TMA completion ownership.
-
-###### V2 staged implementation and approval order
-
-**Stage T: trace generation and offline proof -- currently authorized**
-
-1. **Freeze scope and baseline**
-   - Do not modify simulator source, simulator configuration, B0-D ownership
-     logic, or the accepted K5 `.e85` and K10 `.e62` baselines.
-   - Restrict code changes to tracer capture, order-artifact production,
-     offline joining, candidate resolution, and their focused tests.
-2. **Configuration and feature-off gate**
-   - Add `SYNC_EVENT_ORDER`, default off.
-   - Add startup validation and banner.
-   - Prove feature-off trace byte identity.
-3. **Stable launch registry**
-   - Implement tracer-lifetime registry allocation.
-   - Add launch slot acquire/reset/retire and overflow/stale-slot aborts.
-4. **Separate order transport**
-   - Add a bounded per-launch managed buffer and versioned fixed-size order
-     record.
-   - Do not modify the existing instruction channel decoder.
-   - Do not make GPU progress depend on a host receiver.
-5. **Interval/point instrumentation**
-   - Select events only by decoded opcode class.
-   - Emit complete begin/end pairs for nonblocking semantic occurrences.
-   - Emit before-only point intervals for potentially blocking synchronization.
-   - Execute callback warp collectives before selecting the publishing lane.
-6. **Raw join and immutable identity**
-   - Write `sync_event_order.jsonl`.
-   - Require bijection with raw protobuf and stamp identity before transforms.
-7. **Candidate-set resolver**
-   - Implement count-barrier, TMA-contract, wait-result, overlap-order, and
-     downstream-provider constraints.
-   - Add empty, multi-candidate, overlapping-order, and unreachable-max
-     fixtures.
-8. **Schema-v6 sidecar**
-   - Emit candidate sets only after all actions pass.
-   - Reject mixed schema or partial ticket coverage.
-9. **Local static and unit validation**
-   - Validate opcode classification, registry lifetime, record decoding, join
-     cardinality, interval ordering, candidate completeness, and fail-closed
-     error paths without building or running the simulator.
-   - Prepare exact server commands and expected artifacts; the user performs
-     the build and server execution.
-10. **Ordered K5/K10 trace generation**
-    - The user builds the tracer and generates one ordered K5/K10 trace on the
-      server.
-    - Compare instruction, TMA, BAR, SYNCS, mask, payload, path-classification,
-      and occurrence fingerprints with the current trace.
-    - Reject the ordered trace if any semantic fingerprint changes.
-11. **Offline production gate**
-    - Require complete tickets for every actionable K5/K10 occurrence.
-    - Require zero missing, duplicate, inconsistent, unbounded, or unsafe
-      candidate sets.
-    - Record the trace-stage verdict before any simulator file is touched.
-
-**Stage T implementation checkpoint (2026-08-27)**
-
-The local trace-side implementation is complete:
-
-- `tracer_tool/common.h` defines a versioned 88-byte order record, bounded
-  stable launch registry, CTA counters, per-warp begin scratch, and explicit
-  device error flags.
-- `tracer_tool/inject_funcs.cu` records one CTA-local `begin_seq/end_seq`
-  interval per selected semantic occurrence, executes ballot participation
-  across the full active mask, and writes the record directly into the bounded
-  launch-owned buffer.
-- `tracer_tool/tracer_tool.cu` implements default-off configuration, opcode
-  selection, registry acquire/retire, post-synchronization raw JSONL dumping,
-  buffer capacity/overflow validation, and fail-closed launch checks.
-- `build_sync_event_order.py` validates intervals and masks, requires a
-  bijective protobuf join, stamps immutable occurrence identity, records input
-  digests, and optionally requires byte-identical protobuf trees against an
-  explicitly supplied baseline.
-- `build_waitblock_candidate_sidecar.py` uses only the validated ordered
-  artifact, protobuf, schema-v5 WaitBlock sidecar, sync metadata, and B0-D TMA
-  contract metadata. It emits a separate schema-v6 candidate sidecar only
-  after complete finite coverage.
-- `run_hw_trace.py` enables this path only with `SYNC_EVENT_ORDER=1`, uses the
-  trace directory generated by that invocation as the join/candidate input,
-  preserves feature-off run-directory artifacts, and runs all order checks
-  after trace generation and existing metadata validation.
-- `SYNC_EVENT_ORDER_BASELINE_TRACES` is optional. When supplied, post-processing
-  requires a byte-identical protobuf tree; when omitted, the ordered trace and
-  its fingerprint are still generated and the summary records
-  `baseline_comparison.status=NOT_REQUESTED`. The final Stage T perturbation
-  gate remains pending until that fingerprint is compared with an accepted
-  baseline.
-
-Local Python syntax checks, ABI layout checks, and 22 focused unit tests pass.
-The NVBit/CUDA build and K5/K10 capture have deliberately not been run locally;
-the user-owned server run and the trace acceptance checks below remain pending.
-No simulator source or configuration has been changed.
-
-The first server attempt failed the trace gate: after 17 hours the FA3 process
-still consumed 99-100% GPU, no threadblock protobuf had completed, and
-`sync_event_order.raw.jsonl` remained empty. The GPU was still inside the
-instrumented benchmark, so offline processing was not involved. A managed
-buffer rerun then remained in kernel 1 beyond 15 minutes even though that
-kernel has only one `BAR.SYNC` and one `WARPSYNC` order site. Static inspection
-found the deterministic deadlock: `record_sync_order_begin()` selected the
-first lane before calling `__ballot_sync(active_mask, pred)`, so the collective
-waited for active lanes that had already returned. The callback now executes
-the ballot on every active lane before electing the publisher. The earlier
-channel transport is also removed because its bounded `push()` unnecessarily
-coupled GPU progress to host drain, but runtime evidence did not establish it
-as the first blocking instruction. Potentially blocking synchronization sites
-now use before-only point capture to avoid relying on `IPOINT_AFTER`.
-
-**Decision gate after Stage T**
-
-```text
-TRACE PASS
-    retain the isolated tracer/offline changes and accepted artifacts
-    keep every simulator file unchanged
-    request separate approval for Stage S
-
-TRACE FAIL
-    do not start Stage S
-    revert only code/config/schema/test changes introduced by Stage T
-    discard unaccepted Stage T order/sidecar artifacts
-    preserve B0-D, pre-existing user changes, and unrelated files
-```
-
-An intermediate implementation defect may be fixed and retested inside Stage T.
-`TRACE FAIL` is the final disposition when the ordered capture or offline proof
-cannot satisfy every trace acceptance item. A partial sidecar, a manually
-edited ticket, or a special-case fallback does not convert a failure to PASS.
-
-**Stage S: simulator consumption and runtime -- frozen**
-
-Stage S may begin only after `TRACE PASS` and a separate explicit user
-approval. Its future order is:
-
-1. Add the schema-v6 loader and immutable identity plumbing through every
-   cursor/replay path.
-2. Implement the WaitBlock runtime contract above while preserving native-ready
-   behavior and B0-D exact completion equality.
-3. Run focused loader, identity, release, hold, ambiguity, rollback, and
-   conservation tests.
-4. Run K5 and K10 with the accepted ordered sidecars and check the final
-   simulator acceptance criteria.
-
-###### V2 trace-stage acceptance (current gate)
-
-```text
-SYNC_EVENT_ORDER=0 is byte-identical
-no application/kernel/PC/barrier/generation hardcoding
-separate order buffer cannot enter the instruction channel decoder
-record-buffer overflow count is zero
-launch registry pointer remains stable across reinstrumented launches
-all begin/end pairs and raw joins are bijective
-all overlapping intervals retain every legal order
-all 87,763 current K5/K10 semantic actions receive complete tickets
-no candidate is removed using simulator-log evidence
-no semantic TMA/BAR/memory occurrence is changed
-ordered K5/K10 semantic fingerprints match their unordered baselines
-CTA124 warp12 0x74e0 candidate max is below the .e85 stale-arrival generation
-```
-
-The final CTA124 comparison is a post-generation validation check only. The
-`.e85` simulator log must not be an input to capture, joining, pruning, or
-candidate generation. The trace gate proves that the required offline
-information exists and is complete; it does not by itself prove that the K5
-simulator deadlock is fixed.
-
-###### V2 future simulator acceptance (not currently authorized)
-
-```text
-every schema-v6 ticket is loaded by immutable occurrence identity
-CTA124 warp12 0x74e0 releases only under the candidate-set contract
-CTA124 warp0 0xb370 remains held until its required generation
-B0-D equality and byte/identity reconciliation remain PASS
-K5 exits without the 13-warp cycle
-K10 retains all `.e62` ownership, cursor, replay, and WaitBlock invariants
-```
-
-**Required B0-E stage gates**
+**Required B0-E implementation gates**
 
 1. Treat K10 `.e62` as the completed B0-D baseline: 384/384 CTAs complete,
    132/132 TMABIND final records pass, and every WaitBlock summary passes.
-2. Complete Stage T only. Simulator files and baselines remain frozen
-   throughout this stage.
-3. Require the user-generated ordered K5/K10 traces to pass feature-off,
-   perturbation, capture-completeness, raw-join, and candidate-completeness
-   checks.
-4. On `TRACE FAIL`, stop B0-E and revert only the isolated Stage T changes. Do
-   not compensate with a simulator heuristic or a hardcoded ticket.
-5. On `TRACE PASS`, retain Stage T but keep Stage S frozen and present the
-   evidence for a separate implementation approval.
-6. After that separate approval only, implement Stage S and preserve every
-   semantic TMA/BAR/memory occurrence, cursor ownership rule, and B0-D
-   byte/identity invariant.
-7. Final B0-E acceptance requires focused cycle tests, K5 clean exit with every
-   `[WAITBLOCK][summary] status=PASS` and `[TMABIND][FINAL] status=PASS`, and
-   K10 retention of the complete `.e62` baseline.
+2. Extract the chronological `.e85` simulator-log timeline for CTA124 warps 0,
+   4, and 12 around the `0x16c50`/`0x16c60` flips and the
+   `0x74e0`/`0xb370` holds. Identify the first simulator interval that diverges
+   from the intended producer-to-consumer order. This is root-cause evidence,
+   not an input to a ticket resolver.
+3. For every hold in the terminal cycle, determine whether the held warp still
+   has an ARRIVE or other semantic event ahead of the hold that another warp
+   requires. Compare completing SM119 against hanging SM124 at the same
+   occurrence.
+4. Use the evidence from gates 2-3 to select a pure timing correction, a
+   park-safety correction, or both. Do not reintroduce ordered generation
+   tickets, forced phase flips, guessed generations, or unproven releases.
+5. Review the correction separately from B1 and preserve every semantic
+   TMA/BAR/memory occurrence, cursor ownership rule, and B0-D byte/identity
+   invariant.
+6. Require focused cycle tests plus K5 clean exit with every
+   `[WAITBLOCK][summary] status=PASS` and every
+   `[TMABIND][FINAL] status=PASS`.
 
 The post-B0-D K5 `.e85` rerun has established the remaining terminal state.
 B0-E acceptance must eliminate the 13-warp all-live cycle without dropping a
