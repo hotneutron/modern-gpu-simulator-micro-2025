@@ -3,7 +3,7 @@
 > **Post-`.e83` authority note.** This document owns stable TMA architecture
 > contracts. The evidence, staged repair order, and K5/K10 acceptance criteria
 > for descriptor-size restoration and exact mbarrier completion ownership live
-> in [`WAIT_BLOCK.md` Section 6](WAIT_BLOCK.md#6-consolidated-batch-b-design-after-e83)
+> in [`WAIT_BLOCK_TMA_OWNERSHIP.md`](WAIT_BLOCK_TMA_OWNERSHIP.md)
 > and override older completion/base-mapping claims here.
 
 ## Goal
@@ -917,7 +917,7 @@ requests_total = requests_per_row * outer_iters              // count of 128B AG
   FA3 Q geometry require `box_dim=[64,192]`, `element_size=2`,
   `total_bytes=24,576`, `requests_total=192`, and 768 32-byte sector
   responses. The kernel-aware mapping repair and size-only validation are
-  specified in `WAIT_BLOCK.md` Section 6.4.
+  specified in `WAIT_BLOCK_TMA_OWNERSHIP.md` Section 3.
 
 **B. Covered-span source — `UBLKCP`, `UBLKPF`, `UBLKRED`** (1D bulk ops, no box geometry)
 
@@ -971,7 +971,7 @@ break an identity tie. The earlier reasoning that rejected 24,576/768 held the
 the actual defect is the misidentified geometry, under which 24,576/768 is
 exactly consistent. Restoring the 24,576-byte model is the B0-B map
 regeneration, checked by the B0-C byte-conservation diagnostic in
-`WAIT_BLOCK.md` Section 6.4. `UTMAPF`/`UBLKPF` are **not** covered here; they
+`WAIT_BLOCK_TMA_OWNERSHIP.md` Section 3. `UTMAPF`/`UBLKPF` are **not** covered here; they
 were moved to Phase 4.5 (see phase map).
 
 **Key implementation detail (L2-friendly issue):** the TMA mover emits each 128B AGU request as `SECTOR_CHUNCK_SIZE` (4) separate 32B sector mem_fetches, each carrying a single-bit `sector_mask` and matching `byte_mask`, exactly like a coalesced ldst request. This keeps the L2 from re-splitting the request (`breakdown_request_to_sector_requests` passes `data_size==32 && sector_mask.count()==1` unchanged), so one issued mf maps to exactly one response. AGU throughput remains modeled in 128B cache-line units (`requests_total`); only the wire-level mf granularity is 32B.
@@ -1183,7 +1183,9 @@ use the high half of the first destination-state register pair for observed
 completion-bearing `UTMALDG` and `UBLKCP`. `UTMAPF`/`UBLKPF` are prefetches and
 have no completion target. Commit `9e92fe9` captures the runtime target in the
 trace, but it is not represented in the current `TMACommand`. K5 `.e83` proves
-that the per-warp FIFO is insufficient; see `WAIT_BLOCK.md` Sections 5 and 6.
+that the per-warp FIFO is insufficient; see `WAIT_BLOCK_HISTORY.md` Section 4
+(the `.e83` tx-credit deadlock) and `WAIT_BLOCK_TMA_OWNERSHIP.md` (the exact
+completion-ownership design).
 
 The store-side commit-group / wait-group completion (Phase 4, `UTMACMDFLUSH`) is a **separate** mechanism and is *not* covered by this mbarrier model.
 

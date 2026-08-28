@@ -13,7 +13,7 @@
 > `(trace_kernel_id, unique_function_id, pc)`, preserve each UTMACCTL
 > source/destination edge, reject ambiguity, and remove direct/pool selection
 > as an identity authority. The complete staged plan is
-> [`WAIT_BLOCK.md` Section 6](WAIT_BLOCK.md#6-consolidated-batch-b-design-after-e83).
+> [`WAIT_BLOCK_TMA_OWNERSHIP.md`](WAIT_BLOCK_TMA_OWNERSHIP.md).
 
 > **Goal.** Make the TMA unit resolve the *actual* per-transfer GMEM address the
 > way real Hopper HW does — `addr = global_base + Σ coord[d]·global_stride[d]` —

@@ -5,7 +5,8 @@
 > produced them, but they are not final timing baselines. K5 `UTMALDG 0x96b0`
 > was modeled as 16,384 bytes through a non-authoritative direct descriptor
 > mapping; its Q transaction is 24,576 bytes. K5 timing must therefore be
-> re-baselined after the size-only correction in `WAIT_BLOCK.md` Section 6.
+> re-baselined after the size-only correction in `WAIT_BLOCK_TMA_OWNERSHIP.md`
+> Section 3.
 > K10 command-byte contracts remain exact, including
 > `UTMALDG(16,384)+UBLKCP(512)=16,896`, but descriptor base identity remains
 > provisional until the kernel-aware UTMACCTL chain is validated. Also repair

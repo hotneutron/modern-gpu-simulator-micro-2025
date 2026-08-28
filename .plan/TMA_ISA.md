@@ -10,7 +10,7 @@ This note is for **FlashAttention-3 (FA3)** trace investigation on Hopper.
 > offsets from different coordinate spaces, while the old chain merges
 > trace-kernel variants. Exact descriptor identity now requires a
 > `(trace_kernel_id, unique_function_id, pc)` UTMACCTL data-flow chain with zero
-> ambiguity. See [`WAIT_BLOCK.md` Section 6](WAIT_BLOCK.md#6-consolidated-batch-b-design-after-e83).
+> ambiguity. See [`WAIT_BLOCK_TMA_OWNERSHIP.md`](WAIT_BLOCK_TMA_OWNERSHIP.md).
 
 Trace path checked:
 
@@ -471,5 +471,5 @@ blockers — that is no longer true):
 5. `UBLKRED` — modeled; exact covered_bytes size (raw-ptr dest, not a tensormap). Base synthetic in M1; **M2.5: real base (offline param-blob) + mock tiling**
 
 The authoritative correction and validation order is tracked in
-[`WAIT_BLOCK.md` Section 6](WAIT_BLOCK.md#6-consolidated-batch-b-design-after-e83).
+[`WAIT_BLOCK_TMA_OWNERSHIP.md`](WAIT_BLOCK_TMA_OWNERSHIP.md).
 The older integration plan remains the subsystem history.

@@ -4,8 +4,9 @@
 > early Batch B investigation. The authoritative post-`.e83` design, current
 > trace evidence, descriptor-size repair, exact TMA completion ownership, and
 > B1 release ordering are consolidated in
-> [`.plan/WAIT_BLOCK.md` Section 6](../../.plan/WAIT_BLOCK.md#6-consolidated-batch-b-design-after-e83).
-> Where this document conflicts with that section, `WAIT_BLOCK.md` wins.
+> [`.plan/WAIT_BLOCK_TMA_OWNERSHIP.md`](../../.plan/WAIT_BLOCK_TMA_OWNERSHIP.md),
+> indexed by [`.plan/WAIT_BLOCK.md`](../../.plan/WAIT_BLOCK.md).
+> Where this document conflicts with those, they win.
 
 ## Summary
 

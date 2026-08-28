@@ -3,7 +3,7 @@
 > **Post-`.e83` status correction (2026-08-24).** This document records the
 > original real-base integration work. Its `direct + chain = 23/23 exact`
 > conclusion is superseded by
-> [`WAIT_BLOCK.md` Section 6](WAIT_BLOCK.md#6-consolidated-batch-b-design-after-e83).
+> [`WAIT_BLOCK_TMA_OWNERSHIP.md`](WAIT_BLOCK_TMA_OWNERSHIP.md).
 > The old `direct` path is a numeric-offset shortcut, not an identity proof.
 > The old chain also merges trace-kernel variants under `(uid,pc)`. Current
 > evidence requires a kernel-aware, ambiguity-free UTMACCTL chain before a

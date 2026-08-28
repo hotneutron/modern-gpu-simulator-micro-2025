@@ -8,7 +8,7 @@ The simulator's synchronization model for Hopper architecture has been completel
 > never received `completion_barrier_addr` or equivalent identity. K5 `.e83`
 > reproduces the same failure class described in Section 4: a completion updates
 > the wrong barrier. The current mechanism is FIFO spill rather than the older
-> single-active-slot overwrite. See `WAIT_BLOCK.md` Section 5.
+> single-active-slot overwrite. See `WAIT_BLOCK_HISTORY.md` Section 4.
 
 # 2. Deterministic Hardware Rules for MBarrier
 
