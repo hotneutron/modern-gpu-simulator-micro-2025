@@ -3625,6 +3625,17 @@ void shader_core_config::reg_options(class OptionParser *opp) {
       opp, "-wait_block_debug", OPT_BOOL, &wait_block_debug,
       "Emit [WAITBLOCK] hold/release/guard/summary diagnostics. (default=0)",
       "0");
+  option_parser_register(
+      opp, "-wait_block_deadlock_release_enable", OPT_BOOL,
+      &wait_block_deadlock_release_enable,
+      "[B0-E] On a proven CTA-wide WaitBlock deadlock (every live participant "
+      "parked on an unsatisfied wait), release ONE cycle-participating "
+      "INJECT_MISSING_WAIT hold per detection so its captured ARRIVE can flip "
+      "the count barrier that frees the producer. Never releases a captured "
+      "poll, never moves a cursor, never forces a phase or guesses a "
+      "generation; aborts if a release produces no new progress. Requires "
+      "-wait_block_enable. (default=0)",
+      "0");
   option_parser_register(opp, "-trimchk_percta_log_enable", OPT_BOOL,
                          &trimchk_percta_log_enable,
                          "[TRIMCHK]/[TRACECHECK] Emit per-CTA trace-load contract lines: "

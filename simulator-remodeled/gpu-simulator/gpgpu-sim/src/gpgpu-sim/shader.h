@@ -2290,6 +2290,15 @@ class shader_core_config : public core_config {
   // Emit [WAITBLOCK] hold/release/guard/summary diagnostics.
   bool wait_block_debug;
 
+  // [B0-E] When the whole CTA is deadlocked (every live participant parked on an
+  // unsatisfied wait), release ONE cycle-participating INJECT_MISSING_WAIT hold
+  // so its captured ARRIVE can flip the count barrier that frees the producer.
+  // Safety rests on the proof-by-contradiction in .plan/WAIT_BLOCK.md (a hold in
+  // a CTA-wide deadlock necessarily waits on already-passed data, else HW would
+  // hang too). Fires only inside a proven deadlock; aborts if a release buys no
+  // new progress. Default-off keeps runs byte-identical to the B0-D baseline.
+  bool wait_block_deadlock_release_enable;
+
   // [TRIMCHK]/[TRACECHECK] Gate verbose per-CTA trace-load contract lines:
   // path/warp counts plus active-lane, memory, sync, BAR, and opcode-work
   // counts. Off by default because it prints two lines per CTA. The
