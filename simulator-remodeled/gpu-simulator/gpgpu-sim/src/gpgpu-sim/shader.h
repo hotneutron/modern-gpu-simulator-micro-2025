@@ -2299,6 +2299,15 @@ class shader_core_config : public core_config {
   // new progress. Default-off keeps runs byte-identical to the B0-D baseline.
   bool wait_block_deadlock_release_enable;
 
+  // [B0-E] Minimum number of consecutive cycles a CTA must be observed fully
+  // stuck before a deadlock is declared and a release is allowed. Transient
+  // all-parked windows (normal drain / brief mutual waits) resolve on their own
+  // within a small span; only a genuine deadlock stays stuck indefinitely. This
+  // sustained-stuck threshold separates the two so normal CTAs are never
+  // disturbed. Measured against the per-CTA suspect_cycle. Only consulted when
+  // wait_block_deadlock_release_enable is set.
+  unsigned wait_block_deadlock_min_stuck_cycles;
+
   // [TRIMCHK]/[TRACECHECK] Gate verbose per-CTA trace-load contract lines:
   // path/warp counts plus active-lane, memory, sync, BAR, and opcode-work
   // counts. Off by default because it prints two lines per CTA. The
