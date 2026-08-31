@@ -40,16 +40,6 @@
 
 #include "../../traces_enhanced/src/string_utilities.h"
 
-template <typename T>
-__device__ __forceinline__ T shfl_from_active_lane(
-    uint32_t active_mask, T value, int source_lane) {
-  // CUDA leaves shuffle results undefined when the source lane is not active.
-  if ((active_mask & (1u << source_lane)) == 0) {
-    return T{};
-  }
-  return __shfl_sync(active_mask, value, source_lane);
-}
-
 /* Instrumentation function that we want to inject, please note the use of
  *  extern "C" __device__ __noinline__
  *    To prevent "dead"-code elimination by the compiler.
@@ -83,7 +73,7 @@ extern "C" __device__ __noinline__ void instrument_inst(
   if (memory_type == MEM_TYPE::STANDARD_MEM) {
     for (int i = 0; i < 32; i++) {
       ma.addrs_or_reg_val_0[i] =
-          shfl_from_active_lane(active_mask, addr_or_offset_or_reg_id, i);
+          __shfl_sync(active_mask, addr_or_offset_or_reg_id, i);
     }
     ma.width = mem_width_or_op_reg_val_0;
     ma.mem_type = MEM_TYPE::STANDARD_MEM;
@@ -102,7 +92,7 @@ extern "C" __device__ __noinline__ void instrument_inst(
     ma.width = 4;
     for (int tid = 0; tid < 32; tid++) {
       ma.addrs_or_reg_val_0[tid] =
-          shfl_from_active_lane(active_mask, reg_value, tid);
+          __shfl_sync(active_mask, reg_value, tid);
     }
   }else if(memory_type == MEM_TYPE::CALL_OR_RET) {
     ma.mem_type = MEM_TYPE::CALL_OR_RET;
@@ -111,9 +101,9 @@ extern "C" __device__ __noinline__ void instrument_inst(
     uint32_t reg_value_2 = op_reg_val_1;
     for (int tid = 0; tid < 32; tid++) {
       uint32_t th_reg_val1 =
-          shfl_from_active_lane(active_mask, reg_value_1, tid);
+          __shfl_sync(active_mask, reg_value_1, tid);
       uint32_t th_reg_val2 =
-          shfl_from_active_lane(active_mask, reg_value_2, tid);
+          __shfl_sync(active_mask, reg_value_2, tid);
       uint64_t final_addr = static_cast<uint64_t>(th_reg_val2) << 32;
       final_addr += th_reg_val1 + addr_or_offset_or_reg_id;
       ma.addrs_or_reg_val_0[tid] = final_addr;
@@ -128,23 +118,22 @@ extern "C" __device__ __noinline__ void instrument_inst(
        (per_operand_type == TRACED_REG_TYPE::PREDICATE)) {
       for (int tid = 0; tid < 32; tid++) {
         ma.addrs_or_reg_val_0[tid] =
-            shfl_from_active_lane(
-                active_mask, mem_width_or_op_reg_val_0, tid);
+            __shfl_sync(active_mask, mem_width_or_op_reg_val_0, tid);
       }
       if(per_operand_type == TRACED_REG_TYPE::REGULAR_2_REGS) {
         for (int tid = 0; tid < 32; tid++) {
           ma.reg_val_1[tid] =
-              shfl_from_active_lane(active_mask, op_reg_val_1, tid);
+              __shfl_sync(active_mask, op_reg_val_1, tid);
         }
       }
       if(per_operand_type == TRACED_REG_TYPE::REGULAR_4_REGS) {
         for (int tid = 0; tid < 32; tid++) {
           ma.reg_val_2[tid] =
-              shfl_from_active_lane(active_mask, op_reg_val_2, tid);
+              __shfl_sync(active_mask, op_reg_val_2, tid);
         }
         for (int tid = 0; tid < 32; tid++) {
           ma.reg_val_3[tid] =
-              shfl_from_active_lane(active_mask, op_reg_val_3, tid);
+              __shfl_sync(active_mask, op_reg_val_3, tid);
         }
       }
     }else if((per_operand_type == TRACED_REG_TYPE::UNIFORM) ||
@@ -230,7 +219,7 @@ extern "C" __device__ __noinline__ void instrument_inst_compact(
     ma.record_flags |= INST_TRACE_HAS_LANE_VALUES;
     for (int i = 0; i < 32; i++) {
       ma.lane_values[i] =
-          shfl_from_active_lane(active_mask, addr_or_offset_or_reg_id, i);
+          __shfl_sync(active_mask, addr_or_offset_or_reg_id, i);
     }
     ma.width = mem_width_or_op_reg_val_0;
     ma.mem_type = MEM_TYPE::STANDARD_MEM;
@@ -251,7 +240,7 @@ extern "C" __device__ __noinline__ void instrument_inst_compact(
     ma.width = 4;
     for (int tid = 0; tid < 32; tid++) {
         ma.lane_values[tid] =
-            shfl_from_active_lane(active_mask, reg_value, tid);
+            __shfl_sync(active_mask, reg_value, tid);
     }
   }else if(memory_type == MEM_TYPE::CALL_OR_RET) {
     ma.record_size = INST_TRACE_MEMORY_SIZE;
@@ -261,10 +250,8 @@ extern "C" __device__ __noinline__ void instrument_inst_compact(
     uint32_t reg_value_1 = mem_width_or_op_reg_val_0;
     uint32_t reg_value_2 = op_reg_val_1;
     for (int tid = 0; tid < 32; tid++) {
-        uint32_t th_reg_val1 =
-            shfl_from_active_lane(active_mask, reg_value_1, tid);
-        uint32_t th_reg_val2 =
-            shfl_from_active_lane(active_mask, reg_value_2, tid);
+        uint32_t th_reg_val1 = __shfl_sync(active_mask, reg_value_1, tid);
+        uint32_t th_reg_val2 = __shfl_sync(active_mask, reg_value_2, tid);
         uint64_t final_addr = static_cast<uint64_t>(th_reg_val2) << 32;
         final_addr += th_reg_val1 + addr_or_offset_or_reg_id;
         ma.lane_values[tid] = final_addr;

@@ -1,28 +1,30 @@
 # WaitBlock: Design Index and Live B0-E Work
 
-**Status (2026-08-30):** Post-processing v5 and the partial-replay simulator are
+**Status (2026-08-31):** Post-processing v5 and the partial-replay simulator are
 implemented and full-trace validated. B0-A/B/C are complete. B0-D (exact TMA
 completion ownership) is **complete and validated** at `39abefb`: K5 `.e85`
 validates ownership-clean out-of-order completion and K10 `.e62` completes
 384/384 CTAs with 132/132 clean SM-level `TMABIND` final records. The only open
 correctness item is **B0-E**: a K5 all-live 13-warp cross-warp WaitBlock cycle
-on SM124 (`0xb370`/`0x16c60`). Three offline pairing designs (ordered generation
-ticket, ordered candidate-set, runtime UR recompute) were explored and
-**rejected**, and a generic runtime deadlock-release attempt
-(single-consumer release under a proven CTA-wide deadlock) was **implemented,
-tested, and reverted** — it advanced K5 from generation 4 to generation 9 but
-still tripped the hold watchdog, and it perturbed K10 timing (regression). The
-tree is back at the `326ef0b` baseline. A **temporary, measurement-only,
-PC-hardcoded K5 deadlock breaker** was added at `9e16c6f` solely to observe the
-K5 completion cycle count; it is explicitly **not a fix**. Its first run
-confirmed K10 stays clean but K5 **still does not complete** — the four consumer
-PCs cleared let K5 reach later generations where new hang sites (`0x35e0`,
-`0x3750`, producer FOLD `0xb0b0`, partial `0xab40`) surface, i.e. the K5 deadlock
-is multi-layer. **The probe code has since been reverted** (only the four code
-files: `shader.h`, `gpu-sim.cc`, `sm.cc`, config); this document's probe findings
-and handover are intentionally kept for the next session. See "Temporary K5
-hardcoded deadlock breaker" → "HANDOVER — next session" for the A/B decision that
-is the immediate next step. B1 and later items remain pending.
+on SM124 (`0xb370`/`0x16c60`). Three attempts to infer an absolute wait
+generation from the old trace (ordered generation ticket, ordered candidate-set,
+runtime UR recompute) remain **rejected**. Generic and PC-hardcoded runtime
+release experiments also remain rejected/reverted: they moved the hang to later
+generations and new wait sites, and the generic release regressed K10.
+
+A new, narrower direction is now the live B0-E candidate: capture the
+**barrier-local opened-contract ordinal at each wait** for TMA-backed barriers
+whose trace proves one initialization, decoded arrival count one, one
+`ARRIVE_EXPECT_TX` arrival per generation, and exact B0-D byte ownership. This
+is not a revival of the rejected offline-order guess: it adds the missing
+cross-warp state to the trace. An audit of the existing full FA3 trace
+(`git_sha=9e92fe9`) found that K5 has 2,112 ordinal-unique TMA wait streams and
+3,072 ambiguous sparse-role streams, while all 11,904 K10 TMA wait streams are
+ordinal-unique under a strict increasing-generation assumption. The existing
+trace therefore proves both the applicability of the restricted contract model
+and the need for one new captured field. **No simulator behavior change is
+authorized until a regenerated FA3 trace resolves every eligible occurrence
+with zero ambiguity.** B1 and later items remain pending.
 
 This document is the authoritative index and the live execution record for
 B0-E. The detailed per-work-type designs and the historical evidence live in the
@@ -55,9 +57,82 @@ designs win.
    baseline.
 2. The post-`951b058` ordered-candidate experiment and the ordered-ticket design
    are historical evidence only (see [WAIT_BLOCK_HISTORY.md](WAIT_BLOCK_HISTORY.md)).
-3. The next authorized work is the first-divergence and global park-safety
-   analysis under the gates in this document. No new trace schema or simulator
-   release heuristic is authorized.
+3. The next planned work is a **capture-only feasibility stage** for
+   barrier-local contract ordinals. It must not infer a generation from current
+   parity alone, reconstruct a CTA-global total order, or change simulator
+   wait/release behavior.
+4. A simulator event-ID implementation may be reviewed only after the new trace
+   proves one release generation for every eligible K5/K10 wait occurrence.
+   Any missing, duplicate, or ambiguous mapping rejects the design.
+5. First-divergence timing analysis and global park-safety remain fallback and
+   diagnostic work. They must not be mixed into the capture-only experiment.
+
+## New-session handover snapshot (2026-08-31)
+
+### Repository state
+
+- Branch: `tma-impl`.
+- The local cleanup commit with subject
+  `chore(waitblock): retire probe and update B0-E plan` has not been pushed at
+  the time of this handover.
+- Relative to `5c575d5`, the intended net changes before Stage E0 are only:
+
+```text
+.plan/WAIT_BLOCK.md
+simulator-remodeled/util/tracer_nvbit/run_hw_trace.py
+```
+
+- `run_hw_trace.py` retains the generic `-f/--force-overwrite` option.
+- The `mbarrier_release_probe` source/build/YAML integration, its plain
+  `NANOSLEEP` sidecar extension, and the unconfirmed inactive-lane tracer
+  experiment from `7240bee` were reverted.
+- The temporary K5 PC-hardcoded release code remains reverted.
+- Existing unrelated untracked debug files must not be added, modified, or
+  deleted as part of Stage E0.
+
+### Fixed source-trace baseline
+
+Use this existing full trace for all before/after comparisons:
+
+```text
+simulator-remodeled/hw_run/traces/device-0/12.8/
+  flashattn-fa3-bf16-bwd-causal-b1-s2048-hd64-nh24/
+  flashattn_fa3_bf16_bwd_causal_b1_s2048_hd64_nh24___warmup_0___iters_1/
+```
+
+It is 2.0 GiB, contains K1-K11, and was generated with:
+
+```text
+tracer git SHA                 = 9e92fe9
+LIGHTER_TRACER canonical mode  = compact_wire,prune_operands
+K5 CTA files                   = 132
+K10 CTA files                  = 384
+```
+
+Required artifacts are present: `dynamic_trace.pb`, all CTA protobufs,
+`enhanced_execution_info.json`, SASS, `sync_operand_resolver.json`,
+`spin_wait_sidecar.json`, `tma_operand_resolver.json`,
+`tma_pc_base_map.json`, and `tma_completion_contracts.json`.
+
+Do **not** use `-f` on this path before preserving it under a distinct baseline
+directory name. Stage E0 needs both the `9e92fe9` trace and the newly captured
+trace for structural comparison.
+
+### Immediate task boundary
+
+The next session starts at **Stage E0 only**:
+
+```text
+implement barrier-local contract-ordinal capture
+implement offline uniqueness/reject analysis
+regenerate one FA3 trace
+compare it against the fixed source trace
+```
+
+Do not modify `sm.cc`, WaitBlock release behavior, generation comparison,
+cursor/replay behavior, scheduler timing, TMA completion timing, or B1 during
+Stage E0. Do not restore the deleted microbenchmark unless a separately
+identified tracer primitive needs an isolated test.
 
 ## The two runtime strategies
 
@@ -132,7 +207,10 @@ sidecar generation; unified metadata does not require unified runtime behavior.
   with a complete diagnostic. Under the approved v2 design it may hold only after
   the complementary join occurrence has issued and all extracted blocked
   occurrences are owned by the replay queue.
-- Generation overshoot and a 32,000-cycle wait-hold timeout abort.
+- Unticketed generation overshoot and a 32,000-cycle wait-hold timeout abort.
+  A future exact-ticket runtime may replace overshoot abort with
+  `current_generation >= target_release_generation`, but only after the
+  capture-only gate below passes and the runtime change is separately reviewed.
 - With a fixed TMA implementation baseline, `wait_block_enable=0` is
   bit-identical to that baseline. A separately approved cross-subsystem
   correctness repair such as B0-D establishes a new baseline; disabling WaitBlock
@@ -146,7 +224,7 @@ sidecar generation; unified metadata does not require unified runtime behavior.
 | B0-B | Kernel-aware descriptor identity and K5 tx-size restoration | **IMPLEMENTED / VALIDATED** at `0f7cbc2`; chain 23/23, ambiguity 0, K5 `0x96b0` = 24,576 bytes, 192 128-byte AGU requests, and 768 32-byte sector requests |
 | B0-C | Size-only K5/K10 byte-conservation diagnostic with existing FIFO/release order | **COMPLETE**; byte contract PASS, K10 clean exit at 138,456 cycles, K5 runtime size PASS but all-live WaitBlock abort at cycle 68,176 |
 | B0-D | Exact TMA-command-to-barrier completion ownership | **COMPLETE / VALIDATED** at `39abefb`; `.e85` validates ownership-clean out-of-order completion, and K10 `.e62` completes 384/384 CTAs with 132/132 clean SM-level TMABIND final records after exercising two simultaneous open contracts per warp |
-| B0-E | K5 all-live cross-warp WaitBlock cycle (`0xb370`/`0x16c60`) | **OPEN / ROOT-CAUSE UNDERSTOOD / NO GENERIC FIX YET**. Rejected: three offline pairing designs (ordered generation ticket, ordered candidate-set, runtime UR recompute) — all blocked by missing cross-warp order; a 1-bit parity plus per-warp modulo state cannot name a wait's absolute release generation. Implemented then **reverted**: generic runtime single-consumer deadlock-release (advanced K5 gen4→gen9 but still watchdog-aborted; regressed K10 timing). Tree restored to `326ef0b`. A **temporary PC-hardcoded, measurement-only** deadlock breaker (flag `-wait_block_k5_hardcoded_deadlock_release`, default off) is in place only to observe the K5 completion cycle count — not a fix |
+| B0-E | K5 all-live cross-warp WaitBlock cycle (`0xb370`/`0x16c60`) | **OPEN / CAPTURE FEASIBILITY NEXT**. Old offline-order ticket designs and runtime releases remain rejected. Existing FA3 trace audit: K5 2,112 unique and 3,072 ambiguous TMA wait streams; K10 11,904 unique. Candidate v1 records a barrier-local opened-contract interval at each wait, only for barriers that pass the arrival-count-one and exact B0-D contract gates. Simulator behavior remains unchanged until regenerated K5/K10 traces resolve all eligible waits uniquely |
 | B1 | One SM-level WaitBlock release phase per cycle | **REQUIRED / NOT IMPLEMENTED** |
 | B2 | WaitBlock startup and provenance fail-fast checks | **MOSTLY IMPLEMENTED** |
 | B3 | Assert-before-clear lifecycle checks | **IMPLEMENTED for WaitBlock and B0-D TMA ownership**; broader non-ownership cleanup audit remains partial |
@@ -251,6 +329,227 @@ Therefore `local proof == PASS` is not sufficient authority to park an all-live
 warp. B0-E must add a CTA-global progress argument or obtain stronger trace
 evidence before changing hold placement.
 
+### Candidate direction: barrier-local contract identity
+
+The new direction separates a wait's **logical producer dependency** from the
+cycle at which the simulator completes that dependency:
+
+```text
+trace / sidecar:
+    wait occurrence W -> exact barrier release generation G
+
+simulator timing model:
+    computes the cycle at which generation G completes
+```
+
+This is neither unconditional trace replay nor hardware-cycle replay. If W
+reaches the simulator before G, it waits. If it reaches after G, the dependency
+is already complete and W continues. Simulator timing still determines the
+wait duration, but timing drift cannot rebind W to a later generation with the
+same one-bit parity.
+
+#### Existing FA3 trace audit
+
+The full trace at
+`hw_run/traces/device-0/12.8/flashattn-fa3-bf16-bwd-causal-b1-s2048-hd64-nh24/`
+`flashattn_fa3_bf16_bwd_causal_b1_s2048_hd64_nh24___warmup_0___iters_1`
+was generated by tracer `9e92fe9`. It contains all CTA protobufs,
+`sync_operand_resolver.json`, schema-v5 `spin_wait_sidecar.json`, and validated
+B0-D TMA metadata.
+
+The barrier-lifecycle audit over all K5/K10 CTA files produced:
+
+| property | K5 | K10 |
+|---|---:|---:|
+| CTAs inspected | 132 | 384 |
+| TMA barrier instances | 660 | 1,872 |
+| active `EXCH` records per TMA barrier | exactly 1 | exactly 1 |
+| `EXCH` semantic value | `0x1ffffe` for all | `0x1ffffe` for all |
+| decoded expected arrival count | 1 for all | 1 for all |
+| TMA contracts | 5,112 | 6,912 |
+| completion-bearing LOADs | 5,112 | 13,824 |
+| expected bytes == assigned bytes | yes | yes |
+| initialization/address/byte errors | 0 | 0 |
+
+K10 commonly has two TMA LOAD commands in one contract. That is still one
+barrier generation: the two commands jointly satisfy one expected-byte
+contract.
+
+`contract` and `generation` are distinct concepts:
+
+```text
+contract:
+    one ARRIVE_EXPECT_TX occurrence plus the completion-bearing TMA command(s)
+    that satisfy its expected-byte value
+
+generation:
+    one barrier phase interval, ending when required arrivals and transaction
+    bytes are both complete
+```
+
+They are one-to-one for the eligible FA3 TMA barriers because every such
+barrier is initialized with expected arrival count one. The one active
+`ARRIVE_EXPECT_TX` supplies that sole arrival, and its TMA command(s) supply the
+transaction bytes. The phase can flip only after both are complete. K10's two
+LOADs per contract therefore remain one generation, not two generations.
+
+For a general barrier initialized with arrival count greater than one, several
+`ARRIVE_EXPECT_TX` or plain `ARRIVE` occurrences may contribute to one
+generation. In that case contract ordinal is not generation identity and this
+v1 must reject it.
+
+The existing trace records barrier address, wait parity/result path, and
+per-warp order, but no cross-warp sequence or barrier-local contract count at a
+wait. Under the strongest admissible trace-only assumption -- successive waits
+by one warp target strictly increasing generations -- the TMA wait streams
+resolve as follows:
+
+```text
+K5:
+    unique streams       = 2,112  (consumer warps 4-7)
+    ambiguous streams    = 3,072  (sparse-role warps 8-15)
+
+K10:
+    unique streams       = 11,904
+    ambiguous streams    = 0
+```
+
+Representative K5 CTA 0 ambiguity:
+
+```text
+barrier 0x16c30 contracts/releases = 9
+warp 8 wait parity sequence        = [0, 0]
+
+first wait candidates  = {1, 3, 5, 7}
+second wait candidates = {3, 5, 7, 9}
+strictly increasing assignments = 10
+```
+
+This proves that the existing compact trace cannot provide exact event IDs for
+K5. It also identifies the missing datum more narrowly than the rejected
+CTA-global ordered trace.
+
+The evidence status is:
+
+| condition | status | evidence / limitation |
+|---|---|---|
+| one initialization per eligible TMA barrier | **PASS** | every K5/K10 TMA barrier instance has exactly one active `EXCH` |
+| expected arrival count is one | **PASS** | all eligible `EXCH` values are `0x1ffffe`, decoded as one |
+| contract byte ownership is exact | **PASS** | B0-D has zero missing, residual, or cross-barrier byte assignments |
+| one contract corresponds to one generation | **PASS under the validated FA3 lifecycle** | arrival count one plus one active `ARRIVE_EXPECT_TX`; not valid for general multi-arrival barriers |
+| actual TMA phase-flip cycle is recorded | **NO** | TMA completion is asynchronous and has no SASS callback point |
+| wait ready/miss result is known | **PASS** | ready-arm path or final captured-poll exit; never inferred from parity |
+| opened contract count at each wait is known | **NO -- Stage E0 target** | current protobuf has no cross-warp sequence or barrier-local snapshot |
+| exact K5 wait-to-generation mapping from current trace | **FAIL** | 3,072 sparse-role streams remain ambiguous |
+
+The 64-bit mbarrier object lives at a shared-memory address, but the ISA does
+not expose a portable monotonic generation field. A raw shared-memory value or
+the wait parity reveals at most current state; after two flips the parity repeats
+and the lost generation count cannot be recovered.
+
+#### Restricted applicability gate
+
+Contract ordinal can stand in for generation only when every barrier instance
+passes all of these checks:
+
+1. exactly one active `EXCH` initialization in the supported epoch;
+2. decoded expected arrival count is one;
+3. no plain `ARRIVE` contributes to that TMA-backed barrier;
+4. one active `ARRIVE_EXPECT_TX` opens the generation;
+5. B0-D assigns every expected byte to the exact completion-bearing TMA
+   command(s), with no residual or cross-barrier ownership;
+6. the same-barrier lifecycle forbids opening the next contract before the
+   previous generation has completed;
+7. the wait result is proven from the captured branch path or final poll-loop
+   exit, never inferred from parity.
+
+This is a capability predicate, not an FA3 name/PC whitelist. A barrier that
+fails any check receives no ticket and the capture stage fails closed.
+
+This v1 does **not** cover:
+
+- arrival count greater than one;
+- multiple `ARRIVE_EXPECT_TX` arrivals in one generation;
+- mixed plain-ARRIVE and TMA-arrival generations;
+- count-only barriers;
+- repeated `EXCH` epochs.
+
+Those cases need arrival-group reconstruction or an explicit monotonic
+generation source. They must not silently use contract count as generation.
+
+#### Capture-only implementation plan
+
+Add barrier-local trace state keyed by:
+
+```text
+(kernel launch, CTA xyz, barrier shared-memory offset, initialization epoch)
+```
+
+Record:
+
+```text
+EXCH:
+    initialize/reset the epoch and opened-contract counter
+
+ARRIVE_EXPECT_TX:
+    allocate the next contract ordinal
+
+TRYWAIT / PHASECHK:
+    record opened-contract count before and after the wait observation
+```
+
+The before/after pair is intentional. Producer and consumer callbacks from
+different warps can overlap; a single snapshot would impose an unproven order.
+The resolver treats the pair as an interval and considers every contract count
+inside it. If `IPOINT_AFTER` is not reliable for a PHASECHK form, capture the
+before snapshot plus the already-proven following branch path and reject any
+occurrence whose contract position cannot be bounded uniquely.
+
+The tracer must not claim that it observed the asynchronous TMA phase flip.
+It observes contract-open instruction callbacks and wait instruction
+boundaries only. The resolver uses the validated same-barrier lifecycle to
+infer the adjacent completed-generation candidates. This distinction must
+remain explicit in schema names, logs, and documentation.
+
+For a supported TMA barrier with `N` contracts opened, same-barrier lifecycle
+restricts the current release generation to adjacent candidates:
+
+```text
+{N - 1, N}
+```
+
+The captured ready/miss result and parity select between them. For a polling
+episode, use the final observation that exits the loop. The output record is:
+
+```text
+barrier initialization epoch
+contract ordinal interval observed at the wait
+target release generation
+proof inputs and reject reason
+```
+
+The trace record must not contain a hardware or instrumented cycle value used
+by simulator timing. It carries dependency identity only.
+
+#### Why this is not the rejected ordered-ticket design
+
+The rejected design imposed a CTA-global order over all synchronization events
+and attempted to infer generations from overlapping begin/end intervals. It
+changed K5 control-path counts and still left candidate sets such as `{1, 3}`.
+
+The new proposal:
+
+- orders only events for the same barrier instance;
+- captures the contract count at the wait instead of reconstructing it from all
+  cross-warp events;
+- uses the already-validated B0-D contract lifecycle;
+- emits nothing when the barrier is outside the restricted applicability gate;
+- changes no simulator behavior during the feasibility stage.
+
+It still adds instrumentation and can perturb execution. Therefore the new
+trace is rejected if WaitBlock path counts, TMA contracts, semantic instruction
+counts, or CTA completion differ from the `9e92fe9` source trace.
+
 ### Why generation removal is not the fix
 
 **The primary work is (1) global park safety and (2) producer/consumer timing
@@ -312,42 +611,131 @@ Actual deadlock root causes, neither of which is the generation counter:
 
 Direction:
 
-- The primary axis is (1) global park safety and (2) producer/consumer timing
-  realignment.
-- Retiring the Role 2a audit is optional cleanup that may follow, and only
-  changes an abort into a hang; it must not be presented as resolving the cycle.
+- The immediate B0-E axis is the capture-only barrier-local contract-identity
+  experiment above. It attempts to prevent simulator timing drift from changing
+  a wait's logical target.
+- Producer/consumer timing analysis remains necessary for cycle accuracy, but
+  timing calibration is not accepted as a liveness mechanism.
+- Global park safety remains a fail-fast guard for unsupported or unticketed
+  holds; it must not release a warp.
+- Retiring the Role 2a audit without exact identity only changes an abort into a
+  hang and remains forbidden.
 - Role 2b (TMA completion identity) stays intact regardless.
 - The ordered-ticket design and the post-`951b058` experiment are recorded as
-  the rejected/closed alternatives in
-  [WAIT_BLOCK_HISTORY.md](WAIT_BLOCK_HISTORY.md). Do not re-propose ordered
-  generation tickets, forced phase flips, guessed generations, or unproven
-  whole-warp releases.
+  rejected/closed alternatives in [WAIT_BLOCK_HISTORY.md](WAIT_BLOCK_HISTORY.md).
+  Do not reintroduce CTA-global ordering, forced phase flips, guessed
+  generations, or unproven whole-warp releases.
 
 ## Required B0-E implementation gates
 
-1. Treat K10 `.e62` as the completed B0-D baseline: 384/384 CTAs complete,
-   132/132 TMABIND final records pass, and every WaitBlock summary passes.
-2. Extract the chronological `.e85` simulator-log timeline for CTA124 warps 0,
-   4, and 12 around the `0x16c50`/`0x16c60` flips and the `0x74e0`/`0xb370`
-   holds. Identify the first simulator interval that diverges from the intended
-   producer-to-consumer order. This is root-cause evidence, not an input to a
-   ticket resolver.
-3. For every hold in the terminal cycle, determine whether the held warp still
-   has an ARRIVE or other semantic event ahead of the hold that another warp
-   requires. Compare completing SM119 against hanging SM124 at the same
-   occurrence.
-4. Use the evidence from gates 2-3 to select a pure timing correction, a
-   park-safety correction, or both. Do not reintroduce ordered generation
-   tickets, forced phase flips, guessed generations, or unproven releases.
-5. Review the correction separately from B1 and preserve every semantic
-   TMA/BAR/memory occurrence, cursor ownership rule, and B0-D byte/identity
-   invariant.
-6. Require focused cycle tests plus K5 clean exit with every
-   `[WAITBLOCK][summary] status=PASS` and every `[TMABIND][FINAL] status=PASS`.
+### Stage E0: capture feasibility only
+
+1. Treat the full `9e92fe9` FA3 trace and K10 `.e62` as the fixed source and
+   simulator baselines.
+2. Extend the protobuf/wire record with initialization epoch, contract ordinal,
+   and wait-side before/after contract-count snapshots. Do not record or consume
+   hardware cycles.
+3. Maintain state per CTA and barrier, not in a CTA-global sequence. Reset only
+   on the exact `EXCH` event and reject storage overflow, duplicate initialization,
+   unsupported active-arrival shape, or lifecycle inconsistency.
+4. Extend post-processing with the restricted applicability predicate and a
+   closed reject-reason taxonomy.
+5. Generate one new full FA3 trace. Compare it with `9e92fe9` and require:
+
+```text
+same K5/K10 CTA counts
+same semantic instruction and TMA command counts
+same B0-D contract counts and byte totals
+same WaitBlock action records and ready/poll path counts
+zero missing/duplicate contract snapshots
+zero unsupported snapshots on eligible barriers
+zero inconsistent generation assignments
+zero ambiguous generation assignments
+K5's previously ambiguous 3,072 streams become unique
+K10's 11,904 unique streams retain the same ordinal mapping
+```
+
+6. If any condition fails, stop. Do not tune the resolver and do not modify the
+   simulator.
+
+Implementation order inside E0:
+
+```text
+E0.1  Define protobuf/wire fields and closed reject reasons.
+E0.2  Design bounded per-launch (CTA, barrier) state and lifecycle cleanup.
+E0.3  Capture EXCH epoch, ARRIVE_EXPECT_TX ordinal, and wait begin/end snapshots.
+E0.4  Unit-test serialization, overflow, duplicate-init, unsupported-shape,
+      missing-snapshot, interval ambiguity, and many-waits-to-one-event cases.
+E0.5  Run post-processing on synthetic fixtures before generating FA3.
+E0.6  Preserve/rename the 9e92fe9 baseline directory.
+E0.7  Generate exactly one new full FA3 trace and run the acceptance comparison.
+```
+
+Hardware build and trace execution remain user-owned. The expected trace command
+after E0 implementation is:
+
+```bash
+nohup env \
+  LIGHTER_TRACER="all" \
+  ./util/tracer_nvbit/run_hw_trace.py \
+  -f \
+  -B flashattn:flashattn-fa3-bf16-bwd-causal-b1-s2048-hd64-nh24 \
+  -D 0 \
+  > /tmp/flashattn.log 2>&1 &
+```
+
+This command is valid only after the old run directory has been preserved under
+a different name; `-f` intentionally deletes the selected run directory.
+
+Expected Stage E0 files:
+
+```text
+util/traces_enhanced/dynamic_trace/instruction.proto
+util/tracer_nvbit/tracer_tool/common.h
+util/tracer_nvbit/tracer_tool/inject_funcs.cu
+util/tracer_nvbit/tracer_tool/tracer_tool.cu
+util/tracer_nvbit/build_spin_wait_sidecar.py
+util/tracer_nvbit/tests/test_build_spin_wait_sidecar.py
+```
+
+The exact device-state allocation must be designed before editing: it needs a
+bounded per-launch `(CTA, barrier)` index, explicit reset/cleanup, and
+overflow/unknown-key rejection. It must not use application names, kernel IDs,
+PC lists, fixed barrier addresses, or expected occurrence counts.
+
+### Stage E1: separately reviewed simulator use
+
+Only after Stage E0 passes:
+
+1. Add exact `target_release_generation` to eligible
+   `INJECT_MISSING_WAIT` records.
+2. At runtime, bind the wait to that target instead of deriving a target from
+   the simulator's current phase.
+3. Use:
+
+```text
+current_generation < target  -> hold
+current_generation >= target -> dependency already complete; continue
+```
+
+4. Count `current_generation > target` as a late-arrival timing divergence. It
+   is not a reason to bind the wait to a later same-parity generation.
+5. Leave unsupported TMA barriers, count-only barriers,
+   `FOLD_CAPTURED_POLL`, partial replay ownership, B0-D TMA completion identity,
+   and cursor movement unchanged.
+6. Validate K5 and K10 separately from B1. Require K5 clean exit without forced
+   releases, K10 384/384 completion, all WaitBlock/TMABIND summaries PASS, and
+   unchanged semantic TMA/BAR/memory work. Report total-cycle and producer/
+   consumer-tail deltas rather than accepting completion alone.
+
+Expected Stage E1 files are the existing sidecar loader/runtime state in
+`shader.h` and `sm.cc`, plus parser/schema integration where the current v5
+records are loaded. File scope must be finalized from the code at implementation
+time; no B1 scheduler changes belong in E1.
 
 B0-E acceptance must eliminate the 13-warp all-live cycle without dropping a
-hold, forcing a phase, guessing a generation, advancing a cursor outside an
-approved release, or changing semantic TMA/BAR/memory work.
+dependency, forcing a phase, guessing a generation, advancing a cursor outside
+an approved release, or changing semantic TMA/BAR/memory work.
 
 ## Temporary K5 hardcoded deadlock breaker (measurement only)
 
@@ -411,37 +799,17 @@ once each, then releasing) — **not** hangs. Only `0xb0b0` (FOLD) and `0xab40`
 (DEFER_PARTIAL) reach ~24-28k held cycles, i.e. real hangs, alongside the
 still-stuck INJECT sites `0x35e0`/`0x3750`.
 
-### HANDOVER — next session
+### Historical handover — superseded 2026-08-31
 
-**State:** tree at `9e16c6f` (three reverts + the temporary probe on top of
-`326ef0b`). The generic B0-E fix remains unsolved; the probe is measurement-only.
-Goal of the probe track is still just to observe K5's completion cycle count.
+The old A-vs-B choice between extending the PC whitelist and adding a generic
+held-cycle threshold is closed. Both are measurement-only release mechanisms,
+both contaminate cycle timing, and neither supplies the missing dependency
+identity. The hardcoded probe has been reverted.
 
-**Decision pending (asked, not yet answered):** how to get K5 to actually finish.
-Two options were put to the user:
-
-- **Option A — extend the PC whitelist.** Add `0x35e0`, `0x3750`, `0xb0b0`, and
-  `0xab40`. Caveats: (1) `0xab40` is `DEFER_PARTIAL_MISSING_WAIT`, whose release
-  path differs from `MISSING_WAIT_HOLD`, so the hook needs a separate branch for
-  it (the current hook only matches `MISSING_WAIT_HOLD`); (2) `0xb0b0` is a
-  producer `FOLD_CAPTURED_POLL`, so releasing it lets the producer advance past a
-  poll the HW actually spun on — acceptable for measurement only; (3) advancing
-  further may surface yet more PCs (the set has grown every time the run gets
-  further), so this may need several build/run round-trips.
-- **Option B (assistant's recommendation) — strategy-agnostic held-cycles
-  threshold.** Replace the PC whitelist with "if any hold's `held_cycles` exceeds
-  a high threshold (e.g. 28,000, below the 32,000 watchdog), force-release it,
-  regardless of strategy or PC." Rationale: covers all layers at once (INJECT,
-  FOLD, DEFER_PARTIAL) so K5 likely completes in one run; K10 is safe because its
-  longest observed transient park is ~1,659 cycles, far under 28,000. This drops
-  PC-hardcoding entirely in favor of a single dwell-time gate, which matches the
-  "just let it finish so we can read the cycle count" intent. Still measurement-
-  only, still default-off, still not a shippable fix.
-
-**Immediate next step:** get the user's A-vs-B decision, then implement, rebuild,
-rerun K5 (`gpu_tot_sim_cycle` is the target number) and K10 (must stay 384/384
-PASS). If Option A and a later run surfaces still more PCs, that is itself
-evidence that the deadlock is unbounded-layer and Option B is the pragmatic path.
+**Current next step:** review and approve Stage E0 above. If approved, implement
+only barrier-local contract-ordinal capture and the offline uniqueness proof,
+then regenerate FA3 once. Do not re-add either release probe and do not modify
+simulator wait behavior during E0.
 
 **Evidence pointers:** K5 `.e89`/`.o89` and K10 `.e65`/`.o65` under
 `sim_run_12.8/.../H100_80GB-OnlyKernel5` and `...-OnlyKernel10`. Pristine

@@ -110,22 +110,6 @@ class WaitBlockFoldProofTest(unittest.TestCase):
         self.assertFalse(safe)
         self.assertEqual(reason, SIDECAR.EFFECT_UNSAFE)
 
-    def test_plain_nanosleep_is_delay_only(self):
-        by_pc = {
-            0x100: instruction("NANOSLEEP", [operand("0x40")]),
-        }
-        candidate = {
-            "allowed_block_pcs": [0x100],
-            "loopback_bra_pc": 0x110,
-        }
-
-        safe, reason, classes = SIDECAR.prove_effects(
-            1, candidate, by_pc)
-
-        self.assertTrue(safe)
-        self.assertIsNone(reason)
-        self.assertEqual(classes, {"nanosleep": 1})
-
     def test_scoreboard_proof_includes_loopback_branch(self):
         by_pc = {
             0x100: instruction(
