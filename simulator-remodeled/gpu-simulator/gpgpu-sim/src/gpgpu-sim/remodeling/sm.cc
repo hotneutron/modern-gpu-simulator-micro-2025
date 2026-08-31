@@ -3808,24 +3808,6 @@ void SM::service_wait_block_release(unsigned warp_id) {
   pending_wait = HopperMBarrierPendingWait();
 }
 
-unsigned long long SM::cta_trace_cursor_sum(unsigned cta_slot) const {
-  // Monotonic per-CTA execution progress: sum trace cursors over EVERY warp of
-  // the slot (exited warps kept their advanced cursor, so the sum never
-  // decreases). Advances iff some warp executed an instruction since the last
-  // read. Read-only; touches no scheduler/barrier/cursor state.
-  unsigned long long sum = 0;
-  for (unsigned w = 0; w < MAX_WARP_PER_SHADER; ++w) {
-    if (m_physical_warp[w] == nullptr ||
-        m_physical_warp[w]->get_cta_id() != cta_slot) {
-      continue;
-    }
-    const trace_shd_warp_t *tw =
-        static_cast<const trace_shd_warp_t *>(m_physical_warp[w]);
-    sum += tw->used_insts;
-  }
-  return sum;
-}
-
 void SM::maybe_break_cta_deadlock(unsigned warp_id) {
   // [B0-E] Default-off. See .plan/WAIT_BLOCK.md "deadlock-triggered
   // single-consumer release". Fires only inside a proven CTA-wide deadlock and
@@ -3842,15 +3824,6 @@ void SM::maybe_break_cta_deadlock(unsigned warp_id) {
   if (cta_slot >= MAX_CTA_PER_SHADER || m_cta_status[cta_slot] == 0) {
     return;
   }
-  // This runs once per warp per cycle, but the whole-CTA evaluation below (stuck
-  // scan, fullstuck accounting, at-most-one release) must run once per CTA slot
-  // per cycle. Gate on the current cycle so only the first warp of the slot this
-  // cycle does the work; later same-cycle calls for sibling warps return early.
-  const unsigned long long eval_now = get_current_gpu_cycle();
-  if (m_deadlock_last_eval_cycle[cta_slot] == eval_now) {
-    return;
-  }
-  m_deadlock_last_eval_cycle[cta_slot] = eval_now;
 
   // STEP 1 — deadlock gate (fail-closed). Every live (not-exited) warp of this
   // CTA slot must be stuck this cycle: parked on an unsatisfied WaitBlock hold,
@@ -3935,42 +3908,20 @@ void SM::maybe_break_cta_deadlock(unsigned warp_id) {
   const unsigned long long suspect_cycle = m_deadlock_suspect_cycle[cta_slot];
   const unsigned long long suspect_to_now = now - suspect_cycle;
 
-  // Fix B — deadlock requires (1) at least two mutually-waiting live warps and
-  // (2) a sustained all-stuck window. A single live warp cannot be in a
-  // producer/consumer cycle with itself, and normal drain / brief mutual waits
-  // clear on their own within a small span (empirically <=69 cycles on K10);
-  // only a genuine deadlock stays fully stuck indefinitely. Requiring
-  // wait_block_deadlock_min_stuck_cycles of continuous stuck time before acting
-  // keeps transient all-parked windows completely undisturbed (no release, so
-  // byte-identical to baseline for them). suspect_cycle is the start of the
-  // current contiguous all-stuck run, so (now - suspect_cycle) is that window.
-  if (live_count < 2) {
-    // Single live warp cannot be in a producer/consumer cycle with itself.
-    m_deadlock_gate_reject_solo_total++;
-    return;
-  }
-  if (suspect_to_now < m_config->wait_block_deadlock_min_stuck_cycles) {
-    // Multi-warp but the all-stuck window is still short: treat as a transient
-    // (normal drain / brief mutual wait) that is expected to clear on its own.
-    m_deadlock_gate_reject_toosoon_total++;
-    return;
-  }
-
-  // STEP 2 — progress guard (anti-escape). Trace cursors (used_insts) are
-  // monotonic and bounded by the trace length, so their CTA-wide sum advances
-  // iff some warp actually executed an instruction. If we already released for
-  // this CTA slot and the cursor sum has NOT advanced since, the release bought
-  // no forward execution at all: abort loudly rather than escape the deadlock.
-  // Using execution progress (not barrier events) means an intermediate re-park
-  // of the released warp still counts as progress, which is the Fix A behavior.
-  const unsigned long long cursor_sum = cta_trace_cursor_sum(cta_slot);
+  // STEP 2 — progress guard (anti-escape). Every phase flip / arrive is a
+  // semantic event; the SM-global sum is monotonic. If we already released for
+  // this CTA slot and that signal has not advanced since, the release bought no
+  // progress: abort loudly rather than escape the deadlock.
+  const unsigned long long progress_signal =
+      m_sync_debug_phase_flip + m_sync_debug_arrive +
+      m_sync_debug_arrive_expect_tx;
   if (m_deadlock_release_armed[cta_slot] &&
-      cursor_sum == m_deadlock_release_last_cursor_sum[cta_slot]) {
+      progress_signal == m_deadlock_release_last_progress_signal[cta_slot]) {
     std::cerr << "[WAITBLOCK][abort][SM" << m_sm_id << "] cyc=" << now
               << " reason=deadlock-release-no-progress"
               << " cta_slot=" << cta_slot
               << " global_cta=" << m_local_to_global_cta_id[cta_slot]
-              << " cursor_sum=" << cursor_sum
+              << " progress_signal=" << progress_signal
               << " suspect_cycle=" << suspect_cycle
               << " suspect_to_now=" << suspect_to_now
               << " deadlock_release_total=" << m_deadlock_release_total
@@ -4039,7 +3990,7 @@ void SM::maybe_break_cta_deadlock(unsigned warp_id) {
           " stuck_cycles_before_release=" + std::to_string(suspect_to_now) +
           " fullstuck_cycles_total=" +
           std::to_string(m_deadlock_fullstuck_cycles_total) +
-          " cursor_sum=" + std::to_string(cursor_sum) +
+          " progress_signal=" + std::to_string(progress_signal) +
           " deadlock_release_total=" + std::to_string(m_deadlock_release_total) +
           " cursor_action=none");
   if (m_config->wait_block_debug) {
@@ -4065,12 +4016,12 @@ void SM::maybe_break_cta_deadlock(unsigned warp_id) {
   }
   pending = HopperMBarrierPendingWait();
   m_deadlock_release_armed[cta_slot] = true;
-  m_deadlock_release_last_cursor_sum[cta_slot] = cursor_sum;
-  // Do NOT clear the suspect marker here. The released warp's pending wait is
-  // now cleared, so next cycle STEP 1 observes it as not-stuck and closes the
-  // episode (recording its true span). If instead the CTA stays fully stuck and
-  // no cursor advances before the next detection, STEP 2's guard fires. Letting
-  // STEP 1 own the suspect lifecycle keeps episode spans and counts accurate.
+  m_deadlock_release_last_progress_signal[cta_slot] = progress_signal;
+  // End this suspect episode: the release we just made is expected to unstick
+  // the CTA. If it does not, the next detection's progress guard (STEP 2) fires.
+  // Re-arm suspect tracking so the NEXT contiguous all-stuck run is timed
+  // separately (its own corruption gap starts fresh).
+  m_deadlock_suspect_active[cta_slot] = false;
 }
 
 void SM::print_wait_block_summary() const {
@@ -4170,13 +4121,11 @@ void SM::print_wait_block_summary() const {
           "[WAITBLOCK][deadlock-summary] sm=%u deadlock_episodes=%llu "
           "deadlock_releases=%llu deadlock_fullstuck_cycles=%llu "
           "deadlock_episode_span_max=%llu first_suspect_cycle=%llu "
-          "last_release_cycle=%llu gate_reject_solo=%llu "
-          "gate_reject_toosoon=%llu\n",
+          "last_release_cycle=%llu\n",
           m_sm_id, m_deadlock_episodes_total, m_deadlock_release_total,
           m_deadlock_fullstuck_cycles_total,
           m_deadlock_corruption_cycles_max, first_suspect_print,
-          m_deadlock_last_release_cycle, m_deadlock_gate_reject_solo_total,
-          m_deadlock_gate_reject_toosoon_total);
+          m_deadlock_last_release_cycle);
 
   if (!m_config->wait_block_debug) {
     return;

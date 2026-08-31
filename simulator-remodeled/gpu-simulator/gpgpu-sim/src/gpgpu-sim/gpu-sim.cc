@@ -3636,16 +3636,6 @@ void shader_core_config::reg_options(class OptionParser *opp) {
       "generation; aborts if a release produces no new progress. Requires "
       "-wait_block_enable. (default=0)",
       "0");
-  option_parser_register(
-      opp, "-wait_block_deadlock_min_stuck_cycles", OPT_UINT32,
-      &wait_block_deadlock_min_stuck_cycles,
-      "[B0-E] Minimum consecutive cycles a CTA must be fully stuck before a "
-      "deadlock is declared and a release is allowed. Transient all-parked "
-      "windows (normal drain / brief mutual waits) clear on their own within a "
-      "small span; only a genuine deadlock stays stuck indefinitely. Larger = "
-      "more conservative (waits longer before acting). Only used when "
-      "-wait_block_deadlock_release_enable is set. (default=128)",
-      "128");
   option_parser_register(opp, "-trimchk_percta_log_enable", OPT_BOOL,
                          &trimchk_percta_log_enable,
                          "[TRIMCHK]/[TRACECHECK] Emit per-CTA trace-load contract lines: "

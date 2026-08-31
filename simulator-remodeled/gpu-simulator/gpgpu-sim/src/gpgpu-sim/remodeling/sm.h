@@ -298,13 +298,6 @@ class SM : public core_t, public shader_core_ctx_wrapper {
   // flip the count barrier that frees the producer. Default-off; no-op unless
   // wait_block_deadlock_release_enable. See .plan/WAIT_BLOCK.md.
   void maybe_break_cta_deadlock(unsigned warp_id);
-  // [B0-E] Sum of the per-warp trace cursors (trace_shd_warp_t::used_insts)
-  // over EVERY warp of the given CTA slot, including exited ones (a warp that
-  // exits still advanced its cursor, so counting it keeps the sum monotonic).
-  // Used by the deadlock progress guard: the sum advances iff some warp of the
-  // CTA executed an instruction, which is the fail-safe "did the release buy
-  // any forward execution?" signal. Read-only.
-  unsigned long long cta_trace_cursor_sum(unsigned cta_slot) const;
   void clear_gridbar(unsigned int kernel_id);
   void broadcast_barrier_reduction(unsigned cta_id, unsigned bar_id,
                                    warp_set_t warps);
@@ -776,16 +769,12 @@ class SM : public core_t, public shader_core_ctx_wrapper {
   unsigned long long m_wait_block_generation_overshoots_total = 0;
   unsigned long long m_wait_block_watchdog_aborts_total = 0;
   // [B0-E] deadlock-triggered single-consumer release accounting + per-CTA-slot
-  // progress guard. m_deadlock_release_last_cursor_sum[slot] snapshots the sum
-  // of the CTA's per-warp trace cursors (trace_shd_warp_t::used_insts) at the
-  // last release. The cursor sum is monotonic and bounded by the trace length,
-  // so it advances iff some warp of the CTA actually executed an instruction
-  // since the release. If a later deadlock finds the SAME cursor sum, the
-  // release produced zero forward execution (not merely zero barrier events, so
-  // an intermediate re-park still counts as progress) -> abort (anti-escape).
-  // ~0ull means "no release yet".
+  // progress guard. m_deadlock_release_last_progress_signal[slot] snapshots the
+  // SM-global semantic-event signal (phase flips + arrives) at the last release;
+  // if a subsequent deadlock finds the same signal, the release bought no
+  // progress and the run aborts (anti-escape). ~0ull means "no release yet".
   unsigned long long m_deadlock_release_total = 0;
-  unsigned long long m_deadlock_release_last_cursor_sum[MAX_CTA_PER_SHADER] =
+  unsigned long long m_deadlock_release_last_progress_signal[MAX_CTA_PER_SHADER] =
       {0};
   bool m_deadlock_release_armed[MAX_CTA_PER_SHADER] = {false};
   // [B0-E] deadlock debug/corruption accounting, per CTA slot. A "suspect" is
@@ -796,11 +785,6 @@ class SM : public core_t, public shader_core_ctx_wrapper {
   // stall). We accumulate it per SM and count episodes for post-run analysis.
   unsigned long long m_deadlock_suspect_cycle[MAX_CTA_PER_SHADER];
   bool m_deadlock_suspect_active[MAX_CTA_PER_SHADER] = {false};
-  // maybe_break_cta_deadlock runs once per warp per cycle; this guards the
-  // per-CTA evaluation (stuck scan, fullstuck accounting, at-most-one release)
-  // to run only once per CTA slot per cycle. Init 0 is safe: no CTA can be
-  // deadlocked at cycle 0 (reaching a barrier cycle takes many cycles).
-  unsigned long long m_deadlock_last_eval_cycle[MAX_CTA_PER_SHADER] = {0};
   unsigned long long m_deadlock_episodes_total = 0;
   // Longest single fully-stuck episode span (suspect_cycle -> episode close),
   // measured when the episode ends. Peak fake-stall burst on this SM.
@@ -811,15 +795,6 @@ class SM : public core_t, public shader_core_ctx_wrapper {
   // slot observed fully stuck (summed across detections). This is the primary
   // "deadlock timing corruption" figure the post-run analysis reports.
   unsigned long long m_deadlock_fullstuck_cycles_total = 0;
-  // Fix B gate rejections (once per CTA-slot per cycle, since the whole-CTA
-  // evaluation is gated to run once per slot per cycle). A rejection means the
-  // CTA looked fully stuck this cycle but did NOT qualify as a deadlock, so no
-  // release fired. Split by reason so a post-run pass can see how many transient
-  // all-parked windows were correctly filtered out vs. disturbed:
-  //   solo   = only one live warp (cannot be a producer/consumer cycle)
-  //   toosoon = multi-warp but stuck-span still below min_stuck_cycles
-  unsigned long long m_deadlock_gate_reject_solo_total = 0;
-  unsigned long long m_deadlock_gate_reject_toosoon_total = 0;
  public:
   // Increment the tensor-op count for the CTA slot that owns hardware warp wid.
   void inc_tensor_ops_for_warp(unsigned wid) {
