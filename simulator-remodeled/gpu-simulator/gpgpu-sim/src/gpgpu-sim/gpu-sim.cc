@@ -3625,6 +3625,15 @@ void shader_core_config::reg_options(class OptionParser *opp) {
       opp, "-wait_block_debug", OPT_BOOL, &wait_block_debug,
       "Emit [WAITBLOCK] hold/release/guard/summary diagnostics. (default=0)",
       "0");
+  option_parser_register(
+      opp, "-wait_block_k5_hardcoded_deadlock_release", OPT_BOOL,
+      &wait_block_k5_hardcoded_deadlock_release,
+      "[B0-E MEASUREMENT ONLY, NOT A FIX] Force-release an INJECT_MISSING_WAIT "
+      "hold stuck at a K5 wait PC (0x13b0/0x5a50/0x5bc0/0x74e0) instead of "
+      "holding it to the watchdog, so K5 runs to completion and its cycle count "
+      "can be measured. Application/PC-specific throwaway probe; must not ship as "
+      "the real fix. Requires -wait_block_enable. (default=0)",
+      "0");
   option_parser_register(opp, "-trimchk_percta_log_enable", OPT_BOOL,
                          &trimchk_percta_log_enable,
                          "[TRIMCHK]/[TRACECHECK] Emit per-CTA trace-load contract lines: "

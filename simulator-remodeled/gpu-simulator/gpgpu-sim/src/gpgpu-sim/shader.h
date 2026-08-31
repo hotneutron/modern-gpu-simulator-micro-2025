@@ -2290,6 +2290,15 @@ class shader_core_config : public core_config {
   // Emit [WAITBLOCK] hold/release/guard/summary diagnostics.
   bool wait_block_debug;
 
+  // [B0-E MEASUREMENT ONLY — NOT A FIX] Hardcoded K5 deadlock breaker. When set,
+  // an INJECT_MISSING_WAIT hold that is stuck (current_gen < expected_gen) at one
+  // of the K5 producer/consumer wait PCs (0x13b0/0x5a50/0x5bc0/0x74e0) is force-
+  // released instead of held to the watchdog. This is a throwaway probe to let
+  // K5 run to completion so the resulting cycle count can be measured; it is
+  // application/PC-specific and must never ship as the real B0-E fix. Default-off
+  // keeps runs byte-identical to baseline.
+  bool wait_block_k5_hardcoded_deadlock_release;
+
   // [TRIMCHK]/[TRACECHECK] Gate verbose per-CTA trace-load contract lines:
   // path/warp counts plus active-lane, memory, sync, BAR, and opcode-work
   // counts. Off by default because it prints two lines per CTA. The

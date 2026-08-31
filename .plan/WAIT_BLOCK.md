@@ -1,16 +1,21 @@
 # WaitBlock: Design Index and Live B0-E Work
 
-**Status (2026-08-28):** Post-processing v5 and the partial-replay simulator are
+**Status (2026-08-30):** Post-processing v5 and the partial-replay simulator are
 implemented and full-trace validated. B0-A/B/C are complete. B0-D (exact TMA
 completion ownership) is **complete and validated** at `39abefb`: K5 `.e85`
 validates ownership-clean out-of-order completion and K10 `.e62` completes
 384/384 CTAs with 132/132 clean SM-level `TMABIND` final records. The only open
 correctness item is **B0-E**: a K5 all-live 13-warp cross-warp WaitBlock cycle
-on SM124 (`0xb370`/`0x16c60`). The ordered-generation-ticket design and the
-post-`951b058` ordered-candidate experiment were both explored and **rejected /
-reverted**; B0-E now returns to the `39abefb` (`951b058`) baseline for
-first-divergence and global park-safety analysis. B1 and later items remain
-pending.
+on SM124 (`0xb370`/`0x16c60`). Three offline pairing designs (ordered generation
+ticket, ordered candidate-set, runtime UR recompute) were explored and
+**rejected**, and a generic runtime deadlock-release attempt
+(single-consumer release under a proven CTA-wide deadlock) was **implemented,
+tested, and reverted** — it advanced K5 from generation 4 to generation 9 but
+still tripped the hold watchdog, and it perturbed K10 timing (regression). The
+tree is back at the `326ef0b` baseline. A **temporary, measurement-only,
+PC-hardcoded K5 deadlock breaker** is now in place solely to observe the K5
+completion cycle count; it is explicitly **not a fix** and must not ship. B1 and
+later items remain pending.
 
 This document is the authoritative index and the live execution record for
 B0-E. The detailed per-work-type designs and the historical evidence live in the
@@ -134,7 +139,7 @@ sidecar generation; unified metadata does not require unified runtime behavior.
 | B0-B | Kernel-aware descriptor identity and K5 tx-size restoration | **IMPLEMENTED / VALIDATED** at `0f7cbc2`; chain 23/23, ambiguity 0, K5 `0x96b0` = 24,576 bytes, 192 128-byte AGU requests, and 768 32-byte sector requests |
 | B0-C | Size-only K5/K10 byte-conservation diagnostic with existing FIFO/release order | **COMPLETE**; byte contract PASS, K10 clean exit at 138,456 cycles, K5 runtime size PASS but all-live WaitBlock abort at cycle 68,176 |
 | B0-D | Exact TMA-command-to-barrier completion ownership | **COMPLETE / VALIDATED** at `39abefb`; `.e85` validates ownership-clean out-of-order completion, and K10 `.e62` completes 384/384 CTAs with 132/132 clean SM-level TMABIND final records after exercising two simultaneous open contracts per warp |
-| B0-E | K5 all-live cross-warp WaitBlock cycle (`0xb370`/`0x16c60`) | **ORDERED-CANDIDATE EXPERIMENT CLOSED / CODE REVERTED TO `951b058` / ROOT-CAUSE ANALYSIS REOPENED**; v2 retained generation 5 and the v3 precheck could not prove that B60 generation 4 depends on the target wait; proceed with first-divergence and global park-safety analysis |
+| B0-E | K5 all-live cross-warp WaitBlock cycle (`0xb370`/`0x16c60`) | **OPEN / ROOT-CAUSE UNDERSTOOD / NO GENERIC FIX YET**. Rejected: three offline pairing designs (ordered generation ticket, ordered candidate-set, runtime UR recompute) — all blocked by missing cross-warp order; a 1-bit parity plus per-warp modulo state cannot name a wait's absolute release generation. Implemented then **reverted**: generic runtime single-consumer deadlock-release (advanced K5 gen4→gen9 but still watchdog-aborted; regressed K10 timing). Tree restored to `326ef0b`. A **temporary PC-hardcoded, measurement-only** deadlock breaker (flag `-wait_block_k5_hardcoded_deadlock_release`, default off) is in place only to observe the K5 completion cycle count — not a fix |
 | B1 | One SM-level WaitBlock release phase per cycle | **REQUIRED / NOT IMPLEMENTED** |
 | B2 | WaitBlock startup and provenance fail-fast checks | **MOSTLY IMPLEMENTED** |
 | B3 | Assert-before-clear lifecycle checks | **IMPLEMENTED for WaitBlock and B0-D TMA ownership**; broader non-ownership cleanup audit remains partial |
@@ -336,6 +341,47 @@ Direction:
 B0-E acceptance must eliminate the 13-warp all-live cycle without dropping a
 hold, forcing a phase, guessing a generation, advancing a cursor outside an
 approved release, or changing semantic TMA/BAR/memory work.
+
+## Temporary K5 hardcoded deadlock breaker (measurement only)
+
+**This is not a fix and must not ship.** After the generic runtime
+deadlock-release attempt was reverted (see below), a deliberately
+application-specific probe was added purely to let K5 run to completion so its
+cycle count is observable.
+
+- **Flag:** `-wait_block_k5_hardcoded_deadlock_release` (`OPT_BOOL`, default `0`).
+  Default-off keeps every run byte-identical to the `326ef0b` baseline.
+- **Behavior:** in `SM::service_wait_block_release`, when a hold is stuck
+  (`current_gen < expected_gen`) with mode `MISSING_WAIT_HOLD` and its
+  `action_pc` is one of the K5 producer/consumer wait PCs
+  `{0x13b0, 0x5a50, 0x5bc0, 0x74e0}`, force-release it (clear the pending wait,
+  same as the normal missing-wait release: no cursor move, no phase force, no
+  generation guess) instead of holding it to the watchdog. Emits
+  `[WAITBLOCK][k5-hardcoded-deadlock-release]` per event.
+- **PC set provenance:** the four PCs are exactly the `INJECT_MISSING_WAIT`
+  `action_pc` values observed parked in the pristine K5 deadlock (`.e85`).
+- **Scope:** K5-specific, PC-hardcoded, generation-agnostic. It exists only to
+  measure `gpu_tot_sim_cycle` once K5 completes; it does not generalize and no
+  companion document treats it as authority.
+- **Files:** flag in `shader.h`, registration in `gpu-sim.cc`, hook in
+  `SM::service_wait_block_release` (`sm.cc`), enabled in the H100 config.
+
+### Rejected/closed generic attempts (do not re-propose as-is)
+
+1. **Offline pairing (3 variants).** Ordered generation ticket, ordered
+   candidate-set, and runtime UR recompute all fail for the same reason: the
+   compact trace preserves per-warp program order but drops cross-warp execution
+   order, and the SASS/HW state is a 1-bit parity plus per-warp *modulo* counters
+   (UR4/UR5/UR8 wrap), so a wait's absolute release generation is unrecoverable.
+2. **Generic runtime single-consumer deadlock-release** (implemented at
+   `65bbf44`/`2608f40`, reverted at `6c335bf`/`fa9e95e`). On a proven CTA-wide
+   deadlock it released one `INJECT_MISSING_WAIT` consumer per detection, guarded
+   by a trace-cursor progress check and a sustained-stuck (`>=128` cycle,
+   `>=2` live warp) gate. Result: K5 advanced generation 4 → 9 but still tripped
+   the hold watchdog (~90k cycles), and K10 regressed (release fired on
+   transients whose episode span reached ~1,659 cycles, beyond the 128 gate).
+   The single-release cadence accumulates latency each generation, and no fixed
+   cycle threshold separates a real deadlock from a long K10 transient.
 
 ### B1-specific acceptance (separate commit)
 
