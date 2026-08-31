@@ -312,6 +312,366 @@ extern "C" __device__ __noinline__ void instrument_inst_compact(
   }
 }
 
+static __device__ __forceinline__ mbarrier_contract_launch_t *
+get_mbarrier_contract_launch(mbarrier_contract_registry_t *registry) {
+  if (registry == nullptr) {
+    return nullptr;
+  }
+  if (registry->magic != MBARRIER_CONTRACT_REGISTRY_MAGIC ||
+      registry->version != MBARRIER_CONTRACT_REGISTRY_VERSION) {
+    atomicOr(&registry->error_flags,
+             static_cast<unsigned int>(
+                 MBARRIER_CONTRACT_ERROR_INVALID_LAUNCH));
+    return nullptr;
+  }
+  if (registry->active != 1) {
+    atomicOr(&registry->error_flags,
+             static_cast<unsigned int>(
+                 MBARRIER_CONTRACT_ERROR_NO_ACTIVE_LAUNCH));
+    return nullptr;
+  }
+  mbarrier_contract_launch_t *launch = &registry->launch;
+  if (launch->state != 1 || launch->barrier_state_ptr == 0 ||
+      launch->warp_scratch_ptr == 0 ||
+      launch->cta_record_count_ptr == 0 ||
+      launch->record_buffer_ptr == 0 ||
+      launch->record_capacity == 0 ||
+      launch->barrier_slots_per_cta == 0) {
+    atomicOr(&registry->error_flags,
+             static_cast<unsigned int>(
+                 MBARRIER_CONTRACT_ERROR_INVALID_LAUNCH));
+    return nullptr;
+  }
+  return launch;
+}
+
+static __device__ __forceinline__ bool get_mbarrier_contract_location(
+    mbarrier_contract_registry_t *registry,
+    mbarrier_contract_launch_t *launch, unsigned int *linear_cta_id,
+    unsigned int *warp_id, mbarrier_contract_warp_scratch_t **scratch) {
+  const unsigned long long linear_cta =
+      (static_cast<unsigned long long>(blockIdx.z) * gridDim.y +
+       blockIdx.y) *
+          gridDim.x +
+      blockIdx.x;
+  if (linear_cta >= launch->num_ctas) {
+    atomicOr(&registry->error_flags,
+             static_cast<unsigned int>(
+                 MBARRIER_CONTRACT_ERROR_CTA_OUT_OF_RANGE));
+    return false;
+  }
+
+  const unsigned int linear_tid =
+      threadIdx.z * blockDim.y * blockDim.x +
+      threadIdx.y * blockDim.x + threadIdx.x;
+  const unsigned int warp = linear_tid / 32;
+  if (warp >= launch->warps_per_cta ||
+      warp >= MBARRIER_CONTRACT_MAX_WARPS_PER_CTA) {
+    atomicOr(&registry->error_flags,
+             static_cast<unsigned int>(
+                 MBARRIER_CONTRACT_ERROR_WARP_OUT_OF_RANGE));
+    return false;
+  }
+
+  mbarrier_contract_warp_scratch_t *scratch_base =
+      reinterpret_cast<mbarrier_contract_warp_scratch_t *>(
+          launch->warp_scratch_ptr);
+  *linear_cta_id = static_cast<unsigned int>(linear_cta);
+  *warp_id = warp;
+  *scratch =
+      &scratch_base[linear_cta * launch->warps_per_cta + warp];
+  return true;
+}
+
+static __device__ __forceinline__ mbarrier_contract_barrier_state_t *
+find_or_create_mbarrier_contract_state(
+    mbarrier_contract_registry_t *registry,
+    mbarrier_contract_launch_t *launch, unsigned int linear_cta_id,
+    unsigned long long barrier_addr) {
+  if (barrier_addr == ~0ULL || (barrier_addr & 0x7ULL) != 0) {
+    atomicOr(&registry->error_flags,
+             static_cast<unsigned int>(
+                 MBARRIER_CONTRACT_ERROR_INVALID_BARRIER_ADDRESS));
+    return nullptr;
+  }
+
+  mbarrier_contract_barrier_state_t *states =
+      reinterpret_cast<mbarrier_contract_barrier_state_t *>(
+          launch->barrier_state_ptr);
+  const unsigned long long key = barrier_addr + 1ULL;
+  const unsigned int capacity = launch->barrier_slots_per_cta;
+  const unsigned long long hash =
+      (barrier_addr >> 3) * 11400714819323198485ULL;
+  const unsigned int first = static_cast<unsigned int>(hash % capacity);
+  const unsigned long long cta_base =
+      static_cast<unsigned long long>(linear_cta_id) * capacity;
+  for (unsigned int probe = 0; probe < capacity; ++probe) {
+    mbarrier_contract_barrier_state_t *state =
+        &states[cta_base + ((first + probe) % capacity)];
+    const unsigned long long observed =
+        atomicCAS(reinterpret_cast<unsigned long long *>(
+                      &state->key_plus_one),
+                  0ULL, key);
+    if (observed == 0ULL || observed == key) {
+      return state;
+    }
+  }
+
+  atomicOr(&registry->error_flags,
+           static_cast<unsigned int>(
+               MBARRIER_CONTRACT_ERROR_BARRIER_TABLE_OVERFLOW));
+  return nullptr;
+}
+
+static __device__ __forceinline__ void store_mbarrier_contract_record(
+    mbarrier_contract_registry_t *registry,
+    mbarrier_contract_launch_t *launch, unsigned int linear_cta_id,
+    const mbarrier_contract_record_t &record) {
+  unsigned long long *cta_record_counts =
+      reinterpret_cast<unsigned long long *>(
+          launch->cta_record_count_ptr);
+  const unsigned long long local_index =
+      atomicAdd(&cta_record_counts[linear_cta_id], 1ULL);
+  if (local_index >= launch->records_per_cta) {
+    atomicAdd(reinterpret_cast<unsigned long long *>(
+                  &launch->overflow_records),
+              1ULL);
+    atomicOr(&registry->error_flags,
+             static_cast<unsigned int>(
+                 MBARRIER_CONTRACT_ERROR_RECORD_OVERFLOW));
+    return;
+  }
+
+  const unsigned long long record_index =
+      static_cast<unsigned long long>(linear_cta_id) *
+          launch->records_per_cta +
+      local_index;
+  if (record_index >= launch->record_capacity) {
+    atomicAdd(reinterpret_cast<unsigned long long *>(
+                  &launch->overflow_records),
+              1ULL);
+    atomicOr(&registry->error_flags,
+             static_cast<unsigned int>(
+                 MBARRIER_CONTRACT_ERROR_RECORD_OVERFLOW));
+    return;
+  }
+
+  mbarrier_contract_record_t *records =
+      reinterpret_cast<mbarrier_contract_record_t *>(
+          launch->record_buffer_ptr);
+  records[record_index] = record;
+  __threadfence();
+}
+
+extern "C" __device__ __noinline__ void record_mbarrier_contract_begin(
+    int32_t pred, uint32_t unique_function_id, uint32_t vpc,
+    uint32_t event_kind, uint64_t barrier_addr, uint32_t semantic_raw,
+    uint64_t pregistry) {
+  const unsigned int active_mask = __activemask();
+  const unsigned int predicate_mask =
+      __ballot_sync(active_mask, pred);
+  if (predicate_mask == 0) {
+    return;
+  }
+  const int lane_id = get_laneid();
+  const int publisher_lane = __ffs(predicate_mask) - 1;
+  if (lane_id != publisher_lane) {
+    return;
+  }
+
+  mbarrier_contract_registry_t *registry =
+      reinterpret_cast<mbarrier_contract_registry_t *>(pregistry);
+  mbarrier_contract_launch_t *launch =
+      get_mbarrier_contract_launch(registry);
+  if (launch == nullptr) {
+    return;
+  }
+
+  unsigned int linear_cta_id = 0;
+  unsigned int warp_id = 0;
+  mbarrier_contract_warp_scratch_t *scratch = nullptr;
+  if (!get_mbarrier_contract_location(
+          registry, launch, &linear_cta_id, &warp_id, &scratch)) {
+    return;
+  }
+  if (atomicCAS(&scratch->state, 0u, 1u) != 0u) {
+    atomicOr(&registry->error_flags,
+             static_cast<unsigned int>(
+                 MBARRIER_CONTRACT_ERROR_NESTED_BEGIN));
+    return;
+  }
+
+  mbarrier_contract_barrier_state_t *barrier =
+      find_or_create_mbarrier_contract_state(
+          registry, launch, linear_cta_id, barrier_addr);
+  if (barrier == nullptr) {
+    atomicExch(&scratch->state, 0u);
+    return;
+  }
+
+  scratch->event_kind = event_kind;
+  scratch->unique_function_id = unique_function_id;
+  scratch->vpc = vpc;
+  scratch->active_mask = active_mask;
+  scratch->predicate_mask = predicate_mask;
+  scratch->sm_id = get_smid();
+  scratch->capture_flags = MBARRIER_CONTRACT_CAPTURE_NONE;
+  scratch->barrier_addr = barrier_addr;
+  scratch->semantic_raw = semantic_raw;
+  scratch->initialization_epoch_before =
+      atomicAdd(&barrier->initialization_epoch, 0u);
+  scratch->opened_contract_count_before =
+      atomicAdd(reinterpret_cast<unsigned long long *>(
+                    &barrier->opened_contract_count),
+                0ULL);
+  scratch->barrier_error_flags_before =
+      atomicAdd(&barrier->semantic_error_flags, 0u);
+  scratch->contract_ordinal = 0;
+
+  if (event_kind == MBARRIER_CONTRACT_EVENT_EXCH) {
+    const unsigned int initialization_index =
+        atomicAdd(&barrier->initialization_count, 1u);
+    const unsigned int prior_epoch =
+        atomicAdd(&barrier->initialization_epoch, 1u);
+    atomicExch(reinterpret_cast<unsigned long long *>(
+                   &barrier->opened_contract_count),
+               0ULL);
+    if (initialization_index != 0) {
+      scratch->capture_flags |=
+          MBARRIER_CONTRACT_CAPTURE_DUPLICATE_INIT;
+      atomicOr(&barrier->semantic_error_flags,
+               static_cast<unsigned int>(
+                   MBARRIER_CONTRACT_CAPTURE_DUPLICATE_INIT));
+    }
+    if (prior_epoch == 0xffffffffu) {
+      atomicOr(&registry->error_flags,
+               static_cast<unsigned int>(
+                   MBARRIER_CONTRACT_ERROR_EPOCH_OVERFLOW));
+    }
+  } else if (event_kind == MBARRIER_CONTRACT_EVENT_ARRIVE) {
+    if (scratch->initialization_epoch_before == 0) {
+      scratch->capture_flags |=
+          MBARRIER_CONTRACT_CAPTURE_ARRIVE_BEFORE_INIT;
+      atomicOr(&barrier->semantic_error_flags,
+               static_cast<unsigned int>(
+                   MBARRIER_CONTRACT_CAPTURE_ARRIVE_BEFORE_INIT));
+    }
+    if (semantic_raw == 0) {
+      scratch->capture_flags |=
+          MBARRIER_CONTRACT_CAPTURE_PLAIN_ARRIVE;
+      atomicAdd(&barrier->plain_arrive_count, 1u);
+    } else {
+      const unsigned long long prior =
+          atomicAdd(reinterpret_cast<unsigned long long *>(
+                        &barrier->opened_contract_count),
+                    1ULL);
+      scratch->contract_ordinal = prior + 1ULL;
+      if (prior == ~0ULL) {
+        atomicOr(&registry->error_flags,
+                 static_cast<unsigned int>(
+                     MBARRIER_CONTRACT_ERROR_ORDINAL_OVERFLOW));
+      }
+    }
+  } else if (event_kind != MBARRIER_CONTRACT_EVENT_WAIT) {
+    atomicOr(&registry->error_flags,
+             static_cast<unsigned int>(
+                 MBARRIER_CONTRACT_ERROR_IDENTITY_MISMATCH));
+  }
+
+  __threadfence();
+  atomicExch(&scratch->state, 2u);
+}
+
+extern "C" __device__ __noinline__ void record_mbarrier_contract_end(
+    int32_t pred, uint32_t unique_function_id, uint32_t vpc,
+    uint32_t event_kind, uint64_t pregistry) {
+  const unsigned int active_mask = __activemask();
+  const int lane_id = get_laneid();
+  const int publisher_lane = __ffs(active_mask) - 1;
+  if (lane_id != publisher_lane) {
+    return;
+  }
+  (void)pred;
+
+  mbarrier_contract_registry_t *registry =
+      reinterpret_cast<mbarrier_contract_registry_t *>(pregistry);
+  mbarrier_contract_launch_t *launch =
+      get_mbarrier_contract_launch(registry);
+  if (launch == nullptr) {
+    return;
+  }
+
+  unsigned int linear_cta_id = 0;
+  unsigned int warp_id = 0;
+  mbarrier_contract_warp_scratch_t *scratch = nullptr;
+  if (!get_mbarrier_contract_location(
+          registry, launch, &linear_cta_id, &warp_id, &scratch)) {
+    return;
+  }
+  const unsigned int prior_state =
+      atomicCAS(&scratch->state, 2u, 3u);
+  if (prior_state == 0u) {
+    return;
+  }
+  if (prior_state != 2u) {
+    atomicOr(&registry->error_flags,
+             static_cast<unsigned int>(
+                 MBARRIER_CONTRACT_ERROR_MISSING_BEGIN));
+    return;
+  }
+  if (scratch->event_kind != event_kind ||
+      scratch->unique_function_id != unique_function_id ||
+      scratch->vpc != vpc ||
+      scratch->active_mask != active_mask) {
+    atomicOr(&registry->error_flags,
+             static_cast<unsigned int>(
+                 MBARRIER_CONTRACT_ERROR_IDENTITY_MISMATCH));
+    atomicExch(&scratch->state, 0u);
+    return;
+  }
+
+  mbarrier_contract_barrier_state_t *barrier =
+      find_or_create_mbarrier_contract_state(
+          registry, launch, linear_cta_id, scratch->barrier_addr);
+  if (barrier == nullptr) {
+    atomicExch(&scratch->state, 0u);
+    return;
+  }
+
+  mbarrier_contract_record_t record = {};
+  record.record_size = sizeof(mbarrier_contract_record_t);
+  record.record_version = MBARRIER_CONTRACT_RECORD_VERSION;
+  record.event_kind = static_cast<uint16_t>(event_kind);
+  record.launch_uid = launch->launch_uid;
+  record.linear_cta_id = linear_cta_id;
+  record.warp_id_tb = warp_id;
+  record.sm_id = scratch->sm_id;
+  record.unique_function_id = unique_function_id;
+  record.vpc = vpc;
+  record.active_mask = active_mask;
+  record.predicate_mask = scratch->predicate_mask;
+  record.initialization_epoch_before =
+      scratch->initialization_epoch_before;
+  record.initialization_epoch_after =
+      atomicAdd(&barrier->initialization_epoch, 0u);
+  record.capture_flags = scratch->capture_flags;
+  record.barrier_error_flags =
+      atomicAdd(&barrier->semantic_error_flags, 0u);
+  record.barrier_addr = scratch->barrier_addr;
+  record.semantic_raw = scratch->semantic_raw;
+  record.opened_contract_count_before =
+      scratch->opened_contract_count_before;
+  record.opened_contract_count_after =
+      atomicAdd(reinterpret_cast<unsigned long long *>(
+                    &barrier->opened_contract_count),
+                0ULL);
+  record.contract_ordinal = scratch->contract_ordinal;
+
+  store_mbarrier_contract_record(
+      registry, launch, linear_cta_id, record);
+  atomicExch(&scratch->state, 0u);
+}
+
 /* FA3 warp lifetime timestamp. Injected before SASS EXIT by either the
  * EXIT-only probe or the full-trace sidecar. A predicated EXIT can execute more
  * than once as lanes leave; the same warp writes its slot in program order, so

@@ -1,5 +1,8 @@
 import importlib.util
+import json
+import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 
@@ -61,7 +64,511 @@ def dynamic_instruction(pc, active, predicate=None, fid=1):
         "sync_valid": False,
         "barrier_addr": None,
         "semantic_raw": None,
+        "contract_capture_valid": False,
+        "contract_event_kind": None,
+        "contract_barrier_addr": None,
+        "contract_epoch_before": None,
+        "contract_epoch_after": None,
+        "contract_opened_before": None,
+        "contract_opened_after": None,
+        "contract_has_ordinal": False,
+        "contract_ordinal": None,
+        "contract_capture_flags": 0,
+        "contract_barrier_error_flags": 0,
+        "contract_capture_launch_uid": None,
+        "contract_has_semantic_raw": False,
+        "contract_semantic_raw": None,
     }
+
+
+def encode_varint(value):
+    result = bytearray()
+    while value >= 0x80:
+        result.append((value & 0x7f) | 0x80)
+        value >>= 7
+    result.append(value)
+    return bytes(result)
+
+
+def varint_field(number, value):
+    return encode_varint(number << 3) + encode_varint(value)
+
+
+def message_field(number, payload):
+    return encode_varint((number << 3) | 2) + encode_varint(len(payload)) + payload
+
+
+def captured_instruction_wire(pc, event_kind, semantic_raw, opened_before,
+                              opened_after, ordinal=0, launch_uid=7,
+                              barrier=0x1000):
+    sync = b"".join([
+        varint_field(1, 1),
+        varint_field(2, barrier),
+        varint_field(3, 1),
+        varint_field(4, semantic_raw),
+    ])
+    contract_fields = [
+        varint_field(1, 1),
+        varint_field(2, event_kind),
+        varint_field(3, barrier),
+        varint_field(4, 0 if event_kind == SIDECAR.CONTRACT_EVENT_EXCH else 1),
+        varint_field(5, 1),
+        varint_field(6, opened_before),
+        varint_field(7, opened_after),
+        varint_field(10, 0),
+        varint_field(11, 0),
+        varint_field(12, launch_uid),
+        varint_field(13, 1),
+        varint_field(14, semantic_raw),
+    ]
+    if ordinal:
+        contract_fields.extend([
+            varint_field(8, 1),
+            varint_field(9, ordinal),
+        ])
+    return b"".join([
+        varint_field(1, pc),
+        varint_field(2, 1),
+        varint_field(3, 1),
+        varint_field(4, 3),
+        message_field(6, sync),
+        message_field(9, b"".join(contract_fields)),
+    ])
+
+
+class ContractOrdinalCaptureTest(unittest.TestCase):
+    def test_ready_snapshot_selects_one_completed_generation(self):
+        targets, reason = SIDECAR.resolve_contract_generation(
+            4, 4, 0, True)
+
+        self.assertIsNone(reason)
+        self.assertEqual(targets, [3])
+
+    def test_miss_snapshot_targets_next_generation(self):
+        targets, reason = SIDECAR.resolve_contract_generation(
+            4, 4, 0, False)
+
+        self.assertIsNone(reason)
+        self.assertEqual(targets, [5])
+
+    def test_overlapping_two_parity_equivalent_contracts_is_ambiguous(self):
+        targets, reason = SIDECAR.resolve_contract_generation(
+            4, 6, 0, True)
+
+        self.assertIsNone(reason)
+        self.assertEqual(targets, [3, 5])
+
+    def test_many_waits_can_name_the_same_release(self):
+        resolutions = [
+            SIDECAR.resolve_contract_generation(4, 4, 0, False)[0]
+            for _ in range(3)
+        ]
+
+        self.assertEqual(resolutions, [[5], [5], [5]])
+
+    def test_count_regression_is_rejected(self):
+        targets, reason = SIDECAR.resolve_contract_generation(
+            5, 4, 0, True)
+
+        self.assertEqual(targets, [])
+        self.assertEqual(reason, SIDECAR.CONTRACT_COUNT_REGRESSION)
+
+    def test_barrier_requires_single_arrival_contract_shape(self):
+        exch = dynamic_instruction(0x100, 1)
+        exch.update({
+            "contract_event_kind": SIDECAR.CONTRACT_EVENT_EXCH,
+            "semantic_raw": 0x1ffffe,
+            "contract_epoch_before": 0,
+            "contract_epoch_after": 1,
+            "contract_opened_before": 0,
+            "contract_opened_after": 0,
+        })
+        arrive = dynamic_instruction(0x110, 1)
+        arrive.update({
+            "contract_event_kind": SIDECAR.CONTRACT_EVENT_ARRIVE,
+            "semantic_raw": 256,
+            "contract_epoch_before": 1,
+            "contract_epoch_after": 1,
+            "contract_opened_before": 0,
+            "contract_opened_after": 1,
+            "contract_has_ordinal": True,
+            "contract_ordinal": 1,
+        })
+
+        status = SIDECAR.validate_contract_barrier(
+            [exch, arrive], True)
+
+        self.assertTrue(status["eligible"])
+        self.assertEqual(status["contracts"], 1)
+
+    def test_reused_barrier_requires_ready_witness_before_next_contract(self):
+        exch = dynamic_instruction(0x100, 1)
+        exch.update({
+            "contract_event_kind": SIDECAR.CONTRACT_EVENT_EXCH,
+            "semantic_raw": 0x1ffffe,
+            "contract_epoch_before": 0,
+            "contract_epoch_after": 1,
+            "contract_opened_before": 0,
+            "contract_opened_after": 0,
+        })
+        arrivals = []
+        for ordinal in (1, 2):
+            arrive = dynamic_instruction(0x110, 1)
+            arrive.update({
+                "contract_event_kind": SIDECAR.CONTRACT_EVENT_ARRIVE,
+                "semantic_raw": 256,
+                "contract_epoch_before": 1,
+                "contract_epoch_after": 1,
+                "contract_opened_before": ordinal - 1,
+                "contract_opened_after": ordinal,
+                "contract_has_ordinal": True,
+                "contract_ordinal": ordinal,
+            })
+            arrivals.append(arrive)
+        ready_wait = dynamic_instruction(0x120, 1)
+        ready_wait.update({
+            "contract_event_kind": SIDECAR.CONTRACT_EVENT_WAIT,
+            "semantic_raw": 0,
+            "contract_epoch_before": 1,
+            "contract_epoch_after": 1,
+            "contract_opened_before": 1,
+            "contract_opened_after": 1,
+        })
+
+        rejected = SIDECAR.validate_contract_barrier(
+            [exch] + arrivals, True)
+        accepted = SIDECAR.validate_contract_barrier(
+            [exch] + arrivals + [ready_wait], True,
+            [(ready_wait, True)])
+
+        self.assertIn(
+            SIDECAR.CONTRACT_SERIAL_LIFECYCLE_UNPROVEN,
+            rejected["reject_reasons"])
+        self.assertTrue(accepted["eligible"])
+
+    def test_duplicate_initialization_is_rejected(self):
+        events = []
+        for epoch in (1, 2):
+            exch = dynamic_instruction(0x100, 1)
+            exch.update({
+                "contract_event_kind": SIDECAR.CONTRACT_EVENT_EXCH,
+                "semantic_raw": 0x1ffffe,
+                "contract_epoch_before": epoch - 1,
+                "contract_epoch_after": epoch,
+                "contract_opened_before": 0,
+                "contract_opened_after": 0,
+            })
+            events.append(exch)
+
+        status = SIDECAR.validate_contract_barrier(events, True)
+
+        self.assertFalse(status["eligible"])
+        self.assertIn(
+            SIDECAR.CONTRACT_INITIALIZATION_DUPLICATE,
+            status["reject_reasons"])
+
+    def test_plain_arrive_is_rejected(self):
+        exch = dynamic_instruction(0x100, 1)
+        exch.update({
+            "contract_event_kind": SIDECAR.CONTRACT_EVENT_EXCH,
+            "semantic_raw": 0x1ffffe,
+            "contract_epoch_before": 0,
+            "contract_epoch_after": 1,
+            "contract_opened_before": 0,
+            "contract_opened_after": 0,
+        })
+        arrive = dynamic_instruction(0x110, 1)
+        arrive.update({
+            "contract_event_kind": SIDECAR.CONTRACT_EVENT_ARRIVE,
+            "semantic_raw": 0,
+            "contract_epoch_before": 1,
+            "contract_epoch_after": 1,
+            "contract_opened_before": 0,
+            "contract_opened_after": 0,
+            "contract_capture_flags":
+                SIDECAR.CONTRACT_CAPTURE_PLAIN_ARRIVE,
+        })
+
+        status = SIDECAR.validate_contract_barrier(
+            [exch, arrive], True)
+
+        self.assertFalse(status["eligible"])
+        self.assertIn(
+            SIDECAR.CONTRACT_PLAIN_ARRIVE_PRESENT,
+            status["reject_reasons"])
+
+    def test_missing_tma_ownership_is_rejected(self):
+        exch = dynamic_instruction(0x100, 1)
+        exch.update({
+            "contract_event_kind": SIDECAR.CONTRACT_EVENT_EXCH,
+            "semantic_raw": 0x1ffffe,
+            "contract_epoch_before": 0,
+            "contract_epoch_after": 1,
+            "contract_opened_before": 0,
+            "contract_opened_after": 0,
+        })
+        arrive = dynamic_instruction(0x110, 1)
+        arrive.update({
+            "contract_event_kind": SIDECAR.CONTRACT_EVENT_ARRIVE,
+            "semantic_raw": 256,
+            "contract_epoch_before": 1,
+            "contract_epoch_after": 1,
+            "contract_opened_before": 0,
+            "contract_opened_after": 1,
+            "contract_has_ordinal": True,
+            "contract_ordinal": 1,
+        })
+
+        status = SIDECAR.validate_contract_barrier(
+            [exch, arrive], False)
+
+        self.assertFalse(status["eligible"])
+        self.assertIn(
+            SIDECAR.CONTRACT_TMA_OWNERSHIP_UNPROVEN,
+            status["reject_reasons"])
+
+    def test_arrive_ordinal_must_be_inside_snapshot_interval(self):
+        exch = dynamic_instruction(0x100, 1)
+        exch.update({
+            "contract_event_kind": SIDECAR.CONTRACT_EVENT_EXCH,
+            "semantic_raw": 0x1ffffe,
+            "contract_epoch_before": 0,
+            "contract_epoch_after": 1,
+            "contract_opened_before": 0,
+            "contract_opened_after": 0,
+        })
+        arrive = dynamic_instruction(0x110, 1)
+        arrive.update({
+            "contract_event_kind": SIDECAR.CONTRACT_EVENT_ARRIVE,
+            "semantic_raw": 256,
+            "contract_epoch_before": 1,
+            "contract_epoch_after": 1,
+            "contract_opened_before": 0,
+            "contract_opened_after": 1,
+            "contract_has_ordinal": True,
+            "contract_ordinal": 2,
+        })
+
+        status = SIDECAR.validate_contract_barrier(
+            [exch, arrive], True)
+
+        self.assertFalse(status["eligible"])
+        self.assertIn(
+            SIDECAR.CONTRACT_ORDINAL_INTERVAL_MISMATCH,
+            status["reject_reasons"])
+
+    def test_fold_result_uses_loopback_and_exit_boundaries(self):
+        spec = {
+            "poll_probe_pc": 0x120,
+            "poll_loopback_pc": 0x130,
+            "poll_loop_exit_pc": 0x140,
+        }
+        miss_trace = [
+            dynamic_instruction(0x120, 0xf),
+            dynamic_instruction(0x130, 0xf),
+            dynamic_instruction(0x120, 0xf),
+            dynamic_instruction(0x140, 0xf),
+        ]
+
+        self.assertFalse(
+            SIDECAR._fold_wait_result(miss_trace, 0, spec))
+        self.assertTrue(
+            SIDECAR._fold_wait_result(miss_trace, 2, spec))
+
+    def test_contract_capture_protobuf_fields_are_parsed(self):
+        contract = b"".join([
+            varint_field(1, 1),
+            varint_field(2, SIDECAR.CONTRACT_EVENT_WAIT),
+            varint_field(3, 0x16c50),
+            varint_field(4, 1),
+            varint_field(5, 1),
+            varint_field(6, 4),
+            varint_field(7, 5),
+            varint_field(8, 0),
+            varint_field(10, 0),
+            varint_field(11, 0),
+            varint_field(12, 7),
+            varint_field(13, 1),
+        ])
+        instruction_wire = b"".join([
+            varint_field(1, 0x74e0),
+            varint_field(2, 0xffffffff),
+            varint_field(3, 0xffffffff),
+            varint_field(4, 3),
+            message_field(9, contract),
+        ])
+
+        parsed = SIDECAR._inst_full(
+            instruction_wire, 0, len(instruction_wire))
+
+        self.assertTrue(parsed["contract_capture_valid"])
+        self.assertEqual(
+            parsed["contract_event_kind"],
+            SIDECAR.CONTRACT_EVENT_WAIT)
+        self.assertEqual(parsed["contract_barrier_addr"], 0x16c50)
+        self.assertEqual(parsed["contract_opened_before"], 4)
+        self.assertEqual(parsed["contract_opened_after"], 5)
+        self.assertEqual(parsed["contract_capture_launch_uid"], 7)
+        self.assertTrue(parsed["contract_has_semantic_raw"])
+        self.assertEqual(parsed["contract_semantic_raw"], 0)
+
+    def test_baseline_comparison_requires_all_four_equalities(self):
+        kernel = {
+            "trace_kernel_id": 5,
+            "wait_blocks": [{"runtime_strategy": "INJECT_MISSING_WAIT"}],
+        }
+        wait_report = {
+            "inject_missing_wait": 1,
+            "fold_captured_poll": 0,
+            "ready_only_all_live_visits": 1,
+            "ready_only_partial_visits": 0,
+            "partial_defer_records": 0,
+            "partial_join_pending_visits": 0,
+            "partial_join_already_issued_visits": 0,
+        }
+        contracts = {
+            "validation_complete": True,
+            "kernels": [{
+                "trace_kernel_id": 5,
+                "threadblocks": 1,
+                "contracts": 1,
+                "completion_loads": 1,
+                "expected_bytes": 256,
+                "assigned_bytes": 256,
+                "errors": [],
+            }],
+        }
+        with tempfile.TemporaryDirectory() as current_dir, \
+                tempfile.TemporaryDirectory() as baseline_dir:
+            current_extra = Path(current_dir) / "extra_info"
+            baseline_extra = Path(baseline_dir) / "extra_info"
+            current_extra.mkdir()
+            baseline_extra.mkdir()
+            (baseline_extra / "spin_wait_sidecar.json").write_text(
+                json.dumps({
+                    "wait_block_report": wait_report,
+                    "kernels": [kernel],
+                }))
+            for extra in (current_extra, baseline_extra):
+                (extra / "tma_completion_contracts.json").write_text(
+                    json.dumps(contracts))
+            fingerprint = {
+                "sha256": "same",
+                "counts": {"instructions": 10},
+            }
+            with mock.patch.object(
+                    SIDECAR, "semantic_trace_fingerprint",
+                    return_value=fingerprint):
+                result = SIDECAR.compare_contract_capture_baseline(
+                    current_dir, baseline_dir, [kernel], wait_report)
+
+        self.assertEqual(result["status"], "PASS")
+        self.assertTrue(all(result["comparisons"].values()))
+
+    def test_end_to_end_capture_analysis_emits_unique_ticket(self):
+        instructions = [
+            captured_instruction_wire(
+                0x100, SIDECAR.CONTRACT_EVENT_EXCH,
+                0x1ffffe, 0, 0),
+            captured_instruction_wire(
+                0x110, SIDECAR.CONTRACT_EVENT_ARRIVE,
+                256, 0, 1, ordinal=1),
+            captured_instruction_wire(
+                0x120, SIDECAR.CONTRACT_EVENT_WAIT,
+                0, 1, 1),
+        ]
+        warp = varint_field(1, 0) + b"".join(
+            message_field(2, instruction)
+            for instruction in instructions
+        )
+        map_entry = varint_field(1, 0) + message_field(2, warp)
+        threadblock = message_field(2, map_entry)
+
+        with tempfile.TemporaryDirectory() as root:
+            traces = Path(root)
+            kdir = (
+                traces / "threadblocks/device_0/stream_0/kernel_5")
+            kdir.mkdir(parents=True)
+            (kdir / "d_0_s_0_k_5_0,0,0.pb").write_bytes(threadblock)
+            extra = traces / "extra_info"
+            extra.mkdir()
+            (extra / "tma_completion_contracts.json").write_text(
+                json.dumps({
+                    "validation_complete": True,
+                    "kernels": [{
+                        "trace_kernel_id": 5,
+                        "contracts": 1,
+                        "expected_bytes": 256,
+                        "assigned_bytes": 256,
+                        "errors": [],
+                    }],
+                }))
+            sync_sites = {
+                (3, 0x100): {"sync_kind": "EXCH"},
+                (3, 0x110): {"sync_kind": "ARRIVE_EXPECT_TX"},
+                (3, 0x120): {"sync_kind": "TRYWAIT"},
+            }
+            sidecar_kernels = [{
+                "trace_kernel_id": 5,
+                "wait_blocks": [{
+                    "runtime_strategy": "INJECT_MISSING_WAIT",
+                    "unique_function_id": 3,
+                    "entry_probe_pc": 0x120,
+                }],
+            }]
+
+            report = SIDECAR.analyze_mbarrier_contract_capture(
+                str(traces), {5: str(kdir)}, {5: 3},
+                sync_sites, sidecar_kernels, "all")
+
+        self.assertEqual(report["status"], "PASS")
+        self.assertEqual(report["summary"]["unique_assignments"], 1)
+        self.assertEqual(
+            report["tickets"][0]["target_release_generation"], 1)
+
+    def test_device_capture_avoids_prior_deadlock_patterns(self):
+        tracer_dir = MODULE_PATH.parent / "tracer_tool"
+        inject_source = (tracer_dir / "inject_funcs.cu").read_text()
+        begin = inject_source.index(
+            "void record_mbarrier_contract_begin")
+        end = inject_source.index(
+            "void record_mbarrier_contract_end")
+        capture_end = inject_source.index(
+            "void record_warp_exit", end)
+        begin_body = inject_source[begin:end]
+        end_body = inject_source[end:capture_end]
+
+        self.assertLess(
+            begin_body.index("__ballot_sync"),
+            begin_body.index("lane_id != publisher_lane"))
+        self.assertNotIn("ChannelDev", begin_body)
+        self.assertNotIn("channel_dev->push", begin_body)
+        self.assertNotIn("__ballot_sync", end_body)
+        self.assertIn(
+            "const int publisher_lane = __ffs(active_mask) - 1",
+            end_body)
+        self.assertNotIn("ChannelDev", end_body)
+        self.assertNotIn("channel_dev->push", end_body)
+
+        tracer_source = (tracer_dir / "tracer_tool.cu").read_text()
+        self.assertIn(
+            '"MBARRIER_CONTRACT_CAPTURE", 0, 0, 1',
+            tracer_source)
+        self.assertIn(
+            "transport=launch_managed_buffer", tracer_source)
+        self.assertNotIn("mbarrier_contract_channel", tracer_source)
+        self.assertIn(
+            "MBARRIER_CONTRACT_ERROR_RECORD_OVERFLOW",
+            inject_source)
+        self.assertIn(
+            "MBARRIER_CONTRACT_ERROR_BARRIER_TABLE_OVERFLOW",
+            inject_source)
+        runner_source = (
+            MODULE_PATH.parent / "run_hw_trace.py").read_text()
+        self.assertIn(
+            '"--mbarrier-contract-capture"', runner_source)
+        self.assertIn(
+            'if mbarrier_contract_capture:', runner_source)
 
 
 class WaitBlockFoldProofTest(unittest.TestCase):

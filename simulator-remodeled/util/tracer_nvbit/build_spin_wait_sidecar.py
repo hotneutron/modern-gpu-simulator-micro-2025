@@ -35,6 +35,7 @@ in one CTA and captured-poll in another.
 """
 import argparse
 import glob
+import hashlib
 import json
 import os
 import sys
@@ -63,7 +64,11 @@ MAX_LOOP_SPAN = 0x100  # a spin loop is short; guards against matching big loops
 # shared helper. instruction.proto fields: pc=1, active_mask=2, predicate_mask=3,
 # function_unique_id=4, sync=6 { valid=1, barrier_addr=2, has_semantic_raw=3,
 # semantic_raw=4 }, tma_completion=8 { valid=1, barrier_addr=2,
-# barrier_ureg_id=3 }.
+# barrier_ureg_id=3 }, mbarrier_contract=9 { valid=1, event_kind=2,
+# barrier_addr=3, epoch_before=4, epoch_after=5, opened_before=6,
+# opened_after=7, has_ordinal=8, ordinal=9, capture_flags=10,
+# barrier_error_flags=11, capture_launch_uid=12, has_semantic_raw=13,
+# semantic_raw=14 }.
 _rv = _ts._rv
 _skip = _ts._skip
 
@@ -81,6 +86,20 @@ def _inst_full(buf, s, e):
     tma_completion_valid = False
     tma_completion_barrier_addr = None
     tma_completion_barrier_ureg_id = None
+    contract_capture_valid = False
+    contract_event_kind = None
+    contract_barrier_addr = None
+    contract_epoch_before = None
+    contract_epoch_after = None
+    contract_opened_before = None
+    contract_opened_after = None
+    contract_has_ordinal = False
+    contract_ordinal = None
+    contract_capture_flags = 0
+    contract_barrier_error_flags = 0
+    contract_capture_launch_uid = None
+    contract_has_semantic_raw = False
+    contract_semantic_raw = None
     while i < e:
         tag, i = _rv(buf, i)
         f, w = tag >> 3, tag & 7
@@ -126,6 +145,49 @@ def _inst_full(buf, s, e):
                 else:
                     k = _skip(buf, k, w2)
             i = end
+        elif f == 9 and w == 2:                 # mbarrier_contract_runtime_info
+            ln, j = _rv(buf, i)
+            end = j + ln
+            k = j
+            while k < end:
+                t2, k = _rv(buf, k)
+                f2, w2 = t2 >> 3, t2 & 7
+                if w2 != 0:
+                    k = _skip(buf, k, w2)
+                    continue
+                value, k = _rv(buf, k)
+                if f2 == 1:
+                    contract_capture_valid = bool(value)
+                elif f2 == 2:
+                    contract_event_kind = value
+                elif f2 == 3:
+                    contract_barrier_addr = value
+                elif f2 == 4:
+                    contract_epoch_before = value
+                elif f2 == 5:
+                    contract_epoch_after = value
+                elif f2 == 6:
+                    contract_opened_before = value
+                elif f2 == 7:
+                    contract_opened_after = value
+                elif f2 == 8:
+                    contract_has_ordinal = bool(value)
+                elif f2 == 9:
+                    contract_ordinal = value
+                elif f2 == 10:
+                    contract_capture_flags = value
+                elif f2 == 11:
+                    contract_barrier_error_flags = value
+                elif f2 == 12:
+                    contract_capture_launch_uid = value
+                elif f2 == 13:
+                    contract_has_semantic_raw = bool(value)
+                elif f2 == 14:
+                    contract_semantic_raw = value
+            i = end
+            if (contract_has_semantic_raw
+                    and contract_semantic_raw is None):
+                contract_semantic_raw = 0
         else:
             i = _skip(buf, i, w)
     return {
@@ -140,6 +202,20 @@ def _inst_full(buf, s, e):
         "tma_completion_barrier_addr": tma_completion_barrier_addr,
         "tma_completion_barrier_ureg_id":
             tma_completion_barrier_ureg_id,
+        "contract_capture_valid": contract_capture_valid,
+        "contract_event_kind": contract_event_kind,
+        "contract_barrier_addr": contract_barrier_addr,
+        "contract_epoch_before": contract_epoch_before,
+        "contract_epoch_after": contract_epoch_after,
+        "contract_opened_before": contract_opened_before,
+        "contract_opened_after": contract_opened_after,
+        "contract_has_ordinal": contract_has_ordinal,
+        "contract_ordinal": contract_ordinal,
+        "contract_capture_flags": contract_capture_flags,
+        "contract_barrier_error_flags": contract_barrier_error_flags,
+        "contract_capture_launch_uid": contract_capture_launch_uid,
+        "contract_has_semantic_raw": contract_has_semantic_raw,
+        "contract_semantic_raw": contract_semantic_raw,
     }
 
 
@@ -189,6 +265,759 @@ def vpb_parse_full(buf):
         else:
             i = _skip(buf, i, w)
     return warps
+
+
+CONTRACT_EVENT_EXCH = 1
+CONTRACT_EVENT_ARRIVE = 2
+CONTRACT_EVENT_WAIT = 3
+CONTRACT_CAPTURE_PLAIN_ARRIVE = 1 << 0
+CONTRACT_CAPTURE_ARRIVE_BEFORE_INIT = 1 << 1
+CONTRACT_CAPTURE_DUPLICATE_INIT = 1 << 2
+CONTRACT_MAX_INTERVAL_WIDTH = 4096
+
+CONTRACT_CAPTURE_MISSING = "CONTRACT_CAPTURE_MISSING"
+CONTRACT_CAPTURE_EVENT_MISMATCH = "CONTRACT_CAPTURE_EVENT_MISMATCH"
+CONTRACT_CAPTURE_ADDRESS_MISMATCH = "CONTRACT_CAPTURE_ADDRESS_MISMATCH"
+CONTRACT_CAPTURE_SEMANTIC_MISMATCH = "CONTRACT_CAPTURE_SEMANTIC_MISMATCH"
+CONTRACT_LAUNCH_IDENTITY_MISMATCH = \
+    "CONTRACT_LAUNCH_IDENTITY_MISMATCH"
+CONTRACT_CAPTURE_DEVICE_ERROR = "CONTRACT_CAPTURE_DEVICE_ERROR"
+CONTRACT_INITIALIZATION_MISSING = "CONTRACT_INITIALIZATION_MISSING"
+CONTRACT_INITIALIZATION_DUPLICATE = "CONTRACT_INITIALIZATION_DUPLICATE"
+CONTRACT_INITIALIZATION_EPOCH_UNSUPPORTED = \
+    "CONTRACT_INITIALIZATION_EPOCH_UNSUPPORTED"
+CONTRACT_ARRIVAL_COUNT_UNSUPPORTED = "CONTRACT_ARRIVAL_COUNT_UNSUPPORTED"
+CONTRACT_PLAIN_ARRIVE_PRESENT = "CONTRACT_PLAIN_ARRIVE_PRESENT"
+CONTRACT_EXPECT_TX_MISSING = "CONTRACT_EXPECT_TX_MISSING"
+CONTRACT_ORDINAL_MISSING = "CONTRACT_ORDINAL_MISSING"
+CONTRACT_ORDINAL_DUPLICATE = "CONTRACT_ORDINAL_DUPLICATE"
+CONTRACT_ORDINAL_NONCONTIGUOUS = "CONTRACT_ORDINAL_NONCONTIGUOUS"
+CONTRACT_ORDINAL_INTERVAL_MISMATCH = \
+    "CONTRACT_ORDINAL_INTERVAL_MISMATCH"
+CONTRACT_COUNT_REGRESSION = "CONTRACT_COUNT_REGRESSION"
+CONTRACT_INTERVAL_TOO_WIDE = "CONTRACT_INTERVAL_TOO_WIDE"
+CONTRACT_WAIT_RESULT_UNPROVEN = "CONTRACT_WAIT_RESULT_UNPROVEN"
+CONTRACT_GENERATION_INCONSISTENT = "CONTRACT_GENERATION_INCONSISTENT"
+CONTRACT_GENERATION_AMBIGUOUS = "CONTRACT_GENERATION_AMBIGUOUS"
+CONTRACT_TMA_OWNERSHIP_UNPROVEN = "CONTRACT_TMA_OWNERSHIP_UNPROVEN"
+CONTRACT_SERIAL_LIFECYCLE_UNPROVEN = \
+    "CONTRACT_SERIAL_LIFECYCLE_UNPROVEN"
+
+CONTRACT_REJECT_REASONS = (
+    CONTRACT_CAPTURE_MISSING,
+    CONTRACT_CAPTURE_EVENT_MISMATCH,
+    CONTRACT_CAPTURE_ADDRESS_MISMATCH,
+    CONTRACT_CAPTURE_SEMANTIC_MISMATCH,
+    CONTRACT_LAUNCH_IDENTITY_MISMATCH,
+    CONTRACT_CAPTURE_DEVICE_ERROR,
+    CONTRACT_INITIALIZATION_MISSING,
+    CONTRACT_INITIALIZATION_DUPLICATE,
+    CONTRACT_INITIALIZATION_EPOCH_UNSUPPORTED,
+    CONTRACT_ARRIVAL_COUNT_UNSUPPORTED,
+    CONTRACT_PLAIN_ARRIVE_PRESENT,
+    CONTRACT_EXPECT_TX_MISSING,
+    CONTRACT_ORDINAL_MISSING,
+    CONTRACT_ORDINAL_DUPLICATE,
+    CONTRACT_ORDINAL_NONCONTIGUOUS,
+    CONTRACT_ORDINAL_INTERVAL_MISMATCH,
+    CONTRACT_COUNT_REGRESSION,
+    CONTRACT_INTERVAL_TOO_WIDE,
+    CONTRACT_WAIT_RESULT_UNPROVEN,
+    CONTRACT_GENERATION_INCONSISTENT,
+    CONTRACT_GENERATION_AMBIGUOUS,
+    CONTRACT_TMA_OWNERSHIP_UNPROVEN,
+    CONTRACT_SERIAL_LIFECYCLE_UNPROVEN,
+)
+
+
+def decode_exch_arrival_count(raw):
+    raw = int(raw)
+    delta = 0x200000 - raw
+    if raw < 0 or delta <= 0 or delta % 2:
+        return None
+    return delta // 2
+
+
+def decode_wait_parity(raw):
+    return (int(raw) >> 31) & 1
+
+
+def resolve_contract_generation(opened_before, opened_after, wait_parity,
+                                captured_ready):
+    """Return every target generation allowed by one wait snapshot interval.
+
+    With one arrival and one contract per generation, N opened contracts allow
+    only N-1 or N completed generations. A miss targets the next generation;
+    a ready observation targets the generation that already satisfied it.
+    """
+    lo = int(opened_before)
+    hi = int(opened_after)
+    if hi < lo:
+        return [], CONTRACT_COUNT_REGRESSION
+    if hi - lo > CONTRACT_MAX_INTERVAL_WIDTH:
+        return [], CONTRACT_INTERVAL_TOO_WIDE
+    targets = set()
+    for opened in range(lo, hi + 1):
+        completed_candidates = [opened]
+        if opened > 0:
+            completed_candidates.append(opened - 1)
+        for completed in completed_candidates:
+            ready = (completed & 1) != int(wait_parity)
+            if ready != bool(captured_ready):
+                continue
+            targets.add(completed if ready else completed + 1)
+    return sorted(targets), None
+
+
+def validate_contract_barrier(events, tma_ownership_valid,
+                              captured_wait_results=()):
+    reasons = []
+    exch = [event for event in events
+            if event["contract_event_kind"] == CONTRACT_EVENT_EXCH]
+    arrives = [event for event in events
+               if event["contract_event_kind"] == CONTRACT_EVENT_ARRIVE]
+    if not tma_ownership_valid:
+        reasons.append(CONTRACT_TMA_OWNERSHIP_UNPROVEN)
+    if not exch:
+        reasons.append(CONTRACT_INITIALIZATION_MISSING)
+    elif len(exch) != 1:
+        reasons.append(CONTRACT_INITIALIZATION_DUPLICATE)
+    else:
+        expected = decode_exch_arrival_count(
+            0 if exch[0]["semantic_raw"] is None
+            else exch[0]["semantic_raw"])
+        if expected != 1:
+            reasons.append(CONTRACT_ARRIVAL_COUNT_UNSUPPORTED)
+    if any(event["contract_capture_flags"] &
+           CONTRACT_CAPTURE_DUPLICATE_INIT for event in events):
+        reasons.append(CONTRACT_INITIALIZATION_DUPLICATE)
+    if any(event["contract_capture_flags"] &
+           CONTRACT_CAPTURE_ARRIVE_BEFORE_INIT for event in events):
+        reasons.append(CONTRACT_INITIALIZATION_EPOCH_UNSUPPORTED)
+    if any(event["contract_barrier_error_flags"] for event in events):
+        reasons.append(CONTRACT_CAPTURE_DEVICE_ERROR)
+    if any(event["contract_epoch_before"] != event["contract_epoch_after"]
+           for event in events
+           if event["contract_event_kind"] != CONTRACT_EVENT_EXCH):
+        reasons.append(CONTRACT_INITIALIZATION_EPOCH_UNSUPPORTED)
+    if any(event["contract_epoch_after"] != 1 for event in events):
+        reasons.append(CONTRACT_INITIALIZATION_EPOCH_UNSUPPORTED)
+
+    plain_arrives = [
+        event for event in arrives
+        if not int(event["semantic_raw"] or 0)
+    ]
+    expect_arrives = [
+        event for event in arrives
+        if int(event["semantic_raw"] or 0)
+    ]
+    if plain_arrives:
+        reasons.append(CONTRACT_PLAIN_ARRIVE_PRESENT)
+    if not expect_arrives:
+        reasons.append(CONTRACT_EXPECT_TX_MISSING)
+    ordinals = []
+    for event in expect_arrives:
+        if (not event["contract_has_ordinal"]
+                or event["contract_ordinal"] is None
+                or int(event["contract_ordinal"]) <= 0):
+            reasons.append(CONTRACT_ORDINAL_MISSING)
+            continue
+        ordinal = int(event["contract_ordinal"])
+        ordinals.append(ordinal)
+        before = event["contract_opened_before"]
+        after = event["contract_opened_after"]
+        if (before is None or after is None
+                or ordinal <= int(before)
+                or ordinal > int(after)):
+            reasons.append(CONTRACT_ORDINAL_INTERVAL_MISMATCH)
+    if len(ordinals) != len(set(ordinals)):
+        reasons.append(CONTRACT_ORDINAL_DUPLICATE)
+    if sorted(set(ordinals)) != list(range(1, len(ordinals) + 1)):
+        reasons.append(CONTRACT_ORDINAL_NONCONTIGUOUS)
+    for event in events:
+        before = event["contract_opened_before"]
+        after = event["contract_opened_after"]
+        if before is None or after is None:
+            reasons.append(CONTRACT_CAPTURE_MISSING)
+        elif int(after) < int(before):
+            reasons.append(CONTRACT_COUNT_REGRESSION)
+        elif int(after) - int(before) > CONTRACT_MAX_INTERVAL_WIDTH:
+            reasons.append(CONTRACT_INTERVAL_TOO_WIDE)
+    if not reasons and len(expect_arrives) > 1:
+        ready_generations = set()
+        for wait, captured_ready in captured_wait_results:
+            if not captured_ready:
+                continue
+            before = wait["contract_opened_before"]
+            after = wait["contract_opened_after"]
+            if before is None or after is None or int(before) != int(after):
+                continue
+            parity = decode_wait_parity(
+                0 if wait["semantic_raw"] is None
+                else wait["semantic_raw"])
+            targets, error = resolve_contract_generation(
+                before, after, parity, True)
+            if error is None and len(targets) == 1:
+                ready_generations.add(targets[0])
+        required = set(range(1, len(expect_arrives)))
+        if not required.issubset(ready_generations):
+            reasons.append(CONTRACT_SERIAL_LIFECYCLE_UNPROVEN)
+    reasons = sorted(set(reasons))
+    return {
+        "eligible": not reasons,
+        "reject_reasons": reasons,
+        "contracts": len(expect_arrives),
+        "initializations": len(exch),
+        "plain_arrives": len(plain_arrives),
+    }
+
+
+def _contract_expected_event_kind(sync_kind):
+    if sync_kind == "EXCH":
+        return CONTRACT_EVENT_EXCH
+    if sync_kind == "ARRIVE_EXPECT_TX":
+        return CONTRACT_EVENT_ARRIVE
+    if sync_kind in WAIT_KINDS:
+        return CONTRACT_EVENT_WAIT
+    return None
+
+
+def _fold_wait_result(insts, index, spec):
+    owner_mask = (
+        int(insts[index]["active_mask"])
+        & int(insts[index]["predicate_mask"])
+    )
+    for following in insts[index + 1:]:
+        if int(following["function_unique_id"]) != int(
+                insts[index]["function_unique_id"]):
+            continue
+        effective = (
+            int(following["active_mask"])
+            & int(following["predicate_mask"])
+        )
+        if effective & owner_mask == 0:
+            continue
+        pc = int(following["pc"])
+        if pc == int(spec["poll_loopback_pc"]):
+            return False
+        if pc == int(spec["poll_loop_exit_pc"]):
+            return True
+        if pc == int(spec["poll_probe_pc"]):
+            return False
+    return None
+
+
+def _load_tma_ownership_status(extra):
+    path = os.path.join(extra, "tma_completion_contracts.json")
+    if not os.path.exists(path):
+        return {}
+    with open(path) as handle:
+        document = json.load(handle)
+    if not document.get("validation_complete"):
+        return {}
+    result = {}
+    for kernel in document.get("kernels", []):
+        kernel_id = int(kernel["trace_kernel_id"])
+        result[kernel_id] = bool(
+            not kernel.get("errors")
+            and int(kernel.get("contracts", 0)) > 0
+            and int(kernel.get("expected_bytes", -1))
+            == int(kernel.get("assigned_bytes", -2))
+        )
+    return result
+
+
+def analyze_mbarrier_contract_capture(traces, kdirs, kid_to_fid,
+                                      sync_sites, sidecar_kernels,
+                                      max_ctas):
+    action_specs = {}
+    for kernel in sidecar_kernels:
+        kid = int(kernel["trace_kernel_id"])
+        for record in kernel.get("wait_blocks", []):
+            strategy = record.get("runtime_strategy")
+            if strategy == "INJECT_MISSING_WAIT":
+                pc = int(record["entry_probe_pc"])
+            elif strategy == "FOLD_CAPTURED_POLL":
+                pc = int(record["poll_probe_pc"])
+            else:
+                continue
+            action_specs[(kid, int(record["unique_function_id"]), pc)] = record
+
+    ownership = _load_tma_ownership_status(
+        os.path.join(traces, "extra_info"))
+    report = Counter()
+    for field in (
+            "active_sync_occurrences", "missing_snapshots",
+            "duplicate_snapshots", "capture_mismatches", "barriers",
+            "eligible_barriers", "unsupported_barriers",
+            "unsupported_snapshots_on_eligible_barriers",
+            "eligible_action_occurrences",
+            "unsupported_action_occurrences",
+            "rejected_tma_action_occurrences", "unique_assignments",
+            "ambiguous_assignments", "inconsistent_assignments",
+            "unique_streams", "ambiguous_or_invalid_streams"):
+        report[field] = 0
+    tickets = []
+    rejects = []
+    barrier_rejections = []
+    stream_results = defaultdict(list)
+
+    for kid in sorted(kdirs):
+        fid = kid_to_fid.get(kid)
+        if fid is None:
+            continue
+        paths = sorted(glob.glob(os.path.join(kdirs[kid], "*.pb")))
+        if max_ctas != "all":
+            paths = paths[:int(max_ctas)]
+        for path in paths:
+            cta_name = os.path.basename(path)
+            with open(path, "rb") as handle:
+                warps = vpb_parse_full(handle.read())
+            barrier_events = defaultdict(list)
+            action_waits = []
+            captured_wait_results = defaultdict(list)
+            capture_launch_uids = set()
+            for warp_id, insts in warps:
+                for index, inst in enumerate(insts):
+                    effective = (
+                        int(inst["active_mask"])
+                        & int(inst["predicate_mask"])
+                    )
+                    site = (
+                        int(inst["function_unique_id"]), int(inst["pc"]))
+                    sync_site = sync_sites.get(site)
+                    expected_kind = (
+                        _contract_expected_event_kind(
+                            sync_site.get("sync_kind"))
+                        if sync_site else None
+                    )
+                    if effective and expected_kind is not None:
+                        report["active_sync_occurrences"] += 1
+                        if not inst["contract_capture_valid"]:
+                            report["missing_snapshots"] += 1
+                            rejects.append({
+                                "kernel_id": kid,
+                                "cta": cta_name,
+                                "warp_id": warp_id,
+                                "pc": inst["pc"],
+                                "reason": CONTRACT_CAPTURE_MISSING,
+                            })
+                            continue
+                        if inst["contract_event_kind"] != expected_kind:
+                            report["capture_mismatches"] += 1
+                            rejects.append({
+                                "kernel_id": kid,
+                                "cta": cta_name,
+                                "warp_id": warp_id,
+                                "pc": inst["pc"],
+                                "reason": CONTRACT_CAPTURE_EVENT_MISMATCH,
+                            })
+                            continue
+                        if (inst["contract_barrier_addr"]
+                                != inst["barrier_addr"]):
+                            report["capture_mismatches"] += 1
+                            rejects.append({
+                                "kernel_id": kid,
+                                "cta": cta_name,
+                                "warp_id": warp_id,
+                                "pc": inst["pc"],
+                                "reason": CONTRACT_CAPTURE_ADDRESS_MISMATCH,
+                            })
+                            continue
+                        semantic_raw = (
+                            0 if inst["semantic_raw"] is None
+                            else int(inst["semantic_raw"]))
+                        if (not inst["contract_has_semantic_raw"]
+                                or inst["contract_semantic_raw"]
+                                != semantic_raw):
+                            report["capture_mismatches"] += 1
+                            rejects.append({
+                                "kernel_id": kid,
+                                "cta": cta_name,
+                                "warp_id": warp_id,
+                                "pc": inst["pc"],
+                                "reason":
+                                    CONTRACT_CAPTURE_SEMANTIC_MISMATCH,
+                            })
+                            continue
+                        launch_uid = inst["contract_capture_launch_uid"]
+                        if launch_uid is None or int(launch_uid) <= 0:
+                            report["capture_mismatches"] += 1
+                            rejects.append({
+                                "kernel_id": kid,
+                                "cta": cta_name,
+                                "warp_id": warp_id,
+                                "pc": inst["pc"],
+                                "reason":
+                                    CONTRACT_LAUNCH_IDENTITY_MISMATCH,
+                            })
+                            continue
+                        capture_launch_uids.add(int(launch_uid))
+                        barrier_events[
+                            int(inst["contract_barrier_addr"])].append(inst)
+
+                    spec = action_specs.get((kid,) + site)
+                    if not effective or spec is None:
+                        continue
+                    result = None
+                    if spec["runtime_strategy"] == "INJECT_MISSING_WAIT":
+                        result = True
+                    elif spec["runtime_strategy"] == "FOLD_CAPTURED_POLL":
+                        result = _fold_wait_result(insts, index, spec)
+                    action_waits.append({
+                        "warp_id": warp_id,
+                        "source_warp_instruction_index": index,
+                        "instruction": inst,
+                        "spec": spec,
+                        "captured_ready": result,
+                    })
+                    if (inst["contract_capture_valid"]
+                            and inst["contract_barrier_addr"] is not None
+                            and result is not None):
+                        captured_wait_results[
+                            int(inst["contract_barrier_addr"])].append(
+                                (inst, result))
+
+            if len(capture_launch_uids) > 1:
+                report["capture_mismatches"] += 1
+                rejects.append({
+                    "kernel_id": kid,
+                    "cta": cta_name,
+                    "reason": CONTRACT_LAUNCH_IDENTITY_MISMATCH,
+                    "capture_launch_uids":
+                        sorted(capture_launch_uids),
+                })
+            barrier_status = {
+                barrier: validate_contract_barrier(
+                    events, ownership.get(kid, False),
+                    captured_wait_results.get(barrier, ()))
+                for barrier, events in barrier_events.items()
+            }
+            report["barriers"] += len(barrier_status)
+            report["eligible_barriers"] += sum(
+                status["eligible"]
+                for status in barrier_status.values())
+            report["unsupported_barriers"] += sum(
+                not status["eligible"]
+                for status in barrier_status.values())
+            for barrier, status in barrier_status.items():
+                if status["eligible"]:
+                    continue
+                barrier_rejections.append({
+                    "trace_kernel_id": kid,
+                    "capture_launch_uid":
+                        (next(iter(capture_launch_uids))
+                         if len(capture_launch_uids) == 1 else None),
+                    "cta_file": cta_name,
+                    "barrier_addr": barrier,
+                    "reject_reasons": status["reject_reasons"],
+                    "contracts": status["contracts"],
+                    "initializations": status["initializations"],
+                    "plain_arrives": status["plain_arrives"],
+                })
+            for wait in action_waits:
+                inst = wait["instruction"]
+                barrier = inst["contract_barrier_addr"]
+                status = barrier_status.get(barrier)
+                if status is None or not status["eligible"]:
+                    report["unsupported_action_occurrences"] += 1
+                    if status is not None and status["contracts"] > 0:
+                        report["rejected_tma_action_occurrences"] += 1
+                        rejects.append({
+                            "kernel_id": kid,
+                            "cta": cta_name,
+                            "warp_id": wait["warp_id"],
+                            "pc": inst["pc"],
+                            "barrier_addr": barrier,
+                            "reason": status["reject_reasons"],
+                        })
+                    continue
+                report["eligible_action_occurrences"] += 1
+                if wait["captured_ready"] is None:
+                    report["inconsistent_assignments"] += 1
+                    rejects.append({
+                        "kernel_id": kid,
+                        "cta": cta_name,
+                        "warp_id": wait["warp_id"],
+                        "pc": inst["pc"],
+                        "reason": CONTRACT_WAIT_RESULT_UNPROVEN,
+                    })
+                    continue
+                wait_parity = decode_wait_parity(
+                    0 if inst["semantic_raw"] is None
+                    else inst["semantic_raw"])
+                targets, interval_error = resolve_contract_generation(
+                    inst["contract_opened_before"],
+                    inst["contract_opened_after"],
+                    wait_parity,
+                    wait["captured_ready"],
+                )
+                if interval_error is not None:
+                    report["inconsistent_assignments"] += 1
+                    reason = interval_error
+                elif not targets:
+                    report["inconsistent_assignments"] += 1
+                    reason = CONTRACT_GENERATION_INCONSISTENT
+                elif len(targets) != 1:
+                    report["ambiguous_assignments"] += 1
+                    reason = CONTRACT_GENERATION_AMBIGUOUS
+                else:
+                    report["unique_assignments"] += 1
+                    reason = None
+                ticket = {
+                    "trace_kernel_id": kid,
+                    "capture_launch_uid":
+                        int(inst["contract_capture_launch_uid"]),
+                    "cta_file": cta_name,
+                    "warp_id": wait["warp_id"],
+                    "unique_function_id":
+                        int(inst["function_unique_id"]),
+                    "pc": int(inst["pc"]),
+                    "source_warp_instruction_index":
+                        wait["source_warp_instruction_index"],
+                    "runtime_strategy":
+                        wait["spec"]["runtime_strategy"],
+                    "barrier_addr": int(barrier),
+                    "initialization_epoch":
+                        int(inst["contract_epoch_after"]),
+                    "opened_contract_interval": [
+                        int(inst["contract_opened_before"]),
+                        int(inst["contract_opened_after"]),
+                    ],
+                    "wait_parity": wait_parity,
+                    "captured_result":
+                        "READY" if wait["captured_ready"] else "MISS",
+                    "candidate_target_generations": targets,
+                    "target_release_generation":
+                        targets[0] if len(targets) == 1 else None,
+                    "proof_inputs": {
+                        "initialization_count":
+                            status["initializations"],
+                        "decoded_expected_arrival_count": 1,
+                        "plain_arrive_count":
+                            status["plain_arrives"],
+                        "expect_tx_contract_count":
+                            status["contracts"],
+                        "exact_tma_ownership": True,
+                        "serial_same_barrier_lifecycle": True,
+                    },
+                    "status": "UNIQUE" if reason is None else "REJECT",
+                    "reject_reason": reason,
+                }
+                tickets.append(ticket)
+                stream_key = (
+                    kid, cta_name, wait["warp_id"], int(barrier),
+                    wait["spec"]["runtime_strategy"],
+                )
+                stream_results[stream_key].append(ticket)
+                if reason is not None:
+                    rejects.append(ticket)
+
+    for stream in stream_results.values():
+        if all(ticket["status"] == "UNIQUE" for ticket in stream):
+            report["unique_streams"] += 1
+        else:
+            report["ambiguous_or_invalid_streams"] += 1
+
+    required_zero = (
+        "missing_snapshots",
+        "capture_mismatches",
+        "rejected_tma_action_occurrences",
+        "inconsistent_assignments",
+        "ambiguous_assignments",
+        "ambiguous_or_invalid_streams",
+    )
+    status = (
+        "PASS"
+        if report["eligible_action_occurrences"] > 0
+        and all(report[name] == 0 for name in required_zero)
+        else "FAIL"
+    )
+    return {
+        "version": 1,
+        "schema": "mbarrier_contract_ordinal_feasibility",
+        "status": status,
+        "model": "ONE_ARRIVAL_ONE_EXPECT_TX_CONTRACT_PER_GENERATION",
+        "reject_reason_taxonomy": list(CONTRACT_REJECT_REASONS),
+        "summary": dict(report),
+        "tickets": tickets,
+        "barrier_rejections": barrier_rejections,
+        "rejects": rejects,
+    }
+
+
+def semantic_trace_fingerprint(traces, kernel_ids):
+    digest = hashlib.sha256()
+    counts = Counter()
+    kdirs = kernel_dir_map(traces)
+    for kernel_id in sorted(kernel_ids):
+        kdir = kdirs.get(kernel_id)
+        if kdir is None:
+            continue
+        paths = sorted(glob.glob(os.path.join(kdir, "*.pb")))
+        counts["kernel_%d_ctas" % kernel_id] = len(paths)
+        for path in paths:
+            digest.update(
+                ("kernel=%d cta=%s\n"
+                 % (kernel_id, os.path.basename(path))).encode("ascii"))
+            with open(path, "rb") as handle:
+                warps = vpb_parse_full(handle.read())
+            for warp_id, instructions in warps:
+                for index, inst in enumerate(instructions):
+                    fields = (
+                        kernel_id,
+                        os.path.basename(path),
+                        int(warp_id),
+                        index,
+                        int(inst["function_unique_id"]),
+                        int(inst["pc"]),
+                        int(inst["active_mask"]),
+                        int(inst["predicate_mask"]),
+                        int(bool(inst["sync_valid"])),
+                        -1 if inst["barrier_addr"] is None
+                        else int(inst["barrier_addr"]),
+                        -1 if inst["semantic_raw"] is None
+                        else int(inst["semantic_raw"]),
+                        int(bool(inst["tma_completion_valid"])),
+                        -1 if inst["tma_completion_barrier_addr"] is None
+                        else int(inst["tma_completion_barrier_addr"]),
+                    )
+                    digest.update(
+                        ("|".join(str(value) for value in fields) + "\n")
+                        .encode("ascii"))
+                    counts["instructions"] += 1
+                    if inst["sync_valid"]:
+                        counts["sync_instructions"] += 1
+                    if inst["tma_completion_valid"]:
+                        counts["completion_bearing_tma"] += 1
+    return {
+        "sha256": digest.hexdigest(),
+        "counts": dict(sorted(counts.items())),
+    }
+
+
+def compare_contract_capture_baseline(current_traces, baseline_traces,
+                                      current_sidecar_kernels,
+                                      current_wait_report):
+    kernel_ids = sorted(
+        int(kernel["trace_kernel_id"])
+        for kernel in current_sidecar_kernels
+        if any(
+            record.get("runtime_strategy")
+            in ("INJECT_MISSING_WAIT", "FOLD_CAPTURED_POLL")
+            for record in kernel.get("wait_blocks", [])
+        )
+    )
+    if not kernel_ids:
+        return {
+            "status": "FAIL",
+            "reason": "WAIT_BLOCK_KERNELS_NOT_PRESENT",
+        }
+    baseline_extra = os.path.join(baseline_traces, "extra_info")
+    baseline_sidecar_path = os.path.join(
+        baseline_extra, "spin_wait_sidecar.json")
+    baseline_contract_path = os.path.join(
+        baseline_extra, "tma_completion_contracts.json")
+    current_contract_path = os.path.join(
+        current_traces, "extra_info", "tma_completion_contracts.json")
+    missing = [
+        path for path in (
+            baseline_sidecar_path,
+            baseline_contract_path,
+            current_contract_path,
+        )
+        if not os.path.exists(path)
+    ]
+    if missing:
+        return {
+            "status": "FAIL",
+            "reason": "BASELINE_ARTIFACT_MISSING",
+            "missing": missing,
+        }
+
+    current_fingerprint = semantic_trace_fingerprint(
+        current_traces, kernel_ids)
+    baseline_fingerprint = semantic_trace_fingerprint(
+        baseline_traces, kernel_ids)
+    with open(baseline_sidecar_path) as handle:
+        baseline_sidecar = json.load(handle)
+    with open(baseline_contract_path) as handle:
+        baseline_contracts = json.load(handle)
+    with open(current_contract_path) as handle:
+        current_contracts = json.load(handle)
+
+    def wait_blocks_by_kernel(kernels):
+        return {
+            int(kernel["trace_kernel_id"]): kernel.get("wait_blocks", [])
+            for kernel in kernels
+            if int(kernel["trace_kernel_id"]) in kernel_ids
+        }
+
+    def contract_kernel_summary(document):
+        return {
+            int(kernel["trace_kernel_id"]): {
+                "threadblocks": int(kernel.get("threadblocks", 0)),
+                "contracts": int(kernel.get("contracts", 0)),
+                "completion_loads": int(
+                    kernel.get("completion_loads", 0)),
+                "expected_bytes": int(
+                    kernel.get("expected_bytes", 0)),
+                "assigned_bytes": int(
+                    kernel.get("assigned_bytes", 0)),
+                "errors": kernel.get("errors", []),
+            }
+            for kernel in document.get("kernels", [])
+            if int(kernel["trace_kernel_id"]) in kernel_ids
+        }
+
+    current_wait_blocks = wait_blocks_by_kernel(current_sidecar_kernels)
+    baseline_wait_blocks = wait_blocks_by_kernel(
+        baseline_sidecar.get("kernels", []))
+    wait_report_keys = (
+        "inject_missing_wait",
+        "fold_captured_poll",
+        "ready_only_all_live_visits",
+        "ready_only_partial_visits",
+        "partial_defer_records",
+        "partial_join_pending_visits",
+        "partial_join_already_issued_visits",
+    )
+    current_wait_counts = {
+        key: int(current_wait_report.get(key, 0))
+        for key in wait_report_keys
+    }
+    baseline_wait_counts = {
+        key: int(
+            baseline_sidecar.get("wait_block_report", {}).get(key, 0))
+        for key in wait_report_keys
+    }
+    comparisons = {
+        "semantic_fingerprint":
+            current_fingerprint == baseline_fingerprint,
+        "wait_block_records":
+            current_wait_blocks == baseline_wait_blocks,
+        "wait_block_counts":
+            current_wait_counts == baseline_wait_counts,
+        "tma_contracts":
+            contract_kernel_summary(current_contracts)
+            == contract_kernel_summary(baseline_contracts),
+    }
+    return {
+        "status": (
+            "PASS" if all(comparisons.values()) else "FAIL"),
+        "current_traces": os.path.abspath(current_traces),
+        "baseline_traces": os.path.abspath(baseline_traces),
+        "kernel_ids": kernel_ids,
+        "comparisons": comparisons,
+        "current_semantic_trace": current_fingerprint,
+        "baseline_semantic_trace": baseline_fingerprint,
+        "current_wait_counts": current_wait_counts,
+        "baseline_wait_counts": baseline_wait_counts,
+        "current_tma_contracts":
+            contract_kernel_summary(current_contracts),
+        "baseline_tma_contracts":
+            contract_kernel_summary(baseline_contracts),
+    }
 
 # Opcodes whose presence in a loop body makes it NOT a pure wait (would drop real
 # work if the poll count were folded). Global/shared memory + tensor + async.
@@ -1850,6 +2679,14 @@ def main():
     ap.add_argument("--validate-ctas", default="all", help="'all' or an integer count")
     ap.add_argument("--strict", action="store_true",
                     help="fail if any intended runtime record fails its proof")
+    ap.add_argument(
+        "--require-contract-capture", action="store_true",
+        help="require barrier-local contract snapshots and publish the "
+             "capture-only feasibility report")
+    ap.add_argument(
+        "--contract-baseline-traces", default=None,
+        help="accepted baseline traces directory used for the mandatory "
+             "semantic, WaitBlock, and TMA comparison")
     args = ap.parse_args()
 
     traces = args.traces
@@ -2284,12 +3121,72 @@ def main():
         "wait_block_report": dict(report),
         "kernels": out_kernels,
     }
+    contract_report = None
+    if args.require_contract_capture:
+        contract_report = analyze_mbarrier_contract_capture(
+            traces, kdirs, kid_to_fid, sync_sites, out_kernels,
+            args.validate_ctas)
+        if args.contract_baseline_traces:
+            baseline = os.path.abspath(args.contract_baseline_traces)
+            contract_report["baseline_comparison"] = \
+                compare_contract_capture_baseline(
+                    traces, baseline, out_kernels, report)
+            if contract_report["baseline_comparison"]["status"] != "PASS":
+                contract_report["status"] = "FAIL"
+        else:
+            contract_report["baseline_comparison"] = {
+                "status": "NOT_REQUESTED",
+            }
+            if args.strict:
+                contract_report["status"] = "FAIL"
+        contract_path = os.path.join(
+            extra, "mbarrier_contract_ordinal_feasibility.json")
+        contract_tmp = contract_path + ".tmp"
+        with open(contract_tmp, "w") as fh:
+            json.dump(contract_report, fh, indent=2)
+        os.replace(contract_tmp, contract_path)
+        sidecar["mbarrier_contract_capture"] = {
+            "version": contract_report["version"],
+            "schema": contract_report["schema"],
+            "status": contract_report["status"],
+            "artifact": os.path.basename(contract_path),
+            "summary": contract_report["summary"],
+        }
+        summary = contract_report["summary"]
+        print(
+            "[mbarrier-contract] FINAL status=%s "
+            "active_sync=%d missing=%d mismatches=%d barriers=%d "
+            "eligible_barriers=%d eligible_actions=%d "
+            "rejected_tma_actions=%d unique=%d "
+            "ambiguous=%d inconsistent=%d unique_streams=%d "
+            "invalid_streams=%d output=%s"
+            % (
+                contract_report["status"],
+                summary.get("active_sync_occurrences", 0),
+                summary.get("missing_snapshots", 0),
+                summary.get("capture_mismatches", 0),
+                summary.get("barriers", 0),
+                summary.get("eligible_barriers", 0),
+                summary.get("eligible_action_occurrences", 0),
+                summary.get("rejected_tma_action_occurrences", 0),
+                summary.get("unique_assignments", 0),
+                summary.get("ambiguous_assignments", 0),
+                summary.get("inconsistent_assignments", 0),
+                summary.get("unique_streams", 0),
+                summary.get("ambiguous_or_invalid_streams", 0),
+                contract_path,
+            )
+        )
     if args.strict and args.validate_ctas != "all":
         sys.exit("[spin-sidecar] STRICT: runtime strategy emission requires "
                  "--validate-ctas all")
     if args.strict and report["failed"]:
         sys.exit("[spin-sidecar] STRICT: at least one intended runtime record "
                  "failed its proof; inspect FAIL lines")
+    if (args.strict and args.require_contract_capture
+            and contract_report["status"] != "PASS"):
+        sys.exit("[mbarrier-contract] STRICT: contract-ordinal feasibility "
+                 "failed; inspect mbarrier_contract_ordinal_feasibility.json")
 
     out_path = args.out or os.path.join(extra, "spin_wait_sidecar.json")
     tmp_path = out_path + ".tmp"

@@ -45,6 +45,7 @@
 #include <stdio.h>
 #include <string>
 #include <sys/stat.h>
+#include <tuple>
 #include <unistd.h>
 #include <unordered_map>
 #include <unordered_set>
@@ -99,10 +100,10 @@ enum class RecvThreadState {
 
 struct CTXstate {
   /* context id */
-  int id;
+  int id = -1;
 
   /* Channel used to communicate from GPU to CPU receiving thread */
-  ChannelDev* channel_dev;
+  ChannelDev* channel_dev = nullptr;
   ChannelHost channel_host;
 
   // After initialization, set it to WORKING to make recv thread get data,
@@ -115,6 +116,9 @@ struct CTXstate {
   std::atomic<uint64_t> received_records_per_kernel{0};
   std::atomic<uint64_t> sparse_retained_instructions_per_kernel{0};
   std::atomic<uint64_t> sparse_reconstructed_instructions_per_kernel{0};
+
+  /* Stable registry pointer used only when MBARRIER_CONTRACT_CAPTURE=1. */
+  mbarrier_contract_registry_t *mbarrier_contract_registry = nullptr;
 };
 
 /* lock */
@@ -163,6 +167,14 @@ unsigned int warp_lifetime_grid_z = 0;
 unsigned int warp_lifetime_warps_per_cta = 0;
 int warp_lifetime_kernel_id = 0;
 std::string warp_lifetime_kernel_name;
+/* Capture-only B0-E feasibility instrumentation. Default-off and isolated
+ * from the instruction channel to avoid device-to-host backpressure. */
+int mbarrier_contract_capture_enabled = 0;
+int mbarrier_contract_barrier_slots_per_cta = 64;
+int mbarrier_contract_records_per_cta = 8192;
+int mbarrier_contract_max_records = 4194304;
+uint64_t next_mbarrier_contract_launch_uid = 1;
+std::unordered_set<CUfunction> mbarrier_contract_capture_launches;
 
 /* Should we terminate the program once we are done tracing? */
 int terminate_after_limit_number_of_kernels_reached = 0;
@@ -180,6 +192,27 @@ static std::string trim_config_token(const std::string &value) {
     end--;
   }
   return value.substr(begin, end - begin);
+}
+
+static int parse_strict_integer_config(
+    const char *name, int default_value, int minimum, int maximum) {
+  const char *raw = getenv(name);
+  if (raw == nullptr) {
+    return default_value;
+  }
+  if (*raw == '\0') {
+    fprintf(stderr, "%s must not be empty\n", name);
+    abort();
+  }
+  char *end = nullptr;
+  const long parsed = strtol(raw, &end, 10);
+  if (end == raw || *end != '\0' || parsed < minimum ||
+      parsed > maximum) {
+    fprintf(stderr, "%s must be an integer in [%d,%d], got '%s'\n",
+            name, minimum, maximum, raw);
+    abort();
+  }
+  return static_cast<int>(parsed);
 }
 
 [[noreturn]] static void lighter_tracer_config_error(
@@ -422,12 +455,18 @@ struct sync_runtime_capture_site_info {
   sync_runtime_capture_site_info()
       : enabled(false),
         barrier_callback_index(-1),
+        barrier_mref_index(-1),
         semantic_callback_index(-1),
-        semantic_is_zero_literal(false) {}
+        semantic_is_zero_literal(false),
+        semantic_reg_type(TRACED_REG_TYPE::NO_REGS),
+        semantic_reg_id(-1) {}
   bool enabled;
   int barrier_callback_index;
+  int barrier_mref_index;
   int semantic_callback_index;
   bool semantic_is_zero_literal;
+  TRACED_REG_TYPE semantic_reg_type;
+  int semantic_reg_id;
 };
 std::map<int, std::map<int, sync_runtime_capture_site_info>>
     sync_runtime_capture_sites_by_pc;
@@ -596,6 +635,23 @@ static bool sync_runtime_capture_enabled(sync_runtime_capture_kind kind) {
   return kind != sync_runtime_capture_kind::NONE;
 }
 
+static MBARRIER_CONTRACT_EVENT_KIND get_mbarrier_contract_event_kind(
+    const std::string &opcode) {
+  const sync_runtime_capture_kind kind =
+      get_sync_runtime_capture_kind(opcode);
+  switch (kind) {
+    case sync_runtime_capture_kind::EXCH:
+      return MBARRIER_CONTRACT_EVENT_EXCH;
+    case sync_runtime_capture_kind::ARRIVE_EXPECT_TX:
+      return MBARRIER_CONTRACT_EVENT_ARRIVE;
+    case sync_runtime_capture_kind::PHASECHK:
+      return MBARRIER_CONTRACT_EVENT_WAIT;
+    case sync_runtime_capture_kind::NONE:
+      return MBARRIER_CONTRACT_EVENT_NONE;
+  }
+  return MBARRIER_CONTRACT_EVENT_NONE;
+}
+
 static bool is_sync_semantic_operand_type(InstrType::OperandType type) {
   return type == InstrType::OperandType::REG ||
          type == InstrType::OperandType::UREG ||
@@ -609,7 +665,8 @@ static bool is_zero_sync_semantic_operand(const std::string &operand_str) {
 
 static sync_runtime_capture_site_info build_sync_runtime_capture_site_info(
     const std::string &opcode, int operand_position, int callback_index,
-    InstrType::OperandType operand_type, const std::string &operand_str) {
+    int mref_index, InstrType::OperandType operand_type,
+    const std::string &operand_str, int register_id) {
   sync_runtime_capture_site_info info;
   sync_runtime_capture_kind kind = get_sync_runtime_capture_kind(opcode);
   if (!sync_runtime_capture_enabled(kind)) {
@@ -619,6 +676,7 @@ static sync_runtime_capture_site_info build_sync_runtime_capture_site_info(
   if (operand_position == 1 && operand_type == InstrType::OperandType::MREF) {
     info.enabled = true;
     info.barrier_callback_index = callback_index;
+    info.barrier_mref_index = mref_index;
   } else if (operand_position == 2 &&
              is_sync_semantic_operand_type(operand_type)) {
     info.enabled = true;
@@ -626,6 +684,14 @@ static sync_runtime_capture_site_info build_sync_runtime_capture_site_info(
       info.semantic_is_zero_literal = true;
     } else {
       info.semantic_callback_index = callback_index;
+      info.semantic_reg_id = register_id;
+      if (operand_type == InstrType::OperandType::REG) {
+        info.semantic_reg_type = TRACED_REG_TYPE::REGULAR;
+      } else if (operand_type == InstrType::OperandType::UREG) {
+        info.semantic_reg_type = TRACED_REG_TYPE::UNIFORM;
+      } else {
+        info.semantic_reg_type = TRACED_REG_TYPE::NO_REGS;
+      }
     }
   }
   return info;
@@ -1978,6 +2044,35 @@ void nvbit_at_init() {
   GET_VAR_INT(incremental_flush_threshold, "INCREMENTAL_FLUSH_THRESHOLD", 0,
               "Flush threadblocks to disk when instruction count exceeds this threshold. "
               "0 = disabled (default). Recommended: 50000-100000 for large kernels.");
+  mbarrier_contract_capture_enabled = parse_strict_integer_config(
+      "MBARRIER_CONTRACT_CAPTURE", 0, 0, 1);
+  if (mbarrier_contract_capture_enabled) {
+    mbarrier_contract_barrier_slots_per_cta =
+        parse_strict_integer_config(
+            "MBARRIER_CONTRACT_BARRIERS_PER_CTA", 64, 1, 4096);
+    mbarrier_contract_records_per_cta =
+        parse_strict_integer_config(
+            "MBARRIER_CONTRACT_RECORDS_PER_CTA", 8192, 1, 0x7fffffff);
+    mbarrier_contract_max_records =
+        parse_strict_integer_config(
+            "MBARRIER_CONTRACT_MAX_RECORDS", 4194304, 1, 0x7fffffff);
+    if (warp_lifetime_only || warp_lifetime_sidecar ||
+        incremental_flush_threshold != 0) {
+      fprintf(stderr,
+              "MBARRIER_CONTRACT_CAPTURE=1 requires full in-memory tracing "
+              "without warp-lifetime probes "
+              "(WARP_LIFETIME_ONLY=0, WARP_LIFETIME_SIDECAR=0, "
+              "INCREMENTAL_FLUSH_THRESHOLD=0)\n");
+      abort();
+    }
+    printf("[MBARRIER-CONTRACT] enabled=1 version=%u "
+           "barriers_per_cta=%d records_per_cta=%d max_records=%d "
+           "transport=launch_managed_buffer\n",
+           MBARRIER_CONTRACT_RECORD_VERSION,
+           mbarrier_contract_barrier_slots_per_cta,
+           mbarrier_contract_records_per_cta,
+           mbarrier_contract_max_records);
+  }
   GET_VAR_INT(enable_tma_desc, "ENABLE_TMA_DESC", 1,
               "Enable TMA descriptor capture, including runtime desc handle debug and tensor-map descriptor dumps.");
   GET_VAR_INT(aux_htod_dump_max_bytes, "AUX_HTOD_DUMP_MAX_BYTES", 4096,
@@ -2055,6 +2150,26 @@ void instrument_function_if_needed(CUcontext ctx, CUfunction func, int device_id
 
   /* add kernel itself to the related function vector */
   related_functions.push_back(func);
+  if (mbarrier_contract_capture_enabled) {
+    bool launch_has_capture_site = false;
+    for (CUfunction related : related_functions) {
+      for (Instr *candidate : nvbit_get_instrs(ctx, related)) {
+        const std::string opcode =
+            candidate->getOpcode() ? candidate->getOpcode() : "";
+        if (get_mbarrier_contract_event_kind(opcode) !=
+            MBARRIER_CONTRACT_EVENT_NONE) {
+          launch_has_capture_site = true;
+          break;
+        }
+      }
+      if (launch_has_capture_site) {
+        break;
+      }
+    }
+    if (launch_has_capture_site) {
+      mbarrier_contract_capture_launches.insert(func);
+    }
+  }
 
   /* iterate on function */
   for (auto f : related_functions) {
@@ -2219,6 +2334,14 @@ void instrument_function_if_needed(CUcontext ctx, CUfunction func, int device_id
       for(int i = 0; i < instr->getNumOperands(); ++i){
         const InstrType::operand_t *op = instr->getOperand(i);
         std::string operand_str = op->str ? std::string(op->str) : "";
+        const int operand_mref_index =
+            op->type == InstrType::OperandType::MREF
+                ? mem_oper_idx + 1
+                : -1;
+        const int operand_register_id =
+            is_sync_semantic_operand_type(op->type)
+                ? static_cast<int>(op->u.reg.num)
+                : -1;
         if (is_tma_completion_bearing_load_opcode(opcode_str) && i == 0) {
           if (op->type != InstrType::OperandType::MREF ||
               operand_str.rfind("[UR", 0) != 0) {
@@ -2235,16 +2358,24 @@ void instrument_function_if_needed(CUcontext ctx, CUfunction func, int device_id
         }
         sync_runtime_capture_site_info sync_operand_info =
             build_sync_runtime_capture_site_info(opcode_str, i, num_of_injects,
-                                                 op->type, operand_str);
+                                                 operand_mref_index, op->type,
+                                                 operand_str,
+                                                 operand_register_id);
         if (sync_operand_info.enabled) {
           sync_site_info.enabled = true;
           if (sync_operand_info.barrier_callback_index >= 0) {
             sync_site_info.barrier_callback_index =
                 sync_operand_info.barrier_callback_index;
+            sync_site_info.barrier_mref_index =
+                sync_operand_info.barrier_mref_index;
           }
           if (sync_operand_info.semantic_callback_index >= 0) {
             sync_site_info.semantic_callback_index =
                 sync_operand_info.semantic_callback_index;
+            sync_site_info.semantic_reg_type =
+                sync_operand_info.semantic_reg_type;
+            sync_site_info.semantic_reg_id =
+                sync_operand_info.semantic_reg_id;
           }
           if (sync_operand_info.semantic_is_zero_literal) {
             sync_site_info.semantic_is_zero_literal = true;
@@ -2682,6 +2813,76 @@ void instrument_function_if_needed(CUcontext ctx, CUfunction func, int device_id
           mref_index++;
         }
       }
+
+      if (mbarrier_contract_capture_enabled) {
+        const MBARRIER_CONTRACT_EVENT_KIND event_kind =
+            get_mbarrier_contract_event_kind(opcode_str);
+        if (event_kind != MBARRIER_CONTRACT_EVENT_NONE) {
+          if (ctx_state->mbarrier_contract_registry == nullptr ||
+              sync_site_info.barrier_mref_index < 0 ||
+              (!sync_site_info.semantic_is_zero_literal &&
+               sync_site_info.semantic_reg_id < 0) ||
+              (!sync_site_info.semantic_is_zero_literal &&
+               sync_site_info.semantic_reg_type !=
+                   TRACED_REG_TYPE::REGULAR &&
+               sync_site_info.semantic_reg_type !=
+                   TRACED_REG_TYPE::UNIFORM)) {
+            fprintf(stderr,
+                    "[MBARRIER-CONTRACT] unsupported capture operands: "
+                    "function=%s pc=0x%x opcode=%s mref=%d semantic_type=%d "
+                    "semantic_reg=%d zero=%d\n",
+                    current_kernel_name.c_str(), vpc, opcode_str.c_str(),
+                    sync_site_info.barrier_mref_index,
+                    static_cast<int>(sync_site_info.semantic_reg_type),
+                    sync_site_info.semantic_reg_id,
+                    sync_site_info.semantic_is_zero_literal ? 1 : 0);
+            abort();
+          }
+
+          auto add_contract_begin_arguments = [&]() {
+            nvbit_add_call_arg_guard_pred_val(instr);
+            nvbit_add_call_arg_const_val32(
+                instr, next_candidate_unique_function_id);
+            nvbit_add_call_arg_const_val32(
+                instr, static_cast<uint32_t>(instr->getOffset()));
+            nvbit_add_call_arg_const_val32(
+                instr, static_cast<uint32_t>(event_kind));
+            nvbit_add_call_arg_mref_addr64(
+                instr, sync_site_info.barrier_mref_index);
+            if (sync_site_info.semantic_is_zero_literal) {
+              nvbit_add_call_arg_const_val32(instr, 0);
+            } else if (sync_site_info.semantic_reg_type ==
+                       TRACED_REG_TYPE::REGULAR) {
+              nvbit_add_call_arg_reg_val(
+                  instr, sync_site_info.semantic_reg_id);
+            } else {
+              nvbit_add_call_arg_ureg_val(
+                  instr, sync_site_info.semantic_reg_id);
+            }
+            nvbit_add_call_arg_const_val64(
+                instr,
+                reinterpret_cast<uint64_t>(
+                    ctx_state->mbarrier_contract_registry));
+          };
+
+          nvbit_insert_call(
+              instr, "record_mbarrier_contract_begin", IPOINT_BEFORE);
+          add_contract_begin_arguments();
+          nvbit_insert_call(
+              instr, "record_mbarrier_contract_end", IPOINT_AFTER);
+          nvbit_add_call_arg_guard_pred_val(instr);
+          nvbit_add_call_arg_const_val32(
+              instr, next_candidate_unique_function_id);
+          nvbit_add_call_arg_const_val32(
+              instr, static_cast<uint32_t>(instr->getOffset()));
+          nvbit_add_call_arg_const_val32(
+              instr, static_cast<uint32_t>(event_kind));
+          nvbit_add_call_arg_const_val64(
+              instr,
+              reinterpret_cast<uint64_t>(
+                  ctx_state->mbarrier_contract_registry));
+        }
+      }
       cnt++;
     }
 
@@ -2761,6 +2962,458 @@ __global__ void flush_channel(ChannelDev* ch_dev, int compact_transport) {
 
   /* flush channel */
   ch_dev->flush();
+}
+
+static const mbarrier_contract_record_t *
+validated_mbarrier_contract_record(const mbarrier_contract_record_t *record) {
+  if (record->record_size != sizeof(mbarrier_contract_record_t) ||
+      record->record_version != MBARRIER_CONTRACT_RECORD_VERSION ||
+      record->event_kind < MBARRIER_CONTRACT_EVENT_EXCH ||
+      record->event_kind > MBARRIER_CONTRACT_EVENT_WAIT ||
+      record->launch_uid == 0 ||
+      (record->predicate_mask & ~record->active_mask) != 0 ||
+      record->predicate_mask == 0) {
+    fprintf(stderr,
+            "[MBARRIER-CONTRACT] invalid capture record: size=%u version=%u "
+            "kind=%u launch=%llu active=0x%x predicate=0x%x\n",
+            record->record_size, record->record_version,
+            record->event_kind,
+            static_cast<unsigned long long>(record->launch_uid),
+            record->active_mask, record->predicate_mask);
+    abort();
+  }
+  return record;
+}
+
+static void acquire_mbarrier_contract_launch(
+    CTXstate *ctx_state, int device_id, int trace_kernel_id, int stream_id,
+    const cuLaunchKernel_params *params) {
+  assert(mbarrier_contract_capture_enabled);
+  assert(ctx_state->mbarrier_contract_registry != nullptr);
+  mbarrier_contract_registry_t *registry =
+      ctx_state->mbarrier_contract_registry;
+  if (registry->active != 0 || registry->launch.state != 0 ||
+      registry->error_flags != 0) {
+    fprintf(stderr,
+            "[MBARRIER-CONTRACT] concurrent or stale launch: active=%d "
+            "state=%u errors=0x%x kernel=%d\n",
+            registry->active, registry->launch.state,
+            registry->error_flags, trace_kernel_id);
+    abort();
+  }
+
+  const uint64_t num_ctas =
+      static_cast<uint64_t>(params->gridDimX) * params->gridDimY *
+      params->gridDimZ;
+  const uint64_t num_threads =
+      static_cast<uint64_t>(params->blockDimX) * params->blockDimY *
+      params->blockDimZ;
+  const uint64_t warps_per_cta = (num_threads + 31u) / 32u;
+  if (num_ctas == 0 || num_ctas > UINT32_MAX ||
+      warps_per_cta == 0 ||
+      warps_per_cta > MBARRIER_CONTRACT_MAX_WARPS_PER_CTA) {
+    fprintf(stderr,
+            "[MBARRIER-CONTRACT] unsupported launch dimensions: "
+            "ctas=%llu warps_per_cta=%llu kernel=%d\n",
+            static_cast<unsigned long long>(num_ctas),
+            static_cast<unsigned long long>(warps_per_cta),
+            trace_kernel_id);
+    abort();
+  }
+
+  const uint64_t barrier_entries =
+      num_ctas *
+      static_cast<uint64_t>(mbarrier_contract_barrier_slots_per_cta);
+  const uint64_t scratch_entries = num_ctas * warps_per_cta;
+  if (barrier_entries >
+          SIZE_MAX / sizeof(mbarrier_contract_barrier_state_t) ||
+      scratch_entries >
+          SIZE_MAX / sizeof(mbarrier_contract_warp_scratch_t) ||
+      num_ctas >
+          static_cast<uint64_t>(mbarrier_contract_max_records)) {
+    fprintf(stderr,
+            "[MBARRIER-CONTRACT] launch allocation overflow: kernel=%d "
+            "ctas=%llu barrier_entries=%llu scratch_entries=%llu\n",
+            trace_kernel_id,
+            static_cast<unsigned long long>(num_ctas),
+            static_cast<unsigned long long>(barrier_entries),
+            static_cast<unsigned long long>(scratch_entries));
+    abort();
+  }
+
+  const uint64_t records_per_cta = std::min(
+      static_cast<uint64_t>(mbarrier_contract_records_per_cta),
+      static_cast<uint64_t>(mbarrier_contract_max_records) / num_ctas);
+  const uint64_t record_capacity = num_ctas * records_per_cta;
+  if (record_capacity == 0 ||
+      record_capacity >
+          SIZE_MAX / sizeof(mbarrier_contract_record_t)) {
+    fprintf(stderr,
+            "[MBARRIER-CONTRACT] record allocation overflow: kernel=%d "
+            "capacity=%llu\n",
+            trace_kernel_id,
+            static_cast<unsigned long long>(record_capacity));
+    abort();
+  }
+
+  mbarrier_contract_launch_t *launch = &registry->launch;
+  if (launch->barrier_state_ptr != 0 ||
+      launch->warp_scratch_ptr != 0 ||
+      launch->cta_record_count_ptr != 0 ||
+      launch->record_buffer_ptr != 0) {
+    fprintf(stderr,
+            "[MBARRIER-CONTRACT] stale launch pointers: kernel=%d\n",
+            trace_kernel_id);
+    abort();
+  }
+
+  const bool prior_skip_callback = skip_callback_flag;
+  skip_callback_flag = true;
+  CUDA_SAFECALL(cuMemAllocManaged(
+      reinterpret_cast<CUdeviceptr *>(&launch->barrier_state_ptr),
+      barrier_entries * sizeof(mbarrier_contract_barrier_state_t),
+      CU_MEM_ATTACH_GLOBAL));
+  CUDA_SAFECALL(cuMemAllocManaged(
+      reinterpret_cast<CUdeviceptr *>(&launch->warp_scratch_ptr),
+      scratch_entries * sizeof(mbarrier_contract_warp_scratch_t),
+      CU_MEM_ATTACH_GLOBAL));
+  CUDA_SAFECALL(cuMemAllocManaged(
+      reinterpret_cast<CUdeviceptr *>(&launch->cta_record_count_ptr),
+      num_ctas * sizeof(uint64_t), CU_MEM_ATTACH_GLOBAL));
+  CUDA_SAFECALL(cuMemAllocManaged(
+      reinterpret_cast<CUdeviceptr *>(&launch->record_buffer_ptr),
+      record_capacity * sizeof(mbarrier_contract_record_t),
+      CU_MEM_ATTACH_GLOBAL));
+  CUDA_SAFECALL(cuMemsetD8(
+      static_cast<CUdeviceptr>(launch->barrier_state_ptr), 0,
+      barrier_entries * sizeof(mbarrier_contract_barrier_state_t)));
+  CUDA_SAFECALL(cuMemsetD8(
+      static_cast<CUdeviceptr>(launch->warp_scratch_ptr), 0,
+      scratch_entries * sizeof(mbarrier_contract_warp_scratch_t)));
+  CUDA_SAFECALL(cuMemsetD8(
+      static_cast<CUdeviceptr>(launch->cta_record_count_ptr), 0,
+      num_ctas * sizeof(uint64_t)));
+  skip_callback_flag = prior_skip_callback;
+
+  if (next_mbarrier_contract_launch_uid == 0) {
+    fprintf(stderr, "[MBARRIER-CONTRACT] launch UID overflow\n");
+    abort();
+  }
+  launch->device_id = static_cast<uint32_t>(device_id);
+  launch->stream_id = static_cast<uint32_t>(stream_id);
+  launch->trace_kernel_id = static_cast<uint32_t>(trace_kernel_id);
+  launch->launch_uid = next_mbarrier_contract_launch_uid++;
+  launch->grid_dim_x = params->gridDimX;
+  launch->grid_dim_y = params->gridDimY;
+  launch->grid_dim_z = params->gridDimZ;
+  launch->num_ctas = static_cast<uint32_t>(num_ctas);
+  launch->warps_per_cta = static_cast<uint32_t>(warps_per_cta);
+  launch->barrier_slots_per_cta =
+      static_cast<uint32_t>(
+          mbarrier_contract_barrier_slots_per_cta);
+  launch->record_capacity = record_capacity;
+  launch->records_per_cta = records_per_cta;
+  launch->overflow_records = 0;
+  launch->state = 1;
+  registry->error_flags = 0;
+  __sync_synchronize();
+  registry->active = 1;
+
+  printf("[MBARRIER-CONTRACT] launch_begin uid=%llu kernel=%d ctas=%u "
+         "warps_per_cta=%u barrier_slots_per_cta=%u "
+         "records_per_cta=%llu record_buffer_mib=%.2f\n",
+         static_cast<unsigned long long>(launch->launch_uid),
+         trace_kernel_id, launch->num_ctas, launch->warps_per_cta,
+         launch->barrier_slots_per_cta,
+         static_cast<unsigned long long>(launch->records_per_cta),
+         static_cast<double>(
+             launch->record_capacity *
+             sizeof(mbarrier_contract_record_t)) /
+             (1024.0 * 1024.0));
+  fflush(stdout);
+}
+
+static MBARRIER_CONTRACT_EVENT_KIND mbarrier_contract_event_kind_for_pc(
+    uint32_t unique_function_id, uint32_t pc) {
+  auto function_it = pc_to_opcode.find(unique_function_id);
+  if (function_it == pc_to_opcode.end()) {
+    return MBARRIER_CONTRACT_EVENT_NONE;
+  }
+  auto pc_it = function_it->second.find(pc);
+  if (pc_it == function_it->second.end()) {
+    return MBARRIER_CONTRACT_EVENT_NONE;
+  }
+  auto opcode_it = id_to_opcode_map.find(pc_it->second);
+  if (opcode_it == id_to_opcode_map.end()) {
+    return MBARRIER_CONTRACT_EVENT_NONE;
+  }
+  return get_mbarrier_contract_event_kind(opcode_it->second);
+}
+
+static void attach_mbarrier_contract_records(
+    const mbarrier_contract_launch_t &launch) {
+  const uint64_t *cta_record_counts =
+      reinterpret_cast<const uint64_t *>(
+          launch.cta_record_count_ptr);
+  const mbarrier_contract_record_t *records =
+      reinterpret_cast<const mbarrier_contract_record_t *>(
+          launch.record_buffer_ptr);
+  uint64_t attached = 0;
+
+  for (uint32_t cta = 0; cta < launch.num_ctas; ++cta) {
+    const uint32_t cta_x = cta % launch.grid_dim_x;
+    const uint32_t cta_y =
+        (cta / launch.grid_dim_x) % launch.grid_dim_y;
+    const uint32_t cta_z =
+        cta / (launch.grid_dim_x * launch.grid_dim_y);
+    const std::string tb_key =
+        "d_" + std::to_string(launch.device_id) +
+        "_s_" + std::to_string(launch.stream_id) +
+        "_k_" + std::to_string(launch.trace_kernel_id) +
+        "_" + std::to_string(cta_x) + "," +
+        std::to_string(cta_y) + "," + std::to_string(cta_z);
+    auto tb_it = threadblocks.find(tb_key);
+    if (tb_it == threadblocks.end()) {
+      if (cta_record_counts[cta] == 0) {
+        continue;
+      }
+      fprintf(stderr,
+              "[MBARRIER-CONTRACT] capture references missing CTA: "
+              "kernel=%u cta=%u records=%llu\n",
+              launch.trace_kernel_id, cta,
+              static_cast<unsigned long long>(
+                  cta_record_counts[cta]));
+      abort();
+    }
+
+    using occurrence_key_t = std::tuple<int, int, int>;
+    std::map<occurrence_key_t,
+             std::vector<dynamic_trace::instruction *>>
+        protobuf_occurrences;
+    for (auto &warp_pair : *tb_it->second.mutable_warps()) {
+      const int warp_id = warp_pair.first;
+      dynamic_trace::warp &warp = warp_pair.second;
+      for (int index = 0; index < warp.instructions_size(); ++index) {
+        dynamic_trace::instruction *instruction =
+            warp.mutable_instructions(index);
+        if ((instruction->active_mask() &
+             instruction->predicate_mask()) == 0 ||
+            mbarrier_contract_event_kind_for_pc(
+                instruction->function_unique_id(),
+                instruction->pc()) ==
+                MBARRIER_CONTRACT_EVENT_NONE) {
+          continue;
+        }
+        protobuf_occurrences[
+            std::make_tuple(
+                warp_id, instruction->function_unique_id(),
+                static_cast<int>(instruction->pc()))]
+            .push_back(instruction);
+      }
+    }
+
+    std::map<occurrence_key_t, size_t> next_occurrence;
+    const uint64_t cta_records = cta_record_counts[cta];
+    if (cta_records > launch.records_per_cta) {
+      fprintf(stderr,
+              "[MBARRIER-CONTRACT] CTA record count exceeds capacity: "
+              "kernel=%u cta=%u records=%llu capacity=%llu\n",
+              launch.trace_kernel_id, cta,
+              static_cast<unsigned long long>(cta_records),
+              static_cast<unsigned long long>(
+                  launch.records_per_cta));
+      abort();
+    }
+    const uint64_t cta_base =
+        static_cast<uint64_t>(cta) * launch.records_per_cta;
+    for (uint64_t local = 0; local < cta_records; ++local) {
+      const mbarrier_contract_record_t &record =
+          *validated_mbarrier_contract_record(
+              &records[cta_base + local]);
+      if (record.launch_uid != launch.launch_uid ||
+          record.linear_cta_id != cta ||
+          record.warp_id_tb >= launch.warps_per_cta) {
+        fprintf(stderr,
+                "[MBARRIER-CONTRACT] record launch/CTA identity mismatch: "
+                "kernel=%u cta=%u index=%llu\n",
+                launch.trace_kernel_id, cta,
+                static_cast<unsigned long long>(local));
+        abort();
+      }
+      const occurrence_key_t key = std::make_tuple(
+          static_cast<int>(record.warp_id_tb),
+          static_cast<int>(record.unique_function_id),
+          static_cast<int>(record.vpc));
+      auto occurrences_it = protobuf_occurrences.find(key);
+      const size_t ordinal = next_occurrence[key]++;
+      if (occurrences_it == protobuf_occurrences.end() ||
+          ordinal >= occurrences_it->second.size()) {
+        fprintf(stderr,
+                "[MBARRIER-CONTRACT] no protobuf occurrence for capture: "
+                "kernel=%u cta=%u warp=%u function=%u pc=0x%x "
+                "ordinal=%zu\n",
+                launch.trace_kernel_id, cta, record.warp_id_tb,
+                record.unique_function_id, record.vpc, ordinal);
+        abort();
+      }
+
+      dynamic_trace::instruction *instruction =
+          occurrences_it->second[ordinal];
+      if (static_cast<uint32_t>(
+              mbarrier_contract_event_kind_for_pc(
+                  instruction->function_unique_id(),
+                  instruction->pc())) != record.event_kind ||
+          instruction->active_mask() != record.active_mask ||
+          instruction->predicate_mask() != record.predicate_mask ||
+          !instruction->has_sync() ||
+          !instruction->sync().valid() ||
+          instruction->sync().barrier_addr() !=
+              record.barrier_addr ||
+          (instruction->sync().has_semantic_raw()
+               ? instruction->sync().semantic_raw()
+               : 0ULL) != record.semantic_raw) {
+        fprintf(stderr,
+                "[MBARRIER-CONTRACT] protobuf/capture payload mismatch: "
+                "kernel=%u cta=%u warp=%u function=%u pc=0x%x "
+                "ordinal=%zu\n",
+                launch.trace_kernel_id, cta, record.warp_id_tb,
+                record.unique_function_id, record.vpc, ordinal);
+        abort();
+      }
+
+      auto *capture = instruction->mutable_mbarrier_contract();
+      if (capture->valid()) {
+        fprintf(stderr,
+                "[MBARRIER-CONTRACT] duplicate protobuf attachment: "
+                "kernel=%u cta=%u warp=%u function=%u pc=0x%x "
+                "ordinal=%zu\n",
+                launch.trace_kernel_id, cta, record.warp_id_tb,
+                record.unique_function_id, record.vpc, ordinal);
+        abort();
+      }
+      capture->set_valid(true);
+      capture->set_event_kind(record.event_kind);
+      capture->set_barrier_addr(record.barrier_addr);
+      capture->set_initialization_epoch_before(
+          record.initialization_epoch_before);
+      capture->set_initialization_epoch_after(
+          record.initialization_epoch_after);
+      capture->set_opened_contract_count_before(
+          record.opened_contract_count_before);
+      capture->set_opened_contract_count_after(
+          record.opened_contract_count_after);
+      capture->set_has_contract_ordinal(
+          record.contract_ordinal != 0);
+      capture->set_contract_ordinal(record.contract_ordinal);
+      capture->set_capture_flags(record.capture_flags);
+      capture->set_barrier_error_flags(
+          record.barrier_error_flags);
+      capture->set_capture_launch_uid(record.launch_uid);
+      capture->set_has_semantic_raw(true);
+      capture->set_semantic_raw(record.semantic_raw);
+      attached++;
+    }
+
+    for (const auto &entry : protobuf_occurrences) {
+      const size_t consumed = next_occurrence[entry.first];
+      if (consumed != entry.second.size()) {
+        fprintf(stderr,
+                "[MBARRIER-CONTRACT] missing capture records: "
+                "kernel=%u cta=%u warp=%d function=%d pc=0x%x "
+                "captured=%zu protobuf=%zu\n",
+                launch.trace_kernel_id, cta,
+                std::get<0>(entry.first), std::get<1>(entry.first),
+                std::get<2>(entry.first), consumed,
+                entry.second.size());
+        abort();
+      }
+    }
+  }
+
+  printf("[MBARRIER-CONTRACT] attach kernel=%u records=%llu status=PASS\n",
+         launch.trace_kernel_id,
+         static_cast<unsigned long long>(attached));
+}
+
+static void release_mbarrier_contract_launch(CTXstate *ctx_state) {
+  assert(mbarrier_contract_capture_enabled);
+  mbarrier_contract_registry_t *registry =
+      ctx_state->mbarrier_contract_registry;
+  if (registry == nullptr || registry->active != 1 ||
+      registry->launch.state != 1) {
+    fprintf(stderr,
+            "[MBARRIER-CONTRACT] missing active launch at kernel exit\n");
+    abort();
+  }
+  mbarrier_contract_launch_t *launch = &registry->launch;
+  if (registry->error_flags != 0 ||
+      launch->overflow_records != 0) {
+    fprintf(stderr,
+            "[MBARRIER-CONTRACT] launch validation failed: "
+            "uid=%llu kernel=%u errors=0x%x overflow=%llu\n",
+            static_cast<unsigned long long>(launch->launch_uid),
+            launch->trace_kernel_id, registry->error_flags,
+            static_cast<unsigned long long>(
+                launch->overflow_records));
+    abort();
+  }
+
+  const uint64_t scratch_entries =
+      static_cast<uint64_t>(launch->num_ctas) *
+      launch->warps_per_cta;
+  const mbarrier_contract_warp_scratch_t *scratch =
+      reinterpret_cast<
+          const mbarrier_contract_warp_scratch_t *>(
+          launch->warp_scratch_ptr);
+  for (uint64_t index = 0; index < scratch_entries; ++index) {
+    if (scratch[index].state != 0) {
+      fprintf(stderr,
+              "[MBARRIER-CONTRACT] unterminated callback interval: "
+              "uid=%llu kernel=%u scratch=%llu state=%u\n",
+              static_cast<unsigned long long>(launch->launch_uid),
+              launch->trace_kernel_id,
+              static_cast<unsigned long long>(index),
+              scratch[index].state);
+      abort();
+    }
+  }
+
+  attach_mbarrier_contract_records(*launch);
+
+  uint64_t emitted = 0;
+  const uint64_t *record_counts =
+      reinterpret_cast<const uint64_t *>(
+          launch->cta_record_count_ptr);
+  for (uint32_t cta = 0; cta < launch->num_ctas; ++cta) {
+    emitted += record_counts[cta];
+  }
+  printf("[MBARRIER-CONTRACT] launch_end uid=%llu kernel=%u "
+         "records=%llu status=PASS\n",
+         static_cast<unsigned long long>(launch->launch_uid),
+         launch->trace_kernel_id,
+         static_cast<unsigned long long>(emitted));
+  fflush(stdout);
+
+  registry->active = 0;
+  launch->state = 0;
+  const bool prior_skip_callback = skip_callback_flag;
+  skip_callback_flag = true;
+  CUDA_SAFECALL(cuMemFree(
+      static_cast<CUdeviceptr>(launch->barrier_state_ptr)));
+  CUDA_SAFECALL(cuMemFree(
+      static_cast<CUdeviceptr>(launch->warp_scratch_ptr)));
+  CUDA_SAFECALL(cuMemFree(
+      static_cast<CUdeviceptr>(launch->cta_record_count_ptr)));
+  CUDA_SAFECALL(cuMemFree(
+      static_cast<CUdeviceptr>(launch->record_buffer_ptr)));
+  skip_callback_flag = prior_skip_callback;
+  launch->barrier_state_ptr = 0;
+  launch->warp_scratch_ptr = 0;
+  launch->cta_record_count_ptr = 0;
+  launch->record_buffer_ptr = 0;
+  launch->record_capacity = 0;
+  launch->records_per_cta = 0;
+  launch->overflow_records = 0;
 }
 
 static void reset_warp_lifetime_capture(
@@ -3052,6 +3705,12 @@ void nvbit_at_cuda_event(CUcontext ctx, int is_exit, nvbit_api_cuda_t cbid,
         uint64_t stream_key = (uint64_t)p->hStream;
         stream_key = 0; // We use 0 as stream key for now, as we do not support multiple streams yet. WIPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP
         current_stream_id[device_id] = stream_key;
+        if (mbarrier_contract_capture_enabled &&
+            mbarrier_contract_capture_launches.count(p->f) != 0) {
+          acquire_mbarrier_contract_launch(
+              ctx_state, device_id, kernel_id[device_id],
+              static_cast<int>(stream_key), p);
+        }
         dynamic_trace::cuda_stream &stream = (*gpu_dev.mutable_streams())[stream_key];
         stream.set_id(stream_key);
         dynamic_trace::kernel *ker = stream.add_kernels();
@@ -3140,6 +3799,11 @@ void nvbit_at_cuda_event(CUcontext ctx, int is_exit, nvbit_api_cuda_t cbid,
        * current kernel */
       while (recv_thread_receiving[ctx]) {
         pthread_yield();
+      }
+      if (mbarrier_contract_capture_enabled &&
+          ctx_state->mbarrier_contract_registry != nullptr &&
+          ctx_state->mbarrier_contract_registry->active == 1) {
+        release_mbarrier_contract_launch(ctx_state);
       }
 
       /* Phase 0b (TMA_BASE_ADDR.md §2.13): the kernel is fully done and the channel
@@ -4348,6 +5012,20 @@ void init_context_state(CUcontext ctx) {
   ctx_state->channel_host.init((int)ctx_state_map.size() - 1, CHANNEL_SIZE,
                                ctx_state->channel_dev, recv_thread_fun, ctx);
   nvbit_set_tool_pthread(ctx_state->channel_host.get_thread());
+  if (mbarrier_contract_capture_enabled) {
+    CUDA_SAFECALL(cuMemAllocManaged(
+        reinterpret_cast<CUdeviceptr *>(
+            &ctx_state->mbarrier_contract_registry),
+        sizeof(mbarrier_contract_registry_t), CU_MEM_ATTACH_GLOBAL));
+    CUDA_SAFECALL(cuMemsetD8(
+        reinterpret_cast<CUdeviceptr>(
+            ctx_state->mbarrier_contract_registry),
+        0, sizeof(mbarrier_contract_registry_t)));
+    ctx_state->mbarrier_contract_registry->magic =
+        MBARRIER_CONTRACT_REGISTRY_MAGIC;
+    ctx_state->mbarrier_contract_registry->version =
+        MBARRIER_CONTRACT_REGISTRY_VERSION;
+  }
 }
 
 void nvbit_tool_init(CUcontext ctx) {
@@ -4399,6 +5077,23 @@ void nvbit_at_ctx_term(CUcontext ctx) {
   while (ctx_state->recv_thread_done != RecvThreadState::FINISHED);
   ctx_state->channel_host.destroy(false);
   CUDA_SAFECALL(cuMemFree(reinterpret_cast<CUdeviceptr>(ctx_state->channel_dev)));
+  if (ctx_state->mbarrier_contract_registry != nullptr) {
+    if (ctx_state->mbarrier_contract_registry->active != 0 ||
+        ctx_state->mbarrier_contract_registry->launch.state != 0 ||
+        ctx_state->mbarrier_contract_registry->error_flags != 0) {
+      fprintf(stderr,
+              "[MBARRIER-CONTRACT] context terminated with live or failed "
+              "capture state: active=%d state=%u errors=0x%x\n",
+              ctx_state->mbarrier_contract_registry->active,
+              ctx_state->mbarrier_contract_registry->launch.state,
+              ctx_state->mbarrier_contract_registry->error_flags);
+      abort();
+    }
+    CUDA_SAFECALL(cuMemFree(
+        reinterpret_cast<CUdeviceptr>(
+            ctx_state->mbarrier_contract_registry)));
+    ctx_state->mbarrier_contract_registry = nullptr;
+  }
   if (pending_devices_to_finish == 0 && warp_lifetime_capture != nullptr) {
     CUDA_SAFECALL(cuMemFree(
         reinterpret_cast<CUdeviceptr>(warp_lifetime_capture)));

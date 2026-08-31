@@ -24,7 +24,9 @@ ordinal-unique under a strict increasing-generation assumption. The existing
 trace therefore proves both the applicability of the restricted contract model
 and the need for one new captured field. **No simulator behavior change is
 authorized until a regenerated FA3 trace resolves every eligible occurrence
-with zero ambiguity.** B1 and later items remain pending.
+with zero ambiguity.** The option-gated Stage E0 implementation is now present
+locally; CUDA/NVBit build and the regenerated-trace acceptance gate remain
+pending. B1 and later items remain pending.
 
 This document is the authoritative index and the live execution record for
 B0-E. The detailed per-work-type designs and the historical evidence live in the
@@ -671,13 +673,70 @@ E0.6  Preserve/rename the 9e92fe9 baseline directory.
 E0.7  Generate exactly one new full FA3 trace and run the acceptance comparison.
 ```
 
+#### Stage E0 local implementation checkpoint (2026-09-01)
+
+E0.1-E0.5 are implemented locally. E0.6-E0.7 remain user-owned hardware
+validation work.
+
+- `--mbarrier-contract-capture` enables the tracer environment option
+  `MBARRIER_CONTRACT_CAPTURE=1`. The default is zero.
+- Enabled runs use the separate `-mbarrier-contract-v1` output-directory suffix,
+  so `-f` cannot delete the unsuffixed `9e92fe9` baseline.
+- The capture path allocates bounded launch-owned managed buffers. It does not
+  create a second `ChannelDev`, call `ChannelDev::push`, or wait for a second
+  receiver. This specifically excludes the transport mechanism that stalled the
+  earlier `SYNC_EVENT_ORDER` run.
+- The BEFORE callback executes `__ballot_sync` on every active lane before
+  selecting the first predicated-active publisher lane. The AFTER callback
+  executes no warp collective and publishes from the first active lane using
+  the BEGIN scratch state. This excludes the early-return-before-collective
+  deadlock and avoids rereading a PHASECHK destination predicate after the
+  instruction has overwritten it.
+- Only `SYNCS.EXCH*`, `SYNCS.ARRIVE.TRANS64*`, and `SYNCS.PHASECHK*` receive the
+  new callbacks. Blocking `BAR.SYNC`, `WARPSYNC`, and `WARPGROUP*` instructions
+  are not instrumented by this feature.
+- Device state is partitioned by launch and linear CTA. Each CTA owns a bounded
+  open-addressed barrier table, one scratch record per warp, and a bounded
+  record partition. Table exhaustion, record overflow, invalid launch identity,
+  unterminated begin/end pairs, and protobuf join mismatch abort at kernel exit.
+- The host joins each managed-buffer record bijectively to the active protobuf
+  occurrence identified by `(CTA, warp, function, PC, per-PC ordinal)` and
+  writes `mbarrier_contract_runtime_info`; no hardware cycle is recorded.
+- Strict post-processing writes
+  `extra_info/mbarrier_contract_ordinal_feasibility.json`, applies the
+  arrival-count-one/TMA-ownership gate, enumerates every generation allowed by
+  each contract-count interval, and rejects empty or multi-generation results.
+  Reusing a barrier for contract `j+1` additionally requires a captured READY
+  wait at the exact opened count `j`; absence of that witness rejects the
+  barrier as `CONTRACT_SERIAL_LIFECYCLE_UNPROVEN`.
+- Strict enabled runs also compare the new and unsuffixed baseline traces over
+  instruction/mask/synchronization fingerprints, WaitBlock records/counts, and
+  B0-D contract/load/byte totals.
+
+Local validation:
+
+```text
+28 Python unit tests PASS
+Python syntax compilation PASS
+capture ABI size assertions compile with host C++17 PASS
+git diff --check PASS
+existing full-trace capacity audit:
+  K5  max active capture records/CTA = 2,272; max barriers/CTA = 22
+  K10 max active capture records/CTA = 3,321; max barriers/CTA = 9
+  defaults                            = 8,192 records; 64 barriers
+```
+
+The local macOS environment has neither `nvcc` nor `protoc`; generated protobuf
+compilation, NVBit linking, callback execution, and the full FA3 acceptance
+comparison remain pending on the CUDA server. This checkpoint does not authorize
+Stage E1 or any simulator behavior change.
+
 Hardware build and trace execution remain user-owned. The expected trace command
 after E0 implementation is:
 
 ```bash
-nohup env \
-  LIGHTER_TRACER="all" \
-  ./util/tracer_nvbit/run_hw_trace.py \
+nohup ./util/tracer_nvbit/run_hw_trace.py \
+  --mbarrier-contract-capture \
   -f \
   -B flashattn:flashattn-fa3-bf16-bwd-causal-b1-s2048-hd64-nh24 \
   -D 0 \
@@ -696,6 +755,7 @@ util/tracer_nvbit/tracer_tool/inject_funcs.cu
 util/tracer_nvbit/tracer_tool/tracer_tool.cu
 util/tracer_nvbit/build_spin_wait_sidecar.py
 util/tracer_nvbit/tests/test_build_spin_wait_sidecar.py
+util/tracer_nvbit/run_hw_trace.py
 ```
 
 The exact device-state allocation must be designed before editing: it needs a
