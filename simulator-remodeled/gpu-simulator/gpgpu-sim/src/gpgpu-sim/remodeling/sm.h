@@ -290,14 +290,6 @@ class SM : public core_t, public shader_core_ctx_wrapper {
   // UTMACMDFLUSH with outstanding store-class TMA transfers, without touching
   // m_warps_waiting_tma_flush or emitting an episode log.
   bool peek_tma_flush_wait(unsigned warp_id, const warp_inst_t *inst) const;
-  // [B0-E] Deadlock-triggered single-consumer release. Called on the
-  // once-per-warp-per-cycle service path; evaluates the CTA slot that owns
-  // warp_id. When every live participant of that CTA is parked on an
-  // unsatisfied wait (a proven CTA-wide deadlock), release exactly one
-  // cycle-participating INJECT_MISSING_WAIT hold so its captured ARRIVE can
-  // flip the count barrier that frees the producer. Default-off; no-op unless
-  // wait_block_deadlock_release_enable. See .plan/WAIT_BLOCK.md.
-  void maybe_break_cta_deadlock(unsigned warp_id);
   void clear_gridbar(unsigned int kernel_id);
   void broadcast_barrier_reduction(unsigned cta_id, unsigned bar_id,
                                    warp_set_t warps);
@@ -768,33 +760,6 @@ class SM : public core_t, public shader_core_ctx_wrapper {
   unsigned long long m_partial_replay_watchdog_aborts_total = 0;
   unsigned long long m_wait_block_generation_overshoots_total = 0;
   unsigned long long m_wait_block_watchdog_aborts_total = 0;
-  // [B0-E] deadlock-triggered single-consumer release accounting + per-CTA-slot
-  // progress guard. m_deadlock_release_last_progress_signal[slot] snapshots the
-  // SM-global semantic-event signal (phase flips + arrives) at the last release;
-  // if a subsequent deadlock finds the same signal, the release bought no
-  // progress and the run aborts (anti-escape). ~0ull means "no release yet".
-  unsigned long long m_deadlock_release_total = 0;
-  unsigned long long m_deadlock_release_last_progress_signal[MAX_CTA_PER_SHADER] =
-      {0};
-  bool m_deadlock_release_armed[MAX_CTA_PER_SHADER] = {false};
-  // [B0-E] deadlock debug/corruption accounting, per CTA slot. A "suspect" is
-  // the first cycle a CTA is observed fully stuck; it is cleared whenever the
-  // CTA is seen making progress again (some warp not stuck), so the value always
-  // marks the start of the CURRENT contiguous all-stuck episode. The gap from
-  // suspect to the release that ends the episode is timing corruption (fake
-  // stall). We accumulate it per SM and count episodes for post-run analysis.
-  unsigned long long m_deadlock_suspect_cycle[MAX_CTA_PER_SHADER];
-  bool m_deadlock_suspect_active[MAX_CTA_PER_SHADER] = {false};
-  unsigned long long m_deadlock_episodes_total = 0;
-  // Longest single fully-stuck episode span (suspect_cycle -> episode close),
-  // measured when the episode ends. Peak fake-stall burst on this SM.
-  unsigned long long m_deadlock_corruption_cycles_max = 0;
-  unsigned long long m_deadlock_first_suspect_cycle = ~0ull;
-  unsigned long long m_deadlock_last_release_cycle = 0;
-  // Direct fake-stall measure: number of cycles this SM had at least one CTA
-  // slot observed fully stuck (summed across detections). This is the primary
-  // "deadlock timing corruption" figure the post-run analysis reports.
-  unsigned long long m_deadlock_fullstuck_cycles_total = 0;
  public:
   // Increment the tensor-op count for the CTA slot that owns hardware warp wid.
   void inc_tensor_ops_for_warp(unsigned wid) {

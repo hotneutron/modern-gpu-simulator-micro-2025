@@ -3354,12 +3354,6 @@ void SM::service_wait_block_release(unsigned warp_id) {
       warp_id >= m_pending_sync_waits.size()) {
     return;
   }
-  // [B0-E] Deadlock-triggered single-consumer release (default-off). Evaluated
-  // here so detection happens on the same once-per-warp-per-cycle path as the
-  // normal release, i.e. as early as the CTA becomes fully stuck rather than at
-  // the 32,000-cycle watchdog. No-op unless every live participant of this
-  // warp's CTA is parked. See .plan/WAIT_BLOCK.md.
-  maybe_break_cta_deadlock(warp_id);
   service_partial_replay_progress(warp_id);
   HopperPartialWaitArm &partial_arm = m_partial_wait_arms[warp_id];
   if (partial_arm.valid &&
@@ -3808,222 +3802,6 @@ void SM::service_wait_block_release(unsigned warp_id) {
   pending_wait = HopperMBarrierPendingWait();
 }
 
-void SM::maybe_break_cta_deadlock(unsigned warp_id) {
-  // [B0-E] Default-off. See .plan/WAIT_BLOCK.md "deadlock-triggered
-  // single-consumer release". Fires only inside a proven CTA-wide deadlock and
-  // releases exactly one cycle-participating INJECT_MISSING_WAIT hold.
-  if (!m_config->wait_block_enable ||
-      !m_config->wait_block_deadlock_release_enable ||
-      warp_id >= m_pending_sync_waits.size()) {
-    return;
-  }
-  if (m_physical_warp[warp_id] == nullptr) {
-    return;
-  }
-  const unsigned cta_slot = m_physical_warp[warp_id]->get_cta_id();
-  if (cta_slot >= MAX_CTA_PER_SHADER || m_cta_status[cta_slot] == 0) {
-    return;
-  }
-
-  // STEP 1 — deadlock gate (fail-closed). Every live (not-exited) warp of this
-  // CTA slot must be stuck this cycle: parked on an unsatisfied WaitBlock hold,
-  // or blocked on a named-barrier / membar wait. If any live warp can still make
-  // progress, this is not a deadlock and we return without touching anything.
-  // Grid-barrier and TMA-flush waits are intentionally treated as "can still
-  // progress" (not stuck): this only makes the gate MORE conservative (it
-  // under-detects rather than falsely declaring a deadlock), which is the
-  // fail-closed direction. The K5 terminal cycle contains none of them.
-  bool saw_participant = false;
-  unsigned stuck_count = 0;
-  unsigned live_count = 0;
-  for (unsigned w = 0; w < MAX_WARP_PER_SHADER; ++w) {
-    if (m_physical_warp[w] == nullptr ||
-        m_physical_warp[w]->get_cta_id() != cta_slot ||
-        m_physical_warp[w]->done_exit()) {
-      continue;
-    }
-    saw_participant = true;
-    ++live_count;
-    const bool stuck =
-        (peek_wait_block_hold_mode(w) != WaitBlockPendingMode::NONE) ||
-        peek_named_barrier_wait(w) || peek_membar_wait(w);
-    if (stuck) {
-      ++stuck_count;
-    } else {
-      // A live participant can still progress. The CTA is NOT deadlocked; any
-      // in-flight suspect episode is over (it resolved on its own or via a
-      // prior release), so close the episode: record its full-stuck span (from
-      // suspect_cycle to now) into the max tracker and clear the marker.
-      if (m_deadlock_suspect_active[cta_slot]) {
-        const unsigned long long episode_span =
-            get_current_gpu_cycle() - m_deadlock_suspect_cycle[cta_slot];
-        if (episode_span > m_deadlock_corruption_cycles_max) {
-          m_deadlock_corruption_cycles_max = episode_span;
-        }
-        if (m_config->wait_block_debug) {
-          std::cerr << "[WAITBLOCK][deadlock-suspect-clear][SM" << m_sm_id
-                    << "] cyc=" << get_current_gpu_cycle()
-                    << " cta_slot=" << cta_slot
-                    << " global_cta=" << m_local_to_global_cta_id[cta_slot]
-                    << " suspect_since="
-                    << m_deadlock_suspect_cycle[cta_slot]
-                    << " episode_span=" << episode_span
-                    << " progressing_warp=" << w << std::endl;
-        }
-        m_deadlock_suspect_active[cta_slot] = false;
-      }
-      return;
-    }
-  }
-  if (!saw_participant) {
-    return;  // no live participant (CTA draining/empty)
-  }
-
-  // The CTA is fully stuck this cycle. If this is the first such cycle of the
-  // current episode, mark the SUSPECT time: this is "when the deadlock is first
-  // suspected". The gap from here to the release below is the timing corruption
-  // (every cycle in it is fake all-parked stall).
-  const unsigned long long now = get_current_gpu_cycle();
-  // Every cycle the whole CTA sits fully stuck is a fake-stall cycle: on HW this
-  // CTA never all-parks (it completes). Count it directly — this is the most
-  // literal "deadlock timing corruption" measure, independent of how many
-  // release rounds it takes to unwind.
-  m_deadlock_fullstuck_cycles_total++;
-  if (!m_deadlock_suspect_active[cta_slot]) {
-    m_deadlock_suspect_active[cta_slot] = true;
-    m_deadlock_suspect_cycle[cta_slot] = now;
-    m_deadlock_episodes_total++;
-    if (now < m_deadlock_first_suspect_cycle) {
-      m_deadlock_first_suspect_cycle = now;
-    }
-    if (m_config->wait_block_debug) {
-      std::cerr << "[WAITBLOCK][deadlock-suspect][SM" << m_sm_id
-                << "] cyc=" << now << " cta_slot=" << cta_slot
-                << " global_cta=" << m_local_to_global_cta_id[cta_slot]
-                << " live_warps=" << live_count
-                << " stuck_warps=" << stuck_count
-                << " episode=" << m_deadlock_episodes_total << std::endl;
-    }
-  }
-  const unsigned long long suspect_cycle = m_deadlock_suspect_cycle[cta_slot];
-  const unsigned long long suspect_to_now = now - suspect_cycle;
-
-  // STEP 2 — progress guard (anti-escape). Every phase flip / arrive is a
-  // semantic event; the SM-global sum is monotonic. If we already released for
-  // this CTA slot and that signal has not advanced since, the release bought no
-  // progress: abort loudly rather than escape the deadlock.
-  const unsigned long long progress_signal =
-      m_sync_debug_phase_flip + m_sync_debug_arrive +
-      m_sync_debug_arrive_expect_tx;
-  if (m_deadlock_release_armed[cta_slot] &&
-      progress_signal == m_deadlock_release_last_progress_signal[cta_slot]) {
-    std::cerr << "[WAITBLOCK][abort][SM" << m_sm_id << "] cyc=" << now
-              << " reason=deadlock-release-no-progress"
-              << " cta_slot=" << cta_slot
-              << " global_cta=" << m_local_to_global_cta_id[cta_slot]
-              << " progress_signal=" << progress_signal
-              << " suspect_cycle=" << suspect_cycle
-              << " suspect_to_now=" << suspect_to_now
-              << " deadlock_release_total=" << m_deadlock_release_total
-              << " action=abort" << std::endl;
-    debug_dump_tma_binding_snapshot("deadlock-release-no-progress");
-    abort();
-  }
-
-  // STEP 3 — select (role gate). Only a ready-only INJECT_MISSING_WAIT hold is
-  // in scope of the safety argument; captured polls (FOLD) and partial holds are
-  // excluded. Deterministic tie-break: smallest hardware warp id.
-  unsigned chosen = MAX_WARP_PER_SHADER;
-  for (unsigned w = 0; w < MAX_WARP_PER_SHADER; ++w) {
-    if (m_physical_warp[w] == nullptr ||
-        m_physical_warp[w]->get_cta_id() != cta_slot ||
-        m_physical_warp[w]->done_exit()) {
-      continue;
-    }
-    const HopperMBarrierPendingWait &pending = m_pending_sync_waits[w];
-    if (pending.valid &&
-        pending.mode == WaitBlockPendingMode::MISSING_WAIT_HOLD) {
-      chosen = w;
-      break;
-    }
-  }
-  if (chosen == MAX_WARP_PER_SHADER) {
-    // Deadlock with no INJECT_MISSING_WAIT participant: a genuinely unknown
-    // cycle outside the safety argument. Do nothing; the existing hold watchdog
-    // will abort. Fail closed. Log once per episode entry so the terminal state
-    // is attributable in post-run analysis.
-    if (m_config->wait_block_debug) {
-      std::cerr << "[WAITBLOCK][deadlock-no-candidate][SM" << m_sm_id
-                << "] cyc=" << now << " cta_slot=" << cta_slot
-                << " global_cta=" << m_local_to_global_cta_id[cta_slot]
-                << " live_warps=" << live_count
-                << " suspect_cycle=" << suspect_cycle
-                << " suspect_to_now=" << suspect_to_now << std::endl;
-    }
-    return;
-  }
-
-  // STEP 4 — release. Clear the pending wait exactly as the normal
-  // MISSING_WAIT_HOLD release does (no cursor move, no phase force, no
-  // generation guess). The warp resumes at its captured-ready arm because the
-  // INJECT path never advanced either cursor.
-  // The suspect->detect gap (suspect_to_now) is this episode's timing
-  // corruption: every cycle the whole CTA sat parked before we broke it.
-  HopperMBarrierPendingWait &pending = m_pending_sync_waits[chosen];
-  const uint64_t cur_gen = sync_barrier_gen(pending.key);
-  m_deadlock_release_total++;
-  m_missing_wait_releases_total++;
-  m_deadlock_last_release_cycle = now;
-  debug_log_wait_block_event(
-      "deadlock-release",
-      "block=" + pending.block_id +
-          " trace_kernel=" + std::to_string(pending.key.trace_kernel_id) +
-          " function=" + std::to_string(pending.unique_function_id) +
-          " cta=" + std::to_string(pending.key.cta_id) +
-          " global_cta=" + std::to_string(m_local_to_global_cta_id[cta_slot]) +
-          " warp=" + std::to_string(chosen) + " entry_pc=0x" +
-          format_hex_u64(pending.action_pc) + " barrier=0x" +
-          format_hex_u64(pending.key.barrier_addr) +
-          " expected_gen=" + std::to_string(pending.expected_gen) +
-          " current_gen=" + std::to_string(cur_gen) +
-          " suspect_cycle=" + std::to_string(suspect_cycle) +
-          " stuck_cycles_before_release=" + std::to_string(suspect_to_now) +
-          " fullstuck_cycles_total=" +
-          std::to_string(m_deadlock_fullstuck_cycles_total) +
-          " progress_signal=" + std::to_string(progress_signal) +
-          " deadlock_release_total=" + std::to_string(m_deadlock_release_total) +
-          " cursor_action=none");
-  if (m_config->wait_block_debug) {
-    std::cerr << "[WAITBLOCK][deadlock-detect][SM" << m_sm_id << "] cyc=" << now
-              << " cta_slot=" << cta_slot
-              << " global_cta=" << m_local_to_global_cta_id[cta_slot]
-              << " episode=" << m_deadlock_episodes_total
-              << " suspect_cycle=" << suspect_cycle
-              << " stuck_cycles_before_release=" << suspect_to_now
-              << " fullstuck_cycles_total="
-              << m_deadlock_fullstuck_cycles_total
-              << " episode_span_max="
-              << m_deadlock_corruption_cycles_max << std::endl;
-    std::cerr << "[WAITBLOCK][deadlock-release][SM" << m_sm_id << "] cyc=" << now
-              << " cta_slot=" << cta_slot
-              << " global_cta=" << m_local_to_global_cta_id[cta_slot]
-              << " warp=" << chosen << " entry_pc=0x"
-              << format_hex_u64(pending.action_pc) << " barrier=0x"
-              << format_hex_u64(pending.key.barrier_addr)
-              << " expected_gen=" << pending.expected_gen
-              << " current_gen=" << cur_gen
-              << " total=" << m_deadlock_release_total << std::endl;
-  }
-  pending = HopperMBarrierPendingWait();
-  m_deadlock_release_armed[cta_slot] = true;
-  m_deadlock_release_last_progress_signal[cta_slot] = progress_signal;
-  // End this suspect episode: the release we just made is expected to unstick
-  // the CTA. If it does not, the next detection's progress guard (STEP 2) fires.
-  // Re-arm suspect tracking so the NEXT contiguous all-stuck run is timed
-  // separately (its own corruption gap starts fresh).
-  m_deadlock_suspect_active[cta_slot] = false;
-}
-
 void SM::print_wait_block_summary() const {
   if (!m_config->wait_block_enable) {
     return;
@@ -4087,8 +3865,7 @@ void SM::print_wait_block_summary() const {
       "active_partial_regions=%llu "
       "active_partial_capsules=%llu "
       "partial_replay_watchdog_aborts=%llu "
-      "generation_overshoots=%llu watchdog_aborts=%llu "
-      "deadlock_releases=%llu\n",
+      "generation_overshoots=%llu watchdog_aborts=%llu\n",
       balanced ? "PASS" : "ACTIVE", m_sm_id, m_missing_wait_ready_total,
       m_missing_wait_holds_total,
       m_missing_wait_releases_total, m_partial_missing_wait_misses_total,
@@ -4106,26 +3883,7 @@ void SM::print_wait_block_summary() const {
       active_partial_regions, active_partial_capsules,
       m_partial_replay_watchdog_aborts_total,
       m_wait_block_generation_overshoots_total,
-      m_wait_block_watchdog_aborts_total,
-      m_deadlock_release_total);
-
-  // [B0-E] Dedicated deadlock-corruption summary for post-run timing analysis.
-  // Emitted unconditionally (not debug-gated) so it is greppable from any run.
-  // first_suspect_cycle = ~0ull sentinel means no deadlock was ever suspected on
-  // this SM; print it as 0 episodes / 0 corruption in that case.
-  const unsigned long long first_suspect_print =
-      (m_deadlock_first_suspect_cycle == ~0ull)
-          ? 0ull
-          : m_deadlock_first_suspect_cycle;
-  fprintf(stdout,
-          "[WAITBLOCK][deadlock-summary] sm=%u deadlock_episodes=%llu "
-          "deadlock_releases=%llu deadlock_fullstuck_cycles=%llu "
-          "deadlock_episode_span_max=%llu first_suspect_cycle=%llu "
-          "last_release_cycle=%llu\n",
-          m_sm_id, m_deadlock_episodes_total, m_deadlock_release_total,
-          m_deadlock_fullstuck_cycles_total,
-          m_deadlock_corruption_cycles_max, first_suspect_print,
-          m_deadlock_last_release_cycle);
+      m_wait_block_watchdog_aborts_total);
 
   if (!m_config->wait_block_debug) {
     return;
