@@ -2,6 +2,13 @@
 BASE_DIR := $(shell pwd)
 BIN_DIR := $(BASE_DIR)/bin
 
+.PHONY: all clean mbarrier_release_probe
+
+mbarrier_release_probe:
+	mkdir -p $(BIN_DIR)
+	$(MAKE) -C mbarrier_release_probe
+	cp mbarrier_release_probe/mbarrier_release_probe $(BIN_DIR)
+
 all: 	
 	mkdir -p $(BIN_DIR)
 	cd l1_bw_32f &&		make &&	cp l1_bw_32f $(BIN_DIR)
@@ -27,6 +34,7 @@ all:
 	cd ublkred_desc_probe && 		make &&	cp ublkred_desc_probe $(BIN_DIR)
 	cd utmapf_probe && 		make &&	cp utmapf_probe $(BIN_DIR)
 	cd sync_arrive_probe && 		make &&	cp sync_arrive_probe $(BIN_DIR)
+	cd mbarrier_release_probe && 		make &&	cp mbarrier_release_probe $(BIN_DIR)
 	cd Atomic_ubench/Atomic_add/Atomic_add_bw &&            make && cp atomic_add_bw $(BIN_DIR)
 	cd Atomic_ubench/Atomic_add/Atomic_add_bw_conflict &&            make && cp atomic_add_bw_conflict $(BIN_DIR)
 	cd Atomic_ubench/Atomic_add/Atomic_add_lat &&            make && cp atomic_add_lat $(BIN_DIR)

@@ -771,13 +771,14 @@ _BARR_OFF_RE = _re.compile(r"\+\s*(0x[0-9a-fA-F]+)\s*\]")
 #   dst_first  : operand[0] is the (only) destination register; rest are uses.
 #   wait       : SYNCS.PHASECHK* — destination is the predicate operand[0]; the
 #                barrier operand and wait-state operand are uses.
-#   nanosleep  : NANOSLEEP.SYNCS — backoff, immediate only, no reg def/use.
+#   nanosleep  : NANOSLEEP[.SYNCS] — backoff, immediate only, no reg def/use.
 #   bra        : control flow, no data def/use.
 _WB_OPCODE_MODEL = {
     "IMAD.U32": "dst_first",
     "IMAD.MOV.U32": "dst_first",
     "SYNCS.PHASECHK.TRANS64.TRYWAIT": "wait",
     "SYNCS.PHASECHK.TRANS64": "wait",
+    "NANOSLEEP": "nanosleep",
     "NANOSLEEP.SYNCS": "nanosleep",
     "BRA": "bra",
 }

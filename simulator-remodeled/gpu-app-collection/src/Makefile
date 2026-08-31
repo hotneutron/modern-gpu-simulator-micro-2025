@@ -84,6 +84,11 @@ GPU_Microbenchmark:
 	$(SETENV) make $(MAKE_ARGS) -C cuda/GPU_Microbenchmark
 	cp -r cuda/GPU_Microbenchmark/bin/* $(BINDIR)/$(BINSUBDIR)/
 
+mbarrier_release_probe:
+	mkdir -p $(BINDIR)/$(BINSUBDIR)/
+	$(SETENV) $(MAKE) $(MAKE_ARGS) -C cuda/GPU_Microbenchmark mbarrier_release_probe
+	cp cuda/GPU_Microbenchmark/bin/mbarrier_release_probe $(BINDIR)/$(BINSUBDIR)/
+
 
 Deepbench_nvidia:
 	$(SETENV) make $(MAKE_ARGS) -C cuda/DeepBench/code/nvidia

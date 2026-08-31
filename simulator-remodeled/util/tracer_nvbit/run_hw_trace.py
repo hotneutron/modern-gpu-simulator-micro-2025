@@ -244,6 +244,9 @@ parser.add_option("-l", "--limit_kernel_number", dest='kernel_number', default=-
                         "number of traced limits")
 parser.add_option("-t", "--terminate_upon_limit", dest='terminate_upon_limit', action="store_true", help="Once the kernel limit is " +\
                         "reached, terminate the tracing process")
+parser.add_option("-f", "--force-overwrite", dest="force_overwrite",
+                  action="store_true", default=False,
+                  help="Delete an existing benchmark run directory before tracing")
 # MOD. Begin. Improved tracer
 parser.add_option("-C", "--compressed", dest="compressed", action="store_true", 
                  help="It runs the tracer in compressed mode", default="0")
@@ -433,6 +436,38 @@ def spin_trim_run_dir(this_run_dir):
     subprocess.run(cmd, check=True)
 
 
+def remove_existing_run_dir(run_dir, trace_root):
+    if not os.path.lexists(run_dir):
+        return
+
+    absolute_run_dir = os.path.abspath(run_dir)
+    real_run_dir = os.path.realpath(absolute_run_dir)
+    real_trace_root = os.path.realpath(os.path.abspath(trace_root))
+    try:
+        inside_trace_root = (
+            os.path.commonpath((real_run_dir, real_trace_root))
+            == real_trace_root
+        )
+    except ValueError:
+        inside_trace_root = False
+
+    if (
+        not inside_trace_root
+        or real_run_dir == real_trace_root
+        or os.path.islink(absolute_run_dir)
+        or not os.path.isdir(absolute_run_dir)
+    ):
+        raise RuntimeError(
+            "refusing to force-overwrite unsafe run path: {0} "
+            "(trace root: {1})".format(absolute_run_dir, real_trace_root)
+        )
+
+    print("[TRACE-OUTPUT] force-overwrite removing {0}".format(
+        absolute_run_dir
+    ))
+    shutil.rmtree(absolute_run_dir)
+
+
 for bench in benchmarks:
     edir, ddir, exe, argslist = bench
     for argpair in argslist:
@@ -473,6 +508,12 @@ for bench in benchmarks:
         # MOD. End. Improved tracer
 
         this_trace_folder = os.path.join(this_run_dir, "traces")
+        if options.force_overwrite:
+            remove_existing_run_dir(this_run_dir, trace_version_root)
+            if trim_spin_enabled:
+                remove_existing_run_dir(
+                    this_run_dir + ".fullrun", trace_version_root
+                )
         if os.path.exists(this_run_dir):
             if lighter_tracer_config.features:
                 raise RuntimeError(
