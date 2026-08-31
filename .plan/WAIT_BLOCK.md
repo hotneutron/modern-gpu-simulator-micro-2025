@@ -13,9 +13,16 @@ ticket, ordered candidate-set, runtime UR recompute) were explored and
 tested, and reverted** — it advanced K5 from generation 4 to generation 9 but
 still tripped the hold watchdog, and it perturbed K10 timing (regression). The
 tree is back at the `326ef0b` baseline. A **temporary, measurement-only,
-PC-hardcoded K5 deadlock breaker** is now in place solely to observe the K5
-completion cycle count; it is explicitly **not a fix** and must not ship. B1 and
-later items remain pending.
+PC-hardcoded K5 deadlock breaker** was added at `9e16c6f` solely to observe the
+K5 completion cycle count; it is explicitly **not a fix**. Its first run
+confirmed K10 stays clean but K5 **still does not complete** — the four consumer
+PCs cleared let K5 reach later generations where new hang sites (`0x35e0`,
+`0x3750`, producer FOLD `0xb0b0`, partial `0xab40`) surface, i.e. the K5 deadlock
+is multi-layer. **The probe code has since been reverted** (only the four code
+files: `shader.h`, `gpu-sim.cc`, `sm.cc`, config); this document's probe findings
+and handover are intentionally kept for the next session. See "Temporary K5
+hardcoded deadlock breaker" → "HANDOVER — next session" for the A/B decision that
+is the immediate next step. B1 and later items remain pending.
 
 This document is the authoritative index and the live execution record for
 B0-E. The detailed per-work-type designs and the historical evidence live in the
@@ -365,6 +372,80 @@ cycle count is observable.
   companion document treats it as authority.
 - **Files:** flag in `shader.h`, registration in `gpu-sim.cc`, hook in
   `SM::service_wait_block_release` (`sm.cc`), enabled in the H100 config.
+  **These four code files were reverted after the run below** (restored to the
+  pre-probe `fa9e95e` state); this section is retained as findings/handover only,
+  so re-applying the probe means re-adding the hook, not just flipping a flag.
+
+### First hardcoded-probe run (`.e89`/`.o89` K5, `.e65`/`.o65` K10)
+
+Committed at `9e16c6f`. Result: **K5 still does not complete** — the probe cleared
+the original deadlock but exposed deeper hang layers.
+
+- **K10 (`.e65`): clean, no regression.** 384/384 `[WAITBLOCK][summary]
+  status=PASS`, zero aborts, and the hardcoded release fired **0 times** (the four
+  PCs are K5-only). Confirms the probe is inert for K10.
+- **K5 (`.e89`): progressed much further, then aborted again.** The four-PC
+  release fired **7,636 times** and pushed the original `0x16c50/38/30/58`
+  consumer cycle from generations 4-6 out to generations 8-11; many CTAs reached
+  `[CTAFIN]` and 52 SMs emitted `status=PASS`. Final abort at **cyc 89,126**
+  (vs. the pristine `.e85` watchdog at 68,240), reason `hold-watchdog`,
+  `strategy=FOLD_CAPTURED_POLL`, warp 0 (producer), `action_pc=0xb0b0`,
+  `barrier=0x16c20`, gen 2->3, held 32,001.
+
+**Key finding — the K5 deadlock is multi-layer, and the parked-PC set grows as
+the run advances.** Breaking the four consumer PCs let the pipeline reach later
+generations, where *new* wait sites enter the terminal cycle. Full census of
+what was still parked in the last window (cyc 85,000-89,126) of `.e89`:
+
+| strategy | action_pc | barrier | state | in current whitelist? |
+|---|---|---|---|---|
+| INJECT_MISSING_WAIT | `0x35e0` | 0x16c30 / 0x16c38 | gen 8-11 stuck | no |
+| INJECT_MISSING_WAIT | `0x3750` | 0x16c50 / 0x16c58 | gen 9-10 stuck | no |
+| FOLD_CAPTURED_POLL | `0xb0b0` | 0x16c20 | gen 2->3, max_held 28,672 (the abort) | no |
+| DEFER_PARTIAL_MISSING_WAIT | `0xab40` | 0x16c40 / 0x16c48 | gen 8-9, max_held 24,576 | no |
+
+Method note for the census: `[WAITBLOCK][heartbeat]` repeats every 4,096 cycles,
+so `max_held` distinguishes a true hang from normal park. FOLD sites `0xb1f0`,
+`0xb2b0`, `0xb370` show many heartbeats but `max_held=4096` (many warps parking
+once each, then releasing) — **not** hangs. Only `0xb0b0` (FOLD) and `0xab40`
+(DEFER_PARTIAL) reach ~24-28k held cycles, i.e. real hangs, alongside the
+still-stuck INJECT sites `0x35e0`/`0x3750`.
+
+### HANDOVER — next session
+
+**State:** tree at `9e16c6f` (three reverts + the temporary probe on top of
+`326ef0b`). The generic B0-E fix remains unsolved; the probe is measurement-only.
+Goal of the probe track is still just to observe K5's completion cycle count.
+
+**Decision pending (asked, not yet answered):** how to get K5 to actually finish.
+Two options were put to the user:
+
+- **Option A — extend the PC whitelist.** Add `0x35e0`, `0x3750`, `0xb0b0`, and
+  `0xab40`. Caveats: (1) `0xab40` is `DEFER_PARTIAL_MISSING_WAIT`, whose release
+  path differs from `MISSING_WAIT_HOLD`, so the hook needs a separate branch for
+  it (the current hook only matches `MISSING_WAIT_HOLD`); (2) `0xb0b0` is a
+  producer `FOLD_CAPTURED_POLL`, so releasing it lets the producer advance past a
+  poll the HW actually spun on — acceptable for measurement only; (3) advancing
+  further may surface yet more PCs (the set has grown every time the run gets
+  further), so this may need several build/run round-trips.
+- **Option B (assistant's recommendation) — strategy-agnostic held-cycles
+  threshold.** Replace the PC whitelist with "if any hold's `held_cycles` exceeds
+  a high threshold (e.g. 28,000, below the 32,000 watchdog), force-release it,
+  regardless of strategy or PC." Rationale: covers all layers at once (INJECT,
+  FOLD, DEFER_PARTIAL) so K5 likely completes in one run; K10 is safe because its
+  longest observed transient park is ~1,659 cycles, far under 28,000. This drops
+  PC-hardcoding entirely in favor of a single dwell-time gate, which matches the
+  "just let it finish so we can read the cycle count" intent. Still measurement-
+  only, still default-off, still not a shippable fix.
+
+**Immediate next step:** get the user's A-vs-B decision, then implement, rebuild,
+rerun K5 (`gpu_tot_sim_cycle` is the target number) and K10 (must stay 384/384
+PASS). If Option A and a later run surfaces still more PCs, that is itself
+evidence that the deadlock is unbounded-layer and Option B is the pragmatic path.
+
+**Evidence pointers:** K5 `.e89`/`.o89` and K10 `.e65`/`.o65` under
+`sim_run_12.8/.../H100_80GB-OnlyKernel5` and `...-OnlyKernel10`. Pristine
+(pre-probe) deadlock is `.e85`.
 
 ### Rejected/closed generic attempts (do not re-propose as-is)
 

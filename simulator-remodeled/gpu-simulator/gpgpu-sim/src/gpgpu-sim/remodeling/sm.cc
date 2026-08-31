@@ -3494,46 +3494,11 @@ void SM::service_wait_block_release(unsigned warp_id) {
   }
 
   if (cur_gen < exp_gen) {
-        // [B0-E MEASUREMENT ONLY — NOT A FIX] Hardcoded K5 deadlock breaker.
-        // The original K5 deadlock is an INJECT_MISSING_WAIT (ready-only) hold
-        // that stays current_gen < expected_gen forever and eventually trips the
-        // hold watchdog. To measure the completion cycle count, force-release
-        // such a hold when it sits at one of the K5 producer/consumer wait PCs.
-        // This is application/PC-specific and must never ship as the real fix;
-        // it exists only to let K5 finish so its cycles are observable.
-        if (m_config->wait_block_k5_hardcoded_deadlock_release &&
-            pending_wait.mode == WaitBlockPendingMode::MISSING_WAIT_HOLD) {
-          const address_type pc = pending_wait.action_pc;
-          const bool k5_deadlock_pc =
-              (pc == 0x13b0 || pc == 0x5a50 || pc == 0x5bc0 || pc == 0x74e0);
-          if (k5_deadlock_pc) {
-            m_missing_wait_releases_total++;
-            debug_log_wait_block_event(
-                "k5-hardcoded-deadlock-release",
-                "block=" + block + " trace_kernel=" +
-                    std::to_string(pending_wait.key.trace_kernel_id) +
-                    " function=" +
-                    std::to_string(pending_wait.unique_function_id) +
-                    " cta=" + std::to_string(pending_wait.key.cta_id) +
-                    " global_cta=" +
-                    std::to_string(
-                        m_local_to_global_cta_id[pending_wait.key.cta_id]) +
-                    " warp=" + std::to_string(warp_id) + " action_pc=0x" +
-                    format_hex_u64(pc) + " barrier=0x" +
-                    format_hex_u64(pending_wait.key.barrier_addr) +
-                    " expected_gen=" + std::to_string(exp_gen) +
-                    " current_gen=" + std::to_string(cur_gen) +
-                    " held_cycles=" + std::to_string(held_cycles) +
-                    barrier_detail + " cursor_action=none");
-            pending_wait = HopperMBarrierPendingWait();
-            return;
-          }
-        }
-        if (m_config->wait_block_enable &&
-            now - pending_wait.last_heartbeat_cycle >=
-                kWaitBlockHeartbeatCycles) {
-          debug_log_wait_block_event(
-              "heartbeat",
+    if (m_config->wait_block_enable &&
+        now - pending_wait.last_heartbeat_cycle >=
+            kWaitBlockHeartbeatCycles) {
+      debug_log_wait_block_event(
+          "heartbeat",
           "strategy=" +
               std::string(wait_block_mode_to_string(pending_wait.mode)) +
               " block=" + block +
