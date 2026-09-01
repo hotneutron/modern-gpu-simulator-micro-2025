@@ -651,8 +651,9 @@ active SM cycle and emits canonical release fingerprints. The default-off
 `-wait_block_reverse_subcore_traversal` option reverses the subsequent subcore
 issue order for the paired validation run. Normal traversal passes K5 `.e91`
 and K10 `.e67` with exact release-service visit accounting; reversed traversal
-on the same trace remains pending. Detailed results are in
-[WAIT_BLOCK.md](WAIT_BLOCK.md).
+on the same trace remains pending. The tested H100 config is temporarily set to
+`1` for that run and must return to `0` after validation. Detailed results are
+in [WAIT_BLOCK.md](WAIT_BLOCK.md).
 
 ## 8. Startup, payload, and provenance gates
 

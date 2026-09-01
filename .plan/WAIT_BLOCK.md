@@ -135,7 +135,8 @@ release a later subcore in the same cycle. The runtime checks one service visit
 per hardware warp and emits canonical per-release fingerprints. The default-off
 `-wait_block_reverse_subcore_traversal` switch reverses only the subsequent
 subcore issue traversal for the required paired validation. Normal traversal is
-complete; reversed traversal remains pending.
+complete. The tested H100 config is temporarily set to `1` for the pending
+reversed run and must return to `0` after validation.
 
 **Normal-traversal result (`.e91`/`.o91` K5, `.e67`/`.o67` K10).**
 
