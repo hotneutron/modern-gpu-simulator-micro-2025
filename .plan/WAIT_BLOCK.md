@@ -22,12 +22,12 @@ cross-warp state to the trace. An audit of the existing full FA3 trace
 3,072 ambiguous sparse-role streams, while all 11,904 K10 TMA wait streams are
 ordinal-unique under a strict increasing-generation assumption. The existing
 trace therefore proves both the applicability of the restricted contract model
-and the need for one new captured field. The Stage E1 consumer is implemented
-behind a separate default-off option so code review can proceed while the v2
-trace runs; the option must not be enabled for an acceptance run until the
-regenerated FA3 trace resolves every eligible occurrence with zero ambiguity.
-The Stage E0 ABI fix is committed, and the regenerated-trace acceptance gate
-remains pending. B1 and later items remain pending.
+and the need for one new captured field. The ABI-correct v2 trace has now passed
+the Stage E0 identity and conservation gates: 81,999/81,999 eligible WaitBlock
+actions have unique generation assignments, with zero missing snapshots,
+capture mismatches, rejected TMA actions, ambiguous assignments, or inconsistent
+assignments. The Stage E1 consumer is implemented behind a separate default-off
+option. B1 and the K5/K10 simulator acceptance runs remain pending.
 
 This document is the authoritative index and the live execution record for
 B0-E. The detailed per-work-type designs and the historical evidence live in the
@@ -779,8 +779,8 @@ B0-D contracts/loads/bytes      = unchanged
 Therefore the barrier-local ordinal capture resolves every eligible occurrence
 uniquely. The trace still fails the independent perturbation gate: the added
 callbacks reduce repeated polling/backoff iterations while preserving semantic
-work. This remains an E0 stop condition under lines 645-661; Stage E1 and
-simulator behavior changes are not authorized.
+work. This was the v1 result; v2 replaces that capture path and is evaluated
+below.
 
 #### Stage E0 v2 lightweight capture (2026-09-01)
 
@@ -810,6 +810,33 @@ arguments. The follow-up fix restores the exact 16-argument ABI: three fixed
 event-kind symbols select EXCH/ARRIVE/WAIT, while ARRIVE semantic and the
 registry pointer low/high words occupy the existing unused operand-value slots.
 No callback or channel-push count changes.
+
+The ABI-correct v2 full FA3 run completed all instrumented kernels:
+
+```text
+K5 contract records             = 75,015
+K10 contract records            = 266,705
+K11 contract records            = 3,840
+active sync occurrences         = 923,835
+eligible TMA barriers           = 2,916
+eligible WaitBlock actions      = 81,999
+unique generation assignments  = 81,999
+missing/mismatch/ambiguous      = 0/0/0
+inconsistent assignments        = 0
+semantic histogram              = baseline-identical
+WaitBlock action/count/mask     = baseline-identical
+B0-D TMA contracts/bytes        = baseline-identical
+```
+
+The first strict post-processing attempt reported
+`wait_block_structure=false` because the comparator still treated INJECT
+`observed_barrier_addrs` and `observed_wait_states` frequency histograms as
+structural invariants. Eight K5 records changed only those two histograms.
+Those distributions, like FOLD retry counts, depend on hardware scheduling and
+are now diagnostic-only. Entry visit counts, path counts, effective/live masks,
+partial replay proof, static FOLD structure, semantic work, and TMA ownership
+remain hard equality gates. Reprocessing the same v2 trace after this correction
+passes all strict gates and publishes the schema-v5 sidecar.
 
 Hardware build and trace execution remain user-owned. The expected trace command
 after E0 implementation is:

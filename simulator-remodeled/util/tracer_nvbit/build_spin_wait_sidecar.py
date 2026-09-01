@@ -1096,7 +1096,7 @@ def compare_contract_capture_baseline(current_traces, baseline_traces,
     with open(current_contract_path) as handle:
         current_contracts = json.load(handle)
 
-    def wait_blocks_by_kernel(kernels, strip_fold_dynamic=False):
+    def wait_blocks_by_kernel(kernels, strip_runtime_diagnostics=False):
         result = {}
         for kernel in kernels:
             kernel_id = int(kernel["trace_kernel_id"])
@@ -1105,10 +1105,13 @@ def compare_contract_capture_baseline(current_traces, baseline_traces,
             records = []
             for original in kernel.get("wait_blocks", []):
                 record = dict(original)
-                if (strip_fold_dynamic
-                        and record.get("runtime_strategy")
-                        == "FOLD_CAPTURED_POLL"):
-                    record.pop("dynamic", None)
+                if strip_runtime_diagnostics:
+                    strategy = record.get("runtime_strategy")
+                    if strategy == "FOLD_CAPTURED_POLL":
+                        record.pop("dynamic", None)
+                    elif strategy == "INJECT_MISSING_WAIT":
+                        record.pop("observed_barrier_addrs", None)
+                        record.pop("observed_wait_states", None)
                 records.append(record)
             result[kernel_id] = records
         return result
@@ -1124,6 +1127,23 @@ def compare_contract_capture_baseline(current_traces, baseline_traces,
             for record in kernel.get("wait_blocks", [])
             if record.get("runtime_strategy")
             == "FOLD_CAPTURED_POLL"
+        }
+
+    def inject_runtime_identity_by_block(kernels):
+        return {
+            "%d:%s" % (
+                int(kernel["trace_kernel_id"]),
+                record["block_id"]): {
+                    "observed_barrier_addrs":
+                        record.get("observed_barrier_addrs", {}),
+                    "observed_wait_states":
+                        record.get("observed_wait_states", {}),
+                }
+            for kernel in kernels
+            if int(kernel["trace_kernel_id"]) in kernel_ids
+            for record in kernel.get("wait_blocks", [])
+            if record.get("runtime_strategy")
+            == "INJECT_MISSING_WAIT"
         }
 
     def contract_kernel_summary(document):
@@ -1144,13 +1164,17 @@ def compare_contract_capture_baseline(current_traces, baseline_traces,
         }
 
     current_wait_blocks = wait_blocks_by_kernel(
-        current_sidecar_kernels, strip_fold_dynamic=True)
+        current_sidecar_kernels, strip_runtime_diagnostics=True)
     baseline_wait_blocks = wait_blocks_by_kernel(
         baseline_sidecar.get("kernels", []),
-        strip_fold_dynamic=True)
+        strip_runtime_diagnostics=True)
     current_fold_dynamic = fold_dynamic_by_block(
         current_sidecar_kernels)
     baseline_fold_dynamic = fold_dynamic_by_block(
+        baseline_sidecar.get("kernels", []))
+    current_inject_runtime_identity = inject_runtime_identity_by_block(
+        current_sidecar_kernels)
+    baseline_inject_runtime_identity = inject_runtime_identity_by_block(
         baseline_sidecar.get("kernels", []))
     wait_report_keys = (
         "inject_missing_wait",
@@ -1196,6 +1220,13 @@ def compare_contract_capture_baseline(current_traces, baseline_traces,
             current_fold_dynamic == baseline_fold_dynamic,
         "current_fold_dynamic": current_fold_dynamic,
         "baseline_fold_dynamic": baseline_fold_dynamic,
+        "inject_runtime_identity_equal":
+            current_inject_runtime_identity
+            == baseline_inject_runtime_identity,
+        "current_inject_runtime_identity":
+            current_inject_runtime_identity,
+        "baseline_inject_runtime_identity":
+            baseline_inject_runtime_identity,
         "current_tma_contracts":
             contract_kernel_summary(current_contracts),
         "baseline_tma_contracts":

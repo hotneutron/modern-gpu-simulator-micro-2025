@@ -554,6 +554,151 @@ class ContractOrdinalCaptureTest(unittest.TestCase):
         self.assertTrue(all(result["comparisons"].values()))
         self.assertFalse(result["fold_dynamic_equal"])
 
+    def test_baseline_comparison_ignores_inject_runtime_identity_histograms(self):
+        current_kernel = {
+            "trace_kernel_id": 5,
+            "wait_blocks": [{
+                "block_id": "inject",
+                "runtime_strategy": "INJECT_MISSING_WAIT",
+                "entry_probe_pc": 0x120,
+                "active_entry_visits": 8,
+                "observed_effective_masks": {"0xffffffff": 8},
+                "observed_live_masks": {"0xffffffff": 8},
+                "observed_barrier_addrs": {
+                    "0x1000": 3,
+                    "0x1008": 5,
+                },
+                "observed_wait_states": {
+                    "0x0": 3,
+                    "0x80000000": 5,
+                },
+            }],
+        }
+        baseline_kernel = json.loads(json.dumps(current_kernel))
+        baseline_record = baseline_kernel["wait_blocks"][0]
+        baseline_record["observed_barrier_addrs"] = {
+            "0x1000": 4,
+            "0x1008": 4,
+        }
+        baseline_record["observed_wait_states"] = {
+            "0x0": 4,
+            "0x80000000": 4,
+        }
+        wait_report = {
+            "inject_missing_wait": 1,
+            "fold_captured_poll": 0,
+            "ready_only_all_live_visits": 8,
+            "ready_only_partial_visits": 0,
+            "partial_defer_records": 0,
+            "partial_join_pending_visits": 0,
+            "partial_join_already_issued_visits": 0,
+        }
+        contracts = {
+            "kernels": [{
+                "trace_kernel_id": 5,
+                "threadblocks": 1,
+                "contracts": 1,
+                "completion_loads": 1,
+                "expected_bytes": 256,
+                "assigned_bytes": 256,
+                "errors": [],
+            }],
+        }
+        with tempfile.TemporaryDirectory() as current_dir, \
+                tempfile.TemporaryDirectory() as baseline_dir:
+            current_extra = Path(current_dir) / "extra_info"
+            baseline_extra = Path(baseline_dir) / "extra_info"
+            current_extra.mkdir()
+            baseline_extra.mkdir()
+            (baseline_extra / "spin_wait_sidecar.json").write_text(
+                json.dumps({
+                    "wait_block_report": wait_report,
+                    "kernels": [baseline_kernel],
+                }))
+            for extra in (current_extra, baseline_extra):
+                (extra / "tma_completion_contracts.json").write_text(
+                    json.dumps(contracts))
+            fingerprint = {
+                "sha256": "same",
+                "counts": {"semantic_instructions": 8},
+            }
+            with mock.patch.object(
+                    SIDECAR, "semantic_trace_fingerprint",
+                    return_value=fingerprint):
+                result = SIDECAR.compare_contract_capture_baseline(
+                    current_dir, baseline_dir,
+                    [current_kernel], wait_report)
+
+        self.assertEqual(result["status"], "PASS")
+        self.assertTrue(all(result["comparisons"].values()))
+        self.assertFalse(result["inject_runtime_identity_equal"])
+
+    def test_baseline_comparison_keeps_inject_mask_histograms_strict(self):
+        current_kernel = {
+            "trace_kernel_id": 5,
+            "wait_blocks": [{
+                "block_id": "inject",
+                "runtime_strategy": "INJECT_MISSING_WAIT",
+                "entry_probe_pc": 0x120,
+                "active_entry_visits": 8,
+                "observed_effective_masks": {"0xffffffff": 8},
+                "observed_live_masks": {"0xffffffff": 8},
+                "observed_barrier_addrs": {"0x1000": 8},
+                "observed_wait_states": {"0x0": 8},
+            }],
+        }
+        baseline_kernel = json.loads(json.dumps(current_kernel))
+        baseline_kernel["wait_blocks"][0][
+            "observed_effective_masks"] = {"0x1": 8}
+        wait_report = {
+            "inject_missing_wait": 1,
+            "fold_captured_poll": 0,
+            "ready_only_all_live_visits": 8,
+            "ready_only_partial_visits": 0,
+            "partial_defer_records": 0,
+            "partial_join_pending_visits": 0,
+            "partial_join_already_issued_visits": 0,
+        }
+        contracts = {
+            "kernels": [{
+                "trace_kernel_id": 5,
+                "threadblocks": 1,
+                "contracts": 1,
+                "completion_loads": 1,
+                "expected_bytes": 256,
+                "assigned_bytes": 256,
+                "errors": [],
+            }],
+        }
+        with tempfile.TemporaryDirectory() as current_dir, \
+                tempfile.TemporaryDirectory() as baseline_dir:
+            current_extra = Path(current_dir) / "extra_info"
+            baseline_extra = Path(baseline_dir) / "extra_info"
+            current_extra.mkdir()
+            baseline_extra.mkdir()
+            (baseline_extra / "spin_wait_sidecar.json").write_text(
+                json.dumps({
+                    "wait_block_report": wait_report,
+                    "kernels": [baseline_kernel],
+                }))
+            for extra in (current_extra, baseline_extra):
+                (extra / "tma_completion_contracts.json").write_text(
+                    json.dumps(contracts))
+            fingerprint = {
+                "sha256": "same",
+                "counts": {"semantic_instructions": 8},
+            }
+            with mock.patch.object(
+                    SIDECAR, "semantic_trace_fingerprint",
+                    return_value=fingerprint):
+                result = SIDECAR.compare_contract_capture_baseline(
+                    current_dir, baseline_dir,
+                    [current_kernel], wait_report)
+
+        self.assertEqual(result["status"], "FAIL")
+        self.assertFalse(
+            result["comparisons"]["wait_block_structure"])
+
     def test_semantic_fingerprint_uses_pc_and_mask_histogram(self):
         instruction = captured_instruction_wire(
             0x100, SIDECAR.CONTRACT_EVENT_EXCH,
