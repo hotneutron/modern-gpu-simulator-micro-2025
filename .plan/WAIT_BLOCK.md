@@ -801,6 +801,15 @@ must preserve semantic PC counts, B0-D ownership totals, INJECT entry
 occurrences/masks, and static FOLD proof/action structure. Dynamic FOLD retry and
 episode counts remain reported diagnostics but are not hard acceptance inputs.
 
+The first server build of `f9484f3` loaded v2 successfully but faulted in K5
+before channel flush. The error surfaced at the post-kernel
+`cudaDeviceSynchronize`; the launch state allocation had already passed. The
+v2 callback had extended the established NVBit callback ABI from 16 to 19
+arguments. The follow-up fix restores the exact 16-argument ABI: three fixed
+event-kind symbols select EXCH/ARRIVE/WAIT, while ARRIVE semantic and the
+registry pointer low/high words occupy the existing unused operand-value slots.
+No callback or channel-push count changes.
+
 Hardware build and trace execution remain user-owned. The expected trace command
 after E0 implementation is:
 

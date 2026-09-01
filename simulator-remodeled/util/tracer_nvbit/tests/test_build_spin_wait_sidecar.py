@@ -754,6 +754,15 @@ class ContractOrdinalCaptureTest(unittest.TestCase):
             "INST_TRACE_HAS_MBARRIER_CONTRACT", capture_body)
         self.assertIn("channel_dev->push(&record", capture_body)
         self.assertIn("captured_semantic_raw", capture_body)
+        self.assertIn(
+            "instrument_inst_compact_mbarrier_exch", inject_source)
+        self.assertIn(
+            "instrument_inst_compact_mbarrier_arrive", inject_source)
+        self.assertIn(
+            "instrument_inst_compact_mbarrier_wait", inject_source)
+        self.assertIn(
+            "(static_cast<uint64_t>(op_reg_val_3) << 32)",
+            capture_body)
 
         tracer_source = (tracer_dir / "tracer_tool.cu").read_text()
         self.assertIn(
@@ -767,6 +776,9 @@ class ContractOrdinalCaptureTest(unittest.TestCase):
             '"record_mbarrier_contract_begin"', tracer_source)
         self.assertNotIn(
             '"record_mbarrier_contract_end"', tracer_source)
+        self.assertIn(
+            "static_cast<uint32_t>(registry_addr >> 32)",
+            tracer_source)
         self.assertIn(
             "MBARRIER_CONTRACT_ERROR_BARRIER_TABLE_OVERFLOW",
             inject_source)

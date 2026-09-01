@@ -539,8 +539,8 @@ static __device__ __forceinline__ bool capture_mbarrier_contract_payload(
   return true;
 }
 
-extern "C" __device__ __noinline__ void
-instrument_inst_compact_mbarrier(
+static __device__ __forceinline__ void
+instrument_inst_compact_mbarrier_impl(
     int32_t pred, uint32_t unique_function_id, uint32_t vpc,
     uint32_t num_of_injects, uint32_t per_operand_type,
     uint32_t memory_type, uint64_t addr_or_offset_or_reg_id,
@@ -548,8 +548,11 @@ instrument_inst_compact_mbarrier(
     uint32_t op_reg_val_2, uint32_t op_reg_val_3,
     uint64_t pchannel_dev, uint64_t ptotal_dynamic_instr_counter,
     uint64_t preported_dynamic_instr_counter, uint64_t pstop_report,
-    int32_t device_counters_enabled, uint32_t event_kind,
-    uint32_t semantic_raw, uint64_t pregistry) {
+    int32_t device_counters_enabled, uint32_t event_kind) {
+  const uint32_t semantic_raw = op_reg_val_1;
+  const uint64_t pregistry =
+      (static_cast<uint64_t>(op_reg_val_3) << 32) |
+      static_cast<uint64_t>(op_reg_val_2);
   mbarrier_contract_inst_trace_t record;
   inst_trace_t *ma = &record.instruction;
   int first_laneid = -1;
@@ -557,8 +560,11 @@ instrument_inst_compact_mbarrier(
   if (!build_inst_trace_compact(
           pred, unique_function_id, vpc, num_of_injects,
           per_operand_type, memory_type, addr_or_offset_or_reg_id,
-          mem_width_or_op_reg_val_0, op_reg_val_1, op_reg_val_2,
-          op_reg_val_3, ptotal_dynamic_instr_counter,
+          mem_width_or_op_reg_val_0,
+          SECRET_UREG_DESC_NOT_USED,
+          SECRET_UREG_DESC_NOT_USED,
+          SECRET_UREG_DESC_NOT_USED,
+          ptotal_dynamic_instr_counter,
           preported_dynamic_instr_counter, pstop_report, ma,
           &first_laneid, &first_value_laneid)) {
     return;
@@ -600,6 +606,63 @@ instrument_inst_compact_mbarrier(
     atomicAdd((unsigned long long *)ptotal_dynamic_instr_counter, 1);
     atomicAdd((unsigned long long *)preported_dynamic_instr_counter, 1);
   }
+}
+
+extern "C" __device__ __noinline__ void
+instrument_inst_compact_mbarrier_exch(
+    int32_t pred, uint32_t unique_function_id, uint32_t vpc,
+    uint32_t num_of_injects, uint32_t per_operand_type,
+    uint32_t memory_type, uint64_t addr_or_offset_or_reg_id,
+    uint32_t mem_width_or_op_reg_val_0, uint32_t op_reg_val_1,
+    uint32_t op_reg_val_2, uint32_t op_reg_val_3,
+    uint64_t pchannel_dev, uint64_t ptotal_dynamic_instr_counter,
+    uint64_t preported_dynamic_instr_counter, uint64_t pstop_report,
+    int32_t device_counters_enabled) {
+  instrument_inst_compact_mbarrier_impl(
+      pred, unique_function_id, vpc, num_of_injects,
+      per_operand_type, memory_type, addr_or_offset_or_reg_id,
+      mem_width_or_op_reg_val_0, op_reg_val_1, op_reg_val_2,
+      op_reg_val_3, pchannel_dev, ptotal_dynamic_instr_counter,
+      preported_dynamic_instr_counter, pstop_report,
+      device_counters_enabled, MBARRIER_CONTRACT_EVENT_EXCH);
+}
+
+extern "C" __device__ __noinline__ void
+instrument_inst_compact_mbarrier_arrive(
+    int32_t pred, uint32_t unique_function_id, uint32_t vpc,
+    uint32_t num_of_injects, uint32_t per_operand_type,
+    uint32_t memory_type, uint64_t addr_or_offset_or_reg_id,
+    uint32_t mem_width_or_op_reg_val_0, uint32_t op_reg_val_1,
+    uint32_t op_reg_val_2, uint32_t op_reg_val_3,
+    uint64_t pchannel_dev, uint64_t ptotal_dynamic_instr_counter,
+    uint64_t preported_dynamic_instr_counter, uint64_t pstop_report,
+    int32_t device_counters_enabled) {
+  instrument_inst_compact_mbarrier_impl(
+      pred, unique_function_id, vpc, num_of_injects,
+      per_operand_type, memory_type, addr_or_offset_or_reg_id,
+      mem_width_or_op_reg_val_0, op_reg_val_1, op_reg_val_2,
+      op_reg_val_3, pchannel_dev, ptotal_dynamic_instr_counter,
+      preported_dynamic_instr_counter, pstop_report,
+      device_counters_enabled, MBARRIER_CONTRACT_EVENT_ARRIVE);
+}
+
+extern "C" __device__ __noinline__ void
+instrument_inst_compact_mbarrier_wait(
+    int32_t pred, uint32_t unique_function_id, uint32_t vpc,
+    uint32_t num_of_injects, uint32_t per_operand_type,
+    uint32_t memory_type, uint64_t addr_or_offset_or_reg_id,
+    uint32_t mem_width_or_op_reg_val_0, uint32_t op_reg_val_1,
+    uint32_t op_reg_val_2, uint32_t op_reg_val_3,
+    uint64_t pchannel_dev, uint64_t ptotal_dynamic_instr_counter,
+    uint64_t preported_dynamic_instr_counter, uint64_t pstop_report,
+    int32_t device_counters_enabled) {
+  instrument_inst_compact_mbarrier_impl(
+      pred, unique_function_id, vpc, num_of_injects,
+      per_operand_type, memory_type, addr_or_offset_or_reg_id,
+      mem_width_or_op_reg_val_0, op_reg_val_1, op_reg_val_2,
+      op_reg_val_3, pchannel_dev, ptotal_dynamic_instr_counter,
+      preported_dynamic_instr_counter, pstop_report,
+      device_counters_enabled, MBARRIER_CONTRACT_EVENT_WAIT);
 }
 
 /* FA3 warp lifetime timestamp. Injected before SASS EXIT by either the

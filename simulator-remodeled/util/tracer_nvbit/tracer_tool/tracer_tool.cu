@@ -2651,14 +2651,29 @@ void instrument_function_if_needed(CUcontext ctx, CUfunction func, int device_id
               contract_event_kind != MBARRIER_CONTRACT_EVENT_NONE &&
               static_cast<int>(i) ==
                   sync_site_info.barrier_callback_index;
+          const char *callback_name =
+              compact_wire_enabled ? "instrument_inst_compact"
+                                   : "instrument_inst";
+          if (inline_contract_capture) {
+            switch (contract_event_kind) {
+              case MBARRIER_CONTRACT_EVENT_EXCH:
+                callback_name =
+                    "instrument_inst_compact_mbarrier_exch";
+                break;
+              case MBARRIER_CONTRACT_EVENT_ARRIVE:
+                callback_name =
+                    "instrument_inst_compact_mbarrier_arrive";
+                break;
+              case MBARRIER_CONTRACT_EVENT_WAIT:
+                callback_name =
+                    "instrument_inst_compact_mbarrier_wait";
+                break;
+              case MBARRIER_CONTRACT_EVENT_NONE:
+                abort();
+            }
+          }
           /* insert call to the instrumentation function with its arguments */
-          nvbit_insert_call(
-              instr,
-              inline_contract_capture
-                  ? "instrument_inst_compact_mbarrier"
-                  : (compact_wire_enabled ? "instrument_inst_compact"
-                                          : "instrument_inst"),
-              IPOINT_BEFORE);
+          nvbit_insert_call(instr, callback_name, IPOINT_BEFORE);
           /* pass predicate value */
           nvbit_add_call_arg_guard_pred_val(instr);
           /* send Unique Function Identifier and PC */
@@ -2674,20 +2689,46 @@ void instrument_function_if_needed(CUcontext ctx, CUfunction func, int device_id
               assert(num_mref <= 2);
               nvbit_add_call_arg_mref_addr64(instr, mem_oper_idx);
               nvbit_add_call_arg_const_val32(instr, (int)instr->getSize());
-              uint32_t desc_ureg_id = SECRET_UREG_DESC_NOT_USED;
-              if(memref_idx_with_desc.find(mem_oper_idx) != memref_idx_with_desc.end()) {
-                desc_ureg_id = memref_idx_with_desc[mem_oper_idx];
-              } else if(is_tma_desc_consumer_instruction && tma_desc_ureg_id != SECRET_UREG_DESC_NOT_USED) {
-                desc_ureg_id = tma_desc_ureg_id;
-              }
-              if(desc_ureg_id != SECRET_UREG_DESC_NOT_USED) {
-                nvbit_add_call_arg_ureg_val(instr, desc_ureg_id);
-                nvbit_add_call_arg_const_val32(instr, desc_ureg_id);
-                nvbit_add_call_arg_ureg_val(instr, desc_ureg_id + 1);
-              }else {
-                nvbit_add_call_arg_const_val32(instr, SECRET_UREG_DESC_NOT_USED);
-                nvbit_add_call_arg_const_val32(instr, SECRET_UREG_DESC_NOT_USED);
-                nvbit_add_call_arg_const_val32(instr, SECRET_UREG_DESC_NOT_USED);
+              if (inline_contract_capture) {
+                if (contract_event_kind ==
+                        MBARRIER_CONTRACT_EVENT_ARRIVE &&
+                    !sync_site_info.semantic_is_zero_literal) {
+                  if (sync_site_info.semantic_reg_type ==
+                      TRACED_REG_TYPE::REGULAR) {
+                    nvbit_add_call_arg_reg_val(
+                        instr, sync_site_info.semantic_reg_id);
+                  } else {
+                    nvbit_add_call_arg_ureg_val(
+                        instr, sync_site_info.semantic_reg_id);
+                  }
+                } else {
+                  nvbit_add_call_arg_const_val32(instr, 0);
+                }
+                const uint64_t registry_addr =
+                    reinterpret_cast<uint64_t>(
+                        ctx_state->mbarrier_contract_registry);
+                nvbit_add_call_arg_const_val32(
+                    instr,
+                    static_cast<uint32_t>(registry_addr));
+                nvbit_add_call_arg_const_val32(
+                    instr,
+                    static_cast<uint32_t>(registry_addr >> 32));
+              } else {
+                uint32_t desc_ureg_id = SECRET_UREG_DESC_NOT_USED;
+                if(memref_idx_with_desc.find(mem_oper_idx) != memref_idx_with_desc.end()) {
+                  desc_ureg_id = memref_idx_with_desc[mem_oper_idx];
+                } else if(is_tma_desc_consumer_instruction && tma_desc_ureg_id != SECRET_UREG_DESC_NOT_USED) {
+                  desc_ureg_id = tma_desc_ureg_id;
+                }
+                if(desc_ureg_id != SECRET_UREG_DESC_NOT_USED) {
+                  nvbit_add_call_arg_ureg_val(instr, desc_ureg_id);
+                  nvbit_add_call_arg_const_val32(instr, desc_ureg_id);
+                  nvbit_add_call_arg_ureg_val(instr, desc_ureg_id + 1);
+                }else {
+                  nvbit_add_call_arg_const_val32(instr, SECRET_UREG_DESC_NOT_USED);
+                  nvbit_add_call_arg_const_val32(instr, SECRET_UREG_DESC_NOT_USED);
+                  nvbit_add_call_arg_const_val32(instr, SECRET_UREG_DESC_NOT_USED);
+                }
               }
               mem_oper_idx--;
             }else if(has_ldc_with_reg || has_ldc_with_ureg) {
@@ -2785,26 +2826,6 @@ void instrument_function_if_needed(CUcontext ctx, CUfunction func, int device_id
            * with receiver-side per-kernel accounting. */
           nvbit_add_call_arg_const_val32(
               instr, lighter_tracer_host_count ? 0 : 1);
-          if (inline_contract_capture) {
-            nvbit_add_call_arg_const_val32(
-                instr, static_cast<uint32_t>(contract_event_kind));
-            if (contract_event_kind !=
-                    MBARRIER_CONTRACT_EVENT_ARRIVE ||
-                sync_site_info.semantic_is_zero_literal) {
-              nvbit_add_call_arg_const_val32(instr, 0);
-            } else if (sync_site_info.semantic_reg_type ==
-                       TRACED_REG_TYPE::REGULAR) {
-              nvbit_add_call_arg_reg_val(
-                  instr, sync_site_info.semantic_reg_id);
-            } else {
-              nvbit_add_call_arg_ureg_val(
-                  instr, sync_site_info.semantic_reg_id);
-            }
-            nvbit_add_call_arg_const_val64(
-                instr,
-                reinterpret_cast<uint64_t>(
-                    ctx_state->mbarrier_contract_registry));
-          }
       }
 
       /* Phase 0b (TMA_BASE_ADDR.md §2.13): instrument the entry
