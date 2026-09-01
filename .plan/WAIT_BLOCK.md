@@ -497,15 +497,17 @@ ARRIVE_EXPECT_TX:
     allocate the next contract ordinal
 
 TRYWAIT / PHASECHK:
-    record opened-contract count before and after the wait observation
+    record opened-contract count at the existing pre-instruction callback
 ```
 
-The before/after pair is intentional. Producer and consumer callbacks from
-different warps can overlap; a single snapshot would impose an unproven order.
-The resolver treats the pair as an interval and considers every contract count
-inside it. If `IPOINT_AFTER` is not reliable for a PHASECHK form, capture the
-before snapshot plus the already-proven following branch path and reject any
-occurrence whose contract position cannot be bounded uniquely.
+The schema retains before/after bounds so the resolver always consumes an
+interval. V1 used dedicated callbacks on both sides of the instruction. V2
+removes those callbacks and emits `[before,before]` from the existing compact
+sync callback. Full-trace reanalysis showed all 81,561 eligible occurrences
+remain unique under this degenerate interval, including the 137 v1 occurrences
+whose bounds differed. The following branch path still proves READY versus MISS;
+an occurrence is rejected if that result and the single count do not select one
+generation.
 
 The tracer must not claim that it observed the asynchronous TMA phase flip.
 It observes contract-open instruction callbacks and wait instruction
@@ -548,9 +550,12 @@ The new proposal:
 - emits nothing when the barrier is outside the restricted applicability gate;
 - changes no simulator behavior during the feasibility stage.
 
-It still adds instrumentation and can perturb execution. Therefore the new
-trace is rejected if WaitBlock path counts, TMA contracts, semantic instruction
-counts, or CTA completion differ from the `9e92fe9` source trace.
+It still adds state work inside an existing callback and can perturb execution.
+Therefore the new trace is rejected if WaitBlock action structure or ready-only
+entry/mask counts, TMA contracts, semantic instruction counts, or CTA completion
+differ from the `9e92fe9` source trace. Semantic-free FOLD retry and episode
+counts are diagnostic because runtime folding does not consume them as timing
+inputs.
 
 ### Why generation removal is not the fix
 
@@ -635,8 +640,8 @@ Direction:
 1. Treat the full `9e92fe9` FA3 trace and K10 `.e62` as the fixed source and
    simulator baselines.
 2. Extend the protobuf/wire record with initialization epoch, contract ordinal,
-   and wait-side before/after contract-count snapshots. Do not record or consume
-   hardware cycles.
+   and a wait-side contract-count interval. V2 emits a degenerate
+   `[before,before]` interval. Do not record or consume hardware cycles.
 3. Maintain state per CTA and barrier, not in a CTA-global sequence. Reset only
    on the exact `EXCH` event and reject storage overflow, duplicate initialization,
    unsupported active-arrival shape, or lifecycle inconsistency.
@@ -648,7 +653,8 @@ Direction:
 same K5/K10 CTA counts
 same semantic instruction and TMA command counts
 same B0-D contract counts and byte totals
-same WaitBlock action records and ready/poll path counts
+same WaitBlock action structure and ready-only entry/mask counts
+report FOLD retry/episode counts without requiring equality
 zero missing/duplicate contract snapshots
 zero unsupported snapshots on eligible barriers
 zero inconsistent generation assignments
@@ -665,7 +671,7 @@ Implementation order inside E0:
 ```text
 E0.1  Define protobuf/wire fields and closed reject reasons.
 E0.2  Design bounded per-launch (CTA, barrier) state and lifecycle cleanup.
-E0.3  Capture EXCH epoch, ARRIVE_EXPECT_TX ordinal, and wait begin/end snapshots.
+E0.3  Capture EXCH epoch, ARRIVE_EXPECT_TX ordinal, and wait-before snapshots.
 E0.4  Unit-test serialization, overflow, duplicate-init, unsupported-shape,
       missing-snapshot, interval ambiguity, and many-waits-to-one-event cases.
 E0.5  Run post-processing on synthetic fixtures before generating FA3.
@@ -680,28 +686,26 @@ validation work.
 
 - `--mbarrier-contract-capture` enables the tracer environment option
   `MBARRIER_CONTRACT_CAPTURE=1`. The default is zero.
-- Enabled runs use the separate `-mbarrier-contract-v1` output-directory suffix,
+- Enabled runs use the separate `-mbarrier-contract-v2` output-directory suffix,
   so `-f` cannot delete the unsuffixed `9e92fe9` baseline.
-- The capture path allocates bounded launch-owned managed buffers. It does not
-  create a second `ChannelDev`, call `ChannelDev::push`, or wait for a second
-  receiver. This specifically excludes the transport mechanism that stalled the
-  earlier `SYNC_EVENT_ORDER` run.
-- The BEFORE callback executes `__ballot_sync` on every active lane before
-  selecting the first predicated-active publisher lane. The AFTER callback
-  executes no warp collective and publishes from the first active lane using
-  the BEGIN scratch state. This excludes the early-return-before-collective
-  deadlock and avoids rereading a PHASECHK destination predicate after the
-  instruction has overwritten it.
-- Only `SYNCS.EXCH*`, `SYNCS.ARRIVE.TRANS64*`, and `SYNCS.PHASECHK*` receive the
-  new callbacks. Blocking `BAR.SYNC`, `WARPSYNC`, and `WARPGROUP*` instructions
-  are not instrumented by this feature.
-- Device state is partitioned by launch and linear CTA. Each CTA owns a bounded
-  open-addressed barrier table, one scratch record per warp, and a bounded
-  record partition. Table exhaustion, record overflow, invalid launch identity,
-  unterminated begin/end pairs, and protobuf join mismatch abort at kernel exit.
-- The host joins each managed-buffer record bijectively to the active protobuf
-  occurrence identified by `(CTA, warp, function, PC, per-PC ordinal)` and
-  writes `mbarrier_contract_runtime_info`; no hardware cycle is recorded.
+- The v2 capture path adds no instruction callbacks and no channel pushes. The
+  existing compact barrier-address callback updates bounded `(CTA, barrier)`
+  state and appends a 72-byte contract payload to that callback's existing wire
+  record. There is no second `ChannelDev`, device event buffer, record-reservation
+  atomic, warp scratch, or `IPOINT_AFTER` callback.
+- The existing compact callback executes its original warp collectives before
+  selecting the publisher lane. The semantic register is shuffled from the first
+  predicated-active lane before the publisher writes the inline payload.
+- Only existing barrier-address records for `SYNCS.EXCH*`,
+  `SYNCS.ARRIVE.TRANS64*`, and `SYNCS.PHASECHK*` can carry the inline extension.
+  Blocking `BAR.SYNC`, `WARPSYNC`, and `WARPGROUP*` records are unchanged.
+- Device state is partitioned by launch and linear CTA. Each CTA owns only a
+  bounded open-addressed barrier table. Table exhaustion, invalid launch
+  identity, malformed inline payloads, and incomplete protobuf instructions
+  abort.
+- The host attaches the inline payload while processing the same existing sync
+  record and writes `mbarrier_contract_runtime_info`; no post-kernel occurrence
+  join and no hardware cycle are used.
 - Strict post-processing writes
   `extra_info/mbarrier_contract_ordinal_feasibility.json`, applies the
   arrival-count-one/TMA-ownership gate, enumerates every generation allowed by
@@ -710,26 +714,92 @@ validation work.
   wait at the exact opened count `j`; absence of that witness rejects the
   barrier as `CONTRACT_SERIAL_LIFECYCLE_UNPROVEN`.
 - Strict enabled runs also compare the new and unsuffixed baseline traces over
-  instruction/mask/synchronization fingerprints, WaitBlock records/counts, and
-  B0-D contract/load/byte totals.
+  semantic `(kernel, function, PC, opcode, active_mask, predicate_mask)`
+  histograms, WaitBlock action structure/ready-only counts, and B0-D
+  contract/load/byte totals. FOLD dynamics are emitted separately.
 
 Local validation:
 
 ```text
-28 Python unit tests PASS
+33 Python unit tests PASS
 Python syntax compilation PASS
 capture ABI size assertions compile with host C++17 PASS
 git diff --check PASS
 existing full-trace capacity audit:
-  K5  max active capture records/CTA = 2,272; max barriers/CTA = 22
-  K10 max active capture records/CTA = 3,321; max barriers/CTA = 9
-  defaults                            = 8,192 records; 64 barriers
+  K5  max barriers/CTA = 22
+  K10 max barriers/CTA = 9
+  default table bound  = 64 barriers/CTA
 ```
 
 The local macOS environment has neither `nvcc` nor `protoc`; generated protobuf
 compilation, NVBit linking, callback execution, and the full FA3 acceptance
 comparison remain pending on the CUDA server. This checkpoint does not authorize
 Stage E1 or any simulator behavior change.
+
+#### Stage E0 v1 full-trace result (2026-09-01)
+
+The first rebuilt full trace completed without a kernel hang, buffer overflow,
+callback mismatch, or protobuf-join failure:
+
+```text
+K5  220,017 capture records attached
+K10 496,301 capture records attached
+K11   3,840 capture records attached
+missing snapshots = 0
+capture mismatches = 0
+```
+
+Two post-processing defects in `527af10` were found by inspecting the copied
+trace and fixed locally:
+
+1. Proto3 omits zero-valued scalar fields. The custom parser incorrectly decoded
+   omitted epoch/count fields as `None` instead of zero.
+2. Fold lifecycle validation inspected only `poll_probe_pc`. Three K5 CTA
+   instances completed at the earlier TRYWAIT in `poll_wait_pcs`, so the final
+   PHASECHK was predicated off. The lifecycle witness now uses every statically
+   proven wait site in the fold loop.
+
+Reanalysis of the existing trace, without retracing:
+
+```text
+eligible TMA barriers           = 2,916
+eligible action occurrences     = 81,561
+unique generation assignments  = 81,561
+ambiguous assignments           = 0
+inconsistent assignments        = 0
+unique streams                  = 21,045
+invalid streams                 = 0
+semantic instructions K5/K10   = 5,755,752 baseline / 5,755,752 capture
+semantic mask-histogram sites  = 648 baseline / 648 capture
+semantic histogram SHA-256     = b49bed1e... / b49bed1e...
+B0-D contracts/loads/bytes      = unchanged
+```
+
+Therefore the barrier-local ordinal capture resolves every eligible occurrence
+uniquely. The trace still fails the independent perturbation gate: the added
+callbacks reduce repeated polling/backoff iterations while preserving semantic
+work. This remains an E0 stop condition under lines 645-661; Stage E1 and
+simulator behavior changes are not authorized.
+
+#### Stage E0 v2 lightweight capture (2026-09-01)
+
+The v2 implementation replaces both dedicated callbacks and the launch event
+buffer with an inline extension of the existing compact sync-address record:
+
+```text
+additional NVBit callbacks per sync occurrence = 0
+additional ChannelDev pushes per occurrence    = 0
+IPOINT_AFTER callbacks                          = 0
+device event-buffer bytes                       = 0
+per-event record-reservation atomics            = 0
+managed state                                   = CTA-local barrier table only
+```
+
+Raw retry counts inside a proven semantic-free FOLD episode are not simulator
+timing inputs and are not required to be identical. The perturbation comparison
+must preserve semantic PC counts, B0-D ownership totals, INJECT entry
+occurrences/masks, and static FOLD proof/action structure. Dynamic FOLD retry and
+episode counts remain reported diagnostics but are not hard acceptance inputs.
 
 Hardware build and trace execution remain user-owned. The expected trace command
 after E0 implementation is:

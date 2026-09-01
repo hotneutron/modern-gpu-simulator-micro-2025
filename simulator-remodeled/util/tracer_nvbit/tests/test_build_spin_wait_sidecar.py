@@ -136,6 +136,31 @@ def captured_instruction_wire(pc, event_kind, semantic_raw, opened_before,
     ])
 
 
+def sync_only_instruction_wire(pc, semantic_raw, barrier=0x1000):
+    sync = b"".join([
+        varint_field(1, 1),
+        varint_field(2, barrier),
+        varint_field(3, 1),
+        varint_field(4, semantic_raw),
+    ])
+    return b"".join([
+        varint_field(1, pc),
+        varint_field(2, 1),
+        varint_field(3, 1),
+        varint_field(4, 3),
+        message_field(6, sync),
+    ])
+
+
+def write_single_warp_threadblock(path, instructions):
+    warp = varint_field(1, 0) + b"".join(
+        message_field(2, instruction)
+        for instruction in instructions
+    )
+    map_entry = varint_field(1, 0) + message_field(2, warp)
+    path.write_bytes(message_field(2, map_entry))
+
+
 class ContractOrdinalCaptureTest(unittest.TestCase):
     def test_ready_snapshot_selects_one_completed_generation(self):
         targets, reason = SIDECAR.resolve_contract_generation(
@@ -375,6 +400,29 @@ class ContractOrdinalCaptureTest(unittest.TestCase):
         self.assertTrue(
             SIDECAR._fold_wait_result(miss_trace, 2, spec))
 
+    def test_preceding_trywait_uses_predicated_poll_path(self):
+        spec = {
+            "poll_probe_pc": 0x120,
+            "poll_loopback_pc": 0x130,
+            "poll_loop_exit_pc": 0x140,
+        }
+        miss_trace = [
+            dynamic_instruction(0x110, 0xf),
+            dynamic_instruction(0x120, 0xf),
+            dynamic_instruction(0x130, 0xf),
+        ]
+        ready_trace = [
+            dynamic_instruction(0x110, 0xf),
+            dynamic_instruction(0x120, 0xf, predicate=0),
+            dynamic_instruction(0x130, 0xf, predicate=0),
+            dynamic_instruction(0x140, 0xf),
+        ]
+
+        self.assertFalse(
+            SIDECAR._fold_wait_site_result(miss_trace, 0, spec))
+        self.assertTrue(
+            SIDECAR._fold_wait_site_result(ready_trace, 0, spec))
+
     def test_contract_capture_protobuf_fields_are_parsed(self):
         contract = b"".join([
             varint_field(1, 1),
@@ -412,15 +460,47 @@ class ContractOrdinalCaptureTest(unittest.TestCase):
         self.assertTrue(parsed["contract_has_semantic_raw"])
         self.assertEqual(parsed["contract_semantic_raw"], 0)
 
-    def test_baseline_comparison_requires_all_four_equalities(self):
-        kernel = {
+    def test_omitted_proto3_zero_capture_fields_decode_as_zero(self):
+        contract = b"".join([
+            varint_field(1, 1),
+            varint_field(2, SIDECAR.CONTRACT_EVENT_EXCH),
+            varint_field(3, 0x1000),
+            varint_field(5, 1),
+            varint_field(12, 7),
+            varint_field(13, 1),
+            varint_field(14, 0x1ffffe),
+        ])
+        instruction_wire = b"".join([
+            varint_field(1, 0x100),
+            varint_field(2, 1),
+            varint_field(3, 1),
+            varint_field(4, 3),
+            message_field(9, contract),
+        ])
+
+        parsed = SIDECAR._inst_full(
+            instruction_wire, 0, len(instruction_wire))
+
+        self.assertEqual(parsed["contract_epoch_before"], 0)
+        self.assertEqual(parsed["contract_opened_before"], 0)
+        self.assertEqual(parsed["contract_opened_after"], 0)
+
+    def test_baseline_comparison_requires_semantic_and_metadata_equalities(self):
+        current_kernel = {
             "trace_kernel_id": 5,
-            "wait_blocks": [{"runtime_strategy": "INJECT_MISSING_WAIT"}],
+            "wait_blocks": [{
+                "block_id": "fold",
+                "runtime_strategy": "FOLD_CAPTURED_POLL",
+                "poll_probe_pc": 0x120,
+                "dynamic": {"total_iters": 10},
+            }],
         }
+        baseline_kernel = json.loads(json.dumps(current_kernel))
+        baseline_kernel["wait_blocks"][0]["dynamic"]["total_iters"] = 100
         wait_report = {
-            "inject_missing_wait": 1,
-            "fold_captured_poll": 0,
-            "ready_only_all_live_visits": 1,
+            "inject_missing_wait": 0,
+            "fold_captured_poll": 1,
+            "ready_only_all_live_visits": 0,
             "ready_only_partial_visits": 0,
             "partial_defer_records": 0,
             "partial_join_pending_visits": 0,
@@ -447,7 +527,7 @@ class ContractOrdinalCaptureTest(unittest.TestCase):
             (baseline_extra / "spin_wait_sidecar.json").write_text(
                 json.dumps({
                     "wait_block_report": wait_report,
-                    "kernels": [kernel],
+                    "kernels": [baseline_kernel],
                 }))
             for extra in (current_extra, baseline_extra):
                 (extra / "tma_completion_contracts.json").write_text(
@@ -460,10 +540,47 @@ class ContractOrdinalCaptureTest(unittest.TestCase):
                     SIDECAR, "semantic_trace_fingerprint",
                     return_value=fingerprint):
                 result = SIDECAR.compare_contract_capture_baseline(
-                    current_dir, baseline_dir, [kernel], wait_report)
+                    current_dir, baseline_dir,
+                    [current_kernel], wait_report)
 
         self.assertEqual(result["status"], "PASS")
         self.assertTrue(all(result["comparisons"].values()))
+        self.assertFalse(result["fold_dynamic_equal"])
+
+    def test_semantic_fingerprint_uses_pc_and_mask_histogram(self):
+        instruction = captured_instruction_wire(
+            0x100, SIDECAR.CONTRACT_EVENT_EXCH,
+            0x1ffffe, 0, 0)
+        with tempfile.TemporaryDirectory() as root:
+            traces = Path(root)
+            kdir = (
+                traces / "threadblocks/device_0/stream_0/kernel_5")
+            kdir.mkdir(parents=True)
+            write_single_warp_threadblock(
+                kdir / "d_0_s_0_k_5_0,0,0.pb",
+                [instruction, instruction])
+            extra = traces / "extra_info"
+            extra.mkdir()
+            (extra / "enhanced_execution_info.json").write_text(
+                json.dumps({
+                    "kernels": [{
+                        "unique_function_id": 3,
+                        "kernel_name": "synthetic",
+                        "instructions": [{
+                            "pc_num_dec": 0x100,
+                            "op_code": "SYNCS.EXCH.64",
+                        }],
+                    }],
+                }))
+
+            fingerprint = SIDECAR.semantic_trace_fingerprint(
+                str(traces), [5])
+
+        self.assertEqual(
+            fingerprint["counts"]["semantic_instructions"], 2)
+        self.assertEqual(
+            fingerprint["counts"]["semantic_sites"], 1)
+        self.assertEqual(fingerprint["counts"]["kernel_5_ctas"], 1)
 
     def test_end_to_end_capture_analysis_emits_unique_ticket(self):
         instructions = [
@@ -477,19 +594,14 @@ class ContractOrdinalCaptureTest(unittest.TestCase):
                 0x120, SIDECAR.CONTRACT_EVENT_WAIT,
                 0, 1, 1),
         ]
-        warp = varint_field(1, 0) + b"".join(
-            message_field(2, instruction)
-            for instruction in instructions
-        )
-        map_entry = varint_field(1, 0) + message_field(2, warp)
-        threadblock = message_field(2, map_entry)
-
         with tempfile.TemporaryDirectory() as root:
             traces = Path(root)
             kdir = (
                 traces / "threadblocks/device_0/stream_0/kernel_5")
             kdir.mkdir(parents=True)
-            (kdir / "d_0_s_0_k_5_0,0,0.pb").write_bytes(threadblock)
+            write_single_warp_threadblock(
+                kdir / "d_0_s_0_k_5_0,0,0.pb",
+                instructions)
             extra = traces / "extra_info"
             extra.mkdir()
             (extra / "tma_completion_contracts.json").write_text(
@@ -526,40 +638,135 @@ class ContractOrdinalCaptureTest(unittest.TestCase):
         self.assertEqual(
             report["tickets"][0]["target_release_generation"], 1)
 
+    def test_count_only_wait_may_omit_contract_payload(self):
+        instructions = [
+            captured_instruction_wire(
+                0x100, SIDECAR.CONTRACT_EVENT_EXCH,
+                0x1ffffe, 0, 0),
+            captured_instruction_wire(
+                0x110, SIDECAR.CONTRACT_EVENT_ARRIVE,
+                0, 0, 0),
+            sync_only_instruction_wire(0x120, 0),
+        ]
+        with tempfile.TemporaryDirectory() as root:
+            traces = Path(root)
+            kdir = (
+                traces / "threadblocks/device_0/stream_0/kernel_5")
+            kdir.mkdir(parents=True)
+            write_single_warp_threadblock(
+                kdir / "d_0_s_0_k_5_0,0,0.pb",
+                instructions)
+            extra = traces / "extra_info"
+            extra.mkdir()
+            (extra / "tma_completion_contracts.json").write_text(
+                json.dumps({
+                    "validation_complete": True,
+                    "kernels": [{
+                        "trace_kernel_id": 5,
+                        "contracts": 1,
+                        "expected_bytes": 1,
+                        "assigned_bytes": 1,
+                        "errors": [],
+                    }],
+                }))
+            sync_sites = {
+                (3, 0x100): {"sync_kind": "EXCH"},
+                (3, 0x110): {"sync_kind": "ARRIVE_EXPECT_TX"},
+                (3, 0x120): {"sync_kind": "TRYWAIT"},
+            }
+
+            report = SIDECAR.analyze_mbarrier_contract_capture(
+                str(traces), {5: str(kdir)}, {5: 3},
+                sync_sites, [], "all")
+
+        self.assertEqual(report["summary"]["missing_snapshots"], 0)
+        self.assertEqual(report["summary"]["eligible_barriers"], 0)
+
+    def test_tma_wait_without_contract_payload_fails_closed(self):
+        instructions = [
+            captured_instruction_wire(
+                0x100, SIDECAR.CONTRACT_EVENT_EXCH,
+                0x1ffffe, 0, 0),
+            captured_instruction_wire(
+                0x110, SIDECAR.CONTRACT_EVENT_ARRIVE,
+                256, 0, 1, ordinal=1),
+            sync_only_instruction_wire(0x120, 0),
+        ]
+        with tempfile.TemporaryDirectory() as root:
+            traces = Path(root)
+            kdir = (
+                traces / "threadblocks/device_0/stream_0/kernel_5")
+            kdir.mkdir(parents=True)
+            write_single_warp_threadblock(
+                kdir / "d_0_s_0_k_5_0,0,0.pb",
+                instructions)
+            extra = traces / "extra_info"
+            extra.mkdir()
+            (extra / "tma_completion_contracts.json").write_text(
+                json.dumps({
+                    "validation_complete": True,
+                    "kernels": [{
+                        "trace_kernel_id": 5,
+                        "contracts": 1,
+                        "expected_bytes": 256,
+                        "assigned_bytes": 256,
+                        "errors": [],
+                    }],
+                }))
+            sync_sites = {
+                (3, 0x100): {"sync_kind": "EXCH"},
+                (3, 0x110): {"sync_kind": "ARRIVE_EXPECT_TX"},
+                (3, 0x120): {"sync_kind": "TRYWAIT"},
+            }
+            sidecar_kernels = [{
+                "trace_kernel_id": 5,
+                "wait_blocks": [{
+                    "runtime_strategy": "INJECT_MISSING_WAIT",
+                    "unique_function_id": 3,
+                    "entry_probe_pc": 0x120,
+                }],
+            }]
+
+            report = SIDECAR.analyze_mbarrier_contract_capture(
+                str(traces), {5: str(kdir)}, {5: 3},
+                sync_sites, sidecar_kernels, "all")
+
+        self.assertEqual(report["status"], "FAIL")
+        self.assertEqual(report["summary"]["missing_snapshots"], 1)
+        self.assertEqual(
+            report["summary"]["rejected_tma_action_occurrences"], 1)
+
     def test_device_capture_avoids_prior_deadlock_patterns(self):
         tracer_dir = MODULE_PATH.parent / "tracer_tool"
         inject_source = (tracer_dir / "inject_funcs.cu").read_text()
         begin = inject_source.index(
-            "void record_mbarrier_contract_begin")
-        end = inject_source.index(
-            "void record_mbarrier_contract_end")
+            "instrument_inst_compact_mbarrier")
         capture_end = inject_source.index(
-            "void record_warp_exit", end)
-        begin_body = inject_source[begin:end]
-        end_body = inject_source[end:capture_end]
+            "void record_warp_exit", begin)
+        capture_body = inject_source[begin:capture_end]
 
-        self.assertLess(
-            begin_body.index("__ballot_sync"),
-            begin_body.index("lane_id != publisher_lane"))
-        self.assertNotIn("ChannelDev", begin_body)
-        self.assertNotIn("channel_dev->push", begin_body)
-        self.assertNotIn("__ballot_sync", end_body)
+        self.assertNotIn(
+            "record_mbarrier_contract_begin", inject_source)
+        self.assertNotIn(
+            "record_mbarrier_contract_end", inject_source)
+        self.assertNotIn("cta_record_count_ptr", inject_source)
         self.assertIn(
-            "const int publisher_lane = __ffs(active_mask) - 1",
-            end_body)
-        self.assertNotIn("ChannelDev", end_body)
-        self.assertNotIn("channel_dev->push", end_body)
+            "INST_TRACE_HAS_MBARRIER_CONTRACT", capture_body)
+        self.assertIn("channel_dev->push(&record", capture_body)
+        self.assertIn("captured_semantic_raw", capture_body)
 
         tracer_source = (tracer_dir / "tracer_tool.cu").read_text()
         self.assertIn(
             '"MBARRIER_CONTRACT_CAPTURE", 0, 0, 1',
             tracer_source)
         self.assertIn(
-            "transport=launch_managed_buffer", tracer_source)
+            "transport=existing_sync_record", tracer_source)
+        self.assertIn("extra_callbacks=0", tracer_source)
         self.assertNotIn("mbarrier_contract_channel", tracer_source)
-        self.assertIn(
-            "MBARRIER_CONTRACT_ERROR_RECORD_OVERFLOW",
-            inject_source)
+        self.assertNotIn(
+            '"record_mbarrier_contract_begin"', tracer_source)
+        self.assertNotIn(
+            '"record_mbarrier_contract_end"', tracer_source)
         self.assertIn(
             "MBARRIER_CONTRACT_ERROR_BARRIER_TABLE_OVERFLOW",
             inject_source)
@@ -569,6 +776,8 @@ class ContractOrdinalCaptureTest(unittest.TestCase):
             '"--mbarrier-contract-capture"', runner_source)
         self.assertIn(
             'if mbarrier_contract_capture:', runner_source)
+        self.assertIn(
+            '"-mbarrier-contract-v2"', runner_source)
 
 
 class WaitBlockFoldProofTest(unittest.TestCase):

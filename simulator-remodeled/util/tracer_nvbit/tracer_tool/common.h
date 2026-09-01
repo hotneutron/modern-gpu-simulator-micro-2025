@@ -67,6 +67,7 @@ typedef struct {
 
 enum INST_TRACE_RECORD_FLAGS {
   INST_TRACE_HAS_LANE_VALUES = 1u << 0,
+  INST_TRACE_HAS_MBARRIER_CONTRACT = 1u << 1,
 };
 
 #define INST_TRACE_RECORD_VERSION 1u
@@ -128,17 +129,10 @@ static_assert(INST_TRACE_MEMORY_SIZE == 360,
               "unexpected memory inst trace wire size");
 #endif
 
-/*
- * Optional barrier-local contract capture.
- *
- * This transport is launch-owned managed memory, not a ChannelDev stream.
- * Device callbacks therefore cannot block waiting for a second host receiver.
- * All capacities are checked at launch and every overflow is fatal.
- */
-#define MBARRIER_CONTRACT_RECORD_VERSION 1u
+/* Optional barrier-local contract capture. */
+#define MBARRIER_CONTRACT_RECORD_VERSION 2u
 #define MBARRIER_CONTRACT_REGISTRY_VERSION 1u
 #define MBARRIER_CONTRACT_REGISTRY_MAGIC 0x4d42434fu
-#define MBARRIER_CONTRACT_MAX_WARPS_PER_CTA 32u
 
 enum MBARRIER_CONTRACT_EVENT_KIND {
   MBARRIER_CONTRACT_EVENT_NONE = 0,
@@ -159,12 +153,8 @@ enum MBARRIER_CONTRACT_ERROR_FLAGS {
   MBARRIER_CONTRACT_ERROR_NO_ACTIVE_LAUNCH = 1u << 0,
   MBARRIER_CONTRACT_ERROR_INVALID_LAUNCH = 1u << 1,
   MBARRIER_CONTRACT_ERROR_CTA_OUT_OF_RANGE = 1u << 2,
-  MBARRIER_CONTRACT_ERROR_WARP_OUT_OF_RANGE = 1u << 3,
   MBARRIER_CONTRACT_ERROR_BARRIER_TABLE_OVERFLOW = 1u << 4,
-  MBARRIER_CONTRACT_ERROR_NESTED_BEGIN = 1u << 5,
-  MBARRIER_CONTRACT_ERROR_MISSING_BEGIN = 1u << 6,
   MBARRIER_CONTRACT_ERROR_IDENTITY_MISMATCH = 1u << 7,
-  MBARRIER_CONTRACT_ERROR_RECORD_OVERFLOW = 1u << 8,
   MBARRIER_CONTRACT_ERROR_EPOCH_OVERFLOW = 1u << 9,
   MBARRIER_CONTRACT_ERROR_ORDINAL_OVERFLOW = 1u << 10,
   MBARRIER_CONTRACT_ERROR_INVALID_BARRIER_ADDRESS = 1u << 11,
@@ -180,44 +170,28 @@ typedef struct {
 } mbarrier_contract_barrier_state_t;
 
 typedef struct {
-  uint32_t state;
-  uint32_t event_kind;
-  uint32_t unique_function_id;
-  uint32_t vpc;
-  uint32_t active_mask;
-  uint32_t predicate_mask;
-  uint32_t sm_id;
-  uint32_t capture_flags;
-  uint64_t barrier_addr;
-  uint64_t semantic_raw;
-  uint64_t opened_contract_count_before;
-  uint64_t contract_ordinal;
-  uint32_t initialization_epoch_before;
-  uint32_t barrier_error_flags_before;
-} mbarrier_contract_warp_scratch_t;
-
-typedef struct {
-  uint32_t record_size;
-  uint16_t record_version;
+  uint16_t payload_version;
   uint16_t event_kind;
-  uint64_t launch_uid;
-  uint32_t linear_cta_id;
-  uint32_t warp_id_tb;
-  uint32_t sm_id;
-  uint32_t unique_function_id;
-  uint32_t vpc;
-  uint32_t active_mask;
-  uint32_t predicate_mask;
   uint32_t initialization_epoch_before;
   uint32_t initialization_epoch_after;
   uint32_t capture_flags;
   uint32_t barrier_error_flags;
+  uint32_t reserved;
+  uint64_t launch_uid;
   uint64_t barrier_addr;
   uint64_t semantic_raw;
   uint64_t opened_contract_count_before;
   uint64_t opened_contract_count_after;
   uint64_t contract_ordinal;
-} mbarrier_contract_record_t;
+} mbarrier_contract_payload_t;
+
+typedef struct {
+  inst_trace_t instruction;
+  mbarrier_contract_payload_t contract;
+} mbarrier_contract_inst_trace_t;
+
+#define INST_TRACE_MBARRIER_SIZE \
+  ((uint32_t)sizeof(mbarrier_contract_inst_trace_t))
 
 typedef struct {
   uint32_t state;
@@ -229,15 +203,8 @@ typedef struct {
   uint32_t grid_dim_y;
   uint32_t grid_dim_z;
   uint32_t num_ctas;
-  uint32_t warps_per_cta;
   uint32_t barrier_slots_per_cta;
   uint64_t barrier_state_ptr;
-  uint64_t warp_scratch_ptr;
-  uint64_t cta_record_count_ptr;
-  uint64_t record_buffer_ptr;
-  uint64_t record_capacity;
-  uint64_t records_per_cta;
-  uint64_t overflow_records;
 } mbarrier_contract_launch_t;
 
 typedef struct {
@@ -251,13 +218,13 @@ typedef struct {
 #ifdef __cplusplus
 static_assert(sizeof(mbarrier_contract_barrier_state_t) == 32,
               "unexpected mbarrier contract state size");
-static_assert(sizeof(mbarrier_contract_warp_scratch_t) == 72,
-              "unexpected mbarrier contract scratch size");
-static_assert(sizeof(mbarrier_contract_record_t) == 104,
-              "unexpected mbarrier contract record size");
-static_assert(sizeof(mbarrier_contract_launch_t) == 104,
+static_assert(sizeof(mbarrier_contract_payload_t) == 72,
+              "unexpected mbarrier contract payload size");
+static_assert(sizeof(mbarrier_contract_inst_trace_t) == 432,
+              "unexpected mbarrier contract instruction size");
+static_assert(sizeof(mbarrier_contract_launch_t) == 56,
               "unexpected mbarrier contract launch size");
-static_assert(sizeof(mbarrier_contract_registry_t) == 120,
+static_assert(sizeof(mbarrier_contract_registry_t) == 72,
               "unexpected mbarrier contract registry size");
 #endif
 

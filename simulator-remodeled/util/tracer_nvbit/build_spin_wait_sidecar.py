@@ -185,6 +185,15 @@ def _inst_full(buf, s, e):
                 elif f2 == 14:
                     contract_semantic_raw = value
             i = end
+            if contract_capture_valid:
+                if contract_epoch_before is None:
+                    contract_epoch_before = 0
+                if contract_epoch_after is None:
+                    contract_epoch_after = 0
+                if contract_opened_before is None:
+                    contract_opened_before = 0
+                if contract_opened_after is None:
+                    contract_opened_after = 0
             if (contract_has_semantic_raw
                     and contract_semantic_raw is None):
                 contract_semantic_raw = 0
@@ -483,10 +492,21 @@ def _contract_expected_event_kind(sync_kind):
 
 
 def _fold_wait_result(insts, index, spec):
+    return _fold_wait_site_result(insts, index, spec)
+
+
+def _fold_wait_site_result(insts, index, spec):
+    """Recover one wait result from the proven fold-loop control path.
+
+    A wait before poll_probe_pc is a miss when the active path reaches the
+    later poll or loopback. It is ready when both are predicated off and the
+    first matching active path reaches poll_loop_exit_pc.
+    """
     owner_mask = (
         int(insts[index]["active_mask"])
         & int(insts[index]["predicate_mask"])
     )
+    current_pc = int(insts[index]["pc"])
     for following in insts[index + 1:]:
         if int(following["function_unique_id"]) != int(
                 insts[index]["function_unique_id"]):
@@ -498,12 +518,13 @@ def _fold_wait_result(insts, index, spec):
         if effective & owner_mask == 0:
             continue
         pc = int(following["pc"])
+        if (pc == int(spec["poll_probe_pc"])
+                and current_pc != int(spec["poll_probe_pc"])):
+            return False
         if pc == int(spec["poll_loopback_pc"]):
             return False
         if pc == int(spec["poll_loop_exit_pc"]):
             return True
-        if pc == int(spec["poll_probe_pc"]):
-            return False
     return None
 
 
@@ -531,6 +552,7 @@ def analyze_mbarrier_contract_capture(traces, kdirs, kid_to_fid,
                                       sync_sites, sidecar_kernels,
                                       max_ctas):
     action_specs = {}
+    fold_wait_specs = {}
     for kernel in sidecar_kernels:
         kid = int(kernel["trace_kernel_id"])
         for record in kernel.get("wait_blocks", []):
@@ -539,6 +561,10 @@ def analyze_mbarrier_contract_capture(traces, kdirs, kid_to_fid,
                 pc = int(record["entry_probe_pc"])
             elif strategy == "FOLD_CAPTURED_POLL":
                 pc = int(record["poll_probe_pc"])
+                for wait_pc in record["poll_wait_pcs"]:
+                    fold_wait_specs[
+                        (kid, int(record["unique_function_id"]),
+                         int(wait_pc))] = record
             else:
                 continue
             action_specs[(kid, int(record["unique_function_id"]), pc)] = record
@@ -576,6 +602,7 @@ def analyze_mbarrier_contract_capture(traces, kdirs, kid_to_fid,
             barrier_events = defaultdict(list)
             action_waits = []
             captured_wait_results = defaultdict(list)
+            uncaptured_waits = defaultdict(list)
             capture_launch_uids = set()
             for warp_id, insts in warps:
                 for index, inst in enumerate(insts):
@@ -591,17 +618,42 @@ def analyze_mbarrier_contract_capture(traces, kdirs, kid_to_fid,
                             sync_site.get("sync_kind"))
                         if sync_site else None
                     )
+                    spec = action_specs.get((kid,) + site)
+                    if effective and spec is not None:
+                        result = None
+                        if (spec["runtime_strategy"]
+                                == "INJECT_MISSING_WAIT"):
+                            result = True
+                        elif (spec["runtime_strategy"]
+                              == "FOLD_CAPTURED_POLL"):
+                            result = _fold_wait_result(
+                                insts, index, spec)
+                        action_waits.append({
+                            "warp_id": warp_id,
+                            "source_warp_instruction_index": index,
+                            "instruction": inst,
+                            "spec": spec,
+                            "captured_ready": result,
+                        })
                     if effective and expected_kind is not None:
                         report["active_sync_occurrences"] += 1
                         if not inst["contract_capture_valid"]:
-                            report["missing_snapshots"] += 1
-                            rejects.append({
-                                "kernel_id": kid,
-                                "cta": cta_name,
-                                "warp_id": warp_id,
-                                "pc": inst["pc"],
-                                "reason": CONTRACT_CAPTURE_MISSING,
-                            })
+                            if (expected_kind == CONTRACT_EVENT_WAIT
+                                    and inst["barrier_addr"] is not None):
+                                uncaptured_waits[
+                                    int(inst["barrier_addr"])].append({
+                                        "warp_id": warp_id,
+                                        "pc": inst["pc"],
+                                    })
+                            else:
+                                report["missing_snapshots"] += 1
+                                rejects.append({
+                                    "kernel_id": kid,
+                                    "cta": cta_name,
+                                    "warp_id": warp_id,
+                                    "pc": inst["pc"],
+                                    "reason": CONTRACT_CAPTURE_MISSING,
+                                })
                             continue
                         if inst["contract_event_kind"] != expected_kind:
                             report["capture_mismatches"] += 1
@@ -655,28 +707,27 @@ def analyze_mbarrier_contract_capture(traces, kdirs, kid_to_fid,
                         capture_launch_uids.add(int(launch_uid))
                         barrier_events[
                             int(inst["contract_barrier_addr"])].append(inst)
-
-                    spec = action_specs.get((kid,) + site)
-                    if not effective or spec is None:
-                        continue
-                    result = None
-                    if spec["runtime_strategy"] == "INJECT_MISSING_WAIT":
-                        result = True
-                    elif spec["runtime_strategy"] == "FOLD_CAPTURED_POLL":
-                        result = _fold_wait_result(insts, index, spec)
-                    action_waits.append({
-                        "warp_id": warp_id,
-                        "source_warp_instruction_index": index,
-                        "instruction": inst,
-                        "spec": spec,
-                        "captured_ready": result,
-                    })
-                    if (inst["contract_capture_valid"]
-                            and inst["contract_barrier_addr"] is not None
-                            and result is not None):
-                        captured_wait_results[
-                            int(inst["contract_barrier_addr"])].append(
-                                (inst, result))
+                        if expected_kind == CONTRACT_EVENT_WAIT:
+                            result = None
+                            direct_spec = action_specs.get((kid,) + site)
+                            if direct_spec is not None:
+                                if (direct_spec["runtime_strategy"]
+                                        == "INJECT_MISSING_WAIT"):
+                                    result = True
+                                else:
+                                    result = _fold_wait_site_result(
+                                        insts, index, direct_spec)
+                            else:
+                                fold_spec = fold_wait_specs.get(
+                                    (kid, site[0], int(inst["pc"])))
+                                if fold_spec is not None:
+                                    result = _fold_wait_site_result(
+                                        insts, index, fold_spec)
+                            if result is not None:
+                                captured_wait_results[
+                                    int(inst[
+                                        "contract_barrier_addr"])].append(
+                                            (inst, result))
 
             if len(capture_launch_uids) > 1:
                 report["capture_mismatches"] += 1
@@ -693,6 +744,27 @@ def analyze_mbarrier_contract_capture(traces, kdirs, kid_to_fid,
                     captured_wait_results.get(barrier, ()))
                 for barrier, events in barrier_events.items()
             }
+            for barrier, occurrences in uncaptured_waits.items():
+                status = barrier_status.get(barrier)
+                if status is None or status["contracts"] == 0:
+                    continue
+                report["missing_snapshots"] += len(occurrences)
+                report[
+                    "unsupported_snapshots_on_eligible_barriers"
+                ] += len(occurrences)
+                status["eligible"] = False
+                status["reject_reasons"] = sorted(set(
+                    status["reject_reasons"]
+                    + [CONTRACT_CAPTURE_MISSING]))
+                for occurrence in occurrences:
+                    rejects.append({
+                        "kernel_id": kid,
+                        "cta": cta_name,
+                        "warp_id": occurrence["warp_id"],
+                        "pc": occurrence["pc"],
+                        "barrier_addr": barrier,
+                        "reason": CONTRACT_CAPTURE_MISSING,
+                    })
             report["barriers"] += len(barrier_status)
             report["eligible_barriers"] += sum(
                 status["eligible"]
@@ -717,7 +789,10 @@ def analyze_mbarrier_contract_capture(traces, kdirs, kid_to_fid,
                 })
             for wait in action_waits:
                 inst = wait["instruction"]
-                barrier = inst["contract_barrier_addr"]
+                barrier = (
+                    inst["contract_barrier_addr"]
+                    if inst["contract_barrier_addr"] is not None
+                    else inst["barrier_addr"])
                 status = barrier_status.get(barrier)
                 if status is None or not status["eligible"]:
                     report["unsupported_action_occurrences"] += 1
@@ -847,9 +922,11 @@ def analyze_mbarrier_contract_capture(traces, kdirs, kid_to_fid,
 
 
 def semantic_trace_fingerprint(traces, kernel_ids):
-    digest = hashlib.sha256()
     counts = Counter()
+    site_counts = Counter()
     kdirs = kernel_dir_map(traces)
+    static_instructions, _ = load_kernels(
+        os.path.join(traces, "extra_info"))
     for kernel_id in sorted(kernel_ids):
         kdir = kdirs.get(kernel_id)
         if kdir is None:
@@ -857,39 +934,39 @@ def semantic_trace_fingerprint(traces, kernel_ids):
         paths = sorted(glob.glob(os.path.join(kdir, "*.pb")))
         counts["kernel_%d_ctas" % kernel_id] = len(paths)
         for path in paths:
-            digest.update(
-                ("kernel=%d cta=%s\n"
-                 % (kernel_id, os.path.basename(path))).encode("ascii"))
             with open(path, "rb") as handle:
                 warps = vpb_parse_full(handle.read())
-            for warp_id, instructions in warps:
-                for index, inst in enumerate(instructions):
+            for _, instructions in warps:
+                for inst in instructions:
+                    effective_mask = (
+                        int(inst["active_mask"])
+                        & int(inst["predicate_mask"])
+                    )
+                    function_id = int(inst["function_unique_id"])
+                    pc = int(inst["pc"])
+                    opcode = static_instructions.get(
+                        function_id, {}).get(pc, {}).get("op_code", "")
+                    if not effective_mask or not is_semantic(opcode):
+                        continue
                     fields = (
                         kernel_id,
-                        os.path.basename(path),
-                        int(warp_id),
-                        index,
-                        int(inst["function_unique_id"]),
-                        int(inst["pc"]),
+                        function_id,
+                        pc,
+                        opcode,
                         int(inst["active_mask"]),
                         int(inst["predicate_mask"]),
-                        int(bool(inst["sync_valid"])),
-                        -1 if inst["barrier_addr"] is None
-                        else int(inst["barrier_addr"]),
-                        -1 if inst["semantic_raw"] is None
-                        else int(inst["semantic_raw"]),
-                        int(bool(inst["tma_completion_valid"])),
-                        -1 if inst["tma_completion_barrier_addr"] is None
-                        else int(inst["tma_completion_barrier_addr"]),
                     )
-                    digest.update(
-                        ("|".join(str(value) for value in fields) + "\n")
-                        .encode("ascii"))
-                    counts["instructions"] += 1
-                    if inst["sync_valid"]:
-                        counts["sync_instructions"] += 1
+                    site_counts[fields] += 1
+                    counts["semantic_instructions"] += 1
                     if inst["tma_completion_valid"]:
                         counts["completion_bearing_tma"] += 1
+    digest = hashlib.sha256()
+    for fields, count in sorted(site_counts.items()):
+        digest.update(
+            ("%s|%d\n"
+             % ("|".join(str(value) for value in fields), count))
+            .encode("ascii"))
+    counts["semantic_sites"] = len(site_counts)
     return {
         "sha256": digest.hexdigest(),
         "counts": dict(sorted(counts.items())),
@@ -946,11 +1023,34 @@ def compare_contract_capture_baseline(current_traces, baseline_traces,
     with open(current_contract_path) as handle:
         current_contracts = json.load(handle)
 
-    def wait_blocks_by_kernel(kernels):
+    def wait_blocks_by_kernel(kernels, strip_fold_dynamic=False):
+        result = {}
+        for kernel in kernels:
+            kernel_id = int(kernel["trace_kernel_id"])
+            if kernel_id not in kernel_ids:
+                continue
+            records = []
+            for original in kernel.get("wait_blocks", []):
+                record = dict(original)
+                if (strip_fold_dynamic
+                        and record.get("runtime_strategy")
+                        == "FOLD_CAPTURED_POLL"):
+                    record.pop("dynamic", None)
+                records.append(record)
+            result[kernel_id] = records
+        return result
+
+    def fold_dynamic_by_block(kernels):
         return {
-            int(kernel["trace_kernel_id"]): kernel.get("wait_blocks", [])
+            "%d:%s" % (
+                int(kernel["trace_kernel_id"]),
+                record["block_id"]):
+                record.get("dynamic", {})
             for kernel in kernels
             if int(kernel["trace_kernel_id"]) in kernel_ids
+            for record in kernel.get("wait_blocks", [])
+            if record.get("runtime_strategy")
+            == "FOLD_CAPTURED_POLL"
         }
 
     def contract_kernel_summary(document):
@@ -970,8 +1070,14 @@ def compare_contract_capture_baseline(current_traces, baseline_traces,
             if int(kernel["trace_kernel_id"]) in kernel_ids
         }
 
-    current_wait_blocks = wait_blocks_by_kernel(current_sidecar_kernels)
+    current_wait_blocks = wait_blocks_by_kernel(
+        current_sidecar_kernels, strip_fold_dynamic=True)
     baseline_wait_blocks = wait_blocks_by_kernel(
+        baseline_sidecar.get("kernels", []),
+        strip_fold_dynamic=True)
+    current_fold_dynamic = fold_dynamic_by_block(
+        current_sidecar_kernels)
+    baseline_fold_dynamic = fold_dynamic_by_block(
         baseline_sidecar.get("kernels", []))
     wait_report_keys = (
         "inject_missing_wait",
@@ -994,7 +1100,7 @@ def compare_contract_capture_baseline(current_traces, baseline_traces,
     comparisons = {
         "semantic_fingerprint":
             current_fingerprint == baseline_fingerprint,
-        "wait_block_records":
+        "wait_block_structure":
             current_wait_blocks == baseline_wait_blocks,
         "wait_block_counts":
             current_wait_counts == baseline_wait_counts,
@@ -1013,6 +1119,10 @@ def compare_contract_capture_baseline(current_traces, baseline_traces,
         "baseline_semantic_trace": baseline_fingerprint,
         "current_wait_counts": current_wait_counts,
         "baseline_wait_counts": baseline_wait_counts,
+        "fold_dynamic_equal":
+            current_fold_dynamic == baseline_fold_dynamic,
+        "current_fold_dynamic": current_fold_dynamic,
+        "baseline_fold_dynamic": baseline_fold_dynamic,
         "current_tma_contracts":
             contract_kernel_summary(current_contracts),
         "baseline_tma_contracts":

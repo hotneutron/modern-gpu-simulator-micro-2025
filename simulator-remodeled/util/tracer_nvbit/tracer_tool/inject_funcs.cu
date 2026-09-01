@@ -173,13 +173,14 @@ extern "C" __device__ __noinline__ void instrument_inst(
   }
 }
 
-extern "C" __device__ __noinline__ void instrument_inst_compact(
+static __device__ __forceinline__ bool build_inst_trace_compact(
     int32_t pred, uint32_t unique_function_id, uint32_t vpc, uint32_t num_of_injects,
     uint32_t per_operand_type, uint32_t memory_type, uint64_t addr_or_offset_or_reg_id,
     uint32_t mem_width_or_op_reg_val_0, uint32_t op_reg_val_1, uint32_t op_reg_val_2,
-    uint32_t op_reg_val_3, uint64_t pchannel_dev, uint64_t ptotal_dynamic_instr_counter,
+    uint32_t op_reg_val_3, uint64_t ptotal_dynamic_instr_counter,
     uint64_t preported_dynamic_instr_counter, uint64_t pstop_report,
-    int32_t device_counters_enabled) {
+    inst_trace_t *ma, int *first_laneid_out,
+    int *first_value_laneid_out) {
 
   const int active_mask = __ballot_sync(__activemask(), 1);
   const int predicate_mask = __ballot_sync(__activemask(), pred);
@@ -194,59 +195,58 @@ extern "C" __device__ __noinline__ void instrument_inst_compact(
      * device total counter for stop_report kernels in every mode. */
     if (first_laneid == laneid) {
       atomicAdd((unsigned long long *)ptotal_dynamic_instr_counter, 1);
-      return;
     }
+    return false;
   }
 
-  inst_trace_t ma;
-  ma.record_size = INST_TRACE_COMPACT_SIZE;
-  ma.record_version = INST_TRACE_RECORD_VERSION;
-  ma.record_flags = 0;
-  ma.reg_id = SECRET_UREG_DESC_NOT_USED;
-  ma.ureg_desc_id = SECRET_UREG_DESC_NOT_USED;
-  ma.ureg_desc_value = SECRET_UREG_DESC_NOT_USED;
-  ma.ureg_desc_value_hi = SECRET_UREG_DESC_NOT_USED;
-  ma.num_of_injects = num_of_injects;
-  ma.per_operand_type = per_operand_type;
-  ma.scalar_value_0 = 0;
-  ma.scalar_value_1 = 0;
-  ma.scalar_value_2 = 0;
-  ma.scalar_value_3 = 0;
-  ma.reserved = 0;
+  ma->record_size = INST_TRACE_COMPACT_SIZE;
+  ma->record_version = INST_TRACE_RECORD_VERSION;
+  ma->record_flags = 0;
+  ma->reg_id = SECRET_UREG_DESC_NOT_USED;
+  ma->ureg_desc_id = SECRET_UREG_DESC_NOT_USED;
+  ma->ureg_desc_value = SECRET_UREG_DESC_NOT_USED;
+  ma->ureg_desc_value_hi = SECRET_UREG_DESC_NOT_USED;
+  ma->num_of_injects = num_of_injects;
+  ma->per_operand_type = per_operand_type;
+  ma->scalar_value_0 = 0;
+  ma->scalar_value_1 = 0;
+  ma->scalar_value_2 = 0;
+  ma->scalar_value_3 = 0;
+  ma->reserved = 0;
   if (memory_type == MEM_TYPE::STANDARD_MEM) {
     /* collect memory address information */
-    ma.record_size = INST_TRACE_MEMORY_SIZE;
-    ma.record_flags |= INST_TRACE_HAS_LANE_VALUES;
+    ma->record_size = INST_TRACE_MEMORY_SIZE;
+    ma->record_flags |= INST_TRACE_HAS_LANE_VALUES;
     for (int i = 0; i < 32; i++) {
-      ma.lane_values[i] =
+      ma->lane_values[i] =
           __shfl_sync(active_mask, addr_or_offset_or_reg_id, i);
     }
-    ma.width = mem_width_or_op_reg_val_0;
-    ma.mem_type = MEM_TYPE::STANDARD_MEM;
+    ma->width = mem_width_or_op_reg_val_0;
+    ma->mem_type = MEM_TYPE::STANDARD_MEM;
     if(op_reg_val_1 != SECRET_UREG_DESC_NOT_USED) {
-      ma.ureg_desc_value = op_reg_val_1;
+      ma->ureg_desc_value = op_reg_val_1;
     }
     if(op_reg_val_2 != SECRET_UREG_DESC_NOT_USED) {
-      ma.ureg_desc_id = op_reg_val_2;
+      ma->ureg_desc_id = op_reg_val_2;
     }
     if(op_reg_val_3 != SECRET_UREG_DESC_NOT_USED) {
-      ma.ureg_desc_value_hi = op_reg_val_3;
+      ma->ureg_desc_value_hi = op_reg_val_3;
     }
   }else if(memory_type == MEM_TYPE::CONSTANT_MEM) {
-    ma.record_size = INST_TRACE_MEMORY_SIZE;
-    ma.record_flags |= INST_TRACE_HAS_LANE_VALUES;
-    ma.mem_type = MEM_TYPE::CONSTANT_MEM;
+    ma->record_size = INST_TRACE_MEMORY_SIZE;
+    ma->record_flags |= INST_TRACE_HAS_LANE_VALUES;
+    ma->mem_type = MEM_TYPE::CONSTANT_MEM;
     uint32_t reg_value = mem_width_or_op_reg_val_0;
-    ma.width = 4;
+    ma->width = 4;
     for (int tid = 0; tid < 32; tid++) {
-        ma.lane_values[tid] =
+        ma->lane_values[tid] =
             __shfl_sync(active_mask, reg_value, tid);
     }
   }else if(memory_type == MEM_TYPE::CALL_OR_RET) {
-    ma.record_size = INST_TRACE_MEMORY_SIZE;
-    ma.record_flags |= INST_TRACE_HAS_LANE_VALUES;
-    ma.mem_type = MEM_TYPE::CALL_OR_RET;
-    ma.width = 1;
+    ma->record_size = INST_TRACE_MEMORY_SIZE;
+    ma->record_flags |= INST_TRACE_HAS_LANE_VALUES;
+    ma->mem_type = MEM_TYPE::CALL_OR_RET;
+    ma->width = 1;
     uint32_t reg_value_1 = mem_width_or_op_reg_val_0;
     uint32_t reg_value_2 = op_reg_val_1;
     for (int tid = 0; tid < 32; tid++) {
@@ -254,34 +254,34 @@ extern "C" __device__ __noinline__ void instrument_inst_compact(
         uint32_t th_reg_val2 = __shfl_sync(active_mask, reg_value_2, tid);
         uint64_t final_addr = static_cast<uint64_t>(th_reg_val2) << 32;
         final_addr += th_reg_val1 + addr_or_offset_or_reg_id;
-        ma.lane_values[tid] = final_addr;
+        ma->lane_values[tid] = final_addr;
     }
   }else {
-    ma.mem_type = MEM_TYPE::NONE;
-    ma.width = 0;
-    ma.reg_id = addr_or_offset_or_reg_id;
+    ma->mem_type = MEM_TYPE::NONE;
+    ma->width = 0;
+    ma->reg_id = addr_or_offset_or_reg_id;
     if((per_operand_type == TRACED_REG_TYPE::REGULAR) || (per_operand_type == TRACED_REG_TYPE::REGULAR_2_REGS) ||
         (per_operand_type == TRACED_REG_TYPE::REGULAR_4_REGS) || (per_operand_type == TRACED_REG_TYPE::PREDICATE)) {
-      ma.scalar_value_0 =
+      ma->scalar_value_0 =
           __shfl_sync(active_mask, mem_width_or_op_reg_val_0,
                       first_value_laneid);
       if(per_operand_type == TRACED_REG_TYPE::REGULAR_2_REGS) {
-        ma.scalar_value_1 =
+        ma->scalar_value_1 =
             __shfl_sync(active_mask, op_reg_val_1, first_value_laneid);
       }
       if(per_operand_type == TRACED_REG_TYPE::REGULAR_4_REGS) {
-        ma.scalar_value_1 =
+        ma->scalar_value_1 =
             __shfl_sync(active_mask, op_reg_val_1, first_value_laneid);
-        ma.scalar_value_2 =
+        ma->scalar_value_2 =
             __shfl_sync(active_mask, op_reg_val_2, first_value_laneid);
-        ma.scalar_value_3 =
+        ma->scalar_value_3 =
             __shfl_sync(active_mask, op_reg_val_3, first_value_laneid);
       }
     }else if((per_operand_type == TRACED_REG_TYPE::UNIFORM) || (per_operand_type == TRACED_REG_TYPE::UNIFORM_2_REGS) ||
         (per_operand_type == TRACED_REG_TYPE::UNIFORM_PREDICATE)) {
-      ma.scalar_value_0 = mem_width_or_op_reg_val_0;
+      ma->scalar_value_0 = mem_width_or_op_reg_val_0;
       if(per_operand_type == TRACED_REG_TYPE::UNIFORM_2_REGS) {
-        ma.scalar_value_1 = op_reg_val_1;
+        ma->scalar_value_1 = op_reg_val_1;
       }
     }
   }
@@ -289,19 +289,45 @@ extern "C" __device__ __noinline__ void instrument_inst_compact(
   int4 cta = get_ctaid();
   int uniqe_threadId = threadIdx.z * blockDim.y * blockDim.x +
                        threadIdx.y * blockDim.x + threadIdx.x;
-  ma.warpid_tb = uniqe_threadId / 32;
+  ma->warpid_tb = uniqe_threadId / 32;
 
-  ma.cta_id_x = cta.x;
-  ma.cta_id_y = cta.y;
-  ma.cta_id_z = cta.z;
-  ma.warpid_sm = get_warpid();
-  ma.vpc = vpc;
-  ma.unique_function_id = unique_function_id;
-  ma.active_mask = active_mask;
-  ma.predicate_mask = predicate_mask;
-  ma.sm_id = get_smid();
+  ma->cta_id_x = cta.x;
+  ma->cta_id_y = cta.y;
+  ma->cta_id_z = cta.z;
+  ma->warpid_sm = get_warpid();
+  ma->vpc = vpc;
+  ma->unique_function_id = unique_function_id;
+  ma->active_mask = active_mask;
+  ma->predicate_mask = predicate_mask;
+  ma->sm_id = get_smid();
+  *first_laneid_out = first_laneid;
+  *first_value_laneid_out = first_value_laneid;
+  (void)preported_dynamic_instr_counter;
+  return true;
+}
 
-  /* first active lane pushes information on the channel */
+extern "C" __device__ __noinline__ void instrument_inst_compact(
+    int32_t pred, uint32_t unique_function_id, uint32_t vpc, uint32_t num_of_injects,
+    uint32_t per_operand_type, uint32_t memory_type, uint64_t addr_or_offset_or_reg_id,
+    uint32_t mem_width_or_op_reg_val_0, uint32_t op_reg_val_1, uint32_t op_reg_val_2,
+    uint32_t op_reg_val_3, uint64_t pchannel_dev, uint64_t ptotal_dynamic_instr_counter,
+    uint64_t preported_dynamic_instr_counter, uint64_t pstop_report,
+    int32_t device_counters_enabled) {
+  inst_trace_t ma;
+  int first_laneid = -1;
+  int first_value_laneid = -1;
+  if (!build_inst_trace_compact(
+          pred, unique_function_id, vpc, num_of_injects,
+          per_operand_type, memory_type, addr_or_offset_or_reg_id,
+          mem_width_or_op_reg_val_0, op_reg_val_1, op_reg_val_2,
+          op_reg_val_3, ptotal_dynamic_instr_counter,
+          preported_dynamic_instr_counter, pstop_report, &ma,
+          &first_laneid, &first_value_laneid)) {
+    return;
+  }
+  (void)first_value_laneid;
+
+  const int laneid = get_laneid();
   if (first_laneid == laneid) {
     ChannelDev *channel_dev = (ChannelDev *)pchannel_dev;
     channel_dev->push(&ma, ma.record_size);
@@ -332,10 +358,6 @@ get_mbarrier_contract_launch(mbarrier_contract_registry_t *registry) {
   }
   mbarrier_contract_launch_t *launch = &registry->launch;
   if (launch->state != 1 || launch->barrier_state_ptr == 0 ||
-      launch->warp_scratch_ptr == 0 ||
-      launch->cta_record_count_ptr == 0 ||
-      launch->record_buffer_ptr == 0 ||
-      launch->record_capacity == 0 ||
       launch->barrier_slots_per_cta == 0) {
     atomicOr(&registry->error_flags,
              static_cast<unsigned int>(
@@ -347,8 +369,7 @@ get_mbarrier_contract_launch(mbarrier_contract_registry_t *registry) {
 
 static __device__ __forceinline__ bool get_mbarrier_contract_location(
     mbarrier_contract_registry_t *registry,
-    mbarrier_contract_launch_t *launch, unsigned int *linear_cta_id,
-    unsigned int *warp_id, mbarrier_contract_warp_scratch_t **scratch) {
+    mbarrier_contract_launch_t *launch, unsigned int *linear_cta_id) {
   const unsigned long long linear_cta =
       (static_cast<unsigned long long>(blockIdx.z) * gridDim.y +
        blockIdx.y) *
@@ -361,25 +382,7 @@ static __device__ __forceinline__ bool get_mbarrier_contract_location(
     return false;
   }
 
-  const unsigned int linear_tid =
-      threadIdx.z * blockDim.y * blockDim.x +
-      threadIdx.y * blockDim.x + threadIdx.x;
-  const unsigned int warp = linear_tid / 32;
-  if (warp >= launch->warps_per_cta ||
-      warp >= MBARRIER_CONTRACT_MAX_WARPS_PER_CTA) {
-    atomicOr(&registry->error_flags,
-             static_cast<unsigned int>(
-                 MBARRIER_CONTRACT_ERROR_WARP_OUT_OF_RANGE));
-    return false;
-  }
-
-  mbarrier_contract_warp_scratch_t *scratch_base =
-      reinterpret_cast<mbarrier_contract_warp_scratch_t *>(
-          launch->warp_scratch_ptr);
   *linear_cta_id = static_cast<unsigned int>(linear_cta);
-  *warp_id = warp;
-  *scratch =
-      &scratch_base[linear_cta * launch->warps_per_cta + warp];
   return true;
 }
 
@@ -408,12 +411,18 @@ find_or_create_mbarrier_contract_state(
   for (unsigned int probe = 0; probe < capacity; ++probe) {
     mbarrier_contract_barrier_state_t *state =
         &states[cta_base + ((first + probe) % capacity)];
-    const unsigned long long observed =
-        atomicCAS(reinterpret_cast<unsigned long long *>(
-                      &state->key_plus_one),
-                  0ULL, key);
-    if (observed == 0ULL || observed == key) {
+    const unsigned long long observed = state->key_plus_one;
+    if (observed == key) {
       return state;
+    }
+    if (observed == 0ULL) {
+      const unsigned long long prior =
+          atomicCAS(reinterpret_cast<unsigned long long *>(
+                        &state->key_plus_one),
+                    0ULL, key);
+      if (prior == 0ULL || prior == key) {
+        return state;
+      }
     }
   }
 
@@ -423,110 +432,45 @@ find_or_create_mbarrier_contract_state(
   return nullptr;
 }
 
-static __device__ __forceinline__ void store_mbarrier_contract_record(
+static __device__ __forceinline__ bool capture_mbarrier_contract_payload(
     mbarrier_contract_registry_t *registry,
-    mbarrier_contract_launch_t *launch, unsigned int linear_cta_id,
-    const mbarrier_contract_record_t &record) {
-  unsigned long long *cta_record_counts =
-      reinterpret_cast<unsigned long long *>(
-          launch->cta_record_count_ptr);
-  const unsigned long long local_index =
-      atomicAdd(&cta_record_counts[linear_cta_id], 1ULL);
-  if (local_index >= launch->records_per_cta) {
-    atomicAdd(reinterpret_cast<unsigned long long *>(
-                  &launch->overflow_records),
-              1ULL);
-    atomicOr(&registry->error_flags,
-             static_cast<unsigned int>(
-                 MBARRIER_CONTRACT_ERROR_RECORD_OVERFLOW));
-    return;
-  }
-
-  const unsigned long long record_index =
-      static_cast<unsigned long long>(linear_cta_id) *
-          launch->records_per_cta +
-      local_index;
-  if (record_index >= launch->record_capacity) {
-    atomicAdd(reinterpret_cast<unsigned long long *>(
-                  &launch->overflow_records),
-              1ULL);
-    atomicOr(&registry->error_flags,
-             static_cast<unsigned int>(
-                 MBARRIER_CONTRACT_ERROR_RECORD_OVERFLOW));
-    return;
-  }
-
-  mbarrier_contract_record_t *records =
-      reinterpret_cast<mbarrier_contract_record_t *>(
-          launch->record_buffer_ptr);
-  records[record_index] = record;
-  __threadfence();
-}
-
-extern "C" __device__ __noinline__ void record_mbarrier_contract_begin(
-    int32_t pred, uint32_t unique_function_id, uint32_t vpc,
     uint32_t event_kind, uint64_t barrier_addr, uint32_t semantic_raw,
-    uint64_t pregistry) {
-  const unsigned int active_mask = __activemask();
-  const unsigned int predicate_mask =
-      __ballot_sync(active_mask, pred);
-  if (predicate_mask == 0) {
-    return;
-  }
-  const int lane_id = get_laneid();
-  const int publisher_lane = __ffs(predicate_mask) - 1;
-  if (lane_id != publisher_lane) {
-    return;
-  }
-
-  mbarrier_contract_registry_t *registry =
-      reinterpret_cast<mbarrier_contract_registry_t *>(pregistry);
+    mbarrier_contract_payload_t *payload) {
   mbarrier_contract_launch_t *launch =
       get_mbarrier_contract_launch(registry);
   if (launch == nullptr) {
-    return;
+    return false;
   }
 
   unsigned int linear_cta_id = 0;
-  unsigned int warp_id = 0;
-  mbarrier_contract_warp_scratch_t *scratch = nullptr;
-  if (!get_mbarrier_contract_location(
-          registry, launch, &linear_cta_id, &warp_id, &scratch)) {
-    return;
-  }
-  if (atomicCAS(&scratch->state, 0u, 1u) != 0u) {
-    atomicOr(&registry->error_flags,
-             static_cast<unsigned int>(
-                 MBARRIER_CONTRACT_ERROR_NESTED_BEGIN));
-    return;
+  if (!get_mbarrier_contract_location(registry, launch, &linear_cta_id)) {
+    return false;
   }
 
   mbarrier_contract_barrier_state_t *barrier =
       find_or_create_mbarrier_contract_state(
           registry, launch, linear_cta_id, barrier_addr);
   if (barrier == nullptr) {
-    atomicExch(&scratch->state, 0u);
-    return;
+    return false;
   }
 
-  scratch->event_kind = event_kind;
-  scratch->unique_function_id = unique_function_id;
-  scratch->vpc = vpc;
-  scratch->active_mask = active_mask;
-  scratch->predicate_mask = predicate_mask;
-  scratch->sm_id = get_smid();
-  scratch->capture_flags = MBARRIER_CONTRACT_CAPTURE_NONE;
-  scratch->barrier_addr = barrier_addr;
-  scratch->semantic_raw = semantic_raw;
-  scratch->initialization_epoch_before =
+  *payload = {};
+  payload->payload_version = MBARRIER_CONTRACT_RECORD_VERSION;
+  payload->event_kind = static_cast<uint16_t>(event_kind);
+  payload->launch_uid = launch->launch_uid;
+  payload->barrier_addr = barrier_addr;
+  payload->semantic_raw = semantic_raw;
+  payload->initialization_epoch_before =
       atomicAdd(&barrier->initialization_epoch, 0u);
-  scratch->opened_contract_count_before =
+  payload->opened_contract_count_before =
       atomicAdd(reinterpret_cast<unsigned long long *>(
                     &barrier->opened_contract_count),
                 0ULL);
-  scratch->barrier_error_flags_before =
-      atomicAdd(&barrier->semantic_error_flags, 0u);
-  scratch->contract_ordinal = 0;
+  if (event_kind == MBARRIER_CONTRACT_EVENT_WAIT &&
+      payload->opened_contract_count_before == 0 &&
+      atomicAdd(&barrier->plain_arrive_count, 0u) != 0) {
+    return false;
+  }
 
   if (event_kind == MBARRIER_CONTRACT_EVENT_EXCH) {
     const unsigned int initialization_index =
@@ -537,7 +481,7 @@ extern "C" __device__ __noinline__ void record_mbarrier_contract_begin(
                    &barrier->opened_contract_count),
                0ULL);
     if (initialization_index != 0) {
-      scratch->capture_flags |=
+      payload->capture_flags |=
           MBARRIER_CONTRACT_CAPTURE_DUPLICATE_INIT;
       atomicOr(&barrier->semantic_error_flags,
                static_cast<unsigned int>(
@@ -549,15 +493,15 @@ extern "C" __device__ __noinline__ void record_mbarrier_contract_begin(
                    MBARRIER_CONTRACT_ERROR_EPOCH_OVERFLOW));
     }
   } else if (event_kind == MBARRIER_CONTRACT_EVENT_ARRIVE) {
-    if (scratch->initialization_epoch_before == 0) {
-      scratch->capture_flags |=
+    if (payload->initialization_epoch_before == 0) {
+      payload->capture_flags |=
           MBARRIER_CONTRACT_CAPTURE_ARRIVE_BEFORE_INIT;
       atomicOr(&barrier->semantic_error_flags,
                static_cast<unsigned int>(
                    MBARRIER_CONTRACT_CAPTURE_ARRIVE_BEFORE_INIT));
     }
     if (semantic_raw == 0) {
-      scratch->capture_flags |=
+      payload->capture_flags |=
           MBARRIER_CONTRACT_CAPTURE_PLAIN_ARRIVE;
       atomicAdd(&barrier->plain_arrive_count, 1u);
     } else {
@@ -565,7 +509,9 @@ extern "C" __device__ __noinline__ void record_mbarrier_contract_begin(
           atomicAdd(reinterpret_cast<unsigned long long *>(
                         &barrier->opened_contract_count),
                     1ULL);
-      scratch->contract_ordinal = prior + 1ULL;
+      payload->opened_contract_count_before = prior;
+      payload->opened_contract_count_after = prior + 1ULL;
+      payload->contract_ordinal = prior + 1ULL;
       if (prior == ~0ULL) {
         atomicOr(&registry->error_flags,
                  static_cast<unsigned int>(
@@ -576,100 +522,84 @@ extern "C" __device__ __noinline__ void record_mbarrier_contract_begin(
     atomicOr(&registry->error_flags,
              static_cast<unsigned int>(
                  MBARRIER_CONTRACT_ERROR_IDENTITY_MISMATCH));
+    return false;
   }
 
-  __threadfence();
-  atomicExch(&scratch->state, 2u);
+  payload->initialization_epoch_after =
+      atomicAdd(&barrier->initialization_epoch, 0u);
+  payload->barrier_error_flags =
+      atomicAdd(&barrier->semantic_error_flags, 0u);
+  if (event_kind == MBARRIER_CONTRACT_EVENT_EXCH) {
+    payload->opened_contract_count_after = 0;
+  } else if (event_kind == MBARRIER_CONTRACT_EVENT_WAIT ||
+             semantic_raw == 0) {
+    payload->opened_contract_count_after =
+        payload->opened_contract_count_before;
+  }
+  return true;
 }
 
-extern "C" __device__ __noinline__ void record_mbarrier_contract_end(
+extern "C" __device__ __noinline__ void
+instrument_inst_compact_mbarrier(
     int32_t pred, uint32_t unique_function_id, uint32_t vpc,
-    uint32_t event_kind, uint64_t pregistry) {
-  const unsigned int active_mask = __activemask();
-  const int lane_id = get_laneid();
-  const int publisher_lane = __ffs(active_mask) - 1;
-  if (lane_id != publisher_lane) {
-    return;
-  }
-  (void)pred;
-
-  mbarrier_contract_registry_t *registry =
-      reinterpret_cast<mbarrier_contract_registry_t *>(pregistry);
-  mbarrier_contract_launch_t *launch =
-      get_mbarrier_contract_launch(registry);
-  if (launch == nullptr) {
-    return;
-  }
-
-  unsigned int linear_cta_id = 0;
-  unsigned int warp_id = 0;
-  mbarrier_contract_warp_scratch_t *scratch = nullptr;
-  if (!get_mbarrier_contract_location(
-          registry, launch, &linear_cta_id, &warp_id, &scratch)) {
-    return;
-  }
-  const unsigned int prior_state =
-      atomicCAS(&scratch->state, 2u, 3u);
-  if (prior_state == 0u) {
-    return;
-  }
-  if (prior_state != 2u) {
-    atomicOr(&registry->error_flags,
-             static_cast<unsigned int>(
-                 MBARRIER_CONTRACT_ERROR_MISSING_BEGIN));
-    return;
-  }
-  if (scratch->event_kind != event_kind ||
-      scratch->unique_function_id != unique_function_id ||
-      scratch->vpc != vpc ||
-      scratch->active_mask != active_mask) {
-    atomicOr(&registry->error_flags,
-             static_cast<unsigned int>(
-                 MBARRIER_CONTRACT_ERROR_IDENTITY_MISMATCH));
-    atomicExch(&scratch->state, 0u);
+    uint32_t num_of_injects, uint32_t per_operand_type,
+    uint32_t memory_type, uint64_t addr_or_offset_or_reg_id,
+    uint32_t mem_width_or_op_reg_val_0, uint32_t op_reg_val_1,
+    uint32_t op_reg_val_2, uint32_t op_reg_val_3,
+    uint64_t pchannel_dev, uint64_t ptotal_dynamic_instr_counter,
+    uint64_t preported_dynamic_instr_counter, uint64_t pstop_report,
+    int32_t device_counters_enabled, uint32_t event_kind,
+    uint32_t semantic_raw, uint64_t pregistry) {
+  mbarrier_contract_inst_trace_t record;
+  inst_trace_t *ma = &record.instruction;
+  int first_laneid = -1;
+  int first_value_laneid = -1;
+  if (!build_inst_trace_compact(
+          pred, unique_function_id, vpc, num_of_injects,
+          per_operand_type, memory_type, addr_or_offset_or_reg_id,
+          mem_width_or_op_reg_val_0, op_reg_val_1, op_reg_val_2,
+          op_reg_val_3, ptotal_dynamic_instr_counter,
+          preported_dynamic_instr_counter, pstop_report, ma,
+          &first_laneid, &first_value_laneid)) {
     return;
   }
 
-  mbarrier_contract_barrier_state_t *barrier =
-      find_or_create_mbarrier_contract_state(
-          registry, launch, linear_cta_id, scratch->barrier_addr);
-  if (barrier == nullptr) {
-    atomicExch(&scratch->state, 0u);
+  const int laneid = get_laneid();
+  uint32_t captured_semantic_raw = 0;
+  if (event_kind == MBARRIER_CONTRACT_EVENT_ARRIVE) {
+    captured_semantic_raw =
+        __shfl_sync(ma->active_mask, semantic_raw,
+                    first_value_laneid);
+  }
+  if (first_laneid != laneid) {
     return;
   }
-
-  mbarrier_contract_record_t record = {};
-  record.record_size = sizeof(mbarrier_contract_record_t);
-  record.record_version = MBARRIER_CONTRACT_RECORD_VERSION;
-  record.event_kind = static_cast<uint16_t>(event_kind);
-  record.launch_uid = launch->launch_uid;
-  record.linear_cta_id = linear_cta_id;
-  record.warp_id_tb = warp_id;
-  record.sm_id = scratch->sm_id;
-  record.unique_function_id = unique_function_id;
-  record.vpc = vpc;
-  record.active_mask = active_mask;
-  record.predicate_mask = scratch->predicate_mask;
-  record.initialization_epoch_before =
-      scratch->initialization_epoch_before;
-  record.initialization_epoch_after =
-      atomicAdd(&barrier->initialization_epoch, 0u);
-  record.capture_flags = scratch->capture_flags;
-  record.barrier_error_flags =
-      atomicAdd(&barrier->semantic_error_flags, 0u);
-  record.barrier_addr = scratch->barrier_addr;
-  record.semantic_raw = scratch->semantic_raw;
-  record.opened_contract_count_before =
-      scratch->opened_contract_count_before;
-  record.opened_contract_count_after =
-      atomicAdd(reinterpret_cast<unsigned long long *>(
-                    &barrier->opened_contract_count),
-                0ULL);
-  record.contract_ordinal = scratch->contract_ordinal;
-
-  store_mbarrier_contract_record(
-      registry, launch, linear_cta_id, record);
-  atomicExch(&scratch->state, 0u);
+  if (ma->mem_type != MEM_TYPE::STANDARD_MEM ||
+      (ma->predicate_mask & ma->active_mask) == 0) {
+    ChannelDev *channel_dev = (ChannelDev *)pchannel_dev;
+    channel_dev->push(ma, ma->record_size);
+  } else {
+    mbarrier_contract_registry_t *registry =
+        reinterpret_cast<mbarrier_contract_registry_t *>(pregistry);
+    const uint64_t barrier_addr =
+        ma->lane_values[first_value_laneid];
+    if (capture_mbarrier_contract_payload(
+            registry, event_kind, barrier_addr,
+            captured_semantic_raw,
+            &record.contract)) {
+      ma->record_size = INST_TRACE_MBARRIER_SIZE;
+      ma->record_flags |= INST_TRACE_HAS_MBARRIER_CONTRACT;
+      ChannelDev *channel_dev = (ChannelDev *)pchannel_dev;
+      channel_dev->push(&record, ma->record_size);
+    } else {
+      ChannelDev *channel_dev = (ChannelDev *)pchannel_dev;
+      channel_dev->push(ma, ma->record_size);
+    }
+  }
+  if (device_counters_enabled) {
+    atomicAdd((unsigned long long *)ptotal_dynamic_instr_counter, 1);
+    atomicAdd((unsigned long long *)preported_dynamic_instr_counter, 1);
+  }
 }
 
 /* FA3 warp lifetime timestamp. Injected before SASS EXIT by either the

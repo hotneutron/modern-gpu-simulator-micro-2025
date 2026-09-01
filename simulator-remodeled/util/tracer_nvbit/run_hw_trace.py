@@ -277,8 +277,6 @@ if mbarrier_contract_capture and (
     )
 contract_capture_bounds = {
     "MBARRIER_CONTRACT_BARRIERS_PER_CTA": 64,
-    "MBARRIER_CONTRACT_RECORDS_PER_CTA": 8192,
-    "MBARRIER_CONTRACT_MAX_RECORDS": 4194304,
 }
 if mbarrier_contract_capture:
     for contract_name, contract_default in tuple(
@@ -528,8 +526,6 @@ for bench in benchmarks:
         conflicting_config_keys = {
             "LIGHTER_TRACER", "MBARRIER_CONTRACT_CAPTURE",
             "MBARRIER_CONTRACT_BARRIERS_PER_CTA",
-            "MBARRIER_CONTRACT_RECORDS_PER_CTA",
-            "MBARRIER_CONTRACT_MAX_RECORDS",
         } & set(extra_env)
         if conflicting_config_keys:
             raise RuntimeError(
@@ -548,7 +544,7 @@ for bench in benchmarks:
         argument_folder += lighter_tracer_config.artifact_suffix
         baseline_argument_folder = argument_folder
         if mbarrier_contract_capture:
-            argument_folder += "-mbarrier-contract-v1"
+            argument_folder += "-mbarrier-contract-v2"
         run_name = os.path.join(benchmark_name, argument_folder)
 
         # MOD. Begin. Improved tracer
