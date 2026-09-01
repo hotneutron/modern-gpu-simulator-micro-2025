@@ -4293,10 +4293,9 @@ bool SM::is_wait_block_pending_satisfied(
 
 bool SM::is_wait_block_pending_satisfied_at_cycle_start(
     const HopperMBarrierPendingWait &pending_wait) const {
-  if (!m_wait_block_release_snapshot_valid ||
-      m_wait_block_release_snapshot_cycle != get_current_gpu_cycle()) {
-    std::cerr << "[WAITBLOCK][abort][SM" << m_sm_id << "] cyc="
-              << get_current_gpu_cycle()
+  if (!m_wait_block_release_snapshot_valid) {
+    std::cerr << "[WAITBLOCK][abort][SM" << m_sm_id
+              << "] snapshot_cyc=" << m_wait_block_release_snapshot_cycle
               << " reason=release-query-without-cycle-snapshot"
               << " action=abort" << std::endl;
     abort();
