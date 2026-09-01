@@ -1,36 +1,198 @@
-# WaitBlock: Design Index and Live B0-E Work
+# WaitBlock: Design Index and Current Status
 
-**Status (2026-08-31):** Post-processing v5 and the partial-replay simulator are
-implemented and full-trace validated. B0-A/B/C are complete. B0-D (exact TMA
-completion ownership) is **complete and validated** at `39abefb`: K5 `.e85`
-validates ownership-clean out-of-order completion and K10 `.e62` completes
-384/384 CTAs with 132/132 clean SM-level `TMABIND` final records. The only open
-correctness item is **B0-E**: a K5 all-live 13-warp cross-warp WaitBlock cycle
-on SM124 (`0xb370`/`0x16c60`). Three attempts to infer an absolute wait
-generation from the old trace (ordered generation ticket, ordered candidate-set,
-runtime UR recompute) remain **rejected**. Generic and PC-hardcoded runtime
-release experiments also remain rejected/reverted: they moved the hang to later
-generations and new wait sites, and the generic release regressed K10.
+**Status (2026-09-01):** B0-A through B0-E are complete. B0-D exact TMA
+completion ownership remains validated at `39abefb`. B0-E exact-generation
+capture and consumption is implemented at `087b53f` and validated by K5 `.e90`
+and K10 `.e66`. K5 completes 132/132 CTAs at 85,172 cycles without a forced
+release; K10 completes 384/384 CTAs at 137,348 cycles. Every emitted WaitBlock,
+TMABIND, and named-barrier final summary passes, and all pending holds, TMA
+contracts, bindings, and byte credits drain to zero.
 
-A new, narrower direction is now the live B0-E candidate: capture the
-**barrier-local opened-contract ordinal at each wait** for TMA-backed barriers
-whose trace proves one initialization, decoded arrival count one, one
-`ARRIVE_EXPECT_TX` arrival per generation, and exact B0-D byte ownership. This
-is not a revival of the rejected offline-order guess: it adds the missing
-cross-warp state to the trace. An audit of the existing full FA3 trace
-(`git_sha=9e92fe9`) found that K5 has 2,112 ordinal-unique TMA wait streams and
-3,072 ambiguous sparse-role streams, while all 11,904 K10 TMA wait streams are
-ordinal-unique under a strict increasing-generation assumption. The existing
-trace therefore proves both the applicability of the restricted contract model
-and the need for one new captured field. The ABI-correct v2 trace has now passed
-the Stage E0 identity and conservation gates. After extending FOLD coverage
-from only its primary poll to every proven `poll_wait_pcs` occurrence,
-90,868/90,868 eligible WaitBlock waits have unique generation assignments:
-75,840 INJECT entries plus 15,028 FOLD waits. Missing snapshots, capture
-mismatches, rejected TMA actions, ambiguous assignments, and inconsistent
-assignments are all zero. The Stage E1 consumer and strict compact-ticket
-loader are implemented, and the tested H100 config enables them. B1 and the
-K5/K10 simulator acceptance runs remain pending.
+The ABI-correct v2 trace assigns an exact generation to 90,868/90,868 eligible
+WaitBlock waits: 75,840 INJECT entries and 15,028 FOLD waits. The runtime
+validates the intended dependency identity and eliminates the K5 all-live
+13-warp cycle. It does not establish cycle accuracy by itself. K5 reports 9,542
+late-arrival divergences where `current_generation > target_generation` when an
+INJECT action is reached; K10 reports zero. The K5 events are concentrated at
+`0x5a50` and `0x5bc0`, so producer/consumer timing analysis remains open even
+though dependency correctness and completion now pass. B1 also remains pending.
+
+## Remaining work
+
+### 1. K5 first late-arrival root cause (cycle-accuracy priority)
+
+**Problem.** K5 completes, but 9,542 exact INJECT actions execute with
+`current_generation > target_generation`. K10 has zero. A late observation does
+not violate dependency safety because the target is complete, but it proves
+that simulator producer/consumer timing has advanced past the hardware-mapped
+generation before the consumer reaches the action PC.
+
+**State key.**
+
+```text
+(trace_kernel_id, CTA x/y/z, CTA-local warp_id,
+ unique_function_id, action_pc, source_warp_instruction_index,
+ barrier_addr, target_generation)
+```
+
+**Required analysis.**
+
+1. Select the first late-arrival event in each affected CTA before later
+   generations inherit the timing skew.
+2. Record the simulator cycles for target generation completion, next-contract
+   open, next-generation completion, and consumer action-PC issue.
+3. Correlate those transitions with the last producer and consumer semantic
+   anchors before the divergence. Split the delay into producer progress,
+   consumer scheduling, FOLD hold/release, partial replay, and memory/TMA
+   intervals.
+4. Aggregate by action PC and generation distance. Current evidence is:
+   `0x5a50=4,301`, `0x5bc0=4,413`, all other parseable INJECT PCs=827;
+   generation
+   distance `+1=6,846`, `+2=2,667`, `+3=28`, plus one stderr-interleaved record
+   accounted for by the authoritative per-SM totals.
+5. Do not infer a hardware completion cycle from the ticket. The trace proves
+   generation identity, not asynchronous TMA completion time. If simulator
+   evidence cannot distinguish an early producer from a late consumer, obtain
+   an additional hardware timing observation instead of choosing one.
+
+**Acceptance.** A proposed timing correction must preserve the exact ticket
+mapping, semantic TMA/BAR/memory histograms, TMA command/request/byte
+conservation, and K10's zero late-arrival result. It must reduce K5's cycle
+error relative to the 67,696-cycle HW target and improve the
+Producer-minus-Consumer tail without a forced release, phase force, generation
+rewrite, or PC whitelist. A lower divergence count is diagnostic evidence, not
+a standalone acceptance condition.
+
+### 2. B1 deterministic SM-cycle release phase
+
+**Problem.** `service_wait_block_release()` currently runs from each
+`Subcore::modify_warp_state()`. Therefore subcore traversal order can determine
+whether a barrier transition is observed in the current or next simulator
+cycle.
+
+**Required implementation.**
+
+```text
+cycle start
+  -> advance shared pipelines and TMA completions
+  -> snapshot release-visible barrier generations
+  -> service every hardware warp exactly once
+  -> run all subcore issue phases
+  -> expose issue-phase arrivals to releases on the next cycle
+```
+
+The release pass may clear an approved pending WaitBlock state and perform the
+already-defined primary FOLD cursor transition. It must not execute an
+instruction, mutate named-BAR state, or make an issue-phase arrival visible to a
+later-iterated subcore in the same cycle.
+
+**Acceptance.** Run identical traces with normal and reversed subcore traversal.
+Require identical ordered `(cycle, warp, barrier, target_generation)` release
+fingerprints, identical final cycles, exactly one release-service visit per
+hardware warp per SM cycle, unchanged trace cursors, and unchanged semantic and
+TMA conservation summaries.
+
+### 3. B2 startup and provenance closure
+
+Most fail-closed loading checks are implemented. The remaining work is an audit
+that every enabled runtime path is covered before kernel execution.
+
+**Required checks.**
+
+- sidecar and ticket schema/version, `validation_complete`, and non-empty action
+  maps;
+- unique action keys and exact CTA-grid coverage;
+- presence of enhanced trace, sync resolver, TMA metadata, eligible-barrier
+  manifest, and exact ticket artifact;
+- complete static wait/effect/mask/join/cursor proofs;
+- unambiguous descriptor and UBLKCP operand provenance;
+- active action instructions always carry the required runtime payload;
+- zero-effective instructions remain no-ops;
+- fold and observe modes cannot be enabled together.
+
+**Acceptance.** Add or confirm one negative test per rejection class. Each
+malformed input must abort before kernel execution with the violated identity
+field in the diagnostic. A valid K5/K10 sidecar must still load without
+weakening the current exact/fallback barrier-manifest checks.
+
+### 4. B3 assert-before-clear lifecycle audit
+
+WaitBlock and B0-D TMA ownership already assert their primary conservation
+rules. The remaining audit covers every cleanup path that can erase state:
+CTA finish, warp-slot reuse, kernel finish, and simulator teardown.
+
+Before clearing state, assert:
+
+```text
+no active exact/count-only holds
+no partial arm, capsule, replay queue, or replay progress
+no open TMA contract or in-flight binding
+no outstanding barrier/warp completion credit
+no leaked named-BAR participant or deferred-sync credit
+```
+
+Acceptance requires clean K5/K10 teardown and a targeted negative test showing
+that each residual-state class aborts rather than being silently discarded.
+
+### 5. B5 configurable watchdogs and launch-scoped diagnostics
+
+Replace hardcoded timing constants with:
+
+```text
+-wait_block_hold_watchdog_cycles 32000
+-wait_block_heartbeat_cycles      4096
+```
+
+Use `{active, start_cycle}` instead of cycle zero as the inactive sentinel.
+Reset WaitBlock totals, pace records, semantic-work counters, TMA binding
+counters, and log budgets at each runtime kernel launch. A provably
+unfulfillable TMA contract must abort immediately rather than waiting for the
+watchdog.
+
+Acceptance requires startup printing of effective values and a back-to-back
+multi-kernel test proving that the second launch inherits no pending state,
+counter value, start cycle, or exhausted debug budget from the first.
+
+### 6. B6 pure hold query and scheduler accounting
+
+`peek_wait_block_hold_mode(warp_id)` must remain the only scheduler-side
+WaitBlock query. Complete the audit of legacy `mbarrier_spin` and stall metrics
+so no read-only classification path calls a release service, named-BAR
+`waiting()`, `tma_flush`, cache access, or another state-mutating readiness
+helper.
+
+Acceptance requires repeated queries to leave generations, pending waits,
+counters, cursors, and scheduler order unchanged. The SR-M0A population must
+partition every active hardware warp exactly once into selected,
+eligible-not-selected, WaitBlock-held, blocked-with-valid-head,
+no-valid-instruction, drain, or inactive.
+
+### 7. B7 metric reconciliation
+
+Keep issued wait outcomes, logical WaitBlock episodes, TMA completion
+ownership, and exclusive scheduler population as separate metric domains.
+Close the final equations:
+
+```text
+captured_poll_holds == captured_poll_releases
+captured_poll_aux_holds == captured_poll_aux_releases
+partial_join_holds == partial_join_releases
+partial_deferred == partial_replayed + partial_folded
+TMA bindings created == completed + in_flight
+cross_barrier_completion_applications == 0
+fold-off retired warp instructions - fold-on retired warp instructions
+    == WaitBlock skipped warp occurrences
+```
+
+Do not compare skipped warp occurrences directly with active-lane
+`gpu_sim_insn`. Acceptance requires all equations at kernel scope and zero
+active state at finalization for both K5 and K10.
+
+### Deferred generalization
+
+D0 generic ISA-wide effects and D1 repeated-EXCH initialization epochs remain
+deferred. They are not blockers for the validated FA3 lifecycle and must not be
+mixed into the K5 timing correction or B1 validation.
 
 This document is the authoritative index and the live execution record for
 B0-E. The detailed per-work-type designs and the historical evidence live in the
@@ -41,7 +203,7 @@ do next* and *what must not be re-proposed*.
 
 | Document | Work type | Authority |
 |---|---|---|
-| **WAIT_BLOCK.md** (this file) | Index, shared invariants, Batch B scope table, live B0-E analysis and gates | Authoritative for status and next action |
+| **WAIT_BLOCK.md** (this file) | Index, shared invariants, Batch B scope table, B0-E result and remaining work | Authoritative for status and next action |
 | [WAIT_BLOCK_POSTPROC.md](WAIT_BLOCK_POSTPROC.md) | Offline trace post-processing / sidecar classification | Authoritative for the two-strategy classifier |
 | [WAIT_BLOCK_SIMULATOR.md](WAIT_BLOCK_SIMULATOR.md) | Simulator runtime paths + partial-lane v2 replay | Authoritative for runtime hold/release/replay |
 | [WAIT_BLOCK_TMA_OWNERSHIP.md](WAIT_BLOCK_TMA_OWNERSHIP.md) | Exact TMA-command-to-barrier completion ownership (Batch B) | Authoritative for B0-A … B0-D, B1, metrics |
@@ -55,25 +217,24 @@ designs win.
 
 **Debug records:** [`../debug-k10-wait-fold-deadlock.md`](../debug-k10-wait-fold-deadlock.md),
 [`../debug-k5-waitblock-cycle.md`](../debug-k5-waitblock-cycle.md).
-**Next-session entry point:** [B0E_HANDOVER.md](B0E_HANDOVER.md).
+**Historical pre-E0 handover:** [B0E_HANDOVER.md](B0E_HANDOVER.md).
 
 ## Current B0-E authority (intentionally narrow)
 
-1. B0-D at `39abefb` plus K5 `.e85` and K10 `.e62` is the fixed correctness
-   baseline.
-2. The post-`951b058` ordered-candidate experiment and the ordered-ticket design
-   are historical evidence only (see [WAIT_BLOCK_HISTORY.md](WAIT_BLOCK_HISTORY.md)).
-3. The next planned work is a **capture-only feasibility stage** for
-   barrier-local contract ordinals. It must not infer a generation from current
-   parity alone, reconstruct a CTA-global total order, or change simulator
-   wait/release behavior.
-4. A simulator event-ID implementation may be reviewed only after the new trace
-   proves one release generation for every eligible K5/K10 wait occurrence.
-   Any missing, duplicate, or ambiguous mapping rejects the design.
-5. First-divergence timing analysis and global park-safety remain fallback and
-   diagnostic work. They must not be mixed into the capture-only experiment.
+1. B0-D at `39abefb` is the fixed exact TMA-ownership baseline.
+2. B0-E at `087b53f`, K5 `.e90`/`.o90`, and K10 `.e66`/`.o66` is the
+   exact-generation WaitBlock correctness result.
+3. The ABI-correct v2 trace and compact ticket artifact are authoritative for
+   the 90,868 eligible exact-generation actions. The ordered-candidate and
+   parity-only designs remain rejected historical evidence.
+4. Remaining WaitBlock engineering is B1, B2, B3, B5, B6, and B7 as listed in
+   the Batch B table below. B1 and B5 are not implemented; B2, B3, B6, and B7
+   require their listed audits or completion work.
+5. Remaining cycle-accuracy work starts from the first K5
+   `current_generation > target_generation` occurrence. Completion alone must
+   not be used to close the 9,542 late-arrival timing divergences.
 
-## New-session handover snapshot (2026-08-31)
+## Historical pre-E0 handover snapshot (2026-08-31)
 
 ### Repository state
 
@@ -124,9 +285,9 @@ Do **not** use `-f` on this path before preserving it under a distinct baseline
 directory name. Stage E0 needs both the `9e92fe9` trace and the newly captured
 trace for structural comparison.
 
-### Immediate task boundary
+### Historical Stage E0 task boundary
 
-The next session starts at **Stage E0 only**:
+The handover constrained the next session to **Stage E0 only**:
 
 ```text
 implement barrier-local contract-ordinal capture
@@ -139,6 +300,9 @@ Do not modify `sm.cc`, WaitBlock release behavior, generation comparison,
 cursor/replay behavior, scheduler timing, TMA completion timing, or B1 during
 Stage E0. Do not restore the deleted microbenchmark unless a separately
 identified tracer primitive needs an isolated test.
+
+Stage E0 and the separately reviewed Stage E1 are now complete. This section is
+retained only to preserve the original implementation boundary.
 
 ## The two runtime strategies
 
@@ -213,10 +377,11 @@ sidecar generation; unified metadata does not require unified runtime behavior.
   with a complete diagnostic. Under the approved v2 design it may hold only after
   the complementary join occurrence has issued and all extracted blocked
   occurrences are owned by the replay queue.
-- Unticketed generation overshoot and a 32,000-cycle wait-hold timeout abort.
-  A future exact-ticket runtime may replace overshoot abort with
-  `current_generation >= target_release_generation`, but only after the
-  capture-only gate below passes and the runtime change is separately reviewed.
+- Count-only fallback generation overshoot and a 32,000-cycle wait-hold timeout
+  abort. Exact tickets use
+  `current_generation >= target_release_generation`; an exact
+  `current_generation > target_release_generation` continues and increments the
+  late-arrival divergence counter.
 - With a fixed TMA implementation baseline, `wait_block_enable=0` is
   bit-identical to that baseline. A separately approved cross-subsystem
   correctness repair such as B0-D establishes a new baseline; disabling WaitBlock
@@ -224,13 +389,13 @@ sidecar generation; unified metadata does not require unified runtime behavior.
 
 ## Batch B scope and current status
 
-| ID | Work item | Status after `.e85`/`.e62` final |
+| ID | Work item | Current status |
 |---|---|---|
 | B0-A | Repair UBLKCP sidecar callback-role selection | **IMPLEMENTED / VALIDATED** at `0f7cbc2`; K10 is 8 sites/6,528 occurrences at 512 bytes, and kernel 11 is 1 site/384 occurrences at 32,768 bytes |
 | B0-B | Kernel-aware descriptor identity and K5 tx-size restoration | **IMPLEMENTED / VALIDATED** at `0f7cbc2`; chain 23/23, ambiguity 0, K5 `0x96b0` = 24,576 bytes, 192 128-byte AGU requests, and 768 32-byte sector requests |
 | B0-C | Size-only K5/K10 byte-conservation diagnostic with existing FIFO/release order | **COMPLETE**; byte contract PASS, K10 clean exit at 138,456 cycles, K5 runtime size PASS but all-live WaitBlock abort at cycle 68,176 |
 | B0-D | Exact TMA-command-to-barrier completion ownership | **COMPLETE / VALIDATED** at `39abefb`; `.e85` validates ownership-clean out-of-order completion, and K10 `.e62` completes 384/384 CTAs with 132/132 clean SM-level TMABIND final records after exercising two simultaneous open contracts per warp |
-| B0-E | K5 all-live cross-warp WaitBlock cycle (`0xb370`/`0x16c60`) | **TRACE ACCEPTED / SIMULATOR RUN NEXT**. The ABI-correct v2 trace resolves 90,868/90,868 eligible WaitBlock waits uniquely. Stage E1 consumes exact targets at INJECT entries and every proven FOLD wait PC. K5/K10 simulator acceptance remains pending |
+| B0-E | K5 all-live cross-warp WaitBlock cycle (`0xb370`/`0x16c60`) | **COMPLETE / VALIDATED** at `087b53f`; K5 `.e90` completes 132/132 CTAs without forced release and K10 `.e66` completes 384/384. All WaitBlock/TMABIND summaries pass. K5's 9,542 late-arrival divergences remain a cycle-accuracy diagnostic |
 | B1 | One SM-level WaitBlock release phase per cycle | **REQUIRED / NOT IMPLEMENTED** |
 | B2 | WaitBlock startup and provenance fail-fast checks | **MOSTLY IMPLEMENTED** |
 | B3 | Assert-before-clear lifecycle checks | **IMPLEMENTED for WaitBlock and B0-D TMA ownership**; broader non-ownership cleanup audit remains partial |
@@ -240,19 +405,19 @@ sidecar generation; unified metadata does not require unified runtime behavior.
 | B7 | Fold/WaitBlock metric integrity and final reconciliation | **PARTIAL** |
 | D0 | Generic ISA-wide effect framework | **DEFERRED**; exact sidecar allow/proof sets remain authoritative |
 | D1 | Generic repeated-EXCH initialization epochs | **DEFERRED** for current FA3 one-EXCH-per-barrier contract |
-| D2 | Full trace regeneration | **COMPLETE** at tracer commit `9e92fe9`; K5/K10 payload coverage validated |
+| D2 | Full trace regeneration | **COMPLETE**; the `9e92fe9` trace is the comparison baseline and the ABI-correct v2 capture after `9bb9630` supplies the accepted contract ordinals and exact tickets |
 
 No item may weaken the existing WaitBlock generation, cursor/replay, or
 semantic-work invariants. Feature-off identity is evaluated within one TMA
 ownership baseline; B0-D intentionally retires the legacy-FIFO baseline for both
 WaitBlock-on and WaitBlock-off execution.
 
-## Live B0-E analysis
+## Historical B0-E root-cause analysis
 
 B0-D is complete (see [WAIT_BLOCK_HISTORY.md](WAIT_BLOCK_HISTORY.md) sections 5-6
 for the `.e84`/`.e85`/`.e62` evidence). B0-E work uses `39abefb` plus the `.e62`
-result as its fixed exact-ownership baseline. What remains is a WaitBlock
-liveness defect, not a TMA-ownership defect.
+result as its fixed exact-ownership baseline. The analysis below describes the
+WaitBlock liveness defect that Stage E0/E1 subsequently resolved.
 
 ### Minimal SM124 causal cycle (`.e85`)
 
@@ -735,10 +900,10 @@ existing full-trace capacity audit:
   default table bound  = 64 barriers/CTA
 ```
 
-The local macOS environment has neither `nvcc` nor `protoc`; generated protobuf
-compilation, NVBit linking, callback execution, and the full FA3 acceptance
-comparison remain pending on the CUDA server. This checkpoint does not authorize
-Stage E1 or any simulator behavior change.
+At this checkpoint, the local macOS environment had neither `nvcc` nor
+`protoc`; generated protobuf compilation, NVBit linking, callback execution,
+and the full FA3 acceptance comparison were still pending on the CUDA server.
+Those steps were subsequently completed before Stage E1 was accepted.
 
 #### Stage E0 v1 full-trace result (2026-09-01)
 
@@ -958,12 +1123,79 @@ baseline conservation          = PASS
 The scheduler's non-mutating hold predicate uses the same exact
 `current_generation >= target` test as the release service; it does not fall
 back to one-bit parity for an exact pending hold. The tested H100 config sets
-`-wait_block_exact_generation_enable 1`. Simulator build and K5/K10 execution
-remain pending.
+`-wait_block_exact_generation_enable 1`.
 
 B0-E acceptance must eliminate the 13-warp all-live cycle without dropping a
 dependency, forcing a phase, guessing a generation, advancing a cursor outside
 an approved release, or changing semantic TMA/BAR/memory work.
+
+### Stage E1 simulator acceptance (`.e90` K5, `.e66` K10)
+
+Both runs use `-wait_block_enable 1` and
+`-wait_block_exact_generation_enable 1`.
+
+K5:
+
+```text
+CTA completion                 = 132/132
+gpu_tot_sim_cycle              = 85,172
+WaitBlock summaries            = 132/132 PASS
+TMABIND summaries              = 132/132 PASS
+missing holds/releases         = 2,404/2,404
+primary FOLD holds/releases    = 2,500/2,500
+auxiliary FOLD holds/releases  = 1,553/1,553
+partial deferred/replayed      = 3,726/3,726
+partial join holds/releases    = 343/343
+active holds/watchdog aborts   = 0/0
+exact actions observed         = 26,561
+late-arrival divergences       = 9,542
+generation overshoots          = 0
+```
+
+All K5 late-arrival records are immediate-path observations. Of the 9,541
+records whose fields survived concurrent stderr output, 4,301 are at `0x5a50`
+and 4,413 are at `0x5bc0`; the remaining 827 are split across `0x13b0`,
+`0x35e0`, `0x3750`, and `0x74e0`. The generation distance is +1 for 6,846,
++2 for 2,667, and +3 for 28 records. One record's fields were interleaved with
+a TMABIND line, while the per-SM summary counters retain the authoritative
+9,542 total.
+
+K10:
+
+```text
+CTA completion                 = 384/384
+gpu_tot_sim_cycle              = 137,348
+WaitBlock summaries            = 384/384 PASS
+TMABIND summaries              = 132/132 PASS
+missing holds/releases         = 2,888/2,888
+primary FOLD holds/releases    = 3,263/3,263
+auxiliary FOLD holds/releases  = 2,998/2,998
+active holds/watchdog aborts   = 0/0
+exact actions observed         = 57,777
+late-arrival divergences       = 0
+generation overshoots          = 0
+```
+
+The runtime `exact actions observed` counters include only ticketed
+instructions that reach the action handler. They are lower than the artifact's
+per-kernel exact-ticket totals (K5 31,123; K10 59,745) because an approved
+primary FOLD advances past the remaining captured retry records after release.
+Those skipped ticket slots are validated at load time but are not runtime
+actions.
+
+Relative to the B0-D K10 `.o62` result at 136,931 cycles, exact-generation mode
+adds 417 cycles (+0.30%). Semantic work is conserved: both runs issue 30,336
+TMA commands, issue and complete 349,372,416 TMA bytes, execute the same 103,296
+named-barrier operations, and report identical global read/write byte totals.
+
+K5 internally conserves 6,432 TMA commands, 3,090,432 issued/completed requests,
+and 98,893,824 issued/completed bytes. Its 132 named-barrier summaries contain
+no leaked barrier IDs, participants, arrivals, or deferred-sync credits.
+
+Therefore B0-E dependency correctness passes. The next cycle-accuracy target is
+the K5 timing skew exposed by the 9,542 late-arrival divergences. Exact
+generation identity prevents parity aliasing but cannot rewind a barrier that
+has already advanced beyond the hardware-observed target.
 
 ## Temporary K5 hardcoded deadlock breaker (measurement only)
 
@@ -1034,10 +1266,9 @@ held-cycle threshold is closed. Both are measurement-only release mechanisms,
 both contaminate cycle timing, and neither supplies the missing dependency
 identity. The hardcoded probe has been reverted.
 
-**Current next step:** review and approve Stage E0 above. If approved, implement
-only barrier-local contract-ordinal capture and the offline uniqueness proof,
-then regenerate FA3 once. Do not re-add either release probe and do not modify
-simulator wait behavior during E0.
+**Superseded next step:** Stage E0 capture, offline uniqueness proof, and the
+separately reviewed Stage E1 simulator consumer are complete. Do not re-add
+either historical release probe.
 
 **Evidence pointers:** K5 `.e89`/`.o89` and K10 `.e65`/`.o65` under
 `sim_run_12.8/.../H100_80GB-OnlyKernel5` and `...-OnlyKernel10`. Pristine
