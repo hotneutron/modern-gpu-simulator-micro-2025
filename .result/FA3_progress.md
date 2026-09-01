@@ -38,7 +38,7 @@ To keep this file easy to extend, use the following update pattern whenever a ne
 | Opt 9 | L2 sub-partition drain widening (ROP-drain + DRAM-reply-drain) | Two symmetric 1-sector/tick L2 gates, each its own knob: `-gpgpu_l2_rop_drain_per_cycle 2` (Gate A, REQUEST: ROP delay-queue→m_icnt_L2_queue) + `-gpgpu_l2_dram_reply_drain_per_cycle 2` (Gate B, REPLY: m_dram_L2_queue→L2 fill/L2_icnt; fill port modeled M-wide). Fixed latencies unchanged; timing-only (work invariant). | 135,999 cycles (100.9% error, **-1.5% vs Opt 8**). fwd `.o38`. `L2_TMA_true_hit_rate` 0.9455 (unchanged). Small (fwd still frontend-tail bound). | 215,895 cycles (**62.4% error**, **-18.4% vs Opt 8**). bwd `.o21`. `L2_TMA_true_hit_rate` 0.8682 (unchanged). **Unlocked Opt 8**: `L2_admit_per_active_cycle` 1.00→**1.93** (the 2-wide bank was starved by the 1/tick ROP feed); ROP_DELAY 558→**164** (-71%), `averagemflatency` 692→369. | Done. Opt 8+9 were a matched pair. Residual now spread across ROP(45%)+inject(37%)+reply(12.5%); no single 1/tick gate dominates. |
 | Opt 10 | intra-SMSP warp-switch (SFU issue-gating) | `-intra_smsp_warpswitch_enable 1` (code + config). At issue time, also check `fu->can_issue()` for no-queue FUs (SFU), so a busy-SFU MUFU (deterministic II=8) is filtered BEFORE the 1-deep `ISSUE_CONTROL` latch and GTO warp-switches to a ready warp instead of stalling the whole subcore. Queue FUs (MEM/TMA/MISC) keep the deferred path. II/latency unchanged; timing-only (work invariant). | 105,464 cycles (**55.8% error**, **-44.7% vs Opt 9**). fwd `.o58`. `gpu_sim_insn` **bit-identical** to baseline (455,565,060); `issue_stage_issuing` bit-identical (16,064,281). Head-of-line `next_stage` 25.1%→**0.06%**, `blocked_by_sfu` 11.48M→**0**. | 178,856 cycles (**34.6% error**, **-44.6% vs Opt 9**). bwd `.o33`. `gpu_sim_insn` bit-identical (629,211,348). `next_stage` 21.3%→**1.6%**, `blocked_by_sfu` 15.36M→**0**. Warp-switch recovered slot (`other_warp_issued/sfu_filtered`) fwd 31.7% / bwd 26.3%. | Done. The compute-path issue-pipeline defect (SFU head-of-line) fixed; residual (fwd 1.56x) is **SFU-throughput bound** (`still_idle` ≡ `fu_occupied_sfu`, warps queue on the one HW-faithful SFU), not an occupancy floor — next candidate axis is warp-stagger/overlap. See [CONSUMER_COMPUTE_BOUND.md](file:///home/jihyun/modern-gpu-simulator-micro-2025/.plan/CONSUMER_COMPUTE_BOUND.md). |
 | Opt 11-A | Lightweight NVBit full trace (Option 1B) | One untrimmed full capture with compact 104B/360B wire records and semantic callback pruning (`LIGHTER_TRACER="compact_wire,prune_operands"`, `TRIM_SPIN=0`). Transport falls from the original 136.55GB equivalent to 7.41GB (**-94.6%, 18.4x smaller**) and callback records fall 191.79M→64.78M (**-66.2%**), while all replay-visible memory/sync/BAR/TMA payload is retained. | **83,308 cycles (23.1% error, -62.1% vs first measured fwd baseline, -21.0% vs Opt 10)**. fwd `.o68`. `gpgpu_n_tot_w_icount=14,847,194`, `gpu_sim_insn=450,627,804`; both exactly equal the loaded Option 1B trace contract. | **136,898 cycles (3.0% error, -63.7% vs Init, -23.5% vs Opt 10)**. bwd `.o42`. `gpgpu_n_tot_w_icount=21,007,397`, `gpu_sim_insn=624,799,542`; both exactly equal the trace contract. | **Payload/functional gate PASS; timing-fidelity gate FAIL.** Clean exit, TMA unresolved=0, BAR leaks=0, and all HGMMA/MUFU/TMA/memory/sync/BAR totals match. However Producer ends 37.9K/12.0K cycles before Consumer (K5/K10), while K5 HW has a +8.0K Producer tail. K10's 3.0% aggregate error is therefore not proof of correct role timing. |
-| Opt 12 | Exact-generation WaitBlock replay | ABI-safe barrier-local contract-ordinal capture, strict offline wait-to-generation reconstruction, compact schema-v2 tickets, and runtime `current_generation >= target_generation` enforcement for INJECT and every proven FOLD wait. | **85,172 cycles (25.82% error, +2.24% vs Opt 11-A)**. K5 completes 132/132 CTAs without forced release; all WaitBlock/TMABIND/BAR summaries pass. 9,542 late-arrival divergences remain. fwd `.o90/.e90`. | **137,348 cycles (3.35% error, +0.33% vs Opt 11-A)**. K10 completes 384/384 CTAs; all summaries pass, with zero late-arrival divergences. bwd `.o66/.e66`. | **Dependency-correctness PASS; cycle-accuracy PARTIAL.** B0-E parity aliasing/deadlock is resolved. K5 timing remains open at the first exact wait reached after its target generation; K10 aggregate timing remains close to HW. |
+| Opt 12 | WaitBlock exact-generation replay (Batch B: tracer + TMA ownership + fold + wait block) | The full WAIT_BLOCK.md body: B0-A/B0-B tracer+sidecar fixes (UBLKCP callback role, kernel-aware descriptor identity, K5 tx-size), B0-C/B0-D exact TMA-command-to-barrier completion ownership, FOLD captured-poll + partial-lane extract/join/replay, and B0-E ABI-safe barrier-local contract-ordinal capture with runtime `current_generation >= target_generation` enforcement for INJECT and every proven FOLD wait. | **85,172 cycles (25.82% error, +2.24% vs Opt 11-A)**. K5 completes 132/132 CTAs without forced release; all WaitBlock/TMABIND/BAR summaries pass. 9,542 late-arrival divergences remain. fwd `.o90/.e90`. | **137,348 cycles (3.35% error, +0.33% vs Opt 11-A)**. K10 completes 384/384 CTAs; all summaries pass, with zero late-arrival divergences. bwd `.o66/.e66`. | **Dependency-correctness PASS; cycle-accuracy PARTIAL.** B0-E parity aliasing/deadlock is resolved. K5 timing remains open at the first exact wait reached after its target generation; K10 aggregate timing remains close to HW. |
 
 ### Simulator Cycle Breakdown
 
@@ -978,10 +978,30 @@ spin, TMA pacing, or another simulator timing mechanism.
 ### Opt 12 - exact-generation WaitBlock replay
 
 > Authoritative design and validation:
-> [WAIT_BLOCK.md](../.plan/WAIT_BLOCK.md),
-> [WAIT_BLOCK_POSTPROC.md](../.plan/WAIT_BLOCK_POSTPROC.md), and
-> [WAIT_BLOCK_SIMULATOR.md](../.plan/WAIT_BLOCK_SIMULATOR.md). The older
-> `SPIN_WAIT_*` documents preserve the parity-only fold history.
+> [WAIT_BLOCK.md](../.plan/WAIT_BLOCK.md) (index, shared invariants, Batch B
+> scope, B0-E result/gates),
+> [WAIT_BLOCK_POSTPROC.md](../.plan/WAIT_BLOCK_POSTPROC.md) (offline
+> two-strategy classifier),
+> [WAIT_BLOCK_SIMULATOR.md](../.plan/WAIT_BLOCK_SIMULATOR.md) (runtime
+> INJECT/FOLD paths + partial-lane v2 replay),
+> [WAIT_BLOCK_TMA_OWNERSHIP.md](../.plan/WAIT_BLOCK_TMA_OWNERSHIP.md) (exact
+> TMA-command-to-barrier completion ownership B0-A…B0-D, B1 release phase,
+> metrics), and
+> [WAIT_BLOCK_HISTORY.md](../.plan/WAIT_BLOCK_HISTORY.md) (chronological server
+> runs; rejected ordered-generation-ticket and reverted ordered-candidate
+> designs). The older `SPIN_WAIT_*` documents preserve the parity-only fold
+> history.
+>
+> **Scope note.** Opt 12 is the full WAIT_BLOCK.md body of work, not only the
+> final exact-generation replay. It bundles the tracer fixes (B0-A UBLKCP
+> sidecar callback-role selection, B0-B kernel-aware descriptor identity + K5
+> tx-size restoration, and the ABI-safe v2 barrier-local contract-ordinal
+> capture), the exact TMA-command-to-barrier completion ownership (B0-C
+> size-only byte conservation and B0-D exact ownership), the FOLD captured-poll
+> and partial-lane extract/join/replay reservation lifecycle, and the
+> INJECT/FOLD exact-generation WaitBlock replay (B0-E). All of these ship
+> together in the tracked Opt 12 result; the sub-items are labeled B0-A…B0-E
+> in the WAIT_BLOCK.md Batch B table.
 
 #### Why this optimization
 
@@ -999,6 +1019,29 @@ proves one initialization, arrival count one, serial same-barrier contracts,
 and exact B0-D TMA byte ownership.
 
 #### How to implement
+
+The exact-generation replay below rests on two prerequisite layers that ship in
+the same Opt 12 result:
+
+- **Tracer / sidecar fixes (B0-A, B0-B).** B0-A reselects the UBLKCP
+  operand-3 callback by its static role instead of the maximum uniform value,
+  so the hidden completion callback is no longer misread as a byte source
+  (K10 8 sites / 6,528 occurrences at 512 bytes; kernel 11 at 32,768 bytes).
+  B0-B keys TMA metadata by `(trace_kernel_id, unique_function_id, pc)`,
+  preserves the `UTMACCTL.PF` chain, forbids direct/pool routing, and restores
+  the K5 `0x96b0` Q transaction to 24,576 bytes. Both regenerate sidecars from
+  the existing `9e92fe9` raw trace with no retrace.
+- **Exact TMA completion ownership (B0-C, B0-D).** Every completion-bearing
+  LOAD carries its own barrier identity, so one `ARRIVE_EXPECT_TX` contract
+  binds to exactly one command/generation and completion order becomes
+  irrelevant (removing the legacy per-warp FIFO cross-binding spill). This is
+  what lets one warp hold multiple open contracts (K10 `max_open_contracts=2`)
+  and makes "one contract == one generation" provable for the eligible FA3
+  barriers.
+- **FOLD and partial-lane replay.** `FOLD_CAPTURED_POLL` folds captured
+  poll-loop retries without touching the entry probe, and partial-mask misses
+  use the v2 extract/complementary-join/reserved-replay lifecycle so blocked
+  lanes are replayed exactly once instead of held as a whole warp.
 
 - **Capture:** append a bounded barrier-local opened-contract ordinal to the
   existing sync record. The lightweight v2 tracer adds no callback or channel

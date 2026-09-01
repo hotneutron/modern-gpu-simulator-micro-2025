@@ -235,9 +235,12 @@ Supporting documents (`TMA_BASE_ADDR.md`, `TMA_exact_base_mapping_integration.md
 material. Where they conflict with the companion designs above, the companion
 designs win.
 
-**Debug records:** [`../debug-k10-wait-fold-deadlock.md`](../debug-k10-wait-fold-deadlock.md),
-[`../debug-k5-waitblock-cycle.md`](../debug-k5-waitblock-cycle.md).
-**Historical pre-E0 handover:** [B0E_HANDOVER.md](B0E_HANDOVER.md).
+**Debug records:** [`../debug-k10-wait-fold-deadlock.md`](../debug-k10-wait-fold-deadlock.md).
+The K5 all-live WaitBlock-cycle evidence lives in
+[WAIT_BLOCK_HISTORY.md](WAIT_BLOCK_HISTORY.md) sections 2-6 plus the
+"Historical B0-E root-cause analysis" section below.
+**Historical pre-E0 handover:** inlined in the "Historical pre-E0 handover
+snapshot" section below.
 
 ## Current B0-E authority (intentionally narrow)
 
