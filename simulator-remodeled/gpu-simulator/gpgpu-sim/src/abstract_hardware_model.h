@@ -1246,6 +1246,10 @@ class inst_t {
   bool trace_masks_valid = false;
   uint32_t trace_active_mask = 0;
   uint32_t trace_predicate_mask = 0;
+  bool wait_block_generation_ticket_present = false;
+  bool wait_block_exact_target_valid = false;
+  uint64_t wait_block_target_release_generation = 0;
+  uint64_t wait_block_ticket_source_index = 0;
   bool skip_wb;
 
   barrier_type bar_type;

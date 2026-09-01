@@ -107,6 +107,10 @@ struct inst_trace_t {
   uint64_t sync_barrier_addr;
   bool sync_has_semantic_raw;
   uint64_t sync_semantic_raw;
+  bool wait_block_generation_ticket_present;
+  bool wait_block_exact_target_valid;
+  uint64_t wait_block_target_release_generation;
+  uint64_t wait_block_ticket_source_index;
   bool tma_completion_runtime_valid;
   uint64_t tma_completion_barrier_addr;
   uint32_t tma_completion_barrier_ureg_id;

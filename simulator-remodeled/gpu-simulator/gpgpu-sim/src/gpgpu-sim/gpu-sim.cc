@@ -1591,7 +1591,8 @@ void wait_block_validate_partial_static_proof(
 
 void load_wait_block_sidecar_v5(const std::filesystem::path &extra_info_dir,
                                 traced_execution &static_trace_info,
-                                WaitBlockSidecarDB &db) {
+                                WaitBlockSidecarDB &db,
+                                bool require_exact_generation_tickets) {
   const std::filesystem::path path =
       extra_info_dir / "spin_wait_sidecar.json";
   rapidjson::Document doc;
@@ -2112,6 +2113,131 @@ void load_wait_block_sidecar_v5(const std::filesystem::path &extra_info_dir,
     wait_block_sidecar_fatal(path,
                              "strategy or mask accounting disagrees with report");
   }
+
+  if (!require_exact_generation_tickets) {
+    return;
+  }
+
+  const rapidjson::Value &exact =
+      wait_block_require_object(doc, "exact_generation_tickets", path);
+  if (wait_block_require_uint(exact, "version", path) != 1 ||
+      wait_block_require_string(exact, "schema", path) !=
+          "wait_block_exact_generation_tickets" ||
+      wait_block_require_string(exact, "status", path) != "PASS") {
+    wait_block_sidecar_fatal(
+        path, "exact generation ticket schema or validation status mismatch");
+  }
+  const rapidjson::Value &exact_summary =
+      wait_block_require_object(exact, "summary", path);
+  db.exact_generation_ticket_slots =
+      wait_block_require_uint(exact_summary, "slots", path);
+  db.exact_generation_targets =
+      wait_block_require_uint(exact_summary, "exact_targets", path);
+  db.exact_generation_fallbacks =
+      wait_block_require_uint(exact_summary, "fallback_slots", path);
+  if (db.exact_generation_ticket_slots !=
+      db.exact_generation_targets + db.exact_generation_fallbacks) {
+    wait_block_sidecar_fatal(
+        path, "exact generation ticket summary accounting mismatch");
+  }
+
+  const rapidjson::Value &generation_tickets =
+      wait_block_require_array(exact, "tickets", path);
+  if (generation_tickets.Size() != db.exact_generation_ticket_slots) {
+    wait_block_sidecar_fatal(
+        path, "exact generation ticket array size disagrees with summary");
+  }
+
+  uint64_t loaded_exact_targets = 0;
+  uint64_t loaded_fallbacks = 0;
+  for (const rapidjson::Value &ticket_json :
+       generation_tickets.GetArray()) {
+    if (!ticket_json.IsObject()) {
+      wait_block_sidecar_fatal(
+          path, "exact generation tickets contains a non-object record");
+    }
+    const std::string strategy = wait_block_require_string(
+        ticket_json, "runtime_strategy", path);
+    if (strategy != "INJECT_MISSING_WAIT" &&
+        strategy != "FOLD_CAPTURED_POLL") {
+      wait_block_sidecar_fatal(
+          path, "exact generation ticket has an unknown runtime strategy");
+    }
+    WaitBlockGenerationTicketKey key;
+    key.trace_kernel_id =
+        wait_block_require_uint32(ticket_json, "trace_kernel_id", path);
+    key.cta_x = wait_block_require_uint32(ticket_json, "cta_x", path);
+    key.cta_y = wait_block_require_uint32(ticket_json, "cta_y", path);
+    key.cta_z = wait_block_require_uint32(ticket_json, "cta_z", path);
+    key.warp_id = wait_block_require_uint32(ticket_json, "warp_id", path);
+    key.unique_function_id =
+        wait_block_require_uint32(ticket_json, "unique_function_id", path);
+    key.action_pc = wait_block_require_uint(ticket_json, "action_pc", path);
+    key.source_warp_instruction_index = wait_block_require_uint(
+        ticket_json, "source_warp_instruction_index", path);
+
+    const WaitBlockLookupKey action_key{
+        key.trace_kernel_id, key.unique_function_id, key.action_pc};
+    const bool action_exists =
+        strategy == "INJECT_MISSING_WAIT"
+            ? db.missing_wait_by_entry.count(action_key) != 0
+            : db.captured_poll_by_probe.count(action_key) != 0;
+    if (!action_exists) {
+      wait_block_sidecar_fatal(
+          path, "generation ticket has no matching WaitBlock runtime action");
+    }
+
+    WaitBlockGenerationTicket ticket;
+    ticket.active_mask =
+        wait_block_require_uint32(ticket_json, "active_mask", path);
+    ticket.predicate_mask =
+        wait_block_require_uint32(ticket_json, "predicate_mask", path);
+    if ((ticket.active_mask & ticket.predicate_mask) == 0) {
+      wait_block_sidecar_fatal(
+          path, "generation ticket represents a predicated-off occurrence");
+    }
+    ticket.barrier_addr =
+        wait_block_require_uint(ticket_json, "barrier_addr", path);
+    ticket.wait_state_raw =
+        wait_block_require_uint(ticket_json, "wait_state_raw", path);
+    ticket.has_target_release_generation = wait_block_require_bool(
+        ticket_json, "has_target_release_generation", path);
+
+    const rapidjson::Value &target = wait_block_require_member(
+        ticket_json, "target_release_generation", path);
+    const rapidjson::Value &fallback =
+        wait_block_require_member(ticket_json, "fallback_reason", path);
+    if (ticket.has_target_release_generation) {
+      ticket.target_release_generation = wait_block_require_uint(
+          ticket_json, "target_release_generation", path);
+      if (!fallback.IsNull()) {
+        wait_block_sidecar_fatal(
+            path, "exact generation target must have a null fallback");
+      }
+      loaded_exact_targets++;
+    } else {
+      if (!target.IsNull() || !fallback.IsString() ||
+          fallback.GetStringLength() == 0) {
+        wait_block_sidecar_fatal(
+            path, "fallback ticket must have null target and a reason");
+      }
+      ticket.fallback_reason = fallback.GetString();
+      loaded_fallbacks++;
+    }
+
+    if (!db.exact_generation_tickets.emplace(key, ticket).second) {
+      wait_block_sidecar_fatal(path, "duplicate exact generation ticket key");
+    }
+  }
+  if (db.exact_generation_tickets.size() !=
+          db.exact_generation_ticket_slots ||
+      loaded_exact_targets != db.exact_generation_targets ||
+      loaded_fallbacks != db.exact_generation_fallbacks ||
+      loaded_exact_targets == 0) {
+    wait_block_sidecar_fatal(
+        path, "loaded exact generation tickets disagree with summary");
+  }
+  db.exact_generation_tickets_valid = true;
 }
 
 }
@@ -2122,6 +2248,14 @@ void gpgpu_sim::parse_extra_trace_info(std::string filepath, bool is_extra_trace
   m_sync_sidecar_db.clear();
   m_spin_wait_sidecar_db.clear();
   m_wait_block_sidecar_db.clear();
+  if (m_shader_config->wait_block_exact_generation_enable &&
+      !m_shader_config->wait_block_enable) {
+    std::cerr << "[WAITBLOCK][CONFIG][FATAL] "
+                 "-wait_block_exact_generation_enable requires "
+                 "-wait_block_enable"
+              << std::endl;
+    abort();
+  }
   if (m_shader_config->wait_block_enable && !is_extra_trace_enabled) {
     std::cerr << "[WAITBLOCK][CONFIG][FATAL] -wait_block_enable requires "
                  "extra trace metadata and a strict schema-v5 sidecar"
@@ -2141,7 +2275,8 @@ void gpgpu_sim::parse_extra_trace_info(std::string filepath, bool is_extra_trace
     load_tma_completion_contract_validation(extra_info_dir, m_tma_sidecar_db);
     if (m_shader_config->wait_block_enable) {
       load_wait_block_sidecar_v5(
-          extra_info_dir, m_extra_trace_info, m_wait_block_sidecar_db);
+          extra_info_dir, m_extra_trace_info, m_wait_block_sidecar_db,
+          m_shader_config->wait_block_exact_generation_enable);
     } else if (m_shader_config->spin_wait_observe_enable) {
       load_legacy_spin_wait_sidecar(extra_info_dir, m_spin_wait_sidecar_db);
     }
@@ -2195,6 +2330,12 @@ void gpgpu_sim::parse_extra_trace_info(std::string filepath, bool is_extra_trace
                   << m_wait_block_sidecar_db.partial_regions_by_id.size()
                   << " report_passed=" << m_wait_block_sidecar_db.passed
                   << " report_skipped=" << m_wait_block_sidecar_db.skipped
+                  << " exact_ticket_slots="
+                  << m_wait_block_sidecar_db.exact_generation_ticket_slots
+                  << " exact_targets="
+                  << m_wait_block_sidecar_db.exact_generation_targets
+                  << " exact_fallbacks="
+                  << m_wait_block_sidecar_db.exact_generation_fallbacks
                   << std::endl;
       } else {
         std::cerr << "[SPINWAIT] loaded spin_wait_regions="
@@ -2322,6 +2463,21 @@ bool gpgpu_sim::lookup_missing_wait(unsigned int trace_kernel_id,
     return false;
   }
   record = it->second;
+  return true;
+}
+
+bool gpgpu_sim::lookup_wait_block_generation_ticket(
+    const WaitBlockGenerationTicketKey &key,
+    WaitBlockGenerationTicket &ticket) const {
+  if (!m_shader_config->wait_block_exact_generation_enable ||
+      !m_wait_block_sidecar_db.exact_generation_tickets_valid) {
+    return false;
+  }
+  auto it = m_wait_block_sidecar_db.exact_generation_tickets.find(key);
+  if (it == m_wait_block_sidecar_db.exact_generation_tickets.end()) {
+    return false;
+  }
+  ticket = it->second;
   return true;
 }
 
@@ -3620,6 +3776,15 @@ void shader_core_config::reg_options(class OptionParser *opp) {
       "probe, inject all-live missing waits, and defer proven partial-lane "
       "suffixes until their modeled wait releases. Requires a strict, complete "
       "spin_wait_sidecar.json v5. (default=0)",
+      "0");
+  option_parser_register(
+      opp, "-wait_block_exact_generation_enable", OPT_BOOL,
+      &wait_block_exact_generation_enable,
+      "Use trace-derived exact target generations for eligible WaitBlock "
+      "INJECT_MISSING_WAIT and FOLD_CAPTURED_POLL occurrences. Requires "
+      "-wait_block_enable and a "
+      "validated exact_generation_tickets section. Unsupported/count-only "
+      "tickets retain live phase-derived generation. (default=0)",
       "0");
   option_parser_register(
       opp, "-wait_block_debug", OPT_BOOL, &wait_block_debug,

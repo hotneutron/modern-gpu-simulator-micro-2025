@@ -22,11 +22,12 @@ cross-warp state to the trace. An audit of the existing full FA3 trace
 3,072 ambiguous sparse-role streams, while all 11,904 K10 TMA wait streams are
 ordinal-unique under a strict increasing-generation assumption. The existing
 trace therefore proves both the applicability of the restricted contract model
-and the need for one new captured field. **No simulator behavior change is
-authorized until a regenerated FA3 trace resolves every eligible occurrence
-with zero ambiguity.** The option-gated Stage E0 implementation is now present
-locally; CUDA/NVBit build and the regenerated-trace acceptance gate remain
-pending. B1 and later items remain pending.
+and the need for one new captured field. The Stage E1 consumer is implemented
+behind a separate default-off option so code review can proceed while the v2
+trace runs; the option must not be enabled for an acceptance run until the
+regenerated FA3 trace resolves every eligible occurrence with zero ambiguity.
+The Stage E0 ABI fix is committed, and the regenerated-trace acceptance gate
+remains pending. B1 and later items remain pending.
 
 This document is the authoritative index and the live execution record for
 B0-E. The detailed per-work-type designs and the historical evidence live in the
@@ -844,10 +845,13 @@ PC lists, fixed barrier addresses, or expected occurrence counts.
 
 ### Stage E1: separately reviewed simulator use
 
-Only after Stage E0 passes:
+The consumer may be implemented and reviewed behind a default-off option while
+Stage E0 runs. It may be enabled for an acceptance run only after Stage E0
+passes:
 
-1. Add exact `target_release_generation` to eligible
-   `INJECT_MISSING_WAIT` records.
+1. Add exact `target_release_generation` to every eligible selected WaitBlock
+   action occurrence: `INJECT_MISSING_WAIT` entry probes and
+   `FOLD_CAPTURED_POLL` primary poll probes.
 2. At runtime, bind the wait to that target instead of deriving a target from
    the simulator's current phase.
 3. Use:
@@ -859,18 +863,47 @@ current_generation >= target -> dependency already complete; continue
 
 4. Count `current_generation > target` as a late-arrival timing divergence. It
    is not a reason to bind the wait to a later same-parity generation.
-5. Leave unsupported TMA barriers, count-only barriers,
-   `FOLD_CAPTURED_POLL`, partial replay ownership, B0-D TMA completion identity,
-   and cursor movement unchanged.
+5. Unsupported TMA barriers and count-only barriers retain the existing
+   phase-derived fallback. Partial replay ownership, B0-D TMA completion
+   identity, and FOLD cursor movement remain unchanged.
 6. Validate K5 and K10 separately from B1. Require K5 clean exit without forced
    releases, K10 384/384 completion, all WaitBlock/TMABIND summaries PASS, and
    unchanged semantic TMA/BAR/memory work. Report total-cycle and producer/
    consumer-tail deltas rather than accepting completion alone.
 
-Expected Stage E1 files are the existing sidecar loader/runtime state in
-`shader.h` and `sm.cc`, plus parser/schema integration where the current v5
-records are loaded. File scope must be finalized from the code at implementation
-time; no B1 scheduler changes belong in E1.
+Stage E1 file scope is:
+
+```text
+util/tracer_nvbit/build_spin_wait_sidecar.py
+util/tracer_nvbit/tests/test_build_spin_wait_sidecar.py
+gpu-simulator/trace-parser/trace_parser.h
+gpu-simulator/trace-parser/trace_parser.cc
+gpu-simulator/trace-driven/trace_driven.cc
+gpu-simulator/gpgpu-sim/src/abstract_hardware_model.h
+gpu-simulator/gpgpu-sim/src/gpgpu-sim/gpu-sim.h
+gpu-simulator/gpgpu-sim/src/gpgpu-sim/gpu-sim.cc
+gpu-simulator/gpgpu-sim/src/gpgpu-sim/shader.h
+gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/tma_types.h
+gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/sm.h
+gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/sm.cc
+gpu-simulator/gpgpu-sim/configs/tested-cfgs/SM90_H100_L2_50MB_80GB/gpgpusim.config
+```
+
+No B1 scheduler changes belong in E1.
+
+The default-off preimplementation binds a ticket before PC-indexed trace
+storage using:
+
+```text
+(trace_kernel_id, CTA x/y/z, CTA-local warp_id,
+ unique_function_id, action_pc, source_warp_instruction_index)
+```
+
+The loader rejects a missing/duplicate ticket, action-strategy mismatch, mask
+mismatch, barrier-address mismatch, or wait-state mismatch. Exact tickets use
+the comparison above in both immediate and parked paths. Fallback tickets use
+the previous phase-derived target. `-wait_block_exact_generation_enable 0`
+preserves the existing simulator behavior.
 
 B0-E acceptance must eliminate the 13-warp all-live cycle without dropping a
 dependency, forcing a phase, guessing a generation, advancing a cursor outside

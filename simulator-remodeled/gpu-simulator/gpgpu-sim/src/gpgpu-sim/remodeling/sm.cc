@@ -3036,6 +3036,8 @@ void SM::start_partial_wait_hold(unsigned int warp_id,
   held.action_pc = arm.record.entry_probe_pc;
   held.unique_function_id = arm.unique_function_id;
   held.expected_gen = arm.expected_gen;
+  held.uses_exact_generation_ticket =
+      arm.uses_exact_generation_ticket;
   held.hold_start_cycle = get_current_gpu_cycle();
   held.last_heartbeat_cycle = held.hold_start_cycle;
   m_pending_sync_waits[warp_id] = held;
@@ -3439,7 +3441,12 @@ void SM::service_wait_block_release(unsigned warp_id) {
   }
   const std::string barrier_detail = barrier_detail_stream.str();
 
-  if (barrier_it != m_hopper_mbarriers.end()) {
+  // Once an exact target has completed, the live barrier object may already
+  // describe a later generation. Its contract cannot invalidate the completed
+  // dependency represented by this ticket.
+  if (barrier_it != m_hopper_mbarriers.end() &&
+      (!pending_wait.uses_exact_generation_ticket ||
+       cur_gen < exp_gen)) {
     const HopperMBarrierObject &barrier = barrier_it->second;
     const bool missing_assignment =
         barrier.expected_tx_bytes > barrier.completed_tx_bytes &&
@@ -3471,26 +3478,50 @@ void SM::service_wait_block_release(unsigned warp_id) {
   }
 
   if (cur_gen > exp_gen) {
-    m_wait_block_generation_overshoots_total++;
-    std::cerr << "[WAITBLOCK][abort][SM" << m_sm_id << "] cyc=" << now
-              << " reason=generation-overshoot"
-              << " strategy=" << wait_block_mode_to_string(pending_wait.mode)
-              << " block=" << block
-              << " trace_kernel=" << pending_wait.key.trace_kernel_id
-              << " function=" << pending_wait.unique_function_id
-              << " cta=" << pending_wait.key.cta_id
-              << " global_cta="
-              << m_local_to_global_cta_id[pending_wait.key.cta_id]
-              << " warp=" << warp_id << " action_pc=0x"
-              << format_hex_u64(pending_wait.action_pc)
-              << " barrier=0x"
-              << format_hex_u64(pending_wait.key.barrier_addr)
-              << " expected_gen=" << exp_gen << " current_gen=" << cur_gen
-              << " held_cycles=" << held_cycles
-              << barrier_detail
-              << " action=abort" << std::endl;
-    debug_dump_tma_binding_snapshot("waitblock-generation-overshoot");
-    abort();
+    if (pending_wait.uses_exact_generation_ticket) {
+      m_wait_block_late_arrivals_total++;
+      debug_log_wait_block_event(
+          "exact-generation-late-release",
+          "strategy=" +
+              std::string(wait_block_mode_to_string(pending_wait.mode)) +
+              " block=" + block +
+              " trace_kernel=" +
+              std::to_string(pending_wait.key.trace_kernel_id) +
+              " function=" +
+              std::to_string(pending_wait.unique_function_id) +
+              " cta=" + std::to_string(pending_wait.key.cta_id) +
+              " warp=" + std::to_string(warp_id) +
+              " action_pc=0x" +
+              format_hex_u64(pending_wait.action_pc) +
+              " barrier=0x" +
+              format_hex_u64(pending_wait.key.barrier_addr) +
+              " target_gen=" + std::to_string(exp_gen) +
+              " current_gen=" + std::to_string(cur_gen) +
+              " held_cycles=" + std::to_string(held_cycles));
+    } else {
+      m_wait_block_generation_overshoots_total++;
+      std::cerr << "[WAITBLOCK][abort][SM" << m_sm_id << "] cyc=" << now
+                << " reason=generation-overshoot"
+                << " strategy="
+                << wait_block_mode_to_string(pending_wait.mode)
+                << " block=" << block
+                << " trace_kernel=" << pending_wait.key.trace_kernel_id
+                << " function=" << pending_wait.unique_function_id
+                << " cta=" << pending_wait.key.cta_id
+                << " global_cta="
+                << m_local_to_global_cta_id[pending_wait.key.cta_id]
+                << " warp=" << warp_id << " action_pc=0x"
+                << format_hex_u64(pending_wait.action_pc)
+                << " barrier=0x"
+                << format_hex_u64(pending_wait.key.barrier_addr)
+                << " expected_gen=" << exp_gen
+                << " current_gen=" << cur_gen
+                << " held_cycles=" << held_cycles
+                << barrier_detail
+                << " action=abort" << std::endl;
+      debug_dump_tma_binding_snapshot("waitblock-generation-overshoot");
+      abort();
+    }
   }
 
   if (cur_gen < exp_gen) {
@@ -3549,7 +3580,8 @@ void SM::service_wait_block_release(unsigned warp_id) {
     return;
   }
 
-  if (!is_sync_wait_satisfied(pending_wait)) {
+  if (!pending_wait.uses_exact_generation_ticket &&
+      !is_sync_wait_satisfied(pending_wait)) {
     std::cerr << "[WAITBLOCK][abort][SM" << m_sm_id << "] cyc=" << now
               << " reason=generation-ready-state-mismatch"
               << " strategy=" << wait_block_mode_to_string(pending_wait.mode)
@@ -3865,7 +3897,9 @@ void SM::print_wait_block_summary() const {
       "active_partial_regions=%llu "
       "active_partial_capsules=%llu "
       "partial_replay_watchdog_aborts=%llu "
-      "generation_overshoots=%llu watchdog_aborts=%llu\n",
+      "generation_overshoots=%llu exact_generation_targets=%llu "
+      "generation_fallbacks=%llu late_arrival_divergences=%llu "
+      "watchdog_aborts=%llu\n",
       balanced ? "PASS" : "ACTIVE", m_sm_id, m_missing_wait_ready_total,
       m_missing_wait_holds_total,
       m_missing_wait_releases_total, m_partial_missing_wait_misses_total,
@@ -3883,6 +3917,9 @@ void SM::print_wait_block_summary() const {
       active_partial_regions, active_partial_capsules,
       m_partial_replay_watchdog_aborts_total,
       m_wait_block_generation_overshoots_total,
+      m_wait_block_exact_targets_total,
+      m_wait_block_generation_fallbacks_total,
+      m_wait_block_late_arrivals_total,
       m_wait_block_watchdog_aborts_total);
 
   if (!m_config->wait_block_debug) {
@@ -4217,7 +4254,7 @@ void SM::handle_sync_instruction(warp_inst_t &inst, unsigned int warp_id) {
       probe.is_trywait = is_trywait;
       probe.key = key;
       probe.wait_state_raw = inst.sync_semantic_raw;
-      const bool wait_ready = is_sync_wait_satisfied(probe);
+      const bool parity_wait_ready = is_sync_wait_satisfied(probe);
 
       if ((has_missing_action &&
            (missing_record.entry_probe_pc != inst.pc ||
@@ -4240,6 +4277,71 @@ void SM::handle_sync_instruction(warp_inst_t &inst, unsigned int warp_id) {
         abort();
       }
 
+      bool wait_ready = parity_wait_ready;
+      bool action_uses_exact_generation = false;
+      uint64_t action_expected_gen = 0;
+      if (m_config->wait_block_enable &&
+          (has_missing_action || has_poll_action)) {
+        const std::string &action_block_id =
+            has_missing_action ? missing_record.block_id
+                               : poll_region.block_id;
+        if (m_config->wait_block_exact_generation_enable) {
+          if (!inst.wait_block_generation_ticket_present) {
+            std::cerr << "[WAITBLOCK][abort][SM" << m_sm_id << "] cyc="
+                      << get_current_gpu_cycle()
+                      << " reason=missing-generation-ticket"
+                      << " block=" << action_block_id
+                      << " trace_kernel=" << inst.trace_kernel_id
+                      << " function=" << inst.unique_function_id
+                      << " cta=" << key.cta_id << " warp=" << warp_id
+                      << " action_pc=0x" << format_hex_u64(inst.pc)
+                      << " action=abort" << std::endl;
+            abort();
+          }
+          if (inst.wait_block_exact_target_valid) {
+            action_uses_exact_generation = true;
+            action_expected_gen =
+                inst.wait_block_target_release_generation;
+            m_wait_block_exact_targets_total++;
+            const uint64_t cur_gen = sync_barrier_gen(key);
+            wait_ready = cur_gen >= action_expected_gen;
+            if (cur_gen > action_expected_gen) {
+              m_wait_block_late_arrivals_total++;
+              debug_log_wait_block_event(
+                  "exact-generation-late-immediate",
+                  "strategy=" +
+                      std::string(
+                          wait_block_mode_to_string(
+                              has_missing_action
+                                  ? WaitBlockPendingMode::MISSING_WAIT_HOLD
+                                  : WaitBlockPendingMode::CAPTURED_POLL_HOLD)) +
+                      " block=" + action_block_id +
+                      " trace_kernel=" +
+                      std::to_string(inst.trace_kernel_id) +
+                      " function=" +
+                      std::to_string(inst.unique_function_id) +
+                      " cta=" + std::to_string(key.cta_id) +
+                      " warp=" + std::to_string(warp_id) +
+                      " action_pc=0x" + format_hex_u64(inst.pc) +
+                      " source_index=" +
+                      std::to_string(
+                          inst.wait_block_ticket_source_index) +
+                      " barrier=0x" + format_hex_u64(key.barrier_addr) +
+                      " target_gen=" +
+                      std::to_string(action_expected_gen) +
+                      " current_gen=" + std::to_string(cur_gen));
+            }
+          } else {
+            m_wait_block_generation_fallbacks_total++;
+            action_expected_gen = expected_gen_for_wait(
+                warp_id, key, inst.sync_semantic_raw);
+          }
+        } else {
+          action_expected_gen = expected_gen_for_wait(
+              warp_id, key, inst.sync_semantic_raw);
+        }
+      }
+
       if (m_config->producer_tail_instrument_enable) {
         record_producer_tail_phasechk_result(warp_id, wait_ready);
       }
@@ -4260,10 +4362,10 @@ void SM::handle_sync_instruction(warp_inst_t &inst, unsigned int warp_id) {
           m_missing_wait_ready_total++;
         }
         if (m_config->wait_block_enable && has_poll_action) {
-          const uint64_t expected_gen =
-              expected_gen_for_wait(warp_id, key, inst.sync_semantic_raw);
+          const uint64_t expected_gen = action_expected_gen;
           const uint64_t cur_gen = sync_barrier_gen(key);
-          if (expected_gen != cur_gen) {
+          if (!action_uses_exact_generation &&
+              expected_gen != cur_gen) {
             std::cerr << "[WAITBLOCK][abort][SM" << m_sm_id << "] cyc="
                       << get_current_gpu_cycle()
                       << " reason=immediate-generation-mismatch"
@@ -4413,8 +4515,7 @@ void SM::handle_sync_instruction(warp_inst_t &inst, unsigned int warp_id) {
                       << " action=abort" << std::endl;
             abort();
           }
-          const uint64_t expected_gen =
-              expected_gen_for_wait(warp_id, key, inst.sync_semantic_raw);
+          const uint64_t expected_gen = action_expected_gen;
           if (effective_mask != live_mask) {
             m_partial_missing_wait_misses_total++;
             const uint64_t effective_bits = effective_mask.to_ullong();
@@ -4459,6 +4560,8 @@ void SM::handle_sync_instruction(warp_inst_t &inst, unsigned int warp_id) {
             arm.key = key;
             arm.wait_state_raw = inst.sync_semantic_raw;
             arm.expected_gen = expected_gen;
+            arm.uses_exact_generation_ticket =
+                action_uses_exact_generation;
             arm.blocked_mask = effective_bits;
             arm.sibling_mask = sibling_bits;
             arm.unique_function_id = inst.unique_function_id;
@@ -4504,6 +4607,8 @@ void SM::handle_sync_instruction(warp_inst_t &inst, unsigned int warp_id) {
             held.action_pc = inst.pc;
             held.unique_function_id = inst.unique_function_id;
             held.expected_gen = expected_gen;
+            held.uses_exact_generation_ticket =
+                action_uses_exact_generation;
             held.hold_start_cycle = get_current_gpu_cycle();
             held.last_heartbeat_cycle = held.hold_start_cycle;
             m_pending_sync_waits[warp_id] = held;
@@ -4524,6 +4629,9 @@ void SM::handle_sync_instruction(warp_inst_t &inst, unsigned int warp_id) {
                     " wait_state=0x" +
                     format_hex_u64(inst.sync_semantic_raw) +
                     " expected_gen=" + std::to_string(expected_gen) +
+                    " exact_target=" +
+                    std::to_string(
+                        action_uses_exact_generation) +
                     " current_gen=" +
                     std::to_string(sync_barrier_gen(key)));
           }
@@ -4538,8 +4646,9 @@ void SM::handle_sync_instruction(warp_inst_t &inst, unsigned int warp_id) {
           held.action_pc = inst.pc;
           held.poll_loop_exit_pc = poll_region.exit_pc;
           held.unique_function_id = inst.unique_function_id;
-          held.expected_gen =
-              expected_gen_for_wait(warp_id, key, inst.sync_semantic_raw);
+          held.expected_gen = action_expected_gen;
+          held.uses_exact_generation_ticket =
+              action_uses_exact_generation;
           held.hold_start_cycle = get_current_gpu_cycle();
           held.last_heartbeat_cycle = held.hold_start_cycle;
           m_pending_sync_waits[warp_id] = held;
@@ -4568,6 +4677,8 @@ void SM::handle_sync_instruction(warp_inst_t &inst, unsigned int warp_id) {
                     format_hex_u64(poll_region.exit_pc) + " barrier=0x" +
                     format_hex_u64(key.barrier_addr) +
                     " expected_gen=" + std::to_string(held.expected_gen) +
+                    " exact_target=" +
+                    std::to_string(action_uses_exact_generation) +
                     " current_gen=" +
                     std::to_string(sync_barrier_gen(key)));
           }

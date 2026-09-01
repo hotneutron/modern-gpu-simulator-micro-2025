@@ -200,7 +200,29 @@ The runtime guard is an exact allow check, not a broad denylist.
 
 ## 6. Generation and watchdog
 
-Both strategies use the existing generation auditor.
+Both strategies use one generation policy selected per dynamic action
+occurrence.
+
+With `-wait_block_exact_generation_enable 1`, every active
+`INJECT_MISSING_WAIT` entry probe and `FOLD_CAPTURED_POLL` primary poll probe
+must carry a sidecar ticket. An eligible TMA-backed ticket is authoritative:
+
+```text
+current_gen < target_release_generation:
+    remain held
+
+current_gen >= target_release_generation:
+    release or continue immediately
+
+current_gen > target_release_generation:
+    count a late-arrival timing divergence
+```
+
+The greater-than case must not rebind the action to a later same-parity
+generation. This exact rule controls both the initial action result and release
+of an existing hold.
+
+Unsupported/count-only tickets use the original live phase-derived fallback:
 
 ```text
 current_gen < expected_gen:
@@ -213,7 +235,8 @@ current_gen > expected_gen:
     abort generation overshoot
 ```
 
-Generation never force-releases a wait.
+The feature is default-off. With the option disabled, both strategies use the
+fallback and preserve the existing behavior.
 
 The shared wait-hold watchdog threshold is 32,000 cycles. At 32,001 cycles,
 emit a full diagnostic and abort.
@@ -851,6 +874,9 @@ Runtime path A:
 
 - ready entry performs no hold and no cursor change;
 - ready partial entry performs no hold and replays normally;
+- an exact ticket with `current_gen < target` holds even if one-bit parity
+  aliases to ready;
+- an exact ticket with `current_gen >= target` continues without rebinding;
 - not-ready all-live entry holds and releases at the expected generation;
 - under the historical v1 implementation, a not-ready partial entry prints the
   complete diagnostic and aborts before scheduler or cursor mutation;
@@ -880,6 +906,10 @@ Runtime path B:
 
 - ready poll folds immediately to the local exit;
 - not-ready poll holds, releases, and folds to the local exit;
+- the selected primary poll uses its exact ticket for both immediate folding
+  and parked release;
+- `current_gen > target` folds/releases and increments the late-arrival
+  divergence counter;
 - both cursors advance consistently;
 - the exit instruction is not consumed;
 - an unexpected complementary-lane or semantic occurrence aborts before it is

@@ -929,6 +929,9 @@ class gpgpu_sim : public gpgpu_t {
   bool lookup_missing_wait(unsigned int trace_kernel_id,
                            unsigned int unique_function_id, address_type pc,
                            MissingWaitRecord &record) const;
+  bool lookup_wait_block_generation_ticket(
+      const WaitBlockGenerationTicketKey &key,
+      WaitBlockGenerationTicket &ticket) const;
   bool lookup_partial_wait_join(unsigned int trace_kernel_id,
                                 unsigned int unique_function_id,
                                 address_type pc,

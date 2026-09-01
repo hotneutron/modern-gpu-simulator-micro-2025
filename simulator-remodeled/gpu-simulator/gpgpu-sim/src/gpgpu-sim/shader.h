@@ -2287,6 +2287,12 @@ class shader_core_config : public core_config {
   // entry hold, and proven partial misses use bounded deferred replay.
   bool wait_block_enable;
 
+  // Use trace-derived target generations for WaitBlock action occurrences.
+  // Requires exact_generation_tickets in the schema-v5 WaitBlock sidecar.
+  // Unsupported/count-only barriers retain the existing live phase-derived
+  // generation rule. Default 0.
+  bool wait_block_exact_generation_enable;
+
   // Emit [WAITBLOCK] hold/release/guard/summary diagnostics.
   bool wait_block_debug;
 

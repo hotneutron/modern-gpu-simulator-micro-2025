@@ -105,6 +105,10 @@ inst_trace_t::inst_trace_t() {
   sync_barrier_addr = 0;
   sync_has_semantic_raw = false;
   sync_semantic_raw = 0;
+  wait_block_generation_ticket_present = false;
+  wait_block_exact_target_valid = false;
+  wait_block_target_release_generation = 0;
+  wait_block_ticket_source_index = 0;
   tma_completion_runtime_valid = false;
   tma_completion_barrier_addr = 0;
   tma_completion_barrier_ureg_id = 0;
@@ -145,6 +149,14 @@ inst_trace_t::inst_trace_t(const inst_trace_t &b) {
   sync_barrier_addr = b.sync_barrier_addr;
   sync_has_semantic_raw = b.sync_has_semantic_raw;
   sync_semantic_raw = b.sync_semantic_raw;
+  wait_block_generation_ticket_present =
+      b.wait_block_generation_ticket_present;
+  wait_block_exact_target_valid =
+      b.wait_block_exact_target_valid;
+  wait_block_target_release_generation =
+      b.wait_block_target_release_generation;
+  wait_block_ticket_source_index =
+      b.wait_block_ticket_source_index;
   tma_completion_runtime_valid = b.tma_completion_runtime_valid;
   tma_completion_barrier_addr = b.tma_completion_barrier_addr;
   tma_completion_barrier_ureg_id = b.tma_completion_barrier_ureg_id;
@@ -177,6 +189,10 @@ inst_trace_t::inst_trace_t(address_type pc, unsigned int unique_function_id, boo
   sync_barrier_addr = 0;
   sync_has_semantic_raw = false;
   sync_semantic_raw = 0;
+  wait_block_generation_ticket_present = false;
+  wait_block_exact_target_valid = false;
+  wait_block_target_release_generation = 0;
+  wait_block_ticket_source_index = 0;
   tma_completion_runtime_valid = false;
   tma_completion_barrier_addr = 0;
   tma_completion_barrier_ureg_id = 0;
@@ -682,6 +698,78 @@ void trace_parser::get_next_threadblock_traces(
       current_inst.block_idx_x = block_id_x;
       current_inst.block_idx_y = block_id_y;
       current_inst.block_idx_z = block_id_z;
+      const bool exact_generation_enabled =
+          gpu != nullptr && gpu->getShaderCoreConfig() != nullptr &&
+          gpu->getShaderCoreConfig()->wait_block_exact_generation_enable;
+      const uint32_t effective_mask =
+          current_inst.active_mask & current_inst.predicate_mask;
+      if (exact_generation_enabled && effective_mask != 0) {
+        MissingWaitRecord missing_wait;
+        SpinWaitRegionRecord captured_poll;
+        const bool is_missing_wait_action = gpu->lookup_missing_wait(
+            kernelid, current_inst.m_unique_function_id,
+            current_inst.m_pc, missing_wait);
+        const bool is_captured_poll_action =
+            gpu->lookup_spin_wait_region(
+                kernelid, current_inst.m_unique_function_id,
+                current_inst.m_pc, captured_poll) &&
+            captured_poll.foldable;
+        if (is_missing_wait_action || is_captured_poll_action) {
+          const WaitBlockGenerationTicketKey ticket_key{
+              kernelid,
+              block_id_x,
+              block_id_y,
+              block_id_z,
+              warp_id,
+              current_inst.m_unique_function_id,
+              current_inst.m_pc,
+              inst_count};
+          WaitBlockGenerationTicket ticket;
+          if (!gpu->lookup_wait_block_generation_ticket(
+                  ticket_key, ticket)) {
+            std::cerr
+                << "[WAITBLOCK][TICKET][FATAL] missing dynamic ticket"
+                << " kernel=" << kernelid
+                << " cta=" << block_id_x << "," << block_id_y << ","
+                << block_id_z << " warp=" << warp_id
+                << " function=" << current_inst.m_unique_function_id
+                << " pc=0x" << std::hex << current_inst.m_pc << std::dec
+                << " source_index=" << inst_count << std::endl;
+            abort();
+          }
+          if (ticket.active_mask != current_inst.active_mask ||
+              ticket.predicate_mask != current_inst.predicate_mask ||
+              !current_inst.sync_runtime_valid ||
+              !current_inst.sync_has_semantic_raw ||
+              ticket.barrier_addr != current_inst.sync_barrier_addr ||
+              ticket.wait_state_raw != current_inst.sync_semantic_raw) {
+            std::cerr
+                << "[WAITBLOCK][TICKET][FATAL] dynamic ticket payload mismatch"
+                << " kernel=" << kernelid
+                << " cta=" << block_id_x << "," << block_id_y << ","
+                << block_id_z << " warp=" << warp_id
+                << " function=" << current_inst.m_unique_function_id
+                << " pc=0x" << std::hex << current_inst.m_pc << std::dec
+                << " source_index=" << inst_count
+                << " ticket_masks=0x" << std::hex << ticket.active_mask
+                << "/0x" << ticket.predicate_mask
+                << " trace_masks=0x" << current_inst.active_mask
+                << "/0x" << current_inst.predicate_mask
+                << " ticket_barrier=0x" << ticket.barrier_addr
+                << " trace_barrier=0x" << current_inst.sync_barrier_addr
+                << " ticket_wait_state=0x" << ticket.wait_state_raw
+                << " trace_wait_state=0x" << current_inst.sync_semantic_raw
+                << std::dec << std::endl;
+            abort();
+          }
+          current_inst.wait_block_generation_ticket_present = true;
+          current_inst.wait_block_exact_target_valid =
+              ticket.has_target_release_generation;
+          current_inst.wait_block_target_release_generation =
+              ticket.target_release_generation;
+          current_inst.wait_block_ticket_source_index = inst_count;
+        }
+      }
       std::map<address_type, traced_instructions_by_pc> *map_inst_of_warp =
           threadblock_traces[warp_id];
       auto it_find_pc = map_inst_of_warp->find(current_inst.m_pc);

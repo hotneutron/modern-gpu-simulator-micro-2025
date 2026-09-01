@@ -791,6 +791,14 @@ bool trace_warp_inst_t::parse_from_trace_struct(
   trace_masks_valid = true;
   trace_active_mask = trace.active_mask;
   trace_predicate_mask = trace.predicate_mask;
+  wait_block_generation_ticket_present =
+      trace.wait_block_generation_ticket_present;
+  wait_block_exact_target_valid =
+      trace.wait_block_exact_target_valid;
+  wait_block_target_release_generation =
+      trace.wait_block_target_release_generation;
+  wait_block_ticket_source_index =
+      trace.wait_block_ticket_source_index;
 
   isize =
       16;  // starting from MAXWELL isize=16 bytes (including the control bytes)

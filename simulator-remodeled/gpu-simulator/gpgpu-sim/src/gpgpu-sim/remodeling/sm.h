@@ -759,6 +759,9 @@ class SM : public core_t, public shader_core_ctx_wrapper {
   unsigned long long m_partial_join_releases_total = 0;
   unsigned long long m_partial_replay_watchdog_aborts_total = 0;
   unsigned long long m_wait_block_generation_overshoots_total = 0;
+  unsigned long long m_wait_block_exact_targets_total = 0;
+  unsigned long long m_wait_block_generation_fallbacks_total = 0;
+  unsigned long long m_wait_block_late_arrivals_total = 0;
   unsigned long long m_wait_block_watchdog_aborts_total = 0;
  public:
   // Increment the tensor-op count for the CTA slot that owns hardware warp wid.

@@ -309,6 +309,39 @@ struct WaitBlockLookupKey {
   }
 };
 
+struct WaitBlockGenerationTicketKey {
+  uint32_t trace_kernel_id = 0;
+  uint32_t cta_x = 0;
+  uint32_t cta_y = 0;
+  uint32_t cta_z = 0;
+  uint32_t warp_id = 0;
+  uint32_t unique_function_id = 0;
+  uint64_t action_pc = 0;
+  uint64_t source_warp_instruction_index = 0;
+
+  bool operator<(const WaitBlockGenerationTicketKey &other) const {
+    return std::tie(
+               trace_kernel_id, cta_x, cta_y, cta_z, warp_id,
+               unique_function_id, action_pc,
+               source_warp_instruction_index) <
+           std::tie(
+               other.trace_kernel_id, other.cta_x, other.cta_y,
+               other.cta_z, other.warp_id, other.unique_function_id,
+               other.action_pc,
+               other.source_warp_instruction_index);
+  }
+};
+
+struct WaitBlockGenerationTicket {
+  bool has_target_release_generation = false;
+  uint64_t target_release_generation = 0;
+  uint64_t barrier_addr = 0;
+  uint64_t wait_state_raw = 0;
+  uint32_t active_mask = 0;
+  uint32_t predicate_mask = 0;
+  std::string fallback_reason;
+};
+
 struct MissingWaitRecord {
   std::string block_id;
   uint64_t entry_probe_pc = 0;
@@ -359,6 +392,8 @@ struct WaitBlockSidecarDB {
   std::map<std::string, PartialWaitRegionRecord> partial_regions_by_id;
   std::map<WaitBlockLookupKey, std::string> partial_region_id_by_join;
   std::map<WaitBlockLookupKey, std::string> partial_region_id_by_post_join;
+  std::map<WaitBlockGenerationTicketKey, WaitBlockGenerationTicket>
+      exact_generation_tickets;
   uint64_t discovered = 0;
   uint64_t passed = 0;
   uint64_t failed = 0;
@@ -371,6 +406,10 @@ struct WaitBlockSidecarDB {
   uint64_t partial_join_pending_visits = 0;
   uint64_t partial_join_already_issued_visits = 0;
   bool validation_complete = false;
+  bool exact_generation_tickets_valid = false;
+  uint64_t exact_generation_ticket_slots = 0;
+  uint64_t exact_generation_targets = 0;
+  uint64_t exact_generation_fallbacks = 0;
 
   void clear() {
     missing_wait_by_entry.clear();
@@ -378,6 +417,7 @@ struct WaitBlockSidecarDB {
     partial_regions_by_id.clear();
     partial_region_id_by_join.clear();
     partial_region_id_by_post_join.clear();
+    exact_generation_tickets.clear();
     discovered = 0;
     passed = 0;
     failed = 0;
@@ -390,6 +430,10 @@ struct WaitBlockSidecarDB {
     partial_join_pending_visits = 0;
     partial_join_already_issued_visits = 0;
     validation_complete = false;
+    exact_generation_tickets_valid = false;
+    exact_generation_ticket_slots = 0;
+    exact_generation_targets = 0;
+    exact_generation_fallbacks = 0;
   }
 
   bool empty() const {
@@ -462,6 +506,7 @@ struct HopperPartialWaitArm {
   HopperMBarrierKey key;
   uint64_t wait_state_raw = 0;
   uint64_t expected_gen = 0;
+  bool uses_exact_generation_ticket = false;
   uint64_t blocked_mask = 0;
   uint64_t sibling_mask = 0;
   uint32_t unique_function_id = 0;
@@ -503,6 +548,7 @@ struct HopperMBarrierPendingWait {
   // loop occurrences on release; an all-live missing wait never changes either
   // cursor; a partial missing wait replays occurrences extracted before hold.
   uint64_t expected_gen = 0;
+  bool uses_exact_generation_ticket = false;
   uint64_t hold_start_cycle = 0;
   uint64_t last_heartbeat_cycle = 0;
 };

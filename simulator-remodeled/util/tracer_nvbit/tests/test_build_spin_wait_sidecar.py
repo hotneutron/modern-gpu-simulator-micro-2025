@@ -169,6 +169,13 @@ class ContractOrdinalCaptureTest(unittest.TestCase):
         self.assertIsNone(reason)
         self.assertEqual(targets, [3])
 
+    def test_ready_snapshot_may_target_initial_generation_zero(self):
+        targets, reason = SIDECAR.resolve_contract_generation(
+            0, 0, 1, True)
+
+        self.assertIsNone(reason)
+        self.assertEqual(targets, [0])
+
     def test_miss_snapshot_targets_next_generation(self):
         targets, reason = SIDECAR.resolve_contract_generation(
             4, 4, 0, False)
@@ -637,6 +644,82 @@ class ContractOrdinalCaptureTest(unittest.TestCase):
         self.assertEqual(report["summary"]["unique_assignments"], 1)
         self.assertEqual(
             report["tickets"][0]["target_release_generation"], 1)
+        self.assertEqual(
+            report["runtime_ticket_summary"],
+            {"slots": 1, "exact_targets": 1, "fallback_slots": 0})
+        self.assertEqual(
+            report["runtime_tickets"][0][
+                "target_release_generation"], 1)
+        self.assertEqual(
+            report["runtime_tickets"][0][
+                "source_warp_instruction_index"], 2)
+        self.assertEqual(
+            report["runtime_tickets"][0]["runtime_strategy"],
+            "INJECT_MISSING_WAIT")
+
+    def test_fold_action_emits_exact_runtime_ticket(self):
+        instructions = [
+            captured_instruction_wire(
+                0x100, SIDECAR.CONTRACT_EVENT_EXCH,
+                0x1ffffe, 0, 0),
+            captured_instruction_wire(
+                0x110, SIDECAR.CONTRACT_EVENT_ARRIVE,
+                256, 0, 1, ordinal=1),
+            captured_instruction_wire(
+                0x120, SIDECAR.CONTRACT_EVENT_WAIT,
+                0, 1, 1),
+            sync_only_instruction_wire(0x140, 0),
+        ]
+        with tempfile.TemporaryDirectory() as root:
+            traces = Path(root)
+            kdir = (
+                traces / "threadblocks/device_0/stream_0/kernel_5")
+            kdir.mkdir(parents=True)
+            write_single_warp_threadblock(
+                kdir / "d_0_s_0_k_5_0,0,0.pb",
+                instructions)
+            extra = traces / "extra_info"
+            extra.mkdir()
+            (extra / "tma_completion_contracts.json").write_text(
+                json.dumps({
+                    "validation_complete": True,
+                    "kernels": [{
+                        "trace_kernel_id": 5,
+                        "contracts": 1,
+                        "expected_bytes": 256,
+                        "assigned_bytes": 256,
+                        "errors": [],
+                    }],
+                }))
+            sync_sites = {
+                (3, 0x100): {"sync_kind": "EXCH"},
+                (3, 0x110): {"sync_kind": "ARRIVE_EXPECT_TX"},
+                (3, 0x120): {"sync_kind": "TRYWAIT"},
+            }
+            sidecar_kernels = [{
+                "trace_kernel_id": 5,
+                "wait_blocks": [{
+                    "runtime_strategy": "FOLD_CAPTURED_POLL",
+                    "unique_function_id": 3,
+                    "poll_probe_pc": 0x120,
+                    "poll_wait_pcs": [0x120],
+                    "poll_loopback_pc": 0x130,
+                    "poll_loop_exit_pc": 0x140,
+                }],
+            }]
+
+            report = SIDECAR.analyze_mbarrier_contract_capture(
+                str(traces), {5: str(kdir)}, {5: 3},
+                sync_sites, sidecar_kernels, "all")
+
+        self.assertEqual(report["status"], "PASS")
+        self.assertEqual(
+            report["runtime_ticket_summary"],
+            {"slots": 1, "exact_targets": 1, "fallback_slots": 0})
+        ticket = report["runtime_tickets"][0]
+        self.assertEqual(ticket["runtime_strategy"],
+                         "FOLD_CAPTURED_POLL")
+        self.assertEqual(ticket["target_release_generation"], 1)
 
     def test_count_only_wait_may_omit_contract_payload(self):
         instructions = [
@@ -735,6 +818,9 @@ class ContractOrdinalCaptureTest(unittest.TestCase):
         self.assertEqual(report["summary"]["missing_snapshots"], 1)
         self.assertEqual(
             report["summary"]["rejected_tma_action_occurrences"], 1)
+        self.assertEqual(
+            report["runtime_ticket_summary"],
+            {"slots": 1, "exact_targets": 0, "fallback_slots": 1})
 
     def test_device_capture_avoids_prior_deadlock_patterns(self):
         tracer_dir = MODULE_PATH.parent / "tracer_tool"
@@ -790,6 +876,35 @@ class ContractOrdinalCaptureTest(unittest.TestCase):
             'if mbarrier_contract_capture:', runner_source)
         self.assertIn(
             '"-mbarrier-contract-v2"', runner_source)
+
+    def test_simulator_exact_generation_covers_inject_and_fold(self):
+        simulator_root = MODULE_PATH.parents[2] / "gpu-simulator"
+        sm_source = (
+            simulator_root /
+            "gpgpu-sim/src/gpgpu-sim/remodeling/sm.cc"
+        ).read_text()
+        loader_source = (
+            simulator_root /
+            "gpgpu-sim/src/gpgpu-sim/gpu-sim.cc"
+        ).read_text()
+
+        self.assertIn(
+            "(has_missing_action || has_poll_action)", sm_source)
+        self.assertIn(
+            "wait_ready = cur_gen >= action_expected_gen", sm_source)
+        self.assertIn(
+            "held.expected_gen = action_expected_gen", sm_source)
+        self.assertIn(
+            "held.uses_exact_generation_ticket =",
+            sm_source)
+        self.assertIn(
+            "!pending_wait.uses_exact_generation_ticket &&",
+            sm_source)
+        self.assertIn(
+            'strategy != "INJECT_MISSING_WAIT" &&',
+            loader_source)
+        self.assertIn(
+            'strategy != "FOLD_CAPTURED_POLL"', loader_source)
 
 
 class WaitBlockFoldProofTest(unittest.TestCase):
