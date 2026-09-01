@@ -834,17 +834,18 @@ void SM::service_wait_block_releases_for_cycle() {
 
   if (m_config->wait_block_debug) {
     for (const ReleasedWait &event : released) {
-      std::cerr << "[WAITBLOCK][release-fingerprint]"
-                << " sm=" << m_sm_id << " cycle=" << now
-                << " warp=" << event.warp_id
-                << " trace_kernel=" << event.key.trace_kernel_id
-                << " cta_slot=" << event.key.cta_id
-                << " global_cta="
-                << m_local_to_global_cta_id[event.key.cta_id]
-                << " barrier=0x"
-                << format_hex_u64(event.key.barrier_addr)
-                << " target_generation=" << event.target_generation
-                << std::endl;
+      std::ostringstream fingerprint;
+      fingerprint << "[WAITBLOCK][release-fingerprint]"
+                  << " sm=" << m_sm_id << " cycle=" << now
+                  << " warp=" << event.warp_id
+                  << " trace_kernel=" << event.key.trace_kernel_id
+                  << " cta_slot=" << event.key.cta_id
+                  << " global_cta="
+                  << m_local_to_global_cta_id[event.key.cta_id]
+                  << " barrier=0x"
+                  << format_hex_u64(event.key.barrier_addr)
+                  << " target_generation=" << event.target_generation;
+      fprintf(stderr, "%s\n", fingerprint.str().c_str());
     }
   }
 }

@@ -649,8 +649,10 @@ scheduler-side WaitBlock queries use the same immutable cycle-start generation
 and phase snapshot. Runtime accounting asserts one visit per hardware warp per
 active SM cycle and emits canonical release fingerprints. The default-off
 `-wait_block_reverse_subcore_traversal` option reverses the subsequent subcore
-issue order for the paired validation run. K5/K10 normal and reversed results
-remain pending.
+issue order for the paired validation run. Normal traversal passes K5 `.e91`
+and K10 `.e67` with exact release-service visit accounting; reversed traversal
+on the same trace remains pending. Detailed results are in
+[WAIT_BLOCK.md](WAIT_BLOCK.md).
 
 ## 8. Startup, payload, and provenance gates
 

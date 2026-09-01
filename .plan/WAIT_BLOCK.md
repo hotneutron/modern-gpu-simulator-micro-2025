@@ -15,8 +15,8 @@ validates the intended dependency identity and eliminates the K5 all-live
 late-arrival divergences where `current_generation > target_generation` when an
 INJECT action is reached; K10 reports zero. The K5 events are concentrated at
 `0x5a50` and `0x5bc0`, so producer/consumer timing analysis remains open even
-though dependency correctness and completion now pass. B1 implementation is
-local; normal/reversed K5/K10 validation remains pending.
+though dependency correctness and completion now pass. B1 normal traversal
+passes K5/K10; reversed traversal on the same trace remains pending.
 
 ## Remaining work
 
@@ -62,8 +62,33 @@ generation before the consumer reaches the action PC.
 in each CTA. The record preserves the full trace action identity and reports the
 target/next generation's contract-open, first/last TMA-issue, and completion
 cycles together with the preceding producer and consumer semantic anchors. The
-tested H100 configuration enables this probe for the pending combined K5/K10
-experiment. This is observe-only and does not infer hardware completion cycles.
+tested H100 configuration enabled this probe for K5 `.e91` and K10 `.e67`.
+This is observe-only and does not infer hardware completion cycles.
+
+**First-late result (`.e91`/`.o91`, 2026-09-01).** K5 emitted exactly 132
+records, one for every CTA. The first divergence is at `0x5a50` for 126 CTAs and
+`0x5bc0` for 6 CTAs; 131 are one generation late and one CTA is two generations
+late. Every target/next contract-open, TMA-issue, completion, producer-anchor,
+and consumer-anchor field is present.
+
+For the dominant `0x5a50` population, median intervals are:
+
+```text
+target completion -> next contract open       10,926 cycles
+next contract open -> next completion            357 cycles
+next completion -> consumer action PC           1,797 cycles
+last producer semantic anchor -> action PC         919 cycles
+last consumer semantic anchor -> action PC         107 cycles
+```
+
+The first divergence therefore already has a fully completed extra generation;
+it is not a late release-service observation or a long TMA-completion interval.
+The consumer is still issuing semantic work near the action PC, while producer
+warp 0 has opened and completed the next contract. This localizes the defect to
+relative producer/consumer progress before the final consumer anchor, not to
+the final wait issue itself. The trace still does not determine whether hardware
+would classify the simulator difference as an early producer, a late consumer,
+or both; that requires a cross-warp hardware timing observation.
 
 **Acceptance.** A proposed timing correction must preserve the exact ticket
 mapping, semantic TMA/BAR/memory histograms, TMA command/request/byte
@@ -109,8 +134,32 @@ cycle-start `(generation, phase)` snapshot, so an issue-phase ARRIVE cannot
 release a later subcore in the same cycle. The runtime checks one service visit
 per hardware warp and emits canonical per-release fingerprints. The default-off
 `-wait_block_reverse_subcore_traversal` switch reverses only the subsequent
-subcore issue traversal for the required paired validation. K5/K10 normal and
-reversed server runs remain pending.
+subcore issue traversal for the required paired validation. Normal traversal is
+complete; reversed traversal remains pending.
+
+**Normal-traversal result (`.e91`/`.o91` K5, `.e67`/`.o67` K10).**
+
+```text
+K5:  132/132 CTAs, 84,358 cycles, 132/132 WaitBlock PASS,
+     132/132 TMABIND PASS, 10,064 immediate late arrivals
+K10: 384/384 CTAs, 137,756 cycles, 384/384 WaitBlock PASS,
+     132/132 TMABIND PASS, zero late arrivals
+```
+
+Both kernels have zero watchdog/generation aborts, zero active final state, and
+exact `release_service_visits == release_service_expected_visits`. Canonical
+release-fingerprint counts equal the released-hold totals: K5 6,466 and K10
+9,104. One K10 fingerprint was split by a concurrent MEMBAR stderr line; the
+logger now formats the complete record before one `fprintf` call.
+
+Relative to `.o90`/`.o66`, K5 is 814 cycles faster and K10 is 408 cycles slower.
+K5's consumer-minus-producer drain tail improves in mean (2,075.7 -> 1,966.5),
+95th percentile (4,424 -> 3,511), and maximum (5,399 -> 5,257), although its
+median regresses (1,467 -> 1,665). These cycle deltas are diagnostic, not clean
+B1 causal measurements: the current v2 trace and the earlier run trace have
+different dynamic FOLD retry populations. The strict trace comparison still
+passes semantic fingerprint, WaitBlock structure/counts, and TMA contracts.
+Reversed traversal on the same current trace remains required for B1 acceptance.
 
 ### 3. B2 startup and provenance closure
 
@@ -251,9 +300,10 @@ snapshot" section below.
 3. The ABI-correct v2 trace and compact ticket artifact are authoritative for
    the 90,868 eligible exact-generation actions. The ordered-candidate and
    parity-only designs remain rejected historical evidence.
-4. Remaining WaitBlock engineering is B1, B2, B3, B5, B6, and B7 as listed in
-   the Batch B table below. B1 and B5 are not implemented; B2, B3, B6, and B7
-   require their listed audits or completion work.
+4. Remaining WaitBlock engineering is B1 validation plus B2, B3, B5, B6, and
+   B7 as listed in the Batch B table below. B1 normal traversal passes but
+   reversed traversal remains pending. B5 is not implemented; B2, B3, B6, and
+   B7 require their listed audits or completion work.
 5. Remaining cycle-accuracy work starts from the first K5
    `current_generation > target_generation` occurrence. Completion alone must
    not be used to close the 9,542 late-arrival timing divergences.
@@ -420,7 +470,7 @@ sidecar generation; unified metadata does not require unified runtime behavior.
 | B0-C | Size-only K5/K10 byte-conservation diagnostic with existing FIFO/release order | **COMPLETE**; byte contract PASS, K10 clean exit at 138,456 cycles, K5 runtime size PASS but all-live WaitBlock abort at cycle 68,176 |
 | B0-D | Exact TMA-command-to-barrier completion ownership | **COMPLETE / VALIDATED** at `39abefb`; `.e85` validates ownership-clean out-of-order completion, and K10 `.e62` completes 384/384 CTAs with 132/132 clean SM-level TMABIND final records after exercising two simultaneous open contracts per warp |
 | B0-E | K5 all-live cross-warp WaitBlock cycle (`0xb370`/`0x16c60`) | **COMPLETE / VALIDATED** at `087b53f`; K5 `.e90` completes 132/132 CTAs without forced release and K10 `.e66` completes 384/384. All WaitBlock/TMABIND summaries pass. K5's 9,542 late-arrival divergences remain a cycle-accuracy diagnostic |
-| B1 | One SM-level WaitBlock release phase per cycle | **IMPLEMENTED LOCALLY / VALIDATION PENDING**; normal and reversed K5/K10 runs are required |
+| B1 | One SM-level WaitBlock release phase per cycle | **NORMAL TRAVERSAL PASS / REVERSED PENDING**; K5 `.e91` and K10 `.e67` complete with exact release-service accounting |
 | B2 | WaitBlock startup and provenance fail-fast checks | **MOSTLY IMPLEMENTED** |
 | B3 | Assert-before-clear lifecycle checks | **IMPLEMENTED for WaitBlock and B0-D TMA ownership**; broader non-ownership cleanup audit remains partial |
 | B4 | Zero-active no-op and active required-payload checks | **IMPLEMENTED** |
