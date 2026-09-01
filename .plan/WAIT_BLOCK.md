@@ -235,7 +235,8 @@ Supporting documents (`TMA_BASE_ADDR.md`, `TMA_exact_base_mapping_integration.md
 material. Where they conflict with the companion designs above, the companion
 designs win.
 
-**Debug records:** [`../debug-k10-wait-fold-deadlock.md`](../debug-k10-wait-fold-deadlock.md).
+**Debug records:** the K10 `.e51` whole-warp park deadlock evidence is preserved
+in [WAIT_BLOCK_HISTORY.md](WAIT_BLOCK_HISTORY.md) section 6A.
 The K5 all-live WaitBlock-cycle evidence lives in
 [WAIT_BLOCK_HISTORY.md](WAIT_BLOCK_HISTORY.md) sections 2-6 plus the
 "Historical B0-E root-cause analysis" section below.
@@ -484,6 +485,21 @@ hardware observations at `0x5a50` and `0x74e0` into blocking holds when its
 modeled barriers were not ready. Those holds prevented the future ARRIVEs that
 the captured poll at `0xb370` needed, while the poll hold prevented warp 0 from
 issuing the work needed by the consumers.
+
+The CTA124 protobuf establishes the exact provider chain and proves that bypassing
+a hold is not locally semantics-preserving:
+
+- warp 12's held `0x74e0` occurrence is 72 source instructions before its
+  `0x7980` ARRIVE to `0x16c60`;
+- warp 4's held `0x5a50` occurrence is 199 source instructions before its
+  `0x6700` ARRIVE to `0x16c60`;
+- warp 0's held `0xb370` poll precedes the `0xa8a0` ARRIVE_EXPECT_TX and `0xa8b0`
+  TMA LOAD that feed `0x16c50`, then the corresponding `0x16c38` producer work.
+
+Those consumer prefixes contain HGMMA/MUFU and further synchronization, so
+advancing a held warp directly to its provider ARRIVE would execute or skip
+semantic work. Global park safety can reject or diagnose this state, but cannot
+by itself manufacture a safe release.
 
 The source-trace classification remains internally consistent:
 
@@ -764,7 +780,8 @@ K10 .e51:86459  SM24/warp0 entry 0xa9c0 barrier 0x31020 gen=0 for 32,001 cycles
 ```
 
 This hang sits at `gen=0`; it is a watchdog stall, not a generation overshoot.
-Its cause (`debug-k10-wait-fold-deadlock.md` L59-L75) is a whole-warp park of a
+Its cause ([WAIT_BLOCK_HISTORY.md](WAIT_BLOCK_HISTORY.md) section 6A) is a
+whole-warp park of a
 partial-mask (`0x1`) entry that blocks lane 1-31 `WARPSYNC.ALL 0xb2c0`, which
 prevents the producer ARRIVE that would flip `0x31020` gen0->gen1. Generation
 arithmetic is nowhere in that cycle.
@@ -1337,6 +1354,34 @@ only after repeated unchanged-binary runs establish a measurement envelope.
 Do not combine B0 and B1 in one commit or one causal validation step. Only after
 both B0-E and B1 pass may the `.e83` debugging session be closed and the older
 Batch B document be treated as historical rather than authoritative.
+
+## Code anchors
+
+Verified simulator locations for the WaitBlock and TMA-generation logic. Role 2b
+TMA generation equality is a B0-D invariant and must remain exact under any B0-E
+or B1 change.
+
+- Pure WaitBlock hold query:
+  [sm.cc:L2747-L2755](../simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/sm.cc#L2747-L2755)
+- Hold release, generation audit, watchdog, and replay:
+  [sm.cc:L3352-L3802](../simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/sm.cc#L3352-L3802)
+- Phase flip and per-generation reset:
+  [sm.cc:L3945-L4023](../simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/sm.cc#L3945-L4023)
+- Phase-only readiness:
+  [sm.cc:L4026-L4037](../simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/sm.cc#L4026-L4037)
+- Wait generation auditor:
+  [sm.cc:L4045-L4074](../simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/sm.cc#L4045-L4074)
+- Poll/missing-wait admission:
+  [sm.cc:L4262-L4554](../simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/sm.cc#L4262-L4554)
+- Exact TMA completion generation (Role 2b, preserve):
+  [sm.cc:L5098-L5133](../simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/sm.cc#L5098-L5133)
+  and
+  [sm.cc:L5252-L5263](../simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/sm.cc#L5252-L5263)
+- Scheduler-facing non-mutating hold classification:
+  [sm.cc:L5454-L5465](../simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/sm.cc#L5454-L5465)
+
+Line numbers are approximate anchors from the B0-E analysis session and should be
+re-confirmed against the current tree before editing.
 
 ## Document ownership
 

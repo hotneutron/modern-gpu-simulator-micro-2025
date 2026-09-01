@@ -871,6 +871,139 @@ current B0-E root-cause direction are in [WAIT_BLOCK.md](WAIT_BLOCK.md).
 
 ---
 
+## 6A. K10 `.e51` whole-warp park deadlock (pre-generation evidence)
+
+This is the earliest and clearest proof that a whole-warp park, not the
+generation counter, causes a WaitBlock hang. [WAIT_BLOCK.md](WAIT_BLOCK.md)
+cites this evidence in "Why generation removal is not the fix"; the primary log
+is retained here.
+
+The failed Stage 1.7/1.8 universal WaitBlock implementation (later reverted for
+the two-strategy v4 design) parked the whole warp at an admitted entry probe
+even when only one lane group executed it. In K10 `.e51` this produced a
+watchdog stall at `gen=0`:
+
+```text
+.e51:86459  K10 watchdog at SM24/warp0, entry 0xa9c0, barrier 0x31020,
+            gen=0 for 32,001 cycles
+```
+
+The clean pre-implementation run and the regressed run differ only in park
+placement, not in generation arithmetic:
+
+```text
+clean .e48:
+  a9c0 miss -> disjoint b2c0 executes -> park b980 @ 12758
+  barrier gen0->1 -> release b980 @ 22756
+
+regressed .e51:
+  park a9c0 @ 9129 -> b2c0 never executes
+  barrier remains gen0 -> watchdog @ 41130
+```
+
+The mechanism: K10 CTA24 `0xa9c0` executes with `active_mask=0x1`. Before lane 0
+reaches `0xa9e0`, lanes 1-31 execute `WARPSYNC.ALL 0xb2c0` with mask
+`0xfffffffe`. Parking the whole warp at the lane-0 entry suppresses that
+disjoint `0xb2c0`, so the producer ARRIVE that would flip `0x31020` gen0->gen1
+never issues. The hold sits at `gen=0`; no generation compare is involved.
+
+K5 `.e78` showed the same contract defect at release time instead of park time:
+a lane-0 Type-2 visit at `0x9e80` tried to skip toward semantic `resume_pc` with
+one linear warp cursor and hit lane 1-31 `BSYNC 0xa150`, which the offline
+mask-filtered proof had ignored.
+
+The root cause is that a lane-group semantic proof was used as authority for a
+whole-warp park and a whole-warp linear skip. Dynamic protobuf streams are
+linear warp issue streams, not one scalar CFG path: `b1e0(0x1) ->
+a150(0xfffffffe) -> b1f0(0x1)` is SIMT lane-group interleaving, not a same-lane
+CFG edge. This is exactly the boundary the two-strategy v4 design and the
+partial-lane v2 replay policy were built to respect (see
+[WAIT_BLOCK_SIMULATOR.md](WAIT_BLOCK_SIMULATOR.md)).
+
+The failed universal implementation was reverted; full-CTA strict
+post-processing then succeeded with the v4 two-strategy design
+(`discovered=43 passed=36 failed=0 skipped=7`, `INJECT_MISSING_WAIT=22`,
+`FOLD_CAPTURED_POLL=14`).
+
+## 6B. K5 `.e85` producer/consumer timing divergence measurements
+
+These are the quantitative timing findings behind the "K5 first late-arrival
+root cause" work item in [WAIT_BLOCK.md](WAIT_BLOCK.md). They are diagnostic
+evidence, not an accepted correction.
+
+Phase-window miss on the terminal occurrence:
+
+```text
+SM124 0x16c50 generation 3 parity-0 window:
+  opens (gen 2->3) at cycle 30,135
+  closes (gen 3->4) at cycle 34,575
+warp 12 reaches 0x74e0 at cycle 36,624   (2,049 cycles after closure)
+```
+
+Across the parity-0 terminal cohort, successful warp-12 occurrences have
+3,118-4,923 cycles from their preceding `0x16c60` ARRIVE to the `0x16c50`
+close; failed occurrences have only 512-863 cycles. Their raw consumer
+intervals overlap (success 2,429-3,741; failure 2,541-2,909), so absolute
+consumer latency alone does not classify the result. Remaining
+producer/consumer headroom does.
+
+The relevant TMA completion is not the defect:
+
+```text
+SM124 generation-3 0x16c50 contract opens at 34,183, flips at 34,575
+  -> 392-cycle TMA interval
+independently measured K5 TMA latency ~= 402 cycles/tile
+```
+
+Restoring the old identity-incorrect `.e76` 3,043-cycle interval would
+reintroduce an accidental delay, not correct TMA timing. The residual is in
+relative issue density: simulator consumer wall time is ~3,300 cycles/tile
+versus ~1,700 on HW, and matched issue density is 0.71x HW.
+
+Rejected correction axes (each independently disproven):
+
+- **TMA latency inflation:** the 392-cycle transfer already matches the ~402-cycle
+  mean; the multi-thousand-cycle `.e76` window came from an identity-incorrect
+  completion path.
+- **Fixed WGMMA/SFU latency reduction:** tensor occupancy is already lighter than
+  HW and SFU latency is already HW-faithful.
+- **Scheduler ordering alone (GTLRR):** a controlled A/B changed K5 cycles by only
+  -1.6%, lockstep 74.6% -> 73.8%, SM-idle 31.7% -> 31.5%.
+- **B1 release traversal:** the terminal SCC has no release event to reorder.
+
+Rejected HW-timestamp route (do not repeat):
+
+- NCU cannot recover an elapsed interval between low-frequency events; its data
+  is cumulative with no time axis.
+- Full-trace NVBit plus `clock64()` inflated the measured K5 producer tail by
+  ~7,073x and destroyed the natural CTA distribution.
+- The kernel is a prebuilt `flash_attn_3` binary, so there is no in-kernel
+  timestamp source-rebuild path in this repo.
+- Adding more NVBit callbacks measures the instrumented schedule, not the
+  uninstrumented HW schedule whose window is needed.
+
+Valid HW constraints are therefore aggregate only (EXIT-only producer/consumer
+tail, NCU issue density, operation counts, pipe/stall metrics). They can reject
+an incorrect timing change but cannot assign an exact per-occurrence barrier
+window.
+
+Two explicit semantic contracts were defined for any future schedule-robust
+WaitBlock change; neither is selected, and the exact-generation Stage E1 result
+made the liveness question moot for FA3:
+
+```text
+STRICT_PREDICTIVE
+    a modeled miss may hold only when the next satisfying transition remains
+    reachable without semantic work behind the candidate hold;
+    an unsafe schedule aborts immediately.
+
+TRACE_REPLAY
+    a captured-ready INJECT_MISSING_WAIT is observation-only;
+    FOLD_CAPTURED_POLL remains a modeled wait because the poll path was captured.
+```
+
+---
+
 ## 7. Rejected design: ordered occurrence-generation tickets
 
 Status: **REJECTED / RETAINED AS A FAIL-CLOSED ALTERNATIVE.** This section does
