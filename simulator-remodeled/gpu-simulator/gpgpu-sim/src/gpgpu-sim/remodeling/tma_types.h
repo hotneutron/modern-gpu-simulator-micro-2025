@@ -526,6 +526,9 @@ struct HopperMBarrierObject {
   // exact gen1/gen2 window without replaying the full SYNCDBG stream.
   uint64_t prev_flip_cycle = 0;
   uint64_t last_flip_cycle = 0;
+  uint64_t wait_block_release_snapshot_cycle = ~0ull;
+  uint64_t wait_block_release_snapshot_generation = 0;
+  uint32_t wait_block_release_snapshot_phase = 0;
   // Observe-only generation timeline populated only by the late-arrival
   // diagnostic. Keys are release generations: a contract opened while gen=N
   // and the following phase flip are both recorded under N+1.

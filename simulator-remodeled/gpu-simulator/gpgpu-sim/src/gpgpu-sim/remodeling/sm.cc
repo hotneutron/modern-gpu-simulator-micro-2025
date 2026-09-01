@@ -330,6 +330,8 @@ SM::SM(unsigned int num_subcores, gpgpu_sim *gpu, simt_core_cluster *cluster,
   m_partial_joined_regions.resize(config->max_warps_per_shader);
   m_wait_block_last_semantic_anchor_by_warp.resize(
       config->max_warps_per_shader);
+  m_wait_block_last_service_cycle_by_warp.resize(
+      config->max_warps_per_shader, ~0ull);
   m_tma_open_contracts_per_warp.resize(config->max_warps_per_shader, 0);
   m_tma_outstanding_bindings_per_warp.resize(
       config->max_warps_per_shader, 0);
@@ -762,6 +764,91 @@ void SM::record_wait_block_timing_issue(unsigned int warp_id,
   anchor.opcode = opcode;
 }
 
+void SM::service_wait_block_releases_for_cycle() {
+  if (!m_config->wait_block_enable) {
+    return;
+  }
+
+  const uint64_t now = get_current_gpu_cycle();
+  if (m_wait_block_release_snapshot_valid ||
+      m_wait_block_release_snapshot_cycle == now) {
+    std::cerr << "[WAITBLOCK][abort][SM" << m_sm_id << "] cyc=" << now
+              << " reason=duplicate-sm-release-phase action=abort"
+              << std::endl;
+    abort();
+  }
+
+  for (auto &entry : m_hopper_mbarriers) {
+    entry.second.wait_block_release_snapshot_cycle = now;
+    entry.second.wait_block_release_snapshot_generation = entry.second.gen;
+    entry.second.wait_block_release_snapshot_phase = entry.second.phase;
+  }
+  m_wait_block_release_snapshot_valid = true;
+  m_wait_block_release_snapshot_cycle = now;
+  ++m_wait_block_release_phase_cycles_total;
+
+  struct ReleasedWait {
+    unsigned int warp_id = 0;
+    HopperMBarrierKey key;
+    uint64_t target_generation = 0;
+  };
+  std::vector<ReleasedWait> released;
+  unsigned int visits = 0;
+  for (unsigned int warp_id = 0;
+       warp_id < m_pending_sync_waits.size(); ++warp_id) {
+    if (m_wait_block_last_service_cycle_by_warp[warp_id] == now) {
+      std::cerr << "[WAITBLOCK][abort][SM" << m_sm_id << "] cyc=" << now
+                << " reason=duplicate-warp-release-service"
+                << " warp=" << warp_id << " action=abort" << std::endl;
+      abort();
+    }
+    m_wait_block_last_service_cycle_by_warp[warp_id] = now;
+    ++visits;
+
+    const bool was_pending = m_pending_sync_waits[warp_id].valid;
+    HopperMBarrierKey released_key;
+    uint64_t released_target_generation = 0;
+    if (was_pending) {
+      released_key = m_pending_sync_waits[warp_id].key;
+      released_target_generation =
+          m_pending_sync_waits[warp_id].expected_gen;
+    }
+    service_wait_block_release(warp_id);
+    if (was_pending && !m_pending_sync_waits[warp_id].valid) {
+      ReleasedWait event;
+      event.warp_id = warp_id;
+      event.key = released_key;
+      event.target_generation = released_target_generation;
+      released.push_back(event);
+    }
+  }
+  if (visits != m_pending_sync_waits.size()) {
+    std::cerr << "[WAITBLOCK][abort][SM" << m_sm_id << "] cyc=" << now
+              << " reason=incomplete-sm-release-phase"
+              << " visits=" << visits
+              << " hardware_warps=" << m_pending_sync_waits.size()
+              << " action=abort" << std::endl;
+    abort();
+  }
+  m_wait_block_release_service_visits_total += visits;
+
+  if (m_config->wait_block_debug) {
+    for (const ReleasedWait &event : released) {
+      std::cerr << "[WAITBLOCK][release-fingerprint]"
+                << " sm=" << m_sm_id << " cycle=" << now
+                << " warp=" << event.warp_id
+                << " trace_kernel=" << event.key.trace_kernel_id
+                << " cta_slot=" << event.key.cta_id
+                << " global_cta="
+                << m_local_to_global_cta_id[event.key.cta_id]
+                << " barrier=0x"
+                << format_hex_u64(event.key.barrier_addr)
+                << " target_generation=" << event.target_generation
+                << std::endl;
+    }
+  }
+}
+
 void SM::cycle() {
   if (!isactive() && get_not_completed() == 0) return;
 
@@ -791,6 +878,7 @@ void SM::cycle() {
 
   m_ldst_unit_shared_of_sm->cycle();
   m_tma_unit_shared_of_sm->cycle();
+  service_wait_block_releases_for_cycle();
 
   if(m_config->is_interwarp_coalescing_enabled && 
         ((m_config->interwarp_coalescing_selection_policy == DEP_COUNT_WAIT_OLDEST_INST_IBUFFER_GENERIC) ||
@@ -798,8 +886,18 @@ void SM::cycle() {
     m_interwarp_coal_warps_waiting_dep_counter->clear();
   }
   
-  for (auto subcore : m_subcores) {
-    subcore->cycle();
+  if (m_config->wait_block_enable &&
+      m_config->wait_block_reverse_subcore_traversal) {
+    for (auto it = m_subcores.rbegin(); it != m_subcores.rend(); ++it) {
+      (*it)->cycle();
+    }
+  } else {
+    for (auto subcore : m_subcores) {
+      subcore->cycle();
+    }
+  }
+  if (m_config->wait_block_enable) {
+    m_wait_block_release_snapshot_valid = false;
   }
 
   if (m_config->producer_tail_instrument_enable) {
@@ -2800,9 +2898,9 @@ bool SM::warp_waiting_at_barrier(unsigned warp_id) const {
     return false;
   }
   // Pure peek: report hold state, do NOT clear here. The clear + "wait released"
-  // accounting and any captured-poll cursor skip happen exactly once on the
-  // issue path in service_wait_block_release(), never from this query
-  // from a std::sort comparator). See design doc 6.5.1.
+  // accounting and any captured-poll cursor skip happen exactly once in the
+  // SM-level cycle-start release phase, never from this query (including from
+  // a std::sort comparator). See design doc 6.5.1.
   return !is_wait_block_pending_satisfied(pending_wait);
 }
 
@@ -3407,6 +3505,14 @@ void SM::service_wait_block_release(unsigned warp_id) {
       warp_id >= m_pending_sync_waits.size()) {
     return;
   }
+  if (!m_wait_block_release_snapshot_valid ||
+      m_wait_block_release_snapshot_cycle != get_current_gpu_cycle()) {
+    std::cerr << "[WAITBLOCK][abort][SM" << m_sm_id << "] cyc="
+              << get_current_gpu_cycle()
+              << " reason=release-service-outside-sm-phase"
+              << " warp=" << warp_id << " action=abort" << std::endl;
+    abort();
+  }
   service_partial_replay_progress(warp_id);
   HopperPartialWaitArm &partial_arm = m_partial_wait_arms[warp_id];
   if (partial_arm.valid &&
@@ -3632,7 +3738,7 @@ void SM::service_wait_block_release(unsigned warp_id) {
     return;
   }
 
-  if (!is_wait_block_pending_satisfied(pending_wait)) {
+  if (!is_wait_block_pending_satisfied_at_cycle_start(pending_wait)) {
     std::cerr << "[WAITBLOCK][abort][SM" << m_sm_id << "] cyc=" << now
               << " reason=generation-ready-state-mismatch"
               << " strategy=" << wait_block_mode_to_string(pending_wait.mode)
@@ -3943,7 +4049,10 @@ void SM::print_wait_block_summary() const {
       m_partial_join_holds_total == m_partial_join_releases_total &&
       m_partial_deferred_occurrences_total ==
           m_partial_replayed_occurrences_total +
-              m_partial_folded_occurrences_total;
+              m_partial_folded_occurrences_total &&
+      m_wait_block_release_service_visits_total ==
+          m_wait_block_release_phase_cycles_total *
+              m_pending_sync_waits.size();
   const double captured_poll_avg_hold =
       m_fold_releases_total
           ? static_cast<double>(m_fold_park_cycles_total) /
@@ -3973,6 +4082,9 @@ void SM::print_wait_block_summary() const {
       "generation_overshoots=%llu exact_generation_targets=%llu "
       "generation_fallbacks=%llu late_arrival_divergences=%llu "
       "first_late_timing_reports=%llu "
+      "release_phase_cycles=%llu release_service_visits=%llu "
+      "release_service_expected_visits=%llu "
+      "reverse_subcore_traversal=%u "
       "watchdog_aborts=%llu\n",
       balanced ? "PASS" : "ACTIVE", m_sm_id, m_missing_wait_ready_total,
       m_missing_wait_holds_total,
@@ -3996,6 +4108,11 @@ void SM::print_wait_block_summary() const {
       m_wait_block_generation_fallbacks_total,
       m_wait_block_late_arrivals_total,
       m_wait_block_first_late_reports_total,
+      m_wait_block_release_phase_cycles_total,
+      m_wait_block_release_service_visits_total,
+      m_wait_block_release_phase_cycles_total *
+          m_pending_sync_waits.size(),
+      m_config->wait_block_reverse_subcore_traversal ? 1u : 0u,
       m_wait_block_watchdog_aborts_total);
 
   if (!m_config->wait_block_debug) {
@@ -4144,6 +4261,16 @@ void SM::recompute_sync_barrier_ready_and_maybe_flip_phase(
 
 bool SM::is_sync_wait_satisfied(
     const HopperMBarrierPendingWait &pending_wait) const {
+  if (m_wait_block_release_snapshot_valid) {
+    auto snapshot_it = m_hopper_mbarriers.find(pending_wait.key);
+    if (snapshot_it == m_hopper_mbarriers.end() ||
+        snapshot_it->second.wait_block_release_snapshot_cycle !=
+            m_wait_block_release_snapshot_cycle) {
+      return false;
+    }
+    return snapshot_it->second.wait_block_release_snapshot_phase !=
+           decode_sync_wait_phase(pending_wait.wait_state_raw);
+  }
   auto it = m_hopper_mbarriers.find(pending_wait.key);
   if (it == m_hopper_mbarriers.end()) {
     return false;
@@ -4164,7 +4291,28 @@ bool SM::is_wait_block_pending_satisfied(
   return is_sync_wait_satisfied(pending_wait);
 }
 
+bool SM::is_wait_block_pending_satisfied_at_cycle_start(
+    const HopperMBarrierPendingWait &pending_wait) const {
+  if (!m_wait_block_release_snapshot_valid ||
+      m_wait_block_release_snapshot_cycle != get_current_gpu_cycle()) {
+    std::cerr << "[WAITBLOCK][abort][SM" << m_sm_id << "] cyc="
+              << get_current_gpu_cycle()
+              << " reason=release-query-without-cycle-snapshot"
+              << " action=abort" << std::endl;
+    abort();
+  }
+  return is_wait_block_pending_satisfied(pending_wait);
+}
+
 uint64_t SM::sync_barrier_gen(const HopperMBarrierKey &key) const {
+  if (m_wait_block_release_snapshot_valid) {
+    auto snapshot_it = m_hopper_mbarriers.find(key);
+    return snapshot_it == m_hopper_mbarriers.end() ||
+                   snapshot_it->second.wait_block_release_snapshot_cycle !=
+                       m_wait_block_release_snapshot_cycle
+               ? 0
+               : snapshot_it->second.wait_block_release_snapshot_generation;
+  }
   auto it = m_hopper_mbarriers.find(key);
   return it == m_hopper_mbarriers.end() ? 0 : it->second.gen;
 }
@@ -4323,6 +4471,22 @@ uint64_t SM::expected_gen_for_wait(unsigned int warp_id,
   // and, if the barrier
   // over-flips past it, release sees cur_gen > expected and aborts.
   (void)warp_id;
+  if (m_wait_block_release_snapshot_valid) {
+    auto snapshot_it = m_hopper_mbarriers.find(key);
+    if (snapshot_it == m_hopper_mbarriers.end() ||
+        snapshot_it->second.wait_block_release_snapshot_cycle !=
+            m_wait_block_release_snapshot_cycle) {
+      return 1;
+    }
+    const unsigned parity = decode_sync_wait_phase(wait_state_raw);
+    const uint64_t cur_gen =
+        snapshot_it->second.wait_block_release_snapshot_generation;
+    return cur_gen +
+           (snapshot_it->second.wait_block_release_snapshot_phase ==
+                    static_cast<uint32_t>(parity)
+                ? 1ULL
+                : 0ULL);
+  }
   auto barrier_it = m_hopper_mbarriers.find(key);
   if (barrier_it == m_hopper_mbarriers.end()) {
     // An unseen barrier is modeled not-ready by is_sync_wait_satisfied().

@@ -250,6 +250,7 @@ class SM : public core_t, public shader_core_ctx_wrapper {
   // missing-wait holds only clear pending state; partial holds activate or
   // resume their owned replay stream; captured-poll holds fold residual loop
   // occurrences to their exact local exit.
+  void service_wait_block_releases_for_cycle();
   void service_wait_block_release(unsigned warp_id);
   // [Stage 1] Common cursor-skip used by BOTH the parked-release and the
   // immediate-ready fold paths so their skip semantics can never diverge again.
@@ -424,6 +425,8 @@ class SM : public core_t, public shader_core_ctx_wrapper {
       const HopperMBarrierPendingWait &pending_wait) const;
   bool is_wait_block_pending_satisfied(
       const HopperMBarrierPendingWait &pending_wait) const;
+  bool is_wait_block_pending_satisfied_at_cycle_start(
+      const HopperMBarrierPendingWait &pending_wait) const;
   // Pin a modeled wait to the current generation when already ready, or to the
   // next generation when not ready. Release audits this absolute generation,
   // not only parity, so an overshoot cannot be mistaken for a valid release.
@@ -515,6 +518,11 @@ class SM : public core_t, public shader_core_ctx_wrapper {
   std::vector<HopperPartialWaitArm> m_partial_wait_arms;
   std::vector<HopperPartialReplayProgress> m_partial_replay_progress;
   std::vector<std::set<std::string>> m_partial_joined_regions;
+  bool m_wait_block_release_snapshot_valid = false;
+  uint64_t m_wait_block_release_snapshot_cycle = ~0ull;
+  std::vector<uint64_t> m_wait_block_last_service_cycle_by_warp;
+  unsigned long long m_wait_block_release_phase_cycles_total = 0;
+  unsigned long long m_wait_block_release_service_visits_total = 0;
   std::vector<uint32_t> m_tma_open_contracts_per_warp;
   std::vector<uint32_t> m_tma_outstanding_bindings_per_warp;
   std::vector<uint64_t> m_tma_max_completed_transfer_uid_per_warp;

@@ -643,6 +643,15 @@ kernel cycle. A completion present in the cycle-start snapshot may release in
 that cycle; an arrival issued during subcore issue may release no warp until
 the next cycle.
 
+Implementation checkpoint (2026-09-01): the release service has moved to SM
+scope immediately after shared-pipeline/TMA advancement. Release and
+scheduler-side WaitBlock queries use the same immutable cycle-start generation
+and phase snapshot. Runtime accounting asserts one visit per hardware warp per
+active SM cycle and emits canonical release fingerprints. The default-off
+`-wait_block_reverse_subcore_traversal` option reverses the subsequent subcore
+issue order for the paired validation run. K5/K10 normal and reversed results
+remain pending.
+
 ## 8. Startup, payload, and provenance gates
 
 When `-wait_block_enable=1`, retain or enforce:

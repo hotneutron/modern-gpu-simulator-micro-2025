@@ -2298,6 +2298,11 @@ class shader_core_config : public core_config {
   // producer/consumer semantic anchors. Observe-only. Default 0.
   bool wait_block_late_arrival_instrument_enable;
 
+  // Validation-only traversal perturbation for B1. The SM-level release phase
+  // remains canonical; only the subsequent subcore issue traversal is reversed.
+  // Requires WaitBlock. Default 0.
+  bool wait_block_reverse_subcore_traversal;
+
   // Emit [WAITBLOCK] hold/release/guard/summary diagnostics.
   bool wait_block_debug;
 

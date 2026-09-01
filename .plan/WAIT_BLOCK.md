@@ -15,7 +15,8 @@ validates the intended dependency identity and eliminates the K5 all-live
 late-arrival divergences where `current_generation > target_generation` when an
 INJECT action is reached; K10 reports zero. The K5 events are concentrated at
 `0x5a50` and `0x5bc0`, so producer/consumer timing analysis remains open even
-though dependency correctness and completion now pass. B1 also remains pending.
+though dependency correctness and completion now pass. B1 implementation is
+local; normal/reversed K5/K10 validation remains pending.
 
 ## Remaining work
 
@@ -100,6 +101,16 @@ Require identical ordered `(cycle, warp, barrier, target_generation)` release
 fingerprints, identical final cycles, exactly one release-service visit per
 hardware warp per SM cycle, unchanged trace cursors, and unchanged semantic and
 TMA conservation summaries.
+
+**Implementation checkpoint.** The release service now runs once at SM scope
+after shared LD/ST and TMA pipeline advancement and before any subcore issue.
+The release service and scheduler-side hold queries share an immutable
+cycle-start `(generation, phase)` snapshot, so an issue-phase ARRIVE cannot
+release a later subcore in the same cycle. The runtime checks one service visit
+per hardware warp and emits canonical per-release fingerprints. The default-off
+`-wait_block_reverse_subcore_traversal` switch reverses only the subsequent
+subcore issue traversal for the required paired validation. K5/K10 normal and
+reversed server runs remain pending.
 
 ### 3. B2 startup and provenance closure
 
@@ -405,7 +416,7 @@ sidecar generation; unified metadata does not require unified runtime behavior.
 | B0-C | Size-only K5/K10 byte-conservation diagnostic with existing FIFO/release order | **COMPLETE**; byte contract PASS, K10 clean exit at 138,456 cycles, K5 runtime size PASS but all-live WaitBlock abort at cycle 68,176 |
 | B0-D | Exact TMA-command-to-barrier completion ownership | **COMPLETE / VALIDATED** at `39abefb`; `.e85` validates ownership-clean out-of-order completion, and K10 `.e62` completes 384/384 CTAs with 132/132 clean SM-level TMABIND final records after exercising two simultaneous open contracts per warp |
 | B0-E | K5 all-live cross-warp WaitBlock cycle (`0xb370`/`0x16c60`) | **COMPLETE / VALIDATED** at `087b53f`; K5 `.e90` completes 132/132 CTAs without forced release and K10 `.e66` completes 384/384. All WaitBlock/TMABIND summaries pass. K5's 9,542 late-arrival divergences remain a cycle-accuracy diagnostic |
-| B1 | One SM-level WaitBlock release phase per cycle | **REQUIRED / NOT IMPLEMENTED** |
+| B1 | One SM-level WaitBlock release phase per cycle | **IMPLEMENTED LOCALLY / VALIDATION PENDING**; normal and reversed K5/K10 runs are required |
 | B2 | WaitBlock startup and provenance fail-fast checks | **MOSTLY IMPLEMENTED** |
 | B3 | Assert-before-clear lifecycle checks | **IMPLEMENTED for WaitBlock and B0-D TMA ownership**; broader non-ownership cleanup audit remains partial |
 | B4 | Zero-active no-op and active required-payload checks | **IMPLEMENTED** |

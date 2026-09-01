@@ -1265,14 +1265,6 @@ void Subcore::issue(SM *shared_sm) {
 void Subcore::modify_warp_state() {
   for (auto warp : m_warps_of_subcore) {
     warp->get_dependency_state()->cycle();
-    // Once-per-warp-per-cycle WaitBlock release service, at the top of
-    // issue() (subcore.cc:593) so it runs BEFORE this cycle's decode()/fetch()
-    // re-prime get_pc(). Missing-wait release preserves the cursor; captured
-    // poll release advances only to the sidecar-owned local exit.
-    if (m_config->wait_block_enable && warp != NULL &&
-        !warp->done_exit()) {
-      m_sm->service_wait_block_release(warp->get_warp_id());
-    }
     if(m_config->is_interwarp_coalescing_enabled && ((m_config->interwarp_coalescing_selection_policy == DEP_COUNT_WAIT_OLDEST_INST_IBUFFER_GENERIC) ||
         (m_config->interwarp_coalescing_selection_policy == DEP_COUNT_WAIT_OLDEST_INST_IBUFFER_CHECKING_WARP_ID)))  {
       if (warp == NULL || warp->done_exit()) {
