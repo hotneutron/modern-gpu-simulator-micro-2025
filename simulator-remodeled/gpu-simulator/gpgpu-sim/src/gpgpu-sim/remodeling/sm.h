@@ -419,7 +419,7 @@ class SM : public core_t, public shader_core_ctx_wrapper {
   HopperMBarrierObject &get_or_create_sync_barrier(
       const HopperMBarrierKey &key);
   void recompute_sync_barrier_ready_and_maybe_flip_phase(
-      HopperMBarrierObject &barrier, uint64_t barrier_addr);
+      const HopperMBarrierKey &key, HopperMBarrierObject &barrier);
   bool is_sync_wait_satisfied(
       const HopperMBarrierPendingWait &pending_wait) const;
   bool is_wait_block_pending_satisfied(
@@ -433,9 +433,14 @@ class SM : public core_t, public shader_core_ctx_wrapper {
   // Current monotonic generation of a barrier (0 if the object does not exist).
   uint64_t sync_barrier_gen(const HopperMBarrierKey &key) const;
   void clear_sync_barrier_state_for_cta(unsigned int cta_id);
-  void open_tma_assignment_contract(unsigned int warp_id,
+  void open_tma_assignment_contract(const warp_inst_t &inst,
+                                    unsigned int warp_id,
                                     const HopperMBarrierKey &key,
                                     uint32_t expected_tx_bytes);
+  void record_wait_block_first_late_arrival(
+      const warp_inst_t &inst, unsigned int warp_id,
+      const HopperMBarrierKey &key, uint64_t target_generation,
+      uint64_t current_generation, WaitBlockPendingMode mode);
   void claim_tma_completion_target(const warp_inst_t &inst, TMACommand &cmd);
   void complete_tma_load(TmaCompletionTarget &target, uint32_t memory_bytes,
                          uint64_t transfer_uid);
@@ -448,6 +453,8 @@ class SM : public core_t, public shader_core_ctx_wrapper {
   void debug_log_wait_block_event(const char *event,
                                   const std::string &message);
   void debug_dump_sync_counters() const;
+  void record_wait_block_timing_issue(unsigned int warp_id,
+                                      const warp_inst_t *inst);
 
   InterWarp_Coalescing_Waiting_Dep_Counters *m_interwarp_coal_warps_waiting_dep_counter;
 
@@ -511,6 +518,20 @@ class SM : public core_t, public shader_core_ctx_wrapper {
   std::vector<uint32_t> m_tma_open_contracts_per_warp;
   std::vector<uint32_t> m_tma_outstanding_bindings_per_warp;
   std::vector<uint64_t> m_tma_max_completed_transfer_uid_per_warp;
+  struct WaitBlockSemanticAnchor {
+    bool valid = false;
+    uint64_t cycle = 0;
+    uint32_t trace_kernel_id = 0;
+    uint32_t unique_function_id = 0;
+    uint32_t cta_warp_id = 0;
+    uint64_t pc = 0;
+    uint64_t source_index = 0;
+    std::string opcode;
+  };
+  std::vector<WaitBlockSemanticAnchor>
+      m_wait_block_last_semantic_anchor_by_warp;
+  bool m_wait_block_first_late_reported_by_cta_slot[MAX_CTA_PER_SHADER] = {
+      false};
   uint64_t m_next_tma_contract_id = 1;
   uint64_t m_next_tma_binding_id = 1;
   uint64_t m_tma_binding_launch_uid = 0;
@@ -766,6 +787,7 @@ class SM : public core_t, public shader_core_ctx_wrapper {
   unsigned long long m_wait_block_exact_targets_total = 0;
   unsigned long long m_wait_block_generation_fallbacks_total = 0;
   unsigned long long m_wait_block_late_arrivals_total = 0;
+  unsigned long long m_wait_block_first_late_reports_total = 0;
   unsigned long long m_wait_block_watchdog_aborts_total = 0;
  public:
   // Increment the tensor-op count for the CTA slot that owns hardware warp wid.

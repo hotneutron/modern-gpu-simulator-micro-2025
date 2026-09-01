@@ -1243,6 +1243,11 @@ class inst_t {
   uint64_t tma_completion_barrier_addr = 0;
   uint32_t tma_completion_barrier_ureg_id = 0;
   uint32_t trace_kernel_id = 0;
+  uint32_t trace_block_idx_x = 0;
+  uint16_t trace_block_idx_y = 0;
+  uint16_t trace_block_idx_z = 0;
+  uint32_t trace_cta_warp_id = 0;
+  uint64_t trace_instruction_index = 0;
   bool trace_masks_valid = false;
   uint32_t trace_active_mask = 0;
   uint32_t trace_predicate_mask = 0;

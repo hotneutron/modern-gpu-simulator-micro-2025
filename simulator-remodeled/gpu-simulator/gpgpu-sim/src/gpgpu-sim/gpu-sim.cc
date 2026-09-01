@@ -2513,6 +2513,14 @@ void gpgpu_sim::parse_extra_trace_info(std::string filepath, bool is_extra_trace
               << std::endl;
     abort();
   }
+  if (m_shader_config->wait_block_late_arrival_instrument_enable &&
+      !m_shader_config->wait_block_exact_generation_enable) {
+    std::cerr << "[WAITBLOCK][CONFIG][FATAL] "
+                 "-wait_block_late_arrival_instrument_enable requires "
+                 "-wait_block_exact_generation_enable"
+              << std::endl;
+    abort();
+  }
   if (m_shader_config->wait_block_enable && !is_extra_trace_enabled) {
     std::cerr << "[WAITBLOCK][CONFIG][FATAL] -wait_block_enable requires "
                  "extra trace metadata and a strict schema-v5 sidecar"
@@ -4068,6 +4076,13 @@ void shader_core_config::reg_options(class OptionParser *opp) {
       "Requires -wait_block_enable, schema-v2 compact tickets, and an eligible "
       "barrier manifest. Count-only tickets retain live phase-derived "
       "generation. (default=0)",
+      "0");
+  option_parser_register(
+      opp, "-wait_block_late_arrival_instrument_enable", OPT_BOOL,
+      &wait_block_late_arrival_instrument_enable,
+      "Emit one [WAITBLOCK][late-timing-first] record per affected CTA with "
+      "the exact wait identity, target/next generation timing, and preceding "
+      "producer/consumer semantic anchors. Observe-only. (default=0)",
       "0");
   option_parser_register(
       opp, "-wait_block_debug", OPT_BOOL, &wait_block_debug,

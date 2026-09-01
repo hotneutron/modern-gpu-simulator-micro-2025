@@ -97,6 +97,8 @@ struct inst_trace_t {
   uint32_t block_idx_x;
   uint16_t block_idx_y;
   uint16_t block_idx_z;
+  uint32_t trace_cta_warp_id = 0;
+  uint64_t trace_instruction_index = 0;
   bool is_constant_addr_already_calculated;
   bool sync_site_valid;
   SyncInstructionKind sync_kind;

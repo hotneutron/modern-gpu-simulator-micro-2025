@@ -168,6 +168,8 @@ inst_trace_t::inst_trace_t(const inst_trace_t &b) {
   block_idx_x = b.block_idx_x;
   block_idx_y = b.block_idx_y;
   block_idx_z = b.block_idx_z;
+  trace_cta_warp_id = b.trace_cta_warp_id;
+  trace_instruction_index = b.trace_instruction_index;
 }
 
 inst_trace_t::inst_trace_t(address_type pc, unsigned int unique_function_id, bool is_instruction_traced) {
@@ -698,6 +700,8 @@ void trace_parser::get_next_threadblock_traces(
       current_inst.block_idx_x = block_id_x;
       current_inst.block_idx_y = block_id_y;
       current_inst.block_idx_z = block_id_z;
+      current_inst.trace_cta_warp_id = warp_id;
+      current_inst.trace_instruction_index = inst_count;
       const bool exact_generation_enabled =
           gpu != nullptr && gpu->getShaderCoreConfig() != nullptr &&
           gpu->getShaderCoreConfig()->wait_block_exact_generation_enable;

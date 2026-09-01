@@ -55,6 +55,15 @@ generation before the consumer reaches the action PC.
    evidence cannot distinguish an early producer from a late consumer, obtain
    an additional hardware timing observation instead of choosing one.
 
+**Instrumentation checkpoint.** The simulator now has the default-off
+`-wait_block_late_arrival_instrument_enable` option. When enabled, it emits one
+`[WAITBLOCK][late-timing-first]` record for the first exact INJECT late arrival
+in each CTA. The record preserves the full trace action identity and reports the
+target/next generation's contract-open, first/last TMA-issue, and completion
+cycles together with the preceding producer and consumer semantic anchors. The
+tested H100 configuration enables this probe for the pending combined K5/K10
+experiment. This is observe-only and does not infer hardware completion cycles.
+
 **Acceptance.** A proposed timing correction must preserve the exact ticket
 mapping, semantic TMA/BAR/memory histograms, TMA command/request/byte
 conservation, and K10's zero late-arrival result. It must reduce K5's cycle

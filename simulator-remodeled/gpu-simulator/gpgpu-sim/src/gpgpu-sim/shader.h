@@ -2293,6 +2293,11 @@ class shader_core_config : public core_config {
   // barriers retain the live phase-derived generation rule. Default 0.
   bool wait_block_exact_generation_enable;
 
+  // Emit one structured record for the first exact-generation late INJECT
+  // action in each CTA, including barrier-generation timing and the preceding
+  // producer/consumer semantic anchors. Observe-only. Default 0.
+  bool wait_block_late_arrival_instrument_enable;
+
   // Emit [WAITBLOCK] hold/release/guard/summary diagnostics.
   bool wait_block_debug;
 

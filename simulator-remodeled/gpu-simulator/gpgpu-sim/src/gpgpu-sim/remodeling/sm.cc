@@ -240,6 +240,21 @@ bool is_validated_arrive_opcode(const std::string &opcode) {
          opcode == "SYNCS.ARRIVE.TRANS64.A1T0";          // nvcc, plain
 }
 
+bool is_wait_block_timing_semantic_opcode(const std::string &opcode) {
+  static const char *const prefixes[] = {
+      "HGMMA",  "IGMMA",   "QGMMA",  "BGMMA", "OGMMA", "MMA",
+      "WGMMA",  "MUFU",    "UTMALDG", "UTMASTG", "UTMACMDFLUSH",
+      "UBLKCP", "UBLKPF",  "UTMAPF", "UTMAREDG", "UBLKRED",
+      "UTMACCTL", "LDGSTS", "STG", "LDG", "STS", "LDS", "ATOM",
+      "ATOMS", "RED", "SYNCS.ARRIVE", "SYNCS.EXCH", "BAR"};
+  for (const char *prefix : prefixes) {
+    if (opcode.rfind(prefix, 0) == 0) {
+      return true;
+    }
+  }
+  return false;
+}
+
 void debug_print_sm_barrier_issue(const warp_inst_t &inst,
                                   unsigned int warp_id,
                                   unsigned int sm_id,
@@ -313,6 +328,8 @@ SM::SM(unsigned int num_subcores, gpgpu_sim *gpu, simt_core_cluster *cluster,
   m_partial_wait_arms.resize(config->max_warps_per_shader);
   m_partial_replay_progress.resize(config->max_warps_per_shader);
   m_partial_joined_regions.resize(config->max_warps_per_shader);
+  m_wait_block_last_semantic_anchor_by_warp.resize(
+      config->max_warps_per_shader);
   m_tma_open_contracts_per_warp.resize(config->max_warps_per_shader, 0);
   m_tma_outstanding_bindings_per_warp.resize(
       config->max_warps_per_shader, 0);
@@ -717,6 +734,32 @@ void SM::reset_stall_reason_align_stats() {
   for (auto subcore : m_subcores) {
     subcore->reset_stall_reason_align_stats();
   }
+}
+
+void SM::record_wait_block_timing_issue(unsigned int warp_id,
+                                        const warp_inst_t *inst) {
+  if (!m_config->wait_block_late_arrival_instrument_enable ||
+      inst == nullptr ||
+      warp_id >= m_wait_block_last_semantic_anchor_by_warp.size() ||
+      !inst->has_extra_trace_instruction_info()) {
+    return;
+  }
+  const std::string opcode =
+      inst->get_extra_trace_instruction_info().get_op_code();
+  if (!is_wait_block_timing_semantic_opcode(opcode)) {
+    return;
+  }
+
+  WaitBlockSemanticAnchor &anchor =
+      m_wait_block_last_semantic_anchor_by_warp[warp_id];
+  anchor.valid = true;
+  anchor.cycle = get_current_gpu_cycle();
+  anchor.trace_kernel_id = inst->trace_kernel_id;
+  anchor.unique_function_id = inst->unique_function_id;
+  anchor.cta_warp_id = inst->trace_cta_warp_id;
+  anchor.pc = inst->pc;
+  anchor.source_index = inst->trace_instruction_index;
+  anchor.opcode = opcode;
 }
 
 void SM::cycle() {
@@ -1724,6 +1767,7 @@ void SM::init_warps(unsigned cta_id, unsigned start_thread, unsigned end_thread,
     m_wait_pending_by_cta_slot[cta_id] = 0;
     m_wait_released_by_cta_slot[cta_id] = 0;
     m_producer_tail_by_cta_slot[cta_id] = ProducerTailCounters();
+    m_wait_block_first_late_reported_by_cta_slot[cta_id] = false;
   }
   if (m_config->model == POST_DOMINATOR) {
     unsigned start_warp = start_thread / m_config->warp_size;
@@ -1754,6 +1798,10 @@ void SM::init_warps(unsigned cta_id, unsigned start_thread, unsigned end_thread,
         m_warp_drain_cycle[i] = 0;
         m_sync_first_miss_barrier[i] = 0;
         m_sync_first_miss_cycle[i] = 0;
+        if (i < m_wait_block_last_semantic_anchor_by_warp.size()) {
+          m_wait_block_last_semantic_anchor_by_warp[i] =
+              WaitBlockSemanticAnchor();
+        }
       }
       if (m_gpu->resume_option == 1 && kernel_id == m_gpu->resume_kernel &&
           ctaid >= m_gpu->resume_CTA && ctaid < m_gpu->checkpoint_CTA_t) {
@@ -3924,6 +3972,7 @@ void SM::print_wait_block_summary() const {
       "partial_replay_watchdog_aborts=%llu "
       "generation_overshoots=%llu exact_generation_targets=%llu "
       "generation_fallbacks=%llu late_arrival_divergences=%llu "
+      "first_late_timing_reports=%llu "
       "watchdog_aborts=%llu\n",
       balanced ? "PASS" : "ACTIVE", m_sm_id, m_missing_wait_ready_total,
       m_missing_wait_holds_total,
@@ -3946,6 +3995,7 @@ void SM::print_wait_block_summary() const {
       m_wait_block_exact_targets_total,
       m_wait_block_generation_fallbacks_total,
       m_wait_block_late_arrivals_total,
+      m_wait_block_first_late_reports_total,
       m_wait_block_watchdog_aborts_total);
 
   if (!m_config->wait_block_debug) {
@@ -4006,7 +4056,7 @@ HopperMBarrierObject &SM::get_or_create_sync_barrier(
 }
 
 void SM::recompute_sync_barrier_ready_and_maybe_flip_phase(
-    HopperMBarrierObject &barrier, uint64_t barrier_addr) {
+    const HopperMBarrierKey &key, HopperMBarrierObject &barrier) {
   const bool arrive_ready =
       barrier.arrive_count >= barrier.expected_arrive_count;
   const bool tx_ready =
@@ -4029,7 +4079,7 @@ void SM::recompute_sync_barrier_ready_and_maybe_flip_phase(
     std::cerr << "[TMABIND][abort][SM" << m_sm_id << "] cyc="
               << get_current_gpu_cycle()
               << " reason=phase-flip-with-incomplete-contract"
-              << " barrier=0x" << format_hex_u64(barrier_addr)
+              << " barrier=0x" << format_hex_u64(key.barrier_addr)
               << " generation=" << barrier.gen
               << " contract_id=" << barrier.tx_contract_id
               << " assignment_open=" << barrier.assignment_open
@@ -4046,7 +4096,7 @@ void SM::recompute_sync_barrier_ready_and_maybe_flip_phase(
   }
   m_sync_debug_phase_flip++;
   debug_log_sync_event(
-      "phase flip barrier=0x" + format_hex_u64(barrier_addr) + " phase=" +
+      "phase flip barrier=0x" + format_hex_u64(key.barrier_addr) + " phase=" +
       std::to_string(barrier.phase) + "->" +
       std::to_string(barrier.phase ^ 1) + " arrive=" +
       std::to_string(barrier.arrive_count) + "/" +
@@ -4058,6 +4108,12 @@ void SM::recompute_sync_barrier_ready_and_maybe_flip_phase(
       std::to_string(barrier.tx_contract_id) + " gen=" +
       std::to_string(barrier.gen) + "->" + std::to_string(barrier.gen + 1) +
       " prev_flip_cyc=" + std::to_string(barrier.last_flip_cycle));
+  if (m_config->wait_block_late_arrival_instrument_enable) {
+    WaitBlockGenerationTiming &timing =
+        barrier.wait_block_timing[barrier.gen + 1];
+    timing.completion_valid = true;
+    timing.completion_cycle = get_current_gpu_cycle();
+  }
   barrier.prev_flip_cycle = barrier.last_flip_cycle;
   barrier.last_flip_cycle = get_current_gpu_cycle();
   barrier.phase ^= 1;
@@ -4111,6 +4167,140 @@ bool SM::is_wait_block_pending_satisfied(
 uint64_t SM::sync_barrier_gen(const HopperMBarrierKey &key) const {
   auto it = m_hopper_mbarriers.find(key);
   return it == m_hopper_mbarriers.end() ? 0 : it->second.gen;
+}
+
+void SM::record_wait_block_first_late_arrival(
+    const warp_inst_t &inst, unsigned int warp_id,
+    const HopperMBarrierKey &key, uint64_t target_generation,
+    uint64_t current_generation, WaitBlockPendingMode mode) {
+  if (!m_config->wait_block_late_arrival_instrument_enable ||
+      key.cta_id >= MAX_CTA_PER_SHADER ||
+      m_wait_block_first_late_reported_by_cta_slot[key.cta_id]) {
+    return;
+  }
+  m_wait_block_first_late_reported_by_cta_slot[key.cta_id] = true;
+  ++m_wait_block_first_late_reports_total;
+
+  WaitBlockGenerationTiming target_timing;
+  WaitBlockGenerationTiming next_timing;
+  auto barrier_it = m_hopper_mbarriers.find(key);
+  if (barrier_it != m_hopper_mbarriers.end()) {
+    auto target_it =
+        barrier_it->second.wait_block_timing.find(target_generation);
+    if (target_it != barrier_it->second.wait_block_timing.end()) {
+      target_timing = target_it->second;
+    }
+    auto next_it =
+        barrier_it->second.wait_block_timing.find(target_generation + 1);
+    if (next_it != barrier_it->second.wait_block_timing.end()) {
+      next_timing = next_it->second;
+    }
+  }
+
+  const WaitBlockSemanticAnchor *consumer_anchor = nullptr;
+  if (warp_id < m_wait_block_last_semantic_anchor_by_warp.size() &&
+      m_wait_block_last_semantic_anchor_by_warp[warp_id].valid) {
+    consumer_anchor = &m_wait_block_last_semantic_anchor_by_warp[warp_id];
+  }
+  const uint32_t producer_warp =
+      next_timing.contract_open_valid
+          ? next_timing.contract_owner_warp_id
+          : target_timing.contract_owner_warp_id;
+  const WaitBlockSemanticAnchor *producer_anchor = nullptr;
+  if (producer_warp < m_wait_block_last_semantic_anchor_by_warp.size() &&
+      m_wait_block_last_semantic_anchor_by_warp[producer_warp].valid) {
+    producer_anchor =
+        &m_wait_block_last_semantic_anchor_by_warp[producer_warp];
+  }
+
+  const uint64_t now = get_current_gpu_cycle();
+  std::ostringstream line;
+  line << "[WAITBLOCK][late-timing-first]"
+       << " sm=" << m_sm_id << " cycle=" << now
+       << " trace_kernel=" << inst.trace_kernel_id
+       << " cta=" << inst.trace_block_idx_x << ","
+       << inst.trace_block_idx_y << "," << inst.trace_block_idx_z
+       << " cta_slot=" << key.cta_id
+       << " global_cta=" << m_local_to_global_cta_id[key.cta_id]
+       << " cta_warp=" << inst.trace_cta_warp_id
+       << " hardware_warp=" << warp_id
+       << " function=" << inst.unique_function_id
+       << " action_pc=0x" << format_hex_u64(inst.pc)
+       << " source_index=" << inst.wait_block_ticket_source_index
+       << " barrier=0x" << format_hex_u64(key.barrier_addr)
+       << " strategy=" << wait_block_mode_to_string(mode)
+       << " target_gen=" << target_generation
+       << " current_gen=" << current_generation
+       << " generation_distance="
+       << current_generation - target_generation;
+
+  const auto append_generation =
+      [&line](const char *name, uint64_t generation,
+              const WaitBlockGenerationTiming &timing) {
+        line << " " << name << "_gen=" << generation
+             << " " << name << "_open_valid="
+             << timing.contract_open_valid
+             << " " << name << "_open_cycle="
+             << timing.contract_open_cycle
+             << " " << name << "_producer_hardware_warp="
+             << timing.contract_owner_warp_id
+             << " " << name << "_producer_cta_warp="
+             << timing.contract_owner_cta_warp_id
+             << " " << name << "_open_function="
+             << timing.contract_open_function_id
+             << " " << name << "_open_pc=0x"
+             << format_hex_u64(timing.contract_open_pc)
+             << " " << name << "_open_source_index="
+             << timing.contract_open_source_index
+             << " " << name << "_tma_issue_valid="
+             << timing.tma_issue_valid
+             << " " << name << "_first_tma_issue_cycle="
+             << timing.first_tma_issue_cycle
+             << " " << name << "_last_tma_issue_cycle="
+             << timing.last_tma_issue_cycle
+             << " " << name << "_tma_commands="
+             << timing.tma_commands_issued
+             << " " << name << "_completion_valid="
+             << timing.completion_valid
+             << " " << name << "_completion_cycle="
+             << timing.completion_cycle;
+      };
+  append_generation("target", target_generation, target_timing);
+  append_generation("next", target_generation + 1, next_timing);
+
+  const auto append_anchor =
+      [&line, now](const char *name,
+                   const WaitBlockSemanticAnchor *anchor) {
+        line << " " << name << "_valid=" << (anchor != nullptr);
+        if (anchor != nullptr) {
+          line << " " << name << "_cycle=" << anchor->cycle
+               << " " << name << "_age=" << now - anchor->cycle
+               << " " << name << "_cta_warp=" << anchor->cta_warp_id
+               << " " << name << "_function="
+               << anchor->unique_function_id
+               << " " << name << "_pc=0x"
+               << format_hex_u64(anchor->pc)
+               << " " << name << "_source_index="
+               << anchor->source_index
+               << " " << name << "_opcode=" << anchor->opcode;
+        }
+      };
+  append_anchor("producer_anchor", producer_anchor);
+  append_anchor("consumer_anchor", consumer_anchor);
+
+  if (target_timing.completion_valid) {
+    line << " target_complete_to_consumer="
+         << now - target_timing.completion_cycle;
+  }
+  if (next_timing.contract_open_valid) {
+    line << " next_open_to_consumer="
+         << now - next_timing.contract_open_cycle;
+  }
+  if (next_timing.completion_valid) {
+    line << " next_complete_to_consumer="
+         << now - next_timing.completion_cycle;
+  }
+  std::cerr << line.str() << std::endl;
 }
 
 uint64_t SM::expected_gen_for_wait(unsigned int warp_id,
@@ -4350,18 +4540,21 @@ void SM::handle_sync_instruction(warp_inst_t &inst, unsigned int warp_id) {
             wait_ready = cur_gen >= action_expected_gen;
             if (cur_gen > action_expected_gen) {
               m_wait_block_late_arrivals_total++;
+              const WaitBlockPendingMode late_mode =
+                  has_missing_action
+                      ? WaitBlockPendingMode::MISSING_WAIT_HOLD
+                      : (is_primary_fold_wait
+                             ? WaitBlockPendingMode::CAPTURED_POLL_HOLD
+                             : WaitBlockPendingMode::FOLD_AUX_WAIT_HOLD);
+              if (has_missing_action) {
+                record_wait_block_first_late_arrival(
+                    inst, warp_id, key, action_expected_gen, cur_gen,
+                    late_mode);
+              }
               debug_log_wait_block_event(
                   "exact-generation-late-immediate",
                   "strategy=" +
-                      std::string(
-                          wait_block_mode_to_string(
-                              has_missing_action
-                                  ? WaitBlockPendingMode::MISSING_WAIT_HOLD
-                                  : (is_primary_fold_wait
-                                         ? WaitBlockPendingMode::
-                                               CAPTURED_POLL_HOLD
-                                         : WaitBlockPendingMode::
-                                               FOLD_AUX_WAIT_HOLD))) +
+                      std::string(wait_block_mode_to_string(late_mode)) +
                       " block=" + action_block_id +
                       " trace_kernel=" +
                       std::to_string(inst.trace_kernel_id) +
@@ -4879,6 +5072,9 @@ void SM::handle_sync_instruction(warp_inst_t &inst, unsigned int warp_id) {
       barrier.assignment_kernel_launch_uid = 0;
       barrier.assignment_global_cta_id = ~0u;
       barrier.ready = false;
+      if (m_config->wait_block_late_arrival_instrument_enable) {
+        barrier.wait_block_timing.clear();
+      }
       debug_log_sync_event(
           "exch warp=" + std::to_string(warp_id) + " cta=" +
           std::to_string(key.cta_id) + " barrier=0x" +
@@ -4900,8 +5096,7 @@ void SM::handle_sync_instruction(warp_inst_t &inst, unsigned int warp_id) {
           std::to_string(active_threads) + "(mask=0x" + active_mask_hex +
           ") arrive=" + std::to_string(barrier.arrive_count) + "/" +
           std::to_string(barrier.expected_arrive_count));
-      recompute_sync_barrier_ready_and_maybe_flip_phase(barrier,
-                                                        key.barrier_addr);
+      recompute_sync_barrier_ready_and_maybe_flip_phase(key, barrier);
       break;
     case SyncInstructionKind::ARRIVE_COUNTED:
       m_sync_debug_arrive++;
@@ -4918,8 +5113,7 @@ void SM::handle_sync_instruction(warp_inst_t &inst, unsigned int warp_id) {
           std::to_string(active_threads) + "(mask=0x" + active_mask_hex +
           ") arrive=" + std::to_string(barrier.arrive_count) + "/" +
           std::to_string(barrier.expected_arrive_count));
-      recompute_sync_barrier_ready_and_maybe_flip_phase(barrier,
-                                                        key.barrier_addr);
+      recompute_sync_barrier_ready_and_maybe_flip_phase(key, barrier);
       break;
     case SyncInstructionKind::ARRIVE_EXPECT_TX: {
       // The resolver labels every arrive ARRIVE_EXPECT_TX; the real behavior is
@@ -4935,7 +5129,7 @@ void SM::handle_sync_instruction(warp_inst_t &inst, unsigned int warp_id) {
         mark_producer_warp(warp_id);
         barrier.arrive_count += active_threads;
         uint32_t tx_bytes = static_cast<uint32_t>(inst.sync_semantic_raw);
-        open_tma_assignment_contract(warp_id, key, tx_bytes);
+        open_tma_assignment_contract(inst, warp_id, key, tx_bytes);
         debug_log_sync_event(
             "arrive_expect_tx warp=" + std::to_string(warp_id) + " cta=" +
             std::to_string(key.cta_id) + " barrier=0x" +
@@ -4960,8 +5154,7 @@ void SM::handle_sync_instruction(warp_inst_t &inst, unsigned int warp_id) {
             ") arrive=" + std::to_string(barrier.arrive_count) + "/" +
             std::to_string(barrier.expected_arrive_count));
       }
-      recompute_sync_barrier_ready_and_maybe_flip_phase(barrier,
-                                                        key.barrier_addr);
+      recompute_sync_barrier_ready_and_maybe_flip_phase(key, barrier);
       break;
     }
     case SyncInstructionKind::NONE:
@@ -5068,7 +5261,8 @@ void SM::clear_sync_barrier_state_for_cta(unsigned int cta_id) {
   }
 }
 
-void SM::open_tma_assignment_contract(unsigned int warp_id,
+void SM::open_tma_assignment_contract(const warp_inst_t &inst,
+                                      unsigned int warp_id,
                                       const HopperMBarrierKey &key,
                                       uint32_t expected_tx_bytes) {
   if (warp_id >= m_tma_open_contracts_per_warp.size() ||
@@ -5168,6 +5362,18 @@ void SM::open_tma_assignment_contract(unsigned int warp_id,
       std::max(m_tma_max_open_contracts_per_warp,
                m_tma_open_contracts_per_warp[warp_id]);
   ++m_tma_contracts_opened;
+
+  if (m_config->wait_block_late_arrival_instrument_enable) {
+    WaitBlockGenerationTiming &timing =
+        barrier.wait_block_timing[barrier.gen + 1];
+    timing.contract_open_valid = true;
+    timing.contract_open_cycle = get_current_gpu_cycle();
+    timing.contract_owner_warp_id = warp_id;
+    timing.contract_owner_cta_warp_id = inst.trace_cta_warp_id;
+    timing.contract_open_function_id = inst.unique_function_id;
+    timing.contract_open_pc = inst.pc;
+    timing.contract_open_source_index = inst.trace_instruction_index;
+  }
 
   debug_log_tma_binding_event(
       "contract-open",
@@ -5342,6 +5548,17 @@ void SM::claim_tma_completion_target(const warp_inst_t &inst,
   ++m_tma_outstanding_bindings_per_warp[warp_id];
   ++m_tma_bindings_created;
   m_tma_assigned_credit_bytes += target.credit_bytes;
+  if (m_config->wait_block_late_arrival_instrument_enable) {
+    WaitBlockGenerationTiming &timing =
+        barrier.wait_block_timing[barrier.gen + 1];
+    const uint64_t now = get_current_gpu_cycle();
+    if (!timing.tma_issue_valid) {
+      timing.tma_issue_valid = true;
+      timing.first_tma_issue_cycle = now;
+    }
+    timing.last_tma_issue_cycle = now;
+    ++timing.tma_commands_issued;
+  }
 
   if (barrier.assigned_tx_bytes == barrier.expected_tx_bytes) {
     if (m_tma_open_contracts_per_warp[warp_id] == 0) {
@@ -5545,8 +5762,7 @@ void SM::complete_tma_load(TmaCompletionTarget &target,
       std::to_string(barrier.completed_tx_bytes) + "/" +
       std::to_string(barrier.expected_tx_bytes) + " binding_id=" +
       std::to_string(target.binding_id));
-  recompute_sync_barrier_ready_and_maybe_flip_phase(
-      barrier, target.key.barrier_addr);
+  recompute_sync_barrier_ready_and_maybe_flip_phase(target.key, barrier);
 }
 
 bool SM::are_all_wait_barrier_ready(unsigned int warp_id) {

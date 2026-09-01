@@ -486,6 +486,22 @@ struct HopperMBarrierKey {
   }
 };
 
+struct WaitBlockGenerationTiming {
+  bool contract_open_valid = false;
+  uint64_t contract_open_cycle = 0;
+  uint32_t contract_owner_warp_id = ~0u;
+  uint32_t contract_owner_cta_warp_id = ~0u;
+  uint32_t contract_open_function_id = 0;
+  uint64_t contract_open_pc = 0;
+  uint64_t contract_open_source_index = 0;
+  bool tma_issue_valid = false;
+  uint64_t first_tma_issue_cycle = 0;
+  uint64_t last_tma_issue_cycle = 0;
+  uint32_t tma_commands_issued = 0;
+  bool completion_valid = false;
+  uint64_t completion_cycle = 0;
+};
+
 struct HopperMBarrierObject {
   uint32_t expected_arrive_count = 0;
   uint32_t arrive_count = 0;
@@ -510,6 +526,10 @@ struct HopperMBarrierObject {
   // exact gen1/gen2 window without replaying the full SYNCDBG stream.
   uint64_t prev_flip_cycle = 0;
   uint64_t last_flip_cycle = 0;
+  // Observe-only generation timeline populated only by the late-arrival
+  // diagnostic. Keys are release generations: a contract opened while gen=N
+  // and the following phase flip are both recorded under N+1.
+  std::map<uint64_t, WaitBlockGenerationTiming> wait_block_timing;
 };
 
 enum class WaitBlockPendingMode {

@@ -965,6 +965,9 @@ void Subcore::issue(SM *shared_sm) {
               (m_config->interwarp_coalescing_selection_policy == DEP_COUNT_WAIT_DETECTED_AT_DECODE_CHECKING_WARP_ID)))  {
             remove_interwarp_coalescing_dep_counter_at_decode_tracking(pI, sm_warp_id);
           }
+          if (m_config->wait_block_late_arrival_instrument_enable) {
+            shared_sm->record_wait_block_timing_issue(sm_warp_id, pI);
+          }
           if (m_config->producer_tail_instrument_enable) {
             shared_sm->record_producer_tail_issue(sm_warp_id, pI);
           }

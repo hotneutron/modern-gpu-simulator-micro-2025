@@ -788,6 +788,11 @@ bool trace_warp_inst_t::parse_from_trace_struct(
   tma_completion_barrier_ureg_id =
       trace.tma_completion_barrier_ureg_id;
   trace_kernel_id = kernel_trace_info->kernel_id;
+  trace_block_idx_x = trace.block_idx_x;
+  trace_block_idx_y = trace.block_idx_y;
+  trace_block_idx_z = trace.block_idx_z;
+  trace_cta_warp_id = trace.trace_cta_warp_id;
+  trace_instruction_index = trace.trace_instruction_index;
   trace_masks_valid = true;
   trace_active_mask = trace.active_mask;
   trace_predicate_mask = trace.predicate_mask;
