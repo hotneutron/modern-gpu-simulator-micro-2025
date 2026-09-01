@@ -422,6 +422,8 @@ class SM : public core_t, public shader_core_ctx_wrapper {
       HopperMBarrierObject &barrier, uint64_t barrier_addr);
   bool is_sync_wait_satisfied(
       const HopperMBarrierPendingWait &pending_wait) const;
+  bool is_wait_block_pending_satisfied(
+      const HopperMBarrierPendingWait &pending_wait) const;
   // Pin a modeled wait to the current generation when already ready, or to the
   // next generation when not ready. Release audits this absolute generation,
   // not only parity, so an overshoot cannot be mistaken for a valid release.
@@ -746,6 +748,8 @@ class SM : public core_t, public shader_core_ctx_wrapper {
   // subset of skipped_insts contributed by the immediate path.
   unsigned long long m_fold_immediate_folds_total = 0;
   unsigned long long m_fold_immediate_skipped_insts_total = 0;
+  unsigned long long m_fold_aux_holds_total = 0;
+  unsigned long long m_fold_aux_releases_total = 0;
   unsigned long long m_missing_wait_ready_total = 0;
   unsigned long long m_missing_wait_holds_total = 0;
   unsigned long long m_missing_wait_releases_total = 0;

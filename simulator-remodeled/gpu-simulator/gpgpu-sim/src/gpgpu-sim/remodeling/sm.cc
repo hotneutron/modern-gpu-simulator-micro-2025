@@ -164,6 +164,8 @@ const char *wait_block_mode_to_string(WaitBlockPendingMode mode) {
       return "INJECT_MISSING_WAIT";
     case WaitBlockPendingMode::PARTIAL_MISSING_WAIT_HOLD:
       return "DEFER_PARTIAL_MISSING_WAIT";
+    case WaitBlockPendingMode::FOLD_AUX_WAIT_HOLD:
+      return "FOLD_AUX_WAIT";
     case WaitBlockPendingMode::CAPTURED_POLL_HOLD:
       return "FOLD_CAPTURED_POLL";
     case WaitBlockPendingMode::NONE:
@@ -2744,7 +2746,8 @@ bool SM::warp_waiting_at_barrier(unsigned warp_id) const {
   if (warp_id >= m_pending_sync_waits.size()) {
     return false;
   }
-  HopperMBarrierPendingWait &pending_wait = m_pending_sync_waits[warp_id];
+  const HopperMBarrierPendingWait &pending_wait =
+      m_pending_sync_waits[warp_id];
   if (!pending_wait.valid) {
     return false;
   }
@@ -2752,7 +2755,7 @@ bool SM::warp_waiting_at_barrier(unsigned warp_id) const {
   // accounting and any captured-poll cursor skip happen exactly once on the
   // issue path in service_wait_block_release(), never from this query
   // from a std::sort comparator). See design doc 6.5.1.
-  return !is_sync_wait_satisfied(pending_wait);
+  return !is_wait_block_pending_satisfied(pending_wait);
 }
 
 // Non-mutating alias used off the issue path (comparator, stall scans). Same
@@ -3550,7 +3553,8 @@ void SM::service_wait_block_release(unsigned warp_id) {
     const uint64_t threshold = kWaitBlockHoldWatchdogCycles;
     if (held_cycles > threshold) {
       m_wait_block_watchdog_aborts_total++;
-      if (pending_wait.mode == WaitBlockPendingMode::CAPTURED_POLL_HOLD) {
+      if (pending_wait.mode == WaitBlockPendingMode::CAPTURED_POLL_HOLD ||
+          pending_wait.mode == WaitBlockPendingMode::FOLD_AUX_WAIT_HOLD) {
         m_fold_watchdog_hits++;
       }
       std::cerr << "[WAITBLOCK][abort][SM" << m_sm_id << "] cyc=" << now
@@ -3580,8 +3584,7 @@ void SM::service_wait_block_release(unsigned warp_id) {
     return;
   }
 
-  if (!pending_wait.uses_exact_generation_ticket &&
-      !is_sync_wait_satisfied(pending_wait)) {
+  if (!is_wait_block_pending_satisfied(pending_wait)) {
     std::cerr << "[WAITBLOCK][abort][SM" << m_sm_id << "] cyc=" << now
               << " reason=generation-ready-state-mismatch"
               << " strategy=" << wait_block_mode_to_string(pending_wait.mode)
@@ -3730,6 +3733,26 @@ void SM::service_wait_block_release(unsigned warp_id) {
     return;
   }
 
+  if (pending_wait.mode == WaitBlockPendingMode::FOLD_AUX_WAIT_HOLD) {
+    m_fold_aux_releases_total++;
+    debug_log_wait_block_event(
+        "fold-aux-wait-release",
+        "block=" + block +
+            " trace_kernel=" +
+            std::to_string(pending_wait.key.trace_kernel_id) +
+            " function=" + std::to_string(pending_wait.unique_function_id) +
+            " cta=" + std::to_string(pending_wait.key.cta_id) +
+            " warp=" + std::to_string(warp_id) + " wait_pc=0x" +
+            format_hex_u64(pending_wait.action_pc) + " barrier=0x" +
+            format_hex_u64(pending_wait.key.barrier_addr) +
+            " target_gen=" + std::to_string(exp_gen) +
+            " current_gen=" + std::to_string(cur_gen) +
+            " held_cycles=" + std::to_string(held_cycles) +
+            " cursor_action=none");
+    pending_wait = HopperMBarrierPendingWait();
+    return;
+  }
+
   if (pending_wait.mode != WaitBlockPendingMode::CAPTURED_POLL_HOLD) {
     std::cerr << "[WAITBLOCK][abort][SM" << m_sm_id << "] cyc=" << now
               << " reason=unknown-pending-mode warp=" << warp_id
@@ -3868,6 +3891,7 @@ void SM::print_wait_block_summary() const {
       active_partial_capsules == 0 &&
       m_missing_wait_holds_total == m_missing_wait_releases_total &&
       m_fold_parks_total == m_fold_releases_total &&
+      m_fold_aux_holds_total == m_fold_aux_releases_total &&
       m_partial_join_holds_total == m_partial_join_releases_total &&
       m_partial_deferred_occurrences_total ==
           m_partial_replayed_occurrences_total +
@@ -3888,6 +3912,7 @@ void SM::print_wait_block_summary() const {
       "partial_join_holds=%llu partial_join_releases=%llu "
       "captured_poll_immediate_folds=%llu captured_poll_holds=%llu "
       "captured_poll_releases=%llu "
+      "captured_poll_aux_holds=%llu captured_poll_aux_releases=%llu "
       "captured_poll_advanced_occurrences=%llu "
       "captured_poll_immediate_advanced_occurrences=%llu "
       "captured_poll_hold_cycles_total=%llu "
@@ -3909,7 +3934,8 @@ void SM::print_wait_block_summary() const {
       m_partial_folded_occurrences_total, m_partial_join_holds_total,
       m_partial_join_releases_total,
       m_fold_immediate_folds_total, m_fold_parks_total,
-      m_fold_releases_total, m_fold_skipped_insts_total,
+      m_fold_releases_total, m_fold_aux_holds_total,
+      m_fold_aux_releases_total, m_fold_skipped_insts_total,
       m_fold_immediate_skipped_insts_total, m_fold_park_cycles_total,
       captured_poll_avg_hold, m_fold_park_cycles_max, m_fold_watchdog_hits,
       active_holds,
@@ -4074,6 +4100,14 @@ bool SM::is_sync_wait_satisfied(
   return it->second.phase != decode_sync_wait_phase(pending_wait.wait_state_raw);
 }
 
+bool SM::is_wait_block_pending_satisfied(
+    const HopperMBarrierPendingWait &pending_wait) const {
+  if (pending_wait.uses_exact_generation_ticket) {
+    return sync_barrier_gen(pending_wait.key) >= pending_wait.expected_gen;
+  }
+  return is_sync_wait_satisfied(pending_wait);
+}
+
 uint64_t SM::sync_barrier_gen(const HopperMBarrierKey &key) const {
   auto it = m_hopper_mbarriers.find(key);
   return it == m_hopper_mbarriers.end() ? 0 : it->second.gen;
@@ -4210,8 +4244,13 @@ void SM::handle_sync_instruction(warp_inst_t &inst, unsigned int warp_id) {
   SpinWaitRegionRecord poll_region;
   const bool has_poll_record = m_gpu->lookup_spin_wait_region(
       inst.trace_kernel_id, inst.unique_function_id, inst.pc, poll_region);
-  const bool has_poll_action = has_poll_record && poll_region.foldable;
-  if (has_missing_action && has_poll_action) {
+  const bool has_fold_wait_action =
+      has_poll_record && poll_region.foldable;
+  const bool is_primary_fold_wait =
+      has_fold_wait_action && poll_region.primary_wait_pc == inst.pc;
+  const bool is_auxiliary_fold_wait =
+      has_fold_wait_action && !is_primary_fold_wait;
+  if (has_missing_action && has_fold_wait_action) {
     std::cerr << "[WAITBLOCK][abort][SM" << m_sm_id << "] cyc="
               << get_current_gpu_cycle()
               << " reason=conflicting-runtime-actions"
@@ -4224,7 +4263,7 @@ void SM::handle_sync_instruction(warp_inst_t &inst, unsigned int warp_id) {
   const bool is_wait_probe =
       inst.sync_kind == SyncInstructionKind::PHASECHK ||
       inst.sync_kind == SyncInstructionKind::TRYWAIT;
-  if ((has_missing_action || has_poll_action) && !is_wait_probe) {
+  if ((has_missing_action || has_fold_wait_action) && !is_wait_probe) {
     std::cerr << "[WAITBLOCK][abort][SM" << m_sm_id << "] cyc="
               << get_current_gpu_cycle()
               << " reason=runtime-action-kind-mismatch"
@@ -4262,10 +4301,14 @@ void SM::handle_sync_instruction(warp_inst_t &inst, unsigned int warp_id) {
             (!missing_record.partial_modeled_miss_aborts &&
              !missing_record.partial_deferred_replay) ||
             !inst.sync_has_semantic_raw || !inst.trace_masks_valid)) ||
-          (has_poll_action &&
-           (poll_region.primary_wait_pc != inst.pc ||
-            poll_region.primary_wait_kind != inst.sync_kind ||
-            !poll_region.foldable || !inst.sync_has_semantic_raw))) {
+          (has_fold_wait_action &&
+           (std::find(
+                poll_region.wait_pcs.begin(), poll_region.wait_pcs.end(),
+                static_cast<uint64_t>(inst.pc)) ==
+                poll_region.wait_pcs.end() ||
+            (is_primary_fold_wait &&
+             poll_region.primary_wait_kind != inst.sync_kind) ||
+            !inst.sync_has_semantic_raw))) {
         std::cerr << "[WAITBLOCK][abort][SM" << m_sm_id << "] cyc="
                   << get_current_gpu_cycle()
                   << " reason=action-kind-or-proof-mismatch"
@@ -4281,7 +4324,7 @@ void SM::handle_sync_instruction(warp_inst_t &inst, unsigned int warp_id) {
       bool action_uses_exact_generation = false;
       uint64_t action_expected_gen = 0;
       if (m_config->wait_block_enable &&
-          (has_missing_action || has_poll_action)) {
+          (has_missing_action || has_fold_wait_action)) {
         const std::string &action_block_id =
             has_missing_action ? missing_record.block_id
                                : poll_region.block_id;
@@ -4314,7 +4357,11 @@ void SM::handle_sync_instruction(warp_inst_t &inst, unsigned int warp_id) {
                           wait_block_mode_to_string(
                               has_missing_action
                                   ? WaitBlockPendingMode::MISSING_WAIT_HOLD
-                                  : WaitBlockPendingMode::CAPTURED_POLL_HOLD)) +
+                                  : (is_primary_fold_wait
+                                         ? WaitBlockPendingMode::
+                                               CAPTURED_POLL_HOLD
+                                         : WaitBlockPendingMode::
+                                               FOLD_AUX_WAIT_HOLD))) +
                       " block=" + action_block_id +
                       " trace_kernel=" +
                       std::to_string(inst.trace_kernel_id) +
@@ -4350,7 +4397,7 @@ void SM::handle_sync_instruction(warp_inst_t &inst, unsigned int warp_id) {
       }
       // [Spin-wait observe] observe-only would-be-park measurement: only for
       // polls that are the primary_wait_pc of a detected foldable spin loop.
-      if (m_config->spin_wait_observe_enable && has_poll_record &&
+      if (m_config->spin_wait_observe_enable && is_primary_fold_wait &&
           poll_region.semantic_free_body && poll_region.is_spin_loop) {
         record_spin_wait_observe(warp_id, inst.pc, key.barrier_addr, key.cta_id,
                                  wait_ready);
@@ -4361,7 +4408,7 @@ void SM::handle_sync_instruction(warp_inst_t &inst, unsigned int warp_id) {
         if (has_missing_action) {
           m_missing_wait_ready_total++;
         }
-        if (m_config->wait_block_enable && has_poll_action) {
+        if (m_config->wait_block_enable && is_primary_fold_wait) {
           const uint64_t expected_gen = action_expected_gen;
           const uint64_t cur_gen = sync_barrier_gen(key);
           if (!action_uses_exact_generation &&
@@ -4635,7 +4682,8 @@ void SM::handle_sync_instruction(warp_inst_t &inst, unsigned int warp_id) {
                     " current_gen=" +
                     std::to_string(sync_barrier_gen(key)));
           }
-        } else if (m_config->wait_block_enable && has_poll_action) {
+        } else if (m_config->wait_block_enable &&
+                   is_primary_fold_wait) {
           HopperMBarrierPendingWait held;
           held.valid = true;
           held.is_trywait = is_trywait;
@@ -4682,6 +4730,44 @@ void SM::handle_sync_instruction(warp_inst_t &inst, unsigned int warp_id) {
                     " current_gen=" +
                     std::to_string(sync_barrier_gen(key)));
           }
+        } else if (
+            m_config->wait_block_enable &&
+            is_auxiliary_fold_wait &&
+            action_uses_exact_generation) {
+          HopperMBarrierPendingWait held;
+          held.valid = true;
+          held.is_trywait = is_trywait;
+          held.key = key;
+          held.wait_state_raw = inst.sync_semantic_raw;
+          held.mode = WaitBlockPendingMode::FOLD_AUX_WAIT_HOLD;
+          held.block_id = poll_region.block_id;
+          held.action_pc = inst.pc;
+          held.unique_function_id = inst.unique_function_id;
+          held.expected_gen = action_expected_gen;
+          held.uses_exact_generation_ticket = true;
+          held.hold_start_cycle = get_current_gpu_cycle();
+          held.last_heartbeat_cycle = held.hold_start_cycle;
+          m_pending_sync_waits[warp_id] = held;
+          hold_created = true;
+          m_fold_aux_holds_total++;
+          debug_log_wait_block_event(
+              "fold-aux-wait-hold",
+              "block=" + poll_region.block_id +
+                  " trace_kernel=" +
+                  std::to_string(inst.trace_kernel_id) +
+                  " function=" +
+                  std::to_string(inst.unique_function_id) +
+                  " cta=" + std::to_string(key.cta_id) +
+                  " warp=" + std::to_string(warp_id) +
+                  " wait_pc=0x" + format_hex_u64(inst.pc) +
+                  " primary_pc=0x" +
+                  format_hex_u64(poll_region.primary_wait_pc) +
+                  " barrier=0x" + format_hex_u64(key.barrier_addr) +
+                  " target_gen=" +
+                  std::to_string(action_expected_gen) +
+                  " current_gen=" +
+                  std::to_string(sync_barrier_gen(key)) +
+                  " cursor_action=none");
         }
         if (!hold_created) {
           m_pending_sync_waits[warp_id] = HopperMBarrierPendingWait();
@@ -5570,7 +5656,8 @@ WaitBlockPendingMode SM::peek_wait_block_hold_mode(unsigned warp_id) const {
     return WaitBlockPendingMode::NONE;
   }
   const HopperMBarrierPendingWait &pending_wait = m_pending_sync_waits[warp_id];
-  if (!pending_wait.valid || is_sync_wait_satisfied(pending_wait)) {
+  if (!pending_wait.valid ||
+      is_wait_block_pending_satisfied(pending_wait)) {
     return WaitBlockPendingMode::NONE;
   }
   return pending_wait.mode;

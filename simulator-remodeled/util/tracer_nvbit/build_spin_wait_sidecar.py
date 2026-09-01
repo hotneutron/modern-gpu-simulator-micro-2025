@@ -83,6 +83,7 @@ def _inst_full(buf, s, e):
     function_unique_id = None
     sync_valid = False
     barrier_addr = None
+    sync_has_semantic_raw = False
     semantic_raw = None
     tma_completion_valid = False
     tma_completion_barrier_addr = None
@@ -124,11 +125,16 @@ def _inst_full(buf, s, e):
                     sync_valid = bool(v)
                 elif f2 == 2 and w2 == 0:       # barrier_addr
                     barrier_addr, k = _rv(buf, k)
+                elif f2 == 3 and w2 == 0:       # has_semantic_raw
+                    value, k = _rv(buf, k)
+                    sync_has_semantic_raw = bool(value)
                 elif f2 == 4 and w2 == 0:       # semantic_raw
                     semantic_raw, k = _rv(buf, k)
                 else:
                     k = _skip(buf, k, w2)
             i = end
+            if sync_has_semantic_raw and semantic_raw is None:
+                semantic_raw = 0
         elif f == 8 and w == 2:                 # tma_completion_runtime_info
             ln, j = _rv(buf, i)
             end = j + ln
@@ -207,6 +213,7 @@ def _inst_full(buf, s, e):
         "function_unique_id": function_unique_id,
         "sync_valid": sync_valid,
         "barrier_addr": barrier_addr,
+        "sync_has_semantic_raw": sync_has_semantic_raw,
         "semantic_raw": semantic_raw,
         "tma_completion_valid": tma_completion_valid,
         "tma_completion_barrier_addr": tma_completion_barrier_addr,
@@ -338,6 +345,20 @@ CONTRACT_REJECT_REASONS = (
     CONTRACT_TMA_OWNERSHIP_UNPROVEN,
     CONTRACT_SERIAL_LIFECYCLE_UNPROVEN,
 )
+
+RUNTIME_TICKET_ENTRY_FIELDS = (
+    "source_warp_instruction_index",
+    "unique_function_id",
+    "action_pc",
+    "active_mask",
+    "predicate_mask",
+    "barrier_addr",
+    "wait_state_raw",
+    "target_kind",
+    "target_release_generation",
+)
+RUNTIME_TICKET_COUNT_ONLY_FALLBACK = 0
+RUNTIME_TICKET_EXACT_TARGET = 1
 
 
 def decode_exch_arrival_count(raw):
@@ -558,26 +579,80 @@ def _parse_cta_file_coordinates(cta_file):
     return tuple(int(value) for value in match.groups())
 
 
+def compact_runtime_generation_tickets(runtime_tickets):
+    grouped = defaultdict(list)
+    for ticket in runtime_tickets:
+        if ticket["barrier_addr"] is None or ticket["wait_state_raw"] is None:
+            raise ValueError(
+                "runtime generation ticket lacks sync operand payload: "
+                "%r" % ticket)
+        stream_key = (
+            int(ticket["trace_kernel_id"]),
+            int(ticket["cta_x"]),
+            int(ticket["cta_y"]),
+            int(ticket["cta_z"]),
+            int(ticket["warp_id"]),
+        )
+        target_kind = (
+            RUNTIME_TICKET_EXACT_TARGET
+            if ticket["has_target_release_generation"]
+            else RUNTIME_TICKET_COUNT_ONLY_FALLBACK
+        )
+        target = (
+            int(ticket["target_release_generation"])
+            if ticket["has_target_release_generation"] else 0
+        )
+        grouped[stream_key].append([
+            int(ticket["source_warp_instruction_index"]),
+            int(ticket["unique_function_id"]),
+            int(ticket["action_pc"]),
+            int(ticket["active_mask"]),
+            int(ticket["predicate_mask"]),
+            int(ticket["barrier_addr"]),
+            int(ticket["wait_state_raw"]),
+            target_kind,
+            target,
+        ])
+
+    streams = []
+    for stream_key in sorted(grouped):
+        entries = sorted(grouped[stream_key], key=lambda entry: entry[0])
+        source_indices = [entry[0] for entry in entries]
+        if len(source_indices) != len(set(source_indices)):
+            raise ValueError(
+                "duplicate runtime generation ticket source index")
+        streams.append({
+            "trace_kernel_id": stream_key[0],
+            "cta_x": stream_key[1],
+            "cta_y": stream_key[2],
+            "cta_z": stream_key[3],
+            "warp_id": stream_key[4],
+            "entries": entries,
+        })
+    return streams
+
+
 def analyze_mbarrier_contract_capture(traces, kdirs, kid_to_fid,
                                       sync_sites, sidecar_kernels,
                                       max_ctas):
     action_specs = {}
-    fold_wait_specs = {}
     for kernel in sidecar_kernels:
         kid = int(kernel["trace_kernel_id"])
         for record in kernel.get("wait_blocks", []):
             strategy = record.get("runtime_strategy")
             if strategy == "INJECT_MISSING_WAIT":
-                pc = int(record["entry_probe_pc"])
+                action_pcs = [int(record["entry_probe_pc"])]
             elif strategy == "FOLD_CAPTURED_POLL":
-                pc = int(record["poll_probe_pc"])
-                for wait_pc in record["poll_wait_pcs"]:
-                    fold_wait_specs[
-                        (kid, int(record["unique_function_id"]),
-                         int(wait_pc))] = record
+                action_pcs = [
+                    int(wait_pc) for wait_pc in record["poll_wait_pcs"]]
             else:
                 continue
-            action_specs[(kid, int(record["unique_function_id"]), pc)] = record
+            for pc in action_pcs:
+                key = (kid, int(record["unique_function_id"]), pc)
+                if key in action_specs:
+                    raise ValueError(
+                        "duplicate WaitBlock wait action key: %r" % (key,))
+                action_specs[key] = record
 
     ownership = _load_tma_ownership_status(
         os.path.join(traces, "extra_info"))
@@ -595,6 +670,7 @@ def analyze_mbarrier_contract_capture(traces, kdirs, kid_to_fid,
         report[field] = 0
     tickets = []
     runtime_tickets = []
+    runtime_eligible_barriers = []
     rejects = []
     barrier_rejections = []
     stream_results = defaultdict(list)
@@ -730,12 +806,6 @@ def analyze_mbarrier_contract_capture(traces, kdirs, kid_to_fid,
                                 else:
                                     result = _fold_wait_site_result(
                                         insts, index, direct_spec)
-                            else:
-                                fold_spec = fold_wait_specs.get(
-                                    (kid, site[0], int(inst["pc"])))
-                                if fold_spec is not None:
-                                    result = _fold_wait_site_result(
-                                        insts, index, fold_spec)
                             if result is not None:
                                 captured_wait_results[
                                     int(inst[
@@ -787,6 +857,8 @@ def analyze_mbarrier_contract_capture(traces, kdirs, kid_to_fid,
                 for status in barrier_status.values())
             for barrier, status in barrier_status.items():
                 if status["eligible"]:
+                    runtime_eligible_barriers.append([
+                        kid, cta_x, cta_y, cta_z, int(barrier)])
                     continue
                 barrier_rejections.append({
                     "trace_kernel_id": kid,
@@ -935,7 +1007,7 @@ def analyze_mbarrier_contract_capture(traces, kdirs, kid_to_fid,
                 tickets.append(ticket)
                 stream_key = (
                     kid, cta_name, wait["warp_id"], int(barrier),
-                    wait["spec"]["runtime_strategy"],
+                    wait["spec"]["runtime_strategy"], int(inst["pc"]),
                 )
                 stream_results[stream_key].append(ticket)
                 if reason is not None:
@@ -971,6 +1043,9 @@ def analyze_mbarrier_contract_capture(traces, kdirs, kid_to_fid,
         ticket["unique_function_id"],
         ticket["action_pc"],
     ))
+    runtime_ticket_streams = compact_runtime_generation_tickets(
+        runtime_tickets)
+    runtime_eligible_barriers.sort()
     return {
         "version": 1,
         "schema": "mbarrier_contract_ordinal_feasibility",
@@ -980,7 +1055,10 @@ def analyze_mbarrier_contract_capture(traces, kdirs, kid_to_fid,
         "summary": dict(report),
         "tickets": tickets,
         "runtime_tickets": runtime_tickets,
+        "runtime_ticket_streams": runtime_ticket_streams,
+        "runtime_eligible_barriers": runtime_eligible_barriers,
         "runtime_ticket_summary": {
+            "streams": len(runtime_ticket_streams),
             "slots": len(runtime_tickets),
             "exact_targets": sum(
                 ticket["has_target_release_generation"]
@@ -3356,9 +3434,41 @@ def main():
         contract_path = os.path.join(
             extra, "mbarrier_contract_ordinal_feasibility.json")
         contract_tmp = contract_path + ".tmp"
+        serialized_contract_report = dict(contract_report)
+        serialized_contract_report.pop("runtime_tickets", None)
+        serialized_contract_report.pop("runtime_ticket_streams", None)
+        serialized_contract_report.pop(
+            "runtime_eligible_barriers", None)
         with open(contract_tmp, "w") as fh:
-            json.dump(contract_report, fh, indent=2)
+            json.dump(serialized_contract_report, fh, indent=2)
         os.replace(contract_tmp, contract_path)
+        generation_ticket_name = \
+            "wait_block_exact_generation_tickets.json"
+        generation_ticket_path = os.path.join(
+            extra, generation_ticket_name)
+        generation_ticket_tmp = generation_ticket_path + ".tmp"
+        generation_ticket_document = {
+            "version": 2,
+            "schema": "wait_block_exact_generation_tickets",
+            "status": contract_report["status"],
+            "entry_fields": list(RUNTIME_TICKET_ENTRY_FIELDS),
+            "eligible_barrier_fields": [
+                "trace_kernel_id",
+                "cta_x",
+                "cta_y",
+                "cta_z",
+                "barrier_addr",
+            ],
+            "summary": contract_report["runtime_ticket_summary"],
+            "eligible_barriers":
+                contract_report["runtime_eligible_barriers"],
+            "streams": contract_report["runtime_ticket_streams"],
+        }
+        with open(generation_ticket_tmp, "w") as fh:
+            json.dump(
+                generation_ticket_document, fh,
+                separators=(",", ":"))
+        os.replace(generation_ticket_tmp, generation_ticket_path)
         sidecar["mbarrier_contract_capture"] = {
             "version": contract_report["version"],
             "schema": contract_report["schema"],
@@ -3367,11 +3477,11 @@ def main():
             "summary": contract_report["summary"],
         }
         sidecar["exact_generation_tickets"] = {
-            "version": 1,
+            "version": 2,
             "schema": "wait_block_exact_generation_tickets",
             "status": contract_report["status"],
+            "artifact": generation_ticket_name,
             "summary": contract_report["runtime_ticket_summary"],
-            "tickets": contract_report["runtime_tickets"],
         }
         summary = contract_report["summary"]
         print(

@@ -9,12 +9,12 @@ produces the sidecar these paths consume is designed in
 [WAIT_BLOCK_POSTPROC.md](WAIT_BLOCK_POSTPROC.md). Shared terminology and hard
 invariants are defined once in the parent index and are not repeated here.
 
-The simulator loads two disjoint runtime maps and never shares an action site
-between the two strategies.
+The simulator loads disjoint INJECT and FOLD runtime maps and never shares an
+action site between the two strategies.
 
 ## 1. Runtime maps
 
-Load two disjoint maps:
+Load the following strategy maps:
 
 ```text
 missing_wait_by_entry:
@@ -24,9 +24,16 @@ missing_wait_by_entry:
 captured_poll_by_probe:
     (trace_kernel_id, unique_function_id, poll_probe_pc)
     -> FOLD_CAPTURED_POLL record
+
+captured_poll_by_wait:
+    (trace_kernel_id, unique_function_id, any proven poll_wait_pc)
+    -> FOLD_CAPTURED_POLL record
 ```
 
-A record cannot appear in both maps for the same runtime action.
+A record cannot appear in both strategy maps for the same runtime action.
+`captured_poll_by_probe` retains the primary cursor-fold owner.
+`captured_poll_by_wait` is used only when exact-generation mode is enabled so
+an auxiliary wait can enforce its target without acquiring cursor ownership.
 
 The old captured spin-region runtime owner is replaced only after its
 `captured_poll_by_probe` entry is installed. This prevents a captured loop from
@@ -34,11 +41,13 @@ losing its fold owner.
 
 ## 2. Minimal pending state
 
-Only two pending hold modes are required:
+The complete pending-mode set is:
 
 ```text
 NONE
 MISSING_WAIT_HOLD
+PARTIAL_MISSING_WAIT_HOLD
+FOLD_AUX_WAIT_HOLD
 CAPTURED_POLL_HOLD
 ```
 
@@ -123,11 +132,9 @@ This is the entire missing-wait feature and its unsupported-case guard.
 
 ## 4. Runtime path B: `FOLD_CAPTURED_POLL`
 
-There is no lookup or action at the WaitBlock entry.
-
-Lookup occurs only when the captured trace reaches `poll_probe_pc`.
-
-The poll probe executes normally.
+There is no lookup or action at the WaitBlock entry. Exact-generation lookup
+occurs at every active PC in `poll_wait_pcs`. The primary poll retains cursor
+ownership; auxiliary polls can only guard a generation.
 
 ```text
 if effective_mask == 0:
@@ -135,15 +142,30 @@ if effective_mask == 0:
     do not require runtime payload
     do not fold, hold, or advance a cursor
 
-if modeled ready:
+if auxiliary wait and exact target is already complete:
+    continue normal captured replay
+
+if auxiliary wait and exact target is incomplete:
+    enter FOLD_AUX_WAIT_HOLD
+
+if primary wait and modeled ready:
     fold residual captured poll-loop occurrences immediately
 
-if modeled not-ready:
+if primary wait and modeled not-ready:
     pin expected generation
     enter CAPTURED_POLL_HOLD
 ```
 
-On release:
+Auxiliary release:
+
+```text
+assert current generation >= exact target generation
+clear FOLD_AUX_WAIT_HOLD
+do not move either trace cursor
+resume the captured path after the auxiliary wait
+```
+
+Primary release:
 
 ```text
 assert current generation == expected generation
@@ -204,8 +226,9 @@ Both strategies use one generation policy selected per dynamic action
 occurrence.
 
 With `-wait_block_exact_generation_enable 1`, every active
-`INJECT_MISSING_WAIT` entry probe and `FOLD_CAPTURED_POLL` primary poll probe
-must carry a sidecar ticket. An eligible TMA-backed ticket is authoritative:
+`INJECT_MISSING_WAIT` entry probe and every proven
+`FOLD_CAPTURED_POLL.poll_wait_pcs` probe must carry a sidecar ticket. An
+eligible TMA-backed ticket is authoritative:
 
 ```text
 current_gen < target_release_generation:
@@ -235,8 +258,14 @@ current_gen > expected_gen:
     abort generation overshoot
 ```
 
-The feature is default-off. With the option disabled, both strategies use the
-fallback and preserve the existing behavior.
+That fallback state machine applies to INJECT and the primary FOLD wait.
+Auxiliary FOLD fallback probes remain nonblocking, matching the pre-E1 behavior.
+Only an auxiliary wait with an exact eligible-TMA target may create
+`FOLD_AUX_WAIT_HOLD`.
+
+The generic option default is off. The validated SM90 H100 config enables it.
+With the option disabled, both strategies use the fallback and preserve the
+existing behavior.
 
 The shared wait-hold watchdog threshold is 32,000 cycles. At 32,001 cycles,
 emit a full diagnostic and abort.
@@ -260,7 +289,10 @@ a partial modeled miss aborts before scheduler state changes.
 completed K5/K10 before the entry-hold redesign.
 
 Release is owned by one authoritative service. Scheduler sorting,
-instrumentation, and stall queries use a non-mutating held-state query.
+instrumentation, and stall queries use a non-mutating held-state query. Exact
+pending holds use `current_generation >= target_release_generation` in both the
+scheduler query and release service; they never use one-bit parity to decide
+eligibility.
 
 Before CTA cleanup or warp-slot reuse:
 
@@ -904,10 +936,13 @@ Runtime partial v2:
 
 Runtime path B:
 
+- every active proven FOLD wait PC has an exact/fallback ticket;
+- an auxiliary exact wait with `current_gen < target` holds;
+- auxiliary release preserves both trace cursors;
+- auxiliary fallback waits remain nonblocking;
 - ready poll folds immediately to the local exit;
 - not-ready poll holds, releases, and folds to the local exit;
-- the selected primary poll uses its exact ticket for both immediate folding
-  and parked release;
+- the primary poll alone owns immediate and parked cursor folding;
 - `current_gen > target` folds/releases and increments the late-arrival
   divergence counter;
 - both cursors advance consistently;

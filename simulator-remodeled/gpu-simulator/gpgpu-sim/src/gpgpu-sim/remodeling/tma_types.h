@@ -247,6 +247,7 @@ struct SpinWaitRegionRecord {
   std::string block_id;
   uint64_t loop_head_pc = 0;
   uint64_t primary_wait_pc = 0;   // the poll whose barrier readiness gates the loop
+  std::vector<uint64_t> wait_pcs;
   uint64_t loopback_bra_pc = 0;   // backward BRA that closes the loop
   uint64_t exit_pc = 0;           // fall-through target when the loop is left
   SyncInstructionKind primary_wait_kind = SyncInstructionKind::NONE;
@@ -332,14 +333,35 @@ struct WaitBlockGenerationTicketKey {
   }
 };
 
+enum class WaitBlockGenerationTicketKind : uint32_t {
+  COUNT_ONLY_FALLBACK = 0,
+  EXACT_TARGET = 1,
+};
+
 struct WaitBlockGenerationTicket {
+  uint32_t unique_function_id = 0;
+  uint64_t action_pc = 0;
+  uint64_t source_warp_instruction_index = 0;
   bool has_target_release_generation = false;
   uint64_t target_release_generation = 0;
   uint64_t barrier_addr = 0;
   uint64_t wait_state_raw = 0;
   uint32_t active_mask = 0;
   uint32_t predicate_mask = 0;
-  std::string fallback_reason;
+};
+
+struct WaitBlockGenerationTicketStreamKey {
+  uint32_t trace_kernel_id = 0;
+  uint32_t cta_x = 0;
+  uint32_t cta_y = 0;
+  uint32_t cta_z = 0;
+  uint32_t warp_id = 0;
+
+  bool operator<(const WaitBlockGenerationTicketStreamKey &other) const {
+    return std::tie(trace_kernel_id, cta_x, cta_y, cta_z, warp_id) <
+           std::tie(other.trace_kernel_id, other.cta_x, other.cta_y,
+                    other.cta_z, other.warp_id);
+  }
 };
 
 struct MissingWaitRecord {
@@ -389,11 +411,13 @@ struct PartialWaitRegionRecord {
 struct WaitBlockSidecarDB {
   std::map<WaitBlockLookupKey, MissingWaitRecord> missing_wait_by_entry;
   std::map<WaitBlockLookupKey, SpinWaitRegionRecord> captured_poll_by_probe;
+  std::map<WaitBlockLookupKey, SpinWaitRegionRecord> captured_poll_by_wait;
   std::map<std::string, PartialWaitRegionRecord> partial_regions_by_id;
   std::map<WaitBlockLookupKey, std::string> partial_region_id_by_join;
   std::map<WaitBlockLookupKey, std::string> partial_region_id_by_post_join;
-  std::map<WaitBlockGenerationTicketKey, WaitBlockGenerationTicket>
-      exact_generation_tickets;
+  std::map<WaitBlockGenerationTicketStreamKey,
+           std::vector<WaitBlockGenerationTicket>>
+      exact_generation_ticket_streams;
   uint64_t discovered = 0;
   uint64_t passed = 0;
   uint64_t failed = 0;
@@ -407,6 +431,7 @@ struct WaitBlockSidecarDB {
   uint64_t partial_join_already_issued_visits = 0;
   bool validation_complete = false;
   bool exact_generation_tickets_valid = false;
+  uint64_t exact_generation_ticket_stream_count = 0;
   uint64_t exact_generation_ticket_slots = 0;
   uint64_t exact_generation_targets = 0;
   uint64_t exact_generation_fallbacks = 0;
@@ -414,10 +439,11 @@ struct WaitBlockSidecarDB {
   void clear() {
     missing_wait_by_entry.clear();
     captured_poll_by_probe.clear();
+    captured_poll_by_wait.clear();
     partial_regions_by_id.clear();
     partial_region_id_by_join.clear();
     partial_region_id_by_post_join.clear();
-    exact_generation_tickets.clear();
+    exact_generation_ticket_streams.clear();
     discovered = 0;
     passed = 0;
     failed = 0;
@@ -431,6 +457,7 @@ struct WaitBlockSidecarDB {
     partial_join_already_issued_visits = 0;
     validation_complete = false;
     exact_generation_tickets_valid = false;
+    exact_generation_ticket_stream_count = 0;
     exact_generation_ticket_slots = 0;
     exact_generation_targets = 0;
     exact_generation_fallbacks = 0;
@@ -489,6 +516,7 @@ enum class WaitBlockPendingMode {
   NONE,
   MISSING_WAIT_HOLD,
   PARTIAL_MISSING_WAIT_HOLD,
+  FOLD_AUX_WAIT_HOLD,
   CAPTURED_POLL_HOLD,
 };
 

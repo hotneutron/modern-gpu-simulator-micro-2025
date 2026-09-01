@@ -23,11 +23,14 @@ cross-warp state to the trace. An audit of the existing full FA3 trace
 ordinal-unique under a strict increasing-generation assumption. The existing
 trace therefore proves both the applicability of the restricted contract model
 and the need for one new captured field. The ABI-correct v2 trace has now passed
-the Stage E0 identity and conservation gates: 81,999/81,999 eligible WaitBlock
-actions have unique generation assignments, with zero missing snapshots,
-capture mismatches, rejected TMA actions, ambiguous assignments, or inconsistent
-assignments. The Stage E1 consumer is implemented behind a separate default-off
-option. B1 and the K5/K10 simulator acceptance runs remain pending.
+the Stage E0 identity and conservation gates. After extending FOLD coverage
+from only its primary poll to every proven `poll_wait_pcs` occurrence,
+90,868/90,868 eligible WaitBlock waits have unique generation assignments:
+75,840 INJECT entries plus 15,028 FOLD waits. Missing snapshots, capture
+mismatches, rejected TMA actions, ambiguous assignments, and inconsistent
+assignments are all zero. The Stage E1 consumer and strict compact-ticket
+loader are implemented, and the tested H100 config enables them. B1 and the
+K5/K10 simulator acceptance runs remain pending.
 
 This document is the authoritative index and the live execution record for
 B0-E. The detailed per-work-type designs and the historical evidence live in the
@@ -227,7 +230,7 @@ sidecar generation; unified metadata does not require unified runtime behavior.
 | B0-B | Kernel-aware descriptor identity and K5 tx-size restoration | **IMPLEMENTED / VALIDATED** at `0f7cbc2`; chain 23/23, ambiguity 0, K5 `0x96b0` = 24,576 bytes, 192 128-byte AGU requests, and 768 32-byte sector requests |
 | B0-C | Size-only K5/K10 byte-conservation diagnostic with existing FIFO/release order | **COMPLETE**; byte contract PASS, K10 clean exit at 138,456 cycles, K5 runtime size PASS but all-live WaitBlock abort at cycle 68,176 |
 | B0-D | Exact TMA-command-to-barrier completion ownership | **COMPLETE / VALIDATED** at `39abefb`; `.e85` validates ownership-clean out-of-order completion, and K10 `.e62` completes 384/384 CTAs with 132/132 clean SM-level TMABIND final records after exercising two simultaneous open contracts per warp |
-| B0-E | K5 all-live cross-warp WaitBlock cycle (`0xb370`/`0x16c60`) | **OPEN / CAPTURE FEASIBILITY NEXT**. Old offline-order ticket designs and runtime releases remain rejected. Existing FA3 trace audit: K5 2,112 unique and 3,072 ambiguous TMA wait streams; K10 11,904 unique. Candidate v1 records a barrier-local opened-contract interval at each wait, only for barriers that pass the arrival-count-one and exact B0-D contract gates. Simulator behavior remains unchanged until regenerated K5/K10 traces resolve all eligible waits uniquely |
+| B0-E | K5 all-live cross-warp WaitBlock cycle (`0xb370`/`0x16c60`) | **TRACE ACCEPTED / SIMULATOR RUN NEXT**. The ABI-correct v2 trace resolves 90,868/90,868 eligible WaitBlock waits uniquely. Stage E1 consumes exact targets at INJECT entries and every proven FOLD wait PC. K5/K10 simulator acceptance remains pending |
 | B1 | One SM-level WaitBlock release phase per cycle | **REQUIRED / NOT IMPLEMENTED** |
 | B2 | WaitBlock startup and provenance fail-fast checks | **MOSTLY IMPLEMENTED** |
 | B3 | Assert-before-clear lifecycle checks | **IMPLEMENTED for WaitBlock and B0-D TMA ownership**; broader non-ownership cleanup audit remains partial |
@@ -817,10 +820,10 @@ The ABI-correct v2 full FA3 run completed all instrumented kernels:
 K5 contract records             = 75,015
 K10 contract records            = 266,705
 K11 contract records            = 3,840
-active sync occurrences         = 923,835
-eligible TMA barriers           = 2,916
-eligible WaitBlock actions      = 81,999
-unique generation assignments  = 81,999
+active sync occurrences                = 923,835
+eligible TMA barriers                  = 2,916
+primary-only WaitBlock actions         = 81,999
+primary-only unique assignments        = 81,999
 missing/mismatch/ambiguous      = 0/0/0
 inconsistent assignments        = 0
 semantic histogram              = baseline-identical
@@ -872,13 +875,12 @@ PC lists, fixed barrier addresses, or expected occurrence counts.
 
 ### Stage E1: separately reviewed simulator use
 
-The consumer may be implemented and reviewed behind a default-off option while
-Stage E0 runs. It may be enabled for an acceptance run only after Stage E0
-passes:
+The consumer is implemented and the tested H100 config enables it after Stage
+E0 passed. The following rules are authoritative:
 
 1. Add exact `target_release_generation` to every eligible selected WaitBlock
-   action occurrence: `INJECT_MISSING_WAIT` entry probes and
-   `FOLD_CAPTURED_POLL` primary poll probes.
+   handshake occurrence: `INJECT_MISSING_WAIT` entry probes and every proven
+   `FOLD_CAPTURED_POLL.poll_wait_pcs` probe.
 2. At runtime, bind the wait to that target instead of deriving a target from
    the simulator's current phase.
 3. Use:
@@ -890,9 +892,11 @@ current_generation >= target -> dependency already complete; continue
 
 4. Count `current_generation > target` as a late-arrival timing divergence. It
    is not a reason to bind the wait to a later same-parity generation.
-5. Unsupported TMA barriers and count-only barriers retain the existing
-   phase-derived fallback. Partial replay ownership, B0-D TMA completion
-   identity, and FOLD cursor movement remain unchanged.
+5. Count-only barriers retain the existing phase-derived fallback. Auxiliary
+   FOLD fallback probes remain nonblocking. Auxiliary exact probes may hold and
+   release without cursor movement; only the primary FOLD probe may advance the
+   cursor. Partial replay ownership and B0-D TMA completion identity remain
+   unchanged.
 6. Validate K5 and K10 separately from B1. Require K5 clean exit without forced
    releases, K10 384/384 completion, all WaitBlock/TMABIND summaries PASS, and
    unchanged semantic TMA/BAR/memory work. Report total-cycle and producer/
@@ -918,19 +922,44 @@ gpu-simulator/gpgpu-sim/configs/tested-cfgs/SM90_H100_L2_50MB_80GB/gpgpusim.conf
 
 No B1 scheduler changes belong in E1.
 
-The default-off preimplementation binds a ticket before PC-indexed trace
-storage using:
+The implementation binds a ticket before PC-indexed trace storage using:
 
 ```text
 (trace_kernel_id, CTA x/y/z, CTA-local warp_id,
  unique_function_id, action_pc, source_warp_instruction_index)
 ```
 
-The loader rejects a missing/duplicate ticket, action-strategy mismatch, mask
-mismatch, barrier-address mismatch, or wait-state mismatch. Exact tickets use
-the comparison above in both immediate and parked paths. Fallback tickets use
-the previous phase-derived target. `-wait_block_exact_generation_enable 0`
-preserves the existing simulator behavior.
+Schema v2 stores 816,411 occurrence entries in 5,172 CTA-warp streams in a
+separate compact artifact. The main sidecar plus ticket artifact is 32,038,200
+bytes, compared with 271,695,970 bytes for the prior inline sidecar. The
+artifact also carries all 2,916 eligible `(kernel, CTA, barrier)` keys.
+
+The loader rejects a missing/duplicate ticket, action mismatch, mask mismatch,
+barrier-address mismatch, wait-state mismatch, malformed stream ordering,
+summary disagreement, or target-kind/barrier-eligibility mismatch. Exact
+tickets use the comparison above in both immediate and parked paths. Fallback
+tickets are accepted only for barriers absent from the eligible manifest and
+use the previous phase-derived target.
+
+The final full-trace check is:
+
+```text
+eligible barriers              = 2,916
+eligible wait occurrences      = 90,868
+unique generation assignments  = 90,868
+INJECT exact targets            = 75,840
+FOLD exact targets              = 15,028
+fallback occurrences           = 725,543
+missing/mismatch/ambiguous      = 0/0/0
+inconsistent/rejected TMA       = 0/0
+baseline conservation          = PASS
+```
+
+The scheduler's non-mutating hold predicate uses the same exact
+`current_generation >= target` test as the release service; it does not fall
+back to one-bit parity for an exact pending hold. The tested H100 config sets
+`-wait_block_exact_generation_enable 1`. Simulator build and K5/K10 execution
+remain pending.
 
 B0-E acceptance must eliminate the 13-warp all-live cycle without dropping a
 dependency, forcing a phase, guessing a generation, advancing a cursor outside
