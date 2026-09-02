@@ -1159,6 +1159,48 @@ class ContractOrdinalCaptureTest(unittest.TestCase):
             "m_fold_aux_holds_total != m_fold_aux_releases_total",
             sm_source)
 
+    def test_simulator_wait_block_watchdogs_are_launch_scoped(self):
+        simulator_root = MODULE_PATH.parents[2] / "gpu-simulator"
+        sm_source = (
+            simulator_root /
+            "gpgpu-sim/src/gpgpu-sim/remodeling/sm.cc"
+        ).read_text()
+        loader_source = (
+            simulator_root /
+            "gpgpu-sim/src/gpgpu-sim/gpu-sim.cc"
+        ).read_text()
+        h100_config = (
+            simulator_root /
+            "gpgpu-sim/configs/tested-cfgs/"
+            "SM90_H100_L2_50MB_80GB/gpgpusim.config"
+        ).read_text()
+
+        self.assertNotIn(
+            "kWaitBlockHoldWatchdogCycles", sm_source)
+        self.assertNotIn(
+            "kWaitBlockHeartbeatCycles", sm_source)
+        self.assertIn(
+            "m_config->wait_block_hold_watchdog_cycles", sm_source)
+        self.assertIn(
+            "m_config->wait_block_heartbeat_cycles", sm_source)
+        self.assertIn(
+            "reset_wait_block_launch_state(next_launch_uid)", sm_source)
+        self.assertIn(
+            "m_wait_block_debug_print_budget =\n"
+            "      m_config->wait_block_debug ? "
+            "m_config->wait_block_debug_print_budget : 0",
+            sm_source)
+        self.assertIn(
+            '"-wait_block_hold_watchdog_cycles"', loader_source)
+        self.assertIn(
+            '"-wait_block_heartbeat_cycles"', loader_source)
+        self.assertIn(
+            '"-wait_block_debug_print_budget"', loader_source)
+        self.assertIn(
+            "-wait_block_hold_watchdog_cycles 32000", h100_config)
+        self.assertIn(
+            "-wait_block_heartbeat_cycles 4096", h100_config)
+
 
 class WaitBlockFoldProofTest(unittest.TestCase):
     def test_control_requires_primary_wait_predicate(self):

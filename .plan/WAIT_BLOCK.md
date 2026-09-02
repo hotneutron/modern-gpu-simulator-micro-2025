@@ -239,6 +239,16 @@ Acceptance requires startup printing of effective values and a back-to-back
 multi-kernel test proving that the second launch inherits no pending state,
 counter value, start cycle, or exhausted debug budget from the first.
 
+**Implementation checkpoint.** The hold watchdog, heartbeat period, and
+per-launch debug budget are now validated `uint64` config options and are
+printed with the loaded WaitBlock manifest. Pending/arm/replay `valid` fields
+are the explicit active sentinel, so cycle zero is a valid start cycle. Runtime
+kernel UID changes assert that the prior launch drained, then reset WaitBlock
+totals, release-service accounting, pace maps, semantic anchors, late-report
+state, sync work counters, and sync/TMA/WaitBlock log budgets. The existing
+unfulfillable-contract gate aborts before the watchdog. Local source-contract
+tests pass; a back-to-back runtime kernel test remains a server validation item.
+
 ### 6. B6 pure hold query and scheduler accounting
 
 `peek_wait_block_hold_mode(warp_id)` must remain the only scheduler-side
@@ -491,7 +501,7 @@ sidecar generation; unified metadata does not require unified runtime behavior.
 | B2 | WaitBlock startup and provenance fail-fast checks | **IMPLEMENTED / RUNTIME NEGATIVE MATRIX PENDING** |
 | B3 | Assert-before-clear lifecycle checks | **IMPLEMENTED / RUNTIME NEGATIVE MATRIX PENDING** |
 | B4 | Zero-active no-op and active required-payload checks | **IMPLEMENTED** |
-| B5 | Configurable watchdog/heartbeat and kernel-scoped counters | **REQUIRED / NOT IMPLEMENTED** |
+| B5 | Configurable watchdog/heartbeat and kernel-scoped counters | **IMPLEMENTED / MULTI-KERNEL RUNTIME TEST PENDING** |
 | B6 | WaitBlock-only non-mutating hold query | **PARTIAL**: SR-M0A path implemented; legacy metrics still need audit |
 | B7 | Fold/WaitBlock metric integrity and final reconciliation | **PARTIAL** |
 | D0 | Generic ISA-wide effect framework | **DEFERRED**; exact sidecar allow/proof sets remain authoritative |

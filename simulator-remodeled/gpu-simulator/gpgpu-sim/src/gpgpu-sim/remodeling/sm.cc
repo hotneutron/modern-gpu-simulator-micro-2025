@@ -111,8 +111,6 @@ static constexpr uint32_t kSyncExchDecodeBase = 0x200000;
 // Policy thresholds from WAIT_BLOCK.md 2.6 and SPIN_WAIT_SIM_MODELING.md 6.
 // They are strategy-wide safety limits, not trace/application identities.
 static constexpr uint64_t kSpinWaitObserveWatchdogCycles = 400000;
-static constexpr uint64_t kWaitBlockHoldWatchdogCycles = 32000;
-static constexpr uint64_t kWaitBlockHeartbeatCycles = 4096;
 
 uint32_t decode_sync_exch_expected_arrive_count(uint64_t raw) {
   if (raw >= kSyncExchDecodeBase) {
@@ -607,6 +605,90 @@ void SM::assert_wait_block_lifecycle_drained(const char *reason) {
             << " partial_folded=" << m_partial_folded_occurrences_total
             << " action=abort" << std::endl;
   abort();
+}
+
+void SM::reset_wait_block_launch_state(uint64_t launch_uid) {
+  if (!m_config->wait_block_enable || m_wait_block_launch_uid == launch_uid) {
+    return;
+  }
+  if (m_wait_block_launch_uid != 0) {
+    assert_wait_block_lifecycle_drained("kernel-switch");
+    debug_dump_sync_counters();
+  }
+
+  m_wait_block_launch_uid = launch_uid;
+  m_sync_debug_print_budget =
+      m_config->sync_debug_enable ? m_config->sync_debug_print_budget : 0;
+  m_sync_debug_skip_runtime_budget =
+      m_config->sync_debug_enable
+          ? m_config->sync_debug_skip_runtime_budget
+          : 0;
+  m_tma_debug_print_budget =
+      m_config->tma_debug_enable ? m_config->tma_debug_print_budget : 0;
+  m_wait_block_debug_print_budget =
+      m_config->wait_block_debug ? m_config->wait_block_debug_print_budget : 0;
+  m_wait_block_release_snapshot_valid = false;
+  m_wait_block_release_snapshot_cycle = ~0ull;
+  std::fill(m_wait_block_last_service_cycle_by_warp.begin(),
+            m_wait_block_last_service_cycle_by_warp.end(), ~0ull);
+  m_wait_block_release_phase_cycles_total = 0;
+  m_wait_block_release_service_visits_total = 0;
+  m_sync_debug_sync_insts = 0;
+  m_sync_debug_exch = 0;
+  m_sync_debug_arrive = 0;
+  m_sync_debug_arrive_expect_tx = 0;
+  m_sync_debug_wait_pending = 0;
+  m_sync_debug_wait_released = 0;
+  m_sync_debug_phase_flip = 0;
+  m_sync_debug_tma_completions = 0;
+  m_sync_debug_missing_runtime = 0;
+  for (auto &pace : m_fold_pace_by_warp) {
+    pace.clear();
+  }
+  std::fill(std::begin(m_wait_block_first_late_reported_by_cta_slot),
+            std::end(m_wait_block_first_late_reported_by_cta_slot), false);
+  for (WaitBlockSemanticAnchor &anchor :
+       m_wait_block_last_semantic_anchor_by_warp) {
+    anchor = WaitBlockSemanticAnchor();
+  }
+
+  m_fold_parks_total = 0;
+  m_fold_releases_total = 0;
+  m_fold_skipped_insts_total = 0;
+  m_fold_park_cycles_total = 0;
+  m_fold_park_cycles_max = 0;
+  m_fold_watchdog_hits = 0;
+  m_fold_immediate_folds_total = 0;
+  m_fold_immediate_skipped_insts_total = 0;
+  m_fold_aux_holds_total = 0;
+  m_fold_aux_releases_total = 0;
+  m_missing_wait_ready_total = 0;
+  m_missing_wait_holds_total = 0;
+  m_missing_wait_releases_total = 0;
+  m_partial_missing_wait_misses_total = 0;
+  m_partial_capsules_total = 0;
+  m_partial_join_already_issued_total = 0;
+  m_partial_deferred_occurrences_total = 0;
+  m_partial_replayed_occurrences_total = 0;
+  m_partial_folded_occurrences_total = 0;
+  m_partial_join_holds_total = 0;
+  m_partial_join_releases_total = 0;
+  m_partial_replay_watchdog_aborts_total = 0;
+  m_wait_block_generation_overshoots_total = 0;
+  m_wait_block_exact_targets_total = 0;
+  m_wait_block_generation_fallbacks_total = 0;
+  m_wait_block_late_arrivals_total = 0;
+  m_wait_block_first_late_reports_total = 0;
+  m_wait_block_watchdog_aborts_total = 0;
+
+  std::cerr << "[WAITBLOCK][launch-reset] sm=" << m_sm_id
+            << " launch_uid=" << launch_uid
+            << " hold_watchdog_cycles="
+            << m_config->wait_block_hold_watchdog_cycles
+            << " heartbeat_cycles="
+            << m_config->wait_block_heartbeat_cycles
+            << " debug_print_budget=" << m_wait_block_debug_print_budget
+            << std::endl;
 }
 
 void SM::debug_dump_tma_binding_snapshot(const char *reason) const {
@@ -2743,9 +2825,9 @@ address_type SM::next_pc(int tid) const {
 void SM::set_kernel(kernel_info_t *k) {
   assert(k);
   const uint64_t next_launch_uid = k->get_uid();
+  reset_wait_block_launch_state(next_launch_uid);
   if (m_tma_binding_launch_uid != 0 &&
       m_tma_binding_launch_uid != next_launch_uid) {
-    assert_wait_block_lifecycle_drained("kernel-switch");
     for (unsigned int warp_id = 0;
          warp_id < m_tma_open_contracts_per_warp.size(); ++warp_id) {
       const uint32_t open_contracts =
@@ -3200,7 +3282,7 @@ void SM::service_partial_replay_progress(unsigned int warp_id) {
 
   const uint64_t no_progress_cycles = now - progress.last_progress_cycle;
   if (now - progress.last_heartbeat_cycle >=
-      kWaitBlockHeartbeatCycles) {
+      m_config->wait_block_heartbeat_cycles) {
     debug_log_wait_block_event(
         "partial-replay-heartbeat",
         "block=" + progress.block_id +
@@ -3222,7 +3304,7 @@ void SM::service_partial_replay_progress(unsigned int warp_id) {
             std::to_string(no_progress_cycles));
     progress.last_heartbeat_cycle = now;
   }
-  if (no_progress_cycles > kWaitBlockHoldWatchdogCycles) {
+  if (no_progress_cycles > m_config->wait_block_hold_watchdog_cycles) {
     m_partial_replay_watchdog_aborts_total++;
     m_wait_block_watchdog_aborts_total++;
     std::cerr << "[WAITBLOCK][abort][SM" << m_sm_id << "] cyc=" << now
@@ -3243,7 +3325,7 @@ void SM::service_partial_replay_progress(unsigned int warp_id) {
               << format_hex_u64(progress.post_join_pc)
               << " age=" << now - progress.start_cycle
               << " no_progress_cycles=" << no_progress_cycles
-              << " threshold=" << kWaitBlockHoldWatchdogCycles
+              << " threshold=" << m_config->wait_block_hold_watchdog_cycles
               << " action=abort" << std::endl;
     abort();
   }
@@ -3616,7 +3698,7 @@ void SM::service_wait_block_release(unsigned warp_id) {
     const uint64_t now = get_current_gpu_cycle();
     const uint64_t age = now - partial_arm.arm_start_cycle;
     if (now - partial_arm.last_heartbeat_cycle >=
-        kWaitBlockHeartbeatCycles) {
+        m_config->wait_block_heartbeat_cycles) {
       debug_log_wait_block_event(
           "partial-transition-heartbeat",
           "block=" + partial_arm.record.block_id +
@@ -3627,7 +3709,7 @@ void SM::service_wait_block_release(unsigned warp_id) {
               " age=" + std::to_string(age));
       partial_arm.last_heartbeat_cycle = now;
     }
-    if (age > kWaitBlockHoldWatchdogCycles) {
+    if (age > m_config->wait_block_hold_watchdog_cycles) {
       m_wait_block_watchdog_aborts_total++;
       std::cerr << "[WAITBLOCK][abort][SM" << m_sm_id << "] cyc=" << now
                 << " reason=partial-transition-watchdog"
@@ -3780,7 +3862,7 @@ void SM::service_wait_block_release(unsigned warp_id) {
   if (cur_gen < exp_gen) {
     if (m_config->wait_block_enable &&
         now - pending_wait.last_heartbeat_cycle >=
-            kWaitBlockHeartbeatCycles) {
+            m_config->wait_block_heartbeat_cycles) {
       debug_log_wait_block_event(
           "heartbeat",
           "strategy=" +
@@ -3800,7 +3882,7 @@ void SM::service_wait_block_release(unsigned warp_id) {
               barrier_detail);
       pending_wait.last_heartbeat_cycle = now;
     }
-    const uint64_t threshold = kWaitBlockHoldWatchdogCycles;
+    const uint64_t threshold = m_config->wait_block_hold_watchdog_cycles;
     if (held_cycles > threshold) {
       m_wait_block_watchdog_aborts_total++;
       if (pending_wait.mode == WaitBlockPendingMode::CAPTURED_POLL_HOLD ||

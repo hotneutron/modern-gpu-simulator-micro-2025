@@ -701,6 +701,15 @@ Requirements:
   until the WaitBlock watchdog;
 - increasing the watchdog threshold is not a correctness fix.
 
+**Implementation checkpoint.** The watchdog, heartbeat, and WaitBlock event
+budget are now validated `uint64` config options. Kernel UID transitions first
+assert that all WaitBlock/TMA state is drained and then reset WaitBlock totals,
+release-service accounting, pace maps, semantic anchors, sync work counters,
+and all sync/TMA/WaitBlock log budgets. Pending objects use their `valid` flag
+as the active sentinel, so a start cycle of zero is not ambiguous. Local
+source-contract tests pass; the back-to-back runtime launch test remains
+pending on the simulator server.
+
 The generic repeated-EXCH initialization epoch remains deferred because current
 FA3 proves one EXCH per barrier. Existing generation identity is nevertheless
 mandatory for every TMA completion binding.

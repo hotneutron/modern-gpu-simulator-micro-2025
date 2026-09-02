@@ -2560,6 +2560,19 @@ void gpgpu_sim::parse_extra_trace_info(std::string filepath, bool is_extra_trace
               << std::endl;
     abort();
   }
+  if (m_shader_config->wait_block_enable &&
+      (m_shader_config->wait_block_hold_watchdog_cycles == 0 ||
+       m_shader_config->wait_block_heartbeat_cycles == 0 ||
+       m_shader_config->wait_block_heartbeat_cycles >
+           m_shader_config->wait_block_hold_watchdog_cycles)) {
+    std::cerr << "[WAITBLOCK][CONFIG][FATAL] invalid watchdog configuration"
+              << " hold_watchdog_cycles="
+              << m_shader_config->wait_block_hold_watchdog_cycles
+              << " heartbeat_cycles="
+              << m_shader_config->wait_block_heartbeat_cycles
+              << std::endl;
+    abort();
+  }
   if (m_shader_config->wait_block_enable && !is_extra_trace_enabled) {
     std::cerr << "[WAITBLOCK][CONFIG][FATAL] -wait_block_enable requires "
                  "extra trace metadata and a strict schema-v5 sidecar"
@@ -2637,7 +2650,7 @@ void gpgpu_sim::parse_extra_trace_info(std::string filepath, bool is_extra_trace
     }
     if (m_shader_config->sync_debug_enable ||
         m_shader_config->trimchk_percta_log_enable ||
-        m_shader_config->wait_block_debug) {
+        m_shader_config->wait_block_enable) {
       std::cerr << "[SYNC] loaded operand_sites="
                 << m_sync_sidecar_db.site_records.size() << std::endl;
       if (m_shader_config->wait_block_enable) {
@@ -2658,6 +2671,12 @@ void gpgpu_sim::parse_extra_trace_info(std::string filepath, bool is_extra_trace
                   << m_wait_block_sidecar_db.exact_generation_targets
                   << " exact_fallbacks="
                   << m_wait_block_sidecar_db.exact_generation_fallbacks
+                  << " hold_watchdog_cycles="
+                  << m_shader_config->wait_block_hold_watchdog_cycles
+                  << " heartbeat_cycles="
+                  << m_shader_config->wait_block_heartbeat_cycles
+                  << " debug_print_budget="
+                  << m_shader_config->wait_block_debug_print_budget
                   << std::endl;
       } else {
         std::cerr << "[SPINWAIT] loaded spin_wait_regions="
@@ -4145,6 +4164,26 @@ void shader_core_config::reg_options(class OptionParser *opp) {
       "release phase. Validation-only; requires -wait_block_enable. "
       "(default=0)",
       "0");
+  option_parser_register(
+      opp, "-wait_block_hold_watchdog_cycles", OPT_UINT64,
+      &wait_block_hold_watchdog_cycles,
+      "Abort an unresolved WaitBlock hold, partial transition, or partial "
+      "replay after this many cycles. Must be nonzero when WaitBlock is "
+      "enabled. (default=32000)",
+      "32000");
+  option_parser_register(
+      opp, "-wait_block_heartbeat_cycles", OPT_UINT64,
+      &wait_block_heartbeat_cycles,
+      "Emit unresolved WaitBlock progress diagnostics at this cycle period. "
+      "Must be nonzero and no greater than the hold watchdog when WaitBlock "
+      "is enabled. (default=4096)",
+      "4096");
+  option_parser_register(
+      opp, "-wait_block_debug_print_budget", OPT_UINT64,
+      &wait_block_debug_print_budget,
+      "Maximum verbose WaitBlock event records per SM and runtime kernel "
+      "launch. The budget resets at each launch. (default=20000000)",
+      "20000000");
   option_parser_register(
       opp, "-wait_block_debug", OPT_BOOL, &wait_block_debug,
       "Emit [WAITBLOCK] hold/release/guard/summary diagnostics. (default=0)",

@@ -2303,6 +2303,18 @@ class shader_core_config : public core_config {
   // Requires WaitBlock. Default 0.
   bool wait_block_reverse_subcore_traversal;
 
+  // Maximum age of an unresolved WaitBlock hold/replay/transition before a
+  // fail-closed abort. The corresponding valid flag is the active sentinel, so
+  // a start cycle of zero is valid. Default 32000.
+  uint64_t wait_block_hold_watchdog_cycles;
+
+  // Period for unresolved WaitBlock progress diagnostics. Default 4096.
+  uint64_t wait_block_heartbeat_cycles;
+
+  // Per-SM, per-kernel-launch budget for verbose WaitBlock event records.
+  // Reset when the runtime kernel launch UID changes. Default 20000000.
+  uint64_t wait_block_debug_print_budget;
+
   // Emit [WAITBLOCK] hold/release/guard/summary diagnostics.
   bool wait_block_debug;
 

@@ -457,6 +457,7 @@ class SM : public core_t, public shader_core_ctx_wrapper {
                                   const std::string &message);
   void debug_dump_sync_counters() const;
   void assert_wait_block_lifecycle_drained(const char *reason);
+  void reset_wait_block_launch_state(uint64_t launch_uid);
   void record_wait_block_timing_issue(unsigned int warp_id,
                                       const warp_inst_t *inst);
 
@@ -558,13 +559,14 @@ class SM : public core_t, public shader_core_ctx_wrapper {
   uint64_t m_tma_launch_or_cta_mismatch = 0;
   uint64_t m_tma_duplicate_completion = 0;
   uint64_t m_tma_orphan_cleanup = 0;
+  uint64_t m_wait_block_launch_uid = 0;
   // Initialized from shader_core_config in SM::SM(); 0 disables logging.
   uint64_t m_sync_debug_print_budget = 0;
   uint64_t m_sync_debug_skip_runtime_budget = 0;
   // Independent budget for TMA-only stderr logs (TMADBG); 0 disables.
   uint64_t m_tma_debug_print_budget = 0;
   // Independent budget for WaitBlock event logs; 0 disables.
-  uint64_t m_wait_block_debug_print_budget = 20000000;
+  uint64_t m_wait_block_debug_print_budget = 0;
   uint64_t m_sync_debug_sync_insts = 0;
   uint64_t m_sync_debug_exch = 0;
   uint64_t m_sync_debug_arrive = 0;
