@@ -1267,6 +1267,27 @@ class ContractOrdinalCaptureTest(unittest.TestCase):
             "[BARDBG][abort] reason=cta-cleanup-with-active-state",
             shader_source)
 
+    def test_simulator_barrier_teardown_records_are_atomic(self):
+        simulator_root = MODULE_PATH.parents[2] / "gpu-simulator"
+        shader_source = (
+            simulator_root /
+            "gpgpu-sim/src/gpgpu-sim/shader.cc"
+        ).read_text()
+        teardown = shader_source.split(
+            "void barrier_set_t::deallocate_barrier", 1)[1].split(
+                "void barrier_set_t::warp_reaches_barrier", 1)[0]
+
+        self.assertNotIn("std::cerr", teardown)
+        self.assertIn(
+            'fprintf(stderr, "%s\\n", summary_message.c_str());',
+            teardown)
+        self.assertIn(
+            'fprintf(stderr, "%s", leak_messages.c_str());',
+            teardown)
+        self.assertIn(
+            'fprintf(stderr, "%s\\n", abort_message.c_str());',
+            teardown)
+
 
 class WaitBlockFoldProofTest(unittest.TestCase):
     def test_control_requires_primary_wait_predicate(self):

@@ -683,6 +683,14 @@ The current v5 WaitBlock loader and zero-active path already implement most of
 this section. The new TMA completion-target payload must join the same
 fail-closed startup contract.
 
+The integrated loader's malformed-input rejection cannot be runtime-proven by
+the local Python/source-contract tests alone. The B2 startup negative matrix
+would require launching the simulator binary with malformed artifacts; the B3
+lifecycle negative matrix additionally requires a runtime fault-injection hook
+or deliberately retained state. Both server-only negative matrices were
+waived/deferred for Opt 12 closure on 2026-09-02. Existing K5/K10 runs validate
+clean positive teardown, not those negative paths.
+
 ## 9. Watchdog and kernel scope
 
 Replace hardcoded WaitBlock timing constants with explicit configuration:
@@ -819,7 +827,10 @@ sum(TRACECHECK.warp_insts)
 Final log analysis checks this equation and the WaitBlock, TMABIND, named-BAR,
 release-fingerprint, SR-M0A, CTA-count, and clean-exit invariants together.
 Named-BAR teardown explicitly aborts on residual participant or deferred-credit
-state independent of build assertions.
+state independent of build assertions. BAR teardown diagnostics assemble each
+summary/leak/abort record before emission and use one `fprintf(stderr, ...)`
+call per completed record/block, preventing concurrent OpenMP SM diagnostics
+from splitting a record across lines.
 
 Final `7ac4d23` regression results:
 

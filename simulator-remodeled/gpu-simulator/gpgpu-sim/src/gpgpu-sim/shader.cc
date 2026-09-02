@@ -4515,30 +4515,38 @@ void barrier_set_t::deallocate_barrier(unsigned cta_id) {
   const bool leaked =
       at_barrier.any() || active.any() || leaked_ids != 0;
   if (m_shader->get_config()->bar_debug_enable || leaked) {
-    std::cerr << "[BARDBG][summary] cta_id=" << cta_id
-              << " cycle=" << cycle
-              << " active=" << active.to_string()
-              << " parked=" << at_barrier.to_string()
-              << " leaked_ids=" << leaked_ids
-              << " leaked_participant_warps=" << leaked_participant_warps
-              << " leaked_arv_seen=" << leaked_arv_seen
-              << " leaked_defer_sync_extra_credits="
-              << leaked_defer_sync_extra_credits << "\n";
+    std::ostringstream summary_record;
+    summary_record << "[BARDBG][summary] cta_id=" << cta_id
+                   << " cycle=" << cycle
+                   << " active=" << active.to_string()
+                   << " parked=" << at_barrier.to_string()
+                   << " leaked_ids=" << leaked_ids
+                   << " leaked_participant_warps="
+                   << leaked_participant_warps
+                   << " leaked_arv_seen=" << leaked_arv_seen
+                   << " leaked_defer_sync_extra_credits="
+                   << leaked_defer_sync_extra_credits;
+    const std::string summary_message = summary_record.str();
+    fprintf(stderr, "%s\n", summary_message.c_str());
     if (leaked_ids > 0) {
-      std::cerr << leak_details.str();
+      const std::string leak_messages = leak_details.str();
+      fprintf(stderr, "%s", leak_messages.c_str());
     }
   }
   if (leaked) {
-    std::cerr << "[BARDBG][abort] reason=cta-cleanup-with-active-state"
-              << " cta_id=" << cta_id << " cycle=" << cycle
-              << " active_warps=" << active.count()
-              << " parked_warps=" << at_barrier.count()
-              << " leaked_ids=" << leaked_ids
-              << " leaked_participant_warps="
-              << leaked_participant_warps
-              << " leaked_arv_seen=" << leaked_arv_seen
-              << " leaked_defer_sync_extra_credits="
-              << leaked_defer_sync_extra_credits << std::endl;
+    std::ostringstream abort_record;
+    abort_record << "[BARDBG][abort] reason=cta-cleanup-with-active-state"
+                 << " cta_id=" << cta_id << " cycle=" << cycle
+                 << " active_warps=" << active.count()
+                 << " parked_warps=" << at_barrier.count()
+                 << " leaked_ids=" << leaked_ids
+                 << " leaked_participant_warps="
+                 << leaked_participant_warps
+                 << " leaked_arv_seen=" << leaked_arv_seen
+                 << " leaked_defer_sync_extra_credits="
+                 << leaked_defer_sync_extra_credits;
+    const std::string abort_message = abort_record.str();
+    fprintf(stderr, "%s\n", abort_message.c_str());
     abort();
   }
   m_warp_active &= ~warps;

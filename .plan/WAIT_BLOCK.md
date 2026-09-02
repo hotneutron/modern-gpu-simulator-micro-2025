@@ -217,6 +217,13 @@ TMA metadata. Existing exact-target/fallback summary checks remain
 authoritative. Local source-contract tests pass; executing the malformed-input
 matrix against a simulator binary remains a server validation item.
 
+**Validation scope decision (2026-09-02).** The runtime negative matrix is
+waived for Opt 12 closure and remains deferred evidence, not an executed test.
+Local Python/source-contract tests can prove that the guards are present, but
+cannot prove that the integrated C++ loader aborts before cycle 0. That proof
+requires launching the simulator binary with malformed artifacts on the
+server; it would be a short startup-abort test rather than a full K5/K10 run.
+
 ### B3 assert-before-clear lifecycle audit
 
 WaitBlock and B0-D TMA ownership already assert their primary conservation
@@ -243,6 +250,13 @@ state can be cleared. Terminal conservation now includes auxiliary FOLD holds.
 Named-BAR deallocation already asserts participant and deferred-credit state.
 Local source-contract tests pass; runtime residual-state fault injection remains
 a server validation item.
+
+**Validation scope decision (2026-09-02).** Runtime residual-state fault
+injection is waived for Opt 12 closure and remains deferred evidence. There is
+no isolated local SM/CTA lifecycle harness in this repository; proving the
+negative path requires a simulator build plus a test hook or deliberately
+injected residual state on the server. The clean K5/K10 regressions validate
+the non-faulted teardown path only.
 
 ### B5 configurable watchdogs and launch-scoped diagnostics
 
@@ -343,7 +357,12 @@ K10: retired 19,912,509 + skipped 1,084,920 = traced 20,997,429
 Both runs have exact release-service visit counts, complete TMA binding/byte
 conservation, zero named-BAR leaks, and `STALLALIGN FINAL status=PASS`. One K10
 BAR summary was split by concurrent stderr output; its continuation contains
-all four leak counters at zero.
+all four leak counters at zero. The split was caused by chained `std::cerr`
+insertions from concurrent OpenMP SM threads. BAR teardown summary, leak, and
+abort records now assemble off-stream and use one `fprintf(stderr, ...)` call
+per completed record/block; a local source-contract test prevents reintroducing
+chained teardown output. This diagnostics-only fix does not alter simulated
+state or timing.
 
 ### Deferred generalization
 
@@ -388,9 +407,11 @@ snapshot" section below.
 3. The ABI-correct v2 trace and compact ticket artifact are authoritative for
    the 90,868 eligible exact-generation actions. The ordered-candidate and
    parity-only designs remain rejected historical evidence.
-4. B1, B6, and B7 are validated. Remaining Opt 12 validation is the B2/B3
-   runtime negative matrix and B5 multi-kernel test. B2, B3, and B5
-   implementation and local tests are complete.
+4. B1, B6, and B7 are runtime validated. B2 and B3 implementation and local
+   source-contract tests are complete; their server-only runtime negative
+   matrices are explicitly waived/deferred. B5 implementation and local tests
+   are complete, while its back-to-back multi-kernel runtime test remains
+   pending.
 5. Separate cycle-accuracy work starts from the first K5
    `current_generation > target_generation` occurrence. Completion alone must
    not be used to close the 9,542 late-arrival timing divergences; this is not
@@ -559,8 +580,8 @@ sidecar generation; unified metadata does not require unified runtime behavior.
 | B0-D | Exact TMA-command-to-barrier completion ownership | **COMPLETE / VALIDATED** at `39abefb`; `.e85` validates ownership-clean out-of-order completion, and K10 `.e62` completes 384/384 CTAs with 132/132 clean SM-level TMABIND final records after exercising two simultaneous open contracts per warp |
 | B0-E | K5 all-live cross-warp WaitBlock cycle (`0xb370`/`0x16c60`) | **COMPLETE / VALIDATED** at `087b53f`; K5 `.e90` completes 132/132 CTAs without forced release and K10 `.e66` completes 384/384. All WaitBlock/TMABIND summaries pass. K5's 9,542 late-arrival divergences remain a cycle-accuracy diagnostic |
 | B1 | One SM-level WaitBlock release phase per cycle | **IMPLEMENTED / LOG-VALIDATED**; K5 `.e91` and K10 `.e67` have exact release-service accounting, and the invalid whole-subcore reversal experiment is retired |
-| B2 | WaitBlock startup and provenance fail-fast checks | **IMPLEMENTED / RUNTIME NEGATIVE MATRIX PENDING** |
-| B3 | Assert-before-clear lifecycle checks | **IMPLEMENTED / RUNTIME NEGATIVE MATRIX PENDING** |
+| B2 | WaitBlock startup and provenance fail-fast checks | **IMPLEMENTED / LOCAL CONTRACT VALIDATED / SERVER NEGATIVE TEST WAIVED** |
+| B3 | Assert-before-clear lifecycle checks | **IMPLEMENTED / LOCAL CONTRACT VALIDATED / SERVER NEGATIVE TEST WAIVED** |
 | B4 | Zero-active no-op and active required-payload checks | **IMPLEMENTED** |
 | B5 | Configurable watchdog/heartbeat and kernel-scoped counters | **IMPLEMENTED / MULTI-KERNEL RUNTIME TEST PENDING** |
 | B6 | WaitBlock-only non-mutating hold query | **IMPLEMENTED / VALIDATED** by K5 `.o93` and K10 `.o69` SR-M0A PASS |
