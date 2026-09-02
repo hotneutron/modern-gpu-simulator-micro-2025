@@ -821,6 +821,23 @@ release-fingerprint, SR-M0A, CTA-count, and clean-exit invariants together.
 Named-BAR teardown explicitly aborts on residual participant or deferred-credit
 state independent of build assertions.
 
+Final `7ac4d23` regression results:
+
+```text
+K5 .e93/.o93:
+  14,448,016 retired + 371,587 skipped = 14,819,603 traced
+  6,481 releases = 6,481 release fingerprints
+
+K10 .e69/.o69:
+  19,912,509 retired + 1,084,920 skipped = 20,997,429 traced
+  9,061 releases = 9,061 release fingerprints
+```
+
+Both kernels complete all CTAs with exact release-service visit counts,
+TMABIND command/byte conservation, zero named-BAR leaks, zero active final
+state, and `STALLALIGN FINAL status=PASS`. One K10 BAR summary is split across
+two stderr lines; the continuation preserves all four zero leak counters.
+
 ## 12. Diagnostics
 
 Every TMA binding event must be sufficient to reconstruct the causal chain:

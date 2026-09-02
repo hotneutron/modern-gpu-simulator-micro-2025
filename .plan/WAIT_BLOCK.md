@@ -1,6 +1,6 @@
 # WaitBlock: Design Index and Current Status
 
-**Status (2026-09-01):** B0-A through B0-E are complete. B0-D exact TMA
+**Status (2026-09-02):** B0-A through B0-E are complete. B0-D exact TMA
 completion ownership remains validated at `39abefb`. B0-E exact-generation
 capture and consumption is implemented at `087b53f` and validated by K5 `.e90`
 and K10 `.e66`. K5 completes 132/132 CTAs at 85,172 cycles without a forced
@@ -19,6 +19,13 @@ though dependency correctness and completion now pass. That timing analysis is
 a separate cycle-accuracy optimization, not an Opt 12 completion gate. B1
 release-phase accounting and cycle-order checks pass K5/K10. The rejected
 reverse-subcore validation experiment is recorded below.
+
+The final Opt 12 functional regression at `7ac4d23` passes: K5
+`.e93`/`.o93` completes 132/132 CTAs at 84,906 cycles and K10
+`.e69`/`.o69` completes 384/384 CTAs at 140,003 cycles. Both runs preserve
+their prior CTA-level TRACECHECK records exactly and pass WaitBlock, TMABIND,
+named-BAR, SR-M0A, release-service, and warp-instruction conservation with zero
+active final state or aborts.
 
 ## Separate cycle-accuracy follow-up (outside Opt 12)
 
@@ -322,7 +329,21 @@ Final log analysis must close this equation together with WaitBlock
 hold/release, partial replay, release-fingerprint, TMABIND byte/ownership,
 named-BAR, SR-M0A, CTA-count, and clean-exit checks. Named-BAR teardown now
 explicitly aborts on residual participant or credit state even when C/C++
-assertions are disabled. Final K5/K10 logs remain pending.
+assertions are disabled.
+
+**Final regression.**
+
+```text
+K5:  retired 14,448,016 + skipped 371,587 = traced 14,819,603
+     releases 6,481 = fingerprints 6,481
+K10: retired 19,912,509 + skipped 1,084,920 = traced 20,997,429
+     releases 9,061 = fingerprints 9,061
+```
+
+Both runs have exact release-service visit counts, complete TMA binding/byte
+conservation, zero named-BAR leaks, and `STALLALIGN FINAL status=PASS`. One K10
+BAR summary was split by concurrent stderr output; its continuation contains
+all four leak counters at zero.
 
 ### Deferred generalization
 
@@ -367,9 +388,9 @@ snapshot" section below.
 3. The ABI-correct v2 trace and compact ticket artifact are authoritative for
    the 90,868 eligible exact-generation actions. The ordered-candidate and
    parity-only designs remain rejected historical evidence.
-4. B1 is log-validated. Remaining Opt 12 validation is the B2/B3 runtime
-   negative matrix, B5 multi-kernel test, and final B6/B7 K5/K10 verifier pass.
-   B2, B3, B5, B6, and B7 implementation and local tests are complete.
+4. B1, B6, and B7 are validated. Remaining Opt 12 validation is the B2/B3
+   runtime negative matrix and B5 multi-kernel test. B2, B3, and B5
+   implementation and local tests are complete.
 5. Separate cycle-accuracy work starts from the first K5
    `current_generation > target_generation` occurrence. Completion alone must
    not be used to close the 9,542 late-arrival timing divergences; this is not
@@ -542,8 +563,8 @@ sidecar generation; unified metadata does not require unified runtime behavior.
 | B3 | Assert-before-clear lifecycle checks | **IMPLEMENTED / RUNTIME NEGATIVE MATRIX PENDING** |
 | B4 | Zero-active no-op and active required-payload checks | **IMPLEMENTED** |
 | B5 | Configurable watchdog/heartbeat and kernel-scoped counters | **IMPLEMENTED / MULTI-KERNEL RUNTIME TEST PENDING** |
-| B6 | WaitBlock-only non-mutating hold query | **IMPLEMENTED / FINAL RUNTIME CHECK PENDING** |
-| B7 | Fold/WaitBlock metric integrity and final reconciliation | **IMPLEMENTED / FINAL K5/K10 VERIFICATION PENDING** |
+| B6 | WaitBlock-only non-mutating hold query | **IMPLEMENTED / VALIDATED** by K5 `.o93` and K10 `.o69` SR-M0A PASS |
+| B7 | Fold/WaitBlock metric integrity and final reconciliation | **IMPLEMENTED / VALIDATED** by K5 `.e93`/`.o93` and K10 `.e69`/`.o69` |
 | D0 | Generic ISA-wide effect framework | **DEFERRED**; exact sidecar allow/proof sets remain authoritative |
 | D1 | Generic repeated-EXCH initialization epochs | **DEFERRED** for current FA3 one-EXCH-per-barrier contract |
 | D2 | Full trace regeneration | **COMPLETE**; the `9e92fe9` trace is the comparison baseline and the ABI-correct v2 capture after `9bb9630` supplies the accepted contract ordinals and exact tickets |
