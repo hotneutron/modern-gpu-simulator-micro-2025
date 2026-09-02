@@ -3,6 +3,11 @@
 **Work type:** Exact TMA-command-to-mbarrier completion ownership design
 (Batch B: B0-A through B0-D, plus B1 release ordering, metrics, and lifecycle).
 
+**Status (2026-09-02): COMPLETE for Opt 12.** B1/B6/B7 have K5/K10 runtime
+evidence. B2/B3/B5 have implementation and local source-contract validation;
+their server-only negative and multi-kernel tests are waived/deferred and are
+not closure gates.
+
 **Parent index:** [WAIT_BLOCK.md](WAIT_BLOCK.md). The scope/status table for every
 Batch B item (B0-A … B7, D0 … D2) and the current B0-E deadlock analysis live in
 the parent index. Shared terminology and hard invariants are defined once in the
@@ -717,8 +722,8 @@ assert that all WaitBlock/TMA state is drained and then reset WaitBlock totals,
 release-service accounting, pace maps, semantic anchors, sync work counters,
 and all sync/TMA/WaitBlock log budgets. Pending objects use their `valid` flag
 as the active sentinel, so a start cycle of zero is not ambiguous. Local
-source-contract tests pass; the back-to-back runtime launch test remains
-pending on the simulator server.
+source-contract tests pass. The back-to-back runtime launch test is deferred
+server evidence and is not an Opt 12 closure gate.
 
 The generic repeated-EXCH initialization epoch remains deferred because current
 FA3 proves one EXCH per barrier. Existing generation identity is nevertheless

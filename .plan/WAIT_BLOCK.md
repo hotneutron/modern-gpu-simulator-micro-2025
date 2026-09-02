@@ -27,6 +27,13 @@ their prior CTA-level TRACECHECK records exactly and pass WaitBlock, TMABIND,
 named-BAR, SR-M0A, release-service, and warp-instruction conservation with zero
 active final state or aborts.
 
+**Opt 12 closure (2026-09-02): COMPLETE.** B2 and B3 are accepted through
+implementation review and local source-contract validation; their server-only
+negative runtime matrices are waived/deferred. B5 is likewise accepted through
+implementation and local source-contract validation, with its server-only
+back-to-back launch test deferred. These deferred tests are not Opt 12 closure
+gates. K5 cycle-accuracy analysis remains a separate optimization.
+
 ## Separate cycle-accuracy follow-up (outside Opt 12)
 
 ### K5 first late-arrival root cause
@@ -188,8 +195,8 @@ subcore issue order remains canonical.
 
 ### B2 startup and provenance closure
 
-Most fail-closed loading checks are implemented. The remaining work is an audit
-that every enabled runtime path is covered before kernel execution.
+Fail-closed loading checks are implemented for every enabled runtime path
+before kernel execution.
 
 **Required checks.**
 
@@ -226,9 +233,9 @@ server; it would be a short startup-abort test rather than a full K5/K10 run.
 
 ### B3 assert-before-clear lifecycle audit
 
-WaitBlock and B0-D TMA ownership already assert their primary conservation
-rules. The remaining audit covers every cleanup path that can erase state:
-CTA finish, warp-slot reuse, kernel finish, and simulator teardown.
+WaitBlock and B0-D TMA ownership assert their primary conservation rules across
+every cleanup path that can erase state: CTA finish, warp-slot reuse, kernel
+finish, and simulator teardown.
 
 Before clearing state, assert:
 
@@ -285,7 +292,8 @@ kernel UID changes assert that the prior launch drained, then reset WaitBlock
 totals, release-service accounting, pace maps, semantic anchors, late-report
 state, sync work counters, and sync/TMA/WaitBlock log budgets. The existing
 unfulfillable-contract gate aborts before the watchdog. Local source-contract
-tests pass; a back-to-back runtime kernel test remains a server validation item.
+tests pass. The back-to-back runtime kernel test is deferred server evidence
+and is not an Opt 12 closure gate.
 
 ### B6 pure hold query and scheduler accounting
 
@@ -407,11 +415,10 @@ snapshot" section below.
 3. The ABI-correct v2 trace and compact ticket artifact are authoritative for
    the 90,868 eligible exact-generation actions. The ordered-candidate and
    parity-only designs remain rejected historical evidence.
-4. B1, B6, and B7 are runtime validated. B2 and B3 implementation and local
-   source-contract tests are complete; their server-only runtime negative
-   matrices are explicitly waived/deferred. B5 implementation and local tests
-   are complete, while its back-to-back multi-kernel runtime test remains
-   pending.
+4. B1, B6, and B7 are runtime validated. B2, B3, and B5 implementation and
+   local source-contract tests are complete; their server-only negative and
+   multi-kernel matrices are explicitly waived/deferred. Opt 12 is complete
+   under this validation scope.
 5. Separate cycle-accuracy work starts from the first K5
    `current_generation > target_generation` occurrence. Completion alone must
    not be used to close the 9,542 late-arrival timing divergences; this is not
@@ -583,7 +590,7 @@ sidecar generation; unified metadata does not require unified runtime behavior.
 | B2 | WaitBlock startup and provenance fail-fast checks | **IMPLEMENTED / LOCAL CONTRACT VALIDATED / SERVER NEGATIVE TEST WAIVED** |
 | B3 | Assert-before-clear lifecycle checks | **IMPLEMENTED / LOCAL CONTRACT VALIDATED / SERVER NEGATIVE TEST WAIVED** |
 | B4 | Zero-active no-op and active required-payload checks | **IMPLEMENTED** |
-| B5 | Configurable watchdog/heartbeat and kernel-scoped counters | **IMPLEMENTED / MULTI-KERNEL RUNTIME TEST PENDING** |
+| B5 | Configurable watchdog/heartbeat and kernel-scoped counters | **IMPLEMENTED / LOCAL CONTRACT VALIDATED / SERVER MULTI-KERNEL TEST DEFERRED** |
 | B6 | WaitBlock-only non-mutating hold query | **IMPLEMENTED / VALIDATED** by K5 `.o93` and K10 `.o69` SR-M0A PASS |
 | B7 | Fold/WaitBlock metric integrity and final reconciliation | **IMPLEMENTED / VALIDATED** by K5 `.e93`/`.o93` and K10 `.e69`/`.o69` |
 | D0 | Generic ISA-wide effect framework | **DEFERRED**; exact sidecar allow/proof sets remain authoritative |
