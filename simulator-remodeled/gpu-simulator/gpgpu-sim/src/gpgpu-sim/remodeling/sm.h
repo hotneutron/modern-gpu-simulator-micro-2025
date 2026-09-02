@@ -241,10 +241,9 @@ class SM : public core_t, public shader_core_ctx_wrapper {
   bool ldst_unit_response_buffer_full() const override;
   bool are_all_wait_barrier_ready(unsigned int warp_id);
   bool warp_waiting_at_barrier(unsigned warp_id) const override;
-  // Non-mutating peek of the same hold condition as
-  // warp_waiting_at_barrier, but with NO clear and NO counter bump. Used off the
-  // authoritative issue-eligibility path (sort comparator, stall scans) so the
-  // release side effect fires exactly once. See design doc 6.5.1.
+  // WaitBlock-only non-mutating hold predicate for legacy stall metrics. Named
+  // BAR state is excluded; the implementation delegates to the authoritative
+  // peek_wait_block_hold_mode query.
   bool warp_held_on_mbarrier_wait(unsigned warp_id) const;
   // Once-per-warp-per-cycle authoritative release service. All-live
   // missing-wait holds only clear pending state; partial holds activate or
@@ -278,8 +277,7 @@ class SM : public core_t, public shader_core_ctx_wrapper {
   //
   // peek_wait_block_hold_mode inspects ONLY the pending WaitBlock state
   // (m_pending_sync_waits) and returns NONE when no unresolved hold exists.
-  // It deliberately does NOT consult the programmer/named-barrier set, unlike
-  // warp_waiting_at_barrier / warp_held_on_mbarrier_wait.
+  // It deliberately does NOT consult the programmer/named-barrier set.
   WaitBlockPendingMode peek_wait_block_hold_mode(unsigned warp_id) const;
   // Named/programmer barrier hold only (m_barriers), no mbarrier fold state.
   bool peek_named_barrier_wait(unsigned warp_id) const;
@@ -800,6 +798,7 @@ class SM : public core_t, public shader_core_ctx_wrapper {
   unsigned long long m_wait_block_late_arrivals_total = 0;
   unsigned long long m_wait_block_first_late_reports_total = 0;
   unsigned long long m_wait_block_watchdog_aborts_total = 0;
+  unsigned long long m_wait_block_retired_warp_instructions_total = 0;
  public:
   // Increment the tensor-op count for the CTA slot that owns hardware warp wid.
   void inc_tensor_ops_for_warp(unsigned wid) {

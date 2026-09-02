@@ -1201,6 +1201,41 @@ class ContractOrdinalCaptureTest(unittest.TestCase):
         self.assertIn(
             "-wait_block_heartbeat_cycles 4096", h100_config)
 
+    def test_simulator_wait_block_query_and_metrics_are_closed(self):
+        simulator_root = MODULE_PATH.parents[2] / "gpu-simulator"
+        sm_source = (
+            simulator_root /
+            "gpgpu-sim/src/gpgpu-sim/remodeling/sm.cc"
+        ).read_text()
+        subcore_source = (
+            simulator_root /
+            "gpgpu-sim/src/gpgpu-sim/remodeling/subcore.cc"
+        ).read_text()
+        shader_source = (
+            simulator_root /
+            "gpgpu-sim/src/gpgpu-sim/shader.cc"
+        ).read_text()
+
+        hold_alias = sm_source.split(
+            "bool SM::warp_held_on_mbarrier_wait", 1)[1].split(
+                "\n}", 1)[0]
+        self.assertIn("peek_wait_block_hold_mode", hold_alias)
+        self.assertNotIn("warp_waiting_at_barrier(warp_id)", hold_alias)
+        issue_query = sm_source.split(
+            "bool SM::warp_waiting_at_barrier", 1)[1].split(
+                "\n}", 1)[0]
+        self.assertIn("peek_wait_block_hold_mode", issue_query)
+        self.assertIn(
+            "shared_sm->peek_wait_block_hold_mode(sm_warp_id)",
+            subcore_source)
+        self.assertIn(
+            "m_wait_block_retired_warp_instructions_total++",
+            sm_source)
+        self.assertIn("retired_warp_instructions=%llu", sm_source)
+        self.assertIn(
+            "[BARDBG][abort] reason=cta-cleanup-with-active-state",
+            shader_source)
+
 
 class WaitBlockFoldProofTest(unittest.TestCase):
     def test_control_requires_primary_wait_predicate(self):

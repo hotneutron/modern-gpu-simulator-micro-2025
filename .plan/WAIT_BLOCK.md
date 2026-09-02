@@ -15,12 +15,14 @@ validates the intended dependency identity and eliminates the K5 all-live
 late-arrival divergences where `current_generation > target_generation` when an
 INJECT action is reached; K10 reports zero. The K5 events are concentrated at
 `0x5a50` and `0x5bc0`, so producer/consumer timing analysis remains open even
-though dependency correctness and completion now pass. B1 normal traversal
-passes K5/K10; reversed traversal on the same trace remains pending.
+though dependency correctness and completion now pass. That timing analysis is
+a separate cycle-accuracy optimization, not an Opt 12 completion gate. B1
+normal traversal passes K5/K10; reversed traversal on the same trace remains
+pending.
 
-## Remaining work
+## Separate cycle-accuracy follow-up (outside Opt 12)
 
-### 1. K5 first late-arrival root cause (cycle-accuracy priority)
+### K5 first late-arrival root cause
 
 **Problem.** K5 completes, but 9,542 exact INJECT actions execute with
 `current_generation > target_generation`. K10 has zero. A late observation does
@@ -98,7 +100,9 @@ Producer-minus-Consumer tail without a forced release, phase force, generation
 rewrite, or PC whitelist. A lower divergence count is diagnostic evidence, not
 a standalone acceptance condition.
 
-### 2. B1 deterministic SM-cycle release phase
+## Opt 12 completion work
+
+### B1 deterministic SM-cycle release phase
 
 **Problem.** `service_wait_block_release()` currently runs from each
 `Subcore::modify_warp_state()`. Therefore subcore traversal order can determine
@@ -162,7 +166,7 @@ different dynamic FOLD retry populations. The strict trace comparison still
 passes semantic fingerprint, WaitBlock structure/counts, and TMA contracts.
 Reversed traversal on the same current trace remains required for B1 acceptance.
 
-### 3. B2 startup and provenance closure
+### B2 startup and provenance closure
 
 Most fail-closed loading checks are implemented. The remaining work is an audit
 that every enabled runtime path is covered before kernel execution.
@@ -193,7 +197,7 @@ TMA metadata. Existing exact-target/fallback summary checks remain
 authoritative. Local source-contract tests pass; executing the malformed-input
 matrix against a simulator binary remains a server validation item.
 
-### 4. B3 assert-before-clear lifecycle audit
+### B3 assert-before-clear lifecycle audit
 
 WaitBlock and B0-D TMA ownership already assert their primary conservation
 rules. The remaining audit covers every cleanup path that can erase state:
@@ -220,7 +224,7 @@ Named-BAR deallocation already asserts participant and deferred-credit state.
 Local source-contract tests pass; runtime residual-state fault injection remains
 a server validation item.
 
-### 5. B5 configurable watchdogs and launch-scoped diagnostics
+### B5 configurable watchdogs and launch-scoped diagnostics
 
 Replace hardcoded timing constants with:
 
@@ -249,7 +253,7 @@ state, sync work counters, and sync/TMA/WaitBlock log budgets. The existing
 unfulfillable-contract gate aborts before the watchdog. Local source-contract
 tests pass; a back-to-back runtime kernel test remains a server validation item.
 
-### 6. B6 pure hold query and scheduler accounting
+### B6 pure hold query and scheduler accounting
 
 `peek_wait_block_hold_mode(warp_id)` must remain the only scheduler-side
 WaitBlock query. Complete the audit of legacy `mbarrier_spin` and stall metrics
@@ -263,7 +267,14 @@ partition every active hardware warp exactly once into selected,
 eligible-not-selected, WaitBlock-held, blocked-with-valid-head,
 no-valid-instruction, drain, or inactive.
 
-### 7. B7 metric reconciliation
+**Implementation checkpoint.** Both the authoritative issue predicate and the
+legacy mbarrier-stall metric now obtain WaitBlock state only through
+`peek_wait_block_hold_mode()`. The legacy alias previously included named-BAR
+state and could misclassify it as a WaitBlock hold; it is now WaitBlock-only.
+The existing SR-M0A enum-based partition and per-cycle conservation remain the
+acceptance mechanism. Local source-contract tests pass.
+
+### B7 metric reconciliation
 
 Keep issued wait outcomes, logical WaitBlock episodes, TMA completion
 ownership, and exclusive scheduler population as separate metric domains.
@@ -283,6 +294,23 @@ fold-off retired warp instructions - fold-on retired warp instructions
 Do not compare skipped warp occurrences directly with active-lane
 `gpu_sim_insn`. Acceptance requires all equations at kernel scope and zero
 active state at finalization for both K5 and K10.
+
+**Implementation checkpoint.** WaitBlock summaries now expose retired warp
+instructions in the same unit as skipped occurrences. For a single trace run,
+the equivalent invariant is:
+
+```text
+sum(TRACECHECK.warp_insts)
+    == sum(retired_warp_instructions)
+     + sum(captured_poll_advanced_occurrences)
+```
+
+`verify_wait_block_run.py` closes this equation together with WaitBlock
+hold/release, partial replay, release-fingerprint, TMABIND byte/ownership,
+named-BAR, SR-M0A, CTA-count, and clean-exit checks. Named-BAR teardown now
+explicitly aborts on residual participant or credit state even when C/C++
+assertions are disabled. Synthetic positive and fault-injection tests pass;
+final K5/K10 logs remain pending.
 
 ### Deferred generalization
 
@@ -327,13 +355,13 @@ snapshot" section below.
 3. The ABI-correct v2 trace and compact ticket artifact are authoritative for
    the 90,868 eligible exact-generation actions. The ordered-candidate and
    parity-only designs remain rejected historical evidence.
-4. Remaining WaitBlock engineering is B1 validation plus B2, B3, B5, B6, and
-   B7 as listed in the Batch B table below. B1 normal traversal passes but
-   reversed traversal remains pending. B5 is not implemented; B2, B3, B6, and
-   B7 require their listed audits or completion work.
-5. Remaining cycle-accuracy work starts from the first K5
+4. Remaining Opt 12 validation is the B1 reversed run, B2/B3 runtime negative
+   matrix, B5 multi-kernel test, and final B6/B7 K5/K10 verifier pass. B2,
+   B3, B5, B6, and B7 implementation and local tests are complete.
+5. Separate cycle-accuracy work starts from the first K5
    `current_generation > target_generation` occurrence. Completion alone must
-   not be used to close the 9,542 late-arrival timing divergences.
+   not be used to close the 9,542 late-arrival timing divergences; this is not
+   an Opt 12 completion gate.
 
 ## Historical pre-E0 handover snapshot (2026-08-31)
 
@@ -502,8 +530,8 @@ sidecar generation; unified metadata does not require unified runtime behavior.
 | B3 | Assert-before-clear lifecycle checks | **IMPLEMENTED / RUNTIME NEGATIVE MATRIX PENDING** |
 | B4 | Zero-active no-op and active required-payload checks | **IMPLEMENTED** |
 | B5 | Configurable watchdog/heartbeat and kernel-scoped counters | **IMPLEMENTED / MULTI-KERNEL RUNTIME TEST PENDING** |
-| B6 | WaitBlock-only non-mutating hold query | **PARTIAL**: SR-M0A path implemented; legacy metrics still need audit |
-| B7 | Fold/WaitBlock metric integrity and final reconciliation | **PARTIAL** |
+| B6 | WaitBlock-only non-mutating hold query | **IMPLEMENTED / FINAL RUNTIME CHECK PENDING** |
+| B7 | Fold/WaitBlock metric integrity and final reconciliation | **IMPLEMENTED / FINAL K5/K10 VERIFICATION PENDING** |
 | D0 | Generic ISA-wide effect framework | **DEFERRED**; exact sidecar allow/proof sets remain authoritative |
 | D1 | Generic repeated-EXCH initialization epochs | **DEFERRED** for current FA3 one-EXCH-per-barrier contract |
 | D2 | Full trace regeneration | **COMPLETE**; the `9e92fe9` trace is the comparison baseline and the ABI-correct v2 capture after `9bb9630` supplies the accepted contract ordinals and exact tickets |

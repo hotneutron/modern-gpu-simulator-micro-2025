@@ -4472,53 +4472,49 @@ void barrier_set_t::deallocate_barrier(unsigned cta_id) {
   warp_set_t warps = w->second;
   warp_set_t at_barrier = warps & m_warp_at_barrier;
   warp_set_t active = warps & m_warp_active;
-  // BARDBG: emit a compact CTA-teardown summary on every deallocation, and if any
-  // participant / credit state remains, dump the per-id details even when no warp is
-  // currently parked at the barrier. This catches participant-only leaks that would
-  // otherwise bypass the older at_barrier.any() debug condition.
-  if (m_shader->get_config()->bar_debug_enable) {
-    unsigned leaked_ids = 0;
-    unsigned leaked_participant_warps = 0;
-    unsigned leaked_arv_seen = 0;
-    unsigned leaked_defer_sync_extra_credits = 0;
-    std::ostringstream oss;
-    const unsigned long long cycle =
-        m_shader->get_gpu()->gpu_tot_sim_cycle +
-        m_shader->get_gpu()->gpu_sim_cycle;
-    for (unsigned i = 0; i < m_max_barriers_per_cta; i++) {
-      warp_set_t participant_i = warps & m_bar_id_to_warps[i];
-      warp_set_t arrive_i = warps & m_bar_id_to_arrive_credited_warps[i];
-      warp_set_t sync_i = warps & m_bar_id_to_sync_credited_warps[i];
-      if (participant_i.any() || arrive_i.any() || sync_i.any()) {
-        ++leaked_ids;
-        leaked_participant_warps += participant_i.count();
-        leaked_arv_seen += arrive_i.count();
-        leaked_defer_sync_extra_credits += sync_i.count();
-        // DIAG (B7): requested bar_count for this (cta,bar_id), and the arrived credit count
-        // (participants + extra deferred-sync credits) the same way warp_reaches_barrier
-        // computes it. This shows, at the leak, whether the cohort was BELOW its threshold
-        // (true closing-credit-exited leak) vs. AT/ABOVE it (an accounting/ordering bug),
-        // and whether the strict `==active` release was blocked by NON-participant warps.
-        int requested = -2;  // -2 == never recorded this epoch
-        auto cta_it = m_bar_id_to_count_diag.find(cta_id);
-        if (cta_it != m_bar_id_to_count_diag.end()) {
-          auto id_it = cta_it->second.find(i);
-          if (id_it != cta_it->second.end()) requested = (int)id_it->second;
-        }
-        unsigned arrived_credits = participant_i.count() + sync_i.count();
-        oss << "[BARDBG][leak]   bar_id=" << i
-            << " requested_count=" << requested
-            << " arrived_credits=" << arrived_credits
-            << " (warps*32=" << (participant_i.count() * m_warp_size)
-            << ", credits*32=" << (arrived_credits * m_warp_size) << ")"
-            << " participant_warps=" << participant_i.to_string()
-            << " arv_seen=" << arrive_i.count()
-            << " defer_sync_extra_credits=" << sync_i.count()
-            << " parked_here=" << (participant_i & m_warp_at_barrier).to_string()
-            << " active_eq_participant="
-            << ((participant_i == active) ? 1 : 0) << "\n";
+  unsigned leaked_ids = 0;
+  unsigned leaked_participant_warps = 0;
+  unsigned leaked_arv_seen = 0;
+  unsigned leaked_defer_sync_extra_credits = 0;
+  std::ostringstream leak_details;
+  const unsigned long long cycle =
+      m_shader->get_gpu()->gpu_tot_sim_cycle +
+      m_shader->get_gpu()->gpu_sim_cycle;
+  for (unsigned i = 0; i < m_max_barriers_per_cta; i++) {
+    warp_set_t participant_i = warps & m_bar_id_to_warps[i];
+    warp_set_t arrive_i = warps & m_bar_id_to_arrive_credited_warps[i];
+    warp_set_t sync_i = warps & m_bar_id_to_sync_credited_warps[i];
+    if (participant_i.any() || arrive_i.any() || sync_i.any()) {
+      ++leaked_ids;
+      leaked_participant_warps += participant_i.count();
+      leaked_arv_seen += arrive_i.count();
+      leaked_defer_sync_extra_credits += sync_i.count();
+      int requested = -2;
+      auto cta_it = m_bar_id_to_count_diag.find(cta_id);
+      if (cta_it != m_bar_id_to_count_diag.end()) {
+        auto id_it = cta_it->second.find(i);
+        if (id_it != cta_it->second.end()) requested = (int)id_it->second;
       }
+      unsigned arrived_credits = participant_i.count() + sync_i.count();
+      leak_details << "[BARDBG][leak]   bar_id=" << i
+                   << " requested_count=" << requested
+                   << " arrived_credits=" << arrived_credits
+                   << " (warps*32="
+                   << (participant_i.count() * m_warp_size)
+                   << ", credits*32="
+                   << (arrived_credits * m_warp_size) << ")"
+                   << " participant_warps=" << participant_i.to_string()
+                   << " arv_seen=" << arrive_i.count()
+                   << " defer_sync_extra_credits=" << sync_i.count()
+                   << " parked_here="
+                   << (participant_i & m_warp_at_barrier).to_string()
+                   << " active_eq_participant="
+                   << ((participant_i == active) ? 1 : 0) << "\n";
     }
+  }
+  const bool leaked =
+      at_barrier.any() || active.any() || leaked_ids != 0;
+  if (m_shader->get_config()->bar_debug_enable || leaked) {
     std::cerr << "[BARDBG][summary] cta_id=" << cta_id
               << " cycle=" << cycle
               << " active=" << active.to_string()
@@ -4529,22 +4525,26 @@ void barrier_set_t::deallocate_barrier(unsigned cta_id) {
               << " leaked_defer_sync_extra_credits="
               << leaked_defer_sync_extra_credits << "\n";
     if (leaked_ids > 0) {
-      std::cerr << oss.str();
+      std::cerr << leak_details.str();
     }
   }
-  assert(at_barrier.any() == false);  // no warps stuck at barrier
-  assert(active.any() == false);  // no warps in CTA still running
+  if (leaked) {
+    std::cerr << "[BARDBG][abort] reason=cta-cleanup-with-active-state"
+              << " cta_id=" << cta_id << " cycle=" << cycle
+              << " active_warps=" << active.count()
+              << " parked_warps=" << at_barrier.count()
+              << " leaked_ids=" << leaked_ids
+              << " leaked_participant_warps="
+              << leaked_participant_warps
+              << " leaked_arv_seen=" << leaked_arv_seen
+              << " leaked_defer_sync_extra_credits="
+              << leaked_defer_sync_extra_credits << std::endl;
+    abort();
+  }
   m_warp_active &= ~warps;
   m_warp_at_barrier &= ~warps;
 
   for (unsigned i = 0; i < m_max_barriers_per_cta; i++) {
-    warp_set_t at_a_specific_barrier = warps & m_bar_id_to_warps[i];
-    assert(at_a_specific_barrier.any() == false);  // no warps stuck at barrier
-    warp_set_t arrive_credited =
-        warps & m_bar_id_to_arrive_credited_warps[i];
-    assert(arrive_credited.any() == false);
-    warp_set_t sync_credited = warps & m_bar_id_to_sync_credited_warps[i];
-    assert(sync_credited.any() == false);
     m_bar_id_to_warps[i] &= ~warps;
     m_bar_id_to_arrive_credited_warps[i] &= ~warps;
     m_bar_id_to_sync_credited_warps[i] &= ~warps;

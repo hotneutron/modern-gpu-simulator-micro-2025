@@ -755,6 +755,12 @@ IBuffer head, FU availability, or generic programmer-barrier state afterward.
 Legacy `mbarrier_spin` metrics that call a generic barrier predicate must be
 migrated to the pure query or explicitly marked non-authoritative.
 
+**Implementation checkpoint.** The authoritative issue predicate and legacy
+mbarrier-stall metric now delegate WaitBlock classification exclusively to
+`peek_wait_block_hold_mode()`. The legacy alias no longer includes named-BAR
+state, eliminating cross-domain double classification. SR-M0A retains the
+enum-based exclusive population and per-cycle conservation checks.
+
 ## 11. Metric contracts
 
 Keep these domains separate:
@@ -798,6 +804,20 @@ fold-off retired warp instructions
 
 Do not compare raw skipped warp occurrences directly with active-lane
 `gpu_sim_insn`.
+
+WaitBlock summaries now expose `retired_warp_instructions`, allowing the
+single-run trace contract:
+
+```text
+sum(TRACECHECK.warp_insts)
+    == sum(retired_warp_instructions)
+     + sum(captured_poll_advanced_occurrences)
+```
+
+`util/tracer_nvbit/verify_wait_block_run.py` checks this equation and the
+WaitBlock, TMABIND, named-BAR, release-fingerprint, SR-M0A, CTA-count, and
+clean-exit invariants together. Named-BAR teardown explicitly aborts on
+residual participant or deferred-credit state independent of build assertions.
 
 ## 12. Diagnostics
 

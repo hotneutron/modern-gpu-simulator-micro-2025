@@ -645,8 +645,8 @@ void SM::reset_wait_block_launch_state(uint64_t launch_uid) {
   for (auto &pace : m_fold_pace_by_warp) {
     pace.clear();
   }
-  std::fill(std::begin(m_wait_block_first_late_reported_by_cta_slot),
-            std::end(m_wait_block_first_late_reported_by_cta_slot), false);
+  std::fill_n(m_wait_block_first_late_reported_by_cta_slot,
+              MAX_CTA_PER_SHADER, false);
   for (WaitBlockSemanticAnchor &anchor :
        m_wait_block_last_semantic_anchor_by_warp) {
     anchor = WaitBlockSemanticAnchor();
@@ -680,6 +680,7 @@ void SM::reset_wait_block_launch_state(uint64_t launch_uid) {
   m_wait_block_late_arrivals_total = 0;
   m_wait_block_first_late_reports_total = 0;
   m_wait_block_watchdog_aborts_total = 0;
+  m_wait_block_retired_warp_instructions_total = 0;
 
   std::cerr << "[WAITBLOCK][launch-reset] sm=" << m_sm_id
             << " launch_uid=" << launch_uid
@@ -3064,29 +3065,15 @@ bool SM::check_if_non_released_reduction_barrier(warp_inst_t &inst) {
 }
 
 bool SM::warp_waiting_at_barrier(unsigned warp_id) const {
-  if (m_barriers.warp_waiting_at_barrier(warp_id)) {
-    return true;
-  }
-  if (warp_id >= m_pending_sync_waits.size()) {
-    return false;
-  }
-  const HopperMBarrierPendingWait &pending_wait =
-      m_pending_sync_waits[warp_id];
-  if (!pending_wait.valid) {
-    return false;
-  }
-  // Pure peek: report hold state, do NOT clear here. The clear + "wait released"
-  // accounting and any captured-poll cursor skip happen exactly once in the
-  // SM-level cycle-start release phase, never from this query (including from
-  // a std::sort comparator). See design doc 6.5.1.
-  return !is_wait_block_pending_satisfied(pending_wait);
+  return m_barriers.warp_waiting_at_barrier(warp_id) ||
+         peek_wait_block_hold_mode(warp_id) != WaitBlockPendingMode::NONE;
 }
 
-// Non-mutating alias used off the issue path (comparator, stall scans). Same
-// value as warp_waiting_at_barrier; kept as a distinct name so callers document
-// that they must not rely on any side effect.
+// WaitBlock-only non-mutating alias used by legacy stall metrics. Named BAR
+// state is intentionally excluded so the two domains cannot be double-counted.
 bool SM::warp_held_on_mbarrier_wait(unsigned warp_id) const {
-  return warp_waiting_at_barrier(warp_id);
+  return peek_wait_block_hold_mode(warp_id) !=
+         WaitBlockPendingMode::NONE;
 }
 
 // [Stage 1] Common cursor-skip shared by the parked-release and immediate-ready
@@ -4263,6 +4250,7 @@ void SM::print_wait_block_summary() const {
       "release_phase_cycles=%llu release_service_visits=%llu "
       "release_service_expected_visits=%llu "
       "reverse_subcore_traversal=%u "
+      "retired_warp_instructions=%llu "
       "watchdog_aborts=%llu\n",
       balanced ? "PASS" : "ACTIVE", m_sm_id, m_missing_wait_ready_total,
       m_missing_wait_holds_total,
@@ -4291,6 +4279,7 @@ void SM::print_wait_block_summary() const {
       m_wait_block_release_phase_cycles_total *
           m_pending_sync_waits.size(),
       m_config->wait_block_reverse_subcore_traversal ? 1u : 0u,
+      m_wait_block_retired_warp_instructions_total,
       m_wait_block_watchdog_aborts_total);
 
   if (!m_config->wait_block_debug) {
@@ -6599,6 +6588,9 @@ void SM::warp_inst_complete(const warp_inst_t &inst) {
 
   m_sm_stats.m_stats_map["gpu_sim_insn"]->increment_with_integer(inst.active_count());
   m_sm_stats.m_stats_map["total_num_warp_instructions"]->increment_with_integer(1);
+  if (m_config->wait_block_enable) {
+    m_wait_block_retired_warp_instructions_total++;
+  }
 
   if(inst.is_load() || inst.is_store()) {
     m_sm_stats.m_stats_map["total_num_ldst_unit_instructions"]->increment_with_integer(1);
