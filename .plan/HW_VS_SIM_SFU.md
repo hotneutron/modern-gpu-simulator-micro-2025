@@ -1,0 +1,2046 @@
+# FA3 — HW (NCU) vs Simulator: SFU / critical-path / SM-idle analysis (HW_VS_SIM_SFU.md, 2026-07-27)
+
+Goal: reduce the FA3 sim-vs-HW cycle gap (fwd **1.56×**, bwd **1.35×** after Opt 10). This doc is the
+**fresh, definition-checked baseline** for that work. It supersedes the tangle of findings that had
+accreted onto `.plan/WARP_STAGGER_LOCKSTEP.md` (now CLOSED): the warp-stagger / lockstep / trace-`stall_count`
+leads were all either refuted or shown to be symptoms, and the residual is now positively localized to
+**issue-density / pipe-overlap** — with every per-pipe COST confirmed HW-faithful-or-lighter.
+
+Target HW: H100. Kernels: FA3 fwd = kernel 5 (`FlashAttnFwdSm90`), bwd = kernel 10 (`FlashAttnBwdSm90`).
+NCU reports: `nv_reports/h100/...full_rpt.ncu-rep` (ratios only) and
+`nv_reports/h100/fa3_pipe_rawcounts.ncu-rep` (raw `.sum` + `.peak_sustained`, produced by
+`simulator-remodeled/rerun_ncu_pipe_rawcounts.sh`).
+
+## Executive Summary (state as of 2026-07-27, read this first)
+
+### ⭐ HW vs sim — number-for-number (FWD kernel 5)
+| metric | sim | HW | sim/HW | note |
+|---|---|---|---|---|
+| **kernel cycles** | **105,774** | **67,696** | **1.56×** | the gap |
+| thread-inst executed (work) | 455,565,060 | 457,900,688 | 1.00× | **work-invariant ✓** (0.5%, thread-level) |
+| warp-inst issued | 16,064,281 | 14,482,551 | (1.11×)† | †DEFINITION diff (HW warp-inst vs sim; pred). Use thread-level for the true match. NOT a real work diff. |
+| **issue rate / SMSP / ELAPSED-cyc** | **0.288** | **0.404** | **0.71×** | ⚠️ BOTH on elapsed basis (fixed). This is just cycle 1.56× ÷ work 1.10× — the SAME issue-density gap, not new. |
+| issue rate / SMSP / ACTIVE-cyc (HW native) | ~0.29 | 0.456 | — | ⚠️ do NOT mix: HW's native metric is per-ACTIVE (0.456); sim≈elapsed since 1 CTA/SM |
+| warps_active / SMSP | 4.0 | 3.28 | 1.22× | different DEFINITION: sim=resident(1 CTA/SM); HW=avg-active (drops at tail as warps exit). Not comparable as-is. |
+| **HW No-Eligible (active cyc, 0 eligible warp)** | — | **~54%** | — | HW itself issues on <half its ACTIVE cycles — HW is far from saturated too |
+| ~~SM fully-idle~~ | 31.7% | ~10% | — | ❌ REMOVED — apples-vs-oranges: sim=eligible-warp-0 while executing; HW=warp-not-resident (start/end tail). NOT comparable. |
+| per-warp wait_barrier (warp-cyc/inst) | 0.55 | 1.36 (`wait`) | 0.40× | sim waits LESS per warp (see paradox) |
+| tensor busy-cyc / op | 29.5 | 42.7 | 0.69× | sim UNDER-models tensor |
+| SFU II / total latency | 8 / 16 | 8 / 16 | 1.00× | HW-faithful |
+| MUFU op count | =HW | (work-inv) | 1.00× | identical |
+
+**Corrected reading (after the definition audit):** the ONLY clean cross-checked gap is **issue rate
+0.71× on a matched elapsed basis** = cycle 1.56× ÷ work 1.10× — i.e. exactly the issue-density gap we
+started with, nothing new. The earlier "SM idle 3.2×" was an apples-vs-oranges artifact (removed). HW is
+NOT saturated either — it has ~54% No-Eligible active cycles and <1 eligible warp/SMSP. So the honest
+statement is narrower: **on matched definitions the sim issues 0.71× as densely as HW, with SHORTER
+per-warp waits and lighter per-op costs** — still a real gap, but smaller and less mysterious than the
+raw idle numbers suggested. Consistent with the prior producer/consumer analysis (§15,
+`CONSUMER_COMPUTE_BOUND.md`): the residual localizes to the consumer's tensor/math re-issue interval
+(`math_pipe_throttle` sim ~11% vs HW 3.2%, `mma` sim ~5.65% vs HW 1.4%). NOT yet explained (not per-op
+cost / WGMMA-sync / tensor-HoL / queues / ordering; §4-15). **Open for further verification in a later
+session — no floor/exhaustion conclusion drawn here.**
+
+
+**Problem confirmed.** fwd is 1.56× HW (105k vs 68k). Decomposition path: `cycle = work(1.10×) ×
+issue-density(1.41×)`. The gap is issue-density, i.e. the sim does not keep its warps issuing as densely
+as HW.
+
+**What has been RULED OUT (all HW-faithful or refuted):**
+- per-pipe COSTS: tensor busy-cyc/op sim 29.5 vs HW 42.7 (sim UNDER-models, `peak_sustained=4` confirmed);
+  SFU II=8 and total latency 16 both HW-faithful; op-counts (tensor/MUFU) bit-match HW. §1c, §6, §7.
+- issue-path serialization (1-deep ISSUE_CONTROL latch): already fixed by Opt 10, head-of-line ~0.06%. §4.
+- trace `stall_count`: `>>=1` decay UNDER-applies vs HW → cannot inflate cycles. Arch TODO-2.
+- warp-stagger via launch-offset (E1): mbarrier re-synchronizes each tile → ~0. (WARP_STAGGER closed.)
+- "sim 64% vs HW 90% SM-active": apples-vs-oranges (issue-rate vs resident-rate). §0.4.
+
+**Where the gap actually is (critical-path / SM-idle).** Per tile the compute WORK is identical sim/HW
+(~730 cyc if overlapped) but sim wall-clock/tile ≈ 3300 vs HW ≈ 1700 — the whole gap is **wait/idle**.
+sim SM is **fully-idle 31.7%** (HW ~10%). Each warp's own critical-path wait is SHORT (sim ≤ HW), but the
+3 in-phase consumer warps/SMSP hit those waits SIMULTANEOUSLY → SM stalls as a whole = **failed
+latency-hiding**. §8. This unifies the "SFU contention" and "de-phasing" framings: the lever is filling the
+31.7% SM-idle by de-phasing warps so one runs during another's dependency wait — NOT emptying an SFU queue
+(SFU is only 28%-floored).
+
+Per-tile wall-clock decomposition (fwd, per SMSP) — the clearest picture of the gap:
+
+| per tile (fwd, SMSP) | sim | HW |
+|---|---|---|
+| tensor work (16.5 op; sim 29.5 / HW 42.7 busy-cyc/op) | 487 | 705 |
+| MUFU work (91.2 op; II 8) | 730 | 730† |
+| **compute work (if overlapped = max of the two)** | **~730** | **~730** |
+| **wall-clock / tile** | **~3300** | **~1700** |
+| **pure wait/idle / tile** | **~2570** | **~970** |
+
+Note the tensor work is NOT equal (sim 487 < HW 705 — HW holds each WGMMA in the pipe longer, §6); it's the
+MUFU term (730, II=8 HW-faithful) that DOMINATES, so `compute = max(tensor, MUFU) ≈ 730` on BOTH — equal by
+coincidence, not because tensor matches. The key point stands and is stronger: **HW runs MORE tensor work
+per op yet finishes each tile in ~1700, while sim runs LESS and takes ~3300** ⇒ the ~1600 gap is entirely
+**wait/idle** (sim 2570 vs HW 970), never compute.
+
+† **MUFU work "730" is an II=8 THROUGHPUT-FLOOR, not an HW measurement.** op-count is identical sim=HW
+(work-invariant); II=8 is HW-faithful (peak_sustained 0.5/cyc/SM = 8 cyc/MUFU/SMSP). But unlike tensor
+(which has an HW busy-cycle counter → 42.7/op measured), the **SFU has NO HW pipe-busy counter** (§1c), so
+HW's real per-op SFU occupancy cannot be measured — only the II floor. HW's actual MUFU issue rate is 48%
+of peak, i.e. SFU is far from saturated. So "730=730" means "same op-count × same II floor", NOT a measured
+equality.
+
+**How much can be recovered (the number the user wants).** SM-idle 34.5% splits into:
+| bucket | % of elapsed | recoverable by de-phasing? |
+|---|---|---|
+| rest (clearly recoverable) | **~9.9%** | ✅ yes (this is the "10%") |
+| wait_barrier_only | 19.1% | ⏳ PENDING probe: WGMMA=recoverable by de-phasing / TMA=NOT by de-phasing (producer/mem axis) |
+| ibuffer_empty + drained | ~24.7% | ❌ trace-drain straggler tail (floor) |
+
+So the total recoverable = **rest 9.9% + (wait_barrier 19.1% × WGMMA-fraction)**. Pending probe scenarios:
+WGMMA 0% → recover 9.9% (1.57×→1.41×); 50% → 19.5% (→1.26×); 100% → 29% (→1.11×). Upper-bound (idle-fill
+isn't 100% cycle-for-cycle).
+
+**Next measurement (probe implemented, awaiting 12h run):** `-overlap_instrument_enable` now also emits
+`warpcyc_wb_wait_{tensor,tma,other}` — splits the 19.1% wait_barrier into WGMMA-result (recoverable) vs
+TMA (producer floor). That decides the WGMMA-fraction above and thus the final recoverable cycle count.
+
+**Why WGMMA is recoverable but TMA is not (by de-phasing):** the distinction is WHO produces the awaited
+data. A `wgmma.wait_group` wait is for the warp's OWN tensor result — produced INSIDE the SM; while warp A
+waits, a de-phased warp B can run its independent work, so the wait is hidden ⇒ recoverable. A TMA-tile
+wait is for the producer to land the next tile from GMEM→SMEM — produced OUTSIDE the SM; if the tile isn't
+there yet, NO warp on the SM can proceed on that data, so re-phasing SM-internal warps cannot help ⇒ NOT
+recoverable by de-phasing. **Caveat:** TMA is only a hard floor if it's DRAM-bandwidth-bound; here DRAM
+util is low (~12% fwd), so a large TMA-wait would instead point at a producer scheduling/issue problem
+(a DIFFERENT, still-open lever) — not necessarily an immovable floor. So read "TMA" as "not fixable by
+de-phasing" rather than "unfixable".
+
+
+---
+
+## 0. Methodology — how to compare an NCU metric against the sim WITHOUT a definition trap
+
+Repeatedly in this project a "gap" turned out to be an apples-vs-oranges metric mismatch. Rules that
+must be applied before any HW-vs-sim number is trusted:
+
+1. **Know the NCU denominator.** A `*.pct_of_peak_sustained_active` divides by (SM-**active** cycles ×
+   `peak_sustained`). A `*.pct_of_peak_sustained_elapsed` divides by (**elapsed** cycles × peak). The sim
+   usually normalizes by **elapsed**, so convert HW to the elapsed basis (× active/elapsed) before comparing.
+2. **Know `peak_sustained` (the pipe count).** For `sm__pipe_*_cycles_active`, `peak_sustained` is the
+   number of that pipe per SM (e.g. tensor = **4** = one per SMSP). The sim's per-SM counter sums all 4
+   subcore pipes, so it must be divided by the SAME 4. Getting this wrong flips over-vs-under (it did once).
+   → get `peak_sustained` from a raw-count profile (`--metrics ...avg.peak_sustained`), do NOT guess.
+3. **cycles_active (BUSY) vs inst_executed (ISSUE).** `sm__pipe_tensor_cycles_active` (46%) counts cycles
+   the pipe is busy; `sm__inst_executed_pipe_tensor_op_hmma` (2%) counts issue slots. WGMMA issues rarely
+   but runs long → these differ ~20×. Compare sim busy-cycles against the BUSY metric only.
+4. **"SM active" ≠ "issuing".** NCU `sm__cycles_active` = a warp is **resident** (90%). The sim's
+   "SM-active"/`issuing` proxy = a subcore **issued** that cycle ([sm.cc:612](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/sm.cc#L612)).
+   HW's issue-basis metric is `Issue Slots Busy` (45%), not `sm__cycles_active`.
+5. **Trace work-invariance.** The sim replays the HW trace, so op-counts should match HW `inst_executed`
+   exactly — verify (they do: tensor 349,056; a mismatch means a counting bug, not a real difference).
+
+---
+
+## 1. Confirmed HW-vs-sim numbers (fwd kernel 5 unless noted)
+
+### 1a. Cycles / occupancy (context)
+| quantity | sim | HW | note |
+|---|---|---|---|
+| kernel cycles (fwd) | 105,245 | 67,696 | **1.56×** |
+| kernel cycles (bwd) | 178,856 | 132,901 | 1.35× |
+| CTA/SM | 1 (reg-limited) | 1 | same |
+| warps/scheduler resident | 4 fwd / 3 bwd | 4 / 3 (theoretical) | occupancy matches; NOT the gap |
+| active/elapsed | ~100% (1 CTA/SM) | 90.1% | different DEFINITION — see §0.4 |
+
+### 1b. Issue rate / density (the real gap)
+| quantity | sim | HW | ratio |
+|---|---|---|---|
+| issue rate (sim `issuing` vs HW `Issue Slots Busy`) | 38% | 45% | 1.18× |
+| **issue-density** (warp-insts ÷ 528 sched ÷ elapsed cyc) | **0.289** | **0.407** | **1.41×** |
+| HW `No Eligible` (cycles with 0 eligible warp) | — | **54.26%** | HW itself waits most cycles |
+| HW eligible warps/scheduler | — | 0.83 fwd / 0.46 bwd | HW pool is also thin |
+
+`cycle = work(1.10×) × density(1.41×) = 1.55×`. The gap IS issue-density. But HW's own No-Eligible 54%
+means the de-phase ceiling is tightly bounded — HW is itself mostly-waiting on this workload.
+
+### 1c. Per-pipe COST — all HW-faithful or LIGHTER in sim (raw-count confirmed, `peak_sustained` known)
+| pipe | basis | sim | HW | sim/HW | verdict |
+|---|---|---|---|---|---|
+| **tensor (WGMMA)** | busy cyc / op (4-pipe) | **29.5** | **42.7** | **0.69×** | sim UNDER-models (not the cause) |
+| tensor | busy % (÷ n_sm×elapsed×4) | 18.6% | 41.0% | 0.45× | |
+| tensor op-count | total | 349,008 | 349,056 | 1.00× | per-warp convention identical |
+| **SFU (MUFU)** | II (cyc/MUFU/SMSP) | 8 | 8 (`peak_sustained` 0.5/cyc/SM ⇒ 8/SMSP) | 1.00× | HW-faithful (Opt 10) |
+| SFU op-count | — | =HW (work-inv) | 1,926,936 | 1.00× | identical |
+
+**Key reframe**: sim runs each WGMMA *faster* than HW (29.5 vs 42.7 cyc/op) yet is 1.56× slower overall.
+So the gap is categorically **not** a functional-unit cost error. It is **overlap/scheduling**: HW keeps
+the tensor pipe busy 42.7 cyc/op AND concurrently runs MUFU (xu 47.7%) + memory waits, filling the SM
+(density 0.407); the sim's in-phase consumer warps cannot interleave those pipes (density 0.289).
+
+### 1d. HW stall breakdown (per issue_active) — the overlap map
+| stall reason | HW fwd | HW bwd |
+|---|---|---|
+| `wait` (mbarrier / async / WGMMA.wait) | **1.363** | 0.784 |
+| `long_scoreboard` (global/L2 latency) | 0.700 | **1.491** |
+| `barrier` (named/CTA) | 0.782 | **1.313** |
+| `not_selected` | 0.820 | 0.405 |
+| `dispatch_stall` | 0.787 | 0.338 |
+| `mio_throttle` / `short_scoreboard` (MIO/SFU) | 0.457 / 0.330 | 0.474 / 0.643 |
+| pipe active tensor / xu / alu / fma | 46.1 / 47.7 / 27.3 / 16.9 | 53.6 / 21.4 / 15.3 / 9.5 |
+
+fwd's dominant HW stall is `wait` (producer→consumer data dep) — a genuine floor that the sim's
+`wait_barrier` (25% of `no_warps_ready`) mirrors. bwd's is `long_scoreboard` (memory latency).
+
+---
+
+## 2. What is REFUTED / closed (do not re-open without new evidence)
+- **tensor over-model** — refuted; sim is 0.69× (under). The "1.78×" was a ÷1-vs-÷4 `peak_sustained` error.
+- **SFU throughput / II** — HW-faithful (II=8 == HW 8/SMSP). Not a lever.
+- **trace `stall_count` latency** — refuted as inflator: `>>=1` decay UNDER-applies the stall
+  (FA3_progress Arch TODO-2), so it cannot make the sim slower.
+- **warp-stagger / launch-offset (E1)** — measured ~0 (mbarrier re-synchronizes each tile). Reverted `0b863b0`.
+- **occupancy floor** — sim resident warps == HW theoretical.
+
+## 3. The open axis — issue-density / pipe-overlap
+The residual is: **the sim does not overlap tensor + MUFU + memory-wait the way HW does.** HW hides each
+pipe's latency behind another pipe (tensor 46% ∥ xu 48%), reaching density 0.407; the sim's consumer
+warps move in phase so the pipes run more serially (density 0.289). This is a scheduling/concurrency
+property of the model, not a per-op cost. Next investigations (choose):
+- (a) **pipe concurrency in the sim**: can two FUs (tensor + SFU) in the same subcore be busy in the same
+  cycle, and across the 4 subcores? Where does the model serialize what HW overlaps?
+- (b) map HW `wait` / `long_scoreboard` magnitudes to the sim's `wait_barrier` / memory-wait to see if any
+  sim wait is *longer* than HW's (a real lever) vs equal (a floor).
+- (c) whether the 1-CTA/SM + in-phase mbarrier structurally prevents overlap that HW gets from jitter.
+
+## 4. Investigation (a) DONE — pipe concurrency is NOT the bottleneck (2026-07-27h)
+
+Traced the issue→FU path to see if the sim serializes what HW overlaps. Result: the FU **execution** is
+already parallel, and the issue-path serialization is already resolved by Opt 10.
+
+### Structure (source-confirmed)
+- `Subcore::execute()` calls `fu->cycle()` for **every** FU each cycle ([subcore.cc:264-268](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/subcore.cc#L264)) ⇒
+  once ops are IN their FUs, tensor + SFU + others progress **in parallel** (HW-faithful). Pipe
+  concurrency at execute is NOT the problem.
+- The only shared serial resource all FUs pass through is the 1-deep `m_ISSUE_CONTROL_latch` (1 issue /
+  subcore / cycle). But that is **HW-faithful** — an SMSP scheduler also issues ≤1/cycle (no dual-issue
+  post-Volta). Fixed-latency ops additionally pass `m_CONTROL_ALLOCATE_latch` (1-deep) + a 6-deep read
+  pipeline; SFU bypasses both (goes straight to its dispatch reg).
+
+### Measured — the latch head-of-line is already ~0 after Opt 10 (`.o59`)
+| counter | value | % of evaluated (42.2M) |
+|---|---|---|
+| `next_stage_not_available` (latch full ⇒ scan skipped) | 25,472 | **0.06%** |
+| `blocked_by_tensor` / `blocked_by_sfu` / `blocked_by_mem` | 2 / 0 / 2,640 | ~0 |
+| `hol_reason_control_allocate_full` | 15,673 | 0.04% |
+| `hol_reason_read_stage_full` | 0 | 0 |
+
+⇒ Opt 10 (SFU issue-gate) already collapsed the issue-stage head-of-line to noise. The
+CONTROL_ALLOCATE/read-stage serialization for tensor is also negligible (0.04%). **There is no remaining
+issue-path serialization lever.**
+
+### Where the density gap actually is (re-localized)
+The 1.41× issue-density deficit is NOT latch serialization. It is that the warps are **not eligible** in
+the first place: `no_warps_ready` = 51% of cycles, composed of `stall_count` 30% + `wait_barrier` 25% +
+`fu_occupied` ~20% (overlapping). i.e. the sim's ~3 warps/scheduler are all simultaneously waiting on a
+dependency/pipe, so there is nothing to issue — whereas HW, at the same moment, has a warp at a different
+pipe stage to issue (density 0.407). This is the **warp-phasing/overlap** effect again.
+
+### The honest strategic position (2026-07-27h)
+Every mechanistic lead is now closed: per-pipe costs HW-faithful-or-lighter (§1c), issue-path
+serialization resolved (Opt 10, this section), stagger refuted (E1), stall_count refuted (decay under-
+applies). The residual density gap traces to **in-phase consumer warps all waiting together**, and the
+one measured attempt to de-phase them (E1) was annihilated by the per-tile mbarrier. HW avoids this via
+per-warp arrival jitter (real DRAM/bank/latency variance spread across a larger effective pipeline), which
+the deterministic trace-replay model does not reproduce between the mbarrier re-sync points.
+
+**Candidate levers that remain (all require care / a build; none is a clear win):**
+- **(b) wait-magnitude audit**: compare sim `wait_barrier`/memory-wait DURATIONS against HW `wait`
+  (1.363) / `long_scoreboard` per-occurrence. If any sim wait is *longer* than HW's, that is a real
+  (faithful) lever; if equal, it is a floor. This is the last un-audited quantitative comparison and is
+  the recommended next step (read-only-ish, needs per-wait duration instrumentation).
+- **(c) structural floor acceptance**: if (b) shows sim waits ≈ HW waits, then the residual is the
+  deterministic-lockstep floor bounded by HW's own 54% No-Eligible — accept, no cycle claim.
+
+
+## 5. Investigation (b) — wait / throughput-floor audit: the gap is TENSOR↔MUFU OVERLAP (2026-07-27i)
+
+Decomposed HW's warp-cycle budget and the sim's stall budget on a definition-matched basis, then computed
+the hard throughput floors. This localizes the 1.56× to a **pipe-overlap** deficit with a concrete size.
+
+### HW warp-cycle budget (fwd, `Warp Cycles Per Issued Inst` = 7.12, sum of states = 7.17 ✓)
+| state | warp-cyc/inst | % |
+|---|---|---|
+| **wait** (mbarrier/async/WGMMA.wait) | 1.363 | 19.0% |
+| selected (issued) | 1.000 | 13.9% |
+| not_selected | 0.820 | 11.4% |
+| dispatch_stall | 0.787 | 11.0% |
+| barrier | 0.782 | 10.9% |
+| long_scoreboard (mem) | 0.700 | 9.8% |
+| mio_throttle | 0.457 | 6.4% |
+| short_scoreboard | 0.330 | 4.6% |
+| math_pipe_throttle | 0.229 | 3.2% |
+| sleeping / no_instruction / imc / gmma / branch | 0.71 | 9.9% |
+
+### sim subcore-cycle budget (fwd `.o59`, % of all evaluated)
+`issuing 38.1%` | `no_warps_ready 51.3%` | `no_valid_instruction 9.5%` | `issue_port_busy 1.1%`.
+`no_warps_ready` overlap sub-reasons: **fu_occupied 42.9%** (sfu 31.0% + sp_int_dp 13.8% + tensor 8.9%),
+stall_count 15.6%, wait_barrier 13.0%, yield 4.7%.
+
+### ⭐ The decisive throughput floors (per SMSP, over the run, same op-count as HW)
+| pipe | ops/SMSP | II | floor cyc | % of HW elapsed (67,696) |
+|---|---|---|---|---|
+| **MUFU (SFU)** | 3,650 | 8 | **29,196** | **43.1%** |
+| tensor (WGMMA) | 661 | 32 | 21,155 | 31.3% |
+
+- **HW is itself ~43% MUFU-throughput-bound** (xu 47.7% ≈ this 43% floor). HW reaches elapsed 67,696 ≈
+  the MUFU floor 29,196 × ~2.3 (with tensor OVERLAPPED underneath, not added).
+- **sim SFU is UNDER-utilized per-cycle (27.7% vs HW 47.7%) yet blocks issue 31% of cycles** — because the
+  3 in-phase consumer warps hit the SFU in the SAME bursts then idle together, instead of HW's smooth
+  8-cyc-spaced stream. Same MUFU work (op-count identical), same II=8 (HW-faithful), but bursty vs smooth.
+- The kernel-time model: HW ≈ **max(tensor 31%, MUFU 43%) + overhead**; sim ≈ **tensor + MUFU partially
+  SERIALIZED + idle** = 105,245. The 1.56× is the **failure to overlap the tensor and MUFU pipes across
+  the warpgroup**, NOT any per-op cost (all confirmed faithful).
+
+### Why the pipes don't overlap in the sim (mechanism, partly confirmed)
+- FU `execute()` is parallel (§4), so two FUs CAN run same-cycle. The block is upstream: the consumer
+  warpgroup's dependent chain WGMMA→softmax(MUFU)→WGMMA is serial *within* a warp, and the 3 warps/SMSP
+  are **in phase** (deterministic prior region + per-tile mbarrier re-sync), so when they're all in the
+  softmax stage the tensor pipe is idle and vice-versa. HW's per-warp jitter keeps some warp in each stage.
+- This is the SAME phasing root as the (closed) stagger axis — but now sized as a **43% MUFU floor that HW
+  overlaps and sim serializes**, which is a much more concrete target than "lockstep".
+
+### The remaining lever candidates (NOT a floor — still to test)
+1. **wait_barrier / DEPBAR duration**: is the sim's WGMMA→MUFU (and MUFU→WGMMA) dependency wait LONGER
+   than HW's? If the sim over-holds a warp at `wait_barrier`/`stall_count` between the tensor and SFU
+   stages, that *lengthens* the serialization and is a real, faithful lever. **← next probe: measure
+   per-occurrence wait_barrier duration in sim vs HW `wait` 1.363 / `short_scoreboard`.**
+2. **cross-warp de-phasing via a REAL mechanism** (not launch-offset E1): if warps could enter the
+   softmax stage at staggered cycles and STAY staggered (survive the mbarrier), tensor+MUFU would overlap.
+   Needs a faithful jitter source (bank/RF-port cross-warp contention — the candidate B from the closed doc).
+3. **stall_count magnitude** (Arch TODO-2): even though `>>=1` under-applies, the `num_stall_cycles_wait_
+   after_bits_stall_0_and_yield=46` path fires on every yield-with-stall0; quantify how many sim
+   warp-cycles that specific rule adds vs HW `sleeping` (3.1%) — if sim >> HW it is an over-model.
+
+⚠️ The MUFU floor (43% of HW) means the ABSOLUTE ceiling for closing the gap by overlap alone is bounded:
+even perfect tensor∥MUFU overlap cannot beat max(31%,43%)=43% of HW elapsed as the compute floor. So the
+achievable sim improvement is from 105,245 toward ~HW's overlap efficiency, not below it.
+
+
+## 6. RESULT — overlap+warp-cyc probe (2026-07-27j, fwd `.o61` / bwd `.o36`)
+
+The 12h instrumentation run (gate `-overlap_instrument_enable 1`). `gpu_sim_insn` bit-identical
+(fwd 455,565,060 / bwd 629,211,348 = work invariant); `gpu_sim_cycle` fwd 106,045 (+0.76% vs `.o59`
+105,245) / bwd 179,175 — the per-warp map-lookup counters cost a hair of timing but do not affect the
+composition below.
+
+### Finding 1 — tensor↔SFU OVERLAP is actually GOOD (the earlier "no overlap" worry is refuted)
+Per-SM-cycle classification (÷ n_sm×cyc):
+| | both tensor&SFU | tensor-only | sfu-only | neither |
+|---|---|---|---|---|
+| FWD | 38.6% | 2.5% | 19.2% | 31.7% |
+| BWD | 40.5% | 3.5% | 8.1% | 40.4% |
+
+Of cycles where ≥1 of {tensor,SFU} is busy, **BOTH = 64% fwd / 78% bwd**. tensor-only is only 2.5/3.5%.
+⇒ when the tensor pipe runs, the SFU almost always runs too. **The pipes DO overlap**; serialization of
+tensor-vs-SFU is NOT the main lever. (This corrects §5's overlap-deficit hypothesis.)
+
+### Finding 2 — the real concentration is SFU CONTENTION (the dominant stall)
+Per-warp warp-cycles stalled, per issued warp-inst (HW `warp cycles per issued inst` basis):
+| reason | FWD | BWD | HW-ish ref (fwd) |
+|---|---|---|---|
+| **fu_sfu** | **2.211** | **1.313** | (math_pipe 0.229 + mio 0.457 + short_sb 0.330 = ~1.0) |
+| fu_other (sp/int/uniform) | 1.007 | 0.788 | alu/fma stalls |
+| stall_count | 0.622 | 0.464 | (folded into HW pipe latencies) |
+| wait_barrier | 0.552 | 0.626 | HW `wait` 1.363 |
+| fu_tensor | 0.482 | 0.745 | HW `gmma` 0.097 |
+| yield | 0.180 | 0.094 | HW `sleeping` 0.223 |
+| **any (sum, non-excl)** | 4.561 | 3.882 | |
+
+- **`fu_sfu` is the #1 sim stall — 48.5% of all stall warp-cycles (fwd)** — versus HW's SFU-ish share
+  (~16.6% of stall). **sim is ~3× over-concentrated on SFU contention.**
+- Each MUFU issue is associated with **~18 warp-cycles** of OTHER warps blocked on the SFU (fwd), i.e.
+  ~2.3 warps queued on the one SFU for its full II=8 window every MUFU. Heavy same-cycle SFU contention.
+- Note **`wait_barrier` is sim 0.552 vs HW `wait` 1.363** — the sim actually waits LESS on mbarrier/DEPBAR
+  than HW. So the producer→consumer data-dep is NOT over-modeled; it is a HW-faithful/under floor. The
+  excess is squarely SFU contention, not the barrier wait.
+
+
+### fwd vs bwd — is the SFU over-concentration the same in both? (2026-07-27k)
+Both kernels have SFU as the #1 stall, and the PER-MUFU contention is nearly identical; but the SHARE
+differs because bwd has more tensor/barrier stall diluting it.
+| metric | FWD (k5, .o61) | BWD (k10, .o36) |
+|---|---|---|
+| fu_sfu warp-cyc/inst | **2.211** | **1.313** |
+| fu_sfu share of tracked stall | **43.7%** | **32.6%** |
+| fu_sfu warp-cyc PER MUFU op | 18.4 | 17.8 |
+| avg warps blocked over the II=8 window | **2.30** | **2.22** |
+| fu_tensor warp-cyc/inst | 0.482 | 0.745 |
+| wait_barrier warp-cyc/inst | 0.552 | 0.626 |
+
+- **The per-MUFU SFU contention is the SAME in both** (~18 warp-cyc/op, ~2.3 warps queued over II=8) —
+  it is the same in-phase consumer-warp structure.
+- **But SFU DOMINATES fwd (43.7%) while in bwd it is #1-but-shared (32.6%)**: bwd runs fewer MUFU
+  (HW xu 21.4% vs fwd 47.7%) and more tensor (53.6% vs 46%), so bwd's fu_tensor (0.745) and wait_barrier
+  (0.626) rise to SFU's level and spread the stall out.
+- So the earlier "~3× over-concentrated on SFU" statement is a **fwd** figure. bwd is SFU-led but
+  multi-factor. The de-phasing lever helps both (identical per-MUFU contention) but its ceiling is larger
+  for fwd.
+
+### Interpretation — same root (phasing), now precisely localized to SFU contention
+II=8 is HW-faithful (confirmed by `peak_sustained` 0.5/cyc/SM = 8/SMSP). The sim's 3 consumer warps/SMSP
+hit the SFU **in phase** (all in the softmax MUFU stage at once), so they queue on the single SFU;
+HW's 12 warps are phase-dispersed so the same MUFU work spreads out (xu 47.7% steady, low per-warp SFU
+stall). So the gap is the same lockstep/phasing root, but its DOMINANT symptom is SFU issue contention
+(fu_sfu 2.211), not tensor cost (faithful), not overlap (good), not wait_barrier (under HW).
+
+### Consequence for a lever
+- The only faithful way to reduce fu_sfu contention is to **de-phase the consumer warps** so their MUFU
+  streams interleave (HW's behavior) — the same candidate B (real cross-warp jitter) from the closed
+  stagger doc, now with a concrete target (cut fu_sfu 2.211 → toward HW ~1.0 ⇒ recovers a large share of
+  the 48.5% SFU stall). Launch-offset (E1) is dead (mbarrier re-sync); the jitter must live INSIDE the
+  per-tile compute region and survive the bell.
+- ⚠️ Bounded: HW itself is ~43% MUFU-throughput-floored, so even perfect de-phasing cannot go below that.
+  But sim's fu_sfu 2.211 vs HW ~1.0 is headroom well above the floor — this IS a real, sized lever.
+
+
+## 7. SFU latency/II — clarified (2026-07-27k): total is ALREADY 16 (HW-faithful); config was just confusing
+
+Investigating whether SFU result latency is over-modeled (suspected 21 vs HW ~16) resolved to: **it is
+already 16, and correct.** An earlier read in this session that "SFU op latency = 21" was WRONG — it
+confused the FU pipeline-array depth with the op's latency field. Corrected trace:
+
+### The mechanism (why II and latency are two numbers)
+The SFU is modeled as a **pipelined** unit. An op:
+1. sits in `m_dispatch_reg` for **II** cycles (`dispatch_delay` counts `cycles=initiation_interval` down,
+   [functional_unit.cc:306-318](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/functional_unit.cc#L306)) — during this window `can_issue()=false` so it blocks OTHER warps' SFU issue (this is the throughput/contention term);
+2. then enters `m_pipeline_reg[latency_field-1]` and takes **latency_field** more cycles to produce its
+   result (the result-latency term).
+So **total result latency = II + latency_field**, and because II<total, up to `total/II ≈ 2` ops are
+in-flight concurrently (real pipelining — the "op1 in the back half, op2 in the front half" the user asked
+about). II and latency are two numbers precisely because a pipelined unit has independent throughput vs depth.
+
+### The THREE confusing SFU knobs (only one drives FA3)
+| knob | value | used for FA3 (trace mode)? |
+|---|---|---|
+| **`-trace_opcode_latency_initiation_sfu 8,8`** | lat=8, II=8 | ✅ **THE real value** ([trace_driven.cc:811,849-852](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/trace-driven/trace_driven.cc#L811)) ⇒ total = 8+8 = **16** |
+| `-ptx_opcode_latency_sfu 21` / `_initiation 8` | 21 / 8 | ❌ PTX functional-sim only ([cuda-sim.cc:1009](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/cuda-sim/cuda-sim.cc#L1009)); ignored in trace |
+| `-sfu_latency 21` (default) | 21 | ❌ only sizes the FU pipeline-array depth `m_pipeline_depth` ([subcore.cc:1772](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/subcore.cc#L1772)); op enters stage 7, so it's just array capacity, NOT timing. This is why `[LATCFG]` prints sfu=21 while the real op latency is 8. |
+
+### Verdict
+- **SFU total result latency = 16 cyc = HW-faithful** (Ampere/Hopper MUFU microbench ~16). Confirmed by the
+  tensor precedent: `generate_tensor_core_latencies` also splits one op's total as `II=nc/2; latency=nc-II`
+  (II+latency=total). So there is **nothing to lower** — the earlier "reduce 21→16" plan is moot.
+- Config action taken: added a disambiguation comment block at the `-ptx_opcode_*_sfu` lines so the three
+  knobs are no longer confusing (timing unchanged / bit-identical).
+- ⇒ SFU is HW-faithful in BOTH II (8, throughput) AND total latency (16). The `fu_sfu` contention
+  (§6, 2.211 warp-cyc/inst) is therefore NOT a latency over-model — it is purely the II=8 throughput
+  meeting the in-phase consumer warps (the phasing root). No SFU-cost lever exists; the lever remains
+  de-phasing the warps so their MUFU streams interleave.
+
+
+## 8. CRITICAL-PATH static analysis (2026-07-27l) — the gap is SM-idle from failed latency-hiding, NOT SFU cost
+
+User pushback (correct): "if the sim is fully deterministic and warps just pile onto the SFU at the same
+cycle, the total cycle should be the same — de-phasing only reorders, it can't cut cycles unless the SFU is
+a real throughput bottleneck." This forced a critical-path re-analysis. The user is right, and it resolves
+the paradox (per-op latencies are ≤ HW yet total is 1.56×).
+
+### SFU is NOT the sim bottleneck (user confirmed)
+- SFU throughput floor = MUFU/SMSP(3650) × II(8) = **29,196 cyc = only 28% of sim elapsed** (106,045).
+  The sim runs 3.6× longer than its own SFU floor ⇒ SFU throughput is not what sets the cycle count.
+- `fu_sfu` 2.211 warp-cyc/inst is an issue-stage OBSERVATION (non-exclusive overlap counter); much of it
+  is warps that were ALSO waiting on their own data dep, double-attributed to "SFU busy". Not a lever by itself.
+
+### The real decomposition — per tile (fwd, SMSP)
+| component (per tile, fwd, SMSP) | sim | HW |
+|---|---|---|
+| tensor work (16.5 op; busy-cyc/op sim 29.5 / HW 42.7) | 487 | 705 |
+| MUFU work (91.2 op; II 8) | 730 | 730† |
+| **compute work (if overlapped = max)** | **730** | **730** |
+| **wall-clock / tile** | **~3300** | **~1700** |
+| **pure wait/idle / tile** | **~2570** | **~970** |
+
+(Tensor work differs — HW is LONGER per op, §6 — but MUFU 730 dominates so compute≈730 on both by
+coincidence. HW does more tensor work yet finishes faster ⇒ the gap is wait/idle, not compute.
+† MUFU 730 is an II=8 throughput-floor, not an HW measurement: op-count is identical and II=8 is
+HW-faithful, but the SFU has no HW busy-cycle counter (§1c) so HW's real per-op SFU occupancy is
+unmeasurable — HW's actual MUFU issue is only 48% of peak.)
+
+The compute work (730) is identical sim/HW; the **entire gap is wait/idle** — sim wastes ~2570 cyc/tile vs
+HW's ~970.
+
+### Where the wait shows up: SM FULLY-IDLE = 31.7% (fwd)
+- `total_num_cycles_sm_all_subcores_idle` = 4,442,929 ⇒ **31.7% of elapsed** (= /(132×106,045)).
+  ⚠️ the run's printed `percentage_..._sm_all_subcores_idle = 10.50%` is WRONG — it divides the SM-cycle
+  numerator by the subcore-cycle denominator (evaluated 42.3M = 132×4×cyc), a 4× definition mismatch. The
+  correct SM-idle is 31.7%. (HW SM-idle is ~10%.)
+- Per-warp waits are SHORT: sim `wait_barrier` 0.552 + `stall_count` 0.622 = 1.17 warp-cyc/inst, actually
+  LESS than HW `wait` 1.363. So each warp's own critical-path wait is HW-faithful/shorter.
+
+### ⭐ Resolution — critical-path and de-phasing are the SAME problem
+1. Each warp's critical-path wait (WGMMA→MUFU→WGMMA data deps) is NOT over-modeled (sim ≤ HW per warp).
+2. BUT the 3 in-phase warps/SMSP hit those waits **simultaneously**, so the whole SM stalls together →
+   **SM fully-idle 31.7%** = failed latency-hiding. HW overlaps: while warp A waits on a WGMMA/MUFU result,
+   warp B issues → SM-idle ~10%.
+- So the earlier "SFU-contention lever" framing was a symptom; the ROOT is **latency-hiding failure from
+  warp lockstep**. de-phasing's payoff is NOT emptying an SFU queue (SFU is 28%-floored) — it is
+  **filling the 31.7% SM-idle** by letting a non-waiting warp run during another's dependency wait.
+- ⇒ **This RE-VALIDATES de-phasing as the lever** (user: "keep de-phasing in mind"), now with the correct
+  mechanism (idle-fill, not queue-drain) and a sized target: cut SM-idle 31.7% → ~10% (HW) ≈ the whole gap.
+
+### Caveat / next check
+The 2570-cyc/tile wait must be decomposed into: (a) intra-warp dependency stall that COULD be hidden by
+another warp (recoverable by de-phasing) vs (b) genuine all-warps-blocked (e.g. all waiting on the same
+TMA tile via mbarrier — a producer floor). The overlap `neither` bucket (tensor&SFU both idle) + the
+per-CTA `sm_idle_wait_barrier_only` (CTAFIN) can size (b). If (b) dominates, de-phasing is capped by the
+producer; if (a) dominates, de-phasing is the real lever. This is the next static/probe step.
+
+
+## 9. (a) recoverable vs (b) floor decomposition (2026-07-27m) — SM-idle is MOSTLY wait_barrier; need to split it
+
+Decomposed the 34.5% SM-fully-idle (CTAFIN, fwd `.o61`) to see if de-phasing is a real lever (a) or capped
+by a producer/mbarrier floor (b).
+
+### SM-idle breakdown (avg/SM, % of elapsed 97,609)
+| component | % of elapsed | % of SM-idle | interpretation |
+|---|---|---|---|
+| **wait_barrier_only** | 19.1% | **55.4%** | SM-idle whose sole block is `wait_barrier` (mbarrier/DEPBAR) |
+| ibuffer_empty | 19.3% | 56.0% | trace-drained head (tail / winding down) |
+| drained | 5.4% | 15.7% | trace exhausted (straggler tail) |
+| tensor-block | 3.5% | — | tensor FU busy |
+| **rest (not wb-only, not drained)** | ~9.9% | **~29%** | the clearest recoverable-by-scheduling bucket |
+| **total SM fully-idle** | **34.5%** | 100% | |
+
+### The blocker to a clean (a)/(b) verdict: wait_barrier is TWO things merged
+`wait_barrier_only` (55% of idle) is the dominant idle reason, BUT the sim's single `are_wait_barriers_ready`
+check does NOT distinguish:
+- **(b) TMA-tile mbarrier** — consumer waiting for the producer to land the next tile ⇒ NOT recoverable by
+  de-phasing (the tile is produced outside the SM). NOTE this is a producer/mem-axis wait, not necessarily
+  an immovable floor: with DRAM util ~12% it may be a producer scheduling/prefetch gap (separate lever).
+- **(a) WGMMA-result DEPBAR** (`wgmma.wait_group`) — consumer waiting on its OWN prior WGMMA ⇒ if warps were
+  de-phased, another warp could run during this wait ⇒ recoverable.
+So the 55% cannot yet be assigned to (a) or (b).
+
+### Producer/consumer timing (CTAFIN) — a hint, not a verdict
+- `producer_last_drain` = 99,103 ≈ `finish` 99,110 → the producer (TMA) keeps landing tiles until ~kernel
+  end.
+- `consumer_last_drain` = 77,848 = **78% of finish** → the consumer does its last work at 78%, then the last
+  ~22% is drain/idle (straggler tail).
+- ⚠️ This looks like "producer busy to the end, consumer finishes early" — the OPPOSITE of the old
+  CONSUMER_COMPUTE_BOUND "producer waits on consumer" reading. But `producer_last_drain≈finish` may just be
+  the producer warp's teardown, not late tile supply, so treat as a hint only.
+
+### Verdict so far
+- **~29% of SM-idle is clearly recoverable** (rest bucket), **~16% is drain tail (floor)**, and the big
+  **55% wait_barrier chunk is UNRESOLVED** (split needed).
+- If most of the 55% is WGMMA-DEPBAR (a), de-phasing is a large lever (up to ~55%+29% ≈ 84% of the 34.5%
+  idle ≈ recovering ~29% of elapsed → could bring sim near HW's 10% idle). If most is TMA-mbarrier (b),
+  de-phasing won't recover it and the investigation reroutes to the producer path (bandwidth vs prefetch
+  scheduling) — a true floor only if the producer is genuinely bandwidth-bound (DRAM ~12% suggests not).
+
+### Next step (needs a build) — split wait_barrier by kind
+Add a gated read-only counter that, on a `wait_barrier`-blocked warp, classifies the barrier it waits on:
+TMA-tile mbarrier (producer floor) vs WGMMA/DEPBAR (recoverable). The sync-barrier addr / kind is already
+known at the wait site (`build_sync_barrier_key`, HopperMBarrier vs the SASS wait_barrier bits). This is
+THE measurement that decides whether de-phasing is the lever or a producer floor caps it. Fold into the
+next 12h run alongside the existing overlap probe.
+
+## 10. wait_barrier-kind probe — IMPLEMENTED (2026-07-27n), awaiting 12h run
+
+To split the unresolved 19.1% `wait_barrier` (§9) into recoverable (WGMMA-result) vs floor (TMA), a gated
+read-only probe was added under the existing `-overlap_instrument_enable`.
+
+### Mechanism (why it can separate them)
+- Each warp has 6 scoreboard (SB) wait-barriers. An async op that will later signal SB#k arms it at
+  control_stage (`add_pending_wait_barrier_increment`, sm.cc). We tag that SB with the ARMING op's class:
+  `WB_ARM_TENSOR` (WGMMA), `WB_ARM_TMA` (UTMALDG/cp.async.bulk), or `WB_ARM_OTHER`.
+- When a warp is blocked at issue on `!are_wait_barriers_ready`, we look up which of its checked SBs are
+  NOT ready and return the dominant arming class (precedence TENSOR>TMA>OTHER), accumulating per-SM into
+  `warpcyc_wb_wait_{tensor,tma,other,unknown}`.
+- Files: `warp_dependency_state.{h,cc}` (enum + Wait_Barrier tag + `blocking_wait_barrier_armed_op`),
+  `sm.cc` (tag at arm time), `subcore.cc` (classify at stall), `gpu-sim.cc`/`shader.cc` (4 stats+prints).
+  Read-only; arm-time tag is a plain enum push (timing-neutral). Headers changed → `make clean`.
+- ⚠️ Caveat from the search audit: in this trace model, WGMMA RESULT waits may surface as
+  `stall_count`/traditional-scoreboard rather than SB `wait_barrier`, and TMA-tile arrival mostly goes
+  through the mbarrier path (`waiting()` = inst_barrier, which is ~0.03% here). So the SB `wait_barrier`
+  bucket is expected to be dominated by DEPBAR / `wgmma.wait_group` (WGMMA-group) — the probe will confirm
+  or refute this. If `wb_wait_tensor` dominates ⇒ the 19.1% is largely recoverable.
+
+### Analysis plan for the next run (combine with the "10%")
+1. Read `warpcyc_wb_wait_tensor / tma / other` (fwd `.o*`, bwd `.o*`).
+2. WGMMA-fraction = `wb_wait_tensor / (tensor+tma+other)`.
+3. Total recoverable-by-de-phasing = **rest 9.9% + 19.1% × WGMMA-fraction** (of elapsed).
+4. Upper-bound new cycle = `sim_cyc × (1 − recoverable%)`; report the new sim×HW multiplier.
+   (Reminder: this is an UPPER bound — idle-fill via de-phasing is not 100% cycle-for-cycle because the
+   per-warp critical paths only partly overlap; the honest deliverable is the sized ceiling, then a
+   faithful de-phasing mechanism (candidate B: dynamic cross-warp bank/RF-port contention) would be built
+   only if the ceiling justifies it.)
+
+### If the probe says WGMMA dominates (recoverable is large)
+Then de-phasing is the real lever and the next build is the faithful jitter mechanism (candidate B from the
+CLOSED WARP_STAGGER doc — cross-warp bank/RF-port contention that survives the mbarrier). If TMA dominates,
+de-phasing SM-internal warps will NOT recover it (the awaited tile is produced outside the SM) — but that
+does NOT automatically make it an immovable floor: with DRAM util only ~12% (fwd) the tiles are not
+bandwidth-starved, so a large TMA-wait would indicate a PRODUCER scheduling/prefetch problem (a separate,
+still-open lever), whereas a true floor only holds if the producer is genuinely bandwidth-bound. So a
+TMA-dominated result reroutes the investigation to the producer path, it does not simply cap the gain at
+rest-9.9%.
+
+
+## 11. Solution direction — scheduler policy (GTO → LRR/GTLRR) to break the lockstep (2026-07-27o)
+
+The "how", designed while the wait_barrier-kind run is in flight. Root cause (mechanism): the sim's
+**GTO** scheduler actively CREATES the lockstep — it greedily pushes one warp until it stalls, then the
+next warp runs the SAME deterministic code the same distance and stalls at the SAME point, so the 3
+consumer warps/SMSP converge to one phase and hit dependency waits together (SM-idle 31.7%).
+
+### What NVIDIA HW actually does (web audit)
+- H100 SM = 4 warp schedulers (1/SMSP), 1 issue/cycle; eligible = operands ready + target FU free; zero-
+  overhead switch to a ready warp when one stalls. Matches the sim's per-subcore 1-issue model.
+- **The exact warp-selection policy is NOT public (black-box).** NVIDIA docs and academic microbench
+  papers (WPI thread-block scheduler; "Dissecting Blackwell" arXiv:2507.10789) only say "pick a ready
+  warp"; they cannot pin GTO vs LRR vs age. GPGPU-Sim lore: real HW is closer to an age+round-robin mix
+  than to pure GTO.
+
+### Sim status (code)
+- The remodeling `subcore.cc` HARD-CODES GTO via `order_greedy_then_highest_id` ([subcore.cc:589](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/subcore.cc#L589));
+  there is no policy switch on this path. Stock GPGPU-Sim's LRR / GTO / GTLRR / two-level (shader.h:529-543)
+  live only in the original `scheduler_unit`, which the remodeling issue path does NOT use.
+
+### The plan: add an LRR / GTLRR ordering to the remodeling subcore, gated, and A/B it
+- **GTO** (today): greedy → aligns warps → lockstep.
+- **LRR** (loose round-robin): rotate warps every cycle → warps naturally spread across different
+  instruction stages → de-phase → a warp is likely in a non-waiting stage while another waits ⇒ fills
+  SM-idle. 
+- **GTLRR** (greedy-then-LRR) is the sweet spot: keep greedy locality (good for i-cache/RF), but when the
+  greedy warp stalls, fall to round-robin instead of oldest — so the fallback doesn't re-pick a warp that
+  will stall at the same point. This directly targets the lockstep without throwing away GTO's locality.
+- Why this is defensible (not an arbitrary knob like physical jitter): LRR/GTLRR are established GPGPU-Sim
+  policies with published fidelity data; HW's true policy is unknown and believed to be a round-robin-ish
+  mix, so LRR/GTLRR is a legitimate hypothesis, not a fudge.
+
+### Risk / open question (same failure mode as E1)
+GTO→LRR reorders WHO issues, but if every warp still runs the identical deterministic path, LRR may only
+shift the phase without WIDENING it — the warps could re-converge (this is exactly why launch-offset E1
+died on the per-tile mbarrier). LRR's advantage over E1 is that it re-applies the rotation EVERY cycle
+(not once at launch), so a warp pulled ahead stays ahead until the next mbarrier — but whether that
+survives the mbarrier re-sync is the empirical question. **Validate cheaply first:** add the ordering as a
+gated option, A/B on FA3, and read SM-idle 31.7% + the overlap `neither`/`sfu_only` buckets. If SM-idle
+drops, it's real; if it re-converges, we learn LRR alone is insufficient and the jitter must come from
+somewhere the mbarrier can't erase (→ candidate B).
+
+### Guardrail
+Any new ordering is gated + default-off (GTO stays the default, bit-identical when off). Report the new
+cycle count AND confirm `gpu_sim_insn` stays bit-identical (work-invariant) so we know only scheduling,
+not work, changed.
+
+
+## 12. RESULT — wait_barrier-kind probe (2026-07-27p, fwd `.o62` / bwd `.o37`)
+
+The probe ran (work bit-identical: fwd 455,565,060 / bwd 629,211,348). Counter self-consistency holds
+(tensor+tma+other = wait_barrier total).
+
+| wait_barrier split | FWD | BWD |
+|---|---|---|
+| total wait_barrier warp-cyc | 8,677,707 | 14,149,763 |
+| WGMMA (tensor) | **0.0%** | **0.0%** |
+| TMA (producer) | **0.4%** | **0.8%** |
+| other (SM-internal) | **99.6%** | **99.2%** |
+
+### Reading
+- **TMA producer-floor is negligible (0.4–0.8%).** So the big §9 unknown — is the 19.1% wait_barrier a
+  producer floor? — is answered NO. The de-phasing ceiling is NOT capped by the producer.
+- WGMMA = 0 as expected: in this trace model WGMMA-result waits go through the traditional scoreboard
+  (→ `stall_count`), not the SB wait_barrier. So the SB wait_barrier bucket is dominated by **`other`**
+  = ordinary fixed-latency instructions (softmax scaling/convert arithmetic etc.) arming an SB that the
+  next dependent instruction waits on — an **SM-internal** dependency.
+- ⇒ ~99% of wait_barrier is SM-internal (not producer), i.e. a de-phasing candidate.
+
+### Combined recoverable estimate (fwd) — the "how much"
+| bucket | % of elapsed | recoverable? |
+|---|---|---|
+| rest (clearly recoverable) | 9.9% | ✅ |
+| wait_barrier_only, minus TMA 0.4% | ~19.0% | ✅ (SM-internal `other`) |
+| ibuffer_empty + drained | ~24.7% | ❌ drain tail floor |
+| **total recoverable (upper bound)** | **~28.9%** | |
+
+Upper-bound: sim 105,774 → ~75,180 = **1.56× → 1.11×** if ALL SM-internal idle were hidden by de-phasing.
+
+### ⚠️ The remaining unknown — is `other` actually de-phasable?
+`other` is SM-internal, but that alone doesn't prove a de-phased warp CAN fill it. Two cases:
+- (recoverable) the dependency is a short per-warp pipe latency that hits all 3 warps at the SAME cycle
+  because they're in phase → de-phasing lets warp B run during warp A's wait.
+- (not) if the structure forces each warp to wait its own turn regardless of phase, de-phasing won't fill it.
+This can only be settled by the GTLRR A/B itself: de-phase and see whether SM-idle 31.7% actually drops.
+The 28.9% is therefore an UPPER BOUND / motivation, not a promise.
+
+### Net: green light for the GTLRR experiment
+The producer floor is ruled out (TMA ~0.5%), the idle is SM-internal, and the ceiling (→1.11×) is large
+enough to justify building the gated GTLRR ordering and measuring whether SM-idle actually falls.
+
+
+## 13. RESULT — GTLRR A/B: re-convergence, scheduler ordering is NOT the lever (2026-07-27q)
+
+Built + ran GTLRR (`-subcore_gtlrr_enable 1`). fwd `.o63`/`.e63`, bwd `.o38`.
+
+### Verification
+- `[GTLRRDBG] ACTIVE` confirms it's live and round-robin: `greedy=1 → order=[1 2 3 0]`, `greedy=2 →
+  [2 3 0 1]` (vs GTO's oldest-first). ✅
+- `gpu_sim_insn` bit-identical (fwd 455,565,060 / bwd 629,211,348) — scheduling-only, work-invariant. ✅
+
+### Result — essentially no effect (predicted re-convergence)
+| | GTO | GTLRR | Δ |
+|---|---|---|---|
+| fwd cycle | 105,774 | 104,093 | **-1.6%** (1.56×→1.54×) |
+| bwd cycle | 178,129 | 174,586 | -2.0% (1.35×→1.31×) |
+| fwd lockstep (head_mufu/valid_head) | 74.6% | **73.8%** | ~none |
+| fwd SM-idle | 31.7% | **31.5%** | ~none |
+
+### Verdict — scheduler ORDERING cannot de-phase a deterministic workload
+Changing only WHICH warp issues (GTO→GTLRR→...) does not widen the phase: all warps run the identical
+deterministic path with identical latencies, so after any reorder they re-converge to the same phase and
+hit the dependency waits together — exactly the E1 (launch-offset) failure mode, same root. lockstep
+stayed 74.6%→73.8%; SM-idle 31.7%→31.5%. The 1.6-2% is noise-level, not a lever.
+
+⇒ **Approach A (scheduler policy) is REFUTED.** The lockstep's root is NOT the scheduler; it is the
+**deterministic execution timing** — every warp takes exactly the same cycles through each stage, so no
+ordering keeps them staggered. De-phasing can only come from a source that makes warps take DIFFERENT
+times per stage.
+
+### What remains — candidate B (physical cross-warp jitter), now the only live de-phase lever
+For warps to STAY de-phased, per-warp execution time must differ. The faithful source HW has and the sim
+lacks (it's warp-symmetric → zero variance): **dynamic cross-warp contention** — two warps hitting the
+same shared-mem bank / RF read-write port in the same cycle, one delayed 1+ cyc. This creates real,
+data-dependent per-warp jitter that (unlike launch-offset or ordering) is regenerated continuously and
+survives the mbarrier. This is the CLOSED WARP_STAGGER doc's candidate B.
+- ⚠️ Risk: it introduces a timing-model change with a tunable (contention penalty) → fidelity must be
+  pinned against a HW microbench (bank-conflict / RF-port latency), else it's a fudge. Bigger build.
+- Honest status: the 28.9% recoverable ceiling (§12) still stands as a ceiling, but we now know the ONLY
+  mechanism that can approach it is physical jitter (B); ordering (A) and launch-offset (E1) are both dead.
+- Decision point: build B (with a HW-anchored penalty) vs accept the deterministic-lockstep floor. B is
+  the last unexhausted faithful lever; if its penalty can be tied to a real HW number, it's worth trying.
+
+### Note
+GTLRR left in the tree, gated + default-off (GTO remains default, bit-identical). It's a correct,
+harmless option; just not effective for this workload. Revert config to `-subcore_gtlrr_enable 0` for
+normal runs.
+
+
+## 14. Ruled out: WGMMA-sync, tensor head-of-line, queue backpressure (2026-07-27r)
+
+After GTLRR failed (§13), re-examined whether the excess idle is a sim-only structural defect (user's
+question: "HW doesn't have this problem, why does the sim?"). Three concrete suspects, all checked in
+code + data, all NOT the cause:
+
+### (1) Is WGMMA modeled synchronously (warp stalls until result)? → NO, it's async (correct)
+- Issue immediately pops the IBuffer front ([sm.cc:823](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/sm.cc#L823) `issued()`); the warp can issue its NEXT
+  instruction the following cycle. There is NO per-warp "one in-flight" gate (`inst_in_pipeline()` is only
+  an assert). A warp blocks on a WGMMA result ONLY at a real RAW (scoreboard) or an explicit
+  `wgmma.wait_group`/DEPBAR (its own wait_barrier bits) — HW-faithful async.
+
+### (2) Does a busy tensor FU cause head-of-line (stalls the whole subcore)? → NO, already handled
+- tensor is a fixed-latency FU, so `is_fu_available = fu->can_issue()` ([subcore.cc:755-756](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/subcore.cc#L755)) is folded
+  into the issue-eligibility predicate BEFORE the ISSUE_CONTROL latch, so a busy-tensor warp is skipped and
+  the scan tries another warp (same effect Opt 10 gave SFU). `blocked_by_tensor` ≈ 0, `next_stage` 0.06%.
+
+### (3) Does post-issue queue/latch backpressure block issue? → present but NEGLIGIBLE here
+- The issue predicate DOES include `is_write_available_result_queue_for_fixed_latency_available`
+  ([subcore.cc:794](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/subcore.cc#L794)) — a full RF-write result-queue DOES block fixed-latency (incl. tensor) issue. But
+  measured: `result_queue_full` 0.47%, `next_stage` (ISSUE_CONTROL) 0.06%, `control_allocate_full` 0.04%
+  → all post-issue backpressure sums to ~0.6%. Queue size is 8 (config, >default 1) so it rarely fills.
+- Noted: `max_pops_per_cycle_register_file_write_queue_for_fixed_latency = 1` (1 write-back/cyc). Could in
+  principle throttle write-back, but result_queue_full is 0.47% so it does not gate issue in practice.
+
+### Where that leaves us
+All three sim-specific structural suspects are excluded. So the excess idle is NOT: WGMMA-sync, tensor
+head-of-line, or queue backpressure. It re-converges on the same picture:
+- `fu_occupied` = 41% of no_warps_ready (SFU 31% dominant): a warp wants to issue but its target FU is
+  busy AND there is no OTHER ready warp to switch to.
+- Per-warp waits are SHORT (sim 0.55 < HW 1.36) yet issue-rate is LOW (sim 0.29 < HW 0.46).
+- GTO/GTLRR ordering can't fix it (deterministic re-convergence, §13); launch-offset can't (E1); physical
+  jitter would only slow things (user's point).
+
+### The unresolved core question (for further thought)
+Same 12 warps, same async WGMMA (II=8), same op-counts, per-warp waits SHORTER than HW — yet HW issues
+0.46/cyc/SMSP and the sim only 0.29. **What lets HW keep a warp issuable a larger fraction of cycles than
+the sim, given both are in-order and neither is queue-bound here?** No current hypothesis; parked for
+thought. (Candidate angles not yet examined: HW instruction MIX/count per warp vs the sim's trace — does
+HW issue more short filler insts between the long ops? — and whether the sim's `warps_active`=4 vs HW's
+measured 3.28 hides a per-warp readiness difference.)
+
+
+## 15. Cross-check with the prior producer/consumer analysis (2026-07-27s)
+
+Revisited the earlier work in `CONSUMER_COMPUTE_BOUND.md` and `FWD_DRAIN_IDLE_MBARRIER_CEILING.md` (which
+had ALREADY been measured in prior sessions). This session's findings line up with them; recording the
+connection so the next session can continue from a consistent picture. No conclusion about whether the
+residual is or isn't removable — that is left open for further verification.
+
+### What the prior producer/consumer measurement found (fwd, SM0 TMA timeline `.o45`)
+- fwd is **consumer-side**: the producer (warp 0) fetches ~2 tiles then waits ~6,645 cyc on average for
+  the consumer warpgroup to compute and free the shared-mem buffer. **93% of the TMA span is
+  producer-waiting-on-consumer**; per-tile TMA arrival latency is only ~402 cyc (memory is not the wall).
+- Producer warp 0: 14,082 insts, ~66% a spin loop (PHASECHK/NANOSLEEP), only 44 real UTMALDG. Consumer
+  warps 4-15: ~216 HGMMA each + MUFU.EX2. Producer-has-more-insts is trace-inherent.
+- **The producer "wait" is NOT SM-idle**: during those voids the 12 consumer warps are busy; only ~17%
+  of the kernel is fully idle. So SM-wide it is consumer compute, surfacing as stall-depth
+  (`math_pipe`/`mma`), not as idle.
+- Per-tile wall: sim ~3,300 vs HW ~1,700 cyc; the difference is stall/overlap, not raw compute cost.
+- 3-factor identity: `cycle 2.03× = work 1.11× × active-frac 1.39× × issue-depth 1.31×`.
+- NANOSLEEP spin-widening experiment: refuted (spin is a symptom of waiting on the consumer, not a driver;
+  at 1 CTA/SM the freed slots have no other warp to fill).
+
+### How this session's results map onto that
+- wait_barrier-kind probe (§12): TMA/producer barrier waits ~0.4% → consistent with "producer is not the
+  wall / memory is not the wall". The consumer's blocking is SM-internal (`other` 99%), matching
+  "consumer compute" rather than producer/mbarrier.
+- SFU-contention + fu_occupied (§6, §8): the consumer warps concentrating on the tensor/SFU pipes is the
+  same "consumer compute / stall-depth" picture, seen from the issue side.
+- GTLRR / E1 (§13): reordering/launch-offset don't change it — consistent with the prior "producer spin
+  is a symptom, occupancy=1 leaves no filler" observation.
+- Definition audit (table): the one clean cross-checked gap is issue-density 0.71× (elapsed) = cycle
+  1.56× ÷ work 1.10× — the same issue-depth/active-frac factors above.
+
+### The one still-unexplained quantitative delta (for the next session)
+The prior docs localize the residual to the **tensor/math re-issue interval**: `math_pipe_throttle` sim
+~11% vs HW 3.2%, `mma` sim ~5.65% vs HW 1.4%. tensor II/total-latency were checked HW-faithful (§7), so
+this excess is the consumer warps meeting the tensor/SFU pipes together (the same lockstep axis that E1
+and GTLRR did not move). **This delta is the concrete open item to verify further next session** — e.g.
+whether it is an artifact of how the 12 consumer warps are distributed across the 4 SMSP tensor pipes,
+or of the per-op tensor/math accounting, or genuinely the in-phase concentration. Left open; not
+adjudicated here.
+
+### Pointers
+- `CONSUMER_COMPUTE_BOUND.md` — TMA-timeline analysis, 3-factor identity, consumer-compute localization.
+- `FWD_DRAIN_IDLE_MBARRIER_CEILING.md` — the 4-axis SM-idle / producer-consumer-role instrumentation plan
+  (partially realized via the CTAFIN counters used in §9).
+- This doc §1-14 — per-pipe cost audit, overlap/warpcyc/wait_barrier-kind probes, GTLRR null result,
+  definition audit.
+
+
+⚠️ Guardrails: keep every II/latency HW-faithful (confirmed above); no pipe may exceed its NCU occupancy;
+any prototype gated + default-off + bit-identical when off; if the honest answer is "structural floor
+bounded by HW's own 54% No-Eligible", accept it and make no cycle claim.
+
+
+## 16. RESULT — HW producer-only tail via EXIT-only NVBit timestamps
+
+### Why this measurement is needed
+
+The producer/consumer mechanism itself is expected: after the consumer warps exit, the producer warp can
+remain live on one SMSP while the other three SMSPs have no active warp. The unresolved question is the
+**magnitude** of that producer-only tail on uninstrumented H100 versus the simulator.
+
+The prior closure compared sim `nv_ibuffer_empty` against HW SMSP-inactive time. That comparison is not
+definition-exact:
+
+- sim `nv_ibuffer_empty` is an issue-state classification while a subcore is still being evaluated;
+- NCU `Average SMSP Active Cycles` counts SMSP residency/activity;
+- the definition-matched sim counter is `total_num_cycles_issue_stage_evaluated`, because
+  `Subcore::cycle()` calls `issue()` only while `m_num_active_warps_subcore > 0`.
+
+For fwd K5, the existing NCU report gives `Elapsed Cycles = 67,696` and
+`Average SMSP Active Cycles = 60,209`. If every inactive SMSP-cycle came only from a tail where one of
+four SMSPs remains active, the HW producer-only tail is bounded by:
+
+```text
+(67,696 - 60,209) * 4 / 3 = 9,983 cycles
+```
+
+This is an upper bound, not a direct measurement. The current sim CTAFIN data reports an average
+`producer_last_drain - consumer_last_drain` of about 19.3K cycles, so an exact low-overhead HW
+measurement is justified before accepting or reopening the imbalance axis.
+
+### Measurement design
+
+Add a temporary `WARP_LIFETIME_ONLY=1` mode to the NVBit tracer. In this mode:
+
+- instrument only SASS `EXIT` instructions at `IPOINT_BEFORE`;
+- do not emit the full dynamic instruction trace;
+- record only the final `clock64()` timestamp per `(kernel, CTA, warp)`, plus SM id;
+- use the first predicated-active lane and retain the latest timestamp because a warp may execute
+  multiple predicated `EXIT` instances;
+- write `warp_exit_timestamps.csv` after the selected kernel completes.
+
+Role definitions from the existing H100 protobuf trace:
+
+| Kernel | Producer warps | Consumer warps | Setup warps |
+|---|---|---|---|
+| K5 fwd | 0 | 4-15 | 1-3 |
+| K10 bwd | 0-1 | 4-11 | 2-3 |
+
+Per-CTA derivation:
+
+```text
+K5 producer_end = exit[0]
+K5 consumer_end = max(exit[4..15])
+
+K10 producer_end = max(exit[0], exit[1])
+K10 consumer_end = max(exit[4..11])
+
+producer_only_tail = producer_end - consumer_end
+```
+
+`clock64()` is valid for this delta because all warps of one CTA remain on the same SM. No cross-SM
+timestamp subtraction is used.
+
+### GPU-server run
+
+The Python/PyTorch runner is compatible with NVBit injection. `run_hw_trace.py` already launches it with
+`CUDA_INJECTION64_PATH` and `LD_PRELOAD`; only the temporary tracer mode and kernel range are added.
+
+K5:
+
+```bash
+WARP_LIFETIME_ONLY=1 \
+ENABLE_TMA_DESC=0 \
+DYNAMIC_KERNEL_LIMIT_START=5 \
+./util/tracer_nvbit/run_hw_trace.py \
+  -B flashattn:flashattn-fa3-bf16-bwd-causal-b1-s2048-hd64-nh24 \
+  -D 0 -l 5
+```
+
+K10:
+
+```bash
+WARP_LIFETIME_ONLY=1 \
+ENABLE_TMA_DESC=0 \
+DYNAMIC_KERNEL_LIMIT_START=10 \
+./util/tracer_nvbit/run_hw_trace.py \
+  -B flashattn:flashattn-fa3-bf16-bwd-causal-b1-s2048-hd64-nh24 \
+  -D 0 -l 10
+```
+
+When `WARP_LIFETIME_ONLY=1`, `run_hw_trace.py` writes into a separate run directory with a
+kernel-specific suffix and skips the normal TMA/sync trace post-processing. The result files are:
+
+```text
+<run>-warp-lifetime-k5/traces/warp_exit_timestamps.csv
+<run>-warp-lifetime-k10/traces/warp_exit_timestamps.csv
+```
+
+The existing full-trace directory is not modified.
+
+Do not run NCU and NVBit simultaneously. Compare uninstrumented and EXIT-only kernel duration first;
+accept the timestamp result only if overhead is below 1.0%. Run at least three repetitions and use the
+median per-kernel tail distribution.
+
+### Result (three H100 runs, 2026-07-29)
+
+All expected warp EXIT records were captured with no missing CTA, no cross-SM CTA mismatch, and no
+capture overflow:
+
+| Kernel | Runs | CTAs/run | Rows/run | Missing CTA | SM mismatch |
+|---|---:|---:|---:|---:|---:|
+| K5 fwd | 3 | 132 | 2,112 | 0 | 0 |
+| K10 bwd | 3 | 384 | 4,608 | 0 | 0 |
+
+H100 producer-only tail distribution, pooling all three runs:
+
+| Kernel | Samples | Negative | Min | P50 | Mean | P95 | Max |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| K5 fwd | 396 | 0 | 7,798 | 7,916 | 7,950.9 | 8,074 | 10,024 |
+| K10 bwd | 1,152 | 144 | -1,846 | 14,388 | 16,448.0 | 29,467 | 32,271 |
+
+K5 run-to-run means were `7,948.5 / 7,946.0 / 7,958.2` cycles (spread below 0.2%), and the measured
+maximum of 10,024 cycles is consistent with the independent NCU aggregate upper bound of 9,983 cycles
+(0.4% difference). The measurement is stable and definition-consistent.
+
+Comparison against the current sim CTAFIN runs:
+
+| Kernel | HW mean | Sim mean | Sim/HW | HW-Sim mean | HW P50 | Sim P50 | HW P95 | Sim P95 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| K5 fwd | 7,950.9 | 19,298.6 | **2.43x** | -11,347.7 | 7,916 | 20,092 | 8,074 | 23,151 |
+| K10 bwd | 16,448.0 | 12,574.6 | **0.76x** | **+3,873.4** | 14,388 | 12,254 | 29,467 | 22,764 |
+
+The aggregate K10 difference is also substantial, but its wide P50-to-P95 range is not measurement
+noise:
+
+- HW mean is 30.8% longer than sim (`16,448.0 / 12,574.6 = 1.31x`);
+- HW P50 is 17.4% longer (`14,388` vs `12,254`);
+- HW P95 is 29.4% longer (`29,467` vs `22,764`);
+- 12.5% of HW CTA samples have a negative tail (a consumer exits after both producers), versus only
+  1/384 sim CTAs (0.3%).
+
+Per-CTA values are reproducible across the three HW runs (pairwise correlation `r=0.903-0.916`) and
+form deterministic CTA-index populations:
+
+| K10 CTA range | Count | HW mean | HW P50 | HW P95 | Sim mean | Sim-HW mean |
+|---|---:|---:|---:|---:|---:|---:|
+| 0-127 | 128 | 26,876.7 | 27,036 | 29,620 | 13,027.4 | -13,849.3 |
+| 128-255 | 128 | 14,728.1 | 13,431 | 23,498 | 17,069.4 | +2,341.3 |
+| 256-335 | 80 | 12,443.5 | 11,649 | 21,727 | 9,561.1 | -2,882.4 |
+| 336-383 | 48 | -1,502.1 | -1,476 | -1,334 | 4,403.5 | +5,905.6 |
+
+On HW, consumer warp 11 is last for all 384 CTAs. Producer warp 0 is last for CTA 0-335, while producer
+warp 1 is last for CTA 336-383; exactly those final 48 CTAs have a negative tail in all three runs. The
+high P95 comes primarily from CTA 0-127, not from random runtime variation.
+
+Sim does not preserve this structure well: HW-vs-sim per-CTA correlation is only `r=0.359`, and sim has
+only one negative-tail CTA. Therefore K10 has a large, structured role-lifetime fidelity mismatch that
+the aggregate mean hides. Its cycle direction cannot be inferred from the aggregate mean because some
+CTA populations are under-modeled while others are over-modeled.
+
+The current sim global critical CTA is CTA 283 in the 256-335 population. Its sim tail is 12,748 cycles,
+versus an HW three-run median of 11,947 cycles (+801 cycles, +6.7% sim over HW). Thus the large K10
+distribution mismatch is real, but the tail of the current bwd critical CTA is already close and does
+not identify a large immediate cycle-reduction lever.
+
+For K5, the last-finishing sim CTA is also the max-tail CTA:
+
+```text
+global_cta=56
+finish_cyc=104,092
+producer_last_drain=104,085
+consumer_last_drain=79,325
+producer_only_tail=24,760 cycles
+```
+
+Using the measured HW maximum tail (10,024) as a conservative critical-tail target gives an oracle
+upper bound:
+
+```text
+104,093 - (24,760 - 10,024) = 89,357 cycles
+```
+
+This corresponds to `89,357 cycles (32.0% error, -14.2% vs current)`. It is a sizing bound, not a cycle
+claim: no simulator timing has been changed yet.
+
+### Decision after the run
+
+- **K5 fwd: reopen the producer-only role-lifetime axis.** The mechanism exists on HW as expected, but
+  sim over-models its mean magnitude by 2.43x. Next isolate whether the excess is frozen producer polling
+  in the full NVBit trace, warp-retirement timing, or warp-to-SMSP placement.
+- **K10 bwd: track as a separate, structured fidelity issue.** The wide distribution is a deterministic
+  CTA-index effect, with large errors in both directions and missing negative-tail behavior in sim.
+  Aggregate correction is invalid. Because the current critical CTA tail differs by only +6.7%, this
+  result does not yet provide a large bwd cycle-reduction lever; first identify why the four CTA
+  populations and producer-last roles differ.
+
+### Default-off probe policy
+
+The EXIT-only implementation is isolated in code commit `ed804b4` and is default-off:
+
+- unset `WARP_LIFETIME_ONLY` or set it to `0`: the original full instruction trace, run directory, TMA
+  capture, and post-processing paths are used;
+- set `WARP_LIFETIME_ONLY=1`: only EXIT timestamps are collected into kernel-specific lifetime run
+  directories.
+
+The probe may remain in the tree for reproducibility; a revert is not required. If code cleanup is
+desired later, `git revert ed804b4` removes only the probe while retaining this result.
+
+
+## 17. RESULT — K5 producer-only tail decomposition
+
+### Existing mbarrier model
+
+This result does **not** indicate that Hopper mbarrier semantics are missing. The simulator already
+models:
+
+- CTA-scoped mbarrier objects and phase parity;
+- arrive counts and expected/completed transaction bytes;
+- TMA completion binding;
+- `PHASECHK` / `TRYWAIT` through `is_sync_wait_satisfied()`.
+
+The producer-tail probe reads the existing readiness result and changes no mbarrier state, issue
+condition, trace order, or instruction count.
+
+### Full-trace sidecar — timing result rejected
+
+Code commit `b5390dc` adds `WARP_LIFETIME_SIDECAR=1`. Unlike `WARP_LIFETIME_ONLY=1`, sidecar mode retains
+the complete dynamic trace and normal TMA/sync post-processing while also recording the final
+`clock64()` value at each warp's SASS `EXIT`.
+
+The sidecar capture was complete (132 CTAs, 2,112 warp EXIT records, no missing CTA or cross-SM
+mismatch), but full instruction instrumentation destroyed the timing:
+
+| K5 H100 tail | EXIT-only | Full-trace sidecar |
+|---|---:|---:|
+| P50 | 7,916 | 56,038,667 |
+| Mean | 7,950.9 | 56,239,407.5 |
+| P95 | 8,074 | 90,852,956 |
+| Max | 10,024 | 187,425,326 |
+
+Full tracing inflated the measured tail by 7,073x and erased the natural CTA distribution
+(`r=0.028` against EXIT-only per-CTA tails). The sidecar itself did not materially alter the full-trace
+workload: original vs sidecar callback counts were `47,401,323` vs `47,387,527` (`-0.029%`).
+
+Therefore the full-trace `clock64()` result is rejected as an HW timing reference. It proves that
+full NVBit collection strongly perturbs wall-clock timing, but it cannot separate captured polling
+control flow from simulator timing. The valid HW target remains the three-run EXIT-only measurement.
+
+### Simulator result (`K5 .o64`, original trace)
+
+The probe emitted 132 complete `[PRODTAIL]` records with the expected role set
+(`1 producer + 12 consumers` per CTA). All per-CTA invariants passed:
+
+```text
+tail_cycles = producer_last_drain - consumer_last_drain
+issued = phasechk + nanosleep + branch + tma + other
+```
+
+The timing and work counters also stayed at the established values:
+
+```text
+gpu_sim_cycle          = 104,617
+gpu_sim_insn           = 455,565,060
+gpgpu_n_tot_w_icount   = 16,064,281
+```
+
+Tail mismatch:
+
+| K5 tail | H100 EXIT-only | Sim `.o64` | Sim/HW |
+|---|---:|---:|---:|
+| Mean | 7,950.9 | 20,117.6 | 2.53x |
+| P50 | 7,916 | 20,630 | 2.61x |
+| P95 | 8,074 | 23,410 | 2.90x |
+| Max | 10,024 | 24,318 | 2.43x |
+
+The current last-finishing sim CTA is CTA 56:
+
+```text
+tail_cycles=23,614
+issued=4,044
+tail_CPI=5.84
+HW maximum tail=10,024
+critical-tail excess=13,590 cycles
+```
+
+Using the HW maximum as a conservative sizing target gives
+`91,027 cycles (34.5% error, -13.0% vs current)`. This is an upper-bound estimate, not a demonstrated
+cycle reduction.
+
+### New findings
+
+The mean producer tail contains only 3,468.9 issued instructions but takes 20,117.6 cycles:
+
+| Metric | K5 mean |
+|---|---:|
+| Producer instructions | 3,468.9 |
+| Issue fraction | 17.2% |
+| Stall fraction | 82.8% |
+| Tail CPI | 5.80 |
+| CPI required to fit the same work in the HW mean tail | 2.29 |
+
+The tail is overwhelmingly polling control:
+
+| Issued class | Mean | Share |
+|---|---:|---:|
+| `PHASECHK` / `TRYWAIT` | 1,589.1 | 45.8% |
+| `NANOSLEEP` | 789.9 | 22.8% |
+| Branch | 834.1 | 24.0% |
+| TMA + other | 255.8 | 7.4% |
+
+Thus 92.6% of tail-issued instructions are polling control, but the captured instruction count is not
+a physical lower bound preventing an 8K tail: 3,468.9 instructions can fit within 7,950.9 HW cycles.
+
+The existing Hopper mbarrier result was ready for 54.4% of executed tail `PHASECHK` / `TRYWAIT`
+instructions. This does not by itself prove that the next captured branch incorrectly retries, but it
+rules out the interpretation that the complete tail is simply waiting for an unready Hopper mbarrier.
+
+Non-issue reasons (overlapping, normalized by `stall_cycles`):
+
+| Producer-tail stall reason | Fraction |
+|---|---:|
+| SASS dependency `wait_barrier` | 68.8% |
+| `stall_count` | 25.1% |
+| FU occupied | 6.1% |
+| no-valid | 4.9% |
+| issue-port | 0.3% |
+| not-selected | <0.1% |
+
+The 11,462.5 mean cycles attributed to `wait_barrier` are **not** Hopper mbarrier waits. They are SASS
+control-code read/write dependency scoreboard waits evaluated by `are_wait_barriers_ready`. In contrast,
+Hopper mbarrier phase/transaction readiness is the separate nonblocking `PHASECHK` result above.
+
+`next_stage`, traditional scoreboard, TMA flush, instruction barrier, and result-queue stalls were zero;
+not-selected averaged less than one cycle per CTA. This rules out inter-warp contention, Opt-10
+issue-latch blocking, and TMA store drain as the producer-tail wall.
+
+Numerically, `20,117.6 - 11,462.5 = 8,655.1 cycles`, close to the HW mean of 7,950.9. This is only a
+sizing clue because stall reasons overlap; removing one condition can expose another.
+
+### Next decision
+
+Reopen the K5 producer-tail axis as a real simulator fidelity problem. Before changing timing, extend
+the simulator probe with:
+
+- exclusive `wait_barrier`-only cycles in the producer tail;
+- blocked head PC/opcode and wait-SB id;
+- PC/opcode that armed the pending SB;
+- pending counter value and age at each blocked cycle.
+
+If `wait_barrier` remains the sole unmet condition for most of the 11.5K cycles, fix the SASS dependency
+barrier lifetime/release model. If it mostly overlaps `stall_count` or FU occupancy, use the exclusive
+partition to select the actual timing lever. Any fix must remain default-off during validation and
+preserve `gpu_sim_insn`, HGMMA, MUFU, and TMA counts bit-identically.
+
+
+## 18. Trace over-poll evidence (fwd AND bwd) + whole-lifetime producer-spin probe
+
+### Direct trace-vs-HW branch counts
+
+The spin loop is `SYNCS.PHASECHK.TRANS64 -> NANOSLEEP.SYNCS -> BRA`, so one BRA per iteration
+makes branch count a direct proxy for iterations. NCU branch counts are hardware performance
+counters (not instrumentation), so they are the un-perturbed HW truth. The dynamic trace protobufs
+that the simulator actually replays were parsed directly (varint decode, no protoc):
+
+| Branch (BRA) count | HW (NCU) | Replayed trace | Ratio |
+|---|---:|---:|---:|
+| K5 fwd | 203,049 | 576,296 | 2.84x |
+| K10 bwd | 229,938 | 844,000 | 3.67x |
+
+Trace dynamic-instruction totals equal the simulator's `gpgpu_n_tot_w_icount` exactly
+(fwd 16,064,281; bwd 22,626,216), confirming the counts are what the simulator consumes. The trace
+`total_insts` in `stats.csv` (K5 47,401,323) matches the full-trace sidecar capture (47,387,527),
+confirming this trace was produced under full instrumentation - i.e. the excess spin is baked into
+the captured control flow, not synthesized by the simulator scheduler.
+
+### Per-warp: spin is concentrated on the producer
+
+CTA-0 BRA counts show the excess is almost entirely the producer warp:
+
+- K5 fwd: warp 0 (producer) = 3,226 BRA; setup warps 1-3 = 7 each; consumers 4-15 = 79-113 each.
+- K10 bwd: warp 0 (main producer) = 3,234 BRA, 13,970 insts; warp 1 (aux producer) = 69 BRA, 823
+  insts; setup warps 2-3 = 6 each; consumers 4-11 = 69-80 each.
+
+### Why the tail-only probe missed bwd
+
+Section 17's `[PRODTAIL]` probe activates only after every consumer-role warp has drained. In fwd the
+producer's excess spin lands in that post-drain tail, so it was visible. In bwd the producer (warps 0
+and 1) is interleaved with consumers throughout the main loop, so its excess spin is spread across the
+whole kernel and does not appear as a post-drain tail. This is why the EXIT-timestamp tail comparison
+showed bwd sim tail (12,575) shorter than HW (16,448): "bwd has no tail problem" was the wrong
+conclusion; bwd has an over-poll problem located outside the tail.
+
+### New probe: whole-lifetime producer-spin ready-retry (commit `293e21c`)
+
+Added `-producer_spin_ready_instrument_enable` (default-off). Unlike the tail probe it is NOT gated by
+consumer drain: for every PHASECHK/TRYWAIT a producer-role warp executes over its whole lifetime, it
+samples the existing Hopper mbarrier result (`is_sync_wait_satisfied`) and classifies it. It reads
+mbarrier state only - no change to mbarrier state, issue conditions, trace order, timing, or
+`gpu_sim_insn`. Emits one `[PRODSPIN]` line per CTA:
+
+- `phasechk_total` - all producer PHASECHK/TRYWAIT;
+- `phasechk_ready` - modeled mbarrier already satisfied at the test (over-poll candidate);
+- `phasechk_not_ready` - barrier genuinely not yet satisfied (legitimate wait);
+- `ready_run_retries` - within a maximal run of consecutive ready tests on one warp, every test beyond
+  the first (redundant re-polls of an already-satisfied barrier);
+- `issued_phasechk` / `issued_nanosleep` / `issued_branch` / `issued_other`.
+
+### Run and decision
+
+Both probes are enabled in `configs/tested-cfgs/SM90_H100_L2_50MB_80GB/gpgpusim.config`. Run K5 and
+K10 as usual and collect `[PRODSPIN]`.
+
+| Observation | Conclusion |
+|---|---|
+| High `ready_run_retries` / `phasechk_total` (fwd and bwd) | Captured trace re-polls an already-ready barrier; excess iterations are a capture artifact the simulator replays |
+| `ready_run_retries` ~ 0 but `phasechk_not_ready` high | Simulator mbarrier releases later than HW; investigate release timing, not iteration count |
+| bwd `[PRODSPIN]` excess ~ trace 3.67x proxy | Confirms bwd over-poll is real and main-loop-resident, not a tail effect |
+
+Any later fix that removes the replayed-spin cycle cost must preserve `gpu_sim_insn`, HGMMA, MUFU, and
+TMA counts bit-identically (retire the captured ops; remove only their stall cycles), and must be a
+general mbarrier-polling mechanism, not a K5-specific clamp. It must not regress K10.
+
+### Reconciling with the "work matches HW" result (thread-inst vs warp-inst)
+
+An apparent contradiction: section 1 reports work as invariant (thread-inst 455,565,060 sim vs
+457,900,688 HW = 1.00x), yet the producer is said to over-poll. Worse, the sim thread-inst is slightly
+*lower* than HW - which is impossible if the sim genuinely executes more spin. Resolving this shows the
+1.00x "match" is a measurement artifact, not evidence of equal work.
+
+The two thread-inst numbers are not the same kind of measurement:
+
+| Quantity | Sim | HW | Source |
+|---|---:|---:|---|
+| warp-inst | 16,064,281 | 14,482,551 | sim retire counter / NCU `Executed Instructions` |
+| avg active lanes/warp | 28.36 | 31.62 | sim 455.57M/16.06M / NCU `Avg. Active Threads Per Warp` |
+| thread-inst | 455,565,060 | 457,900,688 | sim: direct lane sum (`inst.active_count()`); HW: **derived** = 14,482,551 x 31.62 |
+
+The sim thread-inst is a direct lane-accurate sum (`gpu_sim_insn += inst.active_count()`,
+sm.cc:2928). The HW thread-inst is NOT a measured counter - NCU reports warp-inst (14,482,551) and an
+average lane occupancy (31.62); 457,900,688 is their product. So the "1.00x" compares a direct sum
+against a warp-count x average-lane estimate.
+
+Why they land close is a cancellation, not agreement:
+
+```text
+Sim: many warp-inst (16.06M) x low avg lane (28.36) = 455.6M
+HW : few  warp-inst (14.48M) x high avg lane (31.62) = 457.9M
+```
+
+The sim runs 1.109x more warp-inst, but its extra ops are the 1-lane spin polls
+(`PHASECHK/NANOSLEEP/BRA`), which drag the average lane occupancy down from 31.62 to 28.36. The two
+effects offset, so the products nearly match - and can even leave the sim product marginally lower.
+This is exactly why the sim thread-inst can be below HW despite more spin: dividing a slightly larger
+lane-sum across many more warp-insts lowers the average, and HW's product uses that higher average.
+
+Quantitatively the warp-inst excess is 16,064,281 - 14,482,551 = 1,581,730, and the trace's dynamic
+spin opcodes (PHASECHK 407,234 + NANOSLEEP 407,234 + BRA 576,296 = 1,390,764) account for 88% of it.
+
+Conclusion: the thread-inst 1.00x is a warp-up x lane-down cancellation artifact and is NOT a valid
+work-match proof. The trustworthy, same-definition comparisons all point the same way:
+
+- warp-inst: sim 16.06M vs HW 14.48M = 1.109x (sim higher);
+- avg active lanes: sim 28.36 vs HW 31.62 (sim lower, i.e. more 1-lane spin);
+- HW branch (NCU hardware counter) 203,049 vs replayed trace 576,296 = 2.84x.
+
+This still does not by itself prove a cycle lever - lane-sparse ops are cheap per issue - but it removes
+"work matches at 1.00x" as a reason to dismiss the over-poll. The `[PRODSPIN]` `ready_run_retries`
+count remains the test for how much of the replayed spin is redundant (barrier already satisfied)
+rather than a genuine wait.
+
+### [PRODSPIN] result — half of producer polls are redundant re-checks
+
+Ran K5 (`.o65`, 132 CTAs) and K10 (`.o40`, 384 CTAs) with
+`-producer_spin_ready_instrument_enable`. Work invariants held bit-identically
+(K5 `gpu_sim_insn` 455,565,060 / `gpgpu_n_tot_w_icount` 16,064,281; K10
+629,211,348 / 22,626,216), confirming the probe is observe-only.
+
+| Producer PHASECHK/TRYWAIT | K5 fwd | K10 bwd |
+|---|---:|---:|
+| phasechk_total | 815,523 | 1,319,706 |
+| phasechk_ready | 415,558 (51.0%) | 696,463 (52.8%) |
+| phasechk_not_ready | 399,965 (49.0%) | 623,243 (47.2%) |
+| ready_run_retries | 413,659 (50.7%) | 694,407 (52.6%) |
+
+`ready_run_retries` counts polls issued while the modeled Hopper mbarrier was
+already satisfied and the warp had already tested ready in the same run - i.e.
+redundant re-checks of an already-passed barrier. Roughly half of all producer
+polls in both kernels are redundant.
+
+This cross-checks against the external NCU branch excess (independent measurement):
+
+| | NCU branch excess (trace - HW) | ready_run_retries | Ratio |
+|---|---:|---:|---:|
+| K5 fwd | 373,247 | 413,659 | 1.11 |
+| K10 bwd | 614,062 | 694,407 | 1.13 |
+
+The two independent signals agree in magnitude: the HW-vs-trace over-poll and
+the simulator's redundant-ready re-polls are the same phenomenon. bwd is
+confirmed as a real over-poll (main-loop-resident), matching the 3.67x branch
+ratio; the tail-only probe had missed it.
+
+Still open: this is not yet shown to be a cycle lever. Redundant ready polls are
+1-lane and cheap per issue, and the section 17 tail cost was dominated by SASS
+`wait_barrier` (~5.8 CPI/iteration), a separate axis. Next: test whether these
+redundant re-poll cycles overlap issue slots a co-eligible warp could have used,
+before proposing any polling-collapse timing fix (must preserve gpu_sim_insn,
+HGMMA, MUFU, TMA bit-identically and not regress K10).
+
+### Problem statement (confirmed) — trace-replay fidelity, not scheduling
+
+The root cause is now settled and is NOT a scheduler problem:
+
+- The simulator scheduler is not over-selecting the producer. The spin-displaces-
+  a-co-eligible-warp rate was ~0.2% (section prior), so a "deprioritize the
+  producer" scheduling change would fix a problem that does not exist. That
+  direction is rejected.
+- The real defect is a mismatch between two clocks:
+  - captured trace iteration count: during NVBit capture, full instrumentation
+    slowed the consumers, so the producer spun far more than on real HW, and those
+    inflated iterations are baked into the trace (fwd 2.84x, bwd 3.67x branches);
+  - the simulator's own mbarrier model, which knows exactly when the barrier is
+    satisfied.
+- `ready_run_retries` ~50% (K5 50.7%, K10 52.6%) is the direct evidence: half of
+  producer polls are issued AFTER the simulator's own mbarrier model already
+  reports the barrier satisfied. The simulator ignores what it knows (clock B)
+  and faithfully replays the polluted iteration count from the trace (clock A).
+
+Problem, stated precisely:
+
+> The simulator replays the captured trace's redundant producer spin
+> (PHASECHK/NANOSLEEP/BRA) even though its own Hopper mbarrier model has already
+> reported the barrier satisfied. This is a trace-replay fidelity defect
+> (garbage-in from instrumented capture), not a scheduling defect.
+
+Direction for the fix (design pending, not yet implemented):
+
+- End the producer poll loop on the simulator's own mbarrier-ready event rather
+  than on the trace's recorded iteration count; the extra polls recorded after
+  ready did not occur on real HW and should not carry timing cost.
+- Hard constraint: `gpu_sim_insn` must stay bit-identical, so redundant polls
+  cannot simply be deleted. The mechanism must retire the captured ops (preserve
+  counts) while removing only their timing/stall cost.
+- Two candidate fix sites to decide between: (1) tracer-side normalization of the
+  captured spin, vs (2) simulator replay-side loop termination on modeled
+  mbarrier-ready. Must be a general mbarrier-polling mechanism, not a K5 clamp,
+  and must not regress K10.
+
+
+## 19. STATIC SASS proof — the spin `wait_barrier` is loop-internal, so over-poll IS the cycle lever (2026-07-31)
+
+This was settled **without running the simulator**, by decoding the SASS control bits of the producer
+spin loop directly. It closes the §17/§18 open question ("is the tail cost `branch` itself, or a separate
+`wait_barrier` axis that would survive removing the spin?"). Answer: they are the SAME loop body — cutting
+the over-poll cuts the `wait_barrier` with it.
+
+### Method (no run needed)
+The dynamic trace's `wait_barrier` = the SASS scoreboard-barrier (SB) dependency encoded in each
+instruction's control word, NOT the Hopper mbarrier (that is the separate nonblocking `PHASECHK` result,
+§17). The decoder is [control_bits.cc:35-41](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/util/traces_enhanced/src/control_bits.cc#L35-L41): from the 2nd 64-bit word, `>> 41`
+([CCPos_arch_7x_8x](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/util/traces_enhanced/src/traced_constants.h#L31)), then
+stall=[3:0], yield=[4], write_bar=[7:5], read_bar=[10:8], wait_mask=[16:11] (id 7 = none). Applied to the
+producer spin loop in
+[flash_fwd_hdim64_bf16_sm90.sm_90a.sass:4771-4778](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/hw_run/traces/device-0/12.8/flashattn-fa3-bf16-bwd-causal-b1-s2048-hd64-nh24/flashattn_fa3_bf16_bwd_causal_b1_s2048_hd64_nh24___warmup_0___iters_1/traces/extra_info/sass/flash_fwd_hdim64_bf16_sm90.sm_90a.sass#L4771-L4778).
+
+### The decoded spin loop (fwd, `PHASECHK/NANOSLEEP/BRA`)
+| PC | op | stall | write_bar | read_bar | wait_mask |
+|---|---|---|---|---|---|
+| 94f0 | `SYNCS.PHASECHK.TRANS64.TRYWAIT` | 2 | **SB#3** | **SB#1** | **SB#1** |
+| 9500 | `@!P0 NANOSLEEP.SYNCS` | 5 | none | none | SB#3 |
+| 9510 | `@!P0 SYNCS.PHASECHK.TRANS64` | 2 | SB#3 | none | none |
+| 9520 | `@!P0 BRA 0x94f0` | 5 | none | none | SB#3 |
+
+### Findings (static, definitive)
+1. **The spin loop's `wait_barrier` is the SYNCS/PHASECHK op's OWN result-dependency**, not WGMMA and not
+   TMA. Each `TRYWAIT` arms SB#3 (write) + SB#1 (read); the very next ops (`NANOSLEEP`, `BRA`) wait on those
+   SBs. This is exactly the §17 result that 68.8% of tail stall is `wait_barrier` that is NOT a Hopper
+   mbarrier wait — now identified at the instruction level.
+2. **One iteration is inherently multi-cycle** (not 1): `TRYWAIT` waits SB#1, then `NANOSLEEP`/`BRA` each
+   carry stall=5 + wait SB#3. This is the static origin of §17's measured ~5.8 CPI/iteration. So the trace
+   running the loop 2.84× (fwd) / 3.67× (bwd) more than HW multiplies a **multi-cycle** body — confirming
+   statically that "more branches" directly inflates the producer tail and thus the CTA finish / kernel
+   cycle. (The user's intuition is correct; issue-slot contention is irrelevant to this — the cost is that
+   the warp stays alive executing a multi-cycle loop body, not that it steals another warp's slot.)
+3. **The SB dependency is loop-LOCAL: it does not leak past the loop.** The entry TRYWAITs (93e0/9460/94a0)
+   arm an SB but have `wait_mask=0` (single check, branch on P0 only); the loop-exit `BSYNC` (9530) and
+   `EXIT` (9540) both have `wait_mask=0`. So SB#1/#3 are armed→waited→consumed entirely INSIDE the loop
+   body. There is no post-loop instruction still blocked on them.
+
+### Consequence for the fix (this is the new, actionable conclusion)
+Because the `wait_barrier` lives inside the spin-loop body and does not survive loop exit, **removing the
+redundant iterations removes their `wait_barrier` cycles with them.** The §17 worry ("removing one stall
+condition may just expose another") does NOT apply here: the `wait_barrier` is not a separate parallel
+axis, it is the per-iteration cost of the very iterations we would drop. Therefore:
+- ending the producer poll at the modeled-mbarrier-ready event (the §18 fix direction) should reduce the
+  tail by ~(redundant-iterations × ~5.8 CPI), i.e. it is expected to be a real cycle lever, not just an
+  instruction-count change.
+- this is consistent with the §16/§17 oracle sizing (fwd critical CTA 56: tail 24,760 vs HW-max 10,024 ⇒
+  ~89–91K cycles, 1.56× → ~1.34×), now with a mechanism-level reason to believe the wait_barrier portion
+  is recoverable rather than a floor.
+
+### bwd (K10) confirmed IDENTICAL (2026-07-31) — static decode of the bwd SASS image
+The bwd kernel's SASS is a separate image
+[flash_bwd_hdim64_bf16_softcapall_sm90.sm_90a.sass](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/hw_run/traces/device-0/12.8/flashattn-fa3-bf16-bwd-causal-b1-s2048-hd64-nh24/flashattn_fa3_bf16_bwd_causal_b1_s2048_hd64_nh24___warmup_0___iters_1/traces/extra_info/sass/flash_bwd_hdim64_bf16_softcapall_sm90.sm_90a.sass#L4049-L4055)
+(NOT the `flash_fwd_*` image). Decoded its tight spin loop 7e60-7e90:
+
+| PC | op | stall | write_bar | read_bar | wait_mask |
+|---|---|---|---|---|---|
+| 7e60 | `SYNCS.PHASECHK.TRANS64.TRYWAIT` | 2 | SB#3 | **SB#2** | **SB#2** |
+| 7e70 | `@!P0 NANOSLEEP.SYNCS` | 5 | none | none | SB#3 |
+| 7e80 | `@!P0 SYNCS.PHASECHK.TRANS64` | 2 | SB#3 | none | none |
+| 7e90 | `@!P0 BRA 0x7e60` | 5 | none | none | SB#3 |
+| 7ea0 | `BSYNC` (loop exit) | 5 | none | none | **0** |
+| 7eb0 | `EXIT` | 5 | none | none | **0** |
+
+Same structure as fwd (only the SB ids differ: fwd uses SB#1/#3, bwd uses SB#2/#3): the `TRYWAIT` arms a
+write+read SB and waits the read SB; `NANOSLEEP`/`BRA` carry stall=5 + wait the write SB; and the loop-exit
+`BSYNC`/`EXIT` have `wait_mask=0`, so the SB dependency is again **loop-local** and does not leak past exit.
+A second producer poll loop (7ed0-7f00, on a different mbarrier addr `+0x30c00`) shows the identical
+arm/wait/exit pattern, confirming it is the general per-mbarrier producer spin, not a one-off.
+
+⇒ **All three §19 findings hold for bwd identically.** The over-poll fix is therefore a SINGLE general
+mbarrier-polling mechanism that applies to both kernels (matches the §18 requirement "must not be a K5
+clamp"). fwd and bwd differ only in WHERE the spin lands (fwd: post-drain tail; bwd: main-loop-resident,
+§18), not in the loop's SB-dependency structure.
+
+### Still to verify (does not change the above, but tightens the number)
+- Confirm at the trace/replay level that the redundant (post-ready) iterations carry the SB wait in the
+  sim exactly as the static control bits imply (i.e. the sim's `are_wait_barriers_ready` is gating on
+  SB#1/#3 here) — the arm/disarm path is [subcore.cc:378-382](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/subcore.cc#L378-L382)
+  (arm on new read/write barrier) and [warp_dependency_state.cc:141-148](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/warp_dependency_state.cc#L141-L148)
+  (block at issue). Static bits already show this must be so; a targeted probe would only quantify it.
+
+
+## 20. Root cause of the trace over-poll + chosen fix plan (two-run NVBit calibration) (2026-07-31)
+
+### Why the tracer inflates the producer spin (code-confirmed, not speculation)
+Read-only audit of the NVBit tracer confirmed §18's hypothesis at the code level:
+- **Every instruction is instrumented, no opcode skip** — `nvbit_insert_call(instr, "instrument_inst",
+  IPOINT_BEFORE)` at [tracer_tool.cu:1957-1959](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/util/tracer_nvbit/tracer_tool/tracer_tool.cu#L1957); NANOSLEEP/PHASECHK/TRYWAIT/BRA are treated like any other op.
+- **Each instrumented op pays a heavy per-op cost** — a warp-wide `__shfl_sync` ×32 gather + a several-hundred-byte
+  `inst_trace_t` channel push + atomicAdd at [inject_funcs.cu:158-163](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/util/tracer_nvbit/tracer_tool/inject_funcs.cu#L158). Record struct is 32-lane arrays ([common.h:40-63](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/util/tracer_nvbit/tracer_tool/common.h#L40)).
+- **The inflation is a CLOCK SKEW, not redundant polling.** The consumer warps run many instrumented ops so their
+  wall-clock is dilated enormously; the producer's `NANOSLEEP 0x989680` is a fixed **real-time** hardware sleep
+  that instrumentation does NOT dilate. So per unit of consumer progress the producer polls far more often. Every
+  captured poll was genuinely not-ready **at that dilated instant** — the producer exits the loop immediately once
+  `TRYWAIT` returns P0=true (`@!P0 NANOSLEEP`/`@!P0 BRA` predicate-off). There is NO "post-ready redundant" poll on
+  the tracer/HW side; the §18 `ready_run_retries` is a SIM-frame statement (sim's own mbarrier model already ready),
+  not a claim that the producer spun after HW readiness. Do not conflate the two frames.
+- No existing tracer knob filters/caps/normalizes spin (confirmed by directory-wide search). The only lightweight
+  precedent is the `WARP_LIFETIME_ONLY` EXIT-only mode ([tracer_tool.cu:1771-1786](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/util/tracer_nvbit/tracer_tool/tracer_tool.cu#L1771)).
+
+Consequence: because the poll count N is purely a function of the capture-time consumer dilation, the tracer cannot
+know the "correct" poll count from within the heavy run — it has no HW-timing reference during capture.
+
+### CHOSEN PLAN (try first): two-run NVBit calibration — measure the correct poll count, don't estimate it
+Instead of scaling by a global ratio (÷2.84 fwd / ÷3.67 bwd — which would smear the §16 per-CTA structure), run
+NVBit **twice** and use the light run as ground truth for how many polls each spin burst should have:
+- **Run 1 (heavy, current):** full dynamic trace. Producer polls N times per burst (inflated by consumer dilation).
+- **Run 2 (light):** a new ultra-light NVBit mode that instruments ONLY the spin PCs (PHASECHK/TRYWAIT/BRA) and does
+  nothing but a per-(CTA,warp) atomic counter — no shfl gather, no `inst_trace_t` push. Minimal dilation ⇒ producer
+  poll count M ≈ real HW. Build it on the `WARP_LIFETIME_ONLY` skeleton.
+- **Go/no-go gate:** compare Run 2's poll/branch count against the NCU hardware branch counters (fwd 203,049 /
+  bwd 229,938, §18). If Run 2 ≈ NCU ⇒ the residual dilation is negligible and Run 2 is trustworthy. If not ⇒ Run 2
+  is still too heavy (or the approach doesn't hold) ⇒ fall back to the sim-side plan below.
+- **Trim:** post-process the Run 1 trace so each producer spin burst keeps only M iterations (Run 2 value for that
+  CTA/warp/burst), dropping the excess (N−M). §19 showed every spin iteration is identical (same control bits) and
+  the SB `wait_barrier` is loop-local, so dropping any interior iterations is exact; keep the final ready-exit
+  iteration. Then re-run the sim on the corrected trace and measure cycles.
+
+### Open design questions to resolve BEFORE spending a 12h run (investigate in code first)
+1. **Light-mode feasibility:** can we instrument only the spin PCs with just a counter, reusing the
+   `WARP_LIFETIME_ONLY` gating pattern? How are the spin PCs identified (opcode string PHASECHK/TRYWAIT + the
+   NANOSLEEP/BRA that follow, or the loop-back BRA target)?
+2. **Run1↔Run2 mapping:** the two runs are independent launches, so CTA→SM placement and per-run poll counts differ.
+   The mapping unit must be a **spin-burst instance** (producer waiting on one mbarrier at one loop PC), not a raw
+   poll index. Producer control flow is deterministic, so the NUMBER and ORDER of bursts should match across runs
+   even though the iteration count within each burst differs — **verify this determinism holds** (same burst count
+   per CTA/warp in both runs) before trusting the trim.
+3. **Trace-consistency after trim:** trimming changes `gpu_sim_insn` / branch / PHASECHK / NANOSLEEP counts. This
+   intentionally BREAKS the old bit-identical guardrail because the baseline itself is being corrected toward HW.
+   Record the corrected counts as the NEW reference; the HGMMA/MUFU/TMA counts (real compute) must stay unchanged —
+   only the spin opcodes change. Confirm the trim touches ONLY spin-PC ops.
+
+### Advantage over global scaling / over the sim-side fix
+- Per-CTA/warp measured counts directly target §16's structured K10 mismatch (some CTA populations over-modeled,
+  some under-modeled) instead of averaging it away.
+- The sim timing model is untouched — the sim just replays a corrected trace; no "when does the sim stop replaying"
+  logic needed.
+
+### FALLBACK (if the two-run calibration fails the go/no-go gate)
+Go to the sim-side approach: end the producer poll loop on the simulator's OWN modeled-mbarrier-ready event
+(the sim already knows when the barrier is satisfied — §18 `ready_run_retries`). Retire the captured spin ops
+(preserve `gpu_sim_insn` bit-identically) while removing only their stall/timing cost; §19 proved the spin
+`wait_barrier` is loop-local so removing it exposes no other stall. Must be a general mbarrier-polling mechanism
+(works for both K5 and K10, §19 bwd confirmed identical), gated + default-off, not a K5 clamp.
+
+Decision order: (1) build light mode + verify determinism → (2) Run 2 vs NCU gate → (3a) if pass, trim + measure;
+(3b) if fail, sim-side ready-based early-stop.
+
+
+## 21. Code investigation for the two-run plan — feasibility CONFIRMED + a simplification (2026-07-31)
+
+Read-only source audit of the tracer + trace format to answer the §20 "resolve before a 12h run" questions.
+All three are answered, and one finding materially simplifies the plan.
+
+### Q1 — Light-mode feasibility: YES, `WARP_LIFETIME_ONLY` is a ready-made skeleton
+The EXIT-only mode is exactly the template a spin-counter mode needs, end-to-end:
+- **Gating / instrument-skip:** [tracer_tool.cu:1747-1751](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/util/tracer_nvbit/tracer_tool/tracer_tool.cu#L1747) skips the normal per-inst
+  instrumentation when `warp_lifetime_only`; [tracer_tool.cu:1771-1780](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/util/tracer_nvbit/tracer_tool/tracer_tool.cu#L1771) instruments ONLY the
+  opcode of interest (there: `EXIT`) then `continue`s. A spin-counter mode would instead match the spin
+  opcodes and `continue`.
+- **Ultra-light device fn:** [inject_funcs.cu:170-203](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/util/tracer_nvbit/tracer_tool/inject_funcs.cu#L170) `record_warp_exit` takes only
+  `(pred, capture_ptr)`, uses `__ballot_sync` + first-active-lane, and writes one per-(cta,warp) slot. NO
+  `__shfl_sync ×32` gather and NO `inst_trace_t` channel push (the heavy parts, [inject_funcs.cu:158-163](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/util/tracer_nvbit/tracer_tool/inject_funcs.cu#L158)).
+  A spin counter is even lighter: replace `capture->exit_clock[slot]=clock64()` with
+  `atomicAdd(&capture->poll_count[slot],1)`.
+- **Buffer + host dump plumbing already exists:** managed alloc [tracer_tool.cu:3519-3525](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/util/tracer_nvbit/tracer_tool/tracer_tool.cu#L3519),
+  per-launch reset [tracer_tool.cu:2206-2238](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/util/tracer_nvbit/tracer_tool/tracer_tool.cu#L2206), CSV dump
+  [tracer_tool.cu:2250-2287](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/util/tracer_nvbit/tracer_tool/tracer_tool.cu#L2250); struct `warp_lifetime_capture_t`
+  [common.h:69-78](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/util/tracer_nvbit/tracer_tool/common.h#L69) (add a `poll_count[SLOTS]` field, or a parallel struct).
+
+### Q1b — spin PC identification: trivial via opcode prefix (pattern already in the tracer)
+The tracer already classifies sync ops by opcode-string prefix with `rfind(op,0)==0`
+([get_sync_runtime_capture_kind, tracer_tool.cu:371-390](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/util/tracer_nvbit/tracer_tool/tracer_tool.cu#L371): `SYNCS.PHASECHK`, etc.). The
+spin loop opcodes are `SYNCS.PHASECHK...TRYWAIT`, `NANOSLEEP.SYNCS`, `BRA` (§19). Simplest robust proxy:
+count the loop-back `BRA` (one per iteration, the §18 branch proxy) — but note a producer warp has many
+BRAs, so match the specific spin form (`@!P0 SYNCS.PHASECHK` immediately followed by `@!P0 BRA` to a
+backward target). Cleanest: count `SYNCS.PHASECHK.TRANS64.TRYWAIT` executions (one per poll iteration,
+directly comparable to the NCU/branch proxy).
+
+### Q2 — Run1↔Run2 mapping + determinism: strong code evidence, final check still empirical
+Trace layout is `threadblock -> warp -> repeated instruction{pc, active_mask, predicate_mask, ...}`
+([tracer_tool.cu:2792-2811](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/util/tracer_nvbit/tracer_tool/tracer_tool.cu#L2792)). So each spin iteration appears in the
+producer warp's stream as a recurrence of the spin loop-entry PC (fwd 0x94f0 / 0x9560 / ...; bwd 0x7e60
+/ 0x7ec0 / ..., §19). Different mbarrier loops = different PCs, so bursts are separable by PC.
+Determinism support already in the doc: §13 `gpu_sim_insn` bit-identical across scheduler changes (control
+flow deterministic); §16 per-CTA HW tails reproducible across 3 runs (r=0.903-0.916); §18 per-warp BRA
+counts are stable per CTA. The burst COUNT/ORDER is set by the workload's tile structure (how many tiles
+each producer waits on), which is data-independent here, so it should match across runs even though the
+iteration count within a burst differs. ⚠️ Still verify empirically: same burst count per (CTA,warp) in
+Run1 vs Run2 before trusting the trim.
+
+### ⭐ Simplification found: Run 2 may be UNNECESSARY — the trim target can come straight from NCU
+Because Run 1's trace ALREADY records every poll as a PC recurrence (Q2), we do not strictly need a second
+NVBit run to LOCATE the polls — only to know the correct COUNT. But the correct count already exists as a
+hardware counter: NCU `BRA` = fwd 203,049 / bwd 229,938 (§18), an un-perturbed HW measurement. Two options:
+- **(minimal) global-ratio trim from NCU only:** scale each burst's iteration count by
+  `NCU_branch / trace_branch` (fwd ÷2.84, bwd ÷3.67). No second run at all. Downside: applies one ratio to
+  all bursts/CTAs, smearing the §16 per-CTA structure — but it is a zero-extra-run first probe to size the
+  cycle effect.
+- **(precise) per-(CTA,warp) trim from Run 2:** the light run gives per-slot poll counts, so each burst is
+  trimmed to its own measured M. This is what preserves §16's per-CTA structure. Worth the (cheap, 20-30min)
+  extra trace run ONLY if the minimal global-ratio probe shows a meaningful cycle gain.
+
+Revised decision order:
+1. **(no new run)** Post-process the EXISTING Run 1 trace: count spin-PC recurrences per producer burst;
+   apply the NCU global ratio to trim; re-run sim; measure the cycle delta. This sizes the lever with zero
+   HW time.
+2. If the cycle gain is meaningful → build the light spin-counter NVBit mode (Q1 skeleton), do the cheap
+   Run 2, verify burst determinism (Q2), and do the precise per-CTA trim to also fix the §16 K10 structure.
+3. If even the precise trim underperforms or determinism fails → fall back to the §20 sim-side
+   ready-based early-stop.
+
+### Guardrail note for the trim (unchanged intent, restated)
+The trim changes only the spin opcodes (PHASECHK/TRYWAIT/NANOSLEEP/BRA); HGMMA/MUFU/TMA (real compute)
+counts must be byte-for-byte unchanged. The trimmed trace becomes the NEW HW-faithful baseline, so the old
+"bit-identical vs the untrimmed trace" guardrail is intentionally superseded for the spin ops only.
+
+
+## 22. NCU source-page gives a CLEAN per-PC HW spin count — the branch ratio was contaminated (2026-07-31)
+
+User pushback (correct): "is the NCU branch count trustworthy? other branches are mixed in." Answer: NO, the
+§18 branch ratio IS contaminated, and the NCU **Source page** (per-PC `Instructions Executed`, a HW
+perf-counter, not instrumentation) lets us replace it with an uncontaminated per-PC spin count.
+
+### Source of the §18 numbers, and why they are contaminated
+`Branch Instructions = 203,049 (fwd K5) / 229,938 (bwd K10)` is the `details` page metric — it counts
+**every BRA in the whole kernel** (consumer loop branches, setup, non-spin producer branches), not just the
+spin loop-back BRA. So the 2.84×/3.67× "branch" ratio mixes spin and non-spin branches; the true spin-only
+inflation is not that ratio. The report is `nv_reports/h100/flashattn-fa3-bf16-bwd-...full_rpt.ncu-rep`;
+`ncu` lives at `/usr/local/cuda/bin/ncu` inside the `gpu-sim` container (not on PATH by default).
+
+### The clean instrument: NCU Source page has per-PC `Instructions Executed`
+`ncu --import <rep> --page source --csv` yields, per SASS PC (`Address`): the `Source` (disassembly) and
+`Instructions Executed` (HW counter). This isolates the spin loop exactly. Blocks are per-kernel; the
+FlashAttn kernels of interest are `cutlass::device_kernel<flash::...FlashAttn...>`.
+
+### ⭐ Key finding: NANOSLEEP-exec ≠ TRYWAIT-exec — only NANOSLEEP counts a REAL wait
+Per-kernel totals, split by kernel TYPE (the bwd-workload report contains BOTH the fwd K5 and bwd K10
+FlashAttn kernels, since the bwd workload also runs the forward pass):
+| HW per-PC exec | FWD K5 (`FlashAttnFwdSm90`) | BWD K10 (`FlashAttnBwdSm90`) |
+|---|---:|---:|
+| `SYNCS.PHASECHK...TRYWAIT` (all PCs) | 40,885 | ~73,908† |
+| **`NANOSLEEP.SYNCS` (all PCs) = real spin** | **8,461** | **7,860** |
+| (contaminated §18 `Branch Instructions`) | 203,049 | 229,938 |
+
+† bwd TRYWAIT ~73,908 = the 147,816 total halved (see duplicate-block note below).
+(A `BwdPostprocessConvertdQ` helper kernel adds 6,144/6,144 — ignore for K5/K10.)
+
+⚠️ **NANOSLEEP is spread over MANY PCs, not one** (user's question). FWD K5 has **21 static NANOSLEEP PCs
+(9 nonzero)**, BWD K10 has **17 static NANOSLEEP PCs per block**. The producer waits on several different
+mbarriers, each in its own spin loop with its own predicate (P0/P1/P3/P4). So the spin count is the SUM
+over all NANOSLEEP PCs, and the trim must be applied per-PC — a single-PC view would undercount.
+
+⚠️ **Duplicate-block correction:** the NCU report contains the `FlashAttnBwdSm90` kernel block TWICE
+(identical PCs + identical exec, e.g. both 7,860; NCU profiled the K10 launch twice). They must NOT be
+summed. Correct bwd real-spin = **7,860** (an earlier pass here wrongly added the two → 15,720; corrected).
+FWD K5 has a single block (8,461, correct).
+
+The NANOSLEEP and TRYWAIT counts differ ~5-9×, and the difference is the whole point:
+- A `TRYWAIT` is executed **once on entry to every poll site** and, on the common fast path, returns
+  P0=true immediately → the guarded `@!P0 NANOSLEEP`/`@!P0 PHASECHK`/`@!P0 BRA` are predicated OFF and the
+  loop is NOT taken. So most TRYWAIT executions are a **single non-blocking check, not a spin**.
+- `NANOSLEEP` executes **only when the barrier was not ready** (`@!P0`), i.e. it counts the iterations where
+  the producer actually waited and looped. **`NANOSLEEP`-exec is the clean HW "real spin iteration" count.**
+- Confirmed at PC level: in a tight spin loop the three PCs `TRYWAIT / @!P0 NANOSLEEP / @!P0 PHASECHK`
+  share the SAME exec count (e.g. 3148/3148/3148, 2804/2804/2804), while standalone TRYWAIT PCs (no
+  NANOSLEEP after them) carry large single-check counts (3168, 7680, 23040 …) that are NOT spin.
+- ⚠️ Note the §18 branch numbers (203,049 / 229,938) are ~24× the real spin (8,461 / 15,720): the branch
+  metric is overwhelmingly NON-spin branches. This is concrete proof the branch ratio was the wrong yardstick.
+
+### Consequence — §21's "trim by the NCU branch ratio" is WITHDRAWN
+- The kernel-total BRA ratio (§18) is contaminated and must NOT be used as the trim factor.
+- The correct HW reference is **per-PC `NANOSLEEP`-exec from the Source page** (the real-wait count), matched
+  against the trace's per-PC spin count at the SAME loop PCs (§19: bwd 7e60/7ec0/…, fwd 94f0/9560/…). This is
+  a clean, definition-matched, per-loop comparison — exactly what the user's objection requires.
+- This ALSO removes the §21 "Run 2 may be unnecessary" simplification's weak leg: we no longer lean on the
+  contaminated NCU branch total. NANOSLEEP-exec IS the HW ground truth, already in the existing report — so a
+  second NVBit run may STILL be unnecessary, but now for a sound reason (clean per-PC HW counter exists),
+  not the contaminated branch ratio.
+
+### Revised trim target (supersedes §21's ratio approach)
+For each producer spin loop PC in the Run-1 trace, count its executed spin iterations (trace per-PC), and
+trim it toward the HW per-PC `NANOSLEEP`-exec for the corresponding loop. The mapping between a trace loop
+PC and a Source-page PC is by the SASS offset / mbarrier address operand (both are in the disassembly, e.g.
+`[R7+URZ+0x16800]`), giving a per-loop, per-mbarrier trim factor instead of one global ratio.
+
+### Is the NCU `Instructions Executed` metric exact or sampled? — EXACT (verified)
+User concern: NCU samples periodically, so does `Instructions Executed` equal the true full-run execution
+count of each NANOSLEEP? YES, it is exact, not the sampled column. The Source page has BOTH kinds side by
+side: `Warp Stall Sampling (All Samples)` / `# Samples` (cols 2-4) are the periodic PC-sampler; `Instructions
+Executed` (col 5) is the separate exact HW counter (`smsp__sass_inst_executed`). Proof at the loop level: the
+5 PCs of one tight spin loop `IMAD / TRYWAIT / @!P0 NANOSLEEP / @!P0 PHASECHK / @!P0 BRA(back)` ALL read
+`Instructions Executed = 3148` exactly, while their `# Samples = 0`. A sampler could not produce five
+identical exact values; the counter can. ⇒ NANOSLEEP-exec = true real-wait iteration count for that loop.
+
+### Each NANOSLEEP = one distinct loop (one mbarrier) — HW per-loop spin counts (deduped block)
+Confirmed structurally: one tight loop body contains exactly one NANOSLEEP; the loop-back BRA targets the
+loop head; distinct NANOSLEEP PCs are distinct loops waiting on distinct mbarriers (distinct address
+operand). HW real-spin per loop (nonzero loops only; bwd from a single deduped block):
+
+| FWD K5 loop PC | HW spin exec | mbarrier |     | BWD K10 loop PC | HW spin exec | mbarrier |
+|---|---:|---|---|---|---:|---|
+| 9c5850 | 132 | R11+URZ |   | 8ac590 | 384 | R7+URZ |
+| 9c58d0 | 3148 | R7+URZ+0x16800 |  | 8ac600 | 777 | R2+URZ+0x30c00 |
+| 9c5ca0 | 662 | R16+URZ+0x16820 |  | 8ac930 | 2017 | R18+URZ+0x30c28 |
+| 9c5de0 | 955 | R5+URZ+0x16840 |  | 8aca70 | 2804 | R18+URZ+0x30c20 |
+| 9c5e40 | 96 | R5+URZ+0x60 |  | 8acb30 | 390 | R18+URZ+0x30c28 |
+| 9c5ea0 | 1051 | R5+URZ+0x16840 |  | 8acbf0 | 720 | R7+URZ |
+| 9c5f00 | 100 | R5+URZ+0x60 |  | 8acc50 | 768 | R9+URZ |
+| 9c5f60 | 484 | R5+URZ+0x16860 |  | | | |
+| 9c5fc0 | 1833 | R15+URZ+0x16820 |  | | | |
+| **TOTAL** | **8461** | |  | **TOTAL** | **7860** | |
+
+⚠️ Mapping caveat for the trim: the HW loop is keyed by SASS PC + register-relative mbarrier operand
+(`R7+URZ+0x16800`), whose base register value is only known at runtime. The trace records the RESOLVED
+mbarrier address per dynamic instruction, so the trace-side burst must be matched to the HW loop by the
+static loop PC (offset), not by the symbolic operand. Some loops share a base+offset (e.g. two FWD loops
+both `R5+URZ+0x16840`) → they are DIFFERENT static PCs (9c5de0 vs 9c5ea0) i.e. genuinely different loops
+that happen to reuse the base register; key on PC.
+
+### Still to do (next, cheap) — the per-loop trace vs HW vs sim comparison the user asked for
+1. From the existing Run-1 protobuf, count each producer spin loop's iterations PER STATIC LOOP PC (match to
+   the HW loop PCs above by SASS offset). Tabulate, per loop: HW-spin (above) vs trace-spin. The per-loop
+   ratio is the true, uncontaminated inflation for THAT loop (expected ≫1 and possibly very different per loop).
+2. Also pull the sim run's per-loop spin count (sim replays the trace, so sim-spin ≈ trace-spin for op-count,
+   but capture the sim CYCLES those loops consume) to quantify HW-vs-sim wall difference per loop.
+3. Then size the trim: set each loop's trace iterations = HW NANOSLEEP-exec for that loop; re-run sim; measure
+   cycles. Per-loop (not global) because §16 showed the bwd structure is per-CTA/per-region, and the table
+   above already shows loops ranging 96…3148 (fwd) / 384…2804 (bwd) — a single ratio would misfit them.
+
+All numbers above are from the single bwd-workload report `flashattn-fa3-bf16-bwd-...full_rpt.ncu-rep`,
+which contains both the K5 (fwd) and K10 (bwd) FlashAttn kernels; the K10 block is duplicated and was
+deduped. These are the authoritative clean HW spin counts to trim against.
+
+
+## 23. (3) Trace-side spin count is STATIC (no sim needed) — parsing works; coordinate-mapping is the open step (2026-07-31)
+
+Answering "do we need to run the sim for (3)?": **NO for the trace axis.** The Run-1 trace protobufs are on
+disk and parse cleanly; per-loop trace iteration counts are obtained by static parsing alone. Only the
+"sim CYCLES per loop" sub-part needs the sim, and prior §16/§17 sim outputs already cover much of it.
+
+### Parsing verified (docker `gpu-sim`, pure-python protobuf)
+- proto schema compiled: `protoc --python_out=/tmp/pb2 *.proto` in the container's
+  `.../traces_enhanced/dynamic_trace`. Runtime protobuf is 7.35 vs old protoc → must set
+  `PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python`.
+- Each CTA `.pb` (e.g. `kernel_10/d_0_s_0_k_10_0,0,0.pb`) is a `threadblock` message; `warps` is a
+  `map<int32,warp>` (iterate `.warps` entries via `.key`/`.value`), each `warp.instructions` is a repeated
+  `instruction{pc, active_mask, predicate_mask, function_unique_id, addresses, sync, bar_runtime}`.
+- Sanity: CTA0 warp0 (producer) = **13,970 inst**, matching §18's producer inst count exactly ⇒ parse correct.
+
+### How to isolate spin in the trace WITHOUT opcode strings (the trace has no opcode text)
+`instruction.sync` (a `sync_runtime_info` with `valid`, `barrier_addr`) is populated for SYNCS/PHASECHK-class
+ops. So the spin polls are the sync-valid instructions. CTA0 warp0: **6,392 sync-valid insts across 40 PCs**;
+the hot spin PCs (0xb960:1421, 0xb980:1417, 0xb820:1184, 0xb840:1182, …) dominate. All of warp0 is
+`function_unique_id = 8`. A backward-transition (loop-iter) proxy over the hot PCs = **3,147** for CTA0 (near
+§18's CTA0 producer BRA 3,234). So the trace spin is directly countable per PC.
+
+### ⚠️ The open step: a 3-coordinate mapping is needed for an EXACT per-loop trace-vs-HW table
+Three different PC/address spaces must be linked, and they do NOT match directly:
+1. **NCU Source page** — absolute VA (`0x7f75...`) + mbarrier operand as `Rn+URZ+0xNNNN` (e.g. 0x30c00/0x30c28);
+   the HW real-spin per loop (§22 table).
+2. **Trace** — per-function offset PC (`function_unique_id=8`, pc like 0xb960) + RESOLVED `sync.barrier_addr`
+   whose smem low bits are 0x1020 / 0x1028 (NOT the NCU 0x30c00 form — different base/representation).
+3. **SASS dump** (`flash_bwd_..sass`, §19) — per-function offset (7e60 etc.), and the file concatenates
+   MULTIPLE functions so the same offset (e.g. 0xb820) recurs in different functions; must disambiguate by
+   function.
+Because these don't line up by raw value, an exact per-loop join requires establishing the map first
+(candidate keys: match trace `function_unique_id` → SASS function; match trace hot-PC order/structure to the
+SASS spin-loop sequence; or match by relative barrier-offset pattern). This is the one remaining
+non-trivial step before a clean per-loop trace-vs-HW ratio table.
+
+### What is already usable now (aggregate, no mapping needed)
+- HW total real-spin (NANOSLEEP): FWD 8,461 / BWD 7,860 (§22, whole kernel, all CTAs).
+- Trace CTA0-warp0 spin ≈ 3,147 iterations (one CTA). With 384 CTAs in bwd this is clearly ≫ the HW
+  per-kernel 7,860 — i.e. the trace over-spin is large and real, consistent with §18. (An exact ratio needs
+  the per-CTA HW split, which NCU aggregates; the mapping step above is what enables the precise trim.)
+
+### Next actions
+1. Establish the trace↔SASS↔NCU mapping (function_unique_id ↔ SASS function; loop PC ↔ NCU VA by offset).
+2. Build the per-loop table: HW NANOSLEEP-exec vs trace spin-iterations (summed over CTAs) → true per-loop
+   inflation.
+3. sim cycles per loop: reuse §17 `[PRODTAIL]` / §18 `[PRODSPIN]` outputs (already have per-CTA producer spin
+   + stall cycles) rather than a new 12h run; only re-run if a per-loop cycle attribution is missing.
+
+
+## 24. Mapping ESTABLISHED (trace ↔ NCU) + per-loop inflation is HIGHLY non-uniform (2026-07-31)
+
+The 3-coordinate mapping of §23 is now solved for both kernels. Method (all read-only, docker `gpu-sim`,
+pure-python protobuf; per-kernel sim runs via `-C H100_80GB-OnlyKernel5 / -OnlyKernel10`):
+
+### Link 1 — trace `function_unique_id` ↔ kernel (from the CTA0 `.pb`)
+- **kernel_5 (fwd K5) = `function_unique_id 3`**, producer = warp 0 (14,082 inst, matches §16).
+- **kernel_10 (bwd K10) = `function_unique_id 8`**, producer = warp 0 (13,970 inst).
+
+### Link 2 — NCU VA → function offset (subtract the kernel's base VA = its first Source-page row)
+- fwd base VA = 0x7f76309bac00; bwd base VA = 0x7f755f8a1100.
+- NANOSLEEP `offset = VA − base`. fwd loops: 0xac50/0xacd0/0xb0a0/0xb1e0/0xb240/0xb2a0/0xb300/0xb360/0xb3c0.
+  bwd loops: 0xb490/0xb500/0xb830/0xb970/0xba30/0xbaf0/0xbb50.
+
+### Link 3 — trace hot PC == the loop's TRYWAIT == (NANOSLEEP offset − 0x10)  ✓ VERIFIED
+The trace has no opcode text, but `instruction.sync.valid` marks the SYNCS/PHASECHK poll ops; the trace hot
+spin PC equals the loop's `TRYWAIT`, which sits exactly 0x10 before the NANOSLEEP. Confirmed: bwd NCU
+NANOSLEEP@0xb970 ⇒ TRYWAIT@0xb960, and the trace's #1 hot PC is 0xb960 (CTA0 count 1421). All 7 bwd loops
+line up by `NANOSLEEP_offset − 0x10 = trace TRYWAIT PC`. So a loop is keyed by (kernel funcid, TRYWAIT PC),
+joining HW NANOSLEEP-exec to trace poll count exactly.
+
+### ⭐ CTA0 sanity (bwd) — per-loop inflation varies WILDLY (kills any global ratio)
+`HW_all` = NANOSLEEP-exec over ALL 384 CTAs (§22); `trace_CTA0` = poll count in CTA 0 ALONE:
+| loop TRYWAIT PC | HW (all 384 CTA) | trace (CTA0 only) | note |
+|---|---:|---:|---|
+| 0xb480 | 384 | 1 | barely spins |
+| 0xb4f0 | 777 | 80 | |
+| 0xb820 | 2017 | **1184** | CTA0 alone ≈ 59% of the whole-kernel HW total |
+| 0xb960 | 2804 | **1421** | CTA0 alone ≈ 51% of the whole-kernel HW total |
+| 0xba20 | 390 | 185 | |
+| 0xbae0 | 720 | 169 | |
+| 0xbb40 | 768 | 202 | |
+
+Two loops (0xb820, 0xb960) have a SINGLE CTA's trace poll count already ~half of HW's entire 384-CTA total
+⇒ summed over CTAs the trace over-spin at those loops is enormous, while 0xb480 barely spins at all. **The
+inflation is per-loop, not a global 3.67× — confirming the trim MUST be per-loop (per TRYWAIT PC), exactly as
+the user insisted.**
+
+### Whole-kernel trace sum (all 384 CTAs) — running
+Per-CTA pure-python parsing is slow (~minutes/CTA-batch); a full-kernel sum of trace poll counts per loop PC
+is running to `/tmp/bwd_map.txt`. When done it yields the exact per-loop trace-total vs HW ratio (the trim
+factor per loop). The mapping above is what makes that table exact; the sum is mechanical.
+
+### ⭐⭐ RESULT — bwd K10 per-loop HW-vs-trace (all 384 CTAs summed) — true over-spin = 86×, NOT 3.67×
+| loop TRYWAIT PC | HW real spin (NANOSLEEP) | trace poll (replayed) | inflation |
+|---|---:|---:|---:|
+| 0xb480 | 384 | 384 | **1.00×** (never over-spins — first check always passes) |
+| 0xb4f0 | 777 | 21,548 | 27.7× |
+| 0xb820 | 2,017 | 200,707 | **99.5×** |
+| 0xb960 | 2,804 | 274,462 | **97.9×** |
+| 0xba20 | 390 | 32,267 | 82.7× |
+| 0xbae0 | 720 | 66,102 | 91.8× |
+| 0xbb40 | 768 | 83,298 | 108.5× |
+| **TOTAL** | **7,860** | **678,768** | **86.36×** |
+
+Findings:
+- **The real trace over-spin is 86×, not the §18 "branch ratio" 3.67×.** The branch metric was so
+  contaminated by non-spin branches that it understated the true spin inflation by ~23×. The sim replays
+  678,768 producer poll iterations where HW ran only 7,860.
+- **Per-loop inflation ranges 1.00× … 108×** — decisively non-uniform. Loop 0xb480 is perfectly faithful
+  (HW=trace=384: its TRYWAIT passes on the first check every time, so no NANOSLEEP/loop). Loops 0xb820 and
+  0xb960 alone are 200,707 + 274,462 = 70% of all trace spin. A single global ratio would over-trim 0xb480
+  to nothing-wrong and under-trim the hot loops — **the per-loop trim the user insisted on is required, and
+  the trim factor per loop is now known exactly (the table above).**
+- Each replayed excess iteration carries the loop-local `wait_barrier` (~5.8 CPI, §17/§19), so ~671K excess
+  poll iterations × their stall is the direct inflator of the producer tail / kernel cycles.
+
+### Remaining
+- Run the same all-CTA sum for fwd K5 (funcid=3; NANOSLEEP offsets 0xac50/0xacd0/0xb0a0/0xb1e0/0xb240/
+  0xb2a0/0xb300/0xb360/0xb3c0; trace TRYWAIT = offset−0x10). Expect similarly large, non-uniform inflation.
+- Build the trim: per loop PC, cap trace poll iterations at HW NANOSLEEP-exec (keeping the final ready-exit
+  iteration; preserve HGMMA/MUFU/TMA counts). Re-run sim per kernel (`OnlyKernel5/10`), measure cycles.
+
+### ⭐⭐ RESULT — fwd K5 per-loop HW-vs-trace (all 132 CTAs summed) — over-spin = 48×
+| loop TRYWAIT PC | HW real spin (NANOSLEEP) | trace poll (replayed) | inflation |
+|---|---:|---:|---:|
+| 0xac40 | 132 | 132 | **1.00×** (faithful) |
+| 0xacc0 | 3,148 | 1,499 | **0.48× (UNDER-spins!)** |
+| 0xb090 | 662 | 9,235 | 14.0× |
+| 0xb1d0 | 955 | 136,431 | **142.9×** |
+| 0xb230 | 96 | 9,909 | 103.2× |
+| 0xb290 | 1,051 | 157,418 | **149.8×** |
+| 0xb2f0 | 100 | 10,198 | 102.0× |
+| 0xb350 | 484 | 39,536 | 81.7× |
+| 0xb3b0 | 1,833 | 42,876 | 23.4× |
+| **TOTAL** | **8,461** | **407,234** | **48.13×** |
+
+Findings:
+- **fwd real over-spin = 48×** (not §18's branch 2.84×). Two loops 0xb1d0 + 0xb290 = 136,431 + 157,418 = 72%
+  of all fwd trace spin, at ~143×/150×. Again per-loop, hugely non-uniform (0.48× … 150×).
+- **⚠️ Loop 0xacc0 is 0.48× — trace UNDER-spins vs HW** (1,499 < 3,148). Not a mapping error: in CTA0 this
+  loop executes 0 times (it runs only in a subset of CTAs), and in those CTAs the trace spun LESS than HW.
+  This is the loop-level face of §16's structured per-CTA mismatch (some CTA populations are UNDER-modeled,
+  others over). So the trim is not purely "cut down": one loop must be handled as under-modeled — a global
+  or even per-loop-average factor would still misfit it; the correct target is the HW per-loop count itself
+  (cap the over ones, and note the under one cannot be fixed by trimming — it points to a separate
+  under-spin/timing question, consistent with §16's mixed-direction K10 result).
+- Mapping re-confirmed on fwd: hot trace PCs 0xb1d0/0xb290 = HW NANOSLEEP 0xb1e0/0xb2a0 minus 0x10. ✓
+
+### Summary of the calibration (both kernels)
+| kernel | HW real spin (Σ NANOSLEEP) | trace replayed poll | overall inflation | §18's wrong branch ratio |
+|---|---:|---:|---:|---:|
+| FWD K5 | 8,461 | 407,234 | **48.1×** | 2.84× |
+| BWD K10 | 7,860 | 678,768 | **86.4×** | 3.67× |
+
+The true producer over-spin is ~48-86×, an order of magnitude beyond the contaminated branch ratio, and is
+concentrated in 2 loops per kernel with per-loop factors spanning 0.48×…150×. The per-loop HW target counts
+(the two tables) are the exact trim references.
+
+### Remaining (unchanged)
+- Build the trim: per loop PC, cap trace poll iterations at the HW NANOSLEEP-exec above (keep the final
+  ready-exit iteration; preserve HGMMA/MUFU/TMA counts). Handle the fwd 0xacc0 under-spin loop as a separate
+  note (do not inflate it). Re-run sim per kernel (`OnlyKernel5/10`); measure cycles vs HW (fwd 67,696 /
+  bwd 132,901).
+
+
+## 25. Offline spin-trim tool `trim_spin_trace.py` — built + auto-mapping (2026-07-31)
+
+Decision (per user): trim OFFLINE (existing `.pb` → trimmed `.pb`, no GPU/NVBit re-capture), auto-derive the
+per-loop targets from the NCU report (no hardcoded PCs/counts), generalize to any kernel, and ASSERT on any
+mapping failure. Tool: `util/tracer_nvbit/trim_spin_trace.py` (runs in docker `gpu-sim`, pure-python protobuf,
+`PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python`).
+
+### Kernel mapping is EXACT 1:1 by name (NOT the earlier offset-pattern heuristic — user corrected this)
+The robust key is `extra_info/enhanced_execution_info.json`, which lists every kernel's
+`{unique_function_id → kernel_name (mangled)}`. Chain:
+trace instruction `function_unique_id` → JSON `kernel_name` → NCU Source-page `Kernel Name` block, matched by
+the FlashAttn class token (mangled trace name vs demangled NCU name both contain `FlashAttnFwdSm90` /
+`FlashAttnBwdSm90` / `FlashAttnBwdPreprocess` / `FlashAttnBwdPostprocessConvertdQ`). Exact-string first, then
+unique-token match; **assert on 0 or >1 (dedup identical NCU blocks by base-VA) with a descriptive message**.
+Verified: `funcid 3 = FlashAttnFwd (K5)`, `funcid 8 = FlashAttnBwdSm90 (K10)`. NCU kernel ORDER is NOT used
+(it differs from trace numbering and includes unrelated + duplicate blocks).
+
+### spin loop body in the trace (verified)
+One iteration = the recurring block from a loop-head `TRYWAIT_pc` up to just before the next `TRYWAIT_pc` of
+the same loop: `TRYWAIT(sync) → +0x10 NANOSLEEP → +0x20 PHASECHK(sync) → BRA(back)`, and sometimes a non-spin
+PC interleaves (e.g. bwd 0xb960 block is b960→b970→b2c0→b980→b990). The tool does NOT assume a fixed block
+size — it deletes the whole `[TRYWAIT .. next TRYWAIT)` span per excess iteration. The only structural
+constant is the +0x10 TRYWAIT→NANOSLEEP spacing (asserted).
+
+### Targets auto-extracted (validated against §22/§24)
+- NCU NANOSLEEP `Instructions Executed` per loop → target map `{trywait_off = nanosleep_off − 0x10 : hw_iters}`.
+- Column note: the "Instructions Executed" column index shifts per block (some blocks lack `# Samples`), so the
+  tool finds it by header name, not fixed index.
+- Validated totals: FWD 8,461 (9 loops), BWD 7,860 (7 loops); it also auto-found K11 BwdPostproc (3,072, 1 loop).
+  Preprocess (no NANOSLEEP) and non-flash kernels → passed through untrimmed (not an error).
+
+### Per-CTA distribution of the whole-kernel target
+NCU gives a whole-kernel NANOSLEEP total (all CTAs). The tool distributes it per-CTA proportionally to that
+CTA's own trace spin count: `cap_cta = round(hw_total · cta_iters / kernel_trace_total)`, clamped to
+[1 if the loop runs, cta_iters]. ⚠️ Limitation: this preserves the TRACE per-CTA shape, not HW's true per-CTA
+shape (§16 showed they differ). It is correct in aggregate (Σ = HW total) and a reasonable first cut; a later
+refinement could use per-CTA HW data if a source with per-CTA NANOSLEEP existed (NCU aggregates it).
+
+### Status / next
+- Tool built + light-validated (NCU extraction, name mapping, assert-on-no-match, single-CTA delete keeps
+  non-spin insts byte-identical). NOT yet run over all CTAs to emit a full trimmed trace.
+- Next: run the full trim (all CTAs, K5+K10) → new trimmed trace dir; verify per-loop trimmed totals ≈ HW
+  targets and HGMMA/MUFU/TMA unchanged; then sim `OnlyKernel5/10` on the trimmed trace and compare cycles vs
+  HW (fwd 67,696 / bwd 132,901). Also wire a `--trim-spin` path into run_hw_trace.py (offline post-step).
+- Note the fwd 0xacc0 under-spin loop (0.48×, §24): the cap won't raise it; it stays a separate under-model
+  item, not fixed by trimming.
+
+### ⚠️ Correctness: "what if the trimmed trace exits the loop but the sim scoreboard says NOT ready?" (user)
+Checked in code — the answer splits by WHICH wait, and both are safe IF the trim cuts whole iterations:
+- **mbarrier wait (PHASECHK/TRYWAIT = the spin condition) is NONBLOCKING in the sim**
+  ([sm.cc:2244-2245](file:///home/jihyun/modern-gpu-simulator-micro-2025/simulator-remodeled/gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/sm.cc#L2244): "PHASECHK/TRYWAIT are modeled as nonblocking predicate tests; the traced
+  control flow performs any retry/fallback"). The sim records ready/not-ready but the LOOP EXIT is decided by
+  the TRACE control flow, not by the sim's mbarrier verdict. So a trimmed trace that "exits early" is simply
+  replayed as exiting — even if the sim's modeled mbarrier is still not-ready, there is NO deadlock on the
+  PHASECHK axis. The feared "trace says done, sim says not done" cannot stall the producer here, because the
+  sim never blocks the producer on the mbarrier in the first place. ARRIVE/EXCH likewise only update mbarrier
+  state, non-blocking ([sm.cc:2296-2331]).
+- **SASS scoreboard wait (`are_wait_barriers_ready`) DOES gate issue** (§14/§19) — this is the real risk. BUT
+  §19 proved the spin loop's SB is LOOP-LOCAL (armed→waited→consumed inside the loop body; the loop-exit
+  BSYNC/EXIT have wait_mask=0). So trimming whole iterations removes the SB arm AND its wait together; nothing
+  after the loop waits on it. Safe.
+- **⚠️ The one way to break it: cut a PARTIAL iteration.** If a trim left a TRYWAIT without its paired
+  ARRIVE/PHASECHK, or removed an ARRIVE that a downstream mbarrier count depends on, the mbarrier arrive_count
+  or an SB arm/disarm pair would be corrupted and the sim COULD get stuck. This is exactly why
+  `trim_spin_trace.py` deletes only whole `[TRYWAIT .. next TRYWAIT)` iteration spans and never a partial
+  block. Keep that invariant.
+- **First validation gate after the full trim:** confirm the sim runs to completion (produces `gpu_sim_cycle`,
+  no hang/deadlock) AND `gpu_sim_insn` drops by exactly the removed spin ops while HGMMA/MUFU/TMA are
+  unchanged. A hang would mean a partial-iteration cut or a non-loop-local barrier — investigate before
+  trusting cycles.
+
+
+## 26. Rethink — offline trim is too fragile; pursue LIGHTER NVBit instrumentation instead (2026-07-31)
+
+Decision (user): pause the offline-trim path and reconsider. Fixing the trace AFTER capture is turning out
+brittle; the cleaner fix is to make the CAPTURE itself less perturbing so the producer spin is near-HW to
+begin with (attack the clock-skew root cause, §20).
+
+### Why the offline trim (`trim_spin_trace.py`, §25) is fragile — code review of the implementation
+The tool works and maps kernels exactly (§24 name-based mapping), but the trimming has structural weaknesses
+that make its output hard to trust without extensive per-CTA validation:
+1. **Run-splitting vs target convergence.** `find_loop_runs` groups spin iterations into "runs" of
+   back-to-back `[TRYWAIT..next TRYWAIT)` blocks, and keeps ≥1 iteration + the final iteration PER RUN. FA3
+   re-enters each mbarrier spin once per tile, so a loop can have MANY runs; the per-run floor can hold the
+   trimmed count well ABOVE the HW target (e.g. cap 5 but 100 runs ⇒ ≥100 kept). Convergence to the NCU
+   target is therefore not guaranteed and depends on run structure that we have not measured.
+2. **Map-write reflection unverified on the real path.** The trim rewrites `entry.value.instructions` of a
+   `map<int32,warp>` entry, then re-serializes. Whether the pure-python protobuf map yields a live reference
+   (mutation persists) or a copy (mutation lost → silent no-op trim) was only checked via a standalone mini
+   function, NOT through `main()`'s actual write path.
+3. **single-CTA validation is structurally blind.** With `--only-cta`, `kernel_total` scopes to that one CTA,
+   so `cap = hw_total·(cta/cta) = hw_total` ⇒ nothing gets trimmed. So the real trim path can only be
+   validated on a full multi-CTA run — expensive (minutes) and not yet done.
+4. **per-CTA distribution ≠ HW's true per-CTA shape** (§25 limitation): proportional-to-trace split is only
+   aggregate-correct; §16 showed HW's per-CTA structure differs (some CTAs under-, some over-modeled), and
+   fwd loop 0xacc0 is even 0.48× (UNDER-spun) — a cap cannot fix an under-spun loop at all.
+5. **Multiple producer warps** (bwd has warps 0 AND 1, §16): the tool trims only the single highest-scoring
+   producer warp per CTA, missing any spin on the aux producer.
+Together these mean the offline trim needs heavy per-CTA validation and still can't repair under-spun loops
+or HW's per-CTA shape. Net: high effort, fragile fidelity.
+
+### The alternative to pursue: lighter NVBit capture (reduce the dilation at the source)
+Root cause (§20): every instruction pays a heavy per-op instrumentation cost (warp-wide `__shfl_sync ×32`
+gather + several-hundred-byte `inst_trace_t` channel push, [inject_funcs.cu:158-163]), which dilates the
+CONSUMER wall-clock enormously while the producer's fixed real-time `NANOSLEEP` does not dilate → the
+producer over-polls ~48-86× (§24). If the capture were much lighter, the consumer/producer wall-clock ratio
+would be closer to HW and the recorded spin would be near-correct WITHOUT any post-hoc trimming.
+
+Directions to investigate next session (record only; not yet chosen):
+- **(a) Cheaper per-instruction record.** Do we need the full 32-lane `inst_trace_t` (addresses + reg values)
+  for EVERY instruction? For the FA3 timing trace, memory addresses matter for LD/ST/TMA but the spin ops
+  (PHASECHK/NANOSLEEP/BRA) need no address/reg payload. A per-opcode-class record size (skip the shfl gather
+  + big push for control/sync ops) could cut the dominant overhead on exactly the consumer-heavy path.
+- **(b) Reduce channel/host round-trip pressure.** Larger channel, batched push, or on-device aggregation so
+  the device stalls less waiting for host consumption (backpressure = part of the dilation).
+- **(c) Make the tracer NANOSLEEP-aware.** Since the skew is specifically the producer's fixed real-time
+  sleep vs dilated consumers, one option is to not instrument (or to zero-cost) the producer's spin poll ops
+  so the producer's relative timing tracks the consumers — but this changes recorded counts, so must be
+  reconciled with work-invariance.
+- **(d) Sampling/skip for hot spin PCs at capture.** Detect the spin loop on device and record only 1 of N
+  iterations — but this is essentially the trim moved on-device and shares the fidelity questions.
+- ⚠️ Constraint: any lighter capture must still produce a trace the simulator can replay (same schema, same
+  non-spin op fidelity, addresses for memory ops intact). Validate by re-checking the §24 per-loop NANOSLEEP
+  counts move toward HW (8,461 / 7,860) instead of 407K / 679K.
+
+### Status
+- `trim_spin_trace.py` left in tree (works for mapping + NCU target extraction, which are reusable), but the
+  offline-trim path is PARKED, not adopted.
+- The exact HW spin targets (§22/§24) and the trace↔NCU name mapping (§24) remain valid and are the yardstick
+  for whichever lighter-capture approach is built: success = recorded producer spin ≈ HW NANOSLEEP counts.
+
+
+## 27. RESOLVED — offline spin-trim adopted, sim run confirms the root cause (2026-08-04)
+
+The §18-§26 root cause is now **confirmed by a full simulator run** on the trimmed trace. The offline
+trim (§25, rebuilt) was adopted over the lighter-capture path (§26): a fresh capture with the option-(a)
+lighter tracer (`TRACER_LIGHT_SPIN`) did NOT reduce the recorded producer spin (fwd 821K → 822K), exactly
+as `.plan/Lighter_NVbit_Tracing.md` §5b predicted (the dominant per-op cost is the ~700B channel push,
+not the shfl gather). So the skew cannot be cheaply removed at the source; the captured trace is corrected
+offline against HW instead.
+
+### Tool (reusable, server-independent): `util/tracer_nvbit/trim_spin_from_ncu.py`
+- Input: a FULL-run trace dir + the matching NCU report. Auto-extracts per-loop HW NANOSLEEP-exec (§22),
+  auto-maps trace kernels to NCU blocks by `function_unique_id → kernel_name → NCU block` (§24), maps each
+  loop by `trywait_pc = NANOSLEEP_offset − 0x10` (§24 Link 3).
+- Trim = the fixed 4-pc spin body (`lp / lp+0x10 NANOSLEEP / lp+0x20 PHASECHK / lp+0x30 BRA`), deleting
+  whole iterations down to the per-CTA HW target. **Only those 4 PCs are ever deleted** — a static
+  sync_kind check confirmed no ARRIVE/EXCH/TMA/BAR is touched (deadlock-safe; the deleted PHASECHK/TRYWAIT
+  are nonblocking polls, §25). This also fixes §26 fragility #1 (the old `[occ_k, occ_{k+1})` span swallowed
+  interleaved loops).
+- protobuf backend auto-selects upb with a dependency-free varint fallback (verified byte-identical).
+  Wired into `run_hw_trace.py` via `TRIM_SPIN=1` (+ `TRIM_SPIN_NCU_REP`): full → `<run>.fullrun`,
+  trimmed → `<run>`.
+
+### Per-loop trim (matches the §24 targets)
+| kernel | trace spin (full) | trimmed | HW NANOSLEEP target |
+|---|---:|---:|---:|
+| FWD K5 | 405,495 | 5,311 | 8,461 |
+| BWD K10 | 656,500 | 7,060 | 7,860 |
+
+### ⭐⭐ Simulator cycles on the trimmed trace (historical diagnostic)
+| kernel | baseline (Opt 10) | **count-trim diagnostic** | HW | sim/HW | gap change |
+|---|---:|---:|---:|---:|---|
+| **BWD K10** | 178,856 | **145,406** | 132,901 | **1.09×** | 1.35× → **1.09×** (nearly closed) |
+| **FWD K5** | 105,774 | **96,614** | 67,696 | **1.43×** | 1.56× → **1.43×** |
+
+- Trimmed trace confirmed consumed: `gpgpu_n_tot_w_icount` fwd 16,064,281 → 14,463,545, bwd 22,626,216 →
+  20,028,456 (both = the trim tool's post-trim counts). `[PRODSPIN]` producer-only counts dropped from
+  thousands/CTA to `issued_phasechk≈76 / issued_nanosleep≈26` per CTA. Clean exit, no deadlock.
+
+### Conclusion
+The captured trace's redundant producer spin (§18-§24) **was a real cycle inflator**, not a measurement
+artifact — removing it moves both kernels toward HW and **bwd is essentially closed (1.09×)**. The **fwd
+residual (1.43×)** is NOT producer spin (fwd spin is now HW-faithful); it is the separate consumer
+tensor/math re-issue-interval axis (§15, `CONSUMER_COMPUTE_BOUND.md`) — the next lever. Known non-issue:
+fwd loop `0xacc0` is under-spun in the trace (§24, 0.48×), so the cap cannot raise it.

@@ -2254,6 +2254,71 @@ class shader_core_config : public core_config {
   // See .plan/FWD_DRAIN_IDLE_MBARRIER_CEILING.md.
   bool spin_instrument_enable;
 
+  // [Producer-tail probe] Observe the interval after every consumer-role warp
+  // in a CTA has drained while at least one producer-role warp remains live.
+  // Reports per-CTA producer issues by opcode class, modeled PHASECHK
+  // ready/not-ready outcomes, and non-issue reasons. The existing Hopper
+  // mbarrier state machine is read but never modified. Default 0.
+  bool producer_tail_instrument_enable;
+
+  // [Producer-spin ready-retry probe] Observe-only, whole-producer-lifetime
+  // (NOT gated by consumer drain like producer_tail_*). For every PHASECHK/
+  // TRYWAIT a producer-role warp executes, sample the existing Hopper mbarrier
+  // result and classify it as ready (mbarrier already satisfied but the trace
+  // keeps polling) vs not-ready. Also counts spin-loop opcodes over the whole
+  // lifetime. Sizes the fwd+bwd "excess captured spin" that the tail-only probe
+  // cannot see in bwd (where producer spin is spread across the main loop).
+  // Reads mbarrier state only; never modifies it. Default 0.
+  bool producer_spin_ready_instrument_enable;
+
+  // [Spin-wait observe] Observe-only measurement for the producer spin-wait
+  // fold design (.plan/SPIN_WAIT_POSTPROCESS.md). For every PHASECHK/TRYWAIT that
+  // matches a spin_wait_sidecar.json primary_wait_pc, record — WITHOUT changing
+  // control flow — how long the modeled mbarrier stays not-ready after the FIRST
+  // not-ready poll of each (cta,warp,region) episode, i.e. how long the warp
+  // WOULD have been parked if fold were on, and whether the barrier ever
+  // flips at all (never-flip = deadlock candidate). Reads mbarrier state only;
+  // never blocks or advances the trace. Default 0.
+  bool spin_wait_observe_enable;
+
+  // [WaitBlock v5] Master gate for the two-strategy runtime. When enabled,
+  // spin_wait_sidecar.json must be a complete schema-v5 document. Captured
+  // polls reuse the existing fold path; ready-only all-live misses create an
+  // entry hold, and proven partial misses use bounded deferred replay.
+  bool wait_block_enable;
+
+  // Use trace-derived target generations for INJECT entries and every proven
+  // FOLD wait. Requires schema-v2 compact tickets plus the eligible-barrier
+  // manifest referenced by the schema-v5 WaitBlock sidecar. Count-only
+  // barriers retain the live phase-derived generation rule. Default 0.
+  bool wait_block_exact_generation_enable;
+
+  // Emit one structured record for the first exact-generation late INJECT
+  // action in each CTA, including barrier-generation timing and the preceding
+  // producer/consumer semantic anchors. Observe-only. Default 0.
+  bool wait_block_late_arrival_instrument_enable;
+
+  // Maximum age of an unresolved WaitBlock hold/replay/transition before a
+  // fail-closed abort. The corresponding valid flag is the active sentinel, so
+  // a start cycle of zero is valid. Default 32000.
+  uint64_t wait_block_hold_watchdog_cycles;
+
+  // Period for unresolved WaitBlock progress diagnostics. Default 4096.
+  uint64_t wait_block_heartbeat_cycles;
+
+  // Per-SM, per-kernel-launch budget for verbose WaitBlock event records.
+  // Reset when the runtime kernel launch UID changes. Default 20000000.
+  uint64_t wait_block_debug_print_budget;
+
+  // Emit [WAITBLOCK] hold/release/guard/summary diagnostics.
+  bool wait_block_debug;
+
+  // [TRIMCHK]/[TRACECHECK] Gate verbose per-CTA trace-load contract lines:
+  // path/warp counts plus active-lane, memory, sync, BAR, and opcode-work
+  // counts. Off by default because it prints two lines per CTA. The
+  // per-kernel producer-spin summary is always on regardless.
+  bool trimchk_percta_log_enable;
+
   // [Head-of-line lever] Observe-only counters for the issue-pipeline head-of-line blocking test.
   // On cycles where the subcore issues nothing because the 1-deep ISSUE_CONTROL latch is full
   // (next_stage_not_available), the normal warp-scan loop is skipped, so we cannot tell whether a
@@ -2266,6 +2331,43 @@ class shader_core_config : public core_config {
   // See .plan/CONSUMER_COMPUTE_BOUND.md.
   bool headofline_instrument_enable;
 
+  // [intra-SMSP warp-switch] When on, Subcore::issue() checks fu->can_issue() at issue time for
+  // deterministic-II FUs that have NO queue (i.e. SFU, which today is misfiled as non-fixed-latency
+  // via m_is_sfu and thus skips the issue-time FU check). This filters a busy-SFU MUFU BEFORE it
+  // enters the 1-deep ISSUE_CONTROL latch, so GTO can pick another ready warp (intra-SMSP warp-switch)
+  // instead of the whole subcore stalling. Queue-based FUs (MEM/TMA/MISC_QUEUE) are left on the
+  // deferred path (their drain time is non-deterministic). II/latency values are unchanged. Default 0
+  // reproduces baseline bit-identically. See .plan/CONSUMER_COMPUTE_BOUND.md "Fix design".
+  bool intra_smsp_warpswitch_enable;
+
+  // [MUFU-lockstep probe] When on, on every cycle the subcore issued nothing AND had >=1 SFU-blocked
+  // head (still_idle), tally the valid-head warps by head-op class (MUFU / TENSOR / other) into per-SM
+  // sums. Decides whether the post-Opt-10 SFU-throughput residual is genuine softmax MUFU-lockstep (all
+  // warps on MUFU at once => lever is warp-stagger) or free-pipe warps blocked otherwise (=> different
+  // lever). Read-only (pure read of pI->op), no side effects, default 0 = bit-identical. See
+  // .plan/CONSUMER_COMPUTE_BOUND.md "Next axis".
+  bool mufu_lockstep_instrument_enable;
+
+  // [overlap probe] gate for the tensor-vs-SFU pipe-overlap + wait/stall-duration probes (2026-07-27).
+  // On still-idle cycles the sim's consumer warps are suspected to run tensor and MUFU serially where
+  // HW overlaps them. This gate turns on: (1) SM-level per-cycle tensor∥SFU busy-combination counters,
+  // (2) per-warp wait_barrier/stall_count/yield DURATION histograms, (3) consumer warp stage-transition
+  // gaps, (4) per-warp total stall/wait warp-cycles. All read-only, timing-neutral, default 0 =
+  // bit-identical. See .plan/HW_VS_SIM_SFU.md §5.
+  bool overlap_instrument_enable;
+  // [SR-M0A stall-reason alignment] Enable the observe-only complete, mutually-exclusive per-active-warp
+  // population accounting (a cycle-start pre-issue snapshot separate from the authoritative issue path).
+  // Read-only: never calls a mutating readiness function, never changes scheduler order/eligibility/issue
+  // selection/WaitBlock behavior. Default 0 = bit-identical baseline. See .plan/STALL_REASON_ALIGN.md §6
+  // Stage SR-M0A.
+  bool stall_reason_align_instrument_enable;
+  // [GTLRR lever] warp-ordering policy for the remodeling subcore issue path (default 0 = GTO, the
+  // baseline order_greedy_then_highest_id). 1 = GTLRR (greedy-then-loose-round-robin): keep the greedy
+  // warp first, but order the fallback warps round-robin from greedy_pointer+1 instead of oldest-first,
+  // so a stalled greedy warp hands off to the NEXT warp rather than re-picking the oldest that will stall
+  // at the same point — this de-phases the in-phase consumer warps. Timing-affecting (scheduling only,
+  // work-invariant); default off = bit-identical GTO. See .plan/HW_VS_SIM_SFU.md §11-12.
+  bool subcore_gtlrr_enable;
   // Hopper mbarrier sync debug logging (SYNCDBG). Disabled by default.
   bool sync_debug_enable;
   unsigned int sync_debug_print_budget;
@@ -3753,6 +3855,12 @@ class simt_core_cluster {
       m_core[i]->gather_gpu_per_sm_single_stat(all_stats, stat_name);
     }
   }
+
+  // [SR-M0A] Number of cores held by this cluster and index accessor. Used by
+  // the gpgpu_sim-level stall-reason-align driver, which downcasts each wrapper
+  // to the remodeling SM to reach its per-Subcore totals.
+  unsigned get_num_cores() const { return m_core.size(); }
+  shader_core_ctx_wrapper *get_core(unsigned i) { return m_core[i]; }
 
   traffic_breakdown& get_incomming_traffic_stats() { return m_incoming_traffic_stats; }
   traffic_breakdown& get_outgoing_traffic_stats() { return m_outgoing_traffic_stats; }

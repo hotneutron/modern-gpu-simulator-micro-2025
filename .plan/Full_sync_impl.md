@@ -1,6 +1,15 @@
 # 1. Overview
 The simulator's synchronization model for Hopper architecture has been completely revamped. The previous heuristic-based Python scripts and JSON parsing/inference logic have been entirely removed. The new implementation strictly follows deterministic hardware rules to manage the `mbarrier` protocol, enabling accurate and deadlock-free simulation of asynchronous TMA (Tensor Memory Accelerator) operations.
 
+> **Implementation audit (2026-08-22):** Sections 2.1 and 4 describe the
+> intended exact TMA-command-to-mbarrier binding, not the implementation that
+> landed. Commit `dcd9566b` introduced a per-warp FIFO of
+> `(barrier_key, pending_tx_bytes)` at `SYNCS.ARRIVE_EXPECT_TX`; `TMACommand`
+> never received `completion_barrier_addr` or equivalent identity. K5 `.e83`
+> reproduces the same failure class described in Section 4: a completion updates
+> the wrong barrier. The current mechanism is FIFO spill rather than the older
+> single-active-slot overwrite. See `WAIT_BLOCK_HISTORY.md` Section 4.
+
 # 2. Deterministic Hardware Rules for MBarrier
 
 ## 2.1 TMA Instruction Register Binding

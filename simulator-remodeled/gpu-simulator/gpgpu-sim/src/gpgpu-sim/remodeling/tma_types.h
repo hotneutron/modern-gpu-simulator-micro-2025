@@ -3,8 +3,11 @@
 #include <array>
 #include <cstdint>
 #include <map>
+#include <set>
 #include <string>
+#include <tuple>
 #include <utility>
+#include <vector>
 
 enum class TMAOpcodeFamily {
   UTMALDG,
@@ -64,12 +67,13 @@ struct TMADescriptorConfigMetadata {
 };
 
 struct TMAOperandLookupKey {
+  unsigned int trace_kernel_id = ~0u;
   unsigned int unique_function_id = 0;
   uint64_t pc = 0;
 
   bool operator<(const TMAOperandLookupKey &other) const {
-    return std::tie(unique_function_id, pc) <
-           std::tie(other.unique_function_id, other.pc);
+    return std::tie(trace_kernel_id, unique_function_id, pc) <
+           std::tie(other.trace_kernel_id, other.unique_function_id, other.pc);
   }
 };
 
@@ -105,17 +109,18 @@ struct TMAResolvedSiteMetadata {
   TMADescriptorConfigMetadata descriptor_config;
 };
 
-// Exact per-site descriptor binding recovered offline (build_tma_pc_base_map.py). Keyed
-// by (unique_function_id, pc) — the identity that is still live at build_tma_command,
-// before the mover loses it. Supersedes the handle_hi->config_id heuristic: carries the
-// real GMEM base plus the full descriptor shape so no config_id join is needed.
+// Exact per-site descriptor binding recovered offline
+// (build_tma_pc_base_map.py). Version-2 records are keyed by
+// (trace_kernel_id, unique_function_id, pc), which prevents static variants
+// sharing a function id and PC from overwriting each other.
 struct TMABaseLookupKey {
+  unsigned int trace_kernel_id = ~0u;
   unsigned int unique_function_id = 0;
   uint64_t pc = 0;
 
   bool operator<(const TMABaseLookupKey &other) const {
-    return std::tie(unique_function_id, pc) <
-           std::tie(other.unique_function_id, other.pc);
+    return std::tie(trace_kernel_id, unique_function_id, pc) <
+           std::tie(other.trace_kernel_id, other.unique_function_id, other.pc);
   }
 };
 
@@ -147,15 +152,22 @@ struct TMABaseRecord {
   // The mover spreads transfers as global_base + (visit%num_tiles)*tile_bytes.
   uint32_t tile_bytes_operand = 0;
   uint32_t num_tiles = 0;
-  std::string source;  // "direct" | "chain" | "prefetch" | "pool" | "operand_raw_pointer"
+  std::string source;  // "utmacctl_chain" | "utmacctl_prefetch_edge" |
+                       // "operand_raw_pointer"
 };
 
 struct TMASidecarMetadataDB {
+  unsigned int base_map_version = 0;
+  unsigned int operand_map_version = 0;
+  bool completion_contracts_validated = false;
   std::map<std::string, TMADescriptorConfigMetadata> descriptor_configs;
   std::map<TMAOperandLookupKey, TMAOperandSiteRecord> operand_site_records;
   std::map<TMABaseLookupKey, TMABaseRecord> base_records;
 
   void clear() {
+    base_map_version = 0;
+    operand_map_version = 0;
+    completion_contracts_validated = false;
     descriptor_configs.clear();
     operand_site_records.clear();
     base_records.clear();
@@ -226,6 +238,238 @@ struct SyncSidecarMetadataDB {
   bool empty() const { return site_records.empty(); }
 };
 
+// ---- Producer spin-wait sidecar (spin_wait_sidecar.json) --------------------
+// A producer mbarrier spin loop, described statically by PC so the simulator can
+// (behind a gate) block the warp at the loop's primary wait until the modeled
+// barrier is ready, instead of replaying the capture-time poll count. See
+// build_spin_wait_sidecar.py and .plan/SPIN_WAIT_POSTPROCESS.md.
+struct SpinWaitRegionRecord {
+  std::string block_id;
+  uint64_t loop_head_pc = 0;
+  uint64_t primary_wait_pc = 0;   // the poll whose barrier readiness gates the loop
+  std::vector<uint64_t> wait_pcs;
+  uint64_t loopback_bra_pc = 0;   // backward BRA that closes the loop
+  uint64_t exit_pc = 0;           // fall-through target when the loop is left
+  SyncInstructionKind primary_wait_kind = SyncInstructionKind::NONE;
+  bool semantic_free_body = false;  // body has no TMA/GMMA/MUFU/arrive/memory op
+  bool is_spin_loop = false;        // observed to iterate > 1 (not a single-shot wait)
+  bool barrier_self_tied = false;   // whole-loop skip is SASS scoreboard net-zero
+  // [Stage 1.4] Loop body PCs (loopback BRA excluded). The cursor-skip guard
+  // allows advancing over exactly these PCs plus loopback_bra_pc; any other PC
+  // encountered before exit_pc is a sidecar/trace drift and aborts loudly.
+  std::vector<uint64_t> body_pcs;
+  // The single authoritative fold gate (sidecar v2): the simulator folds
+  // a region ONLY when this is true = is_spin_loop && semantic_free_body &&
+  // barrier_self_tied. See .plan/SPIN_WAIT_SIM_MODELING.md 6.6/12.7.
+  bool foldable = false;
+};
+
+// [Stage 1.4] Decomposition of the instructions the fold cursor-skip advanced
+// over, classified from each skipped occurrence's opcode/sync class. The fold is
+// only sound when NO semantic/local-memory/HGMMA/MUFU/TMA/BAR work is skipped;
+// those fields MUST be zero (asserted at the skip site).
+struct FoldSkipStats {
+  unsigned int cursor_before_flush = 0;  // includes prefetched occurrences
+  unsigned int cursor_after_flush = 0;   // after IBuffer rollback
+  unsigned int cursor_after_skip = 0;    // after residual poll consumption
+  unsigned int prefetched_rollback = 0;  // before_flush - after_flush
+  unsigned int warp_insts = 0;          // total dynamic warp-instruction entries skipped
+  unsigned int phasechk_trywait = 0;    // PHASECHK / TRYWAIT polls
+  unsigned int nanosleep = 0;           // backoff/yield
+  unsigned int imad_scratch = 0;        // loop-local scratch ALU
+  unsigned int loopback_bra = 0;        // the closing backward BRA
+  unsigned int local_memory = 0;        // STL/LDL — must be 0
+  unsigned int semantic_memory = 0;     // global/shared memory refs — must be 0
+  unsigned int hgmma = 0;               // must be 0
+  unsigned int mufu = 0;                // must be 0
+  unsigned int tma_family = 0;          // must be 0
+  unsigned int bar_arrive_exch = 0;     // must be 0
+  unsigned int other = 0;               // vetted scratch/control only
+  std::map<uint64_t, unsigned int> pc_occurrences;
+};
+
+// Keyed by (funcid, primary_wait_pc): the simulator matches a PHASECHK/TRYWAIT at
+// issue time against this to know it is inside a foldable spin loop.
+struct SpinWaitSidecarDB {
+  std::map<SyncOperandLookupKey, SpinWaitRegionRecord> regions_by_wait_pc;
+
+  void clear() { regions_by_wait_pc.clear(); }
+
+  bool empty() const { return regions_by_wait_pc.empty(); }
+};
+
+struct WaitBlockLookupKey {
+  uint32_t trace_kernel_id = 0;
+  uint32_t unique_function_id = 0;
+  uint64_t action_pc = 0;
+
+  bool operator<(const WaitBlockLookupKey &other) const {
+    return std::tie(trace_kernel_id, unique_function_id, action_pc) <
+           std::tie(other.trace_kernel_id, other.unique_function_id,
+                    other.action_pc);
+  }
+};
+
+struct WaitBlockGenerationTicketKey {
+  uint32_t trace_kernel_id = 0;
+  uint32_t cta_x = 0;
+  uint32_t cta_y = 0;
+  uint32_t cta_z = 0;
+  uint32_t warp_id = 0;
+  uint32_t unique_function_id = 0;
+  uint64_t action_pc = 0;
+  uint64_t source_warp_instruction_index = 0;
+
+  bool operator<(const WaitBlockGenerationTicketKey &other) const {
+    return std::tie(
+               trace_kernel_id, cta_x, cta_y, cta_z, warp_id,
+               unique_function_id, action_pc,
+               source_warp_instruction_index) <
+           std::tie(
+               other.trace_kernel_id, other.cta_x, other.cta_y,
+               other.cta_z, other.warp_id, other.unique_function_id,
+               other.action_pc,
+               other.source_warp_instruction_index);
+  }
+};
+
+enum class WaitBlockGenerationTicketKind : uint32_t {
+  COUNT_ONLY_FALLBACK = 0,
+  EXACT_TARGET = 1,
+};
+
+struct WaitBlockGenerationTicket {
+  uint32_t unique_function_id = 0;
+  uint64_t action_pc = 0;
+  uint64_t source_warp_instruction_index = 0;
+  bool has_target_release_generation = false;
+  uint64_t target_release_generation = 0;
+  uint64_t barrier_addr = 0;
+  uint64_t wait_state_raw = 0;
+  uint32_t active_mask = 0;
+  uint32_t predicate_mask = 0;
+};
+
+struct WaitBlockGenerationTicketStreamKey {
+  uint32_t trace_kernel_id = 0;
+  uint32_t cta_x = 0;
+  uint32_t cta_y = 0;
+  uint32_t cta_z = 0;
+  uint32_t warp_id = 0;
+
+  bool operator<(const WaitBlockGenerationTicketStreamKey &other) const {
+    return std::tie(trace_kernel_id, cta_x, cta_y, cta_z, warp_id) <
+           std::tie(other.trace_kernel_id, other.cta_x, other.cta_y,
+                    other.cta_z, other.warp_id);
+  }
+};
+
+struct MissingWaitRecord {
+  std::string block_id;
+  uint64_t entry_probe_pc = 0;
+  uint64_t entry_branch_pc = 0;
+  uint64_t captured_ready_pc = 0;
+  SyncInstructionKind entry_probe_kind = SyncInstructionKind::NONE;
+  bool partial_modeled_miss_aborts = false;
+  bool partial_deferred_replay = false;
+  std::vector<uint64_t> entry_arming_pcs;
+  uint64_t miss_arm_entry_pc = 0;
+  std::vector<uint64_t> miss_arm_wait_pcs;
+  uint64_t miss_arm_loopback_pc = 0;
+  uint64_t miss_arm_exit_pc = 0;
+  uint64_t canonical_barrier_offset = 0;
+  std::set<std::string> canonical_wait_state_operands;
+  std::string partial_region_id;
+  uint64_t sibling_branch_pc = 0;
+  uint64_t join_pc = 0;
+  uint64_t post_join_pc = 0;
+  std::string join_kind;
+  std::set<uint64_t> observed_entry_masks;
+  std::set<uint64_t> observed_sibling_masks;
+  std::set<uint64_t> observed_live_masks;
+  uint64_t captured_ready_visits = 0;
+  uint64_t captured_second_gate_visits = 0;
+  uint64_t captured_poll_visits = 0;
+  uint64_t all_live_entry_visits = 0;
+  uint64_t partial_entry_visits = 0;
+};
+
+struct PartialWaitRegionRecord {
+  std::string region_id;
+  uint32_t trace_kernel_id = 0;
+  uint32_t unique_function_id = 0;
+  uint64_t sibling_branch_pc = 0;
+  uint64_t join_pc = 0;
+  uint64_t post_join_pc = 0;
+  std::string join_kind;
+  uint64_t bssy_pc = 0;
+  std::string join_token;
+  std::set<uint64_t> sibling_masks;
+  std::set<uint64_t> live_masks;
+};
+
+struct WaitBlockSidecarDB {
+  std::map<WaitBlockLookupKey, MissingWaitRecord> missing_wait_by_entry;
+  std::map<WaitBlockLookupKey, SpinWaitRegionRecord> captured_poll_by_probe;
+  std::map<WaitBlockLookupKey, SpinWaitRegionRecord> captured_poll_by_wait;
+  std::map<std::string, PartialWaitRegionRecord> partial_regions_by_id;
+  std::map<WaitBlockLookupKey, std::string> partial_region_id_by_join;
+  std::map<WaitBlockLookupKey, std::string> partial_region_id_by_post_join;
+  std::map<WaitBlockGenerationTicketStreamKey,
+           std::vector<WaitBlockGenerationTicket>>
+      exact_generation_ticket_streams;
+  uint64_t discovered = 0;
+  uint64_t passed = 0;
+  uint64_t failed = 0;
+  uint64_t skipped = 0;
+  uint64_t metadata_only = 0;
+  uint64_t ready_only_all_live_visits = 0;
+  uint64_t ready_only_partial_visits = 0;
+  uint64_t ready_only_records_with_partial_visits = 0;
+  uint64_t partial_defer_records = 0;
+  uint64_t partial_join_pending_visits = 0;
+  uint64_t partial_join_already_issued_visits = 0;
+  bool validation_complete = false;
+  bool exact_generation_tickets_valid = false;
+  uint64_t exact_generation_ticket_stream_count = 0;
+  uint64_t exact_generation_ticket_slots = 0;
+  uint64_t exact_generation_targets = 0;
+  uint64_t exact_generation_fallbacks = 0;
+
+  void clear() {
+    missing_wait_by_entry.clear();
+    captured_poll_by_probe.clear();
+    captured_poll_by_wait.clear();
+    partial_regions_by_id.clear();
+    partial_region_id_by_join.clear();
+    partial_region_id_by_post_join.clear();
+    exact_generation_ticket_streams.clear();
+    discovered = 0;
+    passed = 0;
+    failed = 0;
+    skipped = 0;
+    metadata_only = 0;
+    ready_only_all_live_visits = 0;
+    ready_only_partial_visits = 0;
+    ready_only_records_with_partial_visits = 0;
+    partial_defer_records = 0;
+    partial_join_pending_visits = 0;
+    partial_join_already_issued_visits = 0;
+    validation_complete = false;
+    exact_generation_tickets_valid = false;
+    exact_generation_ticket_stream_count = 0;
+    exact_generation_ticket_slots = 0;
+    exact_generation_targets = 0;
+    exact_generation_fallbacks = 0;
+  }
+
+  bool empty() const {
+    return missing_wait_by_entry.empty() && captured_poll_by_probe.empty() &&
+           partial_regions_by_id.empty();
+  }
+};
+
+
 struct HopperMBarrierKey {
   uint32_t trace_kernel_id = 0;
   uint32_t cta_id = 0;
@@ -235,15 +479,145 @@ struct HopperMBarrierKey {
     return std::tie(trace_kernel_id, cta_id, barrier_addr) <
            std::tie(other.trace_kernel_id, other.cta_id, other.barrier_addr);
   }
+
+  bool operator==(const HopperMBarrierKey &other) const {
+    return trace_kernel_id == other.trace_kernel_id &&
+           cta_id == other.cta_id && barrier_addr == other.barrier_addr;
+  }
+};
+
+struct WaitBlockWarpProgress {
+  uint64_t active = 0;
+  uint64_t selected = 0;
+  uint64_t selected_tensor = 0;
+  uint64_t selected_sfu = 0;
+  uint64_t selected_other = 0;
+  uint64_t eligible_not_selected = 0;
+  uint64_t no_valid = 0;
+  uint64_t drain = 0;
+  uint64_t wait_block_hold = 0;
+  uint64_t blocked_valid = 0;
+  uint64_t no_head_hold = 0;
+  uint64_t unknown_valid = 0;
+  uint64_t sole_yield = 0;
+  uint64_t sole_stall_count = 0;
+  uint64_t sole_wait_barrier = 0;
+  uint64_t sole_named_barrier = 0;
+  uint64_t sole_membar = 0;
+  uint64_t sole_grid_barrier = 0;
+  uint64_t sole_ldgdepbar = 0;
+  uint64_t sole_tma_flush = 0;
+  uint64_t sole_fu_tensor = 0;
+  uint64_t sole_fu_sfu = 0;
+  uint64_t sole_fu_other = 0;
+  uint64_t sole_scoreboard = 0;
+  uint64_t sole_result_queue = 0;
+  uint64_t sole_l1c = 0;
+  uint64_t sole_issue_port = 0;
+  uint64_t sole_issue_control = 0;
+  uint64_t blocked_multi = 0;
+};
+
+struct WaitBlockGenerationTiming {
+  bool contract_open_valid = false;
+  uint64_t contract_open_cycle = 0;
+  uint32_t contract_owner_warp_id = ~0u;
+  uint32_t contract_owner_cta_warp_id = ~0u;
+  uint32_t contract_open_function_id = 0;
+  uint64_t contract_open_pc = 0;
+  uint64_t contract_open_source_index = 0;
+  bool tma_issue_valid = false;
+  uint64_t first_tma_issue_cycle = 0;
+  uint64_t last_tma_issue_cycle = 0;
+  uint32_t tma_commands_issued = 0;
+  bool completion_valid = false;
+  uint64_t completion_cycle = 0;
+  bool contract_open_progress_valid = false;
+  std::vector<WaitBlockWarpProgress> contract_open_progress;
+  bool completion_progress_valid = false;
+  std::vector<WaitBlockWarpProgress> completion_progress;
 };
 
 struct HopperMBarrierObject {
   uint32_t expected_arrive_count = 0;
   uint32_t arrive_count = 0;
   uint32_t expected_tx_bytes = 0;
+  uint32_t assigned_tx_bytes = 0;
   uint32_t completed_tx_bytes = 0;
+  uint32_t outstanding_tma_bindings = 0;
+  uint64_t tx_contract_id = 0;
+  bool assignment_open = false;
+  uint32_t assignment_owner_warp_id = ~0u;
+  uint64_t assignment_generation = ~0ull;
+  uint64_t assignment_kernel_launch_uid = 0;
+  uint32_t assignment_global_cta_id = ~0u;
   uint32_t phase = 0;
   bool ready = false;
+  // Monotonically increasing phase generation. WaitBlock uses it to distinguish
+  // "already passed" from "not yet"; TMA completion targets pin it at issue so
+  // a late completion cannot update a reused barrier phase.
+  uint64_t gen = 0;
+  // Last two flip coordinates are diagnostic-only. They make a poison audit
+  // self-contained: expected/current generations can be correlated with the
+  // exact gen1/gen2 window without replaying the full SYNCDBG stream.
+  uint64_t prev_flip_cycle = 0;
+  uint64_t last_flip_cycle = 0;
+  uint64_t wait_block_release_snapshot_cycle = ~0ull;
+  uint64_t wait_block_release_snapshot_generation = 0;
+  uint32_t wait_block_release_snapshot_phase = 0;
+  // Observe-only generation timeline populated only by the late-arrival
+  // diagnostic. Keys are release generations: a contract opened while gen=N
+  // and the following phase flip are both recorded under N+1.
+  std::map<uint64_t, WaitBlockGenerationTiming> wait_block_timing;
+};
+
+enum class WaitBlockPendingMode {
+  NONE,
+  MISSING_WAIT_HOLD,
+  PARTIAL_MISSING_WAIT_HOLD,
+  FOLD_AUX_WAIT_HOLD,
+  CAPTURED_POLL_HOLD,
+};
+
+enum class PartialWaitArmMode {
+  NONE,
+  ARMED,
+  WAITING_FOR_SIBLING_JOIN,
+  HOLDING,
+};
+
+struct HopperPartialWaitArm {
+  bool valid = false;
+  PartialWaitArmMode mode = PartialWaitArmMode::NONE;
+  MissingWaitRecord record;
+  HopperMBarrierKey key;
+  uint64_t wait_state_raw = 0;
+  uint64_t expected_gen = 0;
+  bool uses_exact_generation_ticket = false;
+  uint64_t blocked_mask = 0;
+  uint64_t sibling_mask = 0;
+  uint32_t unique_function_id = 0;
+  uint64_t arm_start_cycle = 0;
+  uint64_t last_heartbeat_cycle = 0;
+  bool source_was_deferred_replay = false;
+  bool extracted_capsule = false;
+};
+
+struct HopperPartialReplayProgress {
+  bool valid = false;
+  std::string block_id;
+  std::string region_id;
+  uint32_t trace_kernel_id = 0;
+  uint32_t unique_function_id = 0;
+  uint32_t cta_id = 0;
+  uint64_t start_cycle = 0;
+  uint64_t last_heartbeat_cycle = 0;
+  uint64_t last_progress_cycle = 0;
+  uint64_t last_pc = 0;
+  uint64_t post_join_pc = 0;
+  uint64_t progressed_occurrences = 0;
+  unsigned int initial_remaining = 0;
+  unsigned int last_remaining = 0;
 };
 
 struct HopperMBarrierPendingWait {
@@ -251,11 +625,33 @@ struct HopperMBarrierPendingWait {
   bool is_trywait = false;
   HopperMBarrierKey key;
   uint64_t wait_state_raw = 0;
+  WaitBlockPendingMode mode = WaitBlockPendingMode::NONE;
+  std::string block_id;
+  uint64_t action_pc = 0;
+  uint64_t poll_loop_exit_pc = 0;
+  unsigned int unique_function_id = 0;
+  // Absolute barrier generation paired with this hold. Both strategies pin it
+  // once after the action probe executes. A captured poll consumes residual
+  // loop occurrences on release; an all-live missing wait never changes either
+  // cursor; a partial missing wait replays occurrences extracted before hold.
+  uint64_t expected_gen = 0;
+  bool uses_exact_generation_ticket = false;
+  uint64_t hold_start_cycle = 0;
+  uint64_t last_heartbeat_cycle = 0;
 };
 
-struct HopperMBarrierPendingTxBinding {
+struct TmaCompletionTarget {
+  bool valid = false;
+  bool completed = false;
   HopperMBarrierKey key;
-  uint32_t pending_tx_bytes = 0;
+  uint64_t barrier_generation = 0;
+  uint64_t kernel_launch_uid = 0;
+  uint32_t global_cta_id = 0;
+  uint32_t owner_warp_id = 0;
+  uint32_t source_barrier_ureg_id = 0;
+  uint64_t contract_id = 0;
+  uint64_t binding_id = 0;
+  uint32_t credit_bytes = 0;
 };
 
 struct TMACommand {
@@ -263,6 +659,9 @@ struct TMACommand {
   uint32_t cta_id = 0;
   uint32_t sm_id = 0;
   uint32_t subcore_id = 0;
+  uint32_t trace_kernel_id = 0;
+  uint32_t unique_function_id = 0;
+  uint64_t tma_pc = 0;
   TMAOpcodeFamily opcode_family = TMAOpcodeFamily::UNKNOWN;
   TMADirection direction = TMADirection::NONE;
   TMATransferType transfer_type = TMATransferType::UNKNOWN;
@@ -292,10 +691,11 @@ struct TMACommand {
   bool has_real_base = false;
   // M2 (visit-counter tile spread): per-tensor tile this transfer targets, so the
   // mover adds tile_idx*tile_bytes to spread transfers across the tensor's tiles
-  // (restores the cold-miss of first-touch that base-only collapses away). Set in
+  // (restores the cold-miss of first-touch that base-only folds away). Set in
   // build_tma_command from the per-base visit counter; only meaningful when
   // has_real_base is true. tile_bytes = Πbox_dim·element_size (one tile's byte span).
   uint64_t tile_offset_bytes = 0;
+  TmaCompletionTarget completion;
 };
 
 struct TMATransferEntry {

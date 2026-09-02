@@ -105,6 +105,68 @@ void advance_trace_cta_id(kernel_trace_t *kernel_trace_info) {
 }
 
 trace_warp_inst_t *trace_shd_warp_t::get_next_trace_inst(address_type pc) {
+  // Canonical decode entry point. A replay stream, when active, is decoded
+  // through the reservation-indexed overload below (the IBuffer slot carries
+  // the reserved occurrence index/epoch). This preserves slot<->occurrence
+  // identity under out-of-order instruction-cache fills.
+  return get_next_trace_inst(pc, /*is_replay=*/false, /*replay_index=*/0,
+                             /*replay_epoch=*/0);
+}
+
+trace_warp_inst_t *trace_shd_warp_t::get_next_trace_inst(
+    address_type pc, bool is_replay, unsigned int replay_index,
+    uint64_t replay_epoch) {
+  if (is_replay) {
+    // The slot was reserved against a specific replay occurrence. Reject a
+    // stale instruction-cache response from an older replay stream, and decode
+    // exactly that occurrence rather than a moving global head.
+    assert(m_partial_replay_origin != WaitBlockTraceOrigin::CANONICAL &&
+           "replay slot decoded while no replay stream is active");
+    assert(replay_epoch == m_partial_replay_epoch &&
+           "stale replay-epoch instruction-cache response");
+    assert(replay_index < m_partial_replay.size() &&
+           "replay reservation index out of range");
+    inst_trace_t &trace = m_partial_replay[replay_index];
+    trace_warp_inst_t *new_inst =
+        new trace_warp_inst_t(get_shader()->get_config());
+    if (pc != trace.m_pc) {
+      // A speculatively-fetched wrong-path PC has no replay occurrence. It must
+      // never issue; the older resolving branch flushes it. Materialize the
+      // usual zero-active synthetic NOP so the IBuffer slot can be filled.
+      inst_trace_t synthetic(
+          pc, get_current_unique_function_id_call(), false);
+      traced_execution &trc_exec =
+          get_shader()->get_gpu()->get_extra_trace_info();
+      new_inst->parse_from_trace_struct(
+          synthetic, m_kernel_info->OpcodeMap, m_kernel_info->m_tconfig,
+          m_kernel_info->m_kernel_trace_info, trc_exec);
+      new_inst->set_extra_trace_instruction_info(
+          trc_exec
+              .get_kernel_by_unique_function_id(new_inst->unique_function_id)
+              .get_instruction_ptr(pc));
+      new_inst->wait_block_trace_origin =
+          WaitBlockTraceOrigin::SYNTHETIC;
+      return new_inst;
+    }
+
+    traced_execution &trc_exec =
+        get_shader()->get_gpu()->get_extra_trace_info();
+    new_inst->parse_from_trace_struct(
+        trace, m_kernel_info->OpcodeMap, m_kernel_info->m_tconfig,
+        m_kernel_info->m_kernel_trace_info, trc_exec);
+    new_inst->set_extra_trace_instruction_info(
+        trc_exec
+            .get_kernel_by_unique_function_id(new_inst->unique_function_id)
+            .get_instruction_ptr(pc));
+    new_inst->wait_block_trace_origin = m_partial_replay_origin;
+    // Record which reserved occurrence this decoded instruction represents so
+    // FIFO issue can verify exact-once, in-order commit. Filling a slot does not
+    // consume/commit the replay occurrence; that happens at issue in
+    // commit_trace_inst.
+    new_inst->replay_occurrence_index = replay_index;
+    return new_inst;
+  }
+
   if (used_insts < traced_pcs.size()) {
     trace_warp_inst_t *new_inst =
         new trace_warp_inst_t(get_shader()->get_config());
@@ -124,10 +186,14 @@ trace_warp_inst_t *trace_shd_warp_t::get_next_trace_inst(address_type pc) {
         m_kernel_info->m_tconfig, m_kernel_info->m_kernel_trace_info, trc_exec);
     new_inst->set_extra_trace_instruction_info(trc_exec.get_kernel_by_unique_function_id(new_inst->unique_function_id).get_instruction_ptr(pc));
     if(!is_pc_found) {
+      new_inst->wait_block_trace_origin =
+          WaitBlockTraceOrigin::SYNTHETIC;
       delete trace_ptr;
     }else {
       it_inst_trace->second.num_used_instructions[0]++;
       used_insts++;
+      new_inst->wait_block_trace_origin =
+          WaitBlockTraceOrigin::CANONICAL;
     }
     return new_inst;
   } else
@@ -141,6 +207,448 @@ void trace_shd_warp_t::decrease_num_used_inst(address_type pc){
   it_inst_trace->second.num_used_instructions[0]--;
   assert(used_insts > 0);
   used_insts--;
+}
+
+void trace_shd_warp_t::rollback_trace_inst(
+    const trace_warp_inst_t *inst) {
+  assert(inst != nullptr);
+  if (inst->wait_block_trace_origin == WaitBlockTraceOrigin::CANONICAL) {
+    decrease_num_used_inst(inst->pc);
+    return;
+  }
+  if (inst->wait_block_trace_origin == WaitBlockTraceOrigin::SYNTHETIC) {
+    return;
+  }
+  // Replay occurrences are un-reserved per-removed-entry by the IBuffer flush
+  // (unreserve_last_partial_replay), which covers both filled and never-filled
+  // slots. A decoded-but-unissued replay slot holds no committed state, so this
+  // per-instruction rollback hook is a no-op for replay origins.
+  assert(inst->wait_block_trace_origin == m_partial_replay_origin);
+}
+
+void trace_shd_warp_t::commit_trace_inst(
+    const trace_warp_inst_t *inst) {
+  assert(inst != nullptr);
+  if (inst->wait_block_trace_origin == WaitBlockTraceOrigin::CANONICAL ||
+      inst->wait_block_trace_origin == WaitBlockTraceOrigin::SYNTHETIC) {
+    return;
+  }
+  assert(inst->wait_block_trace_origin == m_partial_replay_origin);
+  // FIFO issue: the issued occurrence must be exactly the reservation at the
+  // head of the replay queue, decoded into this instruction.
+  assert(m_partial_replay_issued < m_partial_replay.size());
+  assert(inst->replay_occurrence_index == m_partial_replay_issued &&
+         "replay issued out of FIFO order");
+  assert(m_partial_replay[m_partial_replay_issued].m_pc == inst->pc &&
+         "replay issue PC identity mismatch");
+  m_partial_replay_issued++;
+  if (m_partial_replay_issued == m_partial_replay.size()) {
+    m_partial_replay.clear();
+    m_partial_replay_issued = 0;
+    m_partial_replay_reserved = 0;
+    // Advance the epoch so any still-outstanding cache response from this
+    // now-drained stream cannot fill a slot of a future replay stream.
+    m_partial_replay_epoch++;
+    m_partial_replay_origin = WaitBlockTraceOrigin::CANONICAL;
+  }
+}
+
+bool trace_shd_warp_t::extract_partial_wait_capsule(
+    uint64_t blocked_mask, uint64_t sibling_mask, uint64_t live_mask,
+    unsigned int unique_function_id,
+    address_type captured_ready_pc, address_type join_pc,
+    address_type post_join_pc, PartialTraceExtractStats *out_stats,
+    std::string *failure_reason) {
+  auto fail = [&](const std::string &reason) {
+    if (failure_reason != nullptr) {
+      *failure_reason = reason;
+    }
+    return false;
+  };
+  if (partial_capsule_active() || blocked_mask == 0 || sibling_mask == 0 ||
+      (blocked_mask & sibling_mask) != 0 ||
+      (blocked_mask | sibling_mask) != live_mask) {
+    return fail("invalid-capsule-state-or-mask-partition");
+  }
+  if (used_insts >= traced_pcs.size() ||
+      traced_pcs[used_insts] != captured_ready_pc) {
+    return fail("captured-ready-pc-is-not-source-head");
+  }
+
+  std::vector<inst_trace_t> deferred;
+  std::vector<inst_trace_t> sibling_join;
+  std::vector<address_type> consumed_pcs;
+  std::map<address_type, unsigned int> local_occurrences;
+  bool saw_blocked_join = false;
+  unsigned int cursor = used_insts;
+  while (cursor < traced_pcs.size() &&
+         traced_pcs[cursor] != post_join_pc) {
+    const address_type pc = traced_pcs[cursor];
+    auto trace_it = map_warp_traces.find(pc);
+    if (trace_it == map_warp_traces.end()) {
+      return fail("source-pc-has-no-trace-vector");
+    }
+    const unsigned int occurrence =
+        trace_it->second.num_used_instructions[0] + local_occurrences[pc];
+    if (occurrence >= trace_it->second.num_traced_instructions) {
+      return fail("source-pc-occurrence-exhausted");
+    }
+    const inst_trace_t &trace = trace_it->second.instructions[occurrence];
+    if (trace.m_unique_function_id != unique_function_id) {
+      return fail("capsule-function-identity-mismatch");
+    }
+    const std::string opcode_base =
+        trace.opcode.substr(0, trace.opcode.find('.'));
+    if (opcode_base == "CALL" || opcode_base == "RET" ||
+        opcode_base == "EXIT" || opcode_base == "BRX" ||
+        opcode_base == "JMP" || opcode_base == "JMX" ||
+        opcode_base == "RTT") {
+      return fail("capsule-control-opcode-unsafe");
+    }
+    const uint64_t owner = static_cast<uint64_t>(trace.active_mask) & live_mask;
+    if (pc == join_pc && owner == sibling_mask) {
+      if (!sibling_join.empty() ||
+          static_cast<uint64_t>(trace.mask) != sibling_mask) {
+        return fail("duplicate-sibling-join-occurrence");
+      }
+      sibling_join.emplace_back(trace);
+    } else if (owner == 0 || (owner & ~blocked_mask) == 0) {
+      deferred.emplace_back(trace);
+      if (pc == join_pc && owner == blocked_mask) {
+        saw_blocked_join = true;
+      }
+    } else {
+      return fail("capsule-occurrence-mask-escape");
+    }
+    consumed_pcs.push_back(pc);
+    local_occurrences[pc]++;
+    cursor++;
+  }
+  if (cursor >= traced_pcs.size() || traced_pcs[cursor] != post_join_pc) {
+    return fail("post-join-pc-not-found");
+  }
+  if (sibling_join.size() != 1 || !saw_blocked_join || deferred.empty()) {
+    return fail("join-occurrence-pair-incomplete");
+  }
+  auto post_join_it = map_warp_traces.find(post_join_pc);
+  const unsigned int post_join_occurrence =
+      post_join_it == map_warp_traces.end()
+          ? 0
+          : post_join_it->second.num_used_instructions[0] +
+                local_occurrences[post_join_pc];
+  if (post_join_it == map_warp_traces.end() ||
+      post_join_occurrence >= post_join_it->second.num_traced_instructions ||
+      post_join_it->second.instructions[post_join_occurrence]
+              .m_unique_function_id != unique_function_id ||
+      static_cast<uint64_t>(
+          post_join_it->second.instructions[post_join_occurrence].mask) !=
+          live_mask) {
+    return fail("post-join-occurrence-mismatch");
+  }
+
+  sibling_join.front().m_next_traced_pc = post_join_pc;
+  for (unsigned int i = 0; i < deferred.size(); ++i) {
+    deferred[i].m_next_traced_pc =
+        i + 1 < deferred.size() ? deferred[i + 1].m_pc : post_join_pc;
+  }
+
+  for (address_type pc : consumed_pcs) {
+    auto trace_it = map_warp_traces.find(pc);
+    assert(trace_it != map_warp_traces.end());
+    assert(trace_it->second.num_used_instructions[0] <
+           trace_it->second.num_traced_instructions);
+    trace_it->second.num_used_instructions[0]++;
+    used_insts++;
+  }
+  assert(used_insts == cursor);
+  assert(traced_pcs[used_insts] == post_join_pc);
+
+  m_partial_deferred.swap(deferred);
+  m_partial_replay.swap(sibling_join);
+  m_partial_replay_issued = 0;
+  m_partial_replay_reserved = 0;
+  // New replay stream: bump the epoch so any late cache response from a prior
+  // stream cannot fill a slot reserved against this one.
+  m_partial_replay_epoch++;
+  m_partial_replay_origin = WaitBlockTraceOrigin::PARTIAL_SIBLING_JOIN;
+  if (out_stats != nullptr) {
+    out_stats->cursor_before = cursor - consumed_pcs.size();
+    out_stats->cursor_after = cursor;
+    out_stats->blocked_occurrences = m_partial_deferred.size();
+    out_stats->sibling_join_occurrences = m_partial_replay.size();
+  }
+  return true;
+}
+
+bool trace_shd_warp_t::activate_partial_blocked_replay() {
+  if (m_partial_replay_origin != WaitBlockTraceOrigin::CANONICAL ||
+      !m_partial_replay.empty() || m_partial_deferred.empty()) {
+    return false;
+  }
+  m_partial_replay.swap(m_partial_deferred);
+  m_partial_replay_issued = 0;
+  m_partial_replay_reserved = 0;
+  // New replay stream (blocked suffix): bump the epoch so a late cache response
+  // from the drained sibling-join stream cannot fill a blocked-replay slot.
+  m_partial_replay_epoch++;
+  m_partial_replay_origin = WaitBlockTraceOrigin::PARTIAL_BLOCKED_REPLAY;
+  return true;
+}
+
+unsigned int trace_shd_warp_t::skip_partial_replay_to_exit(
+    address_type exit_pc, address_type loopback_bra_pc,
+    const std::set<address_type> &allowed_skip_pcs,
+    FoldSkipStats *out_stats) {
+  assert(m_partial_replay_origin ==
+         WaitBlockTraceOrigin::PARTIAL_BLOCKED_REPLAY);
+  // Deferred FOLD runs only after the IBuffer flush has cancelled every
+  // reserved-but-unissued replay slot, so the reservation cursor is back at the
+  // issued head. The skipped occurrences are consumed here without ever being
+  // fetched, so reservation advances lock-step with issue.
+  assert(m_partial_replay_reserved == m_partial_replay_issued);
+  FoldSkipStats stats;
+  stats.cursor_before_flush = m_partial_replay_issued;
+  stats.cursor_after_flush = m_partial_replay_issued;
+  unsigned int skipped = 0;
+  while (m_partial_replay_issued < m_partial_replay.size() &&
+         m_partial_replay[m_partial_replay_issued].m_pc != exit_pc) {
+    const inst_trace_t &trace = m_partial_replay[m_partial_replay_issued];
+    const address_type pc = trace.m_pc;
+    const std::string &opcode = trace.opcode;
+    const bool pc_allowed = allowed_skip_pcs.count(pc) != 0;
+    const bool is_wait =
+        (trace.sync_kind == SyncInstructionKind::PHASECHK ||
+         trace.sync_kind == SyncInstructionKind::TRYWAIT) &&
+        (opcode == "SYNCS.PHASECHK.TRANS64" ||
+         opcode == "SYNCS.PHASECHK.TRANS64.TRYWAIT");
+    const bool is_nanosleep = opcode == "NANOSLEEP.SYNCS";
+    const bool is_imad =
+        opcode == "IMAD.U32" || opcode == "IMAD.MOV.U32";
+    const bool is_bra = opcode == "BRA" && pc == loopback_bra_pc;
+    if (!pc_allowed ||
+        !(is_wait || is_nanosleep || is_imad || is_bra)) {
+      std::cerr << "[WAITBLOCK][poll-advance-abort]"
+                << " reason=deferred-replay-opcode"
+                << " pc=0x" << std::hex << pc << std::dec
+                << " opcode=" << opcode
+                << " exit_pc=0x" << std::hex << exit_pc << std::dec
+                << " skipped_so_far=" << skipped << std::endl;
+      abort();
+    }
+    stats.warp_insts++;
+    stats.pc_occurrences[static_cast<uint64_t>(pc)]++;
+    if (is_wait) {
+      stats.phasechk_trywait++;
+    } else if (is_nanosleep) {
+      stats.nanosleep++;
+    } else if (is_bra) {
+      stats.loopback_bra++;
+    } else {
+      stats.imad_scratch++;
+    }
+    m_partial_replay_issued++;
+    m_partial_replay_reserved++;
+    skipped++;
+  }
+  if (m_partial_replay_issued >= m_partial_replay.size() ||
+      m_partial_replay[m_partial_replay_issued].m_pc != exit_pc) {
+    std::cerr << "[WAITBLOCK][poll-advance-abort]"
+              << " reason=deferred-replay-exit-not-found"
+              << " exit_pc=0x" << std::hex << exit_pc << std::dec
+              << " replay_issued=" << m_partial_replay_issued
+              << " replay_size=" << m_partial_replay.size()
+              << " skipped=" << skipped << std::endl;
+    abort();
+  }
+  stats.cursor_after_skip = m_partial_replay_issued;
+  stats.prefetched_rollback = 0;
+  if (out_stats != nullptr) {
+    *out_stats = stats;
+  }
+  return skipped;
+}
+
+bool trace_shd_warp_t::partial_replay_active() const {
+  return m_partial_replay_origin != WaitBlockTraceOrigin::CANONICAL;
+}
+
+bool trace_shd_warp_t::partial_blocked_replay_pending() const {
+  return !m_partial_deferred.empty();
+}
+
+bool trace_shd_warp_t::partial_capsule_active() const {
+  return partial_replay_active() || partial_blocked_replay_pending();
+}
+
+WaitBlockTraceOrigin trace_shd_warp_t::partial_replay_origin() const {
+  return m_partial_replay_origin;
+}
+
+unsigned int trace_shd_warp_t::partial_replay_remaining() const {
+  assert(m_partial_replay_issued <= m_partial_replay.size());
+  return m_partial_replay.size() - m_partial_replay_issued;
+}
+
+unsigned int trace_shd_warp_t::partial_deferred_size() const {
+  return m_partial_deferred.size();
+}
+
+address_type trace_shd_warp_t::canonical_trace_pc() const {
+  assert(used_insts < traced_pcs.size());
+  return traced_pcs[used_insts];
+}
+
+bool trace_shd_warp_t::reserve_next_partial_replay(address_type *pc_out,
+                                                   unsigned int *index_out,
+                                                   uint64_t *epoch_out) {
+  if (m_partial_replay_origin == WaitBlockTraceOrigin::CANONICAL ||
+      m_partial_replay_reserved >= m_partial_replay.size()) {
+    return false;
+  }
+  const unsigned int index = m_partial_replay_reserved;
+  if (pc_out != nullptr) {
+    *pc_out = m_partial_replay[index].m_pc;
+  }
+  if (index_out != nullptr) {
+    *index_out = index;
+  }
+  if (epoch_out != nullptr) {
+    *epoch_out = m_partial_replay_epoch;
+  }
+  m_partial_replay_reserved++;
+  return true;
+}
+
+void trace_shd_warp_t::unreserve_last_partial_replay() {
+  // Give back exactly one replay reservation. Called per-removed-entry by the
+  // IBuffer flush and once by remove_entry after a RESERVATION_FAIL, so an
+  // un-fetched occurrence is re-reserved on the next fetch. Never drops below
+  // the issued head (the in-flight occurrence has already left the deque).
+  assert(m_partial_replay_reserved > m_partial_replay_issued);
+  m_partial_replay_reserved--;
+}
+
+uint64_t trace_shd_warp_t::partial_replay_epoch() const {
+  return m_partial_replay_epoch;
+}
+
+void trace_shd_warp_t::clear_partial_wait_capsule() {
+  m_partial_replay.clear();
+  m_partial_deferred.clear();
+  m_partial_replay_issued = 0;
+  m_partial_replay_reserved = 0;
+  // Bump the epoch so any outstanding cache response cannot fill a slot of a
+  // future replay stream after this capsule is torn down.
+  m_partial_replay_epoch++;
+  m_partial_replay_origin = WaitBlockTraceOrigin::CANONICAL;
+}
+
+// [Spin-wait collapse] Advance the trace cursor from its current position to the
+// spin-loop exit, mirroring get_next_trace_inst's two increments (per-pc
+// occurrence counter + linear used_insts) for every skipped pc, but WITHOUT
+// building/issuing those instructions. Stop condition is the positive
+// traced_pcs[used_insts] == exit_pc (NOT "left the body pc set"): the loopback
+// BRA is deliberately not in body_pcs, so a body-membership test would halt on
+// the first loopback BRA and land short of the exit. See design doc 4b.
+//
+// [Stage 1.4] Every occurrence advanced over is guarded: (a) its PC must be in
+// allowed_skip_pcs (= body_pcs + loopback_bra_pc), (b) it must have a live trace
+// occurrence, and (c) that occurrence's opcode/sync class must be in the same
+// closed wait/backoff/scratch/loopback model used by the post-processor. Any
+// violation emits [WAITBLOCK][poll-advance-abort] and aborts before the cursor
+// advances, so sidecar/trace drift can never silently drop real work.
+unsigned int trace_shd_warp_t::skip_spin_to_exit(
+    address_type exit_pc, address_type loopback_bra_pc,
+    const std::set<address_type> &allowed_skip_pcs,
+    FoldSkipStats *out_stats) {
+  FoldSkipStats stats;
+  unsigned int skipped = 0;
+  while (used_insts < traced_pcs.size() && traced_pcs[used_insts] != exit_pc) {
+    address_type pc = traced_pcs[used_insts];
+    auto it_inst_trace = map_warp_traces.find(pc);
+    const bool have_occurrence =
+        it_inst_trace != map_warp_traces.end() &&
+        it_inst_trace->second.num_used_instructions[0] <
+            it_inst_trace->second.num_traced_instructions;
+
+    // Guard (a): PC must be an allowed body/loopback PC.
+    // Guard (b): the PC must have a live trace occurrence to consume.
+    bool pc_allowed = allowed_skip_pcs.count(pc) != 0;
+    std::string opcode;
+    SyncInstructionKind sync_kind = SyncInstructionKind::NONE;
+    if (have_occurrence) {
+      const inst_trace_t &occ =
+          it_inst_trace->second.instructions[it_inst_trace->second
+                                                 .num_used_instructions[0]];
+      opcode = occ.opcode;
+      sync_kind = occ.sync_kind;
+    }
+
+    // Guard (c): use the same closed opcode model as the v5 post-processor.
+    // A denylist is insufficient here: stale metadata must not consume an
+    // unknown fence/control/semantic opcode merely because its PC is allowed.
+    const bool is_wait =
+        (sync_kind == SyncInstructionKind::PHASECHK ||
+         sync_kind == SyncInstructionKind::TRYWAIT) &&
+        (opcode == "SYNCS.PHASECHK.TRANS64" ||
+         opcode == "SYNCS.PHASECHK.TRANS64.TRYWAIT");
+    const bool is_nanosleep = opcode == "NANOSLEEP.SYNCS";
+    const bool is_imad =
+        opcode == "IMAD.U32" || opcode == "IMAD.MOV.U32";
+    const bool is_bra = opcode == "BRA" && pc == loopback_bra_pc;
+    const bool opcode_allowed = is_wait || is_nanosleep || is_imad || is_bra;
+
+    if (!pc_allowed || !have_occurrence || !opcode_allowed) {
+      std::cerr << "[WAITBLOCK][poll-advance-abort]"
+                << " pc=0x" << std::hex << pc << std::dec
+                << " opcode=" << (opcode.empty() ? "<none>" : opcode)
+                << " pc_allowed=" << pc_allowed
+                << " have_occurrence=" << have_occurrence
+                << " opcode_allowed=" << opcode_allowed
+                << " exit_pc=0x" << std::hex << exit_pc << std::dec
+                << " skipped_so_far=" << skipped
+                << " : the folded region tried to skip an instruction that is"
+                   " not a pure body/loopback poll or carries real semantic"
+                   " work — sidecar/trace drift, never drop work. See"
+                   " .plan/SPIN_WAIT_SIM_MODELING.md 1.4."
+                << std::endl;
+      abort();
+    }
+
+    // Classify the (now proven safe) skipped occurrence for FoldSkipStats.
+    stats.warp_insts++;
+    stats.pc_occurrences[static_cast<uint64_t>(pc)]++;
+    if (is_wait) {
+      stats.phasechk_trywait++;
+    } else if (is_nanosleep) {
+      stats.nanosleep++;
+    } else if (is_bra) {
+      // body_pcs excludes the loopback BRA, but the caller adds loopback_bra_pc
+      // to allowed_skip_pcs, so any BRA reached here is the loop-closing branch.
+      stats.loopback_bra++;
+    } else if (is_imad) {
+      stats.imad_scratch++;
+    } else {
+      stats.other++;
+    }
+
+    it_inst_trace->second.num_used_instructions[0]++;  // mirror get_next_trace_inst
+    used_insts++;
+    ++skipped;
+  }
+  if (used_insts >= traced_pcs.size() || traced_pcs[used_insts] != exit_pc) {
+    std::cerr << "[WAITBLOCK][poll-advance-abort]"
+              << " reason=exit-not-found"
+              << " exit_pc=0x" << std::hex << exit_pc << std::dec
+              << " used_insts=" << used_insts
+              << " trace_size=" << traced_pcs.size()
+              << " skipped=" << skipped << std::endl;
+    abort();
+  }
+  if (out_stats) {
+    *out_stats = stats;
+  }
+  return skipped;
 }
 
 // MOD. Begin. VPREG. Not totally compatible now.
@@ -157,10 +665,13 @@ void trace_shd_warp_t::clear() {
   used_insts = 0;
   map_warp_traces.clear();
   traced_pcs.clear();
+  clear_partial_wait_capsule();
 }
 
 // functional_done
-bool trace_shd_warp_t::trace_done() { return used_insts == (traced_pcs.size()); }
+bool trace_shd_warp_t::trace_done() {
+  return used_insts == traced_pcs.size() && !partial_capsule_active();
+}
 
 address_type trace_shd_warp_t::get_start_trace_pc() {
   assert(traced_pcs.size() > 0);
@@ -169,6 +680,13 @@ address_type trace_shd_warp_t::get_start_trace_pc() {
 
 address_type trace_shd_warp_t::get_pc() {
   assert(traced_pcs.size() > 0);
+  if (partial_replay_active() &&
+      m_partial_replay_reserved < m_partial_replay.size()) {
+    // Next fetch target within the replay stream is the next occurrence to be
+    // reserved. Reservation (reserve_next_partial_replay) drives the actual
+    // per-slot PC; this keeps the IBuffer's fetch base consistent with it.
+    return m_partial_replay[m_partial_replay_reserved].m_pc;
+  }
   assert(used_insts < traced_pcs.size());
   return traced_pcs[used_insts];
 }
@@ -265,7 +783,27 @@ bool trace_warp_inst_t::parse_from_trace_struct(
   sync_barrier_addr = trace.sync_barrier_addr;
   sync_has_semantic_raw = trace.sync_has_semantic_raw;
   sync_semantic_raw = trace.sync_semantic_raw;
+  tma_completion_runtime_valid = trace.tma_completion_runtime_valid;
+  tma_completion_barrier_addr = trace.tma_completion_barrier_addr;
+  tma_completion_barrier_ureg_id =
+      trace.tma_completion_barrier_ureg_id;
   trace_kernel_id = kernel_trace_info->kernel_id;
+  trace_block_idx_x = trace.block_idx_x;
+  trace_block_idx_y = trace.block_idx_y;
+  trace_block_idx_z = trace.block_idx_z;
+  trace_cta_warp_id = trace.trace_cta_warp_id;
+  trace_instruction_index = trace.trace_instruction_index;
+  trace_masks_valid = true;
+  trace_active_mask = trace.active_mask;
+  trace_predicate_mask = trace.predicate_mask;
+  wait_block_generation_ticket_present =
+      trace.wait_block_generation_ticket_present;
+  wait_block_exact_target_valid =
+      trace.wait_block_exact_target_valid;
+  wait_block_target_release_generation =
+      trace.wait_block_target_release_generation;
+  wait_block_ticket_source_index =
+      trace.wait_block_ticket_source_index;
 
   isize =
       16;  // starting from MAXWELL isize=16 bytes (including the control bytes)

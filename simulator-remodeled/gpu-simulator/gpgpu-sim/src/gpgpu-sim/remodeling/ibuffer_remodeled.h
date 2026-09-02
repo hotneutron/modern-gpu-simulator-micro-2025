@@ -51,10 +51,22 @@ struct IBuffer_Entry {
     m_valid = is_valid;
     m_pc = pc;
     m_inst = inst;
+    m_is_replay = false;
+    m_replay_epoch = 0;
+    m_replay_index = 0;
   }
   bool m_valid;
   address_type m_pc;
   warp_inst_t *m_inst;
+  // [WaitBlock partial replay] Reservation binding between this IBuffer slot
+  // and the exact deferred-replay occurrence it represents. When m_is_replay is
+  // true the slot was allocated against m_partial_replay[m_replay_index] of the
+  // replay stream identified by m_replay_epoch. Decode and issue use this
+  // reservation instead of a single global decode head, so out-of-order
+  // instruction-cache fills do not misclassify a real occurrence as synthetic.
+  bool m_is_replay;
+  uint64_t m_replay_epoch;
+  unsigned int m_replay_index;
 };
 
 /**

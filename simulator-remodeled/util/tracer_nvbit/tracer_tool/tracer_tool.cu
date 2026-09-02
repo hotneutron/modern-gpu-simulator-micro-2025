@@ -28,11 +28,14 @@
 
 
 #include <algorithm>
+#include <atomic>
 #include <assert.h>
 #include <bitset>
 #include <cctype>
+#include <cstdlib>
 #include <cstdio>
 #include <deque>
+#include <initializer_list>
 #include <inttypes.h>
 #include <iostream>
 #include <iterator>
@@ -42,7 +45,9 @@
 #include <stdio.h>
 #include <string>
 #include <sys/stat.h>
+#include <tuple>
 #include <unistd.h>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 #include <regex>
@@ -95,10 +100,10 @@ enum class RecvThreadState {
 
 struct CTXstate {
   /* context id */
-  int id;
+  int id = -1;
 
   /* Channel used to communicate from GPU to CPU receiving thread */
-  ChannelDev* channel_dev;
+  ChannelDev* channel_dev = nullptr;
   ChannelHost channel_host;
 
   // After initialization, set it to WORKING to make recv thread get data,
@@ -106,6 +111,15 @@ struct CTXstate {
   // recv thread sets it to FINISHED when it cleans up.
   // parent thread should wait until the state becomes FINISHED to clean up.
   volatile RecvThreadState recv_thread_done = RecvThreadState::STOP;
+
+  /* Published by the receiver when it consumes the end-of-kernel token. */
+  std::atomic<uint64_t> received_records_per_kernel{0};
+  std::atomic<uint64_t> sparse_retained_instructions_per_kernel{0};
+  std::atomic<uint64_t> sparse_reconstructed_instructions_per_kernel{0};
+
+  /* Stable registry pointer used only when MBARRIER_CONTRACT_CAPTURE=1. */
+  mbarrier_contract_registry_t *mbarrier_contract_registry = nullptr;
+  std::atomic<uint64_t> received_mbarrier_records_per_kernel{0};
 };
 
 /* lock */
@@ -126,17 +140,238 @@ uint32_t instr_begin_interval = 0;
 uint32_t instr_end_interval = UINT32_MAX;
 int verbose = 0;
 int intermediate_extra_files_persistance = 0;
-int gather_registers = 0;
 int enable_compress = 1;
 int print_core_id = 0;
 int exclude_pred_off = 1;
 int active_from_start = 1;
 /* used to select region of interest when active from start is 0 */
 bool active_region = true;
+/* Probe-only mode: instrument SASS EXIT and record one final clock64 timestamp
+ * per CTA-local warp. Full instruction tracing stays unchanged when disabled. */
+int warp_lifetime_only = 0;
+/* Resolved LIGHTER_TRACER feature state. */
+int compact_wire_enabled = 0;
+int prune_operands_enabled = 0;
+int lighter_tracer_host_count = 0;
+int lighter_tracer_sparse_reconstruct = 0;
+std::string lighter_tracer_canonical = "off";
+/* Sidecar mode: keep the complete dynamic trace path enabled and additionally
+ * timestamp SASS EXIT. This measures the lifetime perturbation of full tracing
+ * itself, using the same capture/output buffer as WARP_LIFETIME_ONLY. */
+int warp_lifetime_sidecar = 0;
+warp_lifetime_capture_t *warp_lifetime_capture = nullptr;
+bool warp_lifetime_capture_active = false;
+bool warp_lifetime_output_initialized = false;
+unsigned int warp_lifetime_grid_x = 0;
+unsigned int warp_lifetime_grid_y = 0;
+unsigned int warp_lifetime_grid_z = 0;
+unsigned int warp_lifetime_warps_per_cta = 0;
+int warp_lifetime_kernel_id = 0;
+std::string warp_lifetime_kernel_name;
+/* Capture-only B0-E feasibility instrumentation. Default-off; its payload is
+ * appended to the existing sync-address record, so it adds no callbacks or
+ * channel pushes. */
+int mbarrier_contract_capture_enabled = 0;
+int mbarrier_contract_barrier_slots_per_cta = 64;
+uint64_t next_mbarrier_contract_launch_uid = 1;
+std::unordered_set<CUfunction> mbarrier_contract_capture_launches;
 
 /* Should we terminate the program once we are done tracing? */
 int terminate_after_limit_number_of_kernels_reached = 0;
 int user_defined_folders = 0;
+
+static std::string trim_config_token(const std::string &value) {
+  size_t begin = 0;
+  while (begin < value.size() &&
+         std::isspace(static_cast<unsigned char>(value[begin]))) {
+    begin++;
+  }
+  size_t end = value.size();
+  while (end > begin &&
+         std::isspace(static_cast<unsigned char>(value[end - 1]))) {
+    end--;
+  }
+  return value.substr(begin, end - begin);
+}
+
+static int parse_strict_integer_config(
+    const char *name, int default_value, int minimum, int maximum) {
+  const char *raw = getenv(name);
+  if (raw == nullptr) {
+    return default_value;
+  }
+  if (*raw == '\0') {
+    fprintf(stderr, "%s must not be empty\n", name);
+    abort();
+  }
+  char *end = nullptr;
+  const long parsed = strtol(raw, &end, 10);
+  if (end == raw || *end != '\0' || parsed < minimum ||
+      parsed > maximum) {
+    fprintf(stderr, "%s must be an integer in [%d,%d], got '%s'\n",
+            name, minimum, maximum, raw);
+    abort();
+  }
+  return static_cast<int>(parsed);
+}
+
+[[noreturn]] static void lighter_tracer_config_error(
+    const std::string &message) {
+  fprintf(stderr, "[LIGHTER-TRACER] %s\n", message.c_str());
+  abort();
+}
+
+static void validate_lighter_tracer_dependencies(
+    const std::unordered_set<std::string> &features) {
+  auto require = [&](const char *feature,
+                     std::initializer_list<const char *> dependencies) {
+    if (features.count(feature) == 0) {
+      return;
+    }
+    std::vector<std::string> missing;
+    for (const char *dependency : dependencies) {
+      if (features.count(dependency) == 0) {
+        missing.emplace_back(dependency);
+      }
+    }
+    if (!missing.empty()) {
+      std::ostringstream message;
+      message << "feature '" << feature << "' requires: ";
+      for (size_t i = 0; i < missing.size(); i++) {
+        if (i != 0) {
+          message << ",";
+        }
+        message << missing[i];
+      }
+      lighter_tracer_config_error(message.str());
+    }
+  };
+
+  require("prune_operands", {"compact_wire"});
+  require("host_count", {"compact_wire"});
+  require("metadata_record", {"compact_wire"});
+  require("sparse_reconstruct", {"compact_wire", "prune_operands"});
+  require("warp_batch_1k", {"compact_wire"});
+  require("warp_batch_2k", {"compact_wire"});
+  require("warp_batch_4k", {"compact_wire"});
+  require("spin_fusion",
+          {"compact_wire", "prune_operands", "sparse_reconstruct"});
+
+  int batch_features = 0;
+  batch_features += features.count("warp_batch_1k") != 0;
+  batch_features += features.count("warp_batch_2k") != 0;
+  batch_features += features.count("warp_batch_4k") != 0;
+  if (batch_features > 1) {
+    lighter_tracer_config_error(
+        "warp_batch_1k/2k/4k features are mutually exclusive");
+  }
+}
+
+static void resolve_lighter_tracer_config() {
+  static const std::vector<std::string> feature_order = {
+      "compact_wire",      "prune_operands", "host_count",
+      "metadata_record",   "sparse_reconstruct",
+      "warp_batch_1k",     "warp_batch_2k",  "warp_batch_4k",
+      "spin_fusion",
+  };
+  static const std::unordered_set<std::string> implemented_features = {
+      "compact_wire",
+      "prune_operands",
+      "host_count",
+      "sparse_reconstruct",
+  };
+  // sparse_reconstruct remains explicit-only until opcode ordering is fixed.
+  static const std::unordered_set<std::string> production_features = {
+      "compact_wire",
+      "prune_operands",
+  };
+
+  const char *lighter_value = getenv("LIGHTER_TRACER");
+  std::unordered_set<std::string> features;
+  std::string requested = lighter_value == nullptr ? "all" : lighter_value;
+  const char *source = lighter_value == nullptr ? "default" : "LIGHTER_TRACER";
+  std::string raw =
+      lighter_value == nullptr ? "all" : trim_config_token(lighter_value);
+  if (raw.empty()) {
+    lighter_tracer_config_error(
+        "LIGHTER_TRACER must not be empty; use 'off'");
+  }
+  if (raw == "all") {
+    features.insert(production_features.begin(), production_features.end());
+  } else if (raw != "off") {
+    size_t begin = 0;
+    while (begin <= raw.size()) {
+      size_t comma = raw.find(',', begin);
+      size_t end = comma == std::string::npos ? raw.size() : comma;
+      std::string token =
+          trim_config_token(raw.substr(begin, end - begin));
+      if (token.empty()) {
+        lighter_tracer_config_error(
+            "LIGHTER_TRACER contains an empty feature token");
+      }
+      if (token == "off" || token == "all") {
+        lighter_tracer_config_error("feature '" + token +
+                                    "' cannot be combined");
+      }
+      if (std::find(feature_order.begin(), feature_order.end(), token) ==
+          feature_order.end()) {
+        lighter_tracer_config_error("unknown feature '" + token + "'");
+      }
+      if (!features.insert(token).second) {
+        lighter_tracer_config_error("duplicate feature '" + token + "'");
+      }
+      if (comma == std::string::npos) {
+        break;
+      }
+      begin = comma + 1;
+    }
+  }
+
+  validate_lighter_tracer_dependencies(features);
+  std::vector<std::string> unimplemented;
+  for (const auto &feature : features) {
+    if (implemented_features.count(feature) == 0) {
+      unimplemented.push_back(feature);
+    }
+  }
+  if (!unimplemented.empty()) {
+    std::sort(unimplemented.begin(), unimplemented.end());
+    std::ostringstream message;
+    message << "features are recognized but not implemented: ";
+    for (size_t i = 0; i < unimplemented.size(); i++) {
+      if (i != 0) {
+        message << ",";
+      }
+      message << unimplemented[i];
+    }
+    lighter_tracer_config_error(message.str());
+  }
+
+  std::ostringstream canonical;
+  bool first_feature = true;
+  for (const auto &feature : feature_order) {
+    if (features.count(feature) == 0) {
+      continue;
+    }
+    if (!first_feature) {
+      canonical << ",";
+    }
+    canonical << feature;
+    first_feature = false;
+  }
+  lighter_tracer_canonical =
+      features.empty() ? "off" : canonical.str();
+  compact_wire_enabled = features.count("compact_wire") != 0;
+  prune_operands_enabled = features.count("prune_operands") != 0;
+  lighter_tracer_host_count = features.count("host_count") != 0;
+  lighter_tracer_sparse_reconstruct =
+      features.count("sparse_reconstruct") != 0;
+
+  printf("[LIGHTER-TRACER] requested=%s canonical=%s source=%s "
+         "host_count=%d sparse_reconstruct=%d\n",
+         requested.c_str(), lighter_tracer_canonical.c_str(), source,
+         lighter_tracer_host_count, lighter_tracer_sparse_reconstruct);
+}
 
 /* opcode to id map and reverse map  */
 std::map<std::string, int> opcode_to_id_map;
@@ -220,12 +455,18 @@ struct sync_runtime_capture_site_info {
   sync_runtime_capture_site_info()
       : enabled(false),
         barrier_callback_index(-1),
+        barrier_mref_index(-1),
         semantic_callback_index(-1),
-        semantic_is_zero_literal(false) {}
+        semantic_is_zero_literal(false),
+        semantic_reg_type(TRACED_REG_TYPE::NO_REGS),
+        semantic_reg_id(-1) {}
   bool enabled;
   int barrier_callback_index;
+  int barrier_mref_index;
   int semantic_callback_index;
   bool semantic_is_zero_literal;
+  TRACED_REG_TYPE semantic_reg_type;
+  int semantic_reg_id;
 };
 std::map<int, std::map<int, sync_runtime_capture_site_info>>
     sync_runtime_capture_sites_by_pc;
@@ -244,6 +485,17 @@ struct bar_runtime_capture_site_info {
 };
 std::map<int, std::map<int, bar_runtime_capture_site_info>>
     bar_runtime_capture_sites_by_pc;
+struct tma_completion_runtime_capture_site_info {
+  tma_completion_runtime_capture_site_info()
+      : enabled(false),
+        barrier_callback_index(-1),
+        barrier_ureg_id(SECRET_UREG_DESC_NOT_USED) {}
+  bool enabled;
+  int barrier_callback_index;
+  uint32_t barrier_ureg_id;
+};
+std::map<int, std::map<int, tma_completion_runtime_capture_site_info>>
+    tma_completion_runtime_capture_sites_by_pc;
 uint64_t tma_memcpy_dump_id = 0;
 uint64_t tensor_map_encode_dump_id = 0;
 struct tma_desc_producer_candidate_t {
@@ -345,6 +597,12 @@ static bool is_tma_desc_consumer_opcode(const std::string &opcode) {
          opcode.rfind("UTMAREDG", 0) == 0;
 }
 
+static bool is_tma_completion_bearing_load_opcode(
+    const std::string &opcode) {
+  return opcode.rfind("UTMALDG", 0) == 0 ||
+         opcode.rfind("UBLKCP", 0) == 0;
+}
+
 enum class sync_runtime_capture_kind {
   NONE,
   EXCH,
@@ -377,6 +635,23 @@ static bool sync_runtime_capture_enabled(sync_runtime_capture_kind kind) {
   return kind != sync_runtime_capture_kind::NONE;
 }
 
+static MBARRIER_CONTRACT_EVENT_KIND get_mbarrier_contract_event_kind(
+    const std::string &opcode) {
+  const sync_runtime_capture_kind kind =
+      get_sync_runtime_capture_kind(opcode);
+  switch (kind) {
+    case sync_runtime_capture_kind::EXCH:
+      return MBARRIER_CONTRACT_EVENT_EXCH;
+    case sync_runtime_capture_kind::ARRIVE_EXPECT_TX:
+      return MBARRIER_CONTRACT_EVENT_ARRIVE;
+    case sync_runtime_capture_kind::PHASECHK:
+      return MBARRIER_CONTRACT_EVENT_WAIT;
+    case sync_runtime_capture_kind::NONE:
+      return MBARRIER_CONTRACT_EVENT_NONE;
+  }
+  return MBARRIER_CONTRACT_EVENT_NONE;
+}
+
 static bool is_sync_semantic_operand_type(InstrType::OperandType type) {
   return type == InstrType::OperandType::REG ||
          type == InstrType::OperandType::UREG ||
@@ -390,7 +665,8 @@ static bool is_zero_sync_semantic_operand(const std::string &operand_str) {
 
 static sync_runtime_capture_site_info build_sync_runtime_capture_site_info(
     const std::string &opcode, int operand_position, int callback_index,
-    InstrType::OperandType operand_type, const std::string &operand_str) {
+    int mref_index, InstrType::OperandType operand_type,
+    const std::string &operand_str, int register_id) {
   sync_runtime_capture_site_info info;
   sync_runtime_capture_kind kind = get_sync_runtime_capture_kind(opcode);
   if (!sync_runtime_capture_enabled(kind)) {
@@ -400,6 +676,7 @@ static sync_runtime_capture_site_info build_sync_runtime_capture_site_info(
   if (operand_position == 1 && operand_type == InstrType::OperandType::MREF) {
     info.enabled = true;
     info.barrier_callback_index = callback_index;
+    info.barrier_mref_index = mref_index;
   } else if (operand_position == 2 &&
              is_sync_semantic_operand_type(operand_type)) {
     info.enabled = true;
@@ -407,6 +684,14 @@ static sync_runtime_capture_site_info build_sync_runtime_capture_site_info(
       info.semantic_is_zero_literal = true;
     } else {
       info.semantic_callback_index = callback_index;
+      info.semantic_reg_id = register_id;
+      if (operand_type == InstrType::OperandType::REG) {
+        info.semantic_reg_type = TRACED_REG_TYPE::REGULAR;
+      } else if (operand_type == InstrType::OperandType::UREG) {
+        info.semantic_reg_type = TRACED_REG_TYPE::UNIFORM;
+      } else {
+        info.semantic_reg_type = TRACED_REG_TYPE::NO_REGS;
+      }
     }
   }
   return info;
@@ -449,6 +734,113 @@ static int get_first_predicated_lane(uint32_t active_mask, uint32_t predicate_ma
     }
   }
   return -1;
+}
+
+static bool inst_trace_has_lane_values(const inst_trace_t *record) {
+  return (record->record_flags & INST_TRACE_HAS_LANE_VALUES) != 0;
+}
+
+static bool inst_trace_has_mbarrier_contract(
+    const inst_trace_t *record) {
+  return (record->record_flags &
+          INST_TRACE_HAS_MBARRIER_CONTRACT) != 0;
+}
+
+static const mbarrier_contract_payload_t *
+inst_trace_mbarrier_contract(const inst_trace_t *record) {
+  assert(inst_trace_has_mbarrier_contract(record));
+  return reinterpret_cast<const mbarrier_contract_payload_t *>(
+      reinterpret_cast<const char *>(record) +
+      INST_TRACE_MEMORY_SIZE);
+}
+
+static uint64_t inst_trace_value_0(const inst_trace_t *record, int lane) {
+  assert(lane >= 0 && lane < 32);
+  if (inst_trace_has_lane_values(record)) {
+    return record->lane_values[lane];
+  }
+  return record->scalar_value_0;
+}
+
+static int64_t inst_trace_operand_reg_id(const inst_trace_t *record) {
+  switch (record->per_operand_type) {
+    case TRACED_REG_TYPE::REGULAR:
+    case TRACED_REG_TYPE::REGULAR_2_REGS:
+    case TRACED_REG_TYPE::REGULAR_4_REGS:
+    case TRACED_REG_TYPE::UNIFORM:
+    case TRACED_REG_TYPE::UNIFORM_2_REGS:
+    case TRACED_REG_TYPE::PREDICATE:
+    case TRACED_REG_TYPE::UNIFORM_PREDICATE:
+      return static_cast<int64_t>(record->reg_id);
+    case TRACED_REG_TYPE::NO_REGS:
+    case TRACED_REG_TYPE::MEMORY_REF:
+    default:
+      return -1;
+  }
+}
+
+static void normalize_legacy_inst_trace(const legacy_inst_trace_t *legacy,
+                                        inst_trace_t *record) {
+  record->record_version = INST_TRACE_RECORD_VERSION;
+  record->record_flags = 0;
+  record->cta_id_x = legacy->cta_id_x;
+  if (legacy->cta_id_x == -1) {
+    record->record_size = INST_TRACE_COMPACT_SIZE;
+    record->mem_type = MEM_TYPE::NONE;
+    return;
+  }
+
+  record->cta_id_y = legacy->cta_id_y;
+  record->cta_id_z = legacy->cta_id_z;
+  record->warpid_tb = legacy->warpid_tb;
+  record->warpid_sm = legacy->warpid_sm;
+  record->sm_id = legacy->sm_id;
+  record->reg_id =
+      legacy->mem_type == MEM_TYPE::NONE
+          ? legacy->reg_id
+          : SECRET_UREG_DESC_NOT_USED;
+  record->vpc = legacy->vpc;
+  record->unique_function_id = legacy->unique_function_id;
+  record->mem_type = legacy->mem_type;
+  record->width = legacy->width;
+  record->ureg_desc_id = legacy->ureg_desc_id;
+  record->ureg_desc_value = legacy->ureg_desc_value;
+  record->ureg_desc_value_hi = legacy->ureg_desc_value_hi;
+  record->active_mask = legacy->active_mask;
+  record->predicate_mask = legacy->predicate_mask;
+  record->num_of_injects = legacy->num_of_injects;
+  record->per_operand_type = legacy->per_operand_type;
+  record->scalar_value_0 = 0;
+  record->scalar_value_1 = 0;
+  record->scalar_value_2 = 0;
+  record->scalar_value_3 = 0;
+  record->reserved = 0;
+
+  if (legacy->mem_type != MEM_TYPE::NONE) {
+    record->record_size = INST_TRACE_MEMORY_SIZE;
+    record->record_flags |= INST_TRACE_HAS_LANE_VALUES;
+    for (int lane = 0; lane < 32; ++lane) {
+      record->lane_values[lane] = legacy->addrs_or_reg_val_0[lane];
+    }
+    return;
+  }
+
+  record->record_size = INST_TRACE_COMPACT_SIZE;
+  int value_lane =
+      get_first_predicated_lane(legacy->active_mask, legacy->predicate_mask);
+  if (value_lane < 0) {
+    value_lane = 0;
+  }
+  if (legacy->per_operand_type != TRACED_REG_TYPE::NO_REGS) {
+    record->scalar_value_0 = legacy->addrs_or_reg_val_0[value_lane];
+  }
+  if (legacy->per_operand_type == TRACED_REG_TYPE::REGULAR_2_REGS ||
+      legacy->per_operand_type == TRACED_REG_TYPE::UNIFORM_2_REGS) {
+    record->scalar_value_1 = legacy->reg_val_1[value_lane];
+  } else if (legacy->per_operand_type == TRACED_REG_TYPE::REGULAR_4_REGS) {
+    record->scalar_value_2 = legacy->reg_val_2[value_lane];
+    record->scalar_value_3 = legacy->reg_val_3[value_lane];
+  }
 }
 
 static const char *traced_reg_type_to_string(TRACED_REG_TYPE reg_type) {
@@ -846,7 +1238,7 @@ static void append_tma_desc_runtime_debug_event(
   std::bitset<32> mask(ma->active_mask & ma->predicate_mask);
   for (int lane = 0; lane < 32; ++lane) {
     if (mask.test(lane)) {
-      first_lane_addr = ma->addrs_or_reg_val_0[lane];
+      first_lane_addr = inst_trace_value_0(ma, lane);
       break;
     }
   }
@@ -885,7 +1277,7 @@ static void append_tma_runtime_operand_debug_event(
   if (!ofs.is_open()) {
     return;
   }
-  uint64_t first_lane_addr = ma->addrs_or_reg_val_0[first_lane];
+  uint64_t first_lane_addr = inst_trace_value_0(ma, first_lane);
   // #region debug-point tracer-desc-validity
   const bool desc_valid = ma->ureg_desc_id != SECRET_UREG_DESC_NOT_USED;
   // #endregion debug-point tracer-desc-validity
@@ -901,11 +1293,11 @@ static void append_tma_runtime_operand_debug_event(
       << "\"callback_index\":" << callback_index << ","
       << "\"operand_type\":\"" << traced_reg_type_to_string(static_cast<TRACED_REG_TYPE>(ma->per_operand_type)) << "\","
       << "\"mem_type\":\"" << mem_type_to_string(ma->mem_type) << "\","
-      << "\"operand_reg_id\":" << ma->reg_id << ","
-      << "\"value_lo\":" << static_cast<uint64_t>(ma->addrs_or_reg_val_0[first_lane]) << ","
-      << "\"value_hi\":" << ma->reg_val_1[first_lane] << ","
-      << "\"value_2\":" << ma->reg_val_2[first_lane] << ","
-      << "\"value_3\":" << ma->reg_val_3[first_lane] << ","
+      << "\"operand_reg_id\":" << inst_trace_operand_reg_id(ma) << ","
+      << "\"value_lo\":" << inst_trace_value_0(ma, first_lane) << ","
+      << "\"value_hi\":" << ma->scalar_value_1 << ","
+      << "\"value_2\":" << ma->scalar_value_2 << ","
+      << "\"value_3\":" << ma->scalar_value_3 << ","
       << "\"first_lane_addr\":" << first_lane_addr << ","
       << "\"width\":" << ma->width << ","
       // #region debug-point tracer-desc-validity
@@ -1619,6 +2011,39 @@ void nvbit_at_init() {
          active_from_start, "ACTIVE_FROM_START", 1,
          "Start instruction tracing from start or wait for cuProfilerStart "
          "and cuProfilerStop. If set to 0, DYNAMIC_KERNEL_LIMIT options have no effect");
+  GET_VAR_INT(
+      warp_lifetime_only, "WARP_LIFETIME_ONLY", 0,
+      "Probe-only mode: record clock64 at SASS EXIT per CTA-local warp and "
+      "disable full dynamic instruction tracing");
+  GET_VAR_INT(
+      warp_lifetime_sidecar, "WARP_LIFETIME_SIDECAR", 0,
+      "Record clock64 at SASS EXIT while retaining the full dynamic trace "
+      "and normal TMA/sync capture");
+  if (warp_lifetime_only && warp_lifetime_sidecar) {
+    fprintf(stderr,
+            "WARP_LIFETIME_ONLY and WARP_LIFETIME_SIDECAR are mutually "
+            "exclusive\n");
+    abort();
+  }
+  resolve_lighter_tracer_config();
+  if (lighter_tracer_sparse_reconstruct &&
+      (instr_begin_interval != 0 || instr_end_interval != UINT32_MAX)) {
+    fprintf(stderr,
+            "[TRACE-SPARSE] sparse_reconstruct requires the full instruction "
+            "interval\n");
+    abort();
+  }
+  if (lighter_tracer_sparse_reconstruct && warp_lifetime_only) {
+    fprintf(stderr,
+            "[TRACE-SPARSE] sparse_reconstruct is incompatible with "
+            "WARP_LIFETIME_ONLY\n");
+    abort();
+  }
+  printf("[TRACE-WIRE] selected mode=%s legacy_size=%u compact_size=%u "
+         "memory_size=%u\n",
+         compact_wire_enabled ? "compact" : "legacy",
+         INST_TRACE_LEGACY_SIZE, INST_TRACE_COMPACT_SIZE,
+         INST_TRACE_MEMORY_SIZE);
   GET_VAR_INT(verbose, "TOOL_VERBOSE", 0, "Enable verbosity inside the tool");
   GET_VAR_INT(intermediate_extra_files_persistance, "INTERMEDIATE_EXTRA_FILES_PERSISTANCE", 0, "Enable to not delete intermediate files from the extra trace generation");
   GET_VAR_INT(print_core_id, "TOOL_TRACE_CORE", 0,
@@ -1629,10 +2054,33 @@ void nvbit_at_init() {
               "folder TRACES_FOLDER path environment");
   GET_VAR_INT(threshold_unique_kernel_checking, "THRESHOLD_UNIQUE_KERNEL_CHECKING", 10,
               "Number of instructions used to check if kernels with the same name are different");
-  GET_VAR_INT(gather_registers, "GATHER_REGISTERS", 0, "Enable gathering of GPU register values. Not available in this version.");
+  printf("[TRACE-PRUNE] enabled=%d\n", prune_operands_enabled);
   GET_VAR_INT(incremental_flush_threshold, "INCREMENTAL_FLUSH_THRESHOLD", 0,
               "Flush threadblocks to disk when instruction count exceeds this threshold. "
               "0 = disabled (default). Recommended: 50000-100000 for large kernels.");
+  mbarrier_contract_capture_enabled = parse_strict_integer_config(
+      "MBARRIER_CONTRACT_CAPTURE", 0, 0, 1);
+  if (mbarrier_contract_capture_enabled) {
+    mbarrier_contract_barrier_slots_per_cta =
+        parse_strict_integer_config(
+            "MBARRIER_CONTRACT_BARRIERS_PER_CTA", 64, 1, 4096);
+    if (warp_lifetime_only || warp_lifetime_sidecar ||
+        incremental_flush_threshold != 0) {
+      fprintf(stderr,
+              "MBARRIER_CONTRACT_CAPTURE=1 requires full in-memory tracing "
+              "without warp-lifetime probes "
+              "(WARP_LIFETIME_ONLY=0, WARP_LIFETIME_SIDECAR=0, "
+              "INCREMENTAL_FLUSH_THRESHOLD=0)\n");
+      abort();
+    }
+    printf("[MBARRIER-CONTRACT] enabled=1 version=%u "
+           "barriers_per_cta=%d inline_record_size=%u "
+           "transport=existing_sync_record "
+           "extra_callbacks=0\n",
+           MBARRIER_CONTRACT_RECORD_VERSION,
+           mbarrier_contract_barrier_slots_per_cta,
+           INST_TRACE_MBARRIER_SIZE);
+  }
   GET_VAR_INT(enable_tma_desc, "ENABLE_TMA_DESC", 1,
               "Enable TMA descriptor capture, including runtime desc handle debug and tensor-map descriptor dumps.");
   GET_VAR_INT(aux_htod_dump_max_bytes, "AUX_HTOD_DUMP_MAX_BYTES", 4096,
@@ -1645,6 +2093,13 @@ void nvbit_at_init() {
               "SPIKE 6 (§2.18): at executed UTMALDG/UTMASTG, classify the descriptor VA address space (crash-safe) and dump it to tma_desc_factcheck.csv.");
   GET_VAR_INT(tma_desc_factcheck_read, "TMA_DESC_FACTCHECK_READ", 0,
               "SPIKE 6 (§2.18): opt-in — also device-read 128B at the descriptor VA (only when GLOBAL). Off by default because a generic load of a SMEM/raw operand faults.");
+  if (warp_lifetime_only) {
+    enable_tma_desc = 0;
+    incremental_flush_threshold = 0;
+    printf("[WARP-LIFETIME] EXIT-only probe enabled; full trace and TMA capture disabled\n");
+  } else if (warp_lifetime_sidecar) {
+    printf("[WARP-LIFETIME] EXIT sidecar enabled; full trace and TMA capture retained\n");
+  }
   std::string pad(100, '-');
   printf("%s\n", pad.c_str());
 
@@ -1668,6 +2123,27 @@ void nvbit_at_init() {
 // Key is unique function ID. The next key is PC and finally the Value is the datawidh of the opcode ID of the instruction.
 std::map<int,std::map<int, int>>  pc_to_opcode;
 
+/* For each retained instruction, the static unpredicated/payload-free
+ * instructions immediately preceding it in the same basic block. */
+std::map<int, std::map<int, std::vector<uint32_t>>>
+    sparse_prefix_pcs_by_function;
+
+static bool sparse_semantic_anchor(const std::string &opcode) {
+  static const std::vector<std::string> prefixes = {
+      "BAR",       "BSSY",      "BSYNC",    "BRA",
+      "BREAK",     "BRX",       "CALL",     "DEPBAR",
+      "EXIT",      "JMP",       "LDGDEPBAR", "MEMBAR",
+      "NANOSLEEP", "RET",       "SYNCS",    "UTMA",
+      "UBLK",      "WARPSYNC",  "YIELD",    "ULDC",
+  };
+  for (const auto &prefix : prefixes) {
+    if (opcode.rfind(prefix, 0) == 0) {
+      return true;
+    }
+  }
+  return false;
+}
+
 /* Set used to avoid re-instrumenting the same functions multiple times */
 std::unordered_set<CUfunction> already_instrumented;
 
@@ -1682,6 +2158,26 @@ void instrument_function_if_needed(CUcontext ctx, CUfunction func, int device_id
 
   /* add kernel itself to the related function vector */
   related_functions.push_back(func);
+  if (mbarrier_contract_capture_enabled) {
+    bool launch_has_capture_site = false;
+    for (CUfunction related : related_functions) {
+      for (Instr *candidate : nvbit_get_instrs(ctx, related)) {
+        const std::string opcode =
+            candidate->getOpcode() ? candidate->getOpcode() : "";
+        if (get_mbarrier_contract_event_kind(opcode) !=
+            MBARRIER_CONTRACT_EVENT_NONE) {
+          launch_has_capture_site = true;
+          break;
+        }
+      }
+      if (launch_has_capture_site) {
+        break;
+      }
+    }
+    if (launch_has_capture_site) {
+      mbarrier_contract_capture_launches.insert(func);
+    }
+  }
 
   /* iterate on function */
   for (auto f : related_functions) {
@@ -1699,15 +2195,50 @@ void instrument_function_if_needed(CUcontext ctx, CUfunction func, int device_id
     next_candidate_unique_function_id++;
 
     const std::vector<Instr *> &instrs = nvbit_get_instrs(ctx, f);
+    const CFG_t &cfg = nvbit_get_CFG(ctx, f);
+    std::unordered_set<Instr *> sparse_block_entries;
+    std::unordered_set<Instr *> sparse_block_exits;
+    std::unordered_map<Instr *, size_t> sparse_block_index;
+    std::vector<std::vector<uint32_t>> sparse_pending_pcs(cfg.bbs.size());
+    if (lighter_tracer_sparse_reconstruct && !cfg.is_degenerate) {
+      for (size_t bb_index = 0; bb_index < cfg.bbs.size(); bb_index++) {
+        const auto &instructions = cfg.bbs[bb_index]->instrs;
+        if (instructions.empty()) {
+          continue;
+        }
+        sparse_block_entries.insert(instructions.front());
+        sparse_block_exits.insert(instructions.back());
+        for (Instr *bb_instruction : instructions) {
+          auto inserted =
+              sparse_block_index.emplace(bb_instruction, bb_index);
+          if (!inserted.second) {
+            fprintf(stderr,
+                    "[TRACE-SPARSE] instruction belongs to multiple basic "
+                    "blocks: function=%s pc=0x%x\n",
+                    current_kernel_name.c_str(),
+                    static_cast<unsigned int>(
+                        bb_instruction->getOffset()));
+            abort();
+          }
+        }
+      }
+    } else if (lighter_tracer_sparse_reconstruct) {
+      printf("[TRACE-SPARSE] function=%s mode=direct reason=degenerate_cfg\n",
+             current_kernel_name.c_str());
+    }
     if (verbose) {
       printf("Inspecting function %s at address 0x%lx\n", nvbit_get_func_name(ctx, f), addr_funct);
     }
 
     uint32_t cnt = 0;
+    uint64_t sparse_static_retained = 0;
+    uint64_t sparse_static_omitted = 0;
+    uint64_t sparse_static_cfg_misses = 0;
     /* iterate on all the static instructions in the function */
     for (auto instr : instrs) {
 
-      if (cnt < instr_begin_interval || cnt >= instr_end_interval) {
+      if (!warp_lifetime_only &&
+          (cnt < instr_begin_interval || cnt >= instr_end_interval)) {
         cnt++;
         continue;
       }
@@ -1726,7 +2257,27 @@ void instrument_function_if_needed(CUcontext ctx, CUfunction func, int device_id
 
       int opcode_id = opcode_to_id_map[instr->getOpcode()];
       int vpc = (int)instr->getOffset();
+      std::string opcode_str =
+          instr->getOpcode() ? std::string(instr->getOpcode()) : "";
       pc_to_opcode[next_candidate_unique_function_id][vpc] = opcode_id;
+
+      if (warp_lifetime_only) {
+        if (opcode_str.rfind("EXIT", 0) == 0) {
+          nvbit_insert_call(instr, "record_warp_exit", IPOINT_BEFORE);
+          nvbit_add_call_arg_guard_pred_val(instr);
+          nvbit_add_call_arg_const_val64(
+              instr, reinterpret_cast<uint64_t>(warp_lifetime_capture));
+        }
+        cnt++;
+        continue;
+      }
+
+      if (warp_lifetime_sidecar && opcode_str.rfind("EXIT", 0) == 0) {
+        nvbit_insert_call(instr, "record_warp_exit", IPOINT_BEFORE);
+        nvbit_add_call_arg_guard_pred_val(instr);
+        nvbit_add_call_arg_const_val64(
+            instr, reinterpret_cast<uint64_t>(warp_lifetime_capture));
+      }
 
       std::string inst_str = ReplaceAll(instr->getSass(), ",", " ");
       inst_str = replaceInstructionNewExtraInformation(inst_str);
@@ -1764,7 +2315,8 @@ void instrument_function_if_needed(CUcontext ctx, CUfunction func, int device_id
 
       map_func_addr_to_pc_to_sass_instr[addr_funct][vpc] = inst_str;
       
-      /* We only report memory addresses */
+      /* Build the original per-operand callback list first. Compact mode may
+       * prune callbacks after sync/BAR/TMA semantic roles have been identified. */
       int mem_oper_idx = -1;
       int num_mref = 0;
 
@@ -1778,9 +2330,11 @@ void instrument_function_if_needed(CUcontext ctx, CUfunction func, int device_id
       std::vector<int> aux_reg_ids;
       uint64_t call_ret_imm = 0;
       uint32_t num_of_injects = 0;
-      std::string opcode_str = instr->getOpcode() ? std::string(instr->getOpcode()) : "";
       sync_runtime_capture_site_info sync_site_info;
       bar_runtime_capture_site_info bar_site_info;
+      tma_completion_runtime_capture_site_info tma_completion_site_info;
+      uint32_t tma_completion_barrier_ureg_id =
+          SECRET_UREG_DESC_NOT_USED;
 
       if(inst_parsed->is_tensor_core_op()) {
         inst_parsed->set_tensor_core_instruction_info();
@@ -1788,18 +2342,48 @@ void instrument_function_if_needed(CUcontext ctx, CUfunction func, int device_id
       for(int i = 0; i < instr->getNumOperands(); ++i){
         const InstrType::operand_t *op = instr->getOperand(i);
         std::string operand_str = op->str ? std::string(op->str) : "";
+        const int operand_mref_index =
+            op->type == InstrType::OperandType::MREF
+                ? mem_oper_idx + 1
+                : -1;
+        const int operand_register_id =
+            is_sync_semantic_operand_type(op->type)
+                ? static_cast<int>(op->u.reg.num)
+                : -1;
+        if (is_tma_completion_bearing_load_opcode(opcode_str) && i == 0) {
+          if (op->type != InstrType::OperandType::MREF ||
+              operand_str.rfind("[UR", 0) != 0) {
+            fprintf(stderr,
+                    "[TMA-COMPLETION] unsupported destination-state operand: "
+                    "function=%s pc=0x%x opcode=%s operand=%s\n",
+                    current_kernel_name.c_str(), vpc, opcode_str.c_str(),
+                    operand_str.c_str());
+            abort();
+          }
+          const uint32_t destination_ureg_id =
+              get_ur_register(operand_str);
+          tma_completion_barrier_ureg_id = destination_ureg_id + 1;
+        }
         sync_runtime_capture_site_info sync_operand_info =
             build_sync_runtime_capture_site_info(opcode_str, i, num_of_injects,
-                                                 op->type, operand_str);
+                                                 operand_mref_index, op->type,
+                                                 operand_str,
+                                                 operand_register_id);
         if (sync_operand_info.enabled) {
           sync_site_info.enabled = true;
           if (sync_operand_info.barrier_callback_index >= 0) {
             sync_site_info.barrier_callback_index =
                 sync_operand_info.barrier_callback_index;
+            sync_site_info.barrier_mref_index =
+                sync_operand_info.barrier_mref_index;
           }
           if (sync_operand_info.semantic_callback_index >= 0) {
             sync_site_info.semantic_callback_index =
                 sync_operand_info.semantic_callback_index;
+            sync_site_info.semantic_reg_type =
+                sync_operand_info.semantic_reg_type;
+            sync_site_info.semantic_reg_id =
+                sync_operand_info.semantic_reg_id;
           }
           if (sync_operand_info.semantic_is_zero_literal) {
             sync_site_info.semantic_is_zero_literal = true;
@@ -1880,6 +2464,94 @@ void instrument_function_if_needed(CUcontext ctx, CUfunction func, int device_id
           num_of_injects++;
         }
       }
+      if (is_tma_completion_bearing_load_opcode(opcode_str)) {
+        if (tma_completion_barrier_ureg_id ==
+            SECRET_UREG_DESC_NOT_USED) {
+          fprintf(stderr,
+                  "[TMA-COMPLETION] missing barrier UReg: function=%s "
+                  "pc=0x%x opcode=%s\n",
+                  current_kernel_name.c_str(), vpc, opcode_str.c_str());
+          abort();
+        }
+        tma_completion_site_info.enabled = true;
+        tma_completion_site_info.barrier_callback_index =
+            static_cast<int>(num_of_injects);
+        tma_completion_site_info.barrier_ureg_id =
+            tma_completion_barrier_ureg_id;
+        per_operand_type[num_of_injects] =
+            traced_operand_instrument(TRACED_REG_TYPE::UNIFORM, 1,
+                                      tma_completion_barrier_ureg_id);
+        num_of_injects++;
+      }
+      /*
+       * The replay protobuf has no generic register-value field. In compact
+       * mode, keep only callbacks whose runtime values have a proven consumer:
+       *
+       *   - MEMORY_REF: replay addresses, sync barrier addresses, LDC/call
+       *   - sync semantic: PHASECHK/ARRIVE/EXCH runtime semantic or phase
+       *   - BAR register operands: runtime named-barrier id/count
+       *   - TMA family: every operand, because tma_runtime_operand_debug.jsonl
+       *     is consumed by strict TMA sidecar generation
+       *
+       * Omitting prune_operands restores the all-operand compact callback
+       * stream for diagnostics. The legacy transport is intentionally
+       * unchanged.
+       */
+      if (compact_wire_enabled && prune_operands_enabled &&
+          !is_tma_desc_consumer_instruction) {
+        std::map<uint32_t, traced_operand_instrument> retained_operands;
+        std::map<int, int> old_to_new_callback_index;
+
+        for (const auto &entry : per_operand_type) {
+          const int old_index = static_cast<int>(entry.first);
+          const bool is_memory =
+              entry.second.reg_type == TRACED_REG_TYPE::MEMORY_REF;
+          const bool is_sync_semantic =
+              sync_site_info.semantic_callback_index == old_index;
+          const bool is_bar_runtime =
+              bar_site_info.id_callback_index == old_index ||
+              bar_site_info.count_callback_index == old_index;
+          if (!is_memory && !is_sync_semantic && !is_bar_runtime) {
+            continue;
+          }
+
+          const int new_index =
+              static_cast<int>(retained_operands.size());
+          retained_operands[static_cast<uint32_t>(new_index)] = entry.second;
+          old_to_new_callback_index[old_index] = new_index;
+        }
+
+        auto remap_required_callback =
+            [&](int &callback_index, const char *role) {
+              if (callback_index < 0) {
+                return;
+              }
+              auto remap_it =
+                  old_to_new_callback_index.find(callback_index);
+              if (remap_it == old_to_new_callback_index.end()) {
+                fprintf(stderr,
+                        "[TRACE-PRUNE] required %s callback was pruned: "
+                        "function=%d pc=0x%x old_index=%d\n",
+                        role, next_candidate_unique_function_id, vpc,
+                        callback_index);
+                abort();
+              }
+              callback_index = remap_it->second;
+            };
+
+        remap_required_callback(sync_site_info.barrier_callback_index,
+                                "sync-barrier");
+        remap_required_callback(sync_site_info.semantic_callback_index,
+                                "sync-semantic");
+        remap_required_callback(bar_site_info.id_callback_index, "bar-id");
+        remap_required_callback(bar_site_info.count_callback_index,
+                                "bar-count");
+
+        per_operand_type.swap(retained_operands);
+        num_of_injects =
+            static_cast<uint32_t>(per_operand_type.size());
+      }
+
       if (is_tma_desc_consumer_instruction && tma_desc_ureg_id != SECRET_UREG_DESC_NOT_USED) {
         tma_desc_ureg_by_pc[next_candidate_unique_function_id][vpc] = tma_desc_ureg_id;
       }
@@ -1891,15 +2563,117 @@ void instrument_function_if_needed(CUcontext ctx, CUfunction func, int device_id
         bar_runtime_capture_sites_by_pc[next_candidate_unique_function_id][vpc] =
             bar_site_info;
       }
+      if (tma_completion_site_info.enabled) {
+        tma_completion_runtime_capture_sites_by_pc
+            [next_candidate_unique_function_id][vpc] =
+                tma_completion_site_info;
+      }
+
+      if (lighter_tracer_sparse_reconstruct) {
+        bool retain_directly = true;
+        auto bb_it = sparse_block_index.find(instr);
+        if (!cfg.is_degenerate && bb_it != sparse_block_index.end()) {
+          const bool is_block_entry =
+              sparse_block_entries.count(instr) != 0;
+          const bool is_block_exit =
+              sparse_block_exits.count(instr) != 0;
+          const bool has_runtime_payload = num_of_injects != 0;
+          retain_directly =
+              is_block_entry || is_block_exit || instr->hasPred() ||
+              has_runtime_payload || sync_site_info.enabled ||
+              bar_site_info.enabled || is_tma_desc_consumer_instruction ||
+              is_call_or_ret || sparse_semantic_anchor(opcode_str);
+
+          std::vector<uint32_t> &pending =
+              sparse_pending_pcs[bb_it->second];
+          if (!retain_directly) {
+            pending.push_back(static_cast<uint32_t>(vpc));
+            sparse_static_omitted++;
+            cnt++;
+            continue;
+          }
+          if (!pending.empty()) {
+            auto &function_spans =
+                sparse_prefix_pcs_by_function[
+                    next_candidate_unique_function_id];
+            if (function_spans.count(vpc) != 0) {
+              fprintf(stderr,
+                      "[TRACE-SPARSE] duplicate retained PC span: "
+                      "function=%s pc=0x%x\n",
+                      current_kernel_name.c_str(), vpc);
+              abort();
+            }
+            function_spans[vpc] = pending;
+            pending.clear();
+          }
+        } else if (!cfg.is_degenerate) {
+          sparse_static_cfg_misses++;
+        }
+        sparse_static_retained++;
+      }
 
       if(num_of_injects == 0) {
         per_operand_type[0] = traced_operand_instrument(TRACED_REG_TYPE::NO_REGS, 0, 0);
         num_of_injects++;
       }
 
+      const MBARRIER_CONTRACT_EVENT_KIND contract_event_kind =
+          mbarrier_contract_capture_enabled
+              ? get_mbarrier_contract_event_kind(opcode_str)
+              : MBARRIER_CONTRACT_EVENT_NONE;
+      if (contract_event_kind != MBARRIER_CONTRACT_EVENT_NONE &&
+          (!compact_wire_enabled ||
+           ctx_state->mbarrier_contract_registry == nullptr ||
+           sync_site_info.barrier_callback_index < 0 ||
+           (!sync_site_info.semantic_is_zero_literal &&
+            sync_site_info.semantic_reg_id < 0) ||
+           (!sync_site_info.semantic_is_zero_literal &&
+            sync_site_info.semantic_reg_type !=
+                TRACED_REG_TYPE::REGULAR &&
+            sync_site_info.semantic_reg_type !=
+                TRACED_REG_TYPE::UNIFORM))) {
+        fprintf(stderr,
+                "[MBARRIER-CONTRACT] unsupported inline capture: "
+                "function=%s pc=0x%x opcode=%s compact=%d "
+                "barrier_callback=%d semantic_type=%d semantic_reg=%d "
+                "zero=%d\n",
+                current_kernel_name.c_str(), vpc, opcode_str.c_str(),
+                compact_wire_enabled,
+                sync_site_info.barrier_callback_index,
+                static_cast<int>(sync_site_info.semantic_reg_type),
+                sync_site_info.semantic_reg_id,
+                sync_site_info.semantic_is_zero_literal ? 1 : 0);
+        abort();
+      }
+
       for(unsigned int i = 0; i < num_of_injects; i++) {
+          const bool inline_contract_capture =
+              contract_event_kind != MBARRIER_CONTRACT_EVENT_NONE &&
+              static_cast<int>(i) ==
+                  sync_site_info.barrier_callback_index;
+          const char *callback_name =
+              compact_wire_enabled ? "instrument_inst_compact"
+                                   : "instrument_inst";
+          if (inline_contract_capture) {
+            switch (contract_event_kind) {
+              case MBARRIER_CONTRACT_EVENT_EXCH:
+                callback_name =
+                    "instrument_inst_compact_mbarrier_exch";
+                break;
+              case MBARRIER_CONTRACT_EVENT_ARRIVE:
+                callback_name =
+                    "instrument_inst_compact_mbarrier_arrive";
+                break;
+              case MBARRIER_CONTRACT_EVENT_WAIT:
+                callback_name =
+                    "instrument_inst_compact_mbarrier_wait";
+                break;
+              case MBARRIER_CONTRACT_EVENT_NONE:
+                abort();
+            }
+          }
           /* insert call to the instrumentation function with its arguments */
-          nvbit_insert_call(instr, "instrument_inst", IPOINT_BEFORE);
+          nvbit_insert_call(instr, callback_name, IPOINT_BEFORE);
           /* pass predicate value */
           nvbit_add_call_arg_guard_pred_val(instr);
           /* send Unique Function Identifier and PC */
@@ -1915,20 +2689,46 @@ void instrument_function_if_needed(CUcontext ctx, CUfunction func, int device_id
               assert(num_mref <= 2);
               nvbit_add_call_arg_mref_addr64(instr, mem_oper_idx);
               nvbit_add_call_arg_const_val32(instr, (int)instr->getSize());
-              uint32_t desc_ureg_id = SECRET_UREG_DESC_NOT_USED;
-              if(memref_idx_with_desc.find(mem_oper_idx) != memref_idx_with_desc.end()) {
-                desc_ureg_id = memref_idx_with_desc[mem_oper_idx];
-              } else if(is_tma_desc_consumer_instruction && tma_desc_ureg_id != SECRET_UREG_DESC_NOT_USED) {
-                desc_ureg_id = tma_desc_ureg_id;
-              }
-              if(desc_ureg_id != SECRET_UREG_DESC_NOT_USED) {
-                nvbit_add_call_arg_ureg_val(instr, desc_ureg_id);
-                nvbit_add_call_arg_const_val32(instr, desc_ureg_id);
-                nvbit_add_call_arg_ureg_val(instr, desc_ureg_id + 1);
-              }else {
-                nvbit_add_call_arg_const_val32(instr, SECRET_UREG_DESC_NOT_USED);
-                nvbit_add_call_arg_const_val32(instr, SECRET_UREG_DESC_NOT_USED);
-                nvbit_add_call_arg_const_val32(instr, SECRET_UREG_DESC_NOT_USED);
+              if (inline_contract_capture) {
+                if (contract_event_kind ==
+                        MBARRIER_CONTRACT_EVENT_ARRIVE &&
+                    !sync_site_info.semantic_is_zero_literal) {
+                  if (sync_site_info.semantic_reg_type ==
+                      TRACED_REG_TYPE::REGULAR) {
+                    nvbit_add_call_arg_reg_val(
+                        instr, sync_site_info.semantic_reg_id);
+                  } else {
+                    nvbit_add_call_arg_ureg_val(
+                        instr, sync_site_info.semantic_reg_id);
+                  }
+                } else {
+                  nvbit_add_call_arg_const_val32(instr, 0);
+                }
+                const uint64_t registry_addr =
+                    reinterpret_cast<uint64_t>(
+                        ctx_state->mbarrier_contract_registry);
+                nvbit_add_call_arg_const_val32(
+                    instr,
+                    static_cast<uint32_t>(registry_addr));
+                nvbit_add_call_arg_const_val32(
+                    instr,
+                    static_cast<uint32_t>(registry_addr >> 32));
+              } else {
+                uint32_t desc_ureg_id = SECRET_UREG_DESC_NOT_USED;
+                if(memref_idx_with_desc.find(mem_oper_idx) != memref_idx_with_desc.end()) {
+                  desc_ureg_id = memref_idx_with_desc[mem_oper_idx];
+                } else if(is_tma_desc_consumer_instruction && tma_desc_ureg_id != SECRET_UREG_DESC_NOT_USED) {
+                  desc_ureg_id = tma_desc_ureg_id;
+                }
+                if(desc_ureg_id != SECRET_UREG_DESC_NOT_USED) {
+                  nvbit_add_call_arg_ureg_val(instr, desc_ureg_id);
+                  nvbit_add_call_arg_const_val32(instr, desc_ureg_id);
+                  nvbit_add_call_arg_ureg_val(instr, desc_ureg_id + 1);
+                }else {
+                  nvbit_add_call_arg_const_val32(instr, SECRET_UREG_DESC_NOT_USED);
+                  nvbit_add_call_arg_const_val32(instr, SECRET_UREG_DESC_NOT_USED);
+                  nvbit_add_call_arg_const_val32(instr, SECRET_UREG_DESC_NOT_USED);
+                }
               }
               mem_oper_idx--;
             }else if(has_ldc_with_reg || has_ldc_with_ureg) {
@@ -2022,6 +2822,10 @@ void instrument_function_if_needed(CUcontext ctx, CUfunction func, int device_id
           nvbit_add_call_arg_const_val64(instr,
                                         (uint64_t)&reported_dynamic_instr_counter);
           nvbit_add_call_arg_const_val64(instr, (uint64_t)&stop_report[device_id]);
+          /* host_count replaces successful compact-callback device atomics
+           * with receiver-side per-kernel accounting. */
+          nvbit_add_call_arg_const_val32(
+              instr, lighter_tracer_host_count ? 0 : 1);
       }
 
       /* Phase 0b (TMA_BASE_ADDR.md §2.13): instrument the entry
@@ -2093,7 +2897,26 @@ void instrument_function_if_needed(CUcontext ctx, CUfunction func, int device_id
           mref_index++;
         }
       }
+
       cnt++;
+    }
+
+    if (lighter_tracer_sparse_reconstruct) {
+      for (const auto &pending : sparse_pending_pcs) {
+        if (!pending.empty()) {
+          fprintf(stderr,
+                  "[TRACE-SPARSE] unterminated basic-block span: "
+                  "function=%s omitted=%zu\n",
+                  current_kernel_name.c_str(), pending.size());
+          abort();
+        }
+      }
+      printf("[TRACE-SPARSE] function=%s static_retained=%llu "
+             "static_omitted=%llu cfg_misses=%llu\n",
+             current_kernel_name.c_str(),
+             static_cast<unsigned long long>(sparse_static_retained),
+             static_cast<unsigned long long>(sparse_static_omitted),
+             static_cast<unsigned long long>(sparse_static_cfg_misses));
     }
 
     pthread_mutex_lock(&mutex);
@@ -2135,15 +2958,248 @@ void instrument_function_if_needed(CUcontext ctx, CUfunction func, int device_id
   }
 }
 
-__global__ void flush_channel(ChannelDev* ch_dev) {
+__global__ void flush_channel(ChannelDev* ch_dev, int compact_transport) {
   /* push memory access with negative cta id to communicate the kernel is
    * completed */
-  inst_trace_t ma;
-  ma.cta_id_x = -1;
-  ch_dev->push(&ma, sizeof(inst_trace_t));
+  if (compact_transport) {
+    inst_trace_t ma;
+    ma.record_size = INST_TRACE_COMPACT_SIZE;
+    ma.record_version = INST_TRACE_RECORD_VERSION;
+    ma.record_flags = 0;
+    ma.cta_id_x = -1;
+    ma.mem_type = MEM_TYPE::NONE;
+    ch_dev->push(&ma, ma.record_size);
+  } else {
+    legacy_inst_trace_t ma;
+    ma.cta_id_x = -1;
+    ch_dev->push(&ma, sizeof(legacy_inst_trace_t));
+  }
 
   /* flush channel */
   ch_dev->flush();
+}
+
+static void acquire_mbarrier_contract_launch(
+    CTXstate *ctx_state, int device_id, int trace_kernel_id, int stream_id,
+    const cuLaunchKernel_params *params) {
+  assert(mbarrier_contract_capture_enabled);
+  assert(ctx_state->mbarrier_contract_registry != nullptr);
+  mbarrier_contract_registry_t *registry =
+      ctx_state->mbarrier_contract_registry;
+  if (registry->active != 0 || registry->launch.state != 0 ||
+      registry->error_flags != 0) {
+    fprintf(stderr,
+            "[MBARRIER-CONTRACT] concurrent or stale launch: active=%d "
+            "state=%u errors=0x%x kernel=%d\n",
+            registry->active, registry->launch.state,
+            registry->error_flags, trace_kernel_id);
+    abort();
+  }
+
+  const uint64_t num_ctas =
+      static_cast<uint64_t>(params->gridDimX) * params->gridDimY *
+      params->gridDimZ;
+  if (num_ctas == 0 || num_ctas > UINT32_MAX) {
+    fprintf(stderr,
+            "[MBARRIER-CONTRACT] unsupported launch dimensions: "
+            "ctas=%llu kernel=%d\n",
+            static_cast<unsigned long long>(num_ctas),
+            trace_kernel_id);
+    abort();
+  }
+
+  const uint64_t barrier_entries =
+      num_ctas *
+      static_cast<uint64_t>(mbarrier_contract_barrier_slots_per_cta);
+  if (barrier_entries >
+      SIZE_MAX / sizeof(mbarrier_contract_barrier_state_t)) {
+    fprintf(stderr,
+            "[MBARRIER-CONTRACT] launch allocation overflow: kernel=%d "
+            "ctas=%llu barrier_entries=%llu\n",
+            trace_kernel_id,
+            static_cast<unsigned long long>(num_ctas),
+            static_cast<unsigned long long>(barrier_entries));
+    abort();
+  }
+
+  mbarrier_contract_launch_t *launch = &registry->launch;
+  if (launch->barrier_state_ptr != 0) {
+    fprintf(stderr,
+            "[MBARRIER-CONTRACT] stale launch pointers: kernel=%d\n",
+            trace_kernel_id);
+    abort();
+  }
+
+  const bool prior_skip_callback = skip_callback_flag;
+  skip_callback_flag = true;
+  CUDA_SAFECALL(cuMemAllocManaged(
+      reinterpret_cast<CUdeviceptr *>(&launch->barrier_state_ptr),
+      barrier_entries * sizeof(mbarrier_contract_barrier_state_t),
+      CU_MEM_ATTACH_GLOBAL));
+  CUDA_SAFECALL(cuMemsetD8(
+      static_cast<CUdeviceptr>(launch->barrier_state_ptr), 0,
+      barrier_entries * sizeof(mbarrier_contract_barrier_state_t)));
+  skip_callback_flag = prior_skip_callback;
+
+  if (next_mbarrier_contract_launch_uid == 0) {
+    fprintf(stderr, "[MBARRIER-CONTRACT] launch UID overflow\n");
+    abort();
+  }
+  launch->device_id = static_cast<uint32_t>(device_id);
+  launch->stream_id = static_cast<uint32_t>(stream_id);
+  launch->trace_kernel_id = static_cast<uint32_t>(trace_kernel_id);
+  launch->launch_uid = next_mbarrier_contract_launch_uid++;
+  launch->grid_dim_x = params->gridDimX;
+  launch->grid_dim_y = params->gridDimY;
+  launch->grid_dim_z = params->gridDimZ;
+  launch->num_ctas = static_cast<uint32_t>(num_ctas);
+  launch->barrier_slots_per_cta =
+      static_cast<uint32_t>(
+          mbarrier_contract_barrier_slots_per_cta);
+  launch->state = 1;
+  registry->error_flags = 0;
+  ctx_state->received_mbarrier_records_per_kernel.store(
+      0, std::memory_order_release);
+  __sync_synchronize();
+  registry->active = 1;
+
+  printf("[MBARRIER-CONTRACT] launch_begin uid=%llu kernel=%d ctas=%u "
+         "barrier_slots_per_cta=%u state_buffer_kib=%.2f "
+         "transport=existing_sync_record extra_callbacks=0\n",
+         static_cast<unsigned long long>(launch->launch_uid),
+         trace_kernel_id, launch->num_ctas,
+         launch->barrier_slots_per_cta,
+         static_cast<double>(
+             barrier_entries *
+             sizeof(mbarrier_contract_barrier_state_t)) /
+             1024.0);
+  fflush(stdout);
+}
+
+static void release_mbarrier_contract_launch(CTXstate *ctx_state) {
+  assert(mbarrier_contract_capture_enabled);
+  mbarrier_contract_registry_t *registry =
+      ctx_state->mbarrier_contract_registry;
+  if (registry == nullptr || registry->active != 1 ||
+      registry->launch.state != 1) {
+    fprintf(stderr,
+            "[MBARRIER-CONTRACT] missing active launch at kernel exit\n");
+    abort();
+  }
+  mbarrier_contract_launch_t *launch = &registry->launch;
+  if (registry->error_flags != 0) {
+    fprintf(stderr,
+            "[MBARRIER-CONTRACT] launch validation failed: "
+            "uid=%llu kernel=%u errors=0x%x\n",
+            static_cast<unsigned long long>(launch->launch_uid),
+            launch->trace_kernel_id, registry->error_flags);
+    abort();
+  }
+
+  const uint64_t emitted =
+      ctx_state->received_mbarrier_records_per_kernel.load(
+          std::memory_order_acquire);
+  printf("[MBARRIER-CONTRACT] launch_end uid=%llu kernel=%u "
+         "records=%llu status=PASS\n",
+         static_cast<unsigned long long>(launch->launch_uid),
+         launch->trace_kernel_id,
+         static_cast<unsigned long long>(emitted));
+  fflush(stdout);
+
+  registry->active = 0;
+  launch->state = 0;
+  const bool prior_skip_callback = skip_callback_flag;
+  skip_callback_flag = true;
+  CUDA_SAFECALL(cuMemFree(
+      static_cast<CUdeviceptr>(launch->barrier_state_ptr)));
+  skip_callback_flag = prior_skip_callback;
+  launch->barrier_state_ptr = 0;
+  ctx_state->received_mbarrier_records_per_kernel.store(
+      0, std::memory_order_release);
+}
+
+static void reset_warp_lifetime_capture(
+    int kernel_trace_id, const char *kernel_name,
+    const cuLaunchKernel_params *params) {
+  assert(warp_lifetime_capture != nullptr);
+  const unsigned long long num_ctas =
+      static_cast<unsigned long long>(params->gridDimX) *
+      params->gridDimY * params->gridDimZ;
+  const unsigned int num_threads =
+      params->blockDimX * params->blockDimY * params->blockDimZ;
+  const unsigned int num_warps = (num_threads + 31) / 32;
+  if (num_ctas > WARP_LIFETIME_MAX_CTAS ||
+      num_warps > WARP_LIFETIME_MAX_WARPS) {
+    fprintf(stderr,
+            "[WARP-LIFETIME] launch exceeds capture bounds: ctas=%llu/%u "
+            "warps_per_cta=%u/%u\n",
+            num_ctas, WARP_LIFETIME_MAX_CTAS, num_warps,
+            WARP_LIFETIME_MAX_WARPS);
+    abort();
+  }
+
+  const bool prior_skip_callback = skip_callback_flag;
+  skip_callback_flag = true;
+  CUDA_SAFECALL(cuMemsetD8(
+      reinterpret_cast<CUdeviceptr>(warp_lifetime_capture), 0,
+      sizeof(warp_lifetime_capture_t)));
+  skip_callback_flag = prior_skip_callback;
+  warp_lifetime_grid_x = params->gridDimX;
+  warp_lifetime_grid_y = params->gridDimY;
+  warp_lifetime_grid_z = params->gridDimZ;
+  warp_lifetime_warps_per_cta = num_warps;
+  warp_lifetime_kernel_id = kernel_trace_id;
+  warp_lifetime_kernel_name = kernel_name ? kernel_name : "<unknown>";
+  warp_lifetime_capture_active = true;
+
+  if (!warp_lifetime_output_initialized) {
+    std::ofstream out(traces_path + "/warp_exit_timestamps.csv",
+                      std::ios::out | std::ios::trunc);
+    out << "kernel_id,kernel_name,cta_x,cta_y,cta_z,warp_id,sm_id,"
+           "exit_clock64\n";
+    out.close();
+    warp_lifetime_output_initialized = true;
+  }
+}
+
+static void dump_warp_lifetime_capture() {
+  if (!warp_lifetime_capture_active || warp_lifetime_capture == nullptr) {
+    return;
+  }
+
+  std::ofstream out(traces_path + "/warp_exit_timestamps.csv",
+                    std::ios::out | std::ios::app);
+  const unsigned int num_ctas =
+      warp_lifetime_grid_x * warp_lifetime_grid_y * warp_lifetime_grid_z;
+  unsigned int rows = 0;
+  for (unsigned int cta = 0; cta < num_ctas; ++cta) {
+    const unsigned int cta_x = cta % warp_lifetime_grid_x;
+    const unsigned int cta_y =
+        (cta / warp_lifetime_grid_x) % warp_lifetime_grid_y;
+    const unsigned int cta_z =
+        cta / (warp_lifetime_grid_x * warp_lifetime_grid_y);
+    for (unsigned int warp = 0; warp < warp_lifetime_warps_per_cta; ++warp) {
+      const unsigned int slot =
+          cta * WARP_LIFETIME_MAX_WARPS + warp;
+      const unsigned long long exit_clock =
+          warp_lifetime_capture->exit_clock[slot];
+      if (exit_clock == 0) {
+        continue;
+      }
+      out << warp_lifetime_kernel_id << "," << warp_lifetime_kernel_name
+          << "," << cta_x << "," << cta_y << "," << cta_z
+          << "," << warp << "," << warp_lifetime_capture->sm_id[slot]
+          << "," << exit_clock << "\n";
+      rows++;
+    }
+  }
+  out.close();
+
+  printf("[WARP-LIFETIME] kernel=%d rows=%u overflow=%u output=%s\n",
+         warp_lifetime_kernel_id, rows,
+         warp_lifetime_capture->overflow_count,
+         (traces_path + "/warp_exit_timestamps.csv").c_str());
+  warp_lifetime_capture_active = false;
 }
 
 static FILE *statsFile = NULL;
@@ -2288,6 +3344,12 @@ void nvbit_at_cuda_event(CUcontext ctx, int is_exit, nvbit_api_cuda_t cbid,
     if (!is_exit) {
       int device_id;
       cuCtxGetDevice(&device_id);
+      ctx_state->received_records_per_kernel.store(
+          0, std::memory_order_relaxed);
+      ctx_state->sparse_retained_instructions_per_kernel.store(
+          0, std::memory_order_relaxed);
+      ctx_state->sparse_reconstructed_instructions_per_kernel.store(
+          0, std::memory_order_relaxed);
       if (active_from_start && dynamic_kernel_limit_start && kernel_id[device_id] == dynamic_kernel_limit_start)
         active_region = true;
 
@@ -2329,6 +3391,10 @@ void nvbit_at_cuda_event(CUcontext ctx, int is_exit, nvbit_api_cuda_t cbid,
         assert(it_map_already_instrumented != map_function_to_kernel_name_and_variant_id.end());
         variant_id = std::get<1>(it_map_already_instrumented->second);
         std::string kernel_name(nvbit_get_func_name(ctx, p->f, true));
+        if (warp_lifetime_only || warp_lifetime_sidecar) {
+          reset_warp_lifetime_capture(kernel_id[device_id],
+                                      kernel_name.c_str(), p);
+        }
 
         // std::vector<int> kernel_argument_sizes = nvbit_get_kernel_argument_sizes(p->f);
         
@@ -2341,6 +3407,12 @@ void nvbit_at_cuda_event(CUcontext ctx, int is_exit, nvbit_api_cuda_t cbid,
         uint64_t stream_key = (uint64_t)p->hStream;
         stream_key = 0; // We use 0 as stream key for now, as we do not support multiple streams yet. WIPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP
         current_stream_id[device_id] = stream_key;
+        if (mbarrier_contract_capture_enabled &&
+            mbarrier_contract_capture_launches.count(p->f) != 0) {
+          acquire_mbarrier_contract_launch(
+              ctx_state, device_id, kernel_id[device_id],
+              static_cast<int>(stream_key), p);
+        }
         dynamic_trace::cuda_stream &stream = (*gpu_dev.mutable_streams())[stream_key];
         stream.set_id(stream_key);
         dynamic_trace::kernel *ker = stream.add_kernels();
@@ -2405,13 +3477,20 @@ void nvbit_at_cuda_event(CUcontext ctx, int is_exit, nvbit_api_cuda_t cbid,
       }
       assert(cuErr == cudaSuccess);
 
+      if ((warp_lifetime_only || warp_lifetime_sidecar) &&
+          !stop_report[device_id] &&
+          warp_lifetime_capture_active &&
+          warp_lifetime_kernel_id == kernel_id[device_id] - 1) {
+        dump_warp_lifetime_capture();
+      }
+
       /* make sure we prevent re-entry on the nvbit_callback when issuing
        * the flush_channel kernel */
       skip_callback_flag = true;
 
       /* issue flush of channel so we are sure all the memory accesses
        * have been pushed */
-      flush_channel<<<1, 1>>>(ctx_state->channel_dev);
+      flush_channel<<<1, 1>>>(ctx_state->channel_dev, compact_wire_enabled);
       cudaDeviceSynchronize();
       assert(cudaGetLastError() == cudaSuccess);
 
@@ -2422,6 +3501,11 @@ void nvbit_at_cuda_event(CUcontext ctx, int is_exit, nvbit_api_cuda_t cbid,
        * current kernel */
       while (recv_thread_receiving[ctx]) {
         pthread_yield();
+      }
+      if (mbarrier_contract_capture_enabled &&
+          ctx_state->mbarrier_contract_registry != nullptr &&
+          ctx_state->mbarrier_contract_registry->active == 1) {
+        release_mbarrier_contract_launch(ctx_state);
       }
 
       /* Phase 0b (TMA_BASE_ADDR.md §2.13): the kernel is fully done and the channel
@@ -2434,17 +3518,55 @@ void nvbit_at_cuda_event(CUcontext ctx, int is_exit, nvbit_api_cuda_t cbid,
         append_tma_desc_factcheck_event(device_id, kernel_id[device_id] - 1);
       }
 
-      unsigned total_insts_per_kernel =
+      uint64_t total_insts_per_kernel =
           total_dynamic_instr_counter - old_total_insts;
       old_total_insts = total_dynamic_instr_counter;
 
-      unsigned reported_insts_per_kernel =
+      uint64_t reported_insts_per_kernel =
           reported_dynamic_instr_counter - old_total_reported_insts;
       old_total_reported_insts = reported_dynamic_instr_counter;
 
+      uint64_t received_records =
+          ctx_state->received_records_per_kernel.load(
+              std::memory_order_acquire);
+      if (lighter_tracer_host_count && !stop_report[device_id]) {
+        total_insts_per_kernel = received_records;
+        reported_insts_per_kernel = received_records;
+      }
+      if (lighter_tracer_host_count) {
+        printf("[TRACE-COUNT] kernel=%d received_records=%llu "
+               "stats_total=%llu stats_reported=%llu stop_report=%d "
+               "source=%s\n",
+               kernel_id[device_id] - 1,
+               static_cast<unsigned long long>(received_records),
+               static_cast<unsigned long long>(total_insts_per_kernel),
+               static_cast<unsigned long long>(reported_insts_per_kernel),
+               stop_report[device_id] ? 1 : 0,
+               stop_report[device_id] ? "device-suppressed" : "host");
+      }
+      if (lighter_tracer_sparse_reconstruct) {
+        uint64_t retained_instructions =
+            ctx_state->sparse_retained_instructions_per_kernel.load(
+                std::memory_order_acquire);
+        uint64_t reconstructed_instructions =
+            ctx_state->sparse_reconstructed_instructions_per_kernel.load(
+                std::memory_order_acquire);
+        printf("[TRACE-SPARSE] kernel=%d received_records=%llu "
+               "retained_instructions=%llu reconstructed_instructions=%llu "
+               "final_instructions=%llu stop_report=%d\n",
+               kernel_id[device_id] - 1,
+               static_cast<unsigned long long>(received_records),
+               static_cast<unsigned long long>(retained_instructions),
+               static_cast<unsigned long long>(reconstructed_instructions),
+               static_cast<unsigned long long>(
+                   retained_instructions + reconstructed_instructions),
+               stop_report[device_id] ? 1 : 0);
+      }
+
       statsFile = fopen(stats_location.c_str(), "a");
-      fprintf(statsFile, "%d,%d", total_insts_per_kernel,
-              reported_insts_per_kernel);
+      fprintf(statsFile, "%llu,%llu",
+              static_cast<unsigned long long>(total_insts_per_kernel),
+              static_cast<unsigned long long>(reported_insts_per_kernel));
       fprintf(statsFile, "\n");
       fclose(statsFile);
       
@@ -2583,6 +3705,86 @@ void base_delta_compress(const uint64_t *addrs, const std::bitset<32> &mask,
   }
 }
 
+static uint32_t validated_inst_trace_record_size(const char *data,
+                                                 uint32_t available_bytes) {
+  if (available_bytes < INST_TRACE_COMPACT_SIZE) {
+    std::cerr << "[TRACE-WIRE] truncated compact record: available="
+              << available_bytes << " required=" << INST_TRACE_COMPACT_SIZE
+              << std::endl;
+    abort();
+  }
+
+  const inst_trace_t *record =
+      reinterpret_cast<const inst_trace_t *>(data);
+  if (record->record_version != INST_TRACE_RECORD_VERSION) {
+    std::cerr << "[TRACE-WIRE] unsupported record version "
+              << record->record_version << std::endl;
+    abort();
+  }
+
+  const uint16_t known_flags =
+      INST_TRACE_HAS_LANE_VALUES |
+      INST_TRACE_HAS_MBARRIER_CONTRACT;
+  if ((record->record_flags & ~known_flags) != 0) {
+    std::cerr << "[TRACE-WIRE] unknown record flags 0x" << std::hex
+              << record->record_flags << std::dec << std::endl;
+    abort();
+  }
+
+  const uint32_t expected_size =
+      inst_trace_has_mbarrier_contract(record)
+          ? INST_TRACE_MBARRIER_SIZE
+          : (inst_trace_has_lane_values(record)
+                 ? INST_TRACE_MEMORY_SIZE
+                 : INST_TRACE_COMPACT_SIZE);
+  if (record->record_size != expected_size ||
+      record->record_size > available_bytes) {
+    std::cerr << "[TRACE-WIRE] invalid record size=" << record->record_size
+              << " expected=" << expected_size
+              << " available=" << available_bytes << std::endl;
+    abort();
+  }
+  if (record->cta_id_x != -1) {
+    const bool memory_record = record->mem_type != MEM_TYPE::NONE;
+    if (memory_record != inst_trace_has_lane_values(record)) {
+      std::cerr << "[TRACE-WIRE] payload/type mismatch: mem_type="
+                << static_cast<int>(record->mem_type)
+                << " flags=0x" << std::hex << record->record_flags
+                << std::dec << std::endl;
+      abort();
+    }
+    if (inst_trace_has_mbarrier_contract(record)) {
+      if (!inst_trace_has_lane_values(record) ||
+          record->mem_type != MEM_TYPE::STANDARD_MEM ||
+          (record->active_mask & record->predicate_mask) == 0) {
+        std::cerr
+            << "[MBARRIER-CONTRACT] invalid inline record envelope"
+            << std::endl;
+        abort();
+      }
+      const mbarrier_contract_payload_t *payload =
+          inst_trace_mbarrier_contract(record);
+      if (payload->payload_version !=
+              MBARRIER_CONTRACT_RECORD_VERSION ||
+          payload->event_kind < MBARRIER_CONTRACT_EVENT_EXCH ||
+          payload->event_kind > MBARRIER_CONTRACT_EVENT_WAIT ||
+          payload->launch_uid == 0 ||
+          payload->barrier_addr !=
+              inst_trace_value_0(
+                  record,
+                  get_first_predicated_lane(
+                      record->active_mask,
+                      record->predicate_mask))) {
+        std::cerr
+            << "[MBARRIER-CONTRACT] invalid inline payload"
+            << std::endl;
+        abort();
+      }
+    }
+  }
+  return record->record_size;
+}
+
 void *recv_thread_fun(void *args) {
   CUcontext ctx = (CUcontext)args;
   pthread_mutex_lock(&mutex);
@@ -2601,23 +3803,116 @@ void *recv_thread_fun(void *args) {
   pthread_mutex_unlock(&mutex);
 
   char *recv_buffer = (char *)malloc(CHANNEL_SIZE);
+  uint64_t legacy_records = 0;
+  uint64_t compact_records = 0;
+  uint64_t memory_records = 0;
+  uint64_t wire_bytes = 0;
+  uint64_t kernel_received_records = 0;
+  uint64_t kernel_mbarrier_records = 0;
+  uint64_t kernel_sparse_retained_instructions = 0;
+  uint64_t kernel_sparse_reconstructed_instructions = 0;
 
   while (ctx_state->recv_thread_done == RecvThreadState::WORKING) {
     uint32_t num_recv_bytes = ch_host->recv(recv_buffer, CHANNEL_SIZE);
     if (num_recv_bytes > 0) {
+      if (warp_lifetime_only) {
+        uint32_t offset = 0;
+        while (offset < num_recv_bytes) {
+          uint32_t record_size = 0;
+          int cta_id_x = 0;
+          if (compact_wire_enabled) {
+            record_size = validated_inst_trace_record_size(
+                &recv_buffer[offset], num_recv_bytes - offset);
+            const inst_trace_t *token =
+                reinterpret_cast<const inst_trace_t *>(&recv_buffer[offset]);
+            cta_id_x = token->cta_id_x;
+          } else {
+            if (num_recv_bytes - offset < INST_TRACE_LEGACY_SIZE) {
+              std::cerr << "[TRACE-WIRE] truncated legacy record"
+                        << std::endl;
+              abort();
+            }
+            record_size = INST_TRACE_LEGACY_SIZE;
+            const legacy_inst_trace_t *token =
+                reinterpret_cast<const legacy_inst_trace_t *>(
+                    &recv_buffer[offset]);
+            cta_id_x = token->cta_id_x;
+          }
+          if (cta_id_x == -1) {
+            ctx_state->received_records_per_kernel.store(
+                0, std::memory_order_release);
+            ctx_state->sparse_retained_instructions_per_kernel.store(
+                0, std::memory_order_release);
+            ctx_state->sparse_reconstructed_instructions_per_kernel.store(
+                0, std::memory_order_release);
+            ctx_state->received_mbarrier_records_per_kernel.store(
+                0, std::memory_order_release);
+            recv_thread_receiving[ctx] = false;
+            break;
+          }
+          offset += record_size;
+        }
+        continue;
+      }
       uint32_t num_processed_bytes = 0;
-      dynamic_trace::cuda_stream &stream = (*gpu_dev.mutable_streams())[current_stream_id[device_id]];
-      dynamic_trace::kernel &ker = (*stream.mutable_kernels())[kernel_id[device_id]-2]; 
       while (num_processed_bytes < num_recv_bytes) {
-        inst_trace_t *ma = (inst_trace_t *)&recv_buffer[num_processed_bytes];
+        uint32_t record_size = 0;
+        inst_trace_t normalized_record;
+        inst_trace_t *ma = nullptr;
+        if (compact_wire_enabled) {
+          record_size = validated_inst_trace_record_size(
+              &recv_buffer[num_processed_bytes],
+              num_recv_bytes - num_processed_bytes);
+          ma = reinterpret_cast<inst_trace_t *>(
+              &recv_buffer[num_processed_bytes]);
+        } else {
+          if (num_recv_bytes - num_processed_bytes <
+              INST_TRACE_LEGACY_SIZE) {
+            std::cerr << "[TRACE-WIRE] truncated legacy record"
+                      << std::endl;
+            abort();
+          }
+          const legacy_inst_trace_t *legacy =
+              reinterpret_cast<const legacy_inst_trace_t *>(
+                  &recv_buffer[num_processed_bytes]);
+          normalize_legacy_inst_trace(legacy, &normalized_record);
+          ma = &normalized_record;
+          record_size = INST_TRACE_LEGACY_SIZE;
+        }
 
         /* when we receive a CTA_id_x it means all the kernels
         * completed, this is the special token we receive from the
         * flush channel kernel that is issues at the end of the
         * context */
         if (ma->cta_id_x == -1) {
+          ctx_state->received_records_per_kernel.store(
+              kernel_received_records, std::memory_order_release);
+          ctx_state->sparse_retained_instructions_per_kernel.store(
+              kernel_sparse_retained_instructions,
+              std::memory_order_release);
+          ctx_state->sparse_reconstructed_instructions_per_kernel.store(
+              kernel_sparse_reconstructed_instructions,
+              std::memory_order_release);
+          ctx_state->received_mbarrier_records_per_kernel.store(
+              kernel_mbarrier_records, std::memory_order_release);
+          kernel_received_records = 0;
+          kernel_mbarrier_records = 0;
+          kernel_sparse_retained_instructions = 0;
+          kernel_sparse_reconstructed_instructions = 0;
           recv_thread_receiving[ctx] = false;
           break;
+        }
+        if (lighter_tracer_host_count ||
+            lighter_tracer_sparse_reconstruct) {
+          kernel_received_records++;
+        }
+        wire_bytes += record_size;
+        if (!compact_wire_enabled) {
+          legacy_records++;
+        } else if (inst_trace_has_lane_values(ma)) {
+          memory_records++;
+        } else {
+          compact_records++;
         }
         while(!recv_thread_receiving[ctx]) {
           pthread_yield();
@@ -2642,6 +3937,28 @@ void *recv_thread_fun(void *args) {
         unsigned int &remaining_injects = get_remaining_injects_to_current_instruction(tb_string_id, warp_id_tb);
         dynamic_trace::instruction *inst;
         if(remaining_injects == 0) {
+          if (lighter_tracer_sparse_reconstruct) {
+            auto function_it =
+                sparse_prefix_pcs_by_function.find(
+                    ma->unique_function_id);
+            if (function_it != sparse_prefix_pcs_by_function.end()) {
+              auto span_it = function_it->second.find(ma->vpc);
+              if (span_it != function_it->second.end()) {
+                for (uint32_t omitted_pc : span_it->second) {
+                  dynamic_trace::instruction *reconstructed =
+                      wp.add_instructions();
+                  reconstructed->set_pc(omitted_pc);
+                  reconstructed->set_active_mask(ma->active_mask);
+                  reconstructed->set_predicate_mask(ma->active_mask);
+                  reconstructed->set_function_unique_id(
+                      ma->unique_function_id);
+                }
+                kernel_sparse_reconstructed_instructions +=
+                    span_it->second.size();
+              }
+            }
+            kernel_sparse_retained_instructions++;
+          }
           inst = wp.add_instructions();
           inst->set_pc(ma->vpc);
           inst->set_active_mask(ma->active_mask);
@@ -2670,10 +3987,72 @@ void *recv_thread_fun(void *args) {
                 dynamic_trace::instruction::sync_runtime_info *sync =
                     inst->mutable_sync();
                 sync->set_valid(true);
-                sync->set_barrier_addr(ma->addrs_or_reg_val_0[first_lane]);
+                sync->set_barrier_addr(
+                    inst_trace_value_0(ma, first_lane));
                 if (sync_site.semantic_is_zero_literal) {
                   sync->set_has_semantic_raw(true);
                   sync->set_semantic_raw(0);
+                }
+                if (inst_trace_has_mbarrier_contract(ma)) {
+                  const mbarrier_contract_payload_t *payload =
+                      inst_trace_mbarrier_contract(ma);
+                  const MBARRIER_CONTRACT_EVENT_KIND expected_kind =
+                      get_mbarrier_contract_event_kind(opcode);
+                  if (expected_kind == MBARRIER_CONTRACT_EVENT_NONE ||
+                      static_cast<uint32_t>(expected_kind) !=
+                          payload->event_kind ||
+                      sync->barrier_addr() != payload->barrier_addr ||
+                      (sync_site.semantic_is_zero_literal &&
+                       payload->semantic_raw != 0)) {
+                    std::cerr
+                        << "[MBARRIER-CONTRACT] inline payload mismatch: "
+                        << "function=" << ma->unique_function_id
+                        << " pc=0x" << std::hex << ma->vpc
+                        << std::dec << std::endl;
+                    abort();
+                  }
+                  auto *capture =
+                      inst->mutable_mbarrier_contract();
+                  if (capture->valid()) {
+                    std::cerr
+                        << "[MBARRIER-CONTRACT] duplicate inline payload: "
+                        << "function=" << ma->unique_function_id
+                        << " pc=0x" << std::hex << ma->vpc
+                        << std::dec << std::endl;
+                    abort();
+                  }
+                  capture->set_valid(true);
+                  capture->set_event_kind(payload->event_kind);
+                  capture->set_barrier_addr(payload->barrier_addr);
+                  capture->set_initialization_epoch_before(
+                      payload->initialization_epoch_before);
+                  capture->set_initialization_epoch_after(
+                      payload->initialization_epoch_after);
+                  capture->set_opened_contract_count_before(
+                      payload->opened_contract_count_before);
+                  capture->set_opened_contract_count_after(
+                      payload->opened_contract_count_after);
+                  capture->set_has_contract_ordinal(
+                      payload->contract_ordinal != 0);
+                  capture->set_contract_ordinal(
+                      payload->contract_ordinal);
+                  capture->set_capture_flags(
+                      payload->capture_flags);
+                  capture->set_barrier_error_flags(
+                      payload->barrier_error_flags);
+                  capture->set_capture_launch_uid(
+                      payload->launch_uid);
+                  const bool payload_has_semantic =
+                      expected_kind ==
+                          MBARRIER_CONTRACT_EVENT_ARRIVE ||
+                      sync_site.semantic_is_zero_literal;
+                  capture->set_has_semantic_raw(
+                      payload_has_semantic);
+                  if (payload_has_semantic) {
+                    capture->set_semantic_raw(
+                        payload->semantic_raw);
+                  }
+                  kernel_mbarrier_records++;
                 }
               } else if (callback_index ==
                              static_cast<unsigned int>(
@@ -2683,7 +4062,25 @@ void *recv_thread_fun(void *args) {
                     inst->mutable_sync();
                 sync->set_valid(true);
                 sync->set_has_semantic_raw(true);
-                sync->set_semantic_raw(ma->addrs_or_reg_val_0[first_lane]);
+                const uint64_t semantic_raw =
+                    inst_trace_value_0(ma, first_lane);
+                sync->set_semantic_raw(semantic_raw);
+                if (inst->has_mbarrier_contract() &&
+                    inst->mbarrier_contract().valid()) {
+                  auto *capture =
+                      inst->mutable_mbarrier_contract();
+                  if (capture->has_semantic_raw() &&
+                      capture->semantic_raw() != semantic_raw) {
+                    std::cerr
+                        << "[MBARRIER-CONTRACT] semantic payload mismatch: "
+                        << "function=" << ma->unique_function_id
+                        << " pc=0x" << std::hex << ma->vpc
+                        << std::dec << std::endl;
+                    abort();
+                  }
+                  capture->set_has_semantic_raw(true);
+                  capture->set_semantic_raw(semantic_raw);
+                }
               }
             }
           }
@@ -2695,7 +4092,7 @@ void *recv_thread_fun(void *args) {
           if (bar_pc_it != bar_function_it->second.end()) {
             const bar_runtime_capture_site_info &bar_site = bar_pc_it->second;
             // Register-form barrier operands take the REGULAR callback path, where the
-            // live register value lands in addrs_or_reg_val_0[lane] with mem_type==NONE.
+            // live register value lands in scalar_value_0 with mem_type==NONE.
             // Pick the first predicated-active lane: if the warp did not actually execute
             // this BAR (no active+predicated lane), nothing is captured for this instance.
             int first_lane =
@@ -2708,7 +4105,8 @@ void *recv_thread_fun(void *args) {
                     inst->mutable_bar_runtime();
                 bar->set_valid(true);
                 bar->set_has_id(true);
-                bar->set_id(static_cast<uint32_t>(ma->addrs_or_reg_val_0[first_lane]));
+                bar->set_id(static_cast<uint32_t>(
+                    inst_trace_value_0(ma, first_lane)));
               } else if (bar_site.count_callback_index >= 0 &&
                          callback_index ==
                              static_cast<unsigned int>(
@@ -2717,8 +4115,35 @@ void *recv_thread_fun(void *args) {
                     inst->mutable_bar_runtime();
                 bar->set_valid(true);
                 bar->set_has_count(true);
-                bar->set_count(static_cast<uint32_t>(ma->addrs_or_reg_val_0[first_lane]));
+                bar->set_count(static_cast<uint32_t>(
+                    inst_trace_value_0(ma, first_lane)));
               }
+            }
+          }
+        }
+        auto tma_completion_function_it =
+            tma_completion_runtime_capture_sites_by_pc.find(
+                ma->unique_function_id);
+        if (tma_completion_function_it !=
+            tma_completion_runtime_capture_sites_by_pc.end()) {
+          auto tma_completion_pc_it =
+              tma_completion_function_it->second.find(ma->vpc);
+          if (tma_completion_pc_it !=
+              tma_completion_function_it->second.end()) {
+            const tma_completion_runtime_capture_site_info &tma_site =
+                tma_completion_pc_it->second;
+            int first_lane =
+                get_first_predicated_lane(ma->active_mask,
+                                          ma->predicate_mask);
+            if (first_lane >= 0 && ma->mem_type == MEM_TYPE::NONE &&
+                callback_index == static_cast<unsigned int>(
+                                      tma_site.barrier_callback_index)) {
+              dynamic_trace::instruction::tma_completion_runtime_info *tma =
+                  inst->mutable_tma_completion();
+              tma->set_valid(true);
+              tma->set_barrier_addr(
+                  inst_trace_value_0(ma, first_lane));
+              tma->set_barrier_ureg_id(tma_site.barrier_ureg_id);
             }
           }
         }
@@ -2741,10 +4166,12 @@ void *recv_thread_fun(void *args) {
               candidate.unique_function_id = ma->unique_function_id;
               candidate.pc = ma->vpc;
               candidate.dest_ureg_id = pc_it->second;
-              candidate.pre_value_lo = static_cast<uint32_t>(ma->addrs_or_reg_val_0[0]);
+              candidate.pre_value_lo =
+                  static_cast<uint32_t>(ma->scalar_value_0);
               candidate.pre_value_hi =
-                  (ma->per_operand_type == TRACED_REG_TYPE::UNIFORM_2_REGS) ? ma->reg_val_1[0]
-                                                                            : SECRET_UREG_DESC_NOT_USED;
+                  (ma->per_operand_type == TRACED_REG_TYPE::UNIFORM_2_REGS)
+                      ? ma->scalar_value_1
+                      : SECRET_UREG_DESC_NOT_USED;
               recent_queue.push_back(candidate);
               if (recent_queue.size() > 16) {
                 recent_queue.pop_front();
@@ -2778,10 +4205,11 @@ void *recv_thread_fun(void *args) {
           if (enable_compress) {
             // try base+stride format
             base_stride_success =
-                base_stride_compress(ma->addrs_or_reg_val_0, mask, base_addr, stride);
+                base_stride_compress(ma->lane_values, mask, base_addr,
+                                     stride);
             if (!base_stride_success) {
               // if base+stride fails, try base+delta format
-              base_delta_compress(ma->addrs_or_reg_val_0, mask, base_addr, deltas);
+              base_delta_compress(ma->lane_values, mask, base_addr, deltas);
             }
           }
 
@@ -2802,7 +4230,7 @@ void *recv_thread_fun(void *args) {
             addr->set_compression_format(address_format::list_all);
             for (int s = 0; s < 32; s++) {
               if (mask.test(s))
-                addr->add_addrs(ma->addrs_or_reg_val_0[s]);
+                addr->add_addrs(ma->lane_values[s]);
             }
           }
           if (ma->mem_type == MEM_TYPE::STANDARD_MEM && enable_tma_desc &&
@@ -2812,6 +4240,36 @@ void *recv_thread_fun(void *args) {
             append_tma_desc_producer_debug_event(device_id, current_stream_id[device_id],
                                                  kernel_id[device_id] - 1, ma, tb_string_id,
                                                  warp_id_tb);
+          }
+        }
+        if (mbarrier_contract_capture_enabled &&
+            remaining_injects == 0 &&
+            (ma->active_mask & ma->predicate_mask) != 0 &&
+            get_mbarrier_contract_event_kind(opcode) !=
+                MBARRIER_CONTRACT_EVENT_NONE) {
+          const MBARRIER_CONTRACT_EVENT_KIND event_kind =
+              get_mbarrier_contract_event_kind(opcode);
+          const bool payload_required =
+              event_kind != MBARRIER_CONTRACT_EVENT_WAIT;
+          if ((payload_required &&
+               (!inst->has_mbarrier_contract() ||
+                !inst->mbarrier_contract().valid())) ||
+              !inst->has_sync() || !inst->sync().valid() ||
+              !inst->sync().has_semantic_raw() ||
+              (inst->has_mbarrier_contract() &&
+               inst->mbarrier_contract().valid() &&
+               (!inst->mbarrier_contract().
+                    has_semantic_raw() ||
+                inst->sync().barrier_addr() !=
+                    inst->mbarrier_contract().barrier_addr() ||
+                inst->sync().semantic_raw() !=
+                    inst->mbarrier_contract().semantic_raw()))) {
+            std::cerr
+                << "[MBARRIER-CONTRACT] incomplete inline instruction: "
+                << "function=" << ma->unique_function_id
+                << " pc=0x" << std::hex << ma->vpc
+                << std::dec << std::endl;
+            abort();
           }
         }
 
@@ -2838,11 +4296,28 @@ void *recv_thread_fun(void *args) {
         }
         // =============================================================================
 
-        num_processed_bytes += sizeof(inst_trace_t);
+        num_processed_bytes += record_size;
       }
     }
   }
   free(recv_buffer);
+
+  const uint64_t total_records =
+      legacy_records + compact_records + memory_records;
+  const uint64_t legacy_bytes =
+      total_records * static_cast<uint64_t>(INST_TRACE_LEGACY_SIZE);
+  const double reduction_pct =
+      legacy_bytes == 0
+          ? 0.0
+          : 100.0 * (1.0 - static_cast<double>(wire_bytes) /
+                               static_cast<double>(legacy_bytes));
+  printf("[TRACE-WIRE] mode=%s legacy_records=%" PRIu64
+         " compact_records=%" PRIu64
+         " memory_records=%" PRIu64 " wire_bytes=%" PRIu64
+         " legacy_bytes=%" PRIu64 " reduction=%.2f%%\n",
+         compact_wire_enabled ? "compact" : "legacy", legacy_records,
+         compact_records, memory_records, wire_bytes, legacy_bytes,
+         reduction_pct);
 
   // Print incremental flush stats at thread end
   if (incremental_flush_threshold > 0 && total_incremental_flushes > 0) {
@@ -3353,6 +4828,14 @@ void init_context_state(CUcontext ctx) {
       kernel_id.push_back(1);
       current_stream_id.push_back(0);
     }
+    if (warp_lifetime_only || warp_lifetime_sidecar) {
+      CUDA_SAFECALL(cuMemAllocManaged(
+          reinterpret_cast<CUdeviceptr *>(&warp_lifetime_capture),
+          sizeof(warp_lifetime_capture_t), CU_MEM_ATTACH_GLOBAL));
+      CUDA_SAFECALL(cuMemsetD8(
+          reinterpret_cast<CUdeviceptr>(warp_lifetime_capture), 0,
+          sizeof(warp_lifetime_capture_t)));
+    }
     /* Phase 0b: one managed param-base capture slot (single device assumed here,
      * matching the rest of the tool's single-stream simplification). */
     if (enable_tma_desc) {
@@ -3378,6 +4861,20 @@ void init_context_state(CUcontext ctx) {
   ctx_state->channel_host.init((int)ctx_state_map.size() - 1, CHANNEL_SIZE,
                                ctx_state->channel_dev, recv_thread_fun, ctx);
   nvbit_set_tool_pthread(ctx_state->channel_host.get_thread());
+  if (mbarrier_contract_capture_enabled) {
+    CUDA_SAFECALL(cuMemAllocManaged(
+        reinterpret_cast<CUdeviceptr *>(
+            &ctx_state->mbarrier_contract_registry),
+        sizeof(mbarrier_contract_registry_t), CU_MEM_ATTACH_GLOBAL));
+    CUDA_SAFECALL(cuMemsetD8(
+        reinterpret_cast<CUdeviceptr>(
+            ctx_state->mbarrier_contract_registry),
+        0, sizeof(mbarrier_contract_registry_t)));
+    ctx_state->mbarrier_contract_registry->magic =
+        MBARRIER_CONTRACT_REGISTRY_MAGIC;
+    ctx_state->mbarrier_contract_registry->version =
+        MBARRIER_CONTRACT_REGISTRY_VERSION;
+  }
 }
 
 void nvbit_tool_init(CUcontext ctx) {
@@ -3397,10 +4894,11 @@ void nvbit_at_ctx_term(CUcontext ctx) {
   assert(ctx_state_map.find(ctx) != ctx_state_map.end());
   CTXstate* ctx_state = ctx_state_map[ctx];
   pending_devices_to_finish--;
-  if(pending_devices_to_finish == 0) {
+  if(pending_devices_to_finish == 0 && !warp_lifetime_only) {
     dyn_trace.set_nvbit_version(NVBIT_VERSION);
     dyn_trace.set_accelsim_version(TRACER_VERSION);
-    dyn_trace.set_is_gathered_registers_values(static_cast<bool>(gather_registers));
+    dyn_trace.set_is_gathered_registers_values(
+        compact_wire_enabled && !prune_operands_enabled);
     std::string program_name = get_program_path();
     std::size_t found = program_name.find_last_of("/");
     if(found != std::string::npos) {
@@ -3428,6 +4926,28 @@ void nvbit_at_ctx_term(CUcontext ctx) {
   while (ctx_state->recv_thread_done != RecvThreadState::FINISHED);
   ctx_state->channel_host.destroy(false);
   CUDA_SAFECALL(cuMemFree(reinterpret_cast<CUdeviceptr>(ctx_state->channel_dev)));
+  if (ctx_state->mbarrier_contract_registry != nullptr) {
+    if (ctx_state->mbarrier_contract_registry->active != 0 ||
+        ctx_state->mbarrier_contract_registry->launch.state != 0 ||
+        ctx_state->mbarrier_contract_registry->error_flags != 0) {
+      fprintf(stderr,
+              "[MBARRIER-CONTRACT] context terminated with live or failed "
+              "capture state: active=%d state=%u errors=0x%x\n",
+              ctx_state->mbarrier_contract_registry->active,
+              ctx_state->mbarrier_contract_registry->launch.state,
+              ctx_state->mbarrier_contract_registry->error_flags);
+      abort();
+    }
+    CUDA_SAFECALL(cuMemFree(
+        reinterpret_cast<CUdeviceptr>(
+            ctx_state->mbarrier_contract_registry)));
+    ctx_state->mbarrier_contract_registry = nullptr;
+  }
+  if (pending_devices_to_finish == 0 && warp_lifetime_capture != nullptr) {
+    CUDA_SAFECALL(cuMemFree(
+        reinterpret_cast<CUdeviceptr>(warp_lifetime_capture)));
+    warp_lifetime_capture = nullptr;
+  }
   skip_callback_flag = false;
   delete ctx_state;
   pthread_mutex_unlock(&mutex);

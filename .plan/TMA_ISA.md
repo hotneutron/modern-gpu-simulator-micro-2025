@@ -4,6 +4,14 @@
 
 This note is for **FlashAttention-3 (FA3)** trace investigation on Hopper.
 
+> **Post-`.e83` mapping status (2026-08-24).** Opcode semantics and byte-source
+> formulas in this document remain valid. Claims that the current
+> `(uid,pc)->descriptor` map is exact do not. The old direct path compares
+> offsets from different coordinate spaces, while the old chain merges
+> trace-kernel variants. Exact descriptor identity now requires a
+> `(trace_kernel_id, unique_function_id, pc)` UTMACCTL data-flow chain with zero
+> ambiguity. See [`WAIT_BLOCK_TMA_OWNERSHIP.md`](WAIT_BLOCK_TMA_OWNERSHIP.md).
+
 Trace path checked:
 
 `/home/jihyun/project/modern-gpu-simulator-micro-2025/simulator-remodeled/hw_run/traces/device-0/12.8/flashattn-fa3-bf16-bwd-causal-b1-s2048-hd64-nh24/flashattn_fa3_bf16_bwd_causal_b1_s2048_hd64_nh24___warmup_0___iters_1/traces/dynamic_trace.pb`
@@ -49,21 +57,21 @@ Related files checked:
   exact** (from operand covered_bytes) even when the base is synthetic — only the
   *where* is fake, not the *how much*.
 
-**How the real base is actually recovered** (per `(uid,pc)`, done in
-`build_tma_pc_base_map.py`): the 128B `CUtensorMap` is passed **by value** as a
-kernel argument, so it physically sits in the param block. We match the encoded
-128B blob into the param struct byte-for-byte, keyed by the **SMEM-window offset
-(low16 = tensor ID)** for load/store, or the **prologue `param_base+off`
-(`off−0x30` = struct slot)** for the prefetch-control chain. `qword0` of that
-matched 128B = the tensor's real GMEM base. Result on FA3: **23/23 descriptor
-sites exact, 0 pool, 0 unresolved.**
+**How the target real-base recovery works:** each 128B `CUtensorMap` blob is
+located byte-for-byte in the captured kernel parameter struct. A
+kernel-specific `UTMACCTL.PF` source/destination edge then links that exact
+struct descriptor to the runtime TMA state consumed by a descriptor-family
+instruction. `qword0` of the selected blob is the real GMEM base. The old
+`runtime offset == struct offset` direct shortcut is not a data-flow proof and
+must not select the descriptor. Historical `23/23` results prove coverage only;
+exactness remains pending the kernel-aware chain repair.
 
 | opcode | desc ref? | dest (GMEM base) source | size source | mapped to real base? |
 |---|---|---|---|---|
-| **UTMALDG.4D** | yes (`desc[URx]`, SMEM window) | operand ci=0 SMEM-window low16 = tensor ID → base map → **descriptor qword0** | descriptor `Πbox_dim·element_size` | **yes (exact)** |
-| **UTMASTG.4D/.5D** | yes (SMEM window) | same as UTMALDG (ci=0 SMEM window → base map) | descriptor box | **yes (exact)** |
-| **UTMAPF.L2.4D** | no (`desc_valid=false`) | prologue `param_base+off`, `off−0x30` = struct slot → **descriptor qword0** (prefetch target) | descriptor box | **yes (exact)** — fwd only |
-| **UTMACCTL.PF** | no (`desc_valid=false`) | prologue `param_base+off` (off∈{0xb0,0x170,0x230,0x2f0,0x4f0,0x5b0}) → struct slot → descriptor qword0 | descriptor box (prefetch control) | **yes (exact)** |
+| **UTMALDG.4D** | yes (`desc[URx]`, SMEM window) | kernel-aware UTMACCTL chain → exact descriptor qword0 | descriptor `Πbox_dim·element_size` | **correction pending** |
+| **UTMASTG.4D/.5D** | yes (SMEM window) | same kernel-aware chain rule | descriptor box | **correction pending** |
+| **UTMAPF.L2.4D** | no (`desc_valid=false`) | kernel-aware prologue chain to the prefetched descriptor | descriptor box | **correction pending** — fwd only |
+| **UTMACCTL.PF** | no (`desc_valid=false`) | prologue source and runtime destination form the descriptor-chain edge | descriptor box (prefetch control) | chain evidence source |
 | **UBLKRED.G.S.ADD.F32.RN** | yes but **bare handle** (`desc_value_hi=0x14f00000`, NOT a tensormap) | dest = raw dQaccum GMEM ptr — **real base read offline from the by-value param struct** (`launch_param_blobs`), NOT from a tensormap | operand ci=2 `span·16B` (covered_bytes, e.g. `0x400·16=16384B`) | **M2.5: real base + mock tiling** (base `0x7fd661400000`, num_tiles 768); synthetic in M1 |
 | **UBLKCP.S.G** | no (`desc_valid=false`) | GMEM addr operand (cb=0) → per-pc **real base** from param struct (scratch `0x7fd533e00000` / dQaccum `0x7fd661400000`) | operand ci=2 `span·16B` (e.g. `0x20·16=512B`) | **M2.5: per-pc real base + mock tiling**; synthetic in M1 |
 | **UTMACMDFLUSH** | no | none (control only) | none (no data request) | n/a |
@@ -80,12 +88,11 @@ M2 CTA-indexed tile spread with `tile_bytes=covered_bytes`, `num_tiles=region/ti
 the local bwd trace — see the UBLKRED section below.
 
 **Simulator integration:** the base is looked up in `build_tma_command`
-(the only place `(uid,pc)` is still live), stored in `TMACommand.global_base`, and
-carried to `mover_issue_requests`. Gated by `-tma_real_base_addr_enable`. All 11
-descriptor fields (`tensor_rank, tensor_data_type, global_dim[5],
-global_strides[5], box_dim[5], element_strides[5], interleave, swizzle,
-l2_promotion, oob_fill, element_size`) now come from the exact matched 128B, so
-the old `handle_hi → config_id` heuristic is superseded.
+(the point where `(trace_kernel_id,uid,pc)` is live), stored in
+`TMACommand.global_base`, and carried to `mover_issue_requests`. The existing
+runtime still looks up `(uid,pc)` and therefore requires B0-B correction before
+its descriptor identity and all 11 associated descriptor fields can be treated
+as exact.
 
 ## Ops Seen In This FA3 Trace
 
@@ -125,9 +132,9 @@ Trace-driven decode/execution path reference:
 
 | Opcode family in FA3 trace | Decode category now         | Runtime handling status in remodeled simulator                                                                                                |
 | -------------------------- | --------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
-| `UTMALDG.*`                | `LOAD_OP`                   | **Modeled**. Issued to `tma_unit_sm`; real base from `tma_pc_base_map.json` (exact), size from descriptor box, 128B-sector requests to L2.     |
-| `UTMAPF.*`                 | `LOAD_OP`                   | **Modeled (prefetch)**. Exact base (prologue chain), descriptor box size; warms L2 (fwd only in FA3).                                          |
-| `UTMASTG.*`                | `STORE_OP`                  | **Modeled**. Issued to `tma_unit_sm`; exact base (SMEM window), descriptor box size, write-side requests.                                      |
+| `UTMALDG.*`                | `LOAD_OP`                   | **Modeled**. Issued to `tma_unit_sm`; base + descriptor box from `tma_pc_base_map.json`. Deterministically resolved, but **not yet exact** — the map is still keyed `(uid,pc)` via the direct-first path, so descriptor identity (and the K5 `0x96b0` size) is pending B0-B regeneration. 128B-sector requests to L2. |
+| `UTMAPF.*`                 | `LOAD_OP`                   | **Modeled (prefetch)**. Base via prologue chain, descriptor box size; warms L2 (fwd only in FA3). Base identity shares the `(uid,pc)` map, so it is **correction pending** with UTMALDG (B0-B).            |
+| `UTMASTG.*`                | `STORE_OP`                  | **Modeled**. Issued to `tma_unit_sm`; base (SMEM window), descriptor box size, write-side requests. Same kernel-aware chain rule — base identity is **correction pending** (B0-B).                          |
 | `UBLKCP.*`                 | `LOAD_OP`                   | **Modeled**. Bulk copy, not a tensormap; size = operand covered_bytes (exact). Base synthetic in M1; **M2.5: per-pc real base (offline param-blob) + mock tiling**.       |
 | `UBLKRED.*`                | `STORE_OP`                  | **Modeled**. Bulk reduction; desc is a bare handle, dest is a raw GMEM ptr; size = covered_bytes (exact). Base synthetic in M1; **M2.5: real base (offline param-blob) + mock tiling**.     |
 | `UTMACCTL.*`               | `MEMORY_MISCELLANEOUS_OP`   | **Modeled (control)**. Prefetch-control; exact descriptor recoverable via prologue chain (used to link the prefetch target tensor).           |
@@ -177,7 +184,8 @@ Simple meaning:
 Current simulator handling:
 
 - decoded as `LOAD_OP`, issued to `tma_unit_sm`
-- **real base** from `tma_pc_base_map.json` (exact, gated by `-tma_real_base_addr_enable`)
+- real base from the current `tma_pc_base_map.json`; the address and descriptor
+  shape are provisional until the kernel-aware chain correction
 - **size** = descriptor `Πbox_dim·element_size`; emits `⌈box·elem/128⌉` 128B-sector requests
 - M2 CTA-indexed tile spread scatters transfers across the tensor's tiles (seeded by the
   global blockIdx; a plain per-SM visit counter was measured to collapse every CTA onto tile 0)
@@ -205,8 +213,8 @@ Simple meaning:
 Current simulator handling:
 
 - decoded as `LOAD_OP`, issued to `tma_unit_sm` as a prefetch
-- **real base** recovered via the prologue chain (`off−0x30` = struct slot →
-  descriptor qword0), so the prefetch target tensor is known exactly
+- real base recovered via the prologue chain; exactness requires preserving the
+  trace-kernel identity and rejecting multiple source candidates
 - size = descriptor box; warms L2 like a load
 
 ### `UTMASTG.4D` / `UTMASTG.5D`
@@ -231,7 +239,8 @@ Simple meaning:
 Current simulator handling:
 
 - decoded as `STORE_OP`, issued to `tma_unit_sm`
-- **real base** from `tma_pc_base_map.json` (exact, SMEM-window path)
+- real base from the current base map; exactness is pending the same
+  kernel-aware chain correction as UTMALDG
 - size = descriptor box; emits write-side 128B-sector requests
 
 ### `UBLKCP.S.G`
@@ -265,6 +274,12 @@ Current simulator handling:
   resolved **per pc**. tile offset = M2 CTA-indexed tile spread with `tile_bytes=covered_bytes`,
   `num_tiles=⌈region/tile⌉`. No trace change.
 - `⌈covered_bytes/128⌉` requests
+- The command-size authority is operand 3 (`0x20 * 16 = 512`), not the
+  base-map `covered_bytes` field. In the retrace at `9e92fe9`, the newly added
+  completion callback contaminates the current base-map builder's
+  `max(all UNIFORM callbacks)` rule and produces multi-megabyte tile sizes.
+  Repair and regenerate this sidecar before simulation; no hardware retrace is
+  needed.
 
 ### `UBLKRED.G.S.ADD.F32.RN`
 
@@ -447,14 +462,14 @@ Current simulator handling:
 mode via `tma_unit_sm` (this section originally listed them as unsupported
 blockers — that is no longer true):
 
-1. `UTMALDG` — modeled; **exact real base** + descriptor-box size
-2. `UTMAPF` — modeled prefetch; exact base (prologue chain), fwd only
-3. `UTMASTG` — modeled; exact real base + descriptor-box size
-4. `UBLKCP` — modeled; exact covered_bytes size. Base synthetic in M1; **M2.5: per-pc real base (offline param-blob) + mock tiling**
+1. `UTMALDG` — modeled; descriptor-base/shape identity requires the B0-B
+   kernel-aware chain correction
+2. `UTMAPF` — modeled prefetch; the same chain correction applies, fwd only
+3. `UTMASTG` — modeled; the same chain correction applies
+4. `UBLKCP` — modeled; command size is exact operand-3 `covered_bytes`. The
+   regenerated base-map tiling metadata requires the B0-A callback-role repair
 5. `UBLKRED` — modeled; exact covered_bytes size (raw-ptr dest, not a tensormap). Base synthetic in M1; **M2.5: real base (offline param-blob) + mock tiling**
 
-Remaining work (address realism, not runnability — M2 coords / M2.5 UBLKRED-UBLKCP
-exact base / M3 heuristic removal) is tracked as **next steps** in the canonical
-integration plan:
-[.plan/TMA_exact_base_mapping_integration.md](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/.plan/TMA_exact_base_mapping_integration.md)
-(see "Next steps (M2+)").
+The authoritative correction and validation order is tracked in
+[`WAIT_BLOCK_TMA_OWNERSHIP.md`](WAIT_BLOCK_TMA_OWNERSHIP.md).
+The older integration plan remains the subsystem history.

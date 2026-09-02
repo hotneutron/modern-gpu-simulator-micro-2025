@@ -86,18 +86,78 @@ address_type IBuffer_Remodeled::get_next_pc_to_fetch_request() {
         res = m_config->is_trace_mode ? static_cast<trace_shd_warp_t*>(m_shd_warp)->get_pc() : (m_shd_warp)->get_pc();
     }
     m_is_init_next_pc = true;
-    m_num_entries += m_fetch_decode_width; 
+    m_num_entries += m_fetch_decode_width;
+    // [WaitBlock partial replay] When a deferred-replay stream is active, each
+    // IBuffer slot must be bound to a specific replay occurrence at allocation
+    // time. Its requested PC comes from the reserved occurrence, NOT from
+    // res + instruction_size, so a branch target or repeated PC inside the
+    // deferred stream is fetched correctly and out-of-order cache fills stay
+    // matched to the right occurrence.
+    trace_shd_warp_t *trace_warp =
+        m_config->is_trace_mode
+            ? static_cast<trace_shd_warp_t *>(m_shd_warp)
+            : nullptr;
+    // [WaitBlock partial replay] The reservation model assumes one IBuffer slot
+    // is allocated (and re-fetched on RESERVATION_FAIL) at a time. remove_entry
+    // rolls back the single most recent reservation and asserts back().m_pc ==
+    // the returned request PC. With m_fetch_decode_width > 1 a request would
+    // allocate several slots at once, mixing reserved replay slots with
+    // sequential canonical slots and breaking that back()/first_pc identity.
+    // Fail closed instead of silently corrupting replay ordering if the width is
+    // ever raised above 1 while a replay stream is active.
+    if (trace_warp != nullptr && m_fetch_decode_width > 1 &&
+        trace_warp->partial_replay_active()) {
+        fprintf(stderr,
+                "[WAITBLOCK][abort] partial replay requires "
+                "fetch_decode_width==1 (got %u)\n",
+                m_fetch_decode_width);
+        abort();
+    }
+    bool used_replay_reservation = false;
+    address_type first_pc = res;
     for(unsigned int i = 0; i < m_fetch_decode_width; i++) {
         address_type pc_to_fetch = res + 16 * i;
-        m_remodeled_ibuffer.push_back(IBuffer_Entry(false, pc_to_fetch, NULL));
+        IBuffer_Entry entry(false, pc_to_fetch, NULL);
+        if (trace_warp != nullptr) {
+            address_type replay_pc = 0;
+            unsigned int replay_index = 0;
+            uint64_t replay_epoch = 0;
+            if (trace_warp->reserve_next_partial_replay(
+                    &replay_pc, &replay_index, &replay_epoch)) {
+                entry.m_pc = replay_pc;
+                entry.m_is_replay = true;
+                entry.m_replay_index = replay_index;
+                entry.m_replay_epoch = replay_epoch;
+                if (i == 0) {
+                    first_pc = replay_pc;
+                }
+                used_replay_reservation = true;
+            }
+        }
+        m_remodeled_ibuffer.push_back(entry);
     }
-    m_next_pc_to_fetch_request = m_next_pc_to_fetch_request + 16 * m_fetch_decode_width;
+    // The trace source can switch from the canonical stream to a deferred
+    // replay while this IBuffer is uninitialized. Advance from the PC selected
+    // above, not from the stale pre-switch fetch cursor. For a replay stream the
+    // next fetch base is re-derived from the reservation cursor via get_pc(),
+    // so leave m_next_pc_to_fetch_request uninitialized-driven in that case.
+    if (used_replay_reservation) {
+        m_is_init_next_pc = false;
+        return first_pc;
+    }
+    m_next_pc_to_fetch_request = res + 16 * m_fetch_decode_width;
     return res;
 }
 
 void IBuffer_Remodeled::remove_entry(address_type pc) {
     assert(!m_remodeled_ibuffer.empty() && "Trying to remove entry from empty remodeled IBuffer");
     assert(m_remodeled_ibuffer.back().m_pc == pc && "Trying to remove entry from remodeled IBuffer that is not the first one");
+    // [WaitBlock partial replay] If the removed slot held a replay reservation,
+    // give that one reservation back so the occurrence is re-reserved next fetch.
+    if (m_config->is_trace_mode && m_remodeled_ibuffer.back().m_is_replay) {
+        static_cast<trace_shd_warp_t*>(m_shd_warp)
+            ->unreserve_last_partial_replay();
+    }
     m_remodeled_ibuffer.pop_back();
     m_next_pc_to_fetch_request = pc;
     m_num_entries--;
@@ -132,6 +192,17 @@ void IBuffer_Remodeled::issued() {
 
 void IBuffer_Remodeled::flush(bool reset_pc_to_0) {
     while(!m_remodeled_ibuffer.empty()) {
+        // [WaitBlock partial replay] Every removed slot that carried a replay
+        // reservation gives that reservation back, whether or not its cache
+        // response ever arrived (unfilled slots are m_valid=false and would
+        // otherwise leak their reservation). This is done per-removed-entry so
+        // the occurrence currently in flight (already pop_front'd by issued()
+        // but not yet committed) is NOT un-reserved: it is no longer in this
+        // deque, so commit_trace_inst can still advance issued past it.
+        if (m_config->is_trace_mode && m_remodeled_ibuffer.front().m_is_replay) {
+            static_cast<trace_shd_warp_t*>(m_shd_warp)
+                ->unreserve_last_partial_replay();
+        }
         if(m_remodeled_ibuffer.front().m_valid) {
             m_shd_warp->dec_inst_in_pipeline();
             if(m_config->is_interwarp_coalescing_enabled && ((m_config->interwarp_coalescing_selection_policy == DEP_COUNT_WAIT_DETECTED_AT_DECODE_GENERIC) ||
@@ -142,7 +213,10 @@ void IBuffer_Remodeled::flush(bool reset_pc_to_0) {
             }
             if(m_config->is_trace_mode && (m_remodeled_ibuffer.front().m_inst != NULL)
                 && m_remodeled_ibuffer.front().m_inst->m_has_the_instruction_been_traced) {
-                static_cast<trace_shd_warp_t*>(m_shd_warp)->decrease_num_used_inst(m_remodeled_ibuffer.front().m_pc);
+                static_cast<trace_shd_warp_t*>(m_shd_warp)
+                    ->rollback_trace_inst(
+                        static_cast<trace_warp_inst_t*>(
+                            m_remodeled_ibuffer.front().m_inst));
                 delete m_remodeled_ibuffer.front().m_inst;
             }else if(m_remodeled_ibuffer.front().m_inst != NULL){
                 delete m_remodeled_ibuffer.front().m_inst;

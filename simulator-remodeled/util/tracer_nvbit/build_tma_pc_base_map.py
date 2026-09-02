@@ -1,27 +1,28 @@
 #!/usr/bin/env python3
-"""Build (uid, pc) -> real GMEM base for TMA descriptor ops (TMA_BASE_ADDR.md §2.27).
+"""Build a kernel-aware real-GMEM-base map for TMA operations.
 
-Unifying key = the SMEM descriptor offset each descriptor-based TMA op carries at runtime
-(ci=0 operand, a generic-SMEM address 0xffffff...; low bits = a per-kernel-stable tensor
-ID). Same SMEM offset => same tensor => same base, which is what L2 locality needs.
+Descriptor identity follows the UTMACCTL.PF data-flow edge that copies an exact
+128-byte descriptor from the launch-parameter struct into runtime TMA state.
+Numeric equality between offsets from those two address spaces is not identity.
 
-Real base assignment (best-effort, deterministic), per uid:
+Real base assignment, per runtime kernel:
   1. discover struct descriptor slots + qword0 base by sliding each encode blob over the
      launch-arg params-struct blob (exact 128B match).
-  2. resolve each SMEM offset to a base:
-       (a) DIRECT: SMEM offset == a struct descriptor slot -> that slot's base.
-       (b) PREFETCH CHAIN: UTMACCTL.PF maps (param source offset -> SMEM dest offset);
-           param_source - 0x30 == struct slot -> base. Ties param<->SMEM coordinate
-           systems (§2.27).
-       (c) POOL: unresolved SMEM offsets get a deterministic base from the kernel's base
-           pool (stable, so same SMEM offset always yields the same base -> locality kept).
-Output: extra_info/tma_pc_base_map.json  { "uid:pc": {base_hex, smem_offset_hex, source} }
+  2. select the exact static kernel variant for each runtime trace kernel.
+  3. resolve each runtime TMA-state offset through the UTMACCTL.PF
+     source/destination chain. Missing or ambiguous chains fail closed.
+  4. derive UBLK covered bytes from the statically identified operand-3 callback;
+     hidden instrumentation callbacks never participate in size selection.
+
+Output: extra_info/tma_pc_base_map.json
+        {"kernel_id:uid:pc": {base_hex, smem_offset_hex, source, ...}}
 
 Usage: python3 build_tma_pc_base_map.py --traces <dir> [--struct-desc-delta 0x30]
 """
 import argparse, csv, json, struct
 from collections import defaultdict
 from pathlib import Path
+import re
 
 DESC_OPS = ("UTMALDG", "UTMASTG", "UTMAPF", "UTMAREDG")  # ops we map (UTMACCTL is the linker)
 
@@ -84,6 +85,59 @@ def smem_offset_of(fla):
     return fla & 0xFFFF
 
 
+def normalize_runtime_kernel_name(name):
+    return re.sub(r"___[0-9]+$", "", name or "")
+
+
+def load_runtime_rows(extra):
+    path = extra / "tma_runtime_operand_debug.jsonl"
+    if not path.exists():
+        return []
+    rows = []
+    with path.open() as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            rows.append(json.loads(line))
+    return rows
+
+
+def load_runtime_kernel_names(extra, runtime_rows):
+    """Map each observed (trace kernel id, function id) to its exact static name."""
+    info_path = extra / "enhanced_execution_info.json"
+    if not info_path.exists():
+        raise SystemExit(f"missing enhanced execution info: {info_path}")
+    data = json.loads(info_path.read_text())
+    names_by_uid = {}
+    for kernel in data.get("kernels", []):
+        uid = str(kernel.get("unique_function_id"))
+        name = normalize_runtime_kernel_name(kernel.get("kernel_name"))
+        old = names_by_uid.get(uid)
+        if old is not None and old != name:
+            raise SystemExit(
+                f"ambiguous enhanced kernel name for uid={uid}: {old} vs {name}"
+            )
+        names_by_uid[uid] = name
+
+    result = {}
+    for row in runtime_rows:
+        if row.get("kernel_id") is None or row.get("unique_function_id") is None:
+            continue
+        key = (int(row["kernel_id"]), str(row["unique_function_id"]))
+        name = names_by_uid.get(key[1])
+        if not name:
+            raise SystemExit(
+                f"missing enhanced kernel name for trace_kernel={key[0]} uid={key[1]}"
+            )
+        result[key] = name
+    return result
+
+
+def map_key(trace_kernel_id, uid, pc):
+    return f"{trace_kernel_id}:{uid}:{pc}"
+
+
 def load_encode_blobs(extra):
     out = []
     p = extra / "tensor_map_encode_dump.csv"
@@ -98,8 +152,10 @@ def load_encode_blobs(extra):
     return out
 
 
-def struct_blob_by_uid(extra):
-    """largest launch arg per uid = the by-value params struct. The CSV blob_path is an
+def struct_blob_by_kernel(extra):
+    """Largest launch arg per (trace kernel, uid) = the by-value params struct.
+
+    The CSV blob_path is an
     absolute path from the tracer host, so rebuild it relative to THIS extra_info dir
     (launch_param_blobs/<basename>) for portability across machines."""
     best = {}
@@ -108,13 +164,18 @@ def struct_blob_by_uid(extra):
         return best
     with p.open(newline="") as fh:
         for r in csv.DictReader(fh):
+            kernel_id = int(r.get("kernel_id"))
             uid = str(r.get("unique_function_id"))
             sz = parse_int(r.get("arg_size"))
             raw = r.get("blob_path") or ""
             local = extra / "launch_param_blobs" / Path(raw).name if raw else None
-            if uid not in best or sz > best[uid][0]:
-                best[uid] = (sz, str(local) if local else None,
-                             parse_int(r.get("param_offset_hex")))
+            key = (kernel_id, uid)
+            if key not in best or sz > best[key][0]:
+                best[key] = (
+                    sz,
+                    str(local) if local else None,
+                    parse_int(r.get("param_offset_hex")),
+                )
     return best
 
 
@@ -138,81 +199,100 @@ def discover_struct_descriptors(struct_bytes, encode_blobs):
     return slots
 
 
-def runtime_smem_offsets(extra, opcodes):
-    """(uid, pc) -> the SMEM descriptor offset (low bits of ci=0 0xffffff.. operand)."""
+def runtime_smem_offsets(runtime_rows, opcodes):
+    """(trace kernel, uid, pc) -> one runtime TMA-state offset."""
     out = {}
     seen_multi = defaultdict(set)
-    p = extra / "tma_runtime_operand_debug.jsonl"
-    if not p.exists():
-        return out, seen_multi
-    with p.open() as fh:
-        for line in fh:
-            try:
-                r = json.loads(line)
-            except Exception:
-                continue
-            op = str(r.get("opcode", "")).split(".")[0]
-            if op not in opcodes:
-                continue
-            if r.get("callback_index") != 0:
-                continue
-            fla = r.get("first_lane_addr")
-            if not is_smem_descriptor_addr(fla):
-                continue
-            uid = str(r.get("unique_function_id"))
-            pc = r.get("pc_hex")
-            off = smem_offset_of(fla)
-            seen_multi[(uid, pc)].add(off)
-            out[(uid, pc)] = off  # deterministic per pc (verified); last wins
+    for r in runtime_rows:
+        op = str(r.get("opcode", "")).split(".")[0]
+        if op not in opcodes or r.get("callback_index") != 0:
+            continue
+        fla = r.get("first_lane_addr")
+        if not is_smem_descriptor_addr(fla):
+            continue
+        key = (
+            int(r.get("kernel_id")),
+            str(r.get("unique_function_id")),
+            r.get("pc_hex"),
+        )
+        off = smem_offset_of(fla)
+        seen_multi[key].add(off)
+        out[key] = off
     return out, seen_multi
 
 
-def utmacctl_chain(extra, delta, struct_slots_by_uid):
-    """Resolve UTMACCTL.PF prefetch sites two ways from one pass:
-      - smem_to_slot[uid][SMEM dest offset] = slot dict  (feeds the LDG chain path)
-      - prefetch_by_pc[(uid,pc)]            = slot dict  (per-pc prefetch emit)
-    via UTMACCTL param_source-delta == struct slot (§2.27). Only RUNTIME-executed
-    UTMACCTL pcs are used (static-only pcs are dead sites), so every emitted prefetch
-    entry corresponds to an instruction the simulator will actually issue."""
-    # runtime SMEM dest per (uid, pc) for executed UTMACCTL only
-    dest = {}
-    p = extra / "tma_runtime_operand_debug.jsonl"
-    if p.exists():
-        with p.open() as fh:
-            for line in fh:
-                try:
-                    r = json.loads(line)
-                except Exception:
-                    continue
-                if not str(r.get("opcode", "")).startswith("UTMACCTL"):
-                    continue
-                if r.get("callback_index") != 0:
-                    continue
-                fla = r.get("first_lane_addr")
-                if is_smem_descriptor_addr(fla):
-                    dest[(str(r.get("unique_function_id")), r.get("pc_hex"))] = smem_offset_of(fla)
-    # param sources per (uid, pc) from prefetch_sites (static def-chain)
+def utmacctl_chain(extra, delta, struct_slots_by_kernel, runtime_rows,
+                   runtime_kernel_names):
+    """Build exact runtime-state -> descriptor edges for each trace kernel."""
+    destinations = defaultdict(set)
+    for row in runtime_rows:
+        if (not str(row.get("opcode", "")).startswith("UTMACCTL") or
+                row.get("callback_index") != 0):
+            continue
+        fla = row.get("first_lane_addr")
+        if not is_smem_descriptor_addr(fla):
+            continue
+        key = (
+            int(row.get("kernel_id")),
+            str(row.get("unique_function_id")),
+            row.get("pc_hex"),
+        )
+        destinations[key].add(smem_offset_of(fla))
+
     off_json = extra / "tma_descriptor_offsets.json"
-    src = defaultdict(set)
+    sources = defaultdict(set)
     if off_json.exists():
         data = json.loads(off_json.read_text())
-        for s in data.get("prefetch_sites", []):
-            uid = str(s.get("unique_function_id"))
-            pc = s.get("pc_hex")
-            o = s.get("tensormap_offset_hex")
-            if o is not None:
-                src[(uid, pc)].add(parse_int(o))
-    smem_to_slot = defaultdict(dict)
+        for entry in data.get("prefetch_sites", []):
+            if entry.get("unique_function_id") is None:
+                continue
+            uid = str(entry.get("unique_function_id"))
+            function_name = entry.get("function_name")
+            offset = entry.get("tensormap_offset_hex")
+            if offset is None:
+                continue
+            for (kernel_id, active_uid), active_name in runtime_kernel_names.items():
+                if active_uid == uid and function_name == active_name:
+                    sources[(kernel_id, uid, entry.get("pc_hex"))].add(
+                        parse_int(offset)
+                    )
+
+    state_candidates = defaultdict(dict)
     prefetch_by_pc = {}
-    for (uid, pc), sm in dest.items():
-        slots = struct_slots_by_uid.get(uid, {})
-        for psrc in src.get((uid, pc), ()):
-            ss = psrc - delta
-            if ss in slots:
-                smem_to_slot[uid][sm] = slots[ss]
-                prefetch_by_pc[(uid, pc)] = slots[ss]
-                break
-    return smem_to_slot, prefetch_by_pc
+    problems = []
+    for site, dest_values in sorted(destinations.items()):
+        kernel_id, uid, pc = site
+        source_values = sources.get(site, set())
+        if len(dest_values) != 1 or len(source_values) != 1:
+            problems.append(
+                f"trace_kernel={kernel_id} uid={uid} pc={pc} "
+                f"destinations={sorted(dest_values)} sources={sorted(source_values)}"
+            )
+            continue
+        sm = next(iter(dest_values))
+        struct_offset = next(iter(source_values)) - delta
+        slot = struct_slots_by_kernel.get((kernel_id, uid), {}).get(struct_offset)
+        if slot is None:
+            problems.append(
+                f"trace_kernel={kernel_id} uid={uid} pc={pc} "
+                f"struct_offset=0x{struct_offset:x} has no exact descriptor"
+            )
+            continue
+        identity = (str(slot["encode_id"]), slot["base"])
+        state_candidates[(kernel_id, uid, sm)][identity] = slot
+        prefetch_by_pc[site] = slot
+
+    chain = {}
+    for state_key, candidates in state_candidates.items():
+        if len(candidates) != 1:
+            problems.append(
+                f"trace_kernel={state_key[0]} uid={state_key[1]} "
+                f"state=0x{state_key[2]:x} descriptor_candidates="
+                f"{sorted(candidates)}"
+            )
+            continue
+        chain[state_key] = next(iter(candidates.values()))
+    return chain, prefetch_by_pc, problems
 
 
 def entry_from_slot(slot, sm, source):
@@ -250,6 +330,72 @@ GMEM_VA_MIN = 0x7E00000000     # typical CUDA device VA floor
 GMEM_VA_MAX = 0x800000000000   # device VA ceiling
 
 
+def load_ublk_span_callbacks(extra, runtime_kernel_names, runtime_rows):
+    """Return the architectural operand-3 callback for each executed UBLK site.
+
+    The observed UBLK forms instrument their three architectural operands as
+    callbacks 0, 1, and 2. A completion-barrier capture, when present, is an
+    auxiliary callback appended after them and must not change this mapping.
+    """
+    path = extra / "tma_discovery.json"
+    if not path.exists():
+        raise SystemExit(f"missing TMA discovery metadata: {path}")
+    discovery = json.loads(path.read_text())
+    callbacks = {}
+    for function in discovery.get("functions", []):
+        static_uid = function.get("unique_function_id")
+        function_name = function.get("function_name")
+        for (kernel_id, active_uid), active_name in runtime_kernel_names.items():
+            if function_name != active_name:
+                continue
+            if static_uid is not None and active_uid != str(static_uid):
+                continue
+            for instruction in function.get("tma_family_ops", []):
+                opcode = str(instruction.get("opcode", "")).split(".")[0]
+                if opcode not in UBLK_OPS:
+                    continue
+                text = instruction.get("text", "")
+                suffix = text.split(instruction.get("opcode", ""), 1)[-1]
+                operands = [
+                    token.strip()
+                    for token in suffix.split(";", 1)[0].split(",")
+                    if token.strip()
+                ]
+                if len(operands) < 3 or not operands[2].startswith("UR"):
+                    raise SystemExit(
+                        f"unsupported {opcode} operand-3 form: "
+                        f"trace_kernel={kernel_id} uid={active_uid} "
+                        f"pc={instruction.get('pc_hex')} text={text}"
+                    )
+                key = (kernel_id, active_uid, instruction.get("pc_hex"))
+                callback_index = 2
+                old = callbacks.get(key)
+                if old is not None and old != callback_index:
+                    raise SystemExit(
+                        f"ambiguous {opcode} span callback: key={key} "
+                        f"old={old} new={callback_index}"
+                    )
+                callbacks[key] = callback_index
+
+    runtime_sites = set()
+    for row in runtime_rows:
+        opcode = str(row.get("opcode", "")).split(".")[0]
+        if opcode not in UBLK_OPS:
+            continue
+        runtime_sites.add((
+            int(row.get("kernel_id")),
+            str(row.get("unique_function_id")),
+            row.get("pc_hex"),
+        ))
+    missing = sorted(runtime_sites - callbacks.keys())
+    if missing:
+        raise SystemExit(
+            "missing static operand-3 callback roles for executed UBLK sites: "
+            f"{missing[:8]}"
+        )
+    return callbacks
+
+
 def gmem_pointers_from_struct(struct_bytes):
     """Every plausible device GMEM pointer (0x7e..0x80 range) in the by-value
     params struct, unique and sorted by low-32 (the coordinate the runtime
@@ -262,38 +408,46 @@ def gmem_pointers_from_struct(struct_bytes):
     return sorted(ptrs, key=lambda p: (p & 0xFFFFFFFF, p))
 
 
-def runtime_ublk_operands(extra, opcodes):
-    """(uid,pc) -> per-callback operand summary for executed UBLKRED/UBLKCP:
-       {opcode, cb_addrs:{cb->set(low32)}, cb_memtype:{cb->str}, uniform_vals:{cb->int}}.
+def runtime_ublk_operands(runtime_rows, opcodes, span_callbacks):
+    """Kernel-aware per-callback operand summary for executed UBLK operations.
+
+    The architectural span comes only from the statically identified operand-3
+    callback. Hidden instrumentation callbacks are retained for diagnostics but
+    can never become a byte source.
+    {
+       opcode, cb_addrs:{cb->set(low32)}, cb_memtype:{cb->str},
+       uniform_vals:{cb->set(int)}, callback_events:{cb->count}
+    }
     The runtime jsonl only holds executed ops, so every entry is an executed site."""
     per = {}
-    p = extra / "tma_runtime_operand_debug.jsonl"
-    if not p.exists():
-        return per
-    with p.open() as fh:
-        for line in fh:
-            if all(tok not in line for tok in opcodes):
-                continue
-            try:
-                r = json.loads(line)
-            except Exception:
-                continue
-            op = str(r.get("opcode", "")).split(".")[0]
-            if op not in opcodes:
-                continue
-            key = (str(r.get("unique_function_id")), r.get("pc_hex"))
-            d = per.get(key)
-            if d is None:
-                d = per[key] = {"opcode": op, "cb_addrs": defaultdict(set),
-                                "cb_memtype": {}, "uniform_vals": {}}
-            cb = r.get("callback_index")
-            fla = r.get("first_lane_addr")
-            d["cb_memtype"][cb] = r.get("mem_type")
-            if r.get("operand_type") == "UNIFORM":
-                if isinstance(fla, int):
-                    d["uniform_vals"][cb] = fla
-            elif isinstance(fla, int):
-                d["cb_addrs"][cb].add(fla & 0xFFFFFFFF)
+    for r in runtime_rows:
+        op = str(r.get("opcode", "")).split(".")[0]
+        if op not in opcodes:
+            continue
+        key = (
+            int(r.get("kernel_id")),
+            str(r.get("unique_function_id")),
+            r.get("pc_hex"),
+        )
+        d = per.get(key)
+        if d is None:
+            d = per[key] = {
+                "opcode": op,
+                "cb_addrs": defaultdict(set),
+                "cb_memtype": {},
+                "uniform_vals": defaultdict(set),
+                "callback_events": defaultdict(int),
+                "span_callback": span_callbacks.get(key),
+            }
+        cb = r.get("callback_index")
+        fla = r.get("first_lane_addr")
+        d["cb_memtype"][cb] = r.get("mem_type")
+        d["callback_events"][cb] += 1
+        if r.get("operand_type") == "UNIFORM":
+            if isinstance(fla, int):
+                d["uniform_vals"][cb].add(fla)
+        elif isinstance(fla, int):
+            d["cb_addrs"][cb].add(fla & 0xFFFFFFFF)
     return per
 
 
@@ -308,49 +462,72 @@ def resolve_ublk_base(min_addr, struct_ptrs):
     return best
 
 
-def build_ublk_entries(per_ublk, struct_ptrs_by_uid):
-    """Resolve base/tile_bytes/num_tiles per executed UBLKRED/UBLKCP (uid,pc).
+def build_ublk_entries(per_ublk, struct_ptrs_by_kernel):
+    """Resolve base/tile_bytes/num_tiles per kernel-aware UBLK site.
+
     Returns (entries, stats, unmatched)."""
-    # pass 1: per (uid,pc) pick the GMEM callback (STANDARD_MEM with the most
+    # pass 1: per site pick the GMEM callback (STANDARD_MEM with the most
     # distinct addresses; the SMEM staging cursor is ~1 distinct) + covered_bytes.
     resolved = {}
     unmatched = []
-    for (uid, pc), d in per_ublk.items():
+    for (kernel_id, uid, pc), d in per_ublk.items():
+        site_text = f"{kernel_id}:{uid}:{pc}"
         gmem_cb, gmem_addrs = None, set()
         for cb, addrs in d["cb_addrs"].items():
             if d["cb_memtype"].get(cb) == "STANDARD_MEM" and len(addrs) > len(gmem_addrs):
                 gmem_cb, gmem_addrs = cb, addrs
         if not gmem_addrs:
-            unmatched.append(f"{uid}:{pc}(no-gmem-operand)")
+            unmatched.append(f"{site_text}(no-gmem-operand)")
             continue
-        span = max(d["uniform_vals"].values()) if d["uniform_vals"] else 0
+        span_cb = d["span_callback"]
+        span_values = d["uniform_vals"].get(span_cb, set())
+        if span_cb is None or len(span_values) != 1:
+            unmatched.append(
+                f"{site_text}(span-callback={span_cb},values={sorted(span_values)})"
+            )
+            continue
+        span = next(iter(span_values))
         covered = span * 16
-        base = resolve_ublk_base(min(gmem_addrs), struct_ptrs_by_uid.get(uid, []))
+        base = resolve_ublk_base(
+            min(gmem_addrs), struct_ptrs_by_kernel.get((kernel_id, uid), [])
+        )
         if base is None:
-            unmatched.append(f"{uid}:{pc}(no-base<=0x{min(gmem_addrs):x})")
+            unmatched.append(
+                f"{site_text}(no-base<=0x{min(gmem_addrs):x})"
+            )
             continue
-        resolved[(uid, pc)] = {"opcode": d["opcode"], "gmem_cb": gmem_cb,
-                               "addrs": gmem_addrs, "covered": covered, "base": base}
+        resolved[(kernel_id, uid, pc)] = {
+            "opcode": d["opcode"],
+            "gmem_cb": gmem_cb,
+            "addrs": gmem_addrs,
+            "covered": covered,
+            "base": base,
+            "span_callback": span_cb,
+            "span_events": d["callback_events"][span_cb],
+        }
 
     # pass 2: region extent per (uid, base) — the full tensor span every sharing
     # transfer reaches (so a pc that only samples part still gets the true count).
-    region_end = defaultdict(int)      # (uid, base) -> max(addr + tile_bytes)
-    region_addrs = defaultdict(set)    # (uid, base) -> union of low-32 addrs
-    for (uid, pc), e in resolved.items():
+    region_end = defaultdict(int)
+    region_addrs = defaultdict(set)
+    for (kernel_id, uid, pc), e in resolved.items():
         tb = e["covered"] or 128
-        rk = (uid, e["base"])
+        rk = (kernel_id, uid, e["base"])
         region_end[rk] = max(region_end[rk], max(e["addrs"]) + tb)
         region_addrs[rk] |= e["addrs"]
 
     # emit
     entries, stats = {}, defaultdict(lambda: {"UBLKRED": 0, "UBLKCP": 0})
-    for (uid, pc), e in sorted(resolved.items()):
+    for (kernel_id, uid, pc), e in sorted(resolved.items()):
         base = e["base"]; base_lo = base & 0xFFFFFFFF
         tb = e["covered"] or 128
-        rk = (uid, base)
+        rk = (kernel_id, uid, base)
         region_bytes = region_end[rk] - base_lo
         num_tiles = max(1, (region_bytes + tb - 1) // tb)
-        entries[f"{uid}:{pc}"] = {
+        entries[map_key(kernel_id, uid, pc)] = {
+            "trace_kernel_id": kernel_id,
+            "unique_function_id": int(uid),
+            "pc_hex": pc,
             "base_hex": f"0x{base:x}",
             "source": "operand_raw_pointer",
             "operand_addressed": True,
@@ -358,6 +535,8 @@ def build_ublk_entries(per_ublk, struct_ptrs_by_uid):
             "has_static_base": False,          # not a tensormap descriptor base
             "opcode": e["opcode"],
             "gmem_cb_index": e["gmem_cb"],
+            "span_callback_index": e["span_callback"],
+            "span_event_count": e["span_events"],
             "covered_bytes": e["covered"],
             "tile_bytes": tb,
             "num_tiles": num_tiles,
@@ -365,7 +544,7 @@ def build_ublk_entries(per_ublk, struct_ptrs_by_uid):
             "distinct_addrs_pc": len(e["addrs"]),
             "distinct_addrs_region": len(region_addrs[rk]),
         }
-        stats[uid][e["opcode"]] += 1
+        stats[(kernel_id, uid)][e["opcode"]] += 1
     return entries, stats, unmatched
 
 
@@ -397,11 +576,8 @@ def main():
     ap.add_argument("--struct-desc-delta", default="0x30",
                     help="param_source - delta == struct descriptor offset (§2.27, =0x30)")
     ap.add_argument("--strict", action="store_true",
-                    help="exit nonzero if any descriptor-op (uid,pc) is unresolved or "
-                         "falls back to the pool (enforces 100%% exact mapping)")
-    ap.add_argument("--allow-pool", action="store_true",
-                    help="permit deterministic pool fallback (default: pool counts as a "
-                         "failure under --strict; kept only as a locality safety net)")
+                    help="exit nonzero unless every kernel-aware descriptor site "
+                         "has one unambiguous UTMACCTL chain")
     ap.add_argument("--no-ublk", action="store_true",
                     help="skip UBLKRED/UBLKCP raw-pointer base+mock-tiling emit (M2.5); "
                          "leaves them synthetic in the simulator")
@@ -409,117 +585,190 @@ def main():
     delta = parse_int(a.struct_desc_delta)
     extra = Path(a.traces).resolve() / "extra_info"
 
+    runtime_rows = load_runtime_rows(extra)
+    runtime_kernel_names = load_runtime_kernel_names(extra, runtime_rows)
     encode_blobs = load_encode_blobs(extra)
-    structs = struct_blob_by_uid(extra)
-    struct_slots_by_uid = {}
-    struct_ptrs_by_uid = {}
-    for uid, (sz, blob, argoff) in structs.items():
+    structs = struct_blob_by_kernel(extra)
+    struct_slots_by_kernel = {}
+    struct_ptrs_by_kernel = {}
+    for launch_key, (sz, blob, argoff) in structs.items():
         bp = Path(blob) if blob else None
         if bp and bp.exists():
             sbytes = bp.read_bytes()
-            struct_slots_by_uid[uid] = discover_struct_descriptors(sbytes, encode_blobs)
-            struct_ptrs_by_uid[uid] = gmem_pointers_from_struct(sbytes)
-    chain, prefetch_by_pc = utmacctl_chain(extra, delta, struct_slots_by_uid)
-    smem_by_pc, multi = runtime_smem_offsets(extra, DESC_OPS)
-
-    # per-uid base pool for fallback: deterministic list of slot dicts sorted by base.
-    pool = {}
-    for uid, slots in struct_slots_by_uid.items():
-        by_base = {}
-        for slot in slots.values():
-            by_base.setdefault(slot["base"], slot)
-        pool[uid] = [by_base[b] for b in sorted(by_base)]
+            struct_slots_by_kernel[launch_key] = discover_struct_descriptors(
+                sbytes, encode_blobs
+            )
+            struct_ptrs_by_kernel[launch_key] = gmem_pointers_from_struct(sbytes)
+    chain, prefetch_by_pc, chain_problems = utmacctl_chain(
+        extra,
+        delta,
+        struct_slots_by_kernel,
+        runtime_rows,
+        runtime_kernel_names,
+    )
+    smem_by_pc, multi = runtime_smem_offsets(runtime_rows, DESC_OPS)
+    runtime_opcode_by_site = {
+        (
+            int(row.get("kernel_id")),
+            str(row.get("unique_function_id")),
+            row.get("pc_hex"),
+        ): str(row.get("opcode", "")).split(".")[0]
+        for row in runtime_rows
+    }
 
     result = {}
-    stats = defaultdict(lambda: {"direct": 0, "chain": 0, "pool": 0, "none": 0,
-                                 "prefetch": 0})
+    stats = defaultdict(lambda: {"chain": 0, "none": 0, "prefetch": 0})
     unresolved_pcs = []
-    pool_pcs = []
-    # stable pool assignment: map each unresolved SMEM offset -> pool[idx] round-robin
-    pool_assign = defaultdict(dict)
-    # (1) descriptor LOAD/STORE ops keyed on runtime SMEM descriptor offset.
-    for (uid, pc), sm in sorted(smem_by_pc.items()):
-        slot, source = None, None
-        slots = struct_slots_by_uid.get(uid, {})
-        if sm in slots:                       # (a) direct
-            slot, source = slots[sm], "direct"
-        elif sm in chain.get(uid, {}):        # (b) prefetch chain
-            slot, source = chain[uid][sm], "chain"
-        elif pool.get(uid):                   # (c) deterministic pool
-            pa = pool_assign[uid]
-            if sm not in pa:
-                pa[sm] = pool[uid][len(pa) % len(pool[uid])]
-            slot, source = pa[sm], "pool"
-        if slot is None:
-            stats[uid]["none"] += 1
-            unresolved_pcs.append(f"{uid}:{pc}(smem=0x{sm:x})")
+    direct_candidate_sites = 0
+    direct_candidate_conflicts = 0
+    # Descriptor operations are keyed only through their kernel-aware UTMACCTL
+    # source/destination chain. Numeric direct matches are diagnostic.
+    for (kernel_id, uid, pc), sm in sorted(smem_by_pc.items()):
+        site = (kernel_id, uid, pc)
+        if len(multi[site]) != 1:
+            stats[(kernel_id, uid)]["none"] += 1
+            unresolved_pcs.append(
+                f"{map_key(kernel_id, uid, pc)}"
+                f"(runtime-state-values={sorted(multi[site])})"
+            )
             continue
-        stats[uid][source] += 1
-        if source == "pool":
-            pool_pcs.append(f"{uid}:{pc}(smem=0x{sm:x})")
-        result[f"{uid}:{pc}"] = entry_from_slot(slot, sm, source)
+        slot = chain.get((kernel_id, uid, sm))
+        if slot is None:
+            stats[(kernel_id, uid)]["none"] += 1
+            unresolved_pcs.append(
+                f"{map_key(kernel_id, uid, pc)}(state=0x{sm:x})"
+            )
+            continue
+        direct_slot = struct_slots_by_kernel.get((kernel_id, uid), {}).get(sm)
+        if direct_slot is not None:
+            direct_candidate_sites += 1
+            if (str(direct_slot["encode_id"]), direct_slot["base"]) != (
+                str(slot["encode_id"]),
+                slot["base"],
+            ):
+                direct_candidate_conflicts += 1
+        stats[(kernel_id, uid)]["chain"] += 1
+        entry = entry_from_slot(slot, sm, "utmacctl_chain")
+        entry.update({
+            "trace_kernel_id": kernel_id,
+            "unique_function_id": int(uid),
+            "pc_hex": pc,
+            "opcode": runtime_opcode_by_site[site],
+        })
+        result[map_key(kernel_id, uid, pc)] = entry
 
-    # (2) UTMACCTL.PF prefetch ops keyed per-pc (so the simulator knows which tensor each
-    # prefetch warms). Not part of smem_by_pc (different opcode); emit separately.
-    for (uid, pc), slot in sorted(prefetch_by_pc.items()):
-        key = f"{uid}:{pc}"
+    # UTMACCTL.PF sites are emitted separately for prefetch modeling.
+    for (kernel_id, uid, pc), slot in sorted(prefetch_by_pc.items()):
+        key = map_key(kernel_id, uid, pc)
         if key in result:
-            continue  # never overwrite a LDG/STG mapping
-        stats[uid]["prefetch"] += 1
-        result[key] = entry_from_slot(slot, None, "prefetch")
+            chain_problems.append(f"duplicate descriptor site key={key}")
+            continue
+        stats[(kernel_id, uid)]["prefetch"] += 1
+        entry = entry_from_slot(slot, None, "utmacctl_prefetch_edge")
+        entry.update({
+            "trace_kernel_id": kernel_id,
+            "unique_function_id": int(uid),
+            "pc_hex": pc,
+            "opcode": "UTMACCTL",
+        })
+        result[key] = entry
 
-    # (3) UBLKRED/UBLKCP raw-pointer ops (M2.5): real base from the by-value params
-    # struct + mock tiling metadata (tile_bytes/num_tiles). Not tensormap-addressed,
-    # so keyed on the runtime GMEM operand, not a SMEM descriptor offset.
+    # UBLKRED/UBLKCP raw-pointer ops (M2.5): real base from the by-value params
+    # struct, keyed on the runtime GMEM operand rather than a descriptor.
     ublk_entries, ublk_stats, ublk_unmatched = {}, {}, []
     if not a.no_ublk:
-        per_ublk = runtime_ublk_operands(extra, UBLK_OPS)
+        span_callbacks = load_ublk_span_callbacks(
+            extra, runtime_kernel_names, runtime_rows
+        )
+        per_ublk = runtime_ublk_operands(
+            runtime_rows, UBLK_OPS, span_callbacks
+        )
         ublk_entries, ublk_stats, ublk_unmatched = build_ublk_entries(
-            per_ublk, struct_ptrs_by_uid)
-        for key, e in ublk_entries.items():
+            per_ublk, struct_ptrs_by_kernel
+        )
+        for key, entry in ublk_entries.items():
             if key in result:
-                continue  # descriptor mapping wins (should never collide)
-            result[key] = e
+                chain_problems.append(f"duplicate descriptor/UBLK site key={key}")
+                continue
+            result[key] = entry
 
     out = extra / "tma_pc_base_map.json"
     ublkred_diag = count_executed_ublkred_resolved(extra)
+    descriptor_sites_total = len(smem_by_pc)
+    chain_resolved = sum(s["chain"] for s in stats.values())
+    ublkcp_entries = [
+        entry for entry in ublk_entries.values()
+        if entry["opcode"] == "UBLKCP"
+    ]
+    ublkcp_by_kernel = {}
+    for entry in ublkcp_entries:
+        kernel_key = str(entry["trace_kernel_id"])
+        summary = ublkcp_by_kernel.setdefault(
+            kernel_key,
+            {"sites": 0, "dynamic_occurrences": 0, "covered_bytes": set()},
+        )
+        summary["sites"] += 1
+        summary["dynamic_occurrences"] += entry["span_event_count"]
+        summary["covered_bytes"].add(entry["covered_bytes"])
+    for summary in ublkcp_by_kernel.values():
+        summary["covered_bytes"] = sorted(summary["covered_bytes"])
+    validation = {
+        "sites_total": descriptor_sites_total,
+        "chain_resolved": chain_resolved,
+        "ambiguous": len(chain_problems),
+        "unresolved": len(unresolved_pcs),
+        "direct_authority": 0,
+        "pool_authority": 0,
+        "legacy_direct_candidates": direct_candidate_sites,
+        "legacy_direct_conflicts": direct_candidate_conflicts,
+        "ublkcp_sites": len(ublkcp_entries),
+        "ublkcp_dynamic_occurrences": sum(
+            entry["span_event_count"] for entry in ublkcp_entries
+        ),
+        "ublkcp_by_kernel": ublkcp_by_kernel,
+    }
     out.write_text(json.dumps({
         "delta_hex": f"0x{delta:x}",
+        "version": 2,
+        "key_fields": [
+            "trace_kernel_id", "unique_function_id", "pc_hex"
+        ],
         "field_order": list(DESC_FIELD_KEYS),
         "ublkred_diagnostic": ublkred_diag,
         "ublk_raw_pointer_fields": [
             "base_hex", "covered_bytes", "tile_bytes", "num_tiles",
             "region_bytes", "gmem_cb_index", "raw_pointer_addressed",
         ],
+        "validation_complete": not (
+            chain_problems or unresolved_pcs or ublk_unmatched
+        ),
+        "validation": validation,
         "map": result,
     }, indent=2) + "\n")
 
-    print(f"struct descriptors discovered per uid:")
-    for uid, slots in sorted(struct_slots_by_uid.items()):
+    print("struct descriptors discovered per trace kernel:")
+    for (kernel_id, uid), slots in sorted(struct_slots_by_kernel.items()):
         bases = {s["base"] for s in slots.values()}
-        print(f"  uid{uid}: {len(slots)} slots, {len(bases)} distinct bases")
-    print(f"\nruntime SMEM offsets: {len(smem_by_pc)} (uid,pc) across "
-          f"{len(set(u for u, _ in smem_by_pc))} uids")
-    # per-uid: how many descriptor-op pcs have a SMEM offset, and do their offsets fall in
-    # the discovered struct slots / chain / neither?
-    by_uid_pc = defaultdict(list)
-    for (uid, pc), sm in smem_by_pc.items():
-        by_uid_pc[uid].append(sm)
-    for uid in sorted(by_uid_pc, key=lambda x: int(x)):
-        offs = sorted(set(by_uid_pc[uid]))
-        slots = struct_slots_by_uid.get(uid, {})
-        ch = chain.get(uid, {})
-        d = [o for o in offs if o in slots]
-        c = [o for o in offs if o not in slots and o in ch]
-        n = [o for o in offs if o not in slots and o not in ch]
-        print(f"  uid{uid}: smem_offsets={[hex(o) for o in offs]}")
-        print(f"         struct_slots={[hex(o) for o in sorted(slots)]} chain_keys={[hex(o) for o in sorted(ch)]}")
-        print(f"         direct={[hex(o) for o in d]} chain={[hex(o) for o in c]} pool/none={[hex(o) for o in n]}")
-    print(f"\n(uid,pc) mapped: {len(result)}  -> {out.name}")
-    for uid in sorted(stats):
-        s = stats[uid]
-        print(f"  uid{uid}: direct={s['direct']} chain={s['chain']} "
-              f"prefetch={s['prefetch']} pool={s['pool']} unresolved={s['none']}")
+        print(f"  trace_kernel={kernel_id} uid={uid}: "
+              f"{len(slots)} slots, {len(bases)} distinct bases")
+    print(f"\nruntime TMA-state sites: {len(smem_by_pc)}")
+    print(f"kernel-aware mappings: {len(result)} -> {out.name}")
+    for (kernel_id, uid) in sorted(stats):
+        s = stats[(kernel_id, uid)]
+        print(f"  trace_kernel={kernel_id} uid={uid}: "
+              f"chain={s['chain']} prefetch={s['prefetch']} "
+              f"unresolved={s['none']}")
+    print(
+        "  descriptor-validation "
+        f"sites_total={validation['sites_total']} "
+        f"chain_resolved={validation['chain_resolved']} "
+        f"ambiguous={validation['ambiguous']} "
+        f"unresolved={validation['unresolved']} "
+        f"direct_authority={validation['direct_authority']} "
+        f"pool_authority={validation['pool_authority']} "
+        f"legacy_direct_candidates={validation['legacy_direct_candidates']} "
+        f"legacy_direct_conflicts={validation['legacy_direct_conflicts']}"
+    )
     if ublkred_diag is not None:
         print(f"\nUBLKRED 1:1 diagnostic (executed sites reaching an in-struct slot): "
               f"{ublkred_diag['resolved_to_struct']}/{ublkred_diag['executed']} "
@@ -529,45 +778,54 @@ def main():
     if not a.no_ublk:
         print(f"\nUBLKRED/UBLKCP raw-pointer base+tiling (M2.5): "
               f"{len(ublk_entries)} (uid,pc) mapped")
-        for uid in sorted(ublk_stats, key=lambda x: int(x)):
-            s = ublk_stats[uid]
-            print(f"  uid{uid}: UBLKRED={s['UBLKRED']} UBLKCP={s['UBLKCP']}")
+        for kernel_uid in sorted(ublk_stats):
+            s = ublk_stats[kernel_uid]
+            print(f"  trace_kernel={kernel_uid[0]} uid={kernel_uid[1]}: "
+                  f"UBLKRED={s['UBLKRED']} UBLKCP={s['UBLKCP']}")
         # per (uid,base) region summary — one line per distinct tensor region
         regions = {}
         for key, e in ublk_entries.items():
-            uid = key.split(":")[0]
-            regions.setdefault((uid, e["base_hex"]), e)
-        for (uid, bh), e in sorted(regions.items()):
-            print(f"  uid{uid} base={bh} tile_bytes={e['tile_bytes']} "
+            region_key = (
+                e["trace_kernel_id"],
+                e["unique_function_id"],
+                e["base_hex"],
+            )
+            regions.setdefault(region_key, e)
+        for (kernel_id, uid, bh), e in sorted(regions.items()):
+            print(f"  trace_kernel={kernel_id} uid={uid} base={bh} "
+                  f"tile_bytes={e['tile_bytes']} "
                   f"num_tiles={e['num_tiles']} region_bytes={e['region_bytes']} "
                   f"(0x{e['region_bytes']:x}) distinct_addrs={e['distinct_addrs_region']}")
         if ublk_unmatched:
             print(f"  UNMATCHED ({len(ublk_unmatched)}): {ublk_unmatched[:8]}")
-    # locality integrity: each SMEM offset must map to exactly one base
-    bad = defaultdict(set)
-    for k, v in result.items():
-        if "smem_offset_hex" not in v:
-            continue  # prefetch entries have no smem offset
-        uid = k.split(":")[0]
-        bad[(uid, v["smem_offset_hex"])].add(v["base_hex"])
-    conflicts = {k: v for k, v in bad.items() if len(v) > 1}
-    print(f"\nlocality check (one base per SMEM offset): "
-          f"{'OK' if not conflicts else 'CONFLICTS: %s' % conflicts}")
 
-    # STRICT GATE: enforce that every descriptor LOAD/STORE site resolved exactly (no
-    # pool, no unresolved). UTMACCTL prefetch + UBLKRED are not gated here (prefetch is
-    # emitted only when resolved; UBLKRED is intentionally synthetic in M1).
     if a.strict:
         problems = []
+        problems.extend(chain_problems)
         if unresolved_pcs:
             problems.append(f"{len(unresolved_pcs)} unresolved: {unresolved_pcs[:8]}")
-        if pool_pcs and not a.allow_pool:
-            problems.append(f"{len(pool_pcs)} pool-fallback: {pool_pcs[:8]}")
-        if conflicts:
-            problems.append(f"{len(conflicts)} locality conflicts")
+        if ublk_unmatched:
+            problems.append(
+                f"{len(ublk_unmatched)} UBLK operand failures: "
+                f"{ublk_unmatched[:8]}"
+            )
+        if descriptor_sites_total == 0 or chain_resolved != descriptor_sites_total:
+            problems.append(
+                f"descriptor chain coverage {chain_resolved}/{descriptor_sites_total}"
+            )
         if problems:
             raise SystemExit("STRICT GATE FAILED: " + "; ".join(problems))
-        print("\nSTRICT GATE: PASS (all descriptor LDG/STG sites exact, no pool)")
+        print("\nSTRICT GATE: PASS")
+        print(
+            "FINAL status=PASS "
+            f"sites_total={descriptor_sites_total} "
+            f"chain_resolved={chain_resolved} ambiguous=0 unresolved=0 "
+            "direct_authority=0 pool_authority=0 "
+            f"ublkcp_sites={validation['ublkcp_sites']} "
+            f"ublkcp_dynamic_occurrences="
+            f"{validation['ublkcp_dynamic_occurrences']} "
+            f"ublkcp_by_kernel={json.dumps(ublkcp_by_kernel, sort_keys=True)}"
+        )
 
 
 if __name__ == "__main__":

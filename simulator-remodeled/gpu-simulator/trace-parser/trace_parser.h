@@ -91,10 +91,14 @@ struct inst_trace_t {
   uint16_t m_unique_function_id;
   unsigned int m_next_traced_pc;
   unsigned int mask;
+  uint32_t active_mask;
+  uint32_t predicate_mask;
   std::string opcode;
   uint32_t block_idx_x;
   uint16_t block_idx_y;
   uint16_t block_idx_z;
+  uint32_t trace_cta_warp_id = 0;
+  uint64_t trace_instruction_index = 0;
   bool is_constant_addr_already_calculated;
   bool sync_site_valid;
   SyncInstructionKind sync_kind;
@@ -105,6 +109,13 @@ struct inst_trace_t {
   uint64_t sync_barrier_addr;
   bool sync_has_semantic_raw;
   uint64_t sync_semantic_raw;
+  bool wait_block_generation_ticket_present;
+  bool wait_block_exact_target_valid;
+  uint64_t wait_block_target_release_generation;
+  uint64_t wait_block_ticket_source_index;
+  bool tma_completion_runtime_valid;
+  uint64_t tma_completion_barrier_addr;
+  uint32_t tma_completion_barrier_ureg_id;
   // Runtime values of register-form BAR.SYNC / BAR.ARV operands (Phase A capture).
   bool bar_runtime_valid;
   bool bar_runtime_has_id;

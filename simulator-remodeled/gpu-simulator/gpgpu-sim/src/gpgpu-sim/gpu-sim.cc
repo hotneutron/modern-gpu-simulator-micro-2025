@@ -63,6 +63,8 @@
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <limits>
+#include <sstream>
 #include "zlib.h"
 
 #include "dram.h"
@@ -165,6 +167,7 @@ static std::string format_top_histogram_entries(
 #include "mem_latency_stat.h"
 
 #include "remodeling/gmmu.h"
+#include "remodeling/sm.h"
 
 namespace {
 
@@ -378,25 +381,126 @@ void load_tma_descriptor_configs(const std::filesystem::path &extra_info_dir,
 void load_tma_pc_base_map(const std::filesystem::path &extra_info_dir,
                           TMASidecarMetadataDB &db) {
   rapidjson::Document doc;
-  if (!load_tma_json_document(extra_info_dir / "tma_pc_base_map.json", doc)) {
+  const std::filesystem::path path =
+      extra_info_dir / "tma_pc_base_map.json";
+  if (!load_tma_json_document(path, doc)) {
     return;
   }
   if (!doc.HasMember("map") || !doc["map"].IsObject()) {
     return;
   }
+  const unsigned int version =
+      doc.HasMember("version")
+          ? static_cast<unsigned int>(parse_tma_json_uint(doc["version"]))
+          : 1;
+  db.base_map_version = version;
+  if (version >= 2 &&
+      (!doc.HasMember("validation_complete") ||
+       !doc["validation_complete"].IsBool() ||
+       !doc["validation_complete"].GetBool())) {
+    std::cerr << "[TMA][BaseMap][FATAL] version-" << version
+              << " sidecar is not validation_complete: " << path.string()
+              << std::endl;
+    abort();
+  }
+  if (version >= 2) {
+    if (!doc.HasMember("validation") || !doc["validation"].IsObject()) {
+      std::cerr << "[TMA][BaseMap][FATAL] version-" << version
+                << " sidecar has no validation summary: " << path.string()
+                << std::endl;
+      abort();
+    }
+    const rapidjson::Value &validation = doc["validation"];
+    const uint64_t sites_total =
+        validation.HasMember("sites_total")
+            ? parse_tma_json_uint(validation["sites_total"])
+            : 0;
+    const uint64_t chain_resolved =
+        validation.HasMember("chain_resolved")
+            ? parse_tma_json_uint(validation["chain_resolved"])
+            : 0;
+    const uint64_t ambiguous =
+        validation.HasMember("ambiguous")
+            ? parse_tma_json_uint(validation["ambiguous"])
+            : 1;
+    const uint64_t unresolved =
+        validation.HasMember("unresolved")
+            ? parse_tma_json_uint(validation["unresolved"])
+            : 1;
+    const uint64_t direct_authority =
+        validation.HasMember("direct_authority")
+            ? parse_tma_json_uint(validation["direct_authority"])
+            : 1;
+    const uint64_t pool_authority =
+        validation.HasMember("pool_authority")
+            ? parse_tma_json_uint(validation["pool_authority"])
+            : 1;
+    if (sites_total == 0 || chain_resolved != sites_total ||
+        ambiguous != 0 || unresolved != 0 || direct_authority != 0 ||
+        pool_authority != 0) {
+      std::cerr << "[TMA][BaseMap][FATAL] invalid kernel-aware validation "
+                << "sites_total=" << sites_total
+                << " chain_resolved=" << chain_resolved
+                << " ambiguous=" << ambiguous
+                << " unresolved=" << unresolved
+                << " direct_authority=" << direct_authority
+                << " pool_authority=" << pool_authority << " path="
+                << path.string() << std::endl;
+      abort();
+    }
+  }
   for (auto it = doc["map"].MemberBegin(); it != doc["map"].MemberEnd(); ++it) {
-    // Key format is "uid:pc_hex" (e.g. "8:0x90a0"). Split on ':'.
+    // Version 2 key: "trace_kernel_id:uid:pc_hex". Version 1 records remain
+    // readable under a wildcard trace-kernel ID for old traces.
     std::string key = it->name.GetString();
-    std::string::size_type colon = key.find(':');
-    if (colon == std::string::npos) {
+    std::string::size_type first_colon = key.find(':');
+    if (first_colon == std::string::npos) {
       continue;
     }
+    std::string::size_type second_colon = key.find(':', first_colon + 1);
+    unsigned int trace_kernel_id = ~0u;
+    std::string uid_text;
+    std::string pc_text;
+    if (second_colon == std::string::npos) {
+      if (version >= 2) {
+        std::cerr << "[TMA][BaseMap][FATAL] version-" << version
+                  << " has legacy key '" << key << "' in " << path.string()
+                  << std::endl;
+        abort();
+      }
+      uid_text = key.substr(0, first_colon);
+      pc_text = key.substr(first_colon + 1);
+    } else {
+      trace_kernel_id = static_cast<unsigned int>(
+          std::strtoul(key.substr(0, first_colon).c_str(), nullptr, 0));
+      uid_text =
+          key.substr(first_colon + 1, second_colon - first_colon - 1);
+      pc_text = key.substr(second_colon + 1);
+    }
     unsigned int unique_function_id = static_cast<unsigned int>(
-        std::strtoul(key.substr(0, colon).c_str(), nullptr, 0));
-    uint64_t pc = std::strtoull(key.substr(colon + 1).c_str(), nullptr, 0);
+        std::strtoul(uid_text.c_str(), nullptr, 0));
+    uint64_t pc = std::strtoull(pc_text.c_str(), nullptr, 0);
     const rapidjson::Value &entry = it->value;
     if (!entry.IsObject()) {
+      if (version >= 2) {
+        std::cerr << "[TMA][BaseMap][FATAL] non-object record for key='"
+                  << key << "' in " << path.string() << std::endl;
+        abort();
+      }
       continue;
+    }
+    if (version >= 2) {
+      if (!entry.HasMember("trace_kernel_id") ||
+          !entry.HasMember("unique_function_id") ||
+          !entry.HasMember("pc_hex") ||
+          parse_tma_json_uint(entry["trace_kernel_id"]) != trace_kernel_id ||
+          parse_tma_json_uint(entry["unique_function_id"]) !=
+              unique_function_id ||
+          parse_tma_json_uint(entry["pc_hex"]) != pc) {
+        std::cerr << "[TMA][BaseMap][FATAL] key/value identity mismatch for '"
+                  << key << "' in " << path.string() << std::endl;
+        abort();
+      }
     }
     TMABaseRecord record;
     if (entry.HasMember("operand_addressed") &&
@@ -467,15 +571,37 @@ void load_tma_pc_base_map(const std::filesystem::path &extra_info_dir,
     if (entry.HasMember("source") && entry["source"].IsString()) {
       record.source = entry["source"].GetString();
     }
-    db.base_records[TMABaseLookupKey{unique_function_id, pc}] = record;
+    if (version >= 2) {
+      const bool valid_source =
+          record.operand_addressed
+              ? record.source == "operand_raw_pointer"
+              : (record.source == "utmacctl_chain" ||
+                 record.source == "utmacctl_prefetch_edge");
+      if (!valid_source) {
+        std::cerr << "[TMA][BaseMap][FATAL] non-authoritative source='"
+                  << record.source << "' for key='" << key << "' in "
+                  << path.string() << std::endl;
+        abort();
+      }
+    }
+    const TMABaseLookupKey lookup_key{
+        trace_kernel_id, unique_function_id, pc};
+    if (!db.base_records.emplace(lookup_key, record).second) {
+      std::cerr << "[TMA][BaseMap][FATAL] duplicate key trace_kernel="
+                << trace_kernel_id << " uid=" << unique_function_id
+                << " pc=0x" << std::hex << pc << std::dec << " in "
+                << path.string() << std::endl;
+      abort();
+    }
   }
 }
 
 void load_tma_operand_resolver(const std::filesystem::path &extra_info_dir,
                                TMASidecarMetadataDB &db) {
   rapidjson::Document doc;
-  if (!load_tma_json_document(extra_info_dir / "tma_operand_resolver.json",
-                              doc)) {
+  const std::filesystem::path path =
+      extra_info_dir / "tma_operand_resolver.json";
+  if (!load_tma_json_document(path, doc)) {
     return;
   }
   if (!doc.HasMember("resolver")) {
@@ -485,22 +611,101 @@ void load_tma_operand_resolver(const std::filesystem::path &extra_info_dir,
   if (!resolver.IsArray()) {
     return;
   }
+  const unsigned int version =
+      doc.HasMember("version")
+          ? static_cast<unsigned int>(parse_tma_json_uint(doc["version"]))
+          : 1;
+  db.operand_map_version = version;
+  if (version >= 2 &&
+      (!doc.HasMember("validation_complete") ||
+       !doc["validation_complete"].IsBool() ||
+       !doc["validation_complete"].GetBool())) {
+    std::cerr << "[TMA][OperandMap][FATAL] version-" << version
+              << " sidecar is not validation_complete: " << path.string()
+              << std::endl;
+    abort();
+  }
+  if (version >= 2) {
+    if (!doc.HasMember("validation") || !doc["validation"].IsObject()) {
+      std::cerr << "[TMA][OperandMap][FATAL] version-" << version
+                << " sidecar has no validation summary: " << path.string()
+                << std::endl;
+      abort();
+    }
+    const rapidjson::Value &validation = doc["validation"];
+    const uint64_t runtime_sites =
+        validation.HasMember("runtime_sites")
+            ? parse_tma_json_uint(validation["runtime_sites"])
+            : 0;
+    const uint64_t resolver_records =
+        validation.HasMember("resolver_records")
+            ? parse_tma_json_uint(validation["resolver_records"])
+            : 0;
+    const uint64_t duplicate_keys =
+        validation.HasMember("duplicate_keys")
+            ? parse_tma_json_uint(validation["duplicate_keys"])
+            : 1;
+    if (runtime_sites == 0 || runtime_sites != resolver.Size() ||
+        resolver_records != resolver.Size() || duplicate_keys != 0) {
+      std::cerr << "[TMA][OperandMap][FATAL] invalid validation summary "
+                << "runtime_sites=" << runtime_sites
+                << " resolver_records=" << resolver_records
+                << " actual_records=" << resolver.Size()
+                << " duplicate_keys=" << duplicate_keys << " path="
+                << path.string() << std::endl;
+      abort();
+    }
+  }
   for (const auto &entry : resolver.GetArray()) {
     if (!entry.IsObject() || !entry.HasMember("unique_function_id") ||
         entry["unique_function_id"].IsNull() ||
         !entry.HasMember("pc_hex") || !entry["pc_hex"].IsString()) {
+      if (version >= 2) {
+        std::cerr << "[TMA][OperandMap][FATAL] malformed version-" << version
+                  << " record in " << path.string() << std::endl;
+        abort();
+      }
       continue;
     }
     unsigned int unique_function_id =
         static_cast<unsigned int>(parse_tma_json_uint(
             entry["unique_function_id"]));
+    unsigned int trace_kernel_id =
+        entry.HasMember("trace_kernel_id")
+            ? static_cast<unsigned int>(
+                  parse_tma_json_uint(entry["trace_kernel_id"]))
+            : ~0u;
+    if (version >= 2 && trace_kernel_id == ~0u) {
+      std::cerr << "[TMA][OperandMap][FATAL] version-" << version
+                << " record has no trace_kernel_id in " << path.string()
+                << std::endl;
+      abort();
+    }
     uint64_t pc = std::strtoull(entry["pc_hex"].GetString(), nullptr, 0);
+    const TMAOperandLookupKey lookup_key{
+        trace_kernel_id, unique_function_id, pc};
+    if (version >= 2 &&
+        db.operand_site_records.count(lookup_key) != 0) {
+      std::cerr << "[TMA][OperandMap][FATAL] duplicate key trace_kernel="
+                << trace_kernel_id << " uid=" << unique_function_id
+                << " pc=0x" << std::hex << pc << std::dec << " in "
+                << path.string() << std::endl;
+      abort();
+    }
     TMAOperandSiteRecord &record =
-        db.operand_site_records[TMAOperandLookupKey{unique_function_id, pc}];
+        db.operand_site_records[lookup_key];
     std::string opcode = entry.HasMember("opcode") && entry["opcode"].IsString()
                              ? entry["opcode"].GetString()
                              : "";
     TMAOpcodeFamily opcode_family = parse_tma_opcode_family_string(opcode);
+    if (entry.HasMember("mapping_method") &&
+        entry["mapping_method"].IsString()) {
+      record.mapping_method = entry["mapping_method"].GetString();
+    }
+    if (entry.HasMember("confidence")) {
+      record.resolver_confidence =
+          parse_tma_confidence_score(entry["confidence"]);
+    }
     if (entry.HasMember("runtime_observed")) {
       record.runtime_observed = entry["runtime_observed"].IsBool() &&
                                 entry["runtime_observed"].GetBool();
@@ -566,6 +771,91 @@ void load_tma_operand_resolver(const std::filesystem::path &extra_info_dir,
       }
     }
   }
+}
+
+void load_tma_completion_contract_validation(
+    const std::filesystem::path &extra_info_dir, TMASidecarMetadataDB &db) {
+  if (db.base_map_version < 2) {
+    return;
+  }
+  rapidjson::Document doc;
+  const std::filesystem::path path =
+      extra_info_dir / "tma_completion_contracts.json";
+  if (!load_tma_json_document(path, doc) ||
+      !doc.HasMember("validation_complete") ||
+      !doc["validation_complete"].IsBool() ||
+      !doc["validation_complete"].GetBool() ||
+      !doc.HasMember("summary") || !doc["summary"].IsObject()) {
+    std::cerr << "[TMA][Contract][FATAL] missing or invalid validated "
+                 "completion contract sidecar: "
+              << path.string() << std::endl;
+    abort();
+  }
+  const uint64_t version =
+      doc.HasMember("version") ? parse_tma_json_uint(doc["version"]) : 0;
+  const uint64_t source_base_map_version =
+      doc.HasMember("source_base_map_version")
+          ? parse_tma_json_uint(doc["source_base_map_version"])
+          : 0;
+  const uint64_t source_operand_map_version =
+      doc.HasMember("source_operand_map_version")
+          ? parse_tma_json_uint(doc["source_operand_map_version"])
+          : 0;
+  const rapidjson::Value &summary = doc["summary"];
+  const uint64_t kernels =
+      summary.HasMember("kernels")
+          ? parse_tma_json_uint(summary["kernels"])
+          : 0;
+  const uint64_t contracts =
+      summary.HasMember("contracts")
+          ? parse_tma_json_uint(summary["contracts"])
+          : 0;
+  const uint64_t completion_loads =
+      summary.HasMember("completion_loads")
+          ? parse_tma_json_uint(summary["completion_loads"])
+          : 0;
+  const uint64_t expected_bytes =
+      summary.HasMember("expected_bytes")
+          ? parse_tma_json_uint(summary["expected_bytes"])
+          : 0;
+  const uint64_t assigned_bytes =
+      summary.HasMember("assigned_bytes")
+          ? parse_tma_json_uint(summary["assigned_bytes"])
+          : 0;
+  const uint64_t metadata_records_checked =
+      summary.HasMember("metadata_records_checked")
+          ? parse_tma_json_uint(summary["metadata_records_checked"])
+          : 0;
+  const uint64_t errors =
+      summary.HasMember("errors")
+          ? parse_tma_json_uint(summary["errors"])
+          : 1;
+  if (version != 2 || source_base_map_version != db.base_map_version ||
+      source_operand_map_version != db.operand_map_version ||
+      kernels == 0 || contracts == 0 || completion_loads == 0 ||
+      expected_bytes != assigned_bytes || errors != 0) {
+    std::cerr << "[TMA][Contract][FATAL] invalid completion contracts "
+              << "version=" << version
+              << " source_base_map_version=" << source_base_map_version
+              << " loaded_base_map_version=" << db.base_map_version
+              << " source_operand_map_version=" << source_operand_map_version
+              << " loaded_operand_map_version=" << db.operand_map_version
+              << " kernels=" << kernels << " contracts=" << contracts
+              << " completion_loads=" << completion_loads
+              << " expected_bytes=" << expected_bytes
+              << " assigned_bytes=" << assigned_bytes
+              << " errors=" << errors << " path=" << path.string()
+              << std::endl;
+    abort();
+  }
+  if (metadata_records_checked != db.base_records.size()) {
+    std::cerr << "[TMA][Contract][FATAL] stale metadata validation "
+              << "checked_records=" << metadata_records_checked
+              << " loaded_records=" << db.base_records.size() << " path="
+              << path.string() << std::endl;
+    abort();
+  }
+  db.completion_contracts_validated = true;
 }
 
 SyncInstructionKind parse_sync_instruction_kind_string(const std::string &kind) {
@@ -650,23 +940,1677 @@ void load_sync_operand_resolver(const std::filesystem::path &extra_info_dir,
   }
 }
 
+// Producer spin-wait sidecar: map (funcid, primary_wait_pc) -> region so the
+// simulator can recognize an mbarrier spin loop at issue time. Payload untouched;
+// see build_spin_wait_sidecar.py and .plan/SPIN_WAIT_POSTPROCESS.md.
+void load_legacy_spin_wait_sidecar(const std::filesystem::path &extra_info_dir,
+                                   SpinWaitSidecarDB &db) {
+  rapidjson::Document doc;
+  if (!load_tma_json_document(extra_info_dir / "spin_wait_sidecar.json", doc)) {
+    return;
+  }
+  if (!doc.HasMember("kernels") || !doc["kernels"].IsArray()) {
+    return;
+  }
+  for (const auto &kernel : doc["kernels"].GetArray()) {
+    if (!kernel.IsObject() || !kernel.HasMember("unique_function_id") ||
+        kernel["unique_function_id"].IsNull() ||
+        !kernel.HasMember("spin_regions") || !kernel["spin_regions"].IsArray()) {
+      continue;
+    }
+    unsigned int unique_function_id = static_cast<unsigned int>(
+        parse_tma_json_uint(kernel["unique_function_id"]));
+    for (const auto &region : kernel["spin_regions"].GetArray()) {
+      if (!region.IsObject() || !region.HasMember("primary_wait_pc")) {
+        continue;
+      }
+      SpinWaitRegionRecord record;
+      record.loop_head_pc = parse_tma_json_uint(region["loop_head_pc"]);
+      record.primary_wait_pc = parse_tma_json_uint(region["primary_wait_pc"]);
+      record.loopback_bra_pc = parse_tma_json_uint(region["loopback_bra_pc"]);
+      record.exit_pc = parse_tma_json_uint(region["exit_pc"]);
+      // [Stage 1.4] Load the loop body PCs so the runtime cursor-skip guard can
+      // assert it only advances over body_pcs + loopback_bra_pc before exit_pc.
+      if (region.HasMember("body_pcs") && region["body_pcs"].IsArray()) {
+        for (const auto &bp : region["body_pcs"].GetArray()) {
+          record.body_pcs.push_back(parse_tma_json_uint(bp));
+        }
+      }
+      if (region.HasMember("primary_wait_kind") &&
+          region["primary_wait_kind"].IsString()) {
+        record.primary_wait_kind =
+            parse_sync_instruction_kind_string(region["primary_wait_kind"].GetString());
+      }
+      if (region.HasMember("semantic_free_body") &&
+          region["semantic_free_body"].IsBool()) {
+        record.semantic_free_body = region["semantic_free_body"].GetBool();
+      }
+      if (region.HasMember("barrier_self_tied") &&
+          region["barrier_self_tied"].IsBool()) {
+        record.barrier_self_tied = region["barrier_self_tied"].GetBool();
+      }
+      if (region.HasMember("dynamic") && region["dynamic"].IsObject() &&
+          region["dynamic"].HasMember("is_spin_loop") &&
+          region["dynamic"]["is_spin_loop"].IsBool()) {
+        record.is_spin_loop = region["dynamic"]["is_spin_loop"].GetBool();
+      }
+      // Prefer the sidecar's authoritative foldable flag (v2); fall back to
+      // recomputing it from the parts so an older sidecar still gates safely.
+      if (region.HasMember("foldable") && region["foldable"].IsBool()) {
+        record.foldable = region["foldable"].GetBool();
+      } else {
+        record.foldable = record.is_spin_loop && record.semantic_free_body &&
+                             record.barrier_self_tied;
+      }
+      db.regions_by_wait_pc[SyncOperandLookupKey{unique_function_id,
+                                                 record.primary_wait_pc}] = record;
+    }
+  }
+}
+
+[[noreturn]] void wait_block_sidecar_fatal(
+    const std::filesystem::path &path, const std::string &message) {
+  std::cerr << "[WAITBLOCK][SIDECAR][FATAL] path=" << path.string()
+            << " reason=" << message << std::endl;
+  abort();
+}
+
+std::string wait_block_hex_u64(uint64_t value) {
+  std::ostringstream stream;
+  stream << std::hex << value;
+  return stream.str();
+}
+
+const rapidjson::Value &wait_block_require_member(
+    const rapidjson::Value &object, const char *name,
+    const std::filesystem::path &path) {
+  if (!object.IsObject() || !object.HasMember(name)) {
+    wait_block_sidecar_fatal(path,
+                             std::string("missing required member '") + name +
+                                 "'");
+  }
+  return object[name];
+}
+
+uint64_t wait_block_require_uint(const rapidjson::Value &object,
+                                 const char *name,
+                                 const std::filesystem::path &path) {
+  const rapidjson::Value &value =
+      wait_block_require_member(object, name, path);
+  if (!(value.IsUint64() || value.IsUint() ||
+        (value.IsInt64() && value.GetInt64() >= 0) ||
+        (value.IsInt() && value.GetInt() >= 0))) {
+    wait_block_sidecar_fatal(
+        path, std::string("member '") + name + "' must be an unsigned integer");
+  }
+  return parse_tma_json_uint(value);
+}
+
+uint32_t wait_block_require_uint32(const rapidjson::Value &object,
+                                   const char *name,
+                                   const std::filesystem::path &path) {
+  const uint64_t value = wait_block_require_uint(object, name, path);
+  if (value > std::numeric_limits<uint32_t>::max()) {
+    wait_block_sidecar_fatal(
+        path, std::string("member '") + name + "' exceeds uint32 range");
+  }
+  return static_cast<uint32_t>(value);
+}
+
+bool wait_block_require_bool(const rapidjson::Value &object, const char *name,
+                             const std::filesystem::path &path) {
+  const rapidjson::Value &value =
+      wait_block_require_member(object, name, path);
+  if (!value.IsBool()) {
+    wait_block_sidecar_fatal(
+        path, std::string("member '") + name + "' must be a boolean");
+  }
+  return value.GetBool();
+}
+
+std::string wait_block_require_string(const rapidjson::Value &object,
+                                      const char *name,
+                                      const std::filesystem::path &path) {
+  const rapidjson::Value &value =
+      wait_block_require_member(object, name, path);
+  if (!value.IsString()) {
+    wait_block_sidecar_fatal(
+        path, std::string("member '") + name + "' must be a string");
+  }
+  return value.GetString();
+}
+
+const rapidjson::Value &wait_block_require_object(
+    const rapidjson::Value &object, const char *name,
+    const std::filesystem::path &path) {
+  const rapidjson::Value &value =
+      wait_block_require_member(object, name, path);
+  if (!value.IsObject()) {
+    wait_block_sidecar_fatal(
+        path, std::string("member '") + name + "' must be an object");
+  }
+  return value;
+}
+
+const rapidjson::Value &wait_block_require_array(
+    const rapidjson::Value &object, const char *name,
+    const std::filesystem::path &path) {
+  const rapidjson::Value &value =
+      wait_block_require_member(object, name, path);
+  if (!value.IsArray()) {
+    wait_block_sidecar_fatal(
+        path, std::string("member '") + name + "' must be an array");
+  }
+  return value;
+}
+
+std::vector<uint64_t> wait_block_require_pc_array(
+    const rapidjson::Value &object, const char *name,
+    const std::filesystem::path &path) {
+  const rapidjson::Value &array =
+      wait_block_require_array(object, name, path);
+  std::vector<uint64_t> pcs;
+  pcs.reserve(array.Size());
+  for (const rapidjson::Value &value : array.GetArray()) {
+    if (!(value.IsUint64() || value.IsUint() ||
+          (value.IsInt64() && value.GetInt64() >= 0) ||
+          (value.IsInt() && value.GetInt() >= 0))) {
+      wait_block_sidecar_fatal(
+          path, std::string("member '") + name +
+                    "' contains a non-unsigned PC");
+    }
+    pcs.push_back(parse_tma_json_uint(value));
+  }
+  return pcs;
+}
+
+std::string wait_block_normalize_operand(std::string operand);
+
+std::set<uint64_t> wait_block_require_mask_key_set(
+    const rapidjson::Value &object, const char *name,
+    const std::filesystem::path &path) {
+  const rapidjson::Value &counts =
+      wait_block_require_object(object, name, path);
+  std::set<uint64_t> masks;
+  for (auto it = counts.MemberBegin(); it != counts.MemberEnd(); ++it) {
+    if (!it->name.IsString()) {
+      wait_block_sidecar_fatal(
+          path, std::string("member '") + name +
+                    "' contains a non-string mask key");
+    }
+    char *end = nullptr;
+    const uint64_t mask = std::strtoull(it->name.GetString(), &end, 0);
+    if (end == it->name.GetString() || *end != '\0' || mask == 0 ||
+        !(it->value.IsUint64() || it->value.IsUint() ||
+          (it->value.IsInt64() && it->value.GetInt64() > 0) ||
+          (it->value.IsInt() && it->value.GetInt() > 0)) ||
+        parse_tma_json_uint(it->value) == 0) {
+      wait_block_sidecar_fatal(
+          path, std::string("member '") + name +
+                    "' contains an invalid mask/count");
+    }
+    masks.insert(mask);
+  }
+  if (masks.empty()) {
+    wait_block_sidecar_fatal(
+        path, std::string("member '") + name + "' is empty");
+  }
+  return masks;
+}
+
+std::set<std::string> wait_block_require_string_set(
+    const rapidjson::Value &object, const char *name,
+    const std::filesystem::path &path) {
+  const rapidjson::Value &values =
+      wait_block_require_array(object, name, path);
+  std::set<std::string> result;
+  for (const rapidjson::Value &value : values.GetArray()) {
+    if (!value.IsString() || value.GetStringLength() == 0) {
+      wait_block_sidecar_fatal(
+          path, std::string("member '") + name +
+                    "' contains an invalid string");
+    }
+    result.insert(wait_block_normalize_operand(value.GetString()));
+  }
+  if (result.empty() || result.size() != values.Size()) {
+    wait_block_sidecar_fatal(
+        path, std::string("member '") + name +
+                  "' is empty or contains duplicates");
+  }
+  return result;
+}
+
+bool wait_block_parse_barrier_offset(const std::string &operand,
+                                     uint64_t &offset) {
+  const std::string normalized = wait_block_normalize_operand(operand);
+  if (normalized.find('[') == std::string::npos ||
+      normalized.find(']') == std::string::npos) {
+    return false;
+  }
+  const size_t pos = normalized.rfind("+0x");
+  if (pos == std::string::npos) {
+    offset = 0;
+    return true;
+  }
+  const size_t end = normalized.find(']', pos);
+  if (end == std::string::npos) {
+    return false;
+  }
+  const std::string value = normalized.substr(pos + 1, end - pos - 1);
+  char *parse_end = nullptr;
+  offset = std::strtoull(value.c_str(), &parse_end, 0);
+  return parse_end != value.c_str() && *parse_end == '\0';
+}
+
+uint64_t wait_block_static_direct_target(
+    const std::shared_ptr<traced_instruction> &instruction,
+    const std::filesystem::path &path, const char *description) {
+  for (size_t i = 0; i < instruction->get_num_operands(); ++i) {
+    traced_operand &operand = instruction->get_operand(i);
+    const std::vector<double> immediates = operand.get_operands_inmediates();
+    if (operand.get_has_inmediate() && !immediates.empty()) {
+      return static_cast<uint64_t>(immediates.back());
+    }
+  }
+  wait_block_sidecar_fatal(
+      path, std::string(description) + " has no direct target");
+}
+
+void wait_block_validate_action_opcode(
+    traced_execution &static_trace_info, uint32_t unique_function_id,
+    uint64_t action_pc, const std::string &sidecar_opcode,
+    const std::filesystem::path &path) {
+  if (sidecar_opcode != "SYNCS.PHASECHK.TRANS64" &&
+      sidecar_opcode != "SYNCS.PHASECHK.TRANS64.TRYWAIT") {
+    wait_block_sidecar_fatal(
+        path, "runtime action opcode is not a supported wait probe");
+  }
+  if (!static_trace_info.has_kernel_with_unique_function_id(
+          unique_function_id)) {
+    wait_block_sidecar_fatal(
+        path, "runtime action references an unknown unique_function_id");
+  }
+  if (action_pc > std::numeric_limits<uint32_t>::max()) {
+    wait_block_sidecar_fatal(
+        path, "runtime action PC exceeds enhanced metadata PC range");
+  }
+  std::shared_ptr<traced_instruction> instruction =
+      static_trace_info.get_kernel_by_unique_function_id(unique_function_id)
+          .get_instruction_ptr(static_cast<uint32_t>(action_pc));
+  if (!instruction) {
+    wait_block_sidecar_fatal(
+        path, "runtime action PC is absent from enhanced execution metadata");
+  }
+  if (instruction->get_op_code() != sidecar_opcode) {
+    wait_block_sidecar_fatal(
+        path, "runtime action opcode disagrees with enhanced execution metadata");
+  }
+}
+
+std::shared_ptr<traced_instruction> wait_block_require_static_instruction(
+    traced_execution &static_trace_info, uint32_t unique_function_id,
+    uint64_t pc, const std::filesystem::path &path) {
+  if (pc > std::numeric_limits<uint32_t>::max() ||
+      !static_trace_info.has_kernel_with_unique_function_id(
+          unique_function_id)) {
+    wait_block_sidecar_fatal(
+        path, "fold proof references invalid function or PC");
+  }
+  std::shared_ptr<traced_instruction> instruction =
+      static_trace_info.get_kernel_by_unique_function_id(unique_function_id)
+          .get_instruction_ptr(static_cast<uint32_t>(pc));
+  if (!instruction) {
+    wait_block_sidecar_fatal(
+        path, "fold proof PC is absent from enhanced execution metadata");
+  }
+  return instruction;
+}
+
+std::string wait_block_normalize_operand(std::string operand) {
+  const std::string reuse = ".reuse";
+  for (size_t pos = operand.find(reuse); pos != std::string::npos;
+       pos = operand.find(reuse)) {
+    operand.erase(pos, reuse.size());
+  }
+  operand.erase(std::remove(operand.begin(), operand.end(), ' '),
+                operand.end());
+  return operand;
+}
+
+bool wait_block_is_wait_opcode(const std::string &opcode) {
+  return opcode == "SYNCS.PHASECHK.TRANS64" ||
+         opcode == "SYNCS.PHASECHK.TRANS64.TRYWAIT";
+}
+
+bool wait_block_is_register_operand(TraceEnhancedOperandType type) {
+  return type == TraceEnhancedOperandType::REG ||
+         type == TraceEnhancedOperandType::UREG;
+}
+
+void wait_block_validate_fold_static_proof(
+    traced_execution &static_trace_info, uint32_t unique_function_id,
+    const SpinWaitRegionRecord &record,
+    const std::vector<uint64_t> &wait_pcs,
+    uint64_t instruction_size,
+    const std::filesystem::path &path) {
+  if (wait_pcs.empty()) {
+    wait_block_sidecar_fatal(path, "captured-poll proof has no wait PCs");
+  }
+  const std::set<uint64_t> declared_wait_pcs(wait_pcs.begin(), wait_pcs.end());
+  if (declared_wait_pcs.size() != wait_pcs.size() ||
+      declared_wait_pcs.count(record.primary_wait_pc) == 0) {
+    wait_block_sidecar_fatal(
+        path, "captured-poll wait PC set is duplicate or misses the primary");
+  }
+
+  bool have_wait_condition = false;
+  std::string expected_barrier_operand;
+  std::string expected_wait_state_operand;
+  TraceEnhancedOperandType expected_predicate_type =
+      TraceEnhancedOperandType::NONE;
+  long expected_predicate_register = -1;
+  for (uint64_t wait_pc : wait_pcs) {
+    std::shared_ptr<traced_instruction> wait =
+        wait_block_require_static_instruction(
+            static_trace_info, unique_function_id, wait_pc, path);
+    if (!wait_block_is_wait_opcode(wait->get_op_code()) ||
+        wait->get_num_operands() < 3) {
+      wait_block_sidecar_fatal(
+          path, "captured-poll wait proof references a non-wait instruction");
+    }
+    traced_operand &predicate = wait->get_operand(0);
+    const TraceEnhancedOperandType predicate_type =
+        predicate.get_operand_type();
+    if (predicate_type != TraceEnhancedOperandType::PRED &&
+        predicate_type != TraceEnhancedOperandType::UPRED) {
+      wait_block_sidecar_fatal(
+          path, "captured-poll wait destination is not a predicate");
+    }
+    const std::string barrier_operand = wait_block_normalize_operand(
+        wait->get_operand(1).get_operand_string());
+    const std::string wait_state_operand = wait_block_normalize_operand(
+        wait->get_operand(2).get_operand_string());
+    if (!have_wait_condition) {
+      have_wait_condition = true;
+      expected_barrier_operand = barrier_operand;
+      expected_wait_state_operand = wait_state_operand;
+      expected_predicate_type = predicate_type;
+      expected_predicate_register = predicate.get_operand_reg_number();
+    } else if (barrier_operand != expected_barrier_operand ||
+               wait_state_operand != expected_wait_state_operand ||
+               predicate_type != expected_predicate_type ||
+               predicate.get_operand_reg_number() !=
+                   expected_predicate_register) {
+      wait_block_sidecar_fatal(
+          path, "captured-poll waits do not share one static condition");
+    }
+  }
+
+  std::shared_ptr<traced_instruction> loopback =
+      wait_block_require_static_instruction(
+          static_trace_info, unique_function_id, record.loopback_bra_pc, path);
+  if (loopback->get_op_code() != "BRA" ||
+      !loopback->get_is_predicated() ||
+      !loopback->get_is_predicate_negate() ||
+      loopback->get_is_uniform_predicate() !=
+          (expected_predicate_type == TraceEnhancedOperandType::UPRED) ||
+      static_cast<long>(loopback->get_predicate_register()) !=
+          expected_predicate_register ||
+      instruction_size == 0 ||
+      record.loopback_bra_pc >
+          std::numeric_limits<uint64_t>::max() - instruction_size ||
+      record.exit_pc != record.loopback_bra_pc + instruction_size) {
+    wait_block_sidecar_fatal(
+        path, "captured-poll loopback is not owned by the primary wait");
+  }
+  bool target_found = false;
+  uint64_t loopback_target = 0;
+  for (size_t i = 0; i < loopback->get_num_operands(); ++i) {
+    traced_operand &operand = loopback->get_operand(i);
+    const std::vector<double> immediates = operand.get_operands_inmediates();
+    if (operand.get_has_inmediate() && !immediates.empty()) {
+      loopback_target = static_cast<uint64_t>(immediates.back());
+      target_found = true;
+      break;
+    }
+  }
+  if (!target_found || loopback_target != record.loop_head_pc) {
+    wait_block_sidecar_fatal(
+        path, "captured-poll loopback target disagrees with loop head");
+  }
+
+  std::set<uint64_t> static_wait_pcs;
+  std::set<int> armed_ids;
+  std::set<int> waited_ids;
+  std::vector<uint64_t> skip_pcs = record.body_pcs;
+  skip_pcs.push_back(record.loopback_bra_pc);
+  for (uint64_t pc : skip_pcs) {
+    std::shared_ptr<traced_instruction> instruction =
+        wait_block_require_static_instruction(
+            static_trace_info, unique_function_id, pc, path);
+    const std::string opcode = instruction->get_op_code();
+    if (wait_block_is_wait_opcode(opcode)) {
+      static_wait_pcs.insert(pc);
+    } else if (opcode == "NANOSLEEP.SYNCS") {
+      // Delay-only backoff.
+    } else if (opcode == "IMAD.U32" || opcode == "IMAD.MOV.U32") {
+      if (instruction->get_num_operands() != 4 ||
+          !wait_block_is_register_operand(
+              instruction->get_operand(0).get_operand_type()) ||
+          !wait_block_is_register_operand(
+              instruction->get_operand(3).get_operand_type()) ||
+          (wait_block_normalize_operand(
+               instruction->get_operand(1).get_operand_string()) != "RZ" &&
+           wait_block_normalize_operand(
+               instruction->get_operand(1).get_operand_string()) != "URZ") ||
+          (wait_block_normalize_operand(
+               instruction->get_operand(2).get_operand_string()) != "RZ" &&
+           wait_block_normalize_operand(
+               instruction->get_operand(2).get_operand_string()) != "URZ")) {
+        wait_block_sidecar_fatal(
+            path, "captured-poll IMAD is not an idempotent register copy");
+      }
+    } else if (opcode != "BRA" || pc != record.loopback_bra_pc) {
+      wait_block_sidecar_fatal(
+          path, "captured-poll skip set contains an unapproved effect");
+    }
+
+    control_bits &bits = instruction->get_control_bits();
+    if (bits.get_is_new_read_barrier()) {
+      armed_ids.insert(bits.get_id_new_read_barrier());
+    }
+    if (bits.get_is_new_write_barrier()) {
+      armed_ids.insert(bits.get_id_new_write_barrier());
+    }
+    const int wait_mask = bits.get_wait_barrier_bits();
+    for (int bit = 0; bit < 6; ++bit) {
+      if (wait_mask & (1 << bit)) {
+        waited_ids.insert(bit);
+      }
+    }
+  }
+  if (static_wait_pcs != declared_wait_pcs) {
+    wait_block_sidecar_fatal(
+        path, "captured-poll wait PC proof is incomplete");
+  }
+  for (int waited_id : waited_ids) {
+    if (armed_ids.count(waited_id) == 0) {
+      wait_block_sidecar_fatal(
+          path, "captured-poll skip set waits on an external scoreboard barrier");
+    }
+  }
+}
+
+void wait_block_validate_partial_static_proof(
+    traced_execution &static_trace_info, uint32_t unique_function_id,
+    const MissingWaitRecord &record, uint64_t bssy_pc,
+    const std::string &join_token, uint64_t instruction_size,
+    const std::filesystem::path &path) {
+  std::shared_ptr<traced_instruction> entry_probe =
+      wait_block_require_static_instruction(
+          static_trace_info, unique_function_id, record.entry_probe_pc, path);
+  auto validate_wait_condition =
+      [&](const std::shared_ptr<traced_instruction> &wait) {
+        uint64_t barrier_offset = 0;
+        if (!wait_block_is_wait_opcode(wait->get_op_code()) ||
+            wait->get_num_operands() < 3 ||
+            !wait_block_parse_barrier_offset(
+                wait->get_operand(1).get_operand_string(), barrier_offset) ||
+            barrier_offset != record.canonical_barrier_offset ||
+            record.canonical_wait_state_operands.count(
+                wait_block_normalize_operand(
+                    wait->get_operand(2).get_operand_string())) == 0) {
+          wait_block_sidecar_fatal(
+              path, "partial wait arm disagrees with canonical condition");
+        }
+      };
+  validate_wait_condition(entry_probe);
+  std::shared_ptr<traced_instruction> entry_branch =
+      wait_block_require_static_instruction(
+          static_trace_info, unique_function_id, record.entry_branch_pc, path);
+  if (!wait_block_is_wait_opcode(entry_probe->get_op_code()) ||
+      entry_probe->get_num_operands() < 1) {
+    wait_block_sidecar_fatal(
+        path, "partial entry probe is not a valid wait");
+  }
+  const TraceEnhancedOperandType entry_predicate_type =
+      entry_probe->get_operand(0).get_operand_type();
+  if ((entry_predicate_type != TraceEnhancedOperandType::PRED &&
+       entry_predicate_type != TraceEnhancedOperandType::UPRED) ||
+      entry_branch->get_op_code() != "BRA" ||
+      !entry_branch->get_is_predicated() ||
+      !entry_branch->get_is_predicate_negate() ||
+      static_cast<long>(entry_branch->get_predicate_register()) !=
+          entry_probe->get_operand(0).get_operand_reg_number() ||
+      entry_branch->get_is_uniform_predicate() !=
+          (entry_predicate_type == TraceEnhancedOperandType::UPRED) ||
+      wait_block_static_direct_target(
+          entry_branch, path, "missing-wait entry branch") !=
+          record.miss_arm_entry_pc) {
+    wait_block_sidecar_fatal(
+        path, "partial missing-wait branch does not enter its wait arm");
+  }
+
+  if (record.entry_arming_pcs.empty() ||
+      std::find(record.entry_arming_pcs.begin(),
+                record.entry_arming_pcs.end(),
+                record.entry_branch_pc) == record.entry_arming_pcs.end()) {
+    wait_block_sidecar_fatal(
+        path, "partial missing-wait arming PCs omit the controlling branch");
+  }
+  for (uint64_t pc : record.entry_arming_pcs) {
+    wait_block_require_static_instruction(
+        static_trace_info, unique_function_id, pc, path);
+  }
+
+  if (record.miss_arm_wait_pcs.empty()) {
+    wait_block_sidecar_fatal(path, "partial wait arm has no wait probe");
+  }
+  for (uint64_t wait_pc : record.miss_arm_wait_pcs) {
+    std::shared_ptr<traced_instruction> wait =
+        wait_block_require_static_instruction(
+            static_trace_info, unique_function_id, wait_pc, path);
+    validate_wait_condition(wait);
+  }
+
+  std::shared_ptr<traced_instruction> loopback =
+      wait_block_require_static_instruction(
+          static_trace_info, unique_function_id,
+          record.miss_arm_loopback_pc, path);
+  const uint64_t loopback_target = wait_block_static_direct_target(
+      loopback, path, "partial wait-arm loopback");
+  if (loopback->get_op_code() != "BRA" ||
+      !loopback->get_is_predicated() ||
+      !loopback->get_is_predicate_negate() ||
+      loopback_target < record.miss_arm_entry_pc ||
+      loopback_target >= record.miss_arm_loopback_pc) {
+    wait_block_sidecar_fatal(
+        path, "partial wait-arm loopback is not a predicated backedge");
+  }
+
+  std::shared_ptr<traced_instruction> arm_exit =
+      wait_block_require_static_instruction(
+          static_trace_info, unique_function_id,
+          record.miss_arm_exit_pc, path);
+  if (arm_exit->get_op_code() != "BRA" ||
+      arm_exit->get_is_predicated() ||
+      record.miss_arm_loopback_pc >
+          std::numeric_limits<uint64_t>::max() - instruction_size ||
+      record.miss_arm_exit_pc !=
+          record.miss_arm_loopback_pc + instruction_size ||
+      wait_block_static_direct_target(
+          arm_exit, path, "partial wait-arm exit") !=
+          record.captured_ready_pc) {
+    wait_block_sidecar_fatal(
+        path, "partial wait-arm exit does not rejoin captured ready path");
+  }
+
+  std::shared_ptr<traced_instruction> sibling_branch =
+      wait_block_require_static_instruction(
+          static_trace_info, unique_function_id,
+          record.sibling_branch_pc, path);
+  if (sibling_branch->get_op_code() != "BRA" ||
+      !sibling_branch->get_is_predicated() ||
+      wait_block_static_direct_target(
+          sibling_branch, path, "partial sibling branch") != record.join_pc) {
+    wait_block_sidecar_fatal(
+        path, "partial sibling branch does not target the declared join");
+  }
+
+  std::shared_ptr<traced_instruction> join =
+      wait_block_require_static_instruction(
+          static_trace_info, unique_function_id, record.join_pc, path);
+  wait_block_require_static_instruction(
+      static_trace_info, unique_function_id, record.post_join_pc, path);
+  if (join->get_is_predicated() ||
+      record.join_pc >
+          std::numeric_limits<uint64_t>::max() - instruction_size ||
+      record.post_join_pc != record.join_pc + instruction_size ||
+      (record.join_kind == "WARPSYNC" &&
+       join->get_op_code() != "WARPSYNC.ALL") ||
+      (record.join_kind == "BSYNC" && join->get_op_code() != "BSYNC") ||
+      (record.join_kind != "WARPSYNC" && record.join_kind != "BSYNC")) {
+    wait_block_sidecar_fatal(
+        path, "partial join opcode disagrees with static metadata");
+  }
+
+  if (record.join_kind == "BSYNC") {
+    std::shared_ptr<traced_instruction> bssy =
+        wait_block_require_static_instruction(
+            static_trace_info, unique_function_id, bssy_pc, path);
+    if (bssy->get_op_code() != "BSSY" ||
+        bssy->get_num_operands() < 2 ||
+        wait_block_normalize_operand(
+            bssy->get_operand(0).get_operand_string()) != join_token ||
+        join->get_num_operands() != 1 ||
+        wait_block_normalize_operand(
+            join->get_operand(0).get_operand_string()) != join_token ||
+        wait_block_static_direct_target(
+            bssy, path, "partial BSSY") != record.post_join_pc) {
+      wait_block_sidecar_fatal(
+          path, "partial BSYNC token or BSSY target mismatch");
+    }
+  } else if (bssy_pc != 0 || !join_token.empty()) {
+    wait_block_sidecar_fatal(
+        path, "WARPSYNC partial region unexpectedly declares BSSY metadata");
+  }
+}
+
+void load_wait_block_sidecar_v5(const std::filesystem::path &extra_info_dir,
+                                traced_execution &static_trace_info,
+                                WaitBlockSidecarDB &db,
+                                bool require_exact_generation_tickets) {
+  const std::filesystem::path path =
+      extra_info_dir / "spin_wait_sidecar.json";
+  rapidjson::Document doc;
+  if (!load_tma_json_document(path, doc)) {
+    wait_block_sidecar_fatal(path, "missing or malformed JSON document");
+  }
+  if (wait_block_require_uint(doc, "version", path) != 5) {
+    wait_block_sidecar_fatal(path, "unsupported version (expected 5)");
+  }
+  if (wait_block_require_string(doc, "schema", path) !=
+      "wait_block_sidecar") {
+    wait_block_sidecar_fatal(path,
+                             "unsupported schema (expected wait_block_sidecar)");
+  }
+  const uint64_t instruction_size =
+      wait_block_require_uint(doc, "isize_bytes", path);
+  if (instruction_size == 0) {
+    wait_block_sidecar_fatal(path, "isize_bytes must be nonzero");
+  }
+  db.validation_complete =
+      wait_block_require_bool(doc, "validation_complete", path);
+  if (!db.validation_complete) {
+    wait_block_sidecar_fatal(path, "validation_complete is false");
+  }
+
+  const rapidjson::Value &report =
+      wait_block_require_object(doc, "wait_block_report", path);
+  db.discovered = wait_block_require_uint(report, "discovered", path);
+  db.passed = wait_block_require_uint(report, "passed", path);
+  db.failed = wait_block_require_uint(report, "failed", path);
+  db.skipped = wait_block_require_uint(report, "skipped", path);
+  const uint64_t expected_inject =
+      wait_block_require_uint(report, "inject_missing_wait", path);
+  const uint64_t expected_fold =
+      wait_block_require_uint(report, "fold_captured_poll", path);
+  db.metadata_only =
+      wait_block_require_uint(report, "metadata_only", path);
+  db.ready_only_all_live_visits =
+      wait_block_require_uint(report, "ready_only_all_live_visits", path);
+  db.ready_only_partial_visits =
+      wait_block_require_uint(report, "ready_only_partial_visits", path);
+  db.ready_only_records_with_partial_visits = wait_block_require_uint(
+      report, "ready_only_records_with_partial_visits", path);
+  db.partial_defer_records =
+      wait_block_require_uint(report, "partial_defer_records", path);
+  db.partial_join_pending_visits =
+      wait_block_require_uint(report, "partial_join_pending_visits", path);
+  db.partial_join_already_issued_visits =
+      wait_block_require_uint(report, "partial_join_already_issued_visits",
+                              path);
+  if (db.failed != 0) {
+    wait_block_sidecar_fatal(path, "wait_block_report.failed is nonzero");
+  }
+  if (db.discovered != db.passed + db.failed + db.skipped) {
+    wait_block_sidecar_fatal(path, "report discovered accounting mismatch");
+  }
+  if (db.passed != expected_inject + expected_fold + db.metadata_only) {
+    wait_block_sidecar_fatal(path, "report passed accounting mismatch");
+  }
+  if (expected_inject + expected_fold == 0) {
+    wait_block_sidecar_fatal(
+        path, "validated sidecar contains no runtime WaitBlock actions");
+  }
+
+  const rapidjson::Value &kernels =
+      wait_block_require_array(doc, "kernels", path);
+  if (kernels.Empty()) {
+    wait_block_sidecar_fatal(path, "kernels array is empty");
+  }
+  std::set<std::pair<uint32_t, uint32_t>> loaded_kernel_keys;
+  uint64_t loaded_metadata = 0;
+  uint64_t loaded_all_live_visits = 0;
+  uint64_t loaded_partial_visits = 0;
+  uint64_t loaded_records_with_partial = 0;
+  uint64_t loaded_partial_defer_records = 0;
+  uint64_t loaded_partial_join_pending_visits = 0;
+  uint64_t loaded_partial_join_already_issued_visits = 0;
+  for (const rapidjson::Value &kernel : kernels.GetArray()) {
+    if (!kernel.IsObject()) {
+      wait_block_sidecar_fatal(path, "kernels contains a non-object record");
+    }
+    const uint32_t trace_kernel_id =
+        wait_block_require_uint32(kernel, "trace_kernel_id", path);
+    const uint32_t unique_function_id =
+        wait_block_require_uint32(kernel, "unique_function_id", path);
+    if (!loaded_kernel_keys
+             .emplace(trace_kernel_id, unique_function_id)
+             .second) {
+      wait_block_sidecar_fatal(
+          path, "duplicate kernel identity trace_kernel=" +
+                    std::to_string(trace_kernel_id) + " function=" +
+                    std::to_string(unique_function_id));
+    }
+    const rapidjson::Value &blocks =
+        wait_block_require_array(kernel, "wait_blocks", path);
+    for (const rapidjson::Value &block : blocks.GetArray()) {
+      if (!block.IsObject()) {
+        wait_block_sidecar_fatal(path,
+                                 "wait_blocks contains a non-object record");
+      }
+      const uint32_t block_uid =
+          wait_block_require_uint32(block, "unique_function_id", path);
+      if (block_uid != unique_function_id) {
+        wait_block_sidecar_fatal(
+            path, "block unique_function_id disagrees with kernel record");
+      }
+      const std::string block_id =
+          wait_block_require_string(block, "block_id", path);
+      if (block_id.empty()) {
+        wait_block_sidecar_fatal(path, "empty wait-block block_id");
+      }
+      if (!block.HasMember("runtime_strategy")) {
+        if (wait_block_require_string(block, "record_class", path) !=
+            "METADATA_ONLY") {
+          wait_block_sidecar_fatal(
+              path, "strategy-less record is not METADATA_ONLY");
+        }
+        loaded_metadata++;
+        continue;
+      }
+      const std::string strategy =
+          wait_block_require_string(block, "runtime_strategy", path);
+
+      if (strategy == "INJECT_MISSING_WAIT") {
+        MissingWaitRecord record;
+        record.block_id = block_id;
+        record.entry_probe_pc =
+            wait_block_require_uint(block, "entry_probe_pc", path);
+        record.entry_branch_pc =
+            wait_block_require_uint(block, "entry_branch_pc", path);
+        record.captured_ready_pc =
+            wait_block_require_uint(block, "captured_ready_pc", path);
+        record.entry_arming_pcs =
+            wait_block_require_pc_array(block, "entry_arming_pcs", path);
+        record.miss_arm_entry_pc =
+            wait_block_require_uint(block, "miss_arm_entry_pc", path);
+        record.miss_arm_wait_pcs =
+            wait_block_require_pc_array(block, "miss_arm_wait_pcs", path);
+        record.miss_arm_loopback_pc =
+            wait_block_require_uint(block, "miss_arm_loopback_pc", path);
+        record.miss_arm_exit_pc =
+            wait_block_require_uint(block, "miss_arm_exit_pc", path);
+        const std::string entry_probe_opcode =
+            wait_block_require_string(block, "entry_probe_opcode", path);
+        record.entry_probe_kind = parse_sync_instruction_kind_string(
+            wait_block_require_string(block, "entry_probe_kind", path));
+        if (record.entry_probe_kind != SyncInstructionKind::PHASECHK &&
+            record.entry_probe_kind != SyncInstructionKind::TRYWAIT) {
+          wait_block_sidecar_fatal(path,
+                                   "missing-wait entry is not a wait probe");
+        }
+        const std::string partial_action =
+            wait_block_require_string(block, "partial_modeled_miss_action",
+                                      path);
+        if (wait_block_require_string(
+                block, "entry_branch_not_ready_polarity", path) !=
+            "PREDICATE_FALSE") {
+          wait_block_sidecar_fatal(
+              path, "unsupported missing-wait branch polarity");
+        }
+        const rapidjson::Value &canonical_wait =
+            wait_block_require_object(
+                block, "canonical_wait_condition", path);
+        const std::string canonical_offset =
+            wait_block_require_string(
+                canonical_wait, "barrier_offset", path);
+        char *canonical_offset_end = nullptr;
+        record.canonical_barrier_offset = std::strtoull(
+            canonical_offset.c_str(), &canonical_offset_end, 0);
+        if (canonical_offset.empty() ||
+            canonical_offset_end == canonical_offset.c_str() ||
+            *canonical_offset_end != '\0') {
+          wait_block_sidecar_fatal(
+              path, "missing-wait canonical condition is incomplete");
+        }
+        record.canonical_wait_state_operands =
+            wait_block_require_string_set(
+                canonical_wait, "wait_state_operands", path);
+        record.partial_modeled_miss_aborts = partial_action == "ABORT";
+        record.partial_deferred_replay =
+            partial_action == "DEFER_BLOCKED_SUFFIX_THEN_HOLD";
+        if (!record.partial_modeled_miss_aborts &&
+            !record.partial_deferred_replay) {
+          wait_block_sidecar_fatal(
+              path, "unknown partial modeled miss action");
+        }
+        if (wait_block_require_uint(block, "sync_payload_missing", path) != 0) {
+          wait_block_sidecar_fatal(
+              path, "missing-wait entry has unresolved sync payloads");
+        }
+        const rapidjson::Value &paths =
+            wait_block_require_object(block, "observed_path_counts", path);
+        record.captured_ready_visits =
+            wait_block_require_uint(paths, "ready_arm", path);
+        record.captured_second_gate_visits =
+            wait_block_require_uint(paths, "second_gate_arm", path);
+        record.captured_poll_visits =
+            wait_block_require_uint(paths, "captured_poll", path);
+        record.all_live_entry_visits =
+            wait_block_require_uint(block, "all_live_entry_visits", path);
+        record.partial_entry_visits =
+            wait_block_require_uint(block, "partial_entry_visits", path);
+        if (record.captured_ready_visits == 0 ||
+            record.captured_second_gate_visits != 0 ||
+            record.captured_poll_visits != 0) {
+          wait_block_sidecar_fatal(
+              path, "INJECT_MISSING_WAIT record is not dynamically ready-only");
+        }
+        if (record.all_live_entry_visits + record.partial_entry_visits !=
+            record.captured_ready_visits) {
+          wait_block_sidecar_fatal(
+              path, "missing-wait mask census disagrees with ready visits");
+        }
+        wait_block_validate_action_opcode(
+            static_trace_info, unique_function_id, record.entry_probe_pc,
+            entry_probe_opcode, path);
+        record.observed_entry_masks = wait_block_require_mask_key_set(
+            block, "observed_effective_masks", path);
+        record.observed_live_masks = wait_block_require_mask_key_set(
+            block, "observed_live_masks", path);
+
+        if (record.partial_deferred_replay) {
+          if (record.partial_entry_visits == 0 ||
+              wait_block_require_uint(
+                  block, "partial_hold_proof_version", path) != 1 ||
+              !wait_block_require_bool(
+                  block, "complementary_masks_complete", path) ||
+              !wait_block_require_bool(block, "sibling_join_only", path) ||
+              !wait_block_require_bool(
+                  block, "blocked_path_reaches_same_join", path) ||
+              !wait_block_require_bool(block, "linear_capsule_safe", path)) {
+            wait_block_sidecar_fatal(
+                path, "partial deferred-replay proof is incomplete");
+          }
+          record.partial_region_id =
+              wait_block_require_string(block, "partial_region_id", path);
+          if (record.partial_region_id.empty()) {
+            wait_block_sidecar_fatal(path, "partial region id is empty");
+          }
+          record.sibling_branch_pc =
+              wait_block_require_uint(block, "sibling_branch_pc", path);
+          if (wait_block_require_uint(
+                  block, "sibling_branch_target_pc", path) !=
+              wait_block_require_uint(block, "join_pc", path)) {
+            wait_block_sidecar_fatal(
+                path, "partial sibling branch target disagrees with join");
+          }
+          record.join_pc =
+              wait_block_require_uint(block, "join_pc", path);
+          record.post_join_pc =
+              wait_block_require_uint(block, "post_join_pc", path);
+          record.join_kind =
+              wait_block_require_string(block, "join_kind", path);
+          record.observed_sibling_masks = wait_block_require_mask_key_set(
+              block, "observed_sibling_masks", path);
+          const uint64_t join_pending =
+              wait_block_require_uint(
+                  block, "partial_join_pending_visits", path);
+          const uint64_t join_already =
+              wait_block_require_uint(
+                  block, "partial_join_already_issued_visits", path);
+          if (join_pending + join_already != record.partial_entry_visits) {
+            wait_block_sidecar_fatal(
+                path, "partial join-state census disagrees with visits");
+          }
+
+          uint64_t bssy_pc = 0;
+          std::string join_token;
+          const rapidjson::Value &bssy =
+              wait_block_require_member(block, "join_bssy_pc", path);
+          const rapidjson::Value &token =
+              wait_block_require_member(block, "join_token", path);
+          if (record.join_kind == "BSYNC") {
+            if (!(bssy.IsUint64() || bssy.IsUint() ||
+                  (bssy.IsInt64() && bssy.GetInt64() >= 0) ||
+                  (bssy.IsInt() && bssy.GetInt() >= 0)) ||
+                !token.IsString() || token.GetStringLength() == 0) {
+              wait_block_sidecar_fatal(
+                  path, "BSYNC partial region lacks BSSY metadata");
+            }
+            bssy_pc = parse_tma_json_uint(bssy);
+            join_token = token.GetString();
+          } else if (!bssy.IsNull() || !token.IsNull()) {
+            wait_block_sidecar_fatal(
+                path, "WARPSYNC partial region has BSSY metadata");
+          }
+
+          wait_block_validate_partial_static_proof(
+              static_trace_info, unique_function_id, record, bssy_pc,
+              join_token, instruction_size, path);
+
+          PartialWaitRegionRecord region;
+          region.region_id = record.partial_region_id;
+          region.trace_kernel_id = trace_kernel_id;
+          region.unique_function_id = unique_function_id;
+          region.sibling_branch_pc = record.sibling_branch_pc;
+          region.join_pc = record.join_pc;
+          region.post_join_pc = record.post_join_pc;
+          region.join_kind = record.join_kind;
+          region.bssy_pc = bssy_pc;
+          region.join_token = join_token;
+          region.sibling_masks = record.observed_sibling_masks;
+          region.live_masks = record.observed_live_masks;
+          auto inserted =
+              db.partial_regions_by_id.emplace(region.region_id, region);
+          if (!inserted.second) {
+            const PartialWaitRegionRecord &existing = inserted.first->second;
+            if (existing.trace_kernel_id != region.trace_kernel_id ||
+                existing.unique_function_id != region.unique_function_id ||
+                existing.sibling_branch_pc != region.sibling_branch_pc ||
+                existing.join_pc != region.join_pc ||
+                existing.post_join_pc != region.post_join_pc ||
+                existing.join_kind != region.join_kind ||
+                existing.bssy_pc != region.bssy_pc ||
+                existing.join_token != region.join_token) {
+              wait_block_sidecar_fatal(
+                  path, "partial region id has conflicting definitions");
+            }
+            inserted.first->second.sibling_masks.insert(
+                region.sibling_masks.begin(), region.sibling_masks.end());
+            inserted.first->second.live_masks.insert(
+                region.live_masks.begin(), region.live_masks.end());
+          }
+          const WaitBlockLookupKey join_key{
+              trace_kernel_id, unique_function_id, region.join_pc};
+          const WaitBlockLookupKey post_key{
+              trace_kernel_id, unique_function_id, region.post_join_pc};
+          auto join_inserted = db.partial_region_id_by_join.emplace(
+              join_key, region.region_id);
+          auto post_inserted = db.partial_region_id_by_post_join.emplace(
+              post_key, region.region_id);
+          if ((!join_inserted.second &&
+               join_inserted.first->second != region.region_id) ||
+              (!post_inserted.second &&
+               post_inserted.first->second != region.region_id)) {
+            wait_block_sidecar_fatal(
+                path, "partial region lookup key is ambiguous");
+          }
+          loaded_partial_defer_records++;
+          loaded_partial_join_pending_visits += join_pending;
+          loaded_partial_join_already_issued_visits += join_already;
+        } else if (record.partial_entry_visits != 0) {
+          wait_block_sidecar_fatal(
+              path, "v5 partial visits require deferred-replay proof");
+        }
+        loaded_all_live_visits += record.all_live_entry_visits;
+        loaded_partial_visits += record.partial_entry_visits;
+        loaded_records_with_partial += record.partial_entry_visits != 0;
+        const WaitBlockLookupKey key{trace_kernel_id, unique_function_id,
+                                     record.entry_probe_pc};
+        if (db.captured_poll_by_probe.count(key) != 0 ||
+            !db.missing_wait_by_entry.emplace(key, record).second) {
+          wait_block_sidecar_fatal(
+              path, "duplicate or conflicting runtime action key "
+                    "trace_kernel=" +
+                        std::to_string(trace_kernel_id) + " function=" +
+                        std::to_string(unique_function_id) + " action_pc=0x" +
+                        wait_block_hex_u64(record.entry_probe_pc));
+        }
+      } else if (strategy == "FOLD_CAPTURED_POLL") {
+        SpinWaitRegionRecord record;
+        if (wait_block_require_uint(block, "fold_proof_version", path) != 1) {
+          wait_block_sidecar_fatal(
+              path, "unsupported captured-poll proof version");
+        }
+        record.block_id = block_id;
+        record.loop_head_pc =
+            wait_block_require_uint(block, "poll_loop_head_pc", path);
+        record.primary_wait_pc =
+            wait_block_require_uint(block, "poll_probe_pc", path);
+        const std::string poll_probe_opcode =
+            wait_block_require_string(block, "poll_probe_opcode", path);
+        record.loopback_bra_pc =
+            wait_block_require_uint(block, "poll_loopback_pc", path);
+        record.exit_pc =
+            wait_block_require_uint(block, "poll_loop_exit_pc", path);
+        record.primary_wait_kind = parse_sync_instruction_kind_string(
+            wait_block_require_string(block, "poll_probe_kind", path));
+        record.semantic_free_body =
+            wait_block_require_bool(block, "semantic_free_body", path);
+        const bool control_safe =
+            wait_block_require_bool(block, "control_safe", path);
+        const bool wait_condition_safe =
+            wait_block_require_bool(block, "wait_condition_safe", path);
+        const bool effect_safe =
+            wait_block_require_bool(block, "effect_safe", path);
+        record.barrier_self_tied =
+            wait_block_require_bool(block, "barrier_self_tied", path);
+        const rapidjson::Value &control_proof =
+            wait_block_require_object(block, "control_proof", path);
+        const rapidjson::Value &wait_condition_proof =
+            wait_block_require_object(block, "wait_condition_proof", path);
+        const rapidjson::Value &effect_proof =
+            wait_block_require_array(block, "effect_proof", path);
+        const rapidjson::Value &scoreboard_proof =
+            wait_block_require_object(block, "scoreboard_proof", path);
+        const std::vector<uint64_t> wait_pcs =
+            wait_block_require_pc_array(block, "poll_wait_pcs", path);
+        record.wait_pcs = wait_pcs;
+        const rapidjson::Value &dynamic =
+            wait_block_require_object(block, "dynamic", path);
+        record.is_spin_loop =
+            wait_block_require_bool(dynamic, "is_spin_loop", path);
+        const bool active_wait_payload_complete =
+            wait_block_require_bool(
+                dynamic, "active_wait_payload_complete", path);
+        const uint64_t active_wait_occurrences =
+            wait_block_require_uint(dynamic, "active_wait_occurrences", path);
+        const uint64_t wait_payload_missing =
+            wait_block_require_uint(
+                dynamic, "wait_sync_payload_missing", path);
+        const uint64_t wait_condition_mismatches =
+            wait_block_require_uint(
+                dynamic, "wait_condition_mismatches", path);
+        if ((record.primary_wait_kind != SyncInstructionKind::PHASECHK &&
+             record.primary_wait_kind != SyncInstructionKind::TRYWAIT) ||
+            !record.semantic_free_body || !control_safe ||
+            !wait_condition_safe || !effect_safe ||
+            !record.barrier_self_tied || !record.is_spin_loop ||
+            !active_wait_payload_complete || active_wait_occurrences == 0 ||
+            wait_payload_missing != 0 || wait_condition_mismatches != 0) {
+          wait_block_sidecar_fatal(
+              path, "FOLD_CAPTURED_POLL safety proof is incomplete");
+        }
+        record.body_pcs =
+            wait_block_require_pc_array(block, "poll_loop_body_pcs", path);
+        const std::vector<uint64_t> allowed = wait_block_require_pc_array(
+            block, "poll_advance_allowed_pcs", path);
+        std::set<uint64_t> expected_allowed(record.body_pcs.begin(),
+                                            record.body_pcs.end());
+        expected_allowed.insert(record.loopback_bra_pc);
+        const std::set<uint64_t> actual_allowed(allowed.begin(), allowed.end());
+        if (record.body_pcs.empty() ||
+            expected_allowed.count(record.primary_wait_pc) == 0 ||
+            record.loopback_bra_pc == record.exit_pc ||
+            actual_allowed.size() != allowed.size() ||
+            expected_allowed != actual_allowed ||
+            actual_allowed.count(record.exit_pc) != 0) {
+          wait_block_sidecar_fatal(
+              path, "captured-poll advance set or exit boundary is invalid");
+        }
+        if (!wait_block_require_bool(
+                control_proof, "all_wait_predicates_match", path) ||
+            !wait_block_require_bool(
+                control_proof, "loopback_predicate_negated", path) ||
+            wait_block_require_uint(
+                control_proof, "loopback_target_pc", path) !=
+                record.loop_head_pc ||
+            wait_block_require_uint(
+                control_proof, "loopback_fallthrough_pc", path) !=
+                record.exit_pc) {
+          wait_block_sidecar_fatal(
+              path, "captured-poll control proof disagrees with record");
+        }
+        const rapidjson::Value &wait_sites =
+            wait_block_require_array(wait_condition_proof, "sites", path);
+        std::set<uint64_t> proven_wait_pcs;
+        for (const rapidjson::Value &site : wait_sites.GetArray()) {
+          proven_wait_pcs.insert(wait_block_require_uint(site, "pc", path));
+          if (wait_block_require_string(
+                  site, "barrier_operand", path).empty() ||
+              wait_block_require_string(
+                  site, "wait_state_operand", path).empty()) {
+            wait_block_sidecar_fatal(
+                path, "captured-poll wait-condition proof is empty");
+          }
+        }
+        const std::set<uint64_t> declared_wait_pcs(
+            wait_pcs.begin(), wait_pcs.end());
+        if (proven_wait_pcs.size() != wait_sites.Size() ||
+            proven_wait_pcs != declared_wait_pcs) {
+          wait_block_sidecar_fatal(
+              path, "captured-poll wait-condition proof is incomplete");
+        }
+        std::set<uint64_t> proven_effect_pcs;
+        for (const rapidjson::Value &effect : effect_proof.GetArray()) {
+          proven_effect_pcs.insert(
+              wait_block_require_uint(effect, "pc", path));
+          if (wait_block_require_string(effect, "opcode", path).empty() ||
+              wait_block_require_string(effect, "effect", path).empty()) {
+            wait_block_sidecar_fatal(
+                path, "captured-poll effect proof is empty");
+          }
+        }
+        const std::vector<uint64_t> scoreboard_pcs =
+            wait_block_require_pc_array(
+                scoreboard_proof, "checked_pcs", path);
+        const std::set<uint64_t> proven_scoreboard_pcs(
+            scoreboard_pcs.begin(), scoreboard_pcs.end());
+        if (proven_effect_pcs.size() != effect_proof.Size() ||
+            proven_effect_pcs != expected_allowed ||
+            proven_scoreboard_pcs.size() != scoreboard_pcs.size() ||
+            proven_scoreboard_pcs != expected_allowed ||
+            !wait_block_require_array(
+                 scoreboard_proof, "wait_on_externally_armed_ids", path)
+                 .Empty() ||
+            !wait_block_require_array(
+                 scoreboard_proof, "async_producer_ops", path)
+                 .Empty()) {
+          wait_block_sidecar_fatal(
+              path, "captured-poll effect or scoreboard proof is incomplete");
+        }
+        wait_block_validate_action_opcode(
+            static_trace_info, unique_function_id, record.primary_wait_pc,
+            poll_probe_opcode, path);
+        wait_block_validate_fold_static_proof(
+            static_trace_info, unique_function_id, record, wait_pcs,
+            instruction_size, path);
+        record.foldable = true;
+        const WaitBlockLookupKey key{trace_kernel_id, unique_function_id,
+                                     record.primary_wait_pc};
+        if (db.missing_wait_by_entry.count(key) != 0 ||
+            !db.captured_poll_by_probe.emplace(key, record).second) {
+          wait_block_sidecar_fatal(
+              path, "duplicate or conflicting runtime action key "
+                    "trace_kernel=" +
+                        std::to_string(trace_kernel_id) + " function=" +
+                        std::to_string(unique_function_id) + " action_pc=0x" +
+                        wait_block_hex_u64(record.primary_wait_pc));
+        }
+        for (uint64_t wait_pc : record.wait_pcs) {
+          const WaitBlockLookupKey wait_key{
+              trace_kernel_id, unique_function_id, wait_pc};
+          if (db.missing_wait_by_entry.count(wait_key) != 0 ||
+              !db.captured_poll_by_wait.emplace(wait_key, record).second) {
+            wait_block_sidecar_fatal(
+                path, "duplicate or conflicting FOLD wait action key");
+          }
+        }
+      } else {
+        wait_block_sidecar_fatal(path,
+                                 "unknown runtime_strategy '" + strategy + "'");
+      }
+    }
+  }
+
+  if (db.missing_wait_by_entry.size() != expected_inject ||
+      db.captured_poll_by_probe.size() != expected_fold ||
+      loaded_metadata != db.metadata_only ||
+      loaded_all_live_visits != db.ready_only_all_live_visits ||
+      loaded_partial_visits != db.ready_only_partial_visits ||
+      loaded_records_with_partial !=
+          db.ready_only_records_with_partial_visits ||
+      loaded_partial_defer_records != db.partial_defer_records ||
+      loaded_partial_join_pending_visits !=
+          db.partial_join_pending_visits ||
+      loaded_partial_join_already_issued_visits !=
+          db.partial_join_already_issued_visits ||
+      loaded_partial_join_pending_visits +
+              loaded_partial_join_already_issued_visits !=
+          loaded_partial_visits) {
+    wait_block_sidecar_fatal(path,
+                             "strategy or mask accounting disagrees with report");
+  }
+
+  if (!require_exact_generation_tickets) {
+    return;
+  }
+
+  const rapidjson::Value &exact =
+      wait_block_require_object(doc, "exact_generation_tickets", path);
+  if (wait_block_require_uint(exact, "version", path) != 2 ||
+      wait_block_require_string(exact, "schema", path) !=
+          "wait_block_exact_generation_tickets" ||
+      wait_block_require_string(exact, "status", path) != "PASS") {
+    wait_block_sidecar_fatal(
+        path, "exact generation ticket schema or validation status mismatch");
+  }
+  const std::string generation_ticket_name =
+      wait_block_require_string(exact, "artifact", path);
+  if (generation_ticket_name !=
+      "wait_block_exact_generation_tickets.json") {
+    wait_block_sidecar_fatal(
+        path, "unexpected exact generation ticket artifact name");
+  }
+  const rapidjson::Value &exact_summary =
+      wait_block_require_object(exact, "summary", path);
+  db.exact_generation_ticket_stream_count =
+      wait_block_require_uint(exact_summary, "streams", path);
+  db.exact_generation_ticket_slots =
+      wait_block_require_uint(exact_summary, "slots", path);
+  db.exact_generation_targets =
+      wait_block_require_uint(exact_summary, "exact_targets", path);
+  db.exact_generation_fallbacks =
+      wait_block_require_uint(exact_summary, "fallback_slots", path);
+  if (db.exact_generation_ticket_slots !=
+      db.exact_generation_targets + db.exact_generation_fallbacks) {
+    wait_block_sidecar_fatal(
+        path, "exact generation ticket summary accounting mismatch");
+  }
+
+  const rapidjson::Value &capture =
+      wait_block_require_object(doc, "mbarrier_contract_capture", path);
+  if (wait_block_require_string(capture, "status", path) != "PASS") {
+    wait_block_sidecar_fatal(
+        path, "mbarrier contract capture status is not PASS");
+  }
+  const rapidjson::Value &capture_summary =
+      wait_block_require_object(capture, "summary", path);
+  const uint64_t eligible_barriers = wait_block_require_uint(
+      capture_summary, "eligible_barriers", path);
+  const uint64_t eligible_actions = wait_block_require_uint(
+      capture_summary, "eligible_action_occurrences", path);
+  const uint64_t unsupported_actions = wait_block_require_uint(
+      capture_summary, "unsupported_action_occurrences", path);
+  if (wait_block_require_uint(
+          capture_summary, "missing_snapshots", path) != 0 ||
+      wait_block_require_uint(
+          capture_summary, "capture_mismatches", path) != 0 ||
+      wait_block_require_uint(
+          capture_summary, "rejected_tma_action_occurrences", path) != 0 ||
+      wait_block_require_uint(
+          capture_summary, "ambiguous_assignments", path) != 0 ||
+      wait_block_require_uint(
+          capture_summary, "inconsistent_assignments", path) != 0 ||
+      wait_block_require_uint(
+          capture_summary, "ambiguous_or_invalid_streams", path) != 0 ||
+      wait_block_require_uint(
+          capture_summary, "unique_assignments", path) !=
+          eligible_actions ||
+      db.exact_generation_targets != eligible_actions ||
+      db.exact_generation_fallbacks != unsupported_actions) {
+    wait_block_sidecar_fatal(
+        path, "exact tickets disagree with mbarrier contract summary");
+  }
+
+  const std::filesystem::path generation_ticket_path =
+      extra_info_dir / generation_ticket_name;
+  rapidjson::Document generation_ticket_doc;
+  if (!load_tma_json_document(
+          generation_ticket_path, generation_ticket_doc)) {
+    wait_block_sidecar_fatal(
+        generation_ticket_path,
+        "missing or malformed exact generation ticket artifact");
+  }
+  if (wait_block_require_uint(
+          generation_ticket_doc, "version", generation_ticket_path) != 2 ||
+      wait_block_require_string(
+          generation_ticket_doc, "schema", generation_ticket_path) !=
+          "wait_block_exact_generation_tickets" ||
+      wait_block_require_string(
+          generation_ticket_doc, "status", generation_ticket_path) !=
+          "PASS") {
+    wait_block_sidecar_fatal(
+        generation_ticket_path,
+        "exact generation ticket artifact metadata mismatch");
+  }
+  const rapidjson::Value &artifact_summary =
+      wait_block_require_object(
+          generation_ticket_doc, "summary", generation_ticket_path);
+  if (wait_block_require_uint(
+          artifact_summary, "streams", generation_ticket_path) !=
+          db.exact_generation_ticket_stream_count ||
+      wait_block_require_uint(
+          artifact_summary, "slots", generation_ticket_path) !=
+          db.exact_generation_ticket_slots ||
+      wait_block_require_uint(
+          artifact_summary, "exact_targets", generation_ticket_path) !=
+          db.exact_generation_targets ||
+      wait_block_require_uint(
+          artifact_summary, "fallback_slots", generation_ticket_path) !=
+          db.exact_generation_fallbacks) {
+    wait_block_sidecar_fatal(
+        generation_ticket_path,
+        "ticket artifact summary disagrees with sidecar");
+  }
+
+  static const char *kExpectedEntryFields[] = {
+      "source_warp_instruction_index",
+      "unique_function_id",
+      "action_pc",
+      "active_mask",
+      "predicate_mask",
+      "barrier_addr",
+      "wait_state_raw",
+      "target_kind",
+      "target_release_generation",
+  };
+  const rapidjson::Value &entry_fields =
+      wait_block_require_array(
+          generation_ticket_doc, "entry_fields", generation_ticket_path);
+  if (entry_fields.Size() !=
+      sizeof(kExpectedEntryFields) / sizeof(kExpectedEntryFields[0])) {
+    wait_block_sidecar_fatal(
+        generation_ticket_path, "ticket entry field count mismatch");
+  }
+  for (rapidjson::SizeType i = 0; i < entry_fields.Size(); ++i) {
+    if (!entry_fields[i].IsString() ||
+        std::string(entry_fields[i].GetString()) !=
+            kExpectedEntryFields[i]) {
+      wait_block_sidecar_fatal(
+          generation_ticket_path, "ticket entry field order mismatch");
+    }
+  }
+
+  auto require_array_uint =
+      [&](const rapidjson::Value &array,
+          rapidjson::SizeType index) -> uint64_t {
+    const rapidjson::Value &value = array[index];
+    if (!(value.IsUint64() || value.IsUint() ||
+          (value.IsInt64() && value.GetInt64() >= 0) ||
+          (value.IsInt() && value.GetInt() >= 0))) {
+      wait_block_sidecar_fatal(
+          generation_ticket_path,
+          "generation ticket array contains a non-unsigned value");
+    }
+    return parse_tma_json_uint(value);
+  };
+
+  static const char *kExpectedBarrierFields[] = {
+      "trace_kernel_id",
+      "cta_x",
+      "cta_y",
+      "cta_z",
+      "barrier_addr",
+  };
+  const rapidjson::Value &barrier_fields =
+      wait_block_require_array(
+          generation_ticket_doc, "eligible_barrier_fields",
+          generation_ticket_path);
+  if (barrier_fields.Size() !=
+      sizeof(kExpectedBarrierFields) / sizeof(kExpectedBarrierFields[0])) {
+    wait_block_sidecar_fatal(
+        generation_ticket_path, "eligible barrier field count mismatch");
+  }
+  for (rapidjson::SizeType i = 0; i < barrier_fields.Size(); ++i) {
+    if (!barrier_fields[i].IsString() ||
+        std::string(barrier_fields[i].GetString()) !=
+            kExpectedBarrierFields[i]) {
+      wait_block_sidecar_fatal(
+          generation_ticket_path, "eligible barrier field order mismatch");
+    }
+  }
+  using ExactBarrierKey =
+      std::tuple<uint32_t, uint32_t, uint32_t, uint32_t, uint64_t>;
+  std::set<ExactBarrierKey> exact_barriers;
+  const rapidjson::Value &eligible_barrier_records =
+      wait_block_require_array(
+          generation_ticket_doc, "eligible_barriers",
+          generation_ticket_path);
+  for (const rapidjson::Value &entry :
+       eligible_barrier_records.GetArray()) {
+    if (!entry.IsArray() || entry.Size() != barrier_fields.Size()) {
+      wait_block_sidecar_fatal(
+          generation_ticket_path, "malformed eligible barrier entry");
+    }
+    const uint64_t kernel_id = require_array_uint(entry, 0);
+    const uint64_t cta_x = require_array_uint(entry, 1);
+    const uint64_t cta_y = require_array_uint(entry, 2);
+    const uint64_t cta_z = require_array_uint(entry, 3);
+    const uint64_t barrier_addr = require_array_uint(entry, 4);
+    if (kernel_id > std::numeric_limits<uint32_t>::max() ||
+        cta_x > std::numeric_limits<uint32_t>::max() ||
+        cta_y > std::numeric_limits<uint32_t>::max() ||
+        cta_z > std::numeric_limits<uint32_t>::max() ||
+        !exact_barriers.emplace(
+            static_cast<uint32_t>(kernel_id),
+            static_cast<uint32_t>(cta_x),
+            static_cast<uint32_t>(cta_y),
+            static_cast<uint32_t>(cta_z),
+            barrier_addr).second) {
+      wait_block_sidecar_fatal(
+          generation_ticket_path,
+          "invalid or duplicate eligible barrier entry");
+    }
+  }
+  if (exact_barriers.size() != eligible_barriers) {
+    wait_block_sidecar_fatal(
+        generation_ticket_path,
+        "eligible barrier artifact count disagrees with contract summary");
+  }
+
+  const rapidjson::Value &generation_tickets =
+      wait_block_require_array(
+          generation_ticket_doc, "streams", generation_ticket_path);
+  if (generation_tickets.Size() !=
+      db.exact_generation_ticket_stream_count) {
+    wait_block_sidecar_fatal(
+        generation_ticket_path,
+        "ticket stream array size disagrees with summary");
+  }
+
+  uint64_t loaded_exact_targets = 0;
+  uint64_t loaded_fallbacks = 0;
+  uint64_t loaded_slots = 0;
+  for (const rapidjson::Value &stream_json :
+       generation_tickets.GetArray()) {
+    if (!stream_json.IsObject()) {
+      wait_block_sidecar_fatal(
+          generation_ticket_path,
+          "exact generation streams contains a non-object record");
+    }
+    WaitBlockGenerationTicketStreamKey stream_key;
+    stream_key.trace_kernel_id = wait_block_require_uint32(
+        stream_json, "trace_kernel_id", generation_ticket_path);
+    stream_key.cta_x = wait_block_require_uint32(
+        stream_json, "cta_x", generation_ticket_path);
+    stream_key.cta_y = wait_block_require_uint32(
+        stream_json, "cta_y", generation_ticket_path);
+    stream_key.cta_z = wait_block_require_uint32(
+        stream_json, "cta_z", generation_ticket_path);
+    stream_key.warp_id = wait_block_require_uint32(
+        stream_json, "warp_id", generation_ticket_path);
+    const rapidjson::Value &entries = wait_block_require_array(
+        stream_json, "entries", generation_ticket_path);
+    if (entries.Empty()) {
+      wait_block_sidecar_fatal(
+          generation_ticket_path, "exact generation ticket stream is empty");
+    }
+
+    std::vector<WaitBlockGenerationTicket> stream;
+    stream.reserve(entries.Size());
+    uint64_t previous_source_index = 0;
+    bool have_previous_source_index = false;
+    for (const rapidjson::Value &entry : entries.GetArray()) {
+      if (!entry.IsArray() || entry.Size() != entry_fields.Size()) {
+        wait_block_sidecar_fatal(
+            generation_ticket_path, "malformed generation ticket entry");
+      }
+      WaitBlockGenerationTicket ticket;
+      ticket.source_warp_instruction_index =
+          require_array_uint(entry, 0);
+      const uint64_t unique_function_id =
+          require_array_uint(entry, 1);
+      ticket.action_pc = require_array_uint(entry, 2);
+      const uint64_t active_mask = require_array_uint(entry, 3);
+      const uint64_t predicate_mask = require_array_uint(entry, 4);
+      ticket.barrier_addr = require_array_uint(entry, 5);
+      ticket.wait_state_raw = require_array_uint(entry, 6);
+      const uint64_t target_kind = require_array_uint(entry, 7);
+      ticket.target_release_generation =
+          require_array_uint(entry, 8);
+      if (unique_function_id > std::numeric_limits<uint32_t>::max() ||
+          active_mask > std::numeric_limits<uint32_t>::max() ||
+          predicate_mask > std::numeric_limits<uint32_t>::max()) {
+        wait_block_sidecar_fatal(
+            generation_ticket_path,
+            "generation ticket entry exceeds uint32 range");
+      }
+      ticket.unique_function_id =
+          static_cast<uint32_t>(unique_function_id);
+      ticket.active_mask = static_cast<uint32_t>(active_mask);
+      ticket.predicate_mask = static_cast<uint32_t>(predicate_mask);
+      if ((ticket.active_mask & ticket.predicate_mask) == 0) {
+        wait_block_sidecar_fatal(
+            generation_ticket_path,
+            "generation ticket represents a predicated-off occurrence");
+      }
+      if (have_previous_source_index &&
+          ticket.source_warp_instruction_index <= previous_source_index) {
+        wait_block_sidecar_fatal(
+            generation_ticket_path,
+            "generation ticket source indices are not strictly increasing");
+      }
+      previous_source_index = ticket.source_warp_instruction_index;
+      have_previous_source_index = true;
+
+      const WaitBlockLookupKey action_key{
+          stream_key.trace_kernel_id, ticket.unique_function_id,
+          ticket.action_pc};
+      const bool is_missing_action =
+          db.missing_wait_by_entry.count(action_key) != 0;
+      const bool is_fold_wait =
+          db.captured_poll_by_wait.count(action_key) != 0;
+      if (is_missing_action == is_fold_wait) {
+        wait_block_sidecar_fatal(
+            generation_ticket_path,
+            "ticket does not resolve to exactly one WaitBlock action");
+      }
+
+      const ExactBarrierKey barrier_key{
+          stream_key.trace_kernel_id, stream_key.cta_x,
+          stream_key.cta_y, stream_key.cta_z, ticket.barrier_addr};
+      const bool barrier_is_exact =
+          exact_barriers.count(barrier_key) != 0;
+      if (target_kind == static_cast<uint64_t>(
+                             WaitBlockGenerationTicketKind::EXACT_TARGET)) {
+        if (!barrier_is_exact) {
+          wait_block_sidecar_fatal(
+              generation_ticket_path,
+              "exact ticket refers to an unsupported barrier");
+        }
+        ticket.has_target_release_generation = true;
+        loaded_exact_targets++;
+      } else if (
+          target_kind ==
+          static_cast<uint64_t>(
+              WaitBlockGenerationTicketKind::COUNT_ONLY_FALLBACK)) {
+        if (barrier_is_exact) {
+          wait_block_sidecar_fatal(
+              generation_ticket_path,
+              "eligible TMA ticket was downgraded to fallback");
+        }
+        ticket.has_target_release_generation = false;
+        if (ticket.target_release_generation != 0) {
+          wait_block_sidecar_fatal(
+              generation_ticket_path,
+              "count-only fallback ticket has a nonzero target");
+        }
+        loaded_fallbacks++;
+      } else {
+        wait_block_sidecar_fatal(
+            generation_ticket_path, "unknown generation ticket target kind");
+      }
+      stream.push_back(ticket);
+      loaded_slots++;
+    }
+
+    if (!db.exact_generation_ticket_streams
+             .emplace(stream_key, std::move(stream))
+             .second) {
+      wait_block_sidecar_fatal(
+          generation_ticket_path, "duplicate generation ticket stream key");
+    }
+  }
+  if (db.exact_generation_ticket_streams.size() !=
+          db.exact_generation_ticket_stream_count ||
+      loaded_slots != db.exact_generation_ticket_slots ||
+      loaded_exact_targets != db.exact_generation_targets ||
+      loaded_fallbacks != db.exact_generation_fallbacks ||
+      loaded_exact_targets == 0) {
+    wait_block_sidecar_fatal(
+        generation_ticket_path,
+        "loaded exact generation tickets disagree with summary");
+  }
+  db.exact_generation_tickets_valid = true;
+}
+
 }
 
 // MOD. Begin. Improved tracer
 void gpgpu_sim::parse_extra_trace_info(std::string filepath, bool is_extra_trace_enabled) {
   m_tma_sidecar_db.clear();
   m_sync_sidecar_db.clear();
+  m_spin_wait_sidecar_db.clear();
+  m_wait_block_sidecar_db.clear();
+  if (m_shader_config->wait_block_exact_generation_enable &&
+      !m_shader_config->wait_block_enable) {
+    std::cerr << "[WAITBLOCK][CONFIG][FATAL] "
+                 "-wait_block_exact_generation_enable requires "
+                 "-wait_block_enable"
+              << std::endl;
+    abort();
+  }
+  if (m_shader_config->wait_block_late_arrival_instrument_enable &&
+      !m_shader_config->wait_block_exact_generation_enable) {
+    std::cerr << "[WAITBLOCK][CONFIG][FATAL] "
+                 "-wait_block_late_arrival_instrument_enable requires "
+                 "-wait_block_exact_generation_enable"
+              << std::endl;
+    abort();
+  }
+  if (m_shader_config->wait_block_enable &&
+      m_shader_config->spin_wait_observe_enable) {
+    std::cerr << "[WAITBLOCK][CONFIG][FATAL] -wait_block_enable and "
+                 "-spin_wait_observe_enable are mutually exclusive"
+              << std::endl;
+    abort();
+  }
+  if (m_shader_config->wait_block_enable &&
+      (m_shader_config->wait_block_hold_watchdog_cycles == 0 ||
+       m_shader_config->wait_block_heartbeat_cycles == 0 ||
+       m_shader_config->wait_block_heartbeat_cycles >
+           m_shader_config->wait_block_hold_watchdog_cycles)) {
+    std::cerr << "[WAITBLOCK][CONFIG][FATAL] invalid watchdog configuration"
+              << " hold_watchdog_cycles="
+              << m_shader_config->wait_block_hold_watchdog_cycles
+              << " heartbeat_cycles="
+              << m_shader_config->wait_block_heartbeat_cycles
+              << std::endl;
+    abort();
+  }
+  if (m_shader_config->wait_block_enable && !is_extra_trace_enabled) {
+    std::cerr << "[WAITBLOCK][CONFIG][FATAL] -wait_block_enable requires "
+                 "extra trace metadata and a strict schema-v5 sidecar"
+              << std::endl;
+    abort();
+  }
   if(is_extra_trace_enabled) {
     m_extra_trace_info.DeserializeFromFile(filepath.c_str());
     std::filesystem::path metadata_path(filepath);
     std::filesystem::path extra_info_dir = metadata_path.parent_path();
     load_tma_descriptor_configs(extra_info_dir, m_tma_sidecar_db);
     load_tma_pc_base_map(extra_info_dir, m_tma_sidecar_db);
-    // The exact (uid,pc) base map is the sole descriptor-address source; the legacy
-    // handle_hi descriptor resolver has been removed (M3). config_id / box_dim still
-    // flow through the operand resolver's linked_config_id -> descriptor_configs join.
+    // Version-2 sidecars use the kernel-aware (trace_kernel_id,uid,pc) key.
+    // Legacy version-1 records remain readable through a wildcard kernel ID.
     load_tma_operand_resolver(extra_info_dir, m_tma_sidecar_db);
     load_sync_operand_resolver(extra_info_dir, m_sync_sidecar_db);
+    load_tma_completion_contract_validation(extra_info_dir, m_tma_sidecar_db);
+    if (m_shader_config->wait_block_enable) {
+      if (m_sync_sidecar_db.site_records.empty()) {
+        wait_block_sidecar_fatal(
+            extra_info_dir / "sync_operand_resolver.json",
+            "required sync operand metadata is empty");
+      }
+      if (m_shader_config->wait_block_exact_generation_enable &&
+          (m_tma_sidecar_db.descriptor_configs.empty() ||
+           m_tma_sidecar_db.operand_site_records.empty() ||
+           m_tma_sidecar_db.base_records.empty() ||
+           !m_tma_sidecar_db.completion_contracts_validated)) {
+        wait_block_sidecar_fatal(
+            extra_info_dir,
+            "exact-generation mode requires validated TMA descriptor, "
+            "operand, base-map, and completion-contract metadata");
+      }
+      load_wait_block_sidecar_v5(
+          extra_info_dir, m_extra_trace_info, m_wait_block_sidecar_db,
+          m_shader_config->wait_block_exact_generation_enable);
+    } else if (m_shader_config->spin_wait_observe_enable) {
+      load_legacy_spin_wait_sidecar(extra_info_dir, m_spin_wait_sidecar_db);
+    }
     // BASE-MAP LOAD-FAILURE ASSERT (M4): real-base addressing is on by default. An empty
     // base_records map means tma_pc_base_map.json was missing, unparsable, or had no
     // descriptor sites. We deliberately FAIL here rather than silently falling back to the
@@ -694,22 +2638,66 @@ void gpgpu_sim::parse_extra_trace_info(std::string filepath, bool is_extra_trace
                 << " operand_sites="
                 << m_tma_sidecar_db.operand_site_records.size()
                 << " base_records="
-                << m_tma_sidecar_db.base_records.size() << std::endl;
+                << m_tma_sidecar_db.base_records.size()
+                << " base_map_version="
+                << m_tma_sidecar_db.base_map_version
+                << " operand_map_version="
+                << m_tma_sidecar_db.operand_map_version
+                << " contracts_validated="
+                << (m_tma_sidecar_db.completion_contracts_validated ? 1 : 0)
+                << std::endl;
     }
-    if (m_shader_config->sync_debug_enable) {
+    if (m_shader_config->sync_debug_enable ||
+        m_shader_config->trimchk_percta_log_enable ||
+        m_shader_config->wait_block_enable) {
       std::cerr << "[SYNC] loaded operand_sites="
                 << m_sync_sidecar_db.site_records.size() << std::endl;
+      if (m_shader_config->wait_block_enable) {
+        std::cerr << "[WAITBLOCK] loaded missing_wait="
+                  << m_wait_block_sidecar_db.missing_wait_by_entry.size()
+                  << " captured_poll="
+                  << m_wait_block_sidecar_db.captured_poll_by_probe.size()
+                  << " partial_regions="
+                  << m_wait_block_sidecar_db.partial_regions_by_id.size()
+                  << " report_passed=" << m_wait_block_sidecar_db.passed
+                  << " report_skipped=" << m_wait_block_sidecar_db.skipped
+                  << " exact_ticket_streams="
+                  << m_wait_block_sidecar_db
+                         .exact_generation_ticket_stream_count
+                  << " exact_ticket_slots="
+                  << m_wait_block_sidecar_db.exact_generation_ticket_slots
+                  << " exact_targets="
+                  << m_wait_block_sidecar_db.exact_generation_targets
+                  << " exact_fallbacks="
+                  << m_wait_block_sidecar_db.exact_generation_fallbacks
+                  << " hold_watchdog_cycles="
+                  << m_shader_config->wait_block_hold_watchdog_cycles
+                  << " heartbeat_cycles="
+                  << m_shader_config->wait_block_heartbeat_cycles
+                  << " debug_print_budget="
+                  << m_shader_config->wait_block_debug_print_budget
+                  << std::endl;
+      } else {
+        std::cerr << "[SPINWAIT] loaded spin_wait_regions="
+                  << m_spin_wait_sidecar_db.regions_by_wait_pc.size()
+                  << std::endl;
+      }
     }
   }
 }
 // MOD. End. Improved tracer
 
-bool gpgpu_sim::lookup_tma_site_metadata(unsigned int unique_function_id,
+bool gpgpu_sim::lookup_tma_site_metadata(unsigned int trace_kernel_id,
+                                         unsigned int unique_function_id,
                                          address_type pc,
                                          TMAResolvedSiteMetadata &metadata) const {
   metadata = TMAResolvedSiteMetadata();
   auto it_operand = m_tma_sidecar_db.operand_site_records.find(
-      TMAOperandLookupKey{unique_function_id, pc});
+      TMAOperandLookupKey{trace_kernel_id, unique_function_id, pc});
+  if (it_operand == m_tma_sidecar_db.operand_site_records.end()) {
+    it_operand = m_tma_sidecar_db.operand_site_records.find(
+        TMAOperandLookupKey{~0u, unique_function_id, pc});
+  }
   if (it_operand != m_tma_sidecar_db.operand_site_records.end()) {
     const TMAOperandSiteRecord &operand_record = it_operand->second;
     metadata.valid = true;
@@ -737,11 +2725,18 @@ bool gpgpu_sim::lookup_tma_site_metadata(unsigned int unique_function_id,
   return metadata.valid;
 }
 
-bool gpgpu_sim::lookup_tma_base_record(unsigned int unique_function_id,
+bool gpgpu_sim::lookup_tma_base_record(unsigned int trace_kernel_id,
+                                       unsigned int unique_function_id,
                                        address_type pc,
                                        TMABaseRecord &record) const {
   auto it = m_tma_sidecar_db.base_records.find(
-      TMABaseLookupKey{unique_function_id, static_cast<uint64_t>(pc)});
+      TMABaseLookupKey{trace_kernel_id, unique_function_id,
+                       static_cast<uint64_t>(pc)});
+  if (it == m_tma_sidecar_db.base_records.end()) {
+    it = m_tma_sidecar_db.base_records.find(
+        TMABaseLookupKey{~0u, unique_function_id,
+                         static_cast<uint64_t>(pc)});
+  }
   if (it == m_tma_sidecar_db.base_records.end()) {
     return false;
   }
@@ -768,6 +2763,121 @@ bool gpgpu_sim::lookup_sync_site_metadata(unsigned int unique_function_id,
   metadata.semantic_operand_role = record.semantic_operand_role;
   metadata.barrier_operand_text = record.barrier_operand_text;
   metadata.semantic_operand_text = record.semantic_operand_text;
+  return true;
+}
+
+bool gpgpu_sim::lookup_spin_wait_region(unsigned int trace_kernel_id,
+                                        unsigned int unique_function_id,
+                                        address_type pc,
+                                        SpinWaitRegionRecord &region) const {
+  if (m_shader_config->wait_block_enable) {
+    const auto &records =
+        m_shader_config->wait_block_exact_generation_enable
+            ? m_wait_block_sidecar_db.captured_poll_by_wait
+            : m_wait_block_sidecar_db.captured_poll_by_probe;
+    auto it = records.find(WaitBlockLookupKey{
+        trace_kernel_id, unique_function_id, static_cast<uint64_t>(pc)});
+    if (it == records.end()) {
+      return false;
+    }
+    region = it->second;
+    return true;
+  }
+  auto it = m_spin_wait_sidecar_db.regions_by_wait_pc.find(
+      SyncOperandLookupKey{unique_function_id, static_cast<uint64_t>(pc)});
+  if (it == m_spin_wait_sidecar_db.regions_by_wait_pc.end()) {
+    return false;
+  }
+  region = it->second;
+  return true;
+}
+
+bool gpgpu_sim::lookup_missing_wait(unsigned int trace_kernel_id,
+                                    unsigned int unique_function_id,
+                                    address_type pc,
+                                    MissingWaitRecord &record) const {
+  if (!m_shader_config->wait_block_enable) {
+    return false;
+  }
+  auto it = m_wait_block_sidecar_db.missing_wait_by_entry.find(
+      WaitBlockLookupKey{trace_kernel_id, unique_function_id,
+                         static_cast<uint64_t>(pc)});
+  if (it == m_wait_block_sidecar_db.missing_wait_by_entry.end()) {
+    return false;
+  }
+  record = it->second;
+  return true;
+}
+
+bool gpgpu_sim::lookup_wait_block_generation_ticket(
+    const WaitBlockGenerationTicketKey &key,
+    WaitBlockGenerationTicket &ticket) const {
+  if (!m_shader_config->wait_block_exact_generation_enable ||
+      !m_wait_block_sidecar_db.exact_generation_tickets_valid) {
+    return false;
+  }
+  const WaitBlockGenerationTicketStreamKey stream_key{
+      key.trace_kernel_id, key.cta_x, key.cta_y, key.cta_z, key.warp_id};
+  auto stream_it =
+      m_wait_block_sidecar_db.exact_generation_ticket_streams.find(
+          stream_key);
+  if (stream_it ==
+      m_wait_block_sidecar_db.exact_generation_ticket_streams.end()) {
+    return false;
+  }
+  const std::vector<WaitBlockGenerationTicket> &stream =
+      stream_it->second;
+  auto ticket_it = std::lower_bound(
+      stream.begin(), stream.end(), key.source_warp_instruction_index,
+      [](const WaitBlockGenerationTicket &candidate,
+         uint64_t source_index) {
+        return candidate.source_warp_instruction_index < source_index;
+      });
+  if (ticket_it == stream.end() ||
+      ticket_it->source_warp_instruction_index !=
+          key.source_warp_instruction_index ||
+      ticket_it->unique_function_id != key.unique_function_id ||
+      ticket_it->action_pc != key.action_pc) {
+    return false;
+  }
+  ticket = *ticket_it;
+  return true;
+}
+
+bool gpgpu_sim::lookup_partial_wait_join(
+    unsigned int trace_kernel_id, unsigned int unique_function_id,
+    address_type pc, PartialWaitRegionRecord &region) const {
+  const WaitBlockLookupKey key{
+      trace_kernel_id, unique_function_id, static_cast<uint64_t>(pc)};
+  auto id_it = m_wait_block_sidecar_db.partial_region_id_by_join.find(key);
+  if (id_it == m_wait_block_sidecar_db.partial_region_id_by_join.end()) {
+    return false;
+  }
+  auto region_it =
+      m_wait_block_sidecar_db.partial_regions_by_id.find(id_it->second);
+  if (region_it == m_wait_block_sidecar_db.partial_regions_by_id.end()) {
+    return false;
+  }
+  region = region_it->second;
+  return true;
+}
+
+bool gpgpu_sim::lookup_partial_wait_post_join(
+    unsigned int trace_kernel_id, unsigned int unique_function_id,
+    address_type pc, PartialWaitRegionRecord &region) const {
+  const WaitBlockLookupKey key{
+      trace_kernel_id, unique_function_id, static_cast<uint64_t>(pc)};
+  auto id_it =
+      m_wait_block_sidecar_db.partial_region_id_by_post_join.find(key);
+  if (id_it == m_wait_block_sidecar_db.partial_region_id_by_post_join.end()) {
+    return false;
+  }
+  auto region_it =
+      m_wait_block_sidecar_db.partial_regions_by_id.find(id_it->second);
+  if (region_it == m_wait_block_sidecar_db.partial_regions_by_id.end()) {
+    return false;
+  }
+  region = region_it->second;
   return true;
 }
 
@@ -1996,6 +4106,89 @@ void shader_core_config::reg_options(class OptionParser *opp) {
                          "Independent gate for bit-identity bisection. See .plan "
                          "FWD_DRAIN_IDLE_MBARRIER_CEILING. (default=0)",
                          "0");
+  option_parser_register(opp, "-producer_tail_instrument_enable", OPT_BOOL,
+                         &producer_tail_instrument_enable,
+                         "Enable observe-only per-CTA producer-tail decomposition after all "
+                         "consumer-role warps have drained: producer issue/opcode counts, modeled "
+                         "PHASECHK ready/not-ready outcomes, and non-issue reasons. Does not alter "
+                         "the existing Hopper mbarrier model. (default=0)",
+                         "0");
+  option_parser_register(opp, "-producer_spin_ready_instrument_enable", OPT_BOOL,
+                         &producer_spin_ready_instrument_enable,
+                         "Enable observe-only whole-lifetime producer-spin ready-retry counters. "
+                         "For every PHASECHK/TRYWAIT a producer-role warp executes (not gated by "
+                         "consumer drain), sample the existing Hopper mbarrier result and classify "
+                         "ready (already satisfied, captured trace keeps polling) vs not-ready, plus "
+                         "spin-loop opcode counts. Sizes fwd+bwd excess captured spin. Reads mbarrier "
+                         "state only; never modifies it. (default=0)",
+                         "0");
+  option_parser_register(opp, "-spin_wait_observe_enable", OPT_BOOL,
+                         &spin_wait_observe_enable,
+                         "Observe-only measurement for the producer spin-wait fold design. "
+                         "For every PHASECHK/TRYWAIT matching a spin_wait_sidecar.json "
+                         "primary_wait_pc, record how long the modeled mbarrier stays not-ready "
+                         "after the first not-ready poll of each (cta,warp,region) episode (the "
+                         "would-be park time under fold) and whether the barrier ever flips "
+                         "(never-flip = deadlock candidate). Reads mbarrier state only; never "
+                         "blocks or advances the trace. Requires spin_wait_sidecar.json. "
+                         "(default=0)",
+                         "0");
+  option_parser_register(
+      opp, "-wait_block_enable", OPT_BOOL, &wait_block_enable,
+      "Enable schema-v5 WaitBlock runtime: fold captured polls at their poll "
+      "probe, inject all-live missing waits, and defer proven partial-lane "
+      "suffixes until their modeled wait releases. Requires a strict, complete "
+      "spin_wait_sidecar.json v5. (default=0)",
+      "0");
+  option_parser_register(
+      opp, "-wait_block_exact_generation_enable", OPT_BOOL,
+      &wait_block_exact_generation_enable,
+      "Use trace-derived exact target generations for eligible WaitBlock "
+      "INJECT_MISSING_WAIT entries and every proven FOLD_CAPTURED_POLL wait. "
+      "Requires -wait_block_enable, schema-v2 compact tickets, and an eligible "
+      "barrier manifest. Count-only tickets retain live phase-derived "
+      "generation. (default=0)",
+      "0");
+  option_parser_register(
+      opp, "-wait_block_late_arrival_instrument_enable", OPT_BOOL,
+      &wait_block_late_arrival_instrument_enable,
+      "Emit one [WAITBLOCK][late-timing-first] record per affected CTA with "
+      "the exact wait identity, target/next generation timing, and preceding "
+      "producer/consumer semantic anchors. Observe-only. (default=0)",
+      "0");
+  option_parser_register(
+      opp, "-wait_block_hold_watchdog_cycles", OPT_UINT64,
+      &wait_block_hold_watchdog_cycles,
+      "Abort an unresolved WaitBlock hold, partial transition, or partial "
+      "replay after this many cycles. Must be nonzero when WaitBlock is "
+      "enabled. (default=32000)",
+      "32000");
+  option_parser_register(
+      opp, "-wait_block_heartbeat_cycles", OPT_UINT64,
+      &wait_block_heartbeat_cycles,
+      "Emit unresolved WaitBlock progress diagnostics at this cycle period. "
+      "Must be nonzero and no greater than the hold watchdog when WaitBlock "
+      "is enabled. (default=4096)",
+      "4096");
+  option_parser_register(
+      opp, "-wait_block_debug_print_budget", OPT_UINT64,
+      &wait_block_debug_print_budget,
+      "Maximum verbose WaitBlock event records per SM and runtime kernel "
+      "launch. The budget resets at each launch. (default=20000000)",
+      "20000000");
+  option_parser_register(
+      opp, "-wait_block_debug", OPT_BOOL, &wait_block_debug,
+      "Emit [WAITBLOCK] hold/release/guard/summary diagnostics. (default=0)",
+      "0");
+  option_parser_register(opp, "-trimchk_percta_log_enable", OPT_BOOL,
+                         &trimchk_percta_log_enable,
+                         "[TRIMCHK]/[TRACECHECK] Emit per-CTA trace-load contract lines: "
+                         "path/warp instruction counts plus active-lane instructions, memory "
+                         "records/lane uses, sync runtime/semantic payloads, BAR runtime "
+                         "id/count payloads, zero-mask instructions, and HGMMA/MUFU/TMA "
+                         "work. Verbose (two lines per CTA), so gated off by default. "
+                         "(default=0)",
+                         "0");
   option_parser_register(opp, "-headofline_instrument_enable", OPT_BOOL,
                          &headofline_instrument_enable,
                          "Enable observe-only head-of-line counters: on next_stage_not_available "
@@ -2005,6 +4198,53 @@ void shader_core_config::reg_options(class OptionParser *opp) {
                          "satisfied; FU-side excluded). Sizes the recoverable head-of-line fraction. "
                          "No timing change. Independent gate. See .plan CONSUMER_COMPUTE_BOUND. "
                          "(default=0)",
+                         "0");
+  option_parser_register(opp, "-intra_smsp_warpswitch_enable", OPT_BOOL,
+                         &intra_smsp_warpswitch_enable,
+                         "Enable intra-SMSP warp-switch around a busy deterministic-II FU: at issue "
+                         "time, also check fu->can_issue() for no-queue FUs (SFU) so a busy-SFU MUFU is "
+                         "filtered BEFORE the 1-deep ISSUE_CONTROL latch, letting GTO pick another ready "
+                         "warp instead of stalling the whole subcore. Queue-based FUs (MEM/TMA/MISC) are "
+                         "left on the deferred path. II/latency unchanged. Default 0 = baseline "
+                         "bit-identical. See .plan/CONSUMER_COMPUTE_BOUND.md 'Fix design'. (default=0)",
+                         "0");
+  option_parser_register(opp, "-mufu_lockstep_instrument_enable", OPT_BOOL,
+                         &mufu_lockstep_instrument_enable,
+                         "On still_idle cycles (subcore issued nothing AND >=1 SFU-blocked head), tally "
+                         "valid-head warps by head-op class (MUFU/TENSOR/other) into per-SM sums, to "
+                         "decide if the post-Opt-10 SFU-throughput residual is softmax MUFU-lockstep "
+                         "(all warps on MUFU) vs free-pipe warps blocked otherwise. Read-only, "
+                         "timing-neutral, default 0 = baseline bit-identical. See "
+                         ".plan/CONSUMER_COMPUTE_BOUND.md 'Next axis'. (default=0)",
+                         "0");
+  option_parser_register(opp, "-overlap_instrument_enable", OPT_BOOL,
+                         &overlap_instrument_enable,
+                         "Enable the tensor-vs-SFU pipe-overlap + wait/stall warp-cycle probes: per-cycle "
+                         "SM-level tensor||SFU busy-combination counters (both/tensor-only/sfu-only/neither) "
+                         "and per-warp warp-cycle stall accounting by reason (wait_barrier/stall_count/yield/"
+                         "fu_tensor/fu_sfu/fu_other/scoreboard), comparable to HW warp-cycles-per-inst stall "
+                         "breakdown. Read-only, timing-neutral, default 0 = bit-identical. See "
+                         ".plan/HW_VS_SIM_SFU.md section 5. (default=0)",
+                         "0");
+  option_parser_register(opp, "-stall_reason_align_instrument_enable", OPT_BOOL,
+                         &stall_reason_align_instrument_enable,
+                         "Enable observe-only SR-M0A stall-reason-alignment accounting: a cycle-start "
+                         "pre-issue snapshot that classifies every active warp into exactly one "
+                         "mutually-exclusive population (selected / eligible_not_selected / "
+                         "no_valid_instruction / drain / wait_block_hold / blocked_with_valid_head / "
+                         "non_frontend_hold_without_valid_head / unknown_valid_head) and validates "
+                         "per-cycle conservation against the actual issue winner. Never calls a mutating "
+                         "readiness function and never changes scheduling; default 0 = bit-identical. "
+                         "See .plan/STALL_REASON_ALIGN.md Stage SR-M0A. (default=0)",
+                         "0");
+  option_parser_register(opp, "-subcore_gtlrr_enable", OPT_BOOL,
+                         &subcore_gtlrr_enable,
+                         "Warp-ordering policy for the remodeling subcore issue/fetch path. 0 = GTO "
+                         "(baseline order_greedy_then_highest_id: greedy, then oldest). 1 = GTLRR "
+                         "(greedy, then loose round-robin from greedy_pointer+1) — de-phases in-phase "
+                         "consumer warps so a stalled greedy warp hands off to the NEXT warp instead of "
+                         "re-picking the oldest. Scheduling-only, work-invariant; default 0 = bit-identical "
+                         "GTO. See .plan/HW_VS_SIM_SFU.md section 11-12. (default=0)",
                          "0");
   option_parser_register(opp, "-sync_debug_enable", OPT_BOOL,
                          &sync_debug_enable,
@@ -2063,7 +4303,9 @@ void shader_core_config::reg_options(class OptionParser *opp) {
   option_parser_register(opp, "-bar_debug_issue_budget", OPT_UINT32,
                          &bar_debug_issue_budget,
                          "Maximum number of BARDBG per-issue decode lines to print "
-                         "(global) when bar_debug_enable is set. (default=2000000)",
+                         "(global) when bar_debug_enable is set. 0 also suppresses "
+                         "MEMBARDBG detail while retaining BAR release/summary/leak "
+                         "logs. (default=2000000)",
                          "2000000");
   option_parser_register(opp, "-is_rf_cache_enabled", OPT_BOOL,
                          &is_rf_cache_enabled,
@@ -2843,6 +5085,7 @@ void gpgpu_sim::create_gpu_per_sm_stats() {
   // Per-reason no_warps_ready breakdown (compared against NCU warp-issue stall decomposition).
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_issue_stage_stall_at_least_one_warp_with_fu_occupied", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_inst_barrier", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_mbarrier_spin", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_tma_flush", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_yield", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_stall_count", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
@@ -2882,6 +5125,12 @@ void gpgpu_sim::create_gpu_per_sm_stats() {
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_next_stage_blocked_by_tensor", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_next_stage_blocked_by_mem", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_next_stage_blocked_by_other", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  // [Head-of-line lever] finer split of blocked_by_other (the ISSUE_CONTROL-holding op's FU), so the
+  // fix knows WHICH pipe's read_stage/FU-latency to deepen. sfu = MUFU/SFU; sp_int_dp = SP/INT/DP/HALF/
+  // UNIFORM; branch_other = BRANCH/everything else.
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_next_stage_blocked_by_sfu", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_next_stage_blocked_by_sp_int_dp", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_next_stage_blocked_by_branch_other", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
   // [Head-of-line lever] why the OTHER warps were not warp-side-ready during next_stage cycles (summed
   // over warps × cycles). If `with_ready_warp` is low, this says whether the whole warpgroup is stuck on
   // the SAME dependency (lockstep — e.g. all on wait_barrier/scoreboard waiting on the same WGMMA), which
@@ -2892,6 +5141,40 @@ void gpgpu_sim::create_gpu_per_sm_stats() {
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_next_stage_notready_yield", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_next_stage_notready_ldgdepbar", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_next_stage_valid_head_warps", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  // [Head-of-line lever] WHY the ISSUE_CONTROL latch could not drain this cycle (root of head-of-line).
+  // control-stage side: control_allocate_full (fixed-latency, CONTROL_ALLOCATE occupied) vs
+  // fu_cannot_issue (non-fixed op, target FU queue full). allocate-stage side (why CONTROL_ALLOCATE
+  // stays occupied): read_stage_full / rf_conflict / fu_latency_full. Distinguishes "deepen the latch"
+  // (latch/queue depth) from "FU throughput/latency" as the real limiter. Gated by
+  // -headofline_instrument_enable. See .plan/CONSUMER_COMPUTE_BOUND.md.
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_hol_reason_control_allocate_full", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_hol_reason_fu_cannot_issue", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_hol_reason_read_stage_full", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_hol_reason_rf_conflict", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_hol_reason_fu_latency_full", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  // [intra-SMSP warp-switch] effect counters (gated by -intra_smsp_warpswitch_enable; the fix itself
+  // changes timing, so these describe THIS run's behavior, not an observe-only overlay).
+  // sfu_filtered      = cycles the fix filtered a busy-SFU head at issue (denominator = fix fired).
+  // other_warp_issued = of those, cycles where ANOTHER warp then issued into the freed slot
+  //                     (the RECOVERED slot; sfu_filtered - this = still-idle). == direct proof of the
+  //                     intra-SMSP warp-switch. Compare against the baseline head-of-line blocked_by_sfu.
+  // still_idle        = of those, cycles where nobody issued anyway (structural idle the fix can't fix).
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_intra_warpswitch_sfu_filtered", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_intra_warpswitch_other_warp_issued", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_intra_warpswitch_still_idle", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  // [MUFU-lockstep probe] on still_idle cycles (issued nothing AND >=1 SFU-blocked head), sum valid-head
+  // warps by head-op class. head_mufu/valid_head ~1 => softmax MUFU-lockstep (lever=warp-stagger);
+  // head_tensor+other > 0 => free-pipe warps blocked otherwise (different lever). Gated, read-only.
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_mufu_lockstep_sfu_cycles", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_mufu_lockstep_sum_head_mufu", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_mufu_lockstep_sum_head_tensor", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_mufu_lockstep_sum_head_other", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_mufu_lockstep_sum_valid_head", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  // [MUFU-lockstep probe] of the non-SFU (free-pipe) heads on still_idle cycles, blocking reason (why
+  // they could not issue) — diagnoses the NOT-lockstep case in the same run.
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_mufu_lockstep_nonsfu_wait_barrier", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_mufu_lockstep_nonsfu_stall_count", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_mufu_lockstep_nonsfu_scoreboard", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
   // [WGMMA Opt6 Step-0 instrumentation] observe-only counters (no timing change).
   // (I) split fu_occupied by pipe op.
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_issue_stage_stall_at_least_one_warp_with_fu_occupied_tensor", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
@@ -2908,6 +5191,29 @@ void gpgpu_sim::create_gpu_per_sm_stats() {
   // the Compute(tensor) throughput% metric. Incremented in functional_unit::cycle() for the
   // TENSOR FU when it has work in flight / dispatch / II-lockout. Observe-only, timing-neutral.
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_tensor_pipe_active", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  // [overlap probe] SFU pipe-active (symmetric to tensor) + SM-level tensor||SFU overlap classification +
+  // per-warp warp-cycle stall accounting by reason. All observe-only. SFU-pipe-active is always on (like
+  // tensor); the rest fire only under -overlap_instrument_enable.
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_sfu_pipe_active", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_overlap_tensor_and_sfu", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_overlap_tensor_only", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_overlap_sfu_only", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_overlap_neither", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_warpcyc_stalled_any", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_warpcyc_stalled_wait_barrier", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_warpcyc_stalled_stall_count", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_warpcyc_stalled_yield", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_warpcyc_stalled_fu_any", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_warpcyc_stalled_fu_tensor", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_warpcyc_stalled_fu_sfu", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_warpcyc_stalled_fu_other", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_warpcyc_stalled_scoreboard", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  // [wait_barrier-kind probe] of the wait_barrier-stalled warp-cycles, which op-class armed the blocking
+  // SB: TENSOR (WGMMA result = recoverable by de-phasing) vs TMA (producer floor) vs other.
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_warpcyc_wb_wait_tensor", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_warpcyc_wb_wait_tma", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_warpcyc_wb_wait_other", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
+  m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_warpcyc_wb_wait_unknown", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
   // (V) SM-level: cycles where NO subcore issued anything; sub-variant where every non-issuing
   // subcore that had an eligible-but-blocked warp was blocked specifically by the tensor pipe.
   m_gpu_per_sm_stats.add_unsigned_long_long_stat("total_num_cycles_sm_all_subcores_idle", AllowedTypesStats::UNSIGNED_LONG_LONG, 0, ": ", "", true, false, false);
@@ -3023,6 +5329,153 @@ void gpgpu_sim::reset_gpu_per_sm_stats() {
   m_l1i_prefetch_miss_set_histogram.clear();
   m_l1i_prefetch_evicted_prefetch_block_histogram.clear();
   m_l1i_prefetch_resident_blocks.clear();
+  // [SR-M0A] Reset per-Subcore stall-reason-align totals once per kernel
+  // boundary (never from SM::reinit()). Strictly gated.
+  if (m_shader_config->stall_reason_align_instrument_enable) {
+    for(unsigned int i = 0; i < m_shader_config->n_simt_clusters; i++) {
+      for(unsigned int j = 0; j < m_cluster[i]->get_num_cores(); j++) {
+        SM *sm = static_cast<SM *>(m_cluster[i]->get_core(j));
+        sm->reset_stall_reason_align_stats();
+      }
+    }
+  }
+}
+
+void gpgpu_sim::report_stall_reason_align_stats() {
+  if (!m_shader_config->stall_reason_align_instrument_enable) return;
+
+  Subcore::StallPopulationTotals agg;
+  for(unsigned int i = 0; i < m_shader_config->n_simt_clusters; i++) {
+    for(unsigned int j = 0; j < m_cluster[i]->get_num_cores(); j++) {
+      SM *sm = static_cast<SM *>(m_cluster[i]->get_core(j));
+      sm->gather_stall_reason_align_stats(agg);
+    }
+  }
+
+  auto idx = [](Subcore::StallPopulation p) {
+    return static_cast<size_t>(p);
+  };
+  static const char *const kNames[] = {
+      "SELECTED",
+      "ELIGIBLE_NOT_SELECTED_WITH_ISSUE",
+      "ELIGIBLE_NOT_SELECTED_WITHOUT_ISSUE",
+      "NO_VALID_INSTRUCTION",
+      "DRAIN",
+      "WAIT_BLOCK_HOLD",
+      "BLOCKED_WITH_VALID_HEAD",
+      "NON_FRONTEND_HOLD_WITHOUT_VALID_HEAD",
+      "UNKNOWN_VALID_HEAD",
+  };
+
+  const uint64_t selected = agg.population[idx(Subcore::StallPopulation::SELECTED)];
+  const uint64_t unknown = agg.population[idx(Subcore::StallPopulation::UNKNOWN_VALID_HEAD)];
+  const uint64_t issue_selected =
+      m_gpu_per_sm_stats.m_stats_map["total_num_cycles_issue_stage_selected"]
+          ->get_value();
+  const uint64_t issue_evaluated =
+      m_gpu_per_sm_stats.m_stats_map["total_num_cycles_issue_stage_evaluated"]
+          ->get_value();
+
+  uint64_t population_sum = 0;
+  for (size_t b = 0; b < static_cast<size_t>(Subcore::StallPopulation::COUNT); b++) {
+    population_sum += agg.population[b];
+  }
+  const long long delta =
+      static_cast<long long>(population_sum) - static_cast<long long>(agg.active_warp_cycles);
+  const long long selected_delta =
+      static_cast<long long>(selected) - static_cast<long long>(issue_selected);
+  const long long sampled_delta =
+      static_cast<long long>(agg.sampled_subcore_cycles) -
+      static_cast<long long>(issue_evaluated);
+
+  const bool fail = (agg.winner_mismatch != 0) || (agg.winner_prestate_unknown != 0) ||
+                    (agg.l1c_snapshot_authoritative_disagreement != 0) ||
+                    (agg.winner_prestate_l1c_disagreement != 0) ||
+                    (unknown != 0) ||
+                    (population_sum != agg.active_warp_cycles) ||
+                    (selected == 0) || !agg.measured_kernel_uid_valid ||
+                    (selected != issue_selected) ||
+                    (agg.sampled_subcore_cycles != issue_evaluated);
+  const char *status = fail ? "FAIL" : "PASS";
+
+  printf("[STALLALIGN] ---- SR-M0A stall-reason alignment report ----\n");
+  for (size_t b = 0; b < static_cast<size_t>(Subcore::StallPopulation::COUNT); b++) {
+    printf("[STALLALIGN] population[%s] = %llu\n", kNames[b],
+           (unsigned long long)agg.population[b]);
+  }
+  printf("[STALLALIGN] active_warp_cycles = %llu\n",
+         (unsigned long long)agg.active_warp_cycles);
+  printf("[STALLALIGN] eligible_warp_cycles = %llu\n",
+         (unsigned long long)agg.eligible_warp_cycles);
+  printf("[STALLALIGN] sampled_subcore_cycles = %llu\n",
+         (unsigned long long)agg.sampled_subcore_cycles);
+  printf("[STALLALIGN] eligible_without_issue_cycles = %llu\n",
+         (unsigned long long)agg.eligible_without_issue_cycles);
+  printf("[STALLALIGN] no_head_stall_count_warp_cycles = %llu\n",
+         (unsigned long long)agg.no_head_stall_count_warp_cycles);
+  printf("[STALLALIGN] no_head_yield_warp_cycles = %llu\n",
+         (unsigned long long)agg.no_head_yield_warp_cycles);
+  printf("[STALLALIGN] winner_mismatch = %llu\n",
+         (unsigned long long)agg.winner_mismatch);
+  printf("[STALLALIGN] winner_prestate_unknown = %llu\n",
+         (unsigned long long)agg.winner_prestate_unknown);
+  printf("[STALLALIGN] l1c_snapshot_authoritative_disagreement = %llu\n",
+         (unsigned long long)agg.l1c_snapshot_authoritative_disagreement);
+  printf("[STALLALIGN] winner_prestate_l1c_disagreement = %llu\n",
+         (unsigned long long)agg.winner_prestate_l1c_disagreement);
+  printf("[STALLALIGN] measured_kernel_uid = %u valid=%u\n",
+         agg.measured_kernel_uid, agg.measured_kernel_uid_valid ? 1u : 0u);
+  printf("[STALLALIGN] population_sum = %llu\n", (unsigned long long)population_sum);
+  printf("[STALLALIGN] delta(population_sum - active_warp_cycles) = %lld\n", delta);
+  printf("[STALLALIGN] reference_issue_selected = %llu delta(selected-reference) = %lld\n",
+         (unsigned long long)issue_selected, selected_delta);
+  printf("[STALLALIGN] reference_issue_evaluated = %llu delta(sampled-reference) = %lld\n",
+         (unsigned long long)issue_evaluated, sampled_delta);
+
+  if (selected > 0) {
+    const double sel = static_cast<double>(selected);
+    printf("[STALLALIGN] ratio active_warp_cycles/selected = %.6f\n",
+           static_cast<double>(agg.active_warp_cycles) / sel);
+    printf("[STALLALIGN] ratio selected/selected = %.6f\n",
+           static_cast<double>(selected) / sel);
+    printf("[STALLALIGN] ratio eligible_not_selected_with_issue/selected = %.6f\n",
+           static_cast<double>(agg.population[idx(Subcore::StallPopulation::ELIGIBLE_NOT_SELECTED_WITH_ISSUE)]) / sel);
+    printf("[STALLALIGN] ratio eligible_not_selected_without_issue/selected = %.6f\n",
+           static_cast<double>(agg.population[idx(Subcore::StallPopulation::ELIGIBLE_NOT_SELECTED_WITHOUT_ISSUE)]) / sel);
+    printf("[STALLALIGN] ratio no_valid_instruction/selected = %.6f\n",
+           static_cast<double>(agg.population[idx(Subcore::StallPopulation::NO_VALID_INSTRUCTION)]) / sel);
+    printf("[STALLALIGN] ratio drain/selected = %.6f\n",
+           static_cast<double>(agg.population[idx(Subcore::StallPopulation::DRAIN)]) / sel);
+  } else {
+    printf("[STALLALIGN] selected=0 (no ratios)\n");
+  }
+
+  printf("[STALLALIGN] FINAL status=%s active=%llu population_sum=%llu delta=%lld "
+         "selected=%llu issue_selected=%llu selected_delta=%lld eligible=%llu "
+         "unknown=%llu sampled=%llu issue_evaluated=%llu sampled_delta=%lld "
+         "kernel_uid=%u kernel_uid_valid=%u winner_mismatch=%llu "
+         "winner_prestate_unknown=%llu "
+         "l1c_snapshot_authoritative_disagreement=%llu "
+         "winner_prestate_l1c_disagreement=%llu\n",
+         status,
+         (unsigned long long)agg.active_warp_cycles,
+         (unsigned long long)population_sum,
+         delta,
+         (unsigned long long)selected,
+         (unsigned long long)issue_selected,
+         selected_delta,
+         (unsigned long long)agg.eligible_warp_cycles,
+         (unsigned long long)unknown,
+         (unsigned long long)agg.sampled_subcore_cycles,
+         (unsigned long long)issue_evaluated,
+         sampled_delta,
+         agg.measured_kernel_uid,
+         agg.measured_kernel_uid_valid ? 1u : 0u,
+         (unsigned long long)agg.winner_mismatch,
+         (unsigned long long)agg.winner_prestate_unknown,
+         (unsigned long long)
+             agg.l1c_snapshot_authoritative_disagreement,
+         (unsigned long long)agg.winner_prestate_l1c_disagreement);
 }
 
 void gpgpu_sim::record_l1i_prefetch_miss_observation(
@@ -3546,6 +5999,7 @@ void gpgpu_sim::gpu_print_stat() {
 
   std::string kernel_info_str = executed_kernel_info_string();
   gather_gpu_per_sm_stats();
+  report_stall_reason_align_stats();
   reset_cycless_access_history();
   
   gpu_sim_insn = m_gpu_per_sm_stats.m_stats_map["gpu_sim_insn"]->get_value();
@@ -3555,6 +6009,24 @@ void gpgpu_sim::gpu_print_stat() {
   printf("gpu_sim_cycle = %lld\n", gpu_sim_cycle);
   m_gpu_per_sm_stats.m_stats_map["gpu_sim_insn"]->print(statfout);
   printf("gpu_ipc = %12.4f\n", (float)gpu_sim_insn / gpu_sim_cycle);
+  // [TRIMCHK] Per-kernel producer-spin issue summary (always on). If a trimmed
+  // trace was consumed these are ~48-86x lower than a full run; if they are still
+  // in the hundreds-of-thousands the sim ran the UNtrimmed trace (do not trust
+  // the cycle result). phasechk+nanosleep together == the modeled spin polls.
+  {
+    unsigned long long trimchk_spin_total =
+        trimchk_spin_phasechk_issued + trimchk_spin_nanosleep_issued;
+    printf("[TRIMCHK] spin_phasechk_issued = %llu\n", trimchk_spin_phasechk_issued);
+    printf("[TRIMCHK] spin_nanosleep_issued = %llu\n", trimchk_spin_nanosleep_issued);
+    printf("[TRIMCHK] spin_branch_issued = %llu\n", trimchk_spin_branch_issued);
+    printf("[TRIMCHK] spin_poll_total(phasechk+nanosleep) = %llu\n", trimchk_spin_total);
+    printf("[TRIMCHK] verdict = %s (full-run spin is O(1e5+); trimmed is O(1e3-1e4))\n",
+           trimchk_spin_total < 50000 ? "LIKELY-TRIMMED" : "LIKELY-FULL-RUN");
+    // reset for the next kernel so each kernel reports its own spin count
+    trimchk_spin_phasechk_issued = 0;
+    trimchk_spin_nanosleep_issued = 0;
+    trimchk_spin_branch_issued = 0;
+  }
   printf("gpu_tot_sim_cycle = %lld\n", gpu_tot_sim_cycle + gpu_sim_cycle);
   printf("gpu_tot_sim_insn = %lld\n", gpu_tot_sim_insn + gpu_sim_insn);
   printf("gpu_tot_ipc = %12.4f\n", (float)(gpu_tot_sim_insn + gpu_sim_insn) /

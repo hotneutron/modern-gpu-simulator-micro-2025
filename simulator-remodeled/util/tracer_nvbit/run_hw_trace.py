@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 
 from optparse import OptionParser
+import hashlib
+import json
 import os
 import subprocess
 import os
@@ -18,11 +20,213 @@ import common
 import re
 import datetime
 
+
+LIGHTER_TRACER_FEATURE_ORDER = (
+    "compact_wire",
+    "prune_operands",
+    "host_count",
+    "metadata_record",
+    "sparse_reconstruct",
+    "warp_batch_1k",
+    "warp_batch_2k",
+    "warp_batch_4k",
+    "spin_fusion",
+)
+
+LIGHTER_TRACER_IMPLEMENTED_FEATURES = frozenset(
+    ("compact_wire", "prune_operands", "host_count", "sparse_reconstruct")
+)
+
+LIGHTER_TRACER_PRODUCTION_FEATURES = frozenset(
+    # sparse_reconstruct remains explicit-only until opcode ordering is fixed.
+    ("compact_wire", "prune_operands")
+)
+
+LIGHTER_TRACER_FEATURE_DEPENDENCIES = {
+    "prune_operands": frozenset(("compact_wire",)),
+    "host_count": frozenset(("compact_wire",)),
+    "metadata_record": frozenset(("compact_wire",)),
+    "sparse_reconstruct": frozenset(
+        ("compact_wire", "prune_operands")
+    ),
+    "warp_batch_1k": frozenset(("compact_wire",)),
+    "warp_batch_2k": frozenset(("compact_wire",)),
+    "warp_batch_4k": frozenset(("compact_wire",)),
+    "spin_fusion": frozenset(
+        ("compact_wire", "prune_operands", "sparse_reconstruct")
+    ),
+}
+
+LIGHTER_TRACER_WARP_BATCH_FEATURES = frozenset(
+    ("warp_batch_1k", "warp_batch_2k", "warp_batch_4k")
+)
+
+
+class LighterTracerConfig:
+    def __init__(self, requested, features, source, publish_default=False):
+        self.requested = requested
+        self.features = tuple(features)
+        self.source = source
+        self.publish_default = publish_default
+        self.canonical = ",".join(self.features) if self.features else "off"
+        self.config_hash = hashlib.sha256(
+            self.canonical.encode("ascii")
+        ).hexdigest()[:8]
+
+    def enabled(self, feature):
+        return feature in self.features
+
+    @property
+    def compact_wire_enabled(self):
+        return self.enabled("compact_wire")
+
+    @property
+    def artifact_suffix(self):
+        if not self.features or self.publish_default:
+            return ""
+        readable = "+".join(self.features)
+        return "_lighter-{0}".format(readable)
+
+
+def parse_lighter_tracer_feature_set(raw_value):
+    if raw_value is None:
+        return ()
+
+    stripped = raw_value.strip()
+    if not stripped:
+        raise ValueError("LIGHTER_TRACER must not be empty; use 'off'")
+    if stripped == "off":
+        return ()
+    if stripped == "all":
+        return tuple(
+            feature
+            for feature in LIGHTER_TRACER_FEATURE_ORDER
+            if feature in LIGHTER_TRACER_PRODUCTION_FEATURES
+        )
+
+    requested_tokens = stripped.split(",")
+    tokens = []
+    seen = set()
+    for requested_token in requested_tokens:
+        token = requested_token.strip()
+        if not token:
+            raise ValueError("LIGHTER_TRACER contains an empty feature token")
+        if token in ("off", "all"):
+            raise ValueError(
+                "LIGHTER_TRACER token '{0}' cannot be combined".format(token)
+            )
+        if token not in LIGHTER_TRACER_FEATURE_ORDER:
+            raise ValueError(
+                "unknown LIGHTER_TRACER feature '{0}'".format(token)
+            )
+        if token in seen:
+            raise ValueError(
+                "duplicate LIGHTER_TRACER feature '{0}'".format(token)
+            )
+        seen.add(token)
+        tokens.append(token)
+
+    selected = frozenset(tokens)
+    selected_batches = selected & LIGHTER_TRACER_WARP_BATCH_FEATURES
+    if len(selected_batches) > 1:
+        raise ValueError(
+            "LIGHTER_TRACER warp_batch_1k/2k/4k features are mutually exclusive"
+        )
+
+    for feature in tokens:
+        missing = (
+            LIGHTER_TRACER_FEATURE_DEPENDENCIES.get(
+                feature, frozenset()
+            )
+            - selected
+        )
+        if missing:
+            raise ValueError(
+                "LIGHTER_TRACER feature '{0}' requires: {1}".format(
+                    feature, ",".join(sorted(missing))
+                )
+            )
+
+    unimplemented = selected - LIGHTER_TRACER_IMPLEMENTED_FEATURES
+    if unimplemented:
+        raise ValueError(
+            "LIGHTER_TRACER features are recognized but not implemented: "
+            "{0}".format(",".join(sorted(unimplemented)))
+        )
+
+    return tuple(
+        feature
+        for feature in LIGHTER_TRACER_FEATURE_ORDER
+        if feature in selected
+    )
+
+
+def resolve_lighter_tracer(lighter_tracer_value):
+    if lighter_tracer_value is None:
+        features = parse_lighter_tracer_feature_set("all")
+        return LighterTracerConfig(
+            requested="all",
+            features=features,
+            source="default",
+            publish_default=True,
+        )
+
+    stripped_value = lighter_tracer_value.strip()
+    features = parse_lighter_tracer_feature_set(lighter_tracer_value)
+    return LighterTracerConfig(
+        requested=lighter_tracer_value,
+        features=features,
+        source="LIGHTER_TRACER",
+        publish_default=stripped_value == "all",
+    )
+
 # MOD. Begin. Improved tracer
 import psutil
 traces_root_dir = os.getenv('TRACES_ROOT_DIR')
 if not traces_root_dir:
     traces_root_dir = "../.."
+warp_lifetime_only = os.getenv("WARP_LIFETIME_ONLY") == "1"
+warp_lifetime_sidecar = os.getenv("WARP_LIFETIME_SIDECAR") == "1"
+if warp_lifetime_only and warp_lifetime_sidecar:
+    raise RuntimeError(
+        "WARP_LIFETIME_ONLY and WARP_LIFETIME_SIDECAR are mutually exclusive"
+    )
+# Spin-trim post-step: when TRIM_SPIN=1, after the normal full run + trace
+# post-processing, move the full trace aside to "<run>.fullrun" and write a
+# spin-trimmed copy back to the original "<run>" location (so the simulator
+# consumes the trimmed trace). Requires the matching NCU report as ground truth.
+trim_spin_enabled = os.getenv("TRIM_SPIN") == "1"
+trim_spin_ncu_rep = os.getenv("TRIM_SPIN_NCU_REP")
+trim_spin_ncu_bin = os.getenv("TRIM_SPIN_NCU_BIN", "ncu")
+try:
+    lighter_tracer_config = resolve_lighter_tracer(os.getenv("LIGHTER_TRACER"))
+except ValueError as error:
+    raise RuntimeError(str(error))
+compact_full_capture_enabled = (
+    lighter_tracer_config.compact_wire_enabled
+)
+print(
+    "[LIGHTER-TRACER] requested={0} canonical={1} config_hash={2} "
+    "artifact_suffix={3}".format(
+        lighter_tracer_config.requested,
+        lighter_tracer_config.canonical,
+        lighter_tracer_config.config_hash,
+        lighter_tracer_config.artifact_suffix or "<none>",
+    )
+)
+if trim_spin_enabled and compact_full_capture_enabled:
+    raise RuntimeError(
+        "TRIM_SPIN=1 and LIGHTER_TRACER compact capture are mutually exclusive: "
+        "use compact full capture for Option 1, or trim/reorganization for Option 2"
+    )
+if trim_spin_enabled and not trim_spin_ncu_rep:
+    raise RuntimeError(
+        "TRIM_SPIN=1 requires TRIM_SPIN_NCU_REP=<path to matching .ncu-rep>"
+    )
+if trim_spin_enabled and (warp_lifetime_only or warp_lifetime_sidecar):
+    raise RuntimeError(
+        "TRIM_SPIN is incompatible with WARP_LIFETIME_ONLY / WARP_LIFETIME_SIDECAR"
+    )
 # MOD. End. Improved tracer
 
 # We will look for the benchmarks 
@@ -40,12 +244,56 @@ parser.add_option("-l", "--limit_kernel_number", dest='kernel_number', default=-
                         "number of traced limits")
 parser.add_option("-t", "--terminate_upon_limit", dest='terminate_upon_limit', action="store_true", help="Once the kernel limit is " +\
                         "reached, terminate the tracing process")
+parser.add_option("-f", "--force-overwrite", dest="force_overwrite",
+                  action="store_true", default=False,
+                  help="Delete an existing benchmark run directory before tracing")
+parser.add_option(
+    "--mbarrier-contract-capture",
+    dest="mbarrier_contract_capture",
+    action="store_true",
+    default=False,
+    help="Enable capture-only barrier-local contract ordinals. The tracer "
+         "runtime option MBARRIER_CONTRACT_CAPTURE is otherwise disabled.")
 # MOD. Begin. Improved tracer
 parser.add_option("-C", "--compressed", dest="compressed", action="store_true", 
                  help="It runs the tracer in compressed mode", default="0")
 # MOD. End. Improved tracer
 
 (options, args) = parser.parse_args()
+
+mbarrier_contract_env = os.getenv("MBARRIER_CONTRACT_CAPTURE", "0")
+if mbarrier_contract_env not in ("0", "1"):
+    raise RuntimeError(
+        "MBARRIER_CONTRACT_CAPTURE must be exactly 0 or 1"
+    )
+mbarrier_contract_capture = (
+    options.mbarrier_contract_capture or mbarrier_contract_env == "1"
+)
+if mbarrier_contract_capture and (
+        trim_spin_enabled or warp_lifetime_only or warp_lifetime_sidecar):
+    raise RuntimeError(
+        "mbarrier contract capture is incompatible with TRIM_SPIN and "
+        "warp-lifetime modes"
+    )
+contract_capture_bounds = {
+    "MBARRIER_CONTRACT_BARRIERS_PER_CTA": 64,
+}
+if mbarrier_contract_capture:
+    for contract_name, contract_default in tuple(
+            contract_capture_bounds.items()):
+        raw_value = os.getenv(contract_name, str(contract_default))
+        try:
+            parsed_value = int(raw_value, 10)
+        except ValueError:
+            raise RuntimeError(
+                "{0} must be a positive decimal integer".format(
+                    contract_name)
+            )
+        if parsed_value <= 0 or parsed_value > 0x7fffffff:
+            raise RuntimeError(
+                "{0} must be in [1,2147483647]".format(contract_name)
+            )
+        contract_capture_bounds[contract_name] = parsed_value
 
 common.load_defined_yamls()
 
@@ -88,8 +336,8 @@ def build_tma_descriptor_mapping_if_available(trace_folder):
         [sys.executable, mapping_script, extra_info_dir, "--configs-only"],
         check=True,
     )
-    # Exact (uid,pc) -> real GMEM base + full descriptor fields. Strict: fail if any
-    # descriptor LDG/STG site is unresolved or falls back to the pool.
+    # Exact (trace_kernel_id,uid,pc) -> real GMEM base + full descriptor fields.
+    # Strict: fail if any descriptor site lacks one unambiguous UTMACCTL chain.
     base_map_inputs = [
         os.path.join(extra_info_dir, "tma_launch_param_dump.csv"),
         os.path.join(extra_info_dir, "tensor_map_encode_dump.csv"),
@@ -123,28 +371,261 @@ def build_sync_operand_mapping_if_available(trace_folder):
     sync_script = os.path.join(this_directory, "build_sync_operand_mapping.py")
     subprocess.run([sys.executable, sync_script, extra_info_dir], check=True)
 
+
+def validate_tma_completion_contracts_if_available(trace_folder):
+    extra_info_dir = os.path.join(trace_folder, "extra_info")
+    inputs = [
+        os.path.join(extra_info_dir, "tma_pc_base_map.json"),
+        os.path.join(extra_info_dir, "tma_operand_resolver.json"),
+        os.path.join(extra_info_dir, "sync_operand_resolver.json"),
+    ]
+    if not all(os.path.exists(path) for path in inputs):
+        return
+    validator = os.path.join(
+        this_directory, "validate_tma_completion_contracts.py"
+    )
+    subprocess.run(
+        [
+            sys.executable,
+            validator,
+            "--traces",
+            trace_folder,
+            "--strict",
+        ],
+        check=True,
+    )
+
+
+def build_spin_wait_sidecar(trace_folder, require_contract_capture=False,
+                            contract_baseline_traces=None):
+    # WaitBlock v5 sidecar. It needs the sync resolver + disassembly, so it runs
+    # after build_sync_operand_mapping. Production trace generation always
+    # validates every CTA and fails closed if any intended runtime record fails
+    # its proof. Also runnable standalone on a CPU server.
+    extra_info_dir = os.path.join(trace_folder, "extra_info")
+    inputs = [
+        os.path.join(extra_info_dir, "enhanced_execution_info.json"),
+        os.path.join(extra_info_dir, "sync_operand_resolver.json"),
+    ]
+    missing = [path for path in inputs if not os.path.exists(path)]
+    if missing:
+        raise RuntimeError(
+            "cannot build mandatory WaitBlock v5 sidecar; missing: {0}".format(
+                ", ".join(missing)
+            )
+        )
+    sidecar_script = os.path.join(this_directory, "build_spin_wait_sidecar.py")
+    command = [
+        sys.executable,
+        sidecar_script,
+        "--traces",
+        trace_folder,
+        "--validate-ctas",
+        "all",
+        "--strict",
+    ]
+    if require_contract_capture:
+        command.append("--require-contract-capture")
+        if not contract_baseline_traces:
+            raise RuntimeError(
+                "contract capture requires an accepted baseline traces path"
+            )
+        command.extend([
+            "--contract-baseline-traces",
+            contract_baseline_traces,
+        ])
+    subprocess.run(command, check=True)
+
+
+def spin_trim_run_dir(this_run_dir):
+    """TRIM_SPIN post-step. The full run has just completed at this_run_dir.
+    Move it aside to '<this_run_dir>.fullrun' (the untouched full trace) and
+    write a spin-trimmed copy back to this_run_dir so the simulator consumes the
+    trimmed trace. Uses trim_spin_from_ncu.py with the matching NCU report as HW
+    ground truth. Idempotent-ish: if '<...>.fullrun' already exists it is reused
+    as the source (so re-running does not lose the original full trace)."""
+    fullrun_dir = this_run_dir + ".fullrun"
+    if not os.path.isdir(fullrun_dir):
+        # first time: the full run currently lives at this_run_dir -> move aside
+        shutil.move(this_run_dir, fullrun_dir)
+    else:
+        # a previous full run is preserved; drop any stale trimmed dir
+        if os.path.isdir(this_run_dir):
+            shutil.rmtree(this_run_dir)
+
+    full_traces = os.path.join(fullrun_dir, "traces")
+    trimmed_traces = os.path.join(this_run_dir, "traces")
+
+    # recreate the run_dir shell and copy every non-'traces' artifact
+    # (run.sh, data symlinks, etc.) so the trimmed run_dir is self-contained.
+    os.makedirs(this_run_dir, exist_ok=True)
+    for name in os.listdir(fullrun_dir):
+        if name == "traces":
+            continue
+        src = os.path.join(fullrun_dir, name)
+        dst = os.path.join(this_run_dir, name)
+        if os.path.islink(src):
+            linkto = os.readlink(src)
+            if os.path.lexists(dst):
+                os.remove(dst)
+            os.symlink(linkto, dst)
+        elif os.path.isdir(src):
+            shutil.copytree(src, dst)
+        else:
+            shutil.copy2(src, dst)
+
+    trim_tool = os.path.join(this_directory, "trim_spin_from_ncu.py")
+    ncu_rep = os.path.abspath(os.path.expandvars(os.path.expanduser(trim_spin_ncu_rep)))
+    cmd = [sys.executable, trim_tool,
+           "--full-run", full_traces,
+           "--ncu-rep", ncu_rep,
+           "--out", trimmed_traces,
+           "--ncu-bin", trim_spin_ncu_bin]
+    print("Spin-trimming trace: %s -> %s (NCU %s)"
+          % (full_traces, trimmed_traces, ncu_rep))
+    subprocess.run(cmd, check=True)
+
+
+def remove_existing_run_dir(run_dir, trace_root):
+    if not os.path.lexists(run_dir):
+        return
+
+    absolute_run_dir = os.path.abspath(run_dir)
+    real_run_dir = os.path.realpath(absolute_run_dir)
+    real_trace_root = os.path.realpath(os.path.abspath(trace_root))
+    try:
+        inside_trace_root = (
+            os.path.commonpath((real_run_dir, real_trace_root))
+            == real_trace_root
+        )
+    except ValueError:
+        inside_trace_root = False
+
+    if (
+        not inside_trace_root
+        or real_run_dir == real_trace_root
+        or os.path.islink(absolute_run_dir)
+        or not os.path.isdir(absolute_run_dir)
+    ):
+        raise RuntimeError(
+            "refusing to force-overwrite unsafe run path: {0} "
+            "(trace root: {1})".format(absolute_run_dir, real_trace_root)
+        )
+
+    print("[TRACE-OUTPUT] force-overwrite removing {0}".format(
+        absolute_run_dir
+    ))
+    shutil.rmtree(absolute_run_dir)
+
+
 for bench in benchmarks:
     edir, ddir, exe, argslist = bench
     for argpair in argslist:
         args = argpair["args"]
         extra_env = argpair.get("env", {})
+        conflicting_config_keys = {
+            "LIGHTER_TRACER", "MBARRIER_CONTRACT_CAPTURE",
+            "MBARRIER_CONTRACT_BARRIERS_PER_CTA",
+        } & set(extra_env)
+        if conflicting_config_keys:
+            raise RuntimeError(
+                "benchmark environment cannot override tracer selection: {0}".format(
+                    ",".join(sorted(conflicting_config_keys))
+                )
+            )
         benchmark_name = argpair.get("benchmark_name", exe)
-        run_name = os.path.join( benchmark_name, common.get_argfoldername( args ) )
+        argument_folder = common.get_argfoldername(args)
+        if warp_lifetime_only:
+            lifetime_kernel = os.getenv("DYNAMIC_KERNEL_LIMIT_START", "all")
+            argument_folder += "-warp-lifetime-k" + lifetime_kernel
+        elif warp_lifetime_sidecar:
+            lifetime_kernel = os.getenv("DYNAMIC_KERNEL_LIMIT_START", "all")
+            argument_folder += "-fulltrace-lifetime-k" + lifetime_kernel
+        argument_folder += lighter_tracer_config.artifact_suffix
+        baseline_argument_folder = argument_folder
+        if mbarrier_contract_capture:
+            argument_folder += "-mbarrier-contract-v2"
+        run_name = os.path.join(benchmark_name, argument_folder)
 
         # MOD. Begin. Improved tracer
         if(options.compressed == "0"):
-            this_run_dir = os.path.abspath(os.path.expandvars(
-                os.path.join(this_directory, "..", "..", "hw_run","traces","device-" + options.device_num, cuda_version, run_name)))
+            trace_version_root = os.path.join(
+                this_directory, "..", "..", "hw_run", "traces",
+                "device-" + options.device_num, cuda_version
+            )
         else:
-            this_run_dir = os.path.abspath(os.path.expandvars(
-                os.path.join(this_directory, traces_root_dir, "hw_run","traces","device-" + options.device_num, cuda_version, run_name)))
+            trace_version_root = os.path.join(
+                this_directory, traces_root_dir, "hw_run", "traces",
+                "device-" + options.device_num, cuda_version
+            )
+        this_run_dir = os.path.abspath(
+            os.path.expandvars(os.path.join(trace_version_root, run_name))
+        )
+        baseline_trace_folder = os.path.abspath(os.path.expandvars(
+            os.path.join(
+                trace_version_root, benchmark_name,
+                baseline_argument_folder, "traces"
+            )
+        ))
+        if (mbarrier_contract_capture
+                and not os.path.isdir(baseline_trace_folder)):
+            raise RuntimeError(
+                "contract capture baseline is missing: {0}".format(
+                    baseline_trace_folder
+                )
+            )
         # MOD. End. Improved tracer
 
         this_trace_folder = os.path.join(this_run_dir, "traces")
-        if not os.path.exists(this_run_dir):
+        if options.force_overwrite:
+            remove_existing_run_dir(this_run_dir, trace_version_root)
+            if trim_spin_enabled:
+                remove_existing_run_dir(
+                    this_run_dir + ".fullrun", trace_version_root
+                )
+        if os.path.exists(this_run_dir):
+            if lighter_tracer_config.features:
+                raise RuntimeError(
+                    "refusing to overwrite existing lighter trace directory: "
+                    "{0}".format(this_run_dir)
+                )
+        else:
             os.makedirs(this_run_dir)
         if not os.path.exists(this_trace_folder):
             os.makedirs(this_trace_folder)
+
+        try:
+            git_sha = subprocess.check_output(
+                ["git", "-C", this_directory, "rev-parse", "HEAD"],
+                universal_newlines=True,
+            ).strip()
+        except (OSError, subprocess.CalledProcessError):
+            git_sha = "unknown"
+        config_manifest = {
+            "requested": lighter_tracer_config.requested,
+            "canonical": lighter_tracer_config.canonical,
+            "features": list(lighter_tracer_config.features),
+            "source": lighter_tracer_config.source,
+            "publish_default": lighter_tracer_config.publish_default,
+            "config_hash": lighter_tracer_config.config_hash,
+            "artifact_suffix": lighter_tracer_config.artifact_suffix,
+            "git_sha": git_sha,
+        }
+        if mbarrier_contract_capture:
+            config_manifest["mbarrier_contract_capture"] = True
+            config_manifest["mbarrier_contract_bounds"] = \
+                contract_capture_bounds
+        with open(
+            os.path.join(this_run_dir, "lighter_tracer_config.json"),
+            "w",
+        ) as manifest_file:
+            json.dump(
+                config_manifest,
+                manifest_file,
+                indent=2,
+                sort_keys=True,
+            )
+            manifest_file.write("\n")
 
         # link the data directory
         try:
@@ -169,6 +650,15 @@ for bench in benchmarks:
         env_exports = ""
         for key, value in extra_env.items():
             env_exports += "export {0}={1}; ".format(key, shlex.quote(str(value)))
+        # Persist the canonical feature set so --norun/manual execution cannot
+        # silently select a different tracer configuration.
+        env_exports += "export LIGHTER_TRACER={0}; ".format(
+            shlex.quote(lighter_tracer_config.canonical)
+        )
+        if mbarrier_contract_capture:
+            env_exports += "export MBARRIER_CONTRACT_CAPTURE=1; "
+            for key, value in sorted(contract_capture_bounds.items()):
+                env_exports += "export {0}={1}; ".format(key, value)
 
         if options.terminate_upon_limit:
             sh_contents += "export TERMINATE_UPON_LIMIT=1; "
@@ -219,6 +709,21 @@ for bench in benchmarks:
             if subprocess.call(["bash","run.sh"]) != 0:
                 sys.exit("Error invoking nvbit on {0}".format(this_run_dir))
             os.chdir(saved_dir)
-            build_tma_descriptor_mapping_if_available(this_trace_folder)
-            build_tma_operand_mapping_if_available(this_trace_folder)
-            build_sync_operand_mapping_if_available(this_trace_folder)
+            if not warp_lifetime_only:
+                build_tma_descriptor_mapping_if_available(this_trace_folder)
+                build_tma_operand_mapping_if_available(this_trace_folder)
+                build_sync_operand_mapping_if_available(this_trace_folder)
+                validate_tma_completion_contracts_if_available(
+                    this_trace_folder
+                )
+            if trim_spin_enabled:
+                spin_trim_run_dir(this_run_dir)
+            if not warp_lifetime_only:
+                build_spin_wait_sidecar(
+                    this_trace_folder,
+                    require_contract_capture=mbarrier_contract_capture,
+                    contract_baseline_traces=(
+                        baseline_trace_folder
+                        if mbarrier_contract_capture else None
+                    ),
+                )

@@ -1345,6 +1345,7 @@ void shader_core_stats::print_remodeling_stats(FILE *fout) {
   // Per-reason no_warps_ready breakdown (for NCU warp-issue stall comparison).
   unsigned long long total_num_cycles_issue_stage_stall_at_least_one_warp_with_fu_occupied = m_gpu-> m_gpu_per_sm_stats.m_stats_map["total_num_cycles_issue_stage_stall_at_least_one_warp_with_fu_occupied"]->get_value();
   unsigned long long total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_inst_barrier = m_gpu-> m_gpu_per_sm_stats.m_stats_map["total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_inst_barrier"]->get_value();
+  unsigned long long total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_mbarrier_spin = m_gpu-> m_gpu_per_sm_stats.m_stats_map["total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_mbarrier_spin"]->get_value();
   unsigned long long total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_tma_flush = m_gpu-> m_gpu_per_sm_stats.m_stats_map["total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_tma_flush"]->get_value();
   unsigned long long total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_yield = m_gpu-> m_gpu_per_sm_stats.m_stats_map["total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_yield"]->get_value();
   unsigned long long total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_stall_count = m_gpu-> m_gpu_per_sm_stats.m_stats_map["total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_stall_count"]->get_value();
@@ -1366,11 +1367,58 @@ void shader_core_stats::print_remodeling_stats(FILE *fout) {
   fprintf(fout, "total_num_next_stage_blocked_by_tensor = %llu\n", m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_next_stage_blocked_by_tensor"]->get_value());
   fprintf(fout, "total_num_next_stage_blocked_by_mem = %llu\n", m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_next_stage_blocked_by_mem"]->get_value());
   fprintf(fout, "total_num_next_stage_blocked_by_other = %llu\n", m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_next_stage_blocked_by_other"]->get_value());
+  fprintf(fout, "total_num_next_stage_blocked_by_sfu = %llu\n", m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_next_stage_blocked_by_sfu"]->get_value());
+  fprintf(fout, "total_num_next_stage_blocked_by_sp_int_dp = %llu\n", m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_next_stage_blocked_by_sp_int_dp"]->get_value());
+  fprintf(fout, "total_num_next_stage_blocked_by_branch_other = %llu\n", m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_next_stage_blocked_by_branch_other"]->get_value());
   fprintf(fout, "total_num_next_stage_notready_wait_barrier = %llu\n", m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_next_stage_notready_wait_barrier"]->get_value());
   fprintf(fout, "total_num_next_stage_notready_scoreboard = %llu\n", m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_next_stage_notready_scoreboard"]->get_value());
   fprintf(fout, "total_num_next_stage_notready_stall_count = %llu\n", m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_next_stage_notready_stall_count"]->get_value());
   fprintf(fout, "total_num_next_stage_notready_yield = %llu\n", m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_next_stage_notready_yield"]->get_value());
   fprintf(fout, "total_num_next_stage_notready_ldgdepbar = %llu\n", m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_next_stage_notready_ldgdepbar"]->get_value());
+  // [Head-of-line lever] root reason the ISSUE_CONTROL latch could not drain (0 unless gate set).
+  fprintf(fout, "total_num_hol_reason_control_allocate_full = %llu\n", m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_hol_reason_control_allocate_full"]->get_value());
+  fprintf(fout, "total_num_hol_reason_fu_cannot_issue = %llu\n", m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_hol_reason_fu_cannot_issue"]->get_value());
+  fprintf(fout, "total_num_hol_reason_read_stage_full = %llu\n", m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_hol_reason_read_stage_full"]->get_value());
+  fprintf(fout, "total_num_hol_reason_rf_conflict = %llu\n", m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_hol_reason_rf_conflict"]->get_value());
+  fprintf(fout, "total_num_hol_reason_fu_latency_full = %llu\n", m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_hol_reason_fu_latency_full"]->get_value());
+  // [intra-SMSP warp-switch] emit the fix-effect counters (0 unless -intra_smsp_warpswitch_enable).
+  // other_warp_issued / sfu_filtered = fraction of fix-fired cycles where the warp-switch recovered a
+  // slot (direct causal proof). See .plan/CONSUMER_COMPUTE_BOUND.md "Fix design".
+  fprintf(fout, "total_num_intra_warpswitch_sfu_filtered = %llu\n", m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_intra_warpswitch_sfu_filtered"]->get_value());
+  fprintf(fout, "total_num_intra_warpswitch_other_warp_issued = %llu\n", m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_intra_warpswitch_other_warp_issued"]->get_value());
+  fprintf(fout, "total_num_intra_warpswitch_still_idle = %llu\n", m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_intra_warpswitch_still_idle"]->get_value());
+  // [MUFU-lockstep probe] emit the gated head-op tallies (0 unless -mufu_lockstep_instrument_enable).
+  // sum_head_mufu / sum_valid_head ~1 => softmax MUFU-lockstep. See .plan/CONSUMER_COMPUTE_BOUND.md "Next axis".
+  fprintf(fout, "total_num_mufu_lockstep_sfu_cycles = %llu\n", m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_mufu_lockstep_sfu_cycles"]->get_value());
+  fprintf(fout, "total_num_mufu_lockstep_sum_head_mufu = %llu\n", m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_mufu_lockstep_sum_head_mufu"]->get_value());
+  fprintf(fout, "total_num_mufu_lockstep_sum_head_tensor = %llu\n", m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_mufu_lockstep_sum_head_tensor"]->get_value());
+  fprintf(fout, "total_num_mufu_lockstep_sum_head_other = %llu\n", m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_mufu_lockstep_sum_head_other"]->get_value());
+  fprintf(fout, "total_num_mufu_lockstep_sum_valid_head = %llu\n", m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_mufu_lockstep_sum_valid_head"]->get_value());
+  fprintf(fout, "total_num_mufu_lockstep_nonsfu_wait_barrier = %llu\n", m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_mufu_lockstep_nonsfu_wait_barrier"]->get_value());
+  fprintf(fout, "total_num_mufu_lockstep_nonsfu_stall_count = %llu\n", m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_mufu_lockstep_nonsfu_stall_count"]->get_value());
+  fprintf(fout, "total_num_mufu_lockstep_nonsfu_scoreboard = %llu\n", m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_mufu_lockstep_nonsfu_scoreboard"]->get_value());
+  // [overlap probe] SFU pipe-active (always on, like tensor) + SM-level tensor||SFU overlap + per-warp
+  // warp-cycle stall breakdown (0 unless -overlap_instrument_enable). See .plan/HW_VS_SIM_SFU.md §5.
+  fprintf(fout, "total_num_cycles_sfu_pipe_active = %llu\n", m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_cycles_sfu_pipe_active"]->get_value());
+  fprintf(fout, "total_num_cycles_overlap_tensor_and_sfu = %llu\n", m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_cycles_overlap_tensor_and_sfu"]->get_value());
+  fprintf(fout, "total_num_cycles_overlap_tensor_only = %llu\n", m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_cycles_overlap_tensor_only"]->get_value());
+  fprintf(fout, "total_num_cycles_overlap_sfu_only = %llu\n", m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_cycles_overlap_sfu_only"]->get_value());
+  fprintf(fout, "total_num_cycles_overlap_neither = %llu\n", m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_cycles_overlap_neither"]->get_value());
+  fprintf(fout, "total_num_warpcyc_stalled_any = %llu\n", m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_warpcyc_stalled_any"]->get_value());
+  fprintf(fout, "total_num_warpcyc_stalled_wait_barrier = %llu\n", m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_warpcyc_stalled_wait_barrier"]->get_value());
+  fprintf(fout, "total_num_warpcyc_stalled_stall_count = %llu\n", m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_warpcyc_stalled_stall_count"]->get_value());
+  fprintf(fout, "total_num_warpcyc_stalled_yield = %llu\n", m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_warpcyc_stalled_yield"]->get_value());
+  fprintf(fout, "total_num_warpcyc_stalled_fu_any = %llu\n", m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_warpcyc_stalled_fu_any"]->get_value());
+  fprintf(fout, "total_num_warpcyc_stalled_fu_tensor = %llu\n", m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_warpcyc_stalled_fu_tensor"]->get_value());
+  fprintf(fout, "total_num_warpcyc_stalled_fu_sfu = %llu\n", m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_warpcyc_stalled_fu_sfu"]->get_value());
+  fprintf(fout, "total_num_warpcyc_stalled_fu_other = %llu\n", m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_warpcyc_stalled_fu_other"]->get_value());
+  fprintf(fout, "total_num_warpcyc_stalled_scoreboard = %llu\n", m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_warpcyc_stalled_scoreboard"]->get_value());
+  // [wait_barrier-kind probe] wait_barrier-stalled warp-cycles split by armed op-class (TENSOR=WGMMA
+  // result recoverable / TMA=producer floor / other). See .plan/HW_VS_SIM_SFU.md §9.
+  fprintf(fout, "total_num_warpcyc_wb_wait_tensor = %llu\n", m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_warpcyc_wb_wait_tensor"]->get_value());
+  fprintf(fout, "total_num_warpcyc_wb_wait_tma = %llu\n", m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_warpcyc_wb_wait_tma"]->get_value());
+  fprintf(fout, "total_num_warpcyc_wb_wait_other = %llu\n", m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_warpcyc_wb_wait_other"]->get_value());
+  fprintf(fout, "total_num_warpcyc_wb_wait_unknown = %llu\n", m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_warpcyc_wb_wait_unknown"]->get_value());
   // [NANOSLEEP spin lever] emit the gated spin counters (0 unless -spin_instrument_enable).
   fprintf(fout, "total_num_cycles_spin_ops_issued = %llu\n", m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_cycles_spin_ops_issued"]->get_value());
   fprintf(fout, "total_num_cycles_spin_won_over_eligible = %llu\n", m_gpu->m_gpu_per_sm_stats.m_stats_map["total_num_cycles_spin_won_over_eligible"]->get_value());
@@ -1484,6 +1532,7 @@ void shader_core_stats::print_remodeling_stats(FILE *fout) {
   // --- no_warps_ready per-reason breakdown (counts) ; grouped TMA vs non-TMA ---
   fprintf(fout, "total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_wait_barrier = %llu\n", total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_wait_barrier);
   fprintf(fout, "total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_inst_barrier = %llu\n", total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_inst_barrier);
+  fprintf(fout, "total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_mbarrier_spin = %llu\n", total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_mbarrier_spin);
   fprintf(fout, "total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_tma_flush = %llu\n", total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_tma_flush);
   fprintf(fout, "total_num_cycles_issue_stage_stall_at_least_one_warp_with_fu_occupied = %llu\n", total_num_cycles_issue_stage_stall_at_least_one_warp_with_fu_occupied);
   fprintf(fout, "total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_stall_count = %llu\n", total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_stall_count);
@@ -1543,6 +1592,7 @@ void shader_core_stats::print_remodeling_stats(FILE *fout) {
     long double denom = total_num_cycles_issue_stage_evaluated ? (long double) total_num_cycles_issue_stage_evaluated : 1;
     unsigned long long tma_axis = total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_wait_barrier
                                 + total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_inst_barrier
+                                + total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_mbarrier_spin
                                 + total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_tma_flush;
     unsigned long long non_tma_axis = total_num_cycles_issue_stage_stall_at_least_one_warp_with_fu_occupied
                                 + total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_stall_count
@@ -1554,6 +1604,7 @@ void shader_core_stats::print_remodeling_stats(FILE *fout) {
     fprintf(fout, "total_percentage_cycles_issue_stage_stall_non_tma_axis = %.4Lf\n", ((long double) non_tma_axis / denom) * 100);
     fprintf(fout, "total_percentage_cycles_issue_stage_stall_at_least_one_warp_waiting_wait_barrier = %.4Lf\n", ((long double) total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_wait_barrier / denom) * 100);
     fprintf(fout, "total_percentage_cycles_issue_stage_stall_at_least_one_warp_waiting_inst_barrier = %.4Lf\n", ((long double) total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_inst_barrier / denom) * 100);
+    fprintf(fout, "total_percentage_cycles_issue_stage_stall_at_least_one_warp_waiting_mbarrier_spin = %.4Lf\n", ((long double) total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_mbarrier_spin / denom) * 100);
     fprintf(fout, "total_percentage_cycles_issue_stage_stall_at_least_one_warp_waiting_tma_flush = %.4Lf\n", ((long double) total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_tma_flush / denom) * 100);
     fprintf(fout, "total_percentage_cycles_issue_stage_stall_at_least_one_warp_with_fu_occupied = %.4Lf\n", ((long double) total_num_cycles_issue_stage_stall_at_least_one_warp_with_fu_occupied / denom) * 100);
     fprintf(fout, "total_percentage_cycles_issue_stage_stall_at_least_one_warp_waiting_stall_count = %.4Lf\n", ((long double) total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_stall_count / denom) * 100);
@@ -1643,7 +1694,8 @@ void shader_core_stats::print_remodeling_stats(FILE *fout) {
     NCU_LINE("warpgroup_arrive",   ncu_wg_arrive);                                                             // NEW (subset of wait_barrier)
     NCU_LINE("long_scoreboard",    ncu_long_sb);                                                               // fold
     NCU_LINE("short_scoreboard",   ncu_short_sb);                                                              // fold
-    NCU_LINE("barrier",            total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_inst_barrier); // MAP
+    NCU_LINE("barrier",            total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_inst_barrier
+                                 + total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_mbarrier_spin); // MAP (mbarrier_spin split kept in same NCU line)
     NCU_LINE("wait",               total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_stall_count);   // MAP
     NCU_LINE("mio_throttle",       total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_result_queue_full); // MAP
     NCU_LINE("math_pipe_throttle", ncu_math_pipe);                                                             // MAP
@@ -4420,79 +4472,87 @@ void barrier_set_t::deallocate_barrier(unsigned cta_id) {
   warp_set_t warps = w->second;
   warp_set_t at_barrier = warps & m_warp_at_barrier;
   warp_set_t active = warps & m_warp_active;
-  // BARDBG: emit a compact CTA-teardown summary on every deallocation, and if any
-  // participant / credit state remains, dump the per-id details even when no warp is
-  // currently parked at the barrier. This catches participant-only leaks that would
-  // otherwise bypass the older at_barrier.any() debug condition.
-  if (m_shader->get_config()->bar_debug_enable) {
-    unsigned leaked_ids = 0;
-    unsigned leaked_participant_warps = 0;
-    unsigned leaked_arv_seen = 0;
-    unsigned leaked_defer_sync_extra_credits = 0;
-    std::ostringstream oss;
-    const unsigned long long cycle =
-        m_shader->get_gpu()->gpu_tot_sim_cycle +
-        m_shader->get_gpu()->gpu_sim_cycle;
-    for (unsigned i = 0; i < m_max_barriers_per_cta; i++) {
-      warp_set_t participant_i = warps & m_bar_id_to_warps[i];
-      warp_set_t arrive_i = warps & m_bar_id_to_arrive_credited_warps[i];
-      warp_set_t sync_i = warps & m_bar_id_to_sync_credited_warps[i];
-      if (participant_i.any() || arrive_i.any() || sync_i.any()) {
-        ++leaked_ids;
-        leaked_participant_warps += participant_i.count();
-        leaked_arv_seen += arrive_i.count();
-        leaked_defer_sync_extra_credits += sync_i.count();
-        // DIAG (B7): requested bar_count for this (cta,bar_id), and the arrived credit count
-        // (participants + extra deferred-sync credits) the same way warp_reaches_barrier
-        // computes it. This shows, at the leak, whether the cohort was BELOW its threshold
-        // (true closing-credit-exited leak) vs. AT/ABOVE it (an accounting/ordering bug),
-        // and whether the strict `==active` release was blocked by NON-participant warps.
-        int requested = -2;  // -2 == never recorded this epoch
-        auto cta_it = m_bar_id_to_count_diag.find(cta_id);
-        if (cta_it != m_bar_id_to_count_diag.end()) {
-          auto id_it = cta_it->second.find(i);
-          if (id_it != cta_it->second.end()) requested = (int)id_it->second;
-        }
-        unsigned arrived_credits = participant_i.count() + sync_i.count();
-        oss << "[BARDBG][leak]   bar_id=" << i
-            << " requested_count=" << requested
-            << " arrived_credits=" << arrived_credits
-            << " (warps*32=" << (participant_i.count() * m_warp_size)
-            << ", credits*32=" << (arrived_credits * m_warp_size) << ")"
-            << " participant_warps=" << participant_i.to_string()
-            << " arv_seen=" << arrive_i.count()
-            << " defer_sync_extra_credits=" << sync_i.count()
-            << " parked_here=" << (participant_i & m_warp_at_barrier).to_string()
-            << " active_eq_participant="
-            << ((participant_i == active) ? 1 : 0) << "\n";
+  unsigned leaked_ids = 0;
+  unsigned leaked_participant_warps = 0;
+  unsigned leaked_arv_seen = 0;
+  unsigned leaked_defer_sync_extra_credits = 0;
+  std::ostringstream leak_details;
+  const unsigned long long cycle =
+      m_shader->get_gpu()->gpu_tot_sim_cycle +
+      m_shader->get_gpu()->gpu_sim_cycle;
+  for (unsigned i = 0; i < m_max_barriers_per_cta; i++) {
+    warp_set_t participant_i = warps & m_bar_id_to_warps[i];
+    warp_set_t arrive_i = warps & m_bar_id_to_arrive_credited_warps[i];
+    warp_set_t sync_i = warps & m_bar_id_to_sync_credited_warps[i];
+    if (participant_i.any() || arrive_i.any() || sync_i.any()) {
+      ++leaked_ids;
+      leaked_participant_warps += participant_i.count();
+      leaked_arv_seen += arrive_i.count();
+      leaked_defer_sync_extra_credits += sync_i.count();
+      int requested = -2;
+      auto cta_it = m_bar_id_to_count_diag.find(cta_id);
+      if (cta_it != m_bar_id_to_count_diag.end()) {
+        auto id_it = cta_it->second.find(i);
+        if (id_it != cta_it->second.end()) requested = (int)id_it->second;
       }
-    }
-    std::cerr << "[BARDBG][summary] cta_id=" << cta_id
-              << " cycle=" << cycle
-              << " active=" << active.to_string()
-              << " parked=" << at_barrier.to_string()
-              << " leaked_ids=" << leaked_ids
-              << " leaked_participant_warps=" << leaked_participant_warps
-              << " leaked_arv_seen=" << leaked_arv_seen
-              << " leaked_defer_sync_extra_credits="
-              << leaked_defer_sync_extra_credits << "\n";
-    if (leaked_ids > 0) {
-      std::cerr << oss.str();
+      unsigned arrived_credits = participant_i.count() + sync_i.count();
+      leak_details << "[BARDBG][leak]   bar_id=" << i
+                   << " requested_count=" << requested
+                   << " arrived_credits=" << arrived_credits
+                   << " (warps*32="
+                   << (participant_i.count() * m_warp_size)
+                   << ", credits*32="
+                   << (arrived_credits * m_warp_size) << ")"
+                   << " participant_warps=" << participant_i.to_string()
+                   << " arv_seen=" << arrive_i.count()
+                   << " defer_sync_extra_credits=" << sync_i.count()
+                   << " parked_here="
+                   << (participant_i & m_warp_at_barrier).to_string()
+                   << " active_eq_participant="
+                   << ((participant_i == active) ? 1 : 0) << "\n";
     }
   }
-  assert(at_barrier.any() == false);  // no warps stuck at barrier
-  assert(active.any() == false);  // no warps in CTA still running
+  const bool leaked =
+      at_barrier.any() || active.any() || leaked_ids != 0;
+  if (m_shader->get_config()->bar_debug_enable || leaked) {
+    std::ostringstream summary_record;
+    summary_record << "[BARDBG][summary] cta_id=" << cta_id
+                   << " cycle=" << cycle
+                   << " active=" << active.to_string()
+                   << " parked=" << at_barrier.to_string()
+                   << " leaked_ids=" << leaked_ids
+                   << " leaked_participant_warps="
+                   << leaked_participant_warps
+                   << " leaked_arv_seen=" << leaked_arv_seen
+                   << " leaked_defer_sync_extra_credits="
+                   << leaked_defer_sync_extra_credits;
+    const std::string summary_message = summary_record.str();
+    fprintf(stderr, "%s\n", summary_message.c_str());
+    if (leaked_ids > 0) {
+      const std::string leak_messages = leak_details.str();
+      fprintf(stderr, "%s", leak_messages.c_str());
+    }
+  }
+  if (leaked) {
+    std::ostringstream abort_record;
+    abort_record << "[BARDBG][abort] reason=cta-cleanup-with-active-state"
+                 << " cta_id=" << cta_id << " cycle=" << cycle
+                 << " active_warps=" << active.count()
+                 << " parked_warps=" << at_barrier.count()
+                 << " leaked_ids=" << leaked_ids
+                 << " leaked_participant_warps="
+                 << leaked_participant_warps
+                 << " leaked_arv_seen=" << leaked_arv_seen
+                 << " leaked_defer_sync_extra_credits="
+                 << leaked_defer_sync_extra_credits;
+    const std::string abort_message = abort_record.str();
+    fprintf(stderr, "%s\n", abort_message.c_str());
+    abort();
+  }
   m_warp_active &= ~warps;
   m_warp_at_barrier &= ~warps;
 
   for (unsigned i = 0; i < m_max_barriers_per_cta; i++) {
-    warp_set_t at_a_specific_barrier = warps & m_bar_id_to_warps[i];
-    assert(at_a_specific_barrier.any() == false);  // no warps stuck at barrier
-    warp_set_t arrive_credited =
-        warps & m_bar_id_to_arrive_credited_warps[i];
-    assert(arrive_credited.any() == false);
-    warp_set_t sync_credited = warps & m_bar_id_to_sync_credited_warps[i];
-    assert(sync_credited.any() == false);
     m_bar_id_to_warps[i] &= ~warps;
     m_bar_id_to_arrive_credited_warps[i] &= ~warps;
     m_bar_id_to_sync_credited_warps[i] &= ~warps;

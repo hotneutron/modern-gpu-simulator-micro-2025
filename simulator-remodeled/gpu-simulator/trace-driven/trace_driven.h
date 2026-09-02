@@ -58,6 +58,7 @@
 #include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <set>
 
 #ifndef TRACE_DRIVEN_H
 #define TRACE_DRIVEN_H
@@ -91,6 +92,13 @@ class trace_function_info : public function_info {
   ~trace_function_info() override {}
 };
 
+enum class WaitBlockTraceOrigin {
+  CANONICAL,
+  PARTIAL_SIBLING_JOIN,
+  PARTIAL_BLOCKED_REPLAY,
+  SYNTHETIC,
+};
+
 class trace_warp_inst_t : public warp_inst_t {
  public:
   trace_warp_inst_t() {
@@ -111,9 +119,24 @@ class trace_warp_inst_t : public warp_inst_t {
       traced_execution &static_trace_info);
       
   bool is_s2r() { return m_opcode == OP_S2R; }
+  WaitBlockTraceOrigin wait_block_trace_origin =
+      WaitBlockTraceOrigin::CANONICAL;
+  // [WaitBlock partial replay] When this instruction was decoded from a
+  // reserved replay occurrence, the index of that occurrence in the warp's
+  // replay stream. Used by commit_trace_inst to enforce exact-once, in-order
+  // (FIFO) issue. Meaningful only when wait_block_trace_origin is a replay
+  // origin (not CANONICAL or SYNTHETIC).
+  unsigned int replay_occurrence_index = 0;
 
  private:
   unsigned m_opcode;
+};
+
+struct PartialTraceExtractStats {
+  unsigned int cursor_before = 0;
+  unsigned int cursor_after = 0;
+  unsigned int blocked_occurrences = 0;
+  unsigned int sibling_join_occurrences = 0;
 };
 
 class trace_kernel_info_t : public kernel_info_t {
@@ -248,8 +271,70 @@ class trace_shd_warp_t : public shd_warp_t {
   std::vector<address_type> traced_pcs;
   unsigned int used_insts;
   trace_warp_inst_t *get_next_trace_inst(address_type pc); // MOD. VPREG
+  // [WaitBlock partial replay] Reservation-indexed decode. When the IBuffer
+  // slot was allocated against a replay occurrence, decode the exact reserved
+  // occurrence (is_replay=true, replay_index, replay_epoch) instead of the
+  // global decode head. This keeps slot<->occurrence identity stable under
+  // out-of-order instruction-cache fills. A canonical slot (is_replay=false)
+  // falls back to the ordinary pc-keyed path.
+  trace_warp_inst_t *get_next_trace_inst(address_type pc, bool is_replay,
+                                         unsigned int replay_index,
+                                         uint64_t replay_epoch);
   void decrement_trace_pc(); // MOD. VPREG
   void decrease_num_used_inst(address_type pc);
+  void rollback_trace_inst(const trace_warp_inst_t *inst);
+  void commit_trace_inst(const trace_warp_inst_t *inst);
+  bool extract_partial_wait_capsule(
+      uint64_t blocked_mask, uint64_t sibling_mask, uint64_t live_mask,
+      unsigned int unique_function_id,
+      address_type captured_ready_pc, address_type join_pc,
+      address_type post_join_pc, PartialTraceExtractStats *out_stats,
+      std::string *failure_reason);
+  bool activate_partial_blocked_replay();
+  unsigned int skip_partial_replay_to_exit(
+      address_type exit_pc, address_type loopback_bra_pc,
+      const std::set<address_type> &allowed_skip_pcs,
+      struct FoldSkipStats *out_stats);
+  bool partial_replay_active() const;
+  bool partial_blocked_replay_pending() const;
+  bool partial_capsule_active() const;
+  WaitBlockTraceOrigin partial_replay_origin() const;
+  unsigned int partial_replay_remaining() const;
+  unsigned int partial_deferred_size() const;
+  address_type canonical_trace_pc() const;
+  // [WaitBlock partial replay] Fetch-time reservation API. When a replay stream
+  // is active and has unreserved occurrences, reserve the next one and return
+  // its PC, occurrence index, and stream epoch through the out-params so the
+  // IBuffer slot can bind to it. Returns false when no replay reservation is
+  // available (caller then uses the canonical sequential fetch PC).
+  bool reserve_next_partial_replay(address_type *pc_out,
+                                   unsigned int *index_out,
+                                   uint64_t *epoch_out);
+  // [WaitBlock partial replay] Undo exactly one (the most recent) replay
+  // reservation. Called per-removed-entry by the IBuffer flush and once by
+  // remove_entry after a RESERVATION_FAIL, so an un-fetched occurrence is
+  // re-reserved on the next fetch. The in-flight (already pop_front'd but not
+  // yet committed) occurrence is never un-reserved.
+  void unreserve_last_partial_replay();
+  uint64_t partial_replay_epoch() const;
+  void clear_partial_wait_capsule();
+  // [Spin-wait fold] Forward analogue of get_next_trace_inst's cursor
+  // bookkeeping: advance both used_insts and each skipped pc's per-occurrence
+  // counter until traced_pcs[used_insts] == exit_pc, WITHOUT issuing the skipped
+  // instructions. Lands the cursor AT exit_pc (so the exit BRA issues normally).
+  // Returns the number of skipped instructions. Only used by the fold path;
+  // see .plan/SPIN_WAIT_SIM_MODELING.md 4b.
+  //
+  // [Stage 1.4] Semantic guard: allowed_skip_pcs is body_pcs + loopback_bra_pc.
+  // Before advancing over any occurrence the guard asserts (a) the current PC is
+  // in allowed_skip_pcs, (b) the PC has a live trace occurrence, and (c) the
+  // occurrence's opcode/sync class carries no semantic/local-memory/HGMMA/MUFU/
+  // TMA/BAR work. Any violation emits [FOLDSKIP_AUDIT] and aborts. The per-class
+  // breakdown of what was skipped is returned in *out_stats when non-null.
+  unsigned int skip_spin_to_exit(address_type exit_pc,
+                                 address_type loopback_bra_pc,
+                                 const std::set<address_type> &allowed_skip_pcs,
+                                 struct FoldSkipStats *out_stats);
   void clear();
   bool trace_done();
   address_type get_start_trace_pc();
@@ -260,6 +345,23 @@ class trace_shd_warp_t : public shd_warp_t {
   }
 
  private:
+  std::vector<inst_trace_t> m_partial_replay;
+  std::vector<inst_trace_t> m_partial_deferred;
+  unsigned int m_partial_replay_issued = 0;
+  // [WaitBlock partial replay] Fetch-time reservation cursor and stream epoch.
+  // m_partial_replay_reserved is the number of replay occurrences already bound
+  // to an IBuffer slot; it satisfies
+  //   0 <= issued <= reserved <= size.
+  // Decode does not use a separate decoded cursor: each IBuffer slot carries the
+  // exact reserved occurrence index, so decode is reservation-indexed and safe
+  // under out-of-order instruction-cache fills.
+  // m_partial_replay_epoch changes whenever a replay stream is activated,
+  // drained, or replaced, so a stale instruction-cache response carrying an
+  // older epoch cannot fill a slot in a newer stream.
+  unsigned int m_partial_replay_reserved = 0;
+  uint64_t m_partial_replay_epoch = 0;
+  WaitBlockTraceOrigin m_partial_replay_origin =
+      WaitBlockTraceOrigin::CANONICAL;
   trace_kernel_info_t *m_kernel_info;
 };
 

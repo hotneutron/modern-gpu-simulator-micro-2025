@@ -910,13 +910,36 @@ class gpgpu_sim : public gpgpu_t {
   }
 
   void parse_extra_trace_info(std::string filepath, bool is_extra_trace_enabled); // MOD. Improved tracer
-  bool lookup_tma_site_metadata(unsigned int unique_function_id, address_type pc,
+  bool lookup_tma_site_metadata(unsigned int trace_kernel_id,
+                                unsigned int unique_function_id, address_type pc,
                                 TMAResolvedSiteMetadata &metadata) const;
-  bool lookup_tma_base_record(unsigned int unique_function_id, address_type pc,
+  bool lookup_tma_base_record(unsigned int trace_kernel_id,
+                              unsigned int unique_function_id, address_type pc,
                               TMABaseRecord &record) const;
   bool lookup_sync_site_metadata(unsigned int unique_function_id,
                                  address_type pc,
                                  SyncResolvedSiteMetadata &metadata) const;
+
+  // Runtime action lookups. WaitBlock v5 uses kernel-aware keys; the legacy
+  // observe-only loader ignores trace_kernel_id and retains its (funcid, pc)
+  // key when spin-wait observation is enabled without the v5 runtime.
+  bool lookup_spin_wait_region(unsigned int trace_kernel_id,
+                               unsigned int unique_function_id, address_type pc,
+                               SpinWaitRegionRecord &region) const;
+  bool lookup_missing_wait(unsigned int trace_kernel_id,
+                           unsigned int unique_function_id, address_type pc,
+                           MissingWaitRecord &record) const;
+  bool lookup_wait_block_generation_ticket(
+      const WaitBlockGenerationTicketKey &key,
+      WaitBlockGenerationTicket &ticket) const;
+  bool lookup_partial_wait_join(unsigned int trace_kernel_id,
+                                unsigned int unique_function_id,
+                                address_type pc,
+                                PartialWaitRegionRecord &region) const;
+  bool lookup_partial_wait_post_join(unsigned int trace_kernel_id,
+                                     unsigned int unique_function_id,
+                                     address_type pc,
+                                     PartialWaitRegionRecord &region) const;
 
   void record_l1i_prefetch_miss_observation(new_addr_type block_addr,
                                             unsigned int unique_function_id,
@@ -969,6 +992,9 @@ class gpgpu_sim : public gpgpu_t {
   void reset_cycless_access_history();
   void gather_gpu_per_sm_single_stat(std::string stat_name);
   void reset_gpu_per_sm_stats();
+  // [SR-M0A] Kernel-boundary driver: fold every SM's stall-reason-align totals
+  // and print the report. No-op unless the instrument gate is on.
+  void report_stall_reason_align_stats();
   // clocks
   void reinit_clock_domains(void);
   int next_clock_domain(void);
@@ -995,6 +1021,8 @@ class gpgpu_sim : public gpgpu_t {
   traced_execution m_extra_trace_info;  // MOD. Improved tracer
   TMASidecarMetadataDB m_tma_sidecar_db;
   SyncSidecarMetadataDB m_sync_sidecar_db;
+  SpinWaitSidecarDB m_spin_wait_sidecar_db;
+  WaitBlockSidecarDB m_wait_block_sidecar_db;
   std::map<new_addr_type, unsigned long long> m_l1i_prefetch_miss_block_histogram;
   std::map<new_addr_type, unsigned int> m_l1i_prefetch_miss_block_unique_function_id;
   std::map<unsigned int, unsigned long long> m_l1i_prefetch_miss_set_histogram;
@@ -1068,6 +1096,14 @@ class gpgpu_sim : public gpgpu_t {
   unsigned long long gpu_tot_sim_insn;
   unsigned long long gpu_sim_insn_last_update;
   unsigned gpu_sim_insn_last_update_sid;
+  // [TRIMCHK] Always-on producer-spin issue accounting (no flag required), so a
+  // long run can be verified to have consumed a spin-trimmed trace and that the
+  // producer over-spin actually dropped. Counts spin ops (PHASECHK/TRYWAIT,
+  // NANOSLEEP) ISSUED by the simulator this kernel. Full run issues ~48-86x more
+  // than a trimmed run. Reset per kernel in gpu_print_stat after emission.
+  unsigned long long trimchk_spin_phasechk_issued = 0;
+  unsigned long long trimchk_spin_nanosleep_issued = 0;
+  unsigned long long trimchk_spin_branch_issued = 0;
   occupancy_stats gpu_occupancy;
   occupancy_stats gpu_tot_occupancy;
 

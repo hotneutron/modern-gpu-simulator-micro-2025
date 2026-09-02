@@ -34,11 +34,12 @@
 #include <queue>
 #include <set>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 #include <stack>
-#include <deque>
 #include <memory>
 #include "ldst_unit_sm.h"
+#include "tma_types.h"
 
 #include "../shader_core_wrapper.h"
 #include "../shader.h"
@@ -241,6 +242,28 @@ class SM : public core_t, public shader_core_ctx_wrapper {
   bool ldst_unit_response_buffer_full() const override;
   bool are_all_wait_barrier_ready(unsigned int warp_id);
   bool warp_waiting_at_barrier(unsigned warp_id) const override;
+  // WaitBlock-only non-mutating hold predicate for legacy stall metrics. Named
+  // BAR state is excluded; the implementation delegates to the authoritative
+  // peek_wait_block_hold_mode query.
+  bool warp_held_on_mbarrier_wait(unsigned warp_id) const;
+  // Once-per-warp-per-cycle authoritative release service. All-live
+  // missing-wait holds only clear pending state; partial holds activate or
+  // resume their owned replay stream; captured-poll holds fold residual loop
+  // occurrences to their exact local exit.
+  void service_wait_block_releases_for_cycle();
+  void service_wait_block_release(unsigned warp_id);
+  // [Stage 1] Common cursor-skip used by BOTH the parked-release and the
+  // immediate-ready fold paths so their skip semantics can never diverge again.
+  // Responsibility is deliberately narrow: flush younger IBuffer entries, build
+  // the allowed-skip PC set (region.body_pcs + loopback_bra_pc), advance the
+  // trace cursor to region.exit_pc via skip_spin_to_exit (which asserts the
+  // post-skip get_pc()==exit_pc and the no-real-work guard), and return the
+  // skipped count plus phase-aware cursor/rollback and per-class statistics.
+  // It does NOT touch generation bookkeeping, pending-wait state, counters,
+  // hold duration, or histograms; those stay owned by each caller.
+  unsigned fold_cursor_skip_to_exit(unsigned warp_id,
+                                    const SpinWaitRegionRecord &region,
+                                    FoldSkipStats &out_stats);
   bool check_if_non_released_reduction_barrier(warp_inst_t &inst);
   bool warp_waiting_at_mem_barrier(unsigned warp_id) override;
   // True when `pI` is a UTMACMDFLUSH (cp.async.bulk.wait_group 0) and the
@@ -248,6 +271,25 @@ class SM : public core_t, public shader_core_ctx_wrapper {
   // stall (warp-local drain-all) until all its store/reduce transfers complete.
   bool warp_waiting_at_tma_flush(unsigned warp_id, const warp_inst_t *pI);
   bool warp_waiting_grid_barrier(unsigned warp_id) override;
+  // [SR-M0A] Pure, non-mutating wait-state queries used only by the stall-reason
+  // alignment snapshot. None of them clear a barrier/membar, insert/erase a
+  // wait-set entry, invalidate a cache, update a watchdog map, or emit a log.
+  // See .plan/STALL_REASON_ALIGN.md Stage SR-M0A.6.
+  //
+  // peek_wait_block_hold_mode inspects ONLY the pending WaitBlock state
+  // (m_pending_sync_waits) and returns NONE when no unresolved hold exists.
+  // It deliberately does NOT consult the programmer/named-barrier set.
+  WaitBlockPendingMode peek_wait_block_hold_mode(unsigned warp_id) const;
+  // Named/programmer barrier hold only (m_barriers), no mbarrier fold state.
+  bool peek_named_barrier_wait(unsigned warp_id) const;
+  // Scope-aware fence drain condition, observed without clearing the membar,
+  // invalidating L1, or touching the stuck-watchdog maps.
+  bool peek_membar_wait(unsigned warp_id) const;
+  // Grid-barrier flag only.
+  bool peek_grid_barrier_wait(unsigned warp_id) const;
+  // UTMACMDFLUSH with outstanding store-class TMA transfers, without touching
+  // m_warps_waiting_tma_flush or emitting an episode log.
+  bool peek_tma_flush_wait(unsigned warp_id, const warp_inst_t *inst) const;
   void clear_gridbar(unsigned int kernel_id);
   void broadcast_barrier_reduction(unsigned cta_id, unsigned bar_id,
                                    warp_set_t warps);
@@ -352,28 +394,73 @@ class SM : public core_t, public shader_core_ctx_wrapper {
   void gather_gpu_per_sm_stats(Element_stats &all_stats, coalescingStatsAcrossSms& coal_stats_l1d, coalescingStatsAcrossSms& coal_stats_const, coalescingStatsAcrossSms& coal_stats_sharedmem) override;
   void gather_gpu_per_sm_single_stat(Element_stats &all_stats, std::string stat_name) override;
 
+  // [SR-M0A] Fold every resident Subcore's stall-reason-align totals into dst
+  // (additive) and reset them. Boundary-only; gated by the caller.
+  void gather_stall_reason_align_stats(Subcore::StallPopulationTotals &dst) const;
+  void reset_stall_reason_align_stats();
+
   void increment_sm_stat_by_integer(std::string stat_name, int val_to_increment) override;
   
   bool is_using_interwarp_coal_warps_waiting_dep_counter();
   void enqueue_instruction_region_prewarm(kernel_info_t &kernel);
   void issue_pending_instruction_region_prewarm();
   void handle_sync_instruction(warp_inst_t &inst, unsigned int warp_id);
+  void handle_partial_wait_instruction_issue(const warp_inst_t &inst,
+                                              unsigned int warp_id);
+  void start_partial_wait_hold(unsigned int warp_id,
+                               HopperPartialWaitArm &arm);
+  void note_partial_replay_progress(unsigned int warp_id,
+                                    unsigned int remaining,
+                                    uint64_t pc,
+                                    unsigned int advanced_occurrences);
+  void service_partial_replay_progress(unsigned int warp_id);
   HopperMBarrierKey build_sync_barrier_key(const warp_inst_t &inst,
                                            unsigned int warp_id) const;
   HopperMBarrierObject &get_or_create_sync_barrier(
       const HopperMBarrierKey &key);
   void recompute_sync_barrier_ready_and_maybe_flip_phase(
-      HopperMBarrierObject &barrier, uint64_t barrier_addr);
+      const HopperMBarrierKey &key, HopperMBarrierObject &barrier);
   bool is_sync_wait_satisfied(
       const HopperMBarrierPendingWait &pending_wait) const;
+  bool is_wait_block_pending_satisfied(
+      const HopperMBarrierPendingWait &pending_wait) const;
+  bool is_wait_block_pending_satisfied_at_cycle_start(
+      const HopperMBarrierPendingWait &pending_wait) const;
+  // Pin a modeled wait to the current generation when already ready, or to the
+  // next generation when not ready. Release audits this absolute generation,
+  // not only parity, so an overshoot cannot be mistaken for a valid release.
+  uint64_t expected_gen_for_wait(unsigned int warp_id,
+                                 const HopperMBarrierKey &key,
+                                 uint64_t wait_state_raw) const;
+  // Current monotonic generation of a barrier (0 if the object does not exist).
+  uint64_t sync_barrier_gen(const HopperMBarrierKey &key) const;
   void clear_sync_barrier_state_for_cta(unsigned int cta_id);
-  void bind_tma_completion_to_sync_barrier(unsigned int warp_id,
-                                           const HopperMBarrierKey &key,
-                                           uint32_t tx_bytes);
-  void notify_tma_completion(unsigned int warp_id, uint32_t completed_tx_bytes);
+  void open_tma_assignment_contract(const warp_inst_t &inst,
+                                    unsigned int warp_id,
+                                    const HopperMBarrierKey &key,
+                                    uint32_t expected_tx_bytes);
+  void record_wait_block_first_late_arrival(
+      const warp_inst_t &inst, unsigned int warp_id,
+      const HopperMBarrierKey &key, uint64_t target_generation,
+      uint64_t current_generation, WaitBlockPendingMode mode);
+  void claim_tma_completion_target(const warp_inst_t &inst, TMACommand &cmd);
+  void complete_tma_load(TmaCompletionTarget &target, uint32_t memory_bytes,
+                         uint64_t transfer_uid);
+  void debug_dump_tma_binding_snapshot(const char *reason) const;
+  void debug_dump_tma_binding_counters() const;
   void debug_log_sync_event(const std::string &message);
   void debug_log_tma_event(const std::string &message);
+  void debug_log_tma_binding_event(const char *event,
+                                   const std::string &message);
+  void debug_log_wait_block_event(const char *event,
+                                  const std::string &message);
   void debug_dump_sync_counters() const;
+  void assert_wait_block_lifecycle_drained(const char *reason);
+  void reset_wait_block_launch_state(uint64_t launch_uid);
+  void record_wait_block_timing_issue(unsigned int warp_id,
+                                      const warp_inst_t *inst);
+  void accumulate_wait_block_stall_progress(
+      unsigned int warp_id, const WaitBlockWarpProgress &delta);
 
   InterWarp_Coalescing_Waiting_Dep_Counters *m_interwarp_coal_warps_waiting_dep_counter;
 
@@ -431,13 +518,58 @@ class SM : public core_t, public shader_core_ctx_wrapper {
   barrier_set_t m_barriers;
   std::map<HopperMBarrierKey, HopperMBarrierObject> m_hopper_mbarriers;
   mutable std::vector<HopperMBarrierPendingWait> m_pending_sync_waits;
-  std::vector<std::deque<HopperMBarrierPendingTxBinding>>
-      m_pending_tma_barrier_binds_per_warp;
+  std::vector<HopperPartialWaitArm> m_partial_wait_arms;
+  std::vector<HopperPartialReplayProgress> m_partial_replay_progress;
+  std::vector<std::set<std::string>> m_partial_joined_regions;
+  bool m_wait_block_release_snapshot_valid = false;
+  uint64_t m_wait_block_release_snapshot_cycle = ~0ull;
+  std::vector<uint64_t> m_wait_block_last_service_cycle_by_warp;
+  unsigned long long m_wait_block_release_phase_cycles_total = 0;
+  unsigned long long m_wait_block_release_service_visits_total = 0;
+  std::vector<uint32_t> m_tma_open_contracts_per_warp;
+  std::vector<uint32_t> m_tma_outstanding_bindings_per_warp;
+  std::vector<uint64_t> m_tma_max_completed_transfer_uid_per_warp;
+  struct WaitBlockSemanticAnchor {
+    bool valid = false;
+    uint64_t cycle = 0;
+    uint32_t trace_kernel_id = 0;
+    uint32_t unique_function_id = 0;
+    uint32_t cta_warp_id = 0;
+    uint64_t pc = 0;
+    uint64_t source_index = 0;
+    std::string opcode;
+  };
+  std::vector<WaitBlockSemanticAnchor>
+      m_wait_block_last_semantic_anchor_by_warp;
+  std::vector<WaitBlockWarpProgress>
+      m_wait_block_stall_progress_by_warp;
+  bool m_wait_block_first_late_reported_by_cta_slot[MAX_CTA_PER_SHADER] = {
+      false};
+  uint64_t m_next_tma_contract_id = 1;
+  uint64_t m_next_tma_binding_id = 1;
+  uint64_t m_tma_binding_launch_uid = 0;
+  uint64_t m_tma_contracts_opened = 0;
+  uint64_t m_tma_contracts_fully_assigned = 0;
+  uint32_t m_tma_max_open_contracts_per_warp = 0;
+  uint64_t m_tma_bindings_created = 0;
+  uint64_t m_tma_bindings_completed = 0;
+  uint64_t m_tma_assigned_credit_bytes = 0;
+  uint64_t m_tma_completed_credit_bytes = 0;
+  uint64_t m_tma_uid_reorders = 0;
+  uint64_t m_tma_cross_barrier_applications = 0;
+  uint64_t m_tma_contract_mismatches = 0;
+  uint64_t m_tma_stale_generation = 0;
+  uint64_t m_tma_launch_or_cta_mismatch = 0;
+  uint64_t m_tma_duplicate_completion = 0;
+  uint64_t m_tma_orphan_cleanup = 0;
+  uint64_t m_wait_block_launch_uid = 0;
   // Initialized from shader_core_config in SM::SM(); 0 disables logging.
   uint64_t m_sync_debug_print_budget = 0;
   uint64_t m_sync_debug_skip_runtime_budget = 0;
   // Independent budget for TMA-only stderr logs (TMADBG); 0 disables.
   uint64_t m_tma_debug_print_budget = 0;
+  // Independent budget for WaitBlock event logs; 0 disables.
+  uint64_t m_wait_block_debug_print_budget = 0;
   uint64_t m_sync_debug_sync_insts = 0;
   uint64_t m_sync_debug_exch = 0;
   uint64_t m_sync_debug_arrive = 0;
@@ -537,6 +669,141 @@ class SM : public core_t, public shader_core_ctx_wrapper {
   address_type m_sync_first_miss_barrier[MAX_WARP_PER_SHADER] = {0};
   unsigned long long m_sync_first_miss_cycle[MAX_WARP_PER_SHADER] = {0};
   unsigned long long m_sync_wait_cycle_hist[6] = {0};
+  // [Producer-tail probe] CTA-cycle and producer-issue decomposition after all
+  // consumer-role warps have drained. PHASECHK ready/not-ready is sampled from
+  // the existing Hopper mbarrier state machine at execution; no state is changed.
+  struct ProducerTailCounters {
+    unsigned long long start_cycle = 0;
+    unsigned long long cycles = 0;
+    unsigned long long issued = 0;
+    unsigned long long issued_phasechk = 0;
+    unsigned long long issued_nanosleep = 0;
+    unsigned long long issued_branch = 0;
+    unsigned long long issued_tma = 0;
+    unsigned long long issued_other = 0;
+    unsigned long long phasechk_ready = 0;
+    unsigned long long phasechk_not_ready = 0;
+    unsigned long long last_producer_issue_cycle = 0;
+    unsigned long long stall_cycles = 0;
+    unsigned long long stall_not_selected = 0;
+    unsigned long long stall_next_stage = 0;
+    unsigned long long stall_issue_port = 0;
+    unsigned long long stall_no_valid = 0;
+    unsigned long long stall_wait_barrier = 0;
+    unsigned long long stall_stall_count = 0;
+    unsigned long long stall_fu_occupied = 0;
+    unsigned long long stall_inst_barrier = 0;
+    unsigned long long stall_tma_flush = 0;
+    unsigned long long stall_scoreboard = 0;
+    unsigned long long stall_l1c = 0;
+    unsigned long long stall_result_queue = 0;
+    unsigned long long stall_yield = 0;
+    unsigned long long stall_unattributed = 0;
+  };
+  ProducerTailCounters m_producer_tail_by_cta_slot[MAX_CTA_PER_SHADER];
+
+  // [Producer-spin ready-retry probe] Whole-producer-lifetime spin accounting,
+  // NOT gated by consumer drain. Sizes captured excess polling for fwd AND bwd
+  // (bwd spin is spread across the main loop, so the tail-only probe misses it).
+  // All fields are read-only samples of the existing Hopper mbarrier result.
+  struct ProducerSpinCounters {
+    unsigned long long phasechk_total = 0;       // all PHASECHK/TRYWAIT by producers
+    unsigned long long phasechk_ready = 0;       // mbarrier already satisfied at test
+    unsigned long long phasechk_not_ready = 0;   // mbarrier not yet satisfied
+    unsigned long long issued_phasechk = 0;      // PHASECHK/TRYWAIT issued
+    unsigned long long issued_nanosleep = 0;     // NANOSLEEP issued
+    unsigned long long issued_branch = 0;        // BRA issued
+    unsigned long long issued_other = 0;         // any other producer op
+    // Consecutive-ready run tracking: a maximal run of back-to-back ready
+    // PHASECHK on one warp with no intervening not-ready is "redundant re-poll".
+    unsigned long long ready_run_retries = 0;    // ready tests beyond the 1st in a run
+  };
+  ProducerSpinCounters m_producer_spin_by_cta_slot[MAX_CTA_PER_SHADER];
+  // Per-warp last-PHASECHK-was-ready flag, for consecutive-ready run detection.
+  bool m_producer_spin_prev_ready[MAX_WARP_PER_SHADER] = {false};
+  bool m_producer_spin_in_ready_run[MAX_WARP_PER_SHADER] = {false};
+
+  // [Spin-wait observe] Observe-only measurement of the would-be park time if the
+  // producer spin-wait fold feature were enabled. For each (warp,region)
+  // episode we remember the cycle of the FIRST not-ready poll and, when the same
+  // warp next polls the same region ready, bucket the elapsed cycles PER REGION
+  // (keyed by primary_wait_pc). This never changes control flow; it only sizes
+  // park latency, attributes it to a specific spin region, and flags never-flip
+  // barriers via a deadlock watchdog. Gated by -spin_wait_observe_enable.
+  struct SpinWaitObserveState {
+    uint64_t active_wait_pc = 0;        // primary_wait_pc of the in-progress episode
+    uint64_t active_barrier_addr = 0;   // barrier being polled (for watchdog dump)
+    unsigned active_cta = 0;            // cta owning the episode (for watchdog dump)
+    unsigned long long first_not_ready_cycle = 0;  // cycle of first not-ready poll
+    bool episode_open = false;          // a not-ready episode is in progress
+    bool watchdog_fired = false;        // deadlock watchdog already reported this episode
+  };
+  SpinWaitObserveState m_spin_wait_observe_by_warp[MAX_WARP_PER_SHADER];
+  // Per-region (keyed by primary_wait_pc) would-be-park accounting.
+  struct SpinWaitRegionObserve {
+    uint64_t primary_wait_pc = 0;
+    unsigned long long episodes = 0;              // completed not-ready->ready episodes
+    unsigned long long park_cycles_total = 0;     // summed would-be park cycles
+    unsigned long long park_cycles_max = 0;       // longest single would-be park
+    unsigned long long immediate_ready_polls = 0; // ready with no open episode
+    unsigned long long watchdog_hits = 0;         // episodes that crossed the deadlock threshold
+    unsigned long long park_hist[6] = {0, 0, 0, 0, 0, 0};  // 0,1-16,17-64,65-256,257-1024,>1024
+  };
+  std::map<uint64_t, SpinWaitRegionObserve> m_spin_wait_observe_by_region;
+  struct FoldPaceStats {
+    unsigned long long parks = 0;
+    unsigned long long releases = 0;
+    unsigned long long park_cycles_total = 0;
+    unsigned long long park_cycles_max = 0;
+    unsigned long long first_park_cycle = 0;
+    unsigned long long last_end_cycle = 0;
+    uint64_t last_expected_gen = 0;
+    uint64_t last_barrier_gen = 0;
+    // [Stage 1.1] Immediate-ready folds are NOT parks/releases: the primary poll
+    // was already satisfied at issue, so no warp ever parked. Counted separately
+    // so parks == releases stays a real park-balance invariant.
+    unsigned long long immediate_folds = 0;
+    unsigned long long immediate_skipped_insts = 0;
+  };
+  // Per-(warp, barrier, wait_pc) pacing decomposition. wait_pc is included
+  // because multiple logical waits may share one runtime barrier.
+  using FoldPaceKey = std::pair<HopperMBarrierKey, uint64_t>;
+  std::vector<std::map<FoldPaceKey, FoldPaceStats>> m_fold_pace_by_warp;
+  // Captured-poll validation counters (only move when -wait_block_enable).
+  // At a clean diagnostic exit, holds == releases. Generation overshoot aborts
+  // rather than creating a late-release path.
+  unsigned long long m_fold_parks_total = 0;
+  unsigned long long m_fold_releases_total = 0;
+  unsigned long long m_fold_skipped_insts_total = 0;
+  unsigned long long m_fold_park_cycles_total = 0;
+  unsigned long long m_fold_park_cycles_max = 0;
+  unsigned long long m_fold_watchdog_hits = 0;
+  // [Stage 1.1] Immediate-ready fold totals (ready-at-issue path, no park).
+  // total_folds = releases + immediate_folds; immediate_skipped_insts is the
+  // subset of skipped_insts contributed by the immediate path.
+  unsigned long long m_fold_immediate_folds_total = 0;
+  unsigned long long m_fold_immediate_skipped_insts_total = 0;
+  unsigned long long m_fold_aux_holds_total = 0;
+  unsigned long long m_fold_aux_releases_total = 0;
+  unsigned long long m_missing_wait_ready_total = 0;
+  unsigned long long m_missing_wait_holds_total = 0;
+  unsigned long long m_missing_wait_releases_total = 0;
+  unsigned long long m_partial_missing_wait_misses_total = 0;
+  unsigned long long m_partial_capsules_total = 0;
+  unsigned long long m_partial_join_already_issued_total = 0;
+  unsigned long long m_partial_deferred_occurrences_total = 0;
+  unsigned long long m_partial_replayed_occurrences_total = 0;
+  unsigned long long m_partial_folded_occurrences_total = 0;
+  unsigned long long m_partial_join_holds_total = 0;
+  unsigned long long m_partial_join_releases_total = 0;
+  unsigned long long m_partial_replay_watchdog_aborts_total = 0;
+  unsigned long long m_wait_block_generation_overshoots_total = 0;
+  unsigned long long m_wait_block_exact_targets_total = 0;
+  unsigned long long m_wait_block_generation_fallbacks_total = 0;
+  unsigned long long m_wait_block_late_arrivals_total = 0;
+  unsigned long long m_wait_block_first_late_reports_total = 0;
+  unsigned long long m_wait_block_watchdog_aborts_total = 0;
+  unsigned long long m_wait_block_retired_warp_instructions_total = 0;
  public:
   // Increment the tensor-op count for the CTA slot that owns hardware warp wid.
   void inc_tensor_ops_for_warp(unsigned wid) {
@@ -546,4 +813,19 @@ class SM : public core_t, public shader_core_ctx_wrapper {
   // [FWD drain-idle 축2] sticky role marks (observe-only; set on first occurrence).
   void mark_producer_warp(unsigned wid) { if (wid < MAX_WARP_PER_SHADER) m_warp_is_producer[wid] = true; }
   void mark_consumer_warp(unsigned wid) { if (wid < MAX_WARP_PER_SHADER) m_warp_is_consumer[wid] = true; }
+  // [Producer-tail probe] read-only hooks used by Subcore::issue() and the
+  // existing mbarrier execution path.
+  bool producer_tail_active_for_warp(unsigned wid) const;
+  void record_producer_tail_issue(unsigned wid, const warp_inst_t *inst);
+  void record_producer_tail_phasechk_result(unsigned wid, bool ready);
+  void account_producer_tail_cycle();
+  // [Producer-spin ready-retry probe] whole-lifetime hooks (not tail-gated).
+  void record_producer_spin_issue(unsigned wid, const warp_inst_t *inst);
+  void record_producer_spin_phasechk_result(unsigned wid, bool ready);
+  // [Spin-wait observe] observe-only would-be-park measurement (never blocks).
+  void record_spin_wait_observe(unsigned wid, uint64_t wait_pc,
+                                uint64_t barrier_addr, unsigned cta_id,
+                                bool ready);
+  void print_spin_wait_observe_summary() const;
+  void print_wait_block_summary() const;
 };

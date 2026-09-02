@@ -94,6 +94,8 @@ void split(const std::string &str, std::vector<std::string> &cont,
 inst_trace_t::inst_trace_t() { 
   is_instruction_traced = true;
   is_constant_addr_already_calculated = false;
+  active_mask = 0;
+  predicate_mask = 0;
   sync_site_valid = false;
   sync_kind = SyncInstructionKind::NONE;
   sync_semantic_operand_role = SyncSemanticOperandRole::NONE;
@@ -103,6 +105,13 @@ inst_trace_t::inst_trace_t() {
   sync_barrier_addr = 0;
   sync_has_semantic_raw = false;
   sync_semantic_raw = 0;
+  wait_block_generation_ticket_present = false;
+  wait_block_exact_target_valid = false;
+  wait_block_target_release_generation = 0;
+  wait_block_ticket_source_index = 0;
+  tma_completion_runtime_valid = false;
+  tma_completion_barrier_addr = 0;
+  tma_completion_barrier_ureg_id = 0;
   bar_runtime_valid = false;
   bar_runtime_has_id = false;
   bar_runtime_id = 0;
@@ -117,6 +126,8 @@ inst_trace_t::inst_trace_t(const inst_trace_t &b) {
   m_next_traced_pc = b.m_next_traced_pc;
   m_unique_function_id = b.m_unique_function_id;
   mask = b.mask;
+  active_mask = b.active_mask;
+  predicate_mask = b.predicate_mask;
   opcode = b.opcode;
   memadd_info.resize(b.memadd_info.size());
   for(unsigned int i = 0; i < b.memadd_info.size(); ++i) {
@@ -138,6 +149,17 @@ inst_trace_t::inst_trace_t(const inst_trace_t &b) {
   sync_barrier_addr = b.sync_barrier_addr;
   sync_has_semantic_raw = b.sync_has_semantic_raw;
   sync_semantic_raw = b.sync_semantic_raw;
+  wait_block_generation_ticket_present =
+      b.wait_block_generation_ticket_present;
+  wait_block_exact_target_valid =
+      b.wait_block_exact_target_valid;
+  wait_block_target_release_generation =
+      b.wait_block_target_release_generation;
+  wait_block_ticket_source_index =
+      b.wait_block_ticket_source_index;
+  tma_completion_runtime_valid = b.tma_completion_runtime_valid;
+  tma_completion_barrier_addr = b.tma_completion_barrier_addr;
+  tma_completion_barrier_ureg_id = b.tma_completion_barrier_ureg_id;
   bar_runtime_valid = b.bar_runtime_valid;
   bar_runtime_has_id = b.bar_runtime_has_id;
   bar_runtime_id = b.bar_runtime_id;
@@ -146,6 +168,8 @@ inst_trace_t::inst_trace_t(const inst_trace_t &b) {
   block_idx_x = b.block_idx_x;
   block_idx_y = b.block_idx_y;
   block_idx_z = b.block_idx_z;
+  trace_cta_warp_id = b.trace_cta_warp_id;
+  trace_instruction_index = b.trace_instruction_index;
 }
 
 inst_trace_t::inst_trace_t(address_type pc, unsigned int unique_function_id, bool is_instruction_traced) {
@@ -154,6 +178,8 @@ inst_trace_t::inst_trace_t(address_type pc, unsigned int unique_function_id, boo
   m_unique_function_id = unique_function_id;
   this->is_instruction_traced = is_instruction_traced;
   mask = 0;
+  active_mask = 0;
+  predicate_mask = 0;
   opcode = "NOP";
   is_constant_addr_already_calculated = false;
   sync_site_valid = false;
@@ -165,6 +191,13 @@ inst_trace_t::inst_trace_t(address_type pc, unsigned int unique_function_id, boo
   sync_barrier_addr = 0;
   sync_has_semantic_raw = false;
   sync_semantic_raw = 0;
+  wait_block_generation_ticket_present = false;
+  wait_block_exact_target_valid = false;
+  wait_block_target_release_generation = 0;
+  wait_block_ticket_source_index = 0;
+  tma_completion_runtime_valid = false;
+  tma_completion_barrier_addr = 0;
+  tma_completion_barrier_ureg_id = 0;
   bar_runtime_valid = false;
   bar_runtime_has_id = false;
   bar_runtime_id = 0;
@@ -311,7 +344,9 @@ void inst_trace_t::parse_memref(unsigned int idx, unsigned int mem_width, const 
 bool inst_trace_t::parse_from_pb(dynamic_trace::instruction pb_inst,
                                      unsigned trace_version, gpgpu_sim *gpu, std::string kernel_name, traced_execution &static_trace_info) {
   m_pc = pb_inst.pc();
-  mask = pb_inst.active_mask() & pb_inst.predicate_mask();
+  active_mask = pb_inst.active_mask();
+  predicate_mask = pb_inst.predicate_mask();
+  mask = active_mask & predicate_mask;
   m_unique_function_id = pb_inst.function_unique_id();
   sync_runtime_valid = pb_inst.has_sync() && pb_inst.sync().valid();
   sync_barrier_addr = sync_runtime_valid ? pb_inst.sync().barrier_addr() : 0;
@@ -319,6 +354,16 @@ bool inst_trace_t::parse_from_pb(dynamic_trace::instruction pb_inst,
       sync_runtime_valid && pb_inst.sync().has_semantic_raw();
   sync_semantic_raw =
       sync_has_semantic_raw ? pb_inst.sync().semantic_raw() : 0;
+  tma_completion_runtime_valid =
+      pb_inst.has_tma_completion() && pb_inst.tma_completion().valid();
+  tma_completion_barrier_addr =
+      tma_completion_runtime_valid
+          ? pb_inst.tma_completion().barrier_addr()
+          : 0;
+  tma_completion_barrier_ureg_id =
+      tma_completion_runtime_valid
+          ? pb_inst.tma_completion().barrier_ureg_id()
+          : 0;
   bar_runtime_valid = pb_inst.has_bar_runtime() && pb_inst.bar_runtime().valid();
   bar_runtime_has_id = bar_runtime_valid && pb_inst.bar_runtime().has_id();
   bar_runtime_id = bar_runtime_has_id ? pb_inst.bar_runtime().id() : 0;
@@ -527,6 +572,122 @@ void trace_parser::get_next_threadblock_traces(
   input.close();
   unsigned int size_traced_instructions_num_used_vector = gpu == nullptr ? 32 : 1;
   std::cout << "thread block = " << tb_cur.block_id().x() << "," << tb_cur.block_id().y() << "," << tb_cur.block_id().z() << std::endl;
+  // [TRIMCHK] Trace-load evidence: total + per-warp instruction counts for this
+  // CTA. A spin-trimmed trace shows the producer warp's count drop by ~10x vs a
+  // full run (the producer's PHASECHK/NANOSLEEP/BRA spin was removed), so this
+  // one line per CTA lets a 12h run be verified as "trimmed trace consumed".
+  // Gated by -trimchk_percta_log_enable (verbose: two lines per CTA); the
+  // per-kernel summary in gpu_print_stat is always on. Grep for "[TRIMCHK]".
+  bool trimchk_percta_log = (gpu != nullptr) &&
+      gpu->getShaderCoreConfig() != nullptr &&
+      gpu->getShaderCoreConfig()->trimchk_percta_log_enable;
+  if (trimchk_percta_log) {
+    unsigned long long trimchk_cta_total = 0;
+    unsigned long long tracecheck_active_lane_insts = 0;
+    unsigned long long tracecheck_memref_records = 0;
+    unsigned long long tracecheck_memref_lane_uses = 0;
+    unsigned long long tracecheck_sync_runtime = 0;
+    unsigned long long tracecheck_sync_semantic = 0;
+    unsigned long long tracecheck_tma_completion_runtime = 0;
+    unsigned long long tracecheck_bar_runtime = 0;
+    unsigned long long tracecheck_bar_id = 0;
+    unsigned long long tracecheck_bar_count = 0;
+    unsigned long long tracecheck_zero_mask_insts = 0;
+    unsigned long long tracecheck_hgmma = 0;
+    unsigned long long tracecheck_mufu = 0;
+    unsigned long long tracecheck_tma_family = 0;
+    unsigned trimchk_max_warp_insts = 0;
+    unsigned trimchk_max_warp_id = 0;
+    for (auto warp : tb_cur.warps()) {
+      unsigned wc = warp.second.instructions_size();
+      trimchk_cta_total += wc;
+      if (wc > trimchk_max_warp_insts) {
+        trimchk_max_warp_insts = wc;
+        trimchk_max_warp_id = warp.first;
+      }
+      for (const auto &pb_inst : warp.second.instructions()) {
+        const std::string opcode =
+            static_trace_info
+                .get_kernel_by_unique_function_id(
+                    pb_inst.function_unique_id())
+                .get_instruction(pb_inst.pc())
+                .get_op_code();
+        if (opcode.rfind("HGMMA", 0) == 0) {
+          tracecheck_hgmma++;
+        }
+        if (opcode.rfind("MUFU", 0) == 0) {
+          tracecheck_mufu++;
+        }
+        if (opcode.rfind("UTMALDG", 0) == 0 ||
+            opcode.rfind("UTMASTG", 0) == 0 ||
+            opcode.rfind("UBLKCP", 0) == 0 ||
+            opcode.rfind("UBLKPF", 0) == 0 ||
+            opcode.rfind("UBLKRED", 0) == 0 ||
+            opcode.rfind("UTMACCTL", 0) == 0 ||
+            opcode.rfind("UTMACMDFLUSH", 0) == 0 ||
+            opcode.rfind("UTMAPF", 0) == 0 ||
+            opcode.rfind("UTMAREDG", 0) == 0) {
+          tracecheck_tma_family++;
+        }
+        const uint32_t exec_mask =
+            pb_inst.active_mask() & pb_inst.predicate_mask();
+        const unsigned active_lanes = std::bitset<WARP_SIZE>(exec_mask).count();
+        tracecheck_active_lane_insts += active_lanes;
+        if (active_lanes == 0) {
+          tracecheck_zero_mask_insts++;
+        }
+        tracecheck_memref_records += pb_inst.addresses_size();
+        tracecheck_memref_lane_uses +=
+            static_cast<unsigned long long>(active_lanes) *
+            pb_inst.addresses_size();
+        if (pb_inst.has_sync() && pb_inst.sync().valid()) {
+          tracecheck_sync_runtime++;
+          if (pb_inst.sync().has_semantic_raw()) {
+            tracecheck_sync_semantic++;
+          }
+        }
+        if (pb_inst.has_tma_completion() &&
+            pb_inst.tma_completion().valid()) {
+          tracecheck_tma_completion_runtime++;
+        }
+        if (pb_inst.has_bar_runtime() && pb_inst.bar_runtime().valid()) {
+          tracecheck_bar_runtime++;
+          if (pb_inst.bar_runtime().has_id()) {
+            tracecheck_bar_id++;
+          }
+          if (pb_inst.bar_runtime().has_count()) {
+            tracecheck_bar_count++;
+          }
+        }
+      }
+    }
+    std::cout << "[TRIMCHK] kernel=" << kernelid
+              << " cta=" << block_id_x << "," << block_id_y << "," << block_id_z
+              << " nwarps=" << tb_cur.warps().size()
+              << " cta_total_insts=" << trimchk_cta_total
+              << " max_warp=" << trimchk_max_warp_id
+              << " max_warp_insts=" << trimchk_max_warp_insts
+              << " path=" << tb_path << std::endl;
+    std::cout << "[TRACECHECK] kernel=" << kernelid
+              << " cta=" << block_id_x << "," << block_id_y << ","
+              << block_id_z
+              << " warp_insts=" << trimchk_cta_total
+              << " active_lane_insts=" << tracecheck_active_lane_insts
+              << " memref_records=" << tracecheck_memref_records
+              << " memref_lane_uses=" << tracecheck_memref_lane_uses
+              << " sync_runtime=" << tracecheck_sync_runtime
+              << " sync_semantic=" << tracecheck_sync_semantic
+              << " tma_completion_runtime="
+              << tracecheck_tma_completion_runtime
+              << " bar_runtime=" << tracecheck_bar_runtime
+              << " bar_id=" << tracecheck_bar_id
+              << " bar_count=" << tracecheck_bar_count
+              << " zero_mask_insts=" << tracecheck_zero_mask_insts
+              << " hgmma=" << tracecheck_hgmma
+              << " mufu=" << tracecheck_mufu
+              << " tma_family=" << tracecheck_tma_family
+              << std::endl;
+  }
   for(auto warp : tb_cur.warps()) {
     previous_traced_pc = 0;
     inst_count = 0;
@@ -539,6 +700,80 @@ void trace_parser::get_next_threadblock_traces(
       current_inst.block_idx_x = block_id_x;
       current_inst.block_idx_y = block_id_y;
       current_inst.block_idx_z = block_id_z;
+      current_inst.trace_cta_warp_id = warp_id;
+      current_inst.trace_instruction_index = inst_count;
+      const bool exact_generation_enabled =
+          gpu != nullptr && gpu->getShaderCoreConfig() != nullptr &&
+          gpu->getShaderCoreConfig()->wait_block_exact_generation_enable;
+      const uint32_t effective_mask =
+          current_inst.active_mask & current_inst.predicate_mask;
+      if (exact_generation_enabled && effective_mask != 0) {
+        MissingWaitRecord missing_wait;
+        SpinWaitRegionRecord captured_poll;
+        const bool is_missing_wait_action = gpu->lookup_missing_wait(
+            kernelid, current_inst.m_unique_function_id,
+            current_inst.m_pc, missing_wait);
+        const bool is_captured_poll_action =
+            gpu->lookup_spin_wait_region(
+                kernelid, current_inst.m_unique_function_id,
+                current_inst.m_pc, captured_poll) &&
+            captured_poll.foldable;
+        if (is_missing_wait_action || is_captured_poll_action) {
+          const WaitBlockGenerationTicketKey ticket_key{
+              kernelid,
+              block_id_x,
+              block_id_y,
+              block_id_z,
+              warp_id,
+              current_inst.m_unique_function_id,
+              current_inst.m_pc,
+              inst_count};
+          WaitBlockGenerationTicket ticket;
+          if (!gpu->lookup_wait_block_generation_ticket(
+                  ticket_key, ticket)) {
+            std::cerr
+                << "[WAITBLOCK][TICKET][FATAL] missing dynamic ticket"
+                << " kernel=" << kernelid
+                << " cta=" << block_id_x << "," << block_id_y << ","
+                << block_id_z << " warp=" << warp_id
+                << " function=" << current_inst.m_unique_function_id
+                << " pc=0x" << std::hex << current_inst.m_pc << std::dec
+                << " source_index=" << inst_count << std::endl;
+            abort();
+          }
+          if (ticket.active_mask != current_inst.active_mask ||
+              ticket.predicate_mask != current_inst.predicate_mask ||
+              !current_inst.sync_runtime_valid ||
+              !current_inst.sync_has_semantic_raw ||
+              ticket.barrier_addr != current_inst.sync_barrier_addr ||
+              ticket.wait_state_raw != current_inst.sync_semantic_raw) {
+            std::cerr
+                << "[WAITBLOCK][TICKET][FATAL] dynamic ticket payload mismatch"
+                << " kernel=" << kernelid
+                << " cta=" << block_id_x << "," << block_id_y << ","
+                << block_id_z << " warp=" << warp_id
+                << " function=" << current_inst.m_unique_function_id
+                << " pc=0x" << std::hex << current_inst.m_pc << std::dec
+                << " source_index=" << inst_count
+                << " ticket_masks=0x" << std::hex << ticket.active_mask
+                << "/0x" << ticket.predicate_mask
+                << " trace_masks=0x" << current_inst.active_mask
+                << "/0x" << current_inst.predicate_mask
+                << " ticket_barrier=0x" << ticket.barrier_addr
+                << " trace_barrier=0x" << current_inst.sync_barrier_addr
+                << " ticket_wait_state=0x" << ticket.wait_state_raw
+                << " trace_wait_state=0x" << current_inst.sync_semantic_raw
+                << std::dec << std::endl;
+            abort();
+          }
+          current_inst.wait_block_generation_ticket_present = true;
+          current_inst.wait_block_exact_target_valid =
+              ticket.has_target_release_generation;
+          current_inst.wait_block_target_release_generation =
+              ticket.target_release_generation;
+          current_inst.wait_block_ticket_source_index = inst_count;
+        }
+      }
       std::map<address_type, traced_instructions_by_pc> *map_inst_of_warp =
           threadblock_traces[warp_id];
       auto it_find_pc = map_inst_of_warp->find(current_inst.m_pc);

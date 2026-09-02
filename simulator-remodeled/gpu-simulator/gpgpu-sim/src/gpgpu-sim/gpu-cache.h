@@ -1511,6 +1511,17 @@ class baseline_cache : public cache_t {
 
   tag_array* get_tag_array() { return m_tag_array; }
 
+  // [SR-M0A] Pure, non-mutating tag probe. Returns the current hit/miss status
+  // for `addr` WITHOUT allocating a mem_fetch, reserving an MSHR, updating LRU,
+  // or enqueuing a miss. Used only by the stall-reason-alignment snapshot to
+  // observe constant-cache readiness. See .plan/STALL_REASON_ALIGN.md SR-M0A.7.
+  enum cache_request_status probe_tag_only(new_addr_type addr,
+                                           mem_access_sector_mask_t mask) const {
+    unsigned idx = 0;
+    return m_tag_array->probe(addr, idx, mask, /*is_write=*/false,
+                              /*probe_mode=*/true, /*mf=*/NULL);
+  }
+
   mshr_table& get_mshr() { return m_mshrs; }
 
   cache_config& get_config() { return m_config; }

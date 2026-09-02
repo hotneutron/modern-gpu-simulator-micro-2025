@@ -59,17 +59,14 @@ if [ -n "${SLURM_CPUS_PER_TASK:-}" ]; then
 elif [ -n "${OMP_NUM_THREADS:-}" ]; then
     # Local launcher (procman): honor an OMP_NUM_THREADS the user exported before
     # invoking run_simulations.py, e.g. `OMP_NUM_THREADS=64 ./run_simulations.py ...`.
+    # (Single-kernel runs are fastest around 64; but for batch/-c runs leave it unset so
+    # OpenMP shares cores across concurrently launched jobs instead of oversubscribing.)
     export OMP_NUM_THREADS=$OMP_NUM_THREADS
 else
-    # No SLURM alloc and no user override: fall back to the per-benchmark openmp-cpus
-    # value from the YAML (templated into --cpus-per-task above). REPLACE_OPENMP_CPUS is
-    # substituted by run_simulations.py; guard against a non-numeric leftover.
-    __oc="REPLACE_OPENMP_CPUS"
-    if [ -n "$__oc" ] && [ "$__oc" -eq "$__oc" ] 2>/dev/null; then
-        export OMP_NUM_THREADS=$__oc
-    else
-        unset OMP_NUM_THREADS
-    fi
+    # No SLURM alloc and no user override: keep the original behavior (unset -> OpenMP uses
+    # its default = all cores, capped by loop iteration count). Do NOT force the YAML
+    # openmp-cpus here, so batch runs are not slowed by per-job thread pinning.
+    unset OMP_NUM_THREADS
 fi
 echo "doing: OMP_NUM_THREADS=${OMP_NUM_THREADS:-<unset>}"
 

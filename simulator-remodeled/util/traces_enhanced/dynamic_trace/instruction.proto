@@ -29,4 +29,31 @@ message instruction {
     uint32 count = 5;
   }
   bar_runtime_info bar_runtime = 7;
+  // Completion-bearing TMA LOADs encode the mbarrier address in the high
+  // uniform register of their first destination-state register pair.
+  message tma_completion_runtime_info {
+    bool valid = 1;
+    uint64 barrier_addr = 2;
+    uint32 barrier_ureg_id = 3;
+  }
+  tma_completion_runtime_info tma_completion = 8;
+  // Capture-only barrier-local contract state. This records instruction
+  // boundaries and contract identity; it never records a hardware cycle.
+  message mbarrier_contract_runtime_info {
+    bool valid = 1;
+    uint32 event_kind = 2;
+    uint64 barrier_addr = 3;
+    uint32 initialization_epoch_before = 4;
+    uint32 initialization_epoch_after = 5;
+    uint64 opened_contract_count_before = 6;
+    uint64 opened_contract_count_after = 7;
+    bool has_contract_ordinal = 8;
+    uint64 contract_ordinal = 9;
+    uint32 capture_flags = 10;
+    uint32 barrier_error_flags = 11;
+    uint64 capture_launch_uid = 12;
+    bool has_semantic_raw = 13;
+    uint64 semantic_raw = 14;
+  }
+  mbarrier_contract_runtime_info mbarrier_contract = 9;
 }

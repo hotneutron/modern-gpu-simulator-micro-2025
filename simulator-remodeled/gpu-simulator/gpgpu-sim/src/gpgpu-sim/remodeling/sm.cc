@@ -47,6 +47,7 @@
 
 #include "../../../../../util/traces_enhanced/src/traced_operand.h"
 
+#include <algorithm>
 #include <sstream>
 
 #define STRSIZE 1024
@@ -107,6 +108,9 @@ unsigned int translate_reg_to_global_id(int reg, TraceEnhancedOperandType reg_ty
 namespace {
 
 static constexpr uint32_t kSyncExchDecodeBase = 0x200000;
+// Policy thresholds from WAIT_BLOCK.md 2.6 and SPIN_WAIT_SIM_MODELING.md 6.
+// They are strategy-wide safety limits, not trace/application identities.
+static constexpr uint64_t kSpinWaitObserveWatchdogCycles = 400000;
 
 uint32_t decode_sync_exch_expected_arrive_count(uint64_t raw) {
   if (raw >= kSyncExchDecodeBase) {
@@ -122,7 +126,7 @@ uint32_t decode_sync_wait_phase(uint64_t wait_state_raw) {
   // The PHASECHK / TRYWAIT phaseParity operand is encoded in bit 31 of the
   // captured wait_state (validated against FA3 traces: the operand only ever
   // takes the values 0x0 and 0x80000000, differing solely in bit 31). Reading
-  // bit 0 collapsed both values to 0 and discarded the parity entirely.
+  // bit 0 folded both values to 0 and discarded the parity entirely.
   return static_cast<uint32_t>((wait_state_raw >> 31) & 0x1ULL);
 }
 
@@ -147,6 +151,22 @@ const char *sync_kind_to_string(SyncInstructionKind kind) {
     case SyncInstructionKind::TRYWAIT:
       return "TRYWAIT";
     case SyncInstructionKind::NONE:
+    default:
+      return "NONE";
+  }
+}
+
+const char *wait_block_mode_to_string(WaitBlockPendingMode mode) {
+  switch (mode) {
+    case WaitBlockPendingMode::MISSING_WAIT_HOLD:
+      return "INJECT_MISSING_WAIT";
+    case WaitBlockPendingMode::PARTIAL_MISSING_WAIT_HOLD:
+      return "DEFER_PARTIAL_MISSING_WAIT";
+    case WaitBlockPendingMode::FOLD_AUX_WAIT_HOLD:
+      return "FOLD_AUX_WAIT";
+    case WaitBlockPendingMode::CAPTURED_POLL_HOLD:
+      return "FOLD_CAPTURED_POLL";
+    case WaitBlockPendingMode::NONE:
     default:
       return "NONE";
   }
@@ -216,6 +236,103 @@ bool is_validated_arrive_opcode(const std::string &opcode) {
          opcode == "SYNCS.ARRIVE.TRANS64.RED.A0TR" ||    // nvcc, tx bytes
          opcode == "SYNCS.ARRIVE.TRANS64.ART0" ||        // nvcc, plain
          opcode == "SYNCS.ARRIVE.TRANS64.A1T0";          // nvcc, plain
+}
+
+bool is_wait_block_timing_semantic_opcode(const std::string &opcode) {
+  static const char *const prefixes[] = {
+      "HGMMA",  "IGMMA",   "QGMMA",  "BGMMA", "OGMMA", "MMA",
+      "WGMMA",  "MUFU",    "UTMALDG", "UTMASTG", "UTMACMDFLUSH",
+      "UBLKCP", "UBLKPF",  "UTMAPF", "UTMAREDG", "UBLKRED",
+      "UTMACCTL", "LDGSTS", "STG", "LDG", "STS", "LDS", "ATOM",
+      "ATOMS", "RED", "SYNCS.ARRIVE", "SYNCS.EXCH", "BAR"};
+  for (const char *prefix : prefixes) {
+    if (opcode.rfind(prefix, 0) == 0) {
+      return true;
+    }
+  }
+  return false;
+}
+
+void add_wait_block_progress(WaitBlockWarpProgress &dst,
+                             const WaitBlockWarpProgress &src) {
+  dst.active += src.active;
+  dst.selected += src.selected;
+  dst.selected_tensor += src.selected_tensor;
+  dst.selected_sfu += src.selected_sfu;
+  dst.selected_other += src.selected_other;
+  dst.eligible_not_selected += src.eligible_not_selected;
+  dst.no_valid += src.no_valid;
+  dst.drain += src.drain;
+  dst.wait_block_hold += src.wait_block_hold;
+  dst.blocked_valid += src.blocked_valid;
+  dst.no_head_hold += src.no_head_hold;
+  dst.unknown_valid += src.unknown_valid;
+  dst.sole_yield += src.sole_yield;
+  dst.sole_stall_count += src.sole_stall_count;
+  dst.sole_wait_barrier += src.sole_wait_barrier;
+  dst.sole_named_barrier += src.sole_named_barrier;
+  dst.sole_membar += src.sole_membar;
+  dst.sole_grid_barrier += src.sole_grid_barrier;
+  dst.sole_ldgdepbar += src.sole_ldgdepbar;
+  dst.sole_tma_flush += src.sole_tma_flush;
+  dst.sole_fu_tensor += src.sole_fu_tensor;
+  dst.sole_fu_sfu += src.sole_fu_sfu;
+  dst.sole_fu_other += src.sole_fu_other;
+  dst.sole_scoreboard += src.sole_scoreboard;
+  dst.sole_result_queue += src.sole_result_queue;
+  dst.sole_l1c += src.sole_l1c;
+  dst.sole_issue_port += src.sole_issue_port;
+  dst.sole_issue_control += src.sole_issue_control;
+  dst.blocked_multi += src.blocked_multi;
+}
+
+bool subtract_wait_block_progress(const WaitBlockWarpProgress &end,
+                                  const WaitBlockWarpProgress &begin,
+                                  WaitBlockWarpProgress &delta) {
+#define SUBTRACT_PROGRESS_FIELD(field)                 \
+  do {                                                 \
+    if (end.field < begin.field) return false;         \
+    delta.field = end.field - begin.field;             \
+  } while (0)
+  SUBTRACT_PROGRESS_FIELD(active);
+  SUBTRACT_PROGRESS_FIELD(selected);
+  SUBTRACT_PROGRESS_FIELD(selected_tensor);
+  SUBTRACT_PROGRESS_FIELD(selected_sfu);
+  SUBTRACT_PROGRESS_FIELD(selected_other);
+  SUBTRACT_PROGRESS_FIELD(eligible_not_selected);
+  SUBTRACT_PROGRESS_FIELD(no_valid);
+  SUBTRACT_PROGRESS_FIELD(drain);
+  SUBTRACT_PROGRESS_FIELD(wait_block_hold);
+  SUBTRACT_PROGRESS_FIELD(blocked_valid);
+  SUBTRACT_PROGRESS_FIELD(no_head_hold);
+  SUBTRACT_PROGRESS_FIELD(unknown_valid);
+  SUBTRACT_PROGRESS_FIELD(sole_yield);
+  SUBTRACT_PROGRESS_FIELD(sole_stall_count);
+  SUBTRACT_PROGRESS_FIELD(sole_wait_barrier);
+  SUBTRACT_PROGRESS_FIELD(sole_named_barrier);
+  SUBTRACT_PROGRESS_FIELD(sole_membar);
+  SUBTRACT_PROGRESS_FIELD(sole_grid_barrier);
+  SUBTRACT_PROGRESS_FIELD(sole_ldgdepbar);
+  SUBTRACT_PROGRESS_FIELD(sole_tma_flush);
+  SUBTRACT_PROGRESS_FIELD(sole_fu_tensor);
+  SUBTRACT_PROGRESS_FIELD(sole_fu_sfu);
+  SUBTRACT_PROGRESS_FIELD(sole_fu_other);
+  SUBTRACT_PROGRESS_FIELD(sole_scoreboard);
+  SUBTRACT_PROGRESS_FIELD(sole_result_queue);
+  SUBTRACT_PROGRESS_FIELD(sole_l1c);
+  SUBTRACT_PROGRESS_FIELD(sole_issue_port);
+  SUBTRACT_PROGRESS_FIELD(sole_issue_control);
+  SUBTRACT_PROGRESS_FIELD(blocked_multi);
+#undef SUBTRACT_PROGRESS_FIELD
+  return true;
+}
+
+uint64_t wait_block_progress_population(
+    const WaitBlockWarpProgress &progress) {
+  return progress.selected + progress.eligible_not_selected +
+         progress.no_valid + progress.drain + progress.wait_block_hold +
+         progress.blocked_valid + progress.no_head_hold +
+         progress.unknown_valid;
 }
 
 void debug_print_sm_barrier_issue(const warp_inst_t &inst,
@@ -288,7 +405,20 @@ SM::SM(unsigned int num_subcores, gpgpu_sim *gpu, simt_core_cluster *cluster,
   m_config = config;
   m_num_cycles_to_wait_to_dispatch_another_inst_from_subcore_to_sm_shared_pipeline = 0;
   m_pending_sync_waits.resize(config->max_warps_per_shader);
-  m_pending_tma_barrier_binds_per_warp.resize(config->max_warps_per_shader);
+  m_partial_wait_arms.resize(config->max_warps_per_shader);
+  m_partial_replay_progress.resize(config->max_warps_per_shader);
+  m_partial_joined_regions.resize(config->max_warps_per_shader);
+  m_wait_block_last_semantic_anchor_by_warp.resize(
+      config->max_warps_per_shader);
+  m_wait_block_stall_progress_by_warp.resize(
+      config->max_warps_per_shader);
+  m_wait_block_last_service_cycle_by_warp.resize(
+      config->max_warps_per_shader, ~0ull);
+  m_tma_open_contracts_per_warp.resize(config->max_warps_per_shader, 0);
+  m_tma_outstanding_bindings_per_warp.resize(
+      config->max_warps_per_shader, 0);
+  m_tma_max_completed_transfer_uid_per_warp.resize(
+      config->max_warps_per_shader, 0);
   if (config->sync_debug_enable) {
     m_sync_debug_print_budget = config->sync_debug_print_budget;
     m_sync_debug_skip_runtime_budget = config->sync_debug_skip_runtime_budget;
@@ -302,6 +432,8 @@ SM::SM(unsigned int num_subcores, gpgpu_sim *gpu, simt_core_cluster *cluster,
 }
 
 SM::~SM() {
+  assert_wait_block_lifecycle_drained("simulator-teardown");
+  debug_dump_tma_binding_counters();
   debug_dump_sync_counters();
   for (auto warp : m_physical_warp) {
     delete warp;
@@ -417,7 +549,12 @@ void SM::debug_log_sync_event(const std::string &message) {
   if (m_sync_debug_print_budget == 0) {
     return;
   }
-  std::cerr << "[SYNCDBG][SM" << m_sm_id << "] " << message << std::endl;
+  // cyc= prefix makes every sync event a point on a reconstructable timeline
+  // (needed to correlate a not-ready wait with the later phase flip / tma
+  // completion that releases it -- i.e. to size or diagnose a would-be fold
+  // park and spot a barrier that never flips). See .plan/SPIN_WAIT_POSTPROCESS.md.
+  std::cerr << "[SYNCDBG][SM" << m_sm_id << "] cyc="
+            << get_current_gpu_cycle() << " " << message << std::endl;
   --m_sync_debug_print_budget;
 }
 
@@ -438,8 +575,339 @@ void SM::debug_log_tma_event(const std::string &message) {
   if (m_tma_debug_print_budget == 0) {
     return;
   }
-  std::cerr << "[TMADBG][SM" << m_sm_id << "] " << message << std::endl;
+  std::cerr << "[TMADBG][SM" << m_sm_id << "] cyc="
+            << get_current_gpu_cycle() << " " << message << std::endl;
   --m_tma_debug_print_budget;
+}
+
+void SM::debug_log_tma_binding_event(const char *event,
+                                     const std::string &message) {
+  if (!m_config->tma_debug_enable || m_tma_debug_print_budget == 0) {
+    return;
+  }
+  std::cerr << "[TMABIND][" << event << "][SM" << m_sm_id << "] cyc="
+            << get_current_gpu_cycle() << " " << message << std::endl;
+  --m_tma_debug_print_budget;
+}
+
+void SM::debug_log_wait_block_event(const char *event,
+                                    const std::string &message) {
+  if (!m_config->wait_block_debug ||
+      m_wait_block_debug_print_budget == 0) {
+    return;
+  }
+  std::cerr << "[WAITBLOCK][" << event << "][SM" << m_sm_id << "] cyc="
+            << get_current_gpu_cycle() << " " << message << std::endl;
+  --m_wait_block_debug_print_budget;
+}
+
+void SM::assert_wait_block_lifecycle_drained(const char *reason) {
+  if (!m_config->wait_block_enable) {
+    return;
+  }
+
+  uint64_t active_holds = 0;
+  uint64_t active_partial_arms = 0;
+  uint64_t active_replay_progress = 0;
+  uint64_t active_joined_regions = 0;
+  uint64_t active_partial_capsules = 0;
+  unsigned int first_active_warp = ~0u;
+  for (unsigned int warp_id = 0; warp_id < m_pending_sync_waits.size();
+       ++warp_id) {
+    const bool pending = m_pending_sync_waits[warp_id].valid;
+    const bool arm = m_partial_wait_arms[warp_id].valid;
+    const bool replay = m_partial_replay_progress[warp_id].valid;
+    const uint64_t joined = m_partial_joined_regions[warp_id].size();
+    const bool capsule =
+        m_config->is_trace_mode && m_physical_warp[warp_id] != nullptr &&
+        static_cast<trace_shd_warp_t *>(m_physical_warp[warp_id])
+            ->partial_capsule_active();
+    active_holds += pending;
+    active_partial_arms += arm;
+    active_replay_progress += replay;
+    active_joined_regions += joined;
+    active_partial_capsules += capsule;
+    if (first_active_warp == ~0u &&
+        (pending || arm || replay || joined != 0 || capsule)) {
+      first_active_warp = warp_id;
+    }
+  }
+
+  uint64_t open_contracts = 0;
+  uint64_t outstanding_bindings = 0;
+  uint64_t incomplete_barriers = 0;
+  for (const auto &entry : m_hopper_mbarriers) {
+    const HopperMBarrierObject &barrier = entry.second;
+    open_contracts += barrier.assignment_open;
+    outstanding_bindings += barrier.outstanding_tma_bindings;
+    incomplete_barriers +=
+        barrier.assignment_open ||
+        barrier.expected_tx_bytes != barrier.assigned_tx_bytes ||
+        barrier.assigned_tx_bytes != barrier.completed_tx_bytes ||
+        barrier.outstanding_tma_bindings != 0;
+  }
+
+  const bool balanced =
+      m_missing_wait_holds_total == m_missing_wait_releases_total &&
+      m_fold_parks_total == m_fold_releases_total &&
+      m_fold_aux_holds_total == m_fold_aux_releases_total &&
+      m_partial_join_holds_total == m_partial_join_releases_total &&
+      m_partial_deferred_occurrences_total ==
+          m_partial_replayed_occurrences_total +
+              m_partial_folded_occurrences_total;
+  if (active_holds == 0 && active_partial_arms == 0 &&
+      active_replay_progress == 0 && active_joined_regions == 0 &&
+      active_partial_capsules == 0 && open_contracts == 0 &&
+      outstanding_bindings == 0 && incomplete_barriers == 0 &&
+      m_warps_waiting_tma_flush.empty() && balanced) {
+    return;
+  }
+
+  std::cerr << "[WAITBLOCK][abort][SM" << m_sm_id << "] cyc="
+            << get_current_gpu_cycle() << " reason=" << reason
+            << "-with-active-state"
+            << " first_active_warp=" << first_active_warp
+            << " active_holds=" << active_holds
+            << " active_partial_arms=" << active_partial_arms
+            << " active_replay_progress=" << active_replay_progress
+            << " active_joined_regions=" << active_joined_regions
+            << " active_partial_capsules=" << active_partial_capsules
+            << " open_contracts=" << open_contracts
+            << " outstanding_bindings=" << outstanding_bindings
+            << " incomplete_barriers=" << incomplete_barriers
+            << " tma_flush_waiters=" << m_warps_waiting_tma_flush.size()
+            << " missing_holds=" << m_missing_wait_holds_total
+            << " missing_releases=" << m_missing_wait_releases_total
+            << " poll_holds=" << m_fold_parks_total
+            << " poll_releases=" << m_fold_releases_total
+            << " poll_aux_holds=" << m_fold_aux_holds_total
+            << " poll_aux_releases=" << m_fold_aux_releases_total
+            << " partial_holds=" << m_partial_join_holds_total
+            << " partial_releases=" << m_partial_join_releases_total
+            << " partial_deferred=" << m_partial_deferred_occurrences_total
+            << " partial_replayed=" << m_partial_replayed_occurrences_total
+            << " partial_folded=" << m_partial_folded_occurrences_total
+            << " action=abort" << std::endl;
+  abort();
+}
+
+void SM::reset_wait_block_launch_state(uint64_t launch_uid) {
+  if (!m_config->wait_block_enable || m_wait_block_launch_uid == launch_uid) {
+    return;
+  }
+  if (m_wait_block_launch_uid != 0) {
+    assert_wait_block_lifecycle_drained("kernel-switch");
+    debug_dump_sync_counters();
+  }
+
+  m_wait_block_launch_uid = launch_uid;
+  m_sync_debug_print_budget =
+      m_config->sync_debug_enable ? m_config->sync_debug_print_budget : 0;
+  m_sync_debug_skip_runtime_budget =
+      m_config->sync_debug_enable
+          ? m_config->sync_debug_skip_runtime_budget
+          : 0;
+  m_tma_debug_print_budget =
+      m_config->tma_debug_enable ? m_config->tma_debug_print_budget : 0;
+  m_wait_block_debug_print_budget =
+      m_config->wait_block_debug ? m_config->wait_block_debug_print_budget : 0;
+  m_wait_block_release_snapshot_valid = false;
+  m_wait_block_release_snapshot_cycle = ~0ull;
+  std::fill(m_wait_block_last_service_cycle_by_warp.begin(),
+            m_wait_block_last_service_cycle_by_warp.end(), ~0ull);
+  m_wait_block_release_phase_cycles_total = 0;
+  m_wait_block_release_service_visits_total = 0;
+  m_sync_debug_sync_insts = 0;
+  m_sync_debug_exch = 0;
+  m_sync_debug_arrive = 0;
+  m_sync_debug_arrive_expect_tx = 0;
+  m_sync_debug_wait_pending = 0;
+  m_sync_debug_wait_released = 0;
+  m_sync_debug_phase_flip = 0;
+  m_sync_debug_tma_completions = 0;
+  m_sync_debug_missing_runtime = 0;
+  for (auto &pace : m_fold_pace_by_warp) {
+    pace.clear();
+  }
+  std::fill_n(m_wait_block_first_late_reported_by_cta_slot,
+              MAX_CTA_PER_SHADER, false);
+  for (WaitBlockSemanticAnchor &anchor :
+       m_wait_block_last_semantic_anchor_by_warp) {
+    anchor = WaitBlockSemanticAnchor();
+  }
+  for (WaitBlockWarpProgress &progress :
+       m_wait_block_stall_progress_by_warp) {
+    progress = WaitBlockWarpProgress();
+  }
+
+  m_fold_parks_total = 0;
+  m_fold_releases_total = 0;
+  m_fold_skipped_insts_total = 0;
+  m_fold_park_cycles_total = 0;
+  m_fold_park_cycles_max = 0;
+  m_fold_watchdog_hits = 0;
+  m_fold_immediate_folds_total = 0;
+  m_fold_immediate_skipped_insts_total = 0;
+  m_fold_aux_holds_total = 0;
+  m_fold_aux_releases_total = 0;
+  m_missing_wait_ready_total = 0;
+  m_missing_wait_holds_total = 0;
+  m_missing_wait_releases_total = 0;
+  m_partial_missing_wait_misses_total = 0;
+  m_partial_capsules_total = 0;
+  m_partial_join_already_issued_total = 0;
+  m_partial_deferred_occurrences_total = 0;
+  m_partial_replayed_occurrences_total = 0;
+  m_partial_folded_occurrences_total = 0;
+  m_partial_join_holds_total = 0;
+  m_partial_join_releases_total = 0;
+  m_partial_replay_watchdog_aborts_total = 0;
+  m_wait_block_generation_overshoots_total = 0;
+  m_wait_block_exact_targets_total = 0;
+  m_wait_block_generation_fallbacks_total = 0;
+  m_wait_block_late_arrivals_total = 0;
+  m_wait_block_first_late_reports_total = 0;
+  m_wait_block_watchdog_aborts_total = 0;
+  m_wait_block_retired_warp_instructions_total = 0;
+
+  std::cerr << "[WAITBLOCK][launch-reset] sm=" << m_sm_id
+            << " launch_uid=" << launch_uid
+            << " hold_watchdog_cycles="
+            << m_config->wait_block_hold_watchdog_cycles
+            << " heartbeat_cycles="
+            << m_config->wait_block_heartbeat_cycles
+            << " debug_print_budget=" << m_wait_block_debug_print_budget
+            << std::endl;
+}
+
+void SM::debug_dump_tma_binding_snapshot(const char *reason) const {
+  uint64_t warp_open_contracts = 0;
+  for (uint32_t count : m_tma_open_contracts_per_warp) {
+    warp_open_contracts += count;
+  }
+  uint64_t barrier_open_contracts = 0;
+  uint64_t barrier_outstanding = 0;
+  for (const auto &entry : m_hopper_mbarriers) {
+    if (entry.second.assignment_open) {
+      ++barrier_open_contracts;
+    }
+    barrier_outstanding += entry.second.outstanding_tma_bindings;
+  }
+  uint64_t warp_outstanding = 0;
+  for (uint32_t count : m_tma_outstanding_bindings_per_warp) {
+    warp_outstanding += count;
+  }
+  const uint64_t bindings_in_flight =
+      m_tma_bindings_created >= m_tma_bindings_completed
+          ? m_tma_bindings_created - m_tma_bindings_completed
+          : 0;
+  const bool accounting_valid =
+      m_tma_contracts_opened >= m_tma_contracts_fully_assigned &&
+      m_tma_contracts_opened - m_tma_contracts_fully_assigned ==
+          barrier_open_contracts &&
+      m_tma_bindings_created >= m_tma_bindings_completed &&
+      m_tma_assigned_credit_bytes >= m_tma_completed_credit_bytes &&
+      warp_open_contracts == barrier_open_contracts &&
+      bindings_in_flight == barrier_outstanding &&
+      barrier_outstanding == warp_outstanding;
+  const bool no_failures =
+      m_tma_cross_barrier_applications == 0 &&
+      m_tma_contract_mismatches == 0 && m_tma_stale_generation == 0 &&
+      m_tma_launch_or_cta_mismatch == 0 &&
+      m_tma_duplicate_completion == 0 && m_tma_orphan_cleanup == 0;
+  std::cerr << "[TMABIND][snapshot] status="
+            << (accounting_valid && no_failures ? "PASS" : "FAIL")
+            << " reason=" << reason << " sm=" << m_sm_id
+            << " launch_uid=" << m_tma_binding_launch_uid
+            << " contracts_opened=" << m_tma_contracts_opened
+            << " contracts_fully_assigned="
+            << m_tma_contracts_fully_assigned
+            << " open_contracts=" << barrier_open_contracts
+            << " warp_open_contracts=" << warp_open_contracts
+            << " max_open_contracts_per_warp="
+            << m_tma_max_open_contracts_per_warp
+            << " bindings_created=" << m_tma_bindings_created
+            << " bindings_completed=" << m_tma_bindings_completed
+            << " bindings_in_flight=" << bindings_in_flight
+            << " barrier_outstanding=" << barrier_outstanding
+            << " warp_outstanding=" << warp_outstanding
+            << " assigned_credit_bytes=" << m_tma_assigned_credit_bytes
+            << " completed_credit_bytes=" << m_tma_completed_credit_bytes
+            << " uid_reorders=" << m_tma_uid_reorders
+            << " cross_barrier_applications="
+            << m_tma_cross_barrier_applications
+            << " contract_mismatches=" << m_tma_contract_mismatches
+            << " stale_generation=" << m_tma_stale_generation
+            << " launch_or_cta_mismatch="
+            << m_tma_launch_or_cta_mismatch
+            << " duplicate_completion=" << m_tma_duplicate_completion
+            << " orphan_cleanup=" << m_tma_orphan_cleanup << std::endl;
+}
+
+void SM::debug_dump_tma_binding_counters() const {
+  if (m_tma_contracts_opened == 0 && m_tma_bindings_created == 0 &&
+      m_tma_contract_mismatches == 0 &&
+      m_tma_launch_or_cta_mismatch == 0 &&
+      m_tma_duplicate_completion == 0 && m_tma_orphan_cleanup == 0) {
+    return;
+  }
+  uint64_t warp_open_contracts = 0;
+  for (uint32_t count : m_tma_open_contracts_per_warp) {
+    warp_open_contracts += count;
+  }
+  uint64_t barrier_open_contracts = 0;
+  uint64_t barrier_outstanding = 0;
+  for (const auto &entry : m_hopper_mbarriers) {
+    if (entry.second.assignment_open) {
+      ++barrier_open_contracts;
+    }
+    barrier_outstanding += entry.second.outstanding_tma_bindings;
+  }
+  uint64_t warp_outstanding = 0;
+  for (uint32_t count : m_tma_outstanding_bindings_per_warp) {
+    warp_outstanding += count;
+  }
+  const uint64_t bindings_in_flight =
+      m_tma_bindings_created >= m_tma_bindings_completed
+          ? m_tma_bindings_created - m_tma_bindings_completed
+          : 0;
+  const bool pass =
+      m_tma_contracts_opened == m_tma_contracts_fully_assigned &&
+      warp_open_contracts == 0 && barrier_open_contracts == 0 &&
+      m_tma_bindings_created == m_tma_bindings_completed &&
+      bindings_in_flight == 0 && barrier_outstanding == 0 &&
+      warp_outstanding == 0 &&
+      m_tma_assigned_credit_bytes == m_tma_completed_credit_bytes &&
+      m_tma_cross_barrier_applications == 0 &&
+      m_tma_contract_mismatches == 0 && m_tma_stale_generation == 0 &&
+      m_tma_launch_or_cta_mismatch == 0 &&
+      m_tma_duplicate_completion == 0 && m_tma_orphan_cleanup == 0;
+  std::cerr << "[TMABIND][FINAL] status=" << (pass ? "PASS" : "FAIL")
+            << " sm=" << m_sm_id
+            << " launch_uid=" << m_tma_binding_launch_uid
+            << " contracts_opened=" << m_tma_contracts_opened
+            << " contracts_fully_assigned="
+            << m_tma_contracts_fully_assigned
+            << " open_contracts=" << barrier_open_contracts
+            << " warp_open_contracts=" << warp_open_contracts
+            << " max_open_contracts_per_warp="
+            << m_tma_max_open_contracts_per_warp
+            << " bindings_created=" << m_tma_bindings_created
+            << " bindings_completed=" << m_tma_bindings_completed
+            << " bindings_in_flight=" << bindings_in_flight
+            << " barrier_outstanding=" << barrier_outstanding
+            << " warp_outstanding=" << warp_outstanding
+            << " assigned_credit_bytes=" << m_tma_assigned_credit_bytes
+            << " completed_credit_bytes=" << m_tma_completed_credit_bytes
+            << " uid_reorders=" << m_tma_uid_reorders
+            << " cross_barrier_applications="
+            << m_tma_cross_barrier_applications
+            << " contract_mismatches=" << m_tma_contract_mismatches
+            << " stale_generation=" << m_tma_stale_generation
+            << " launch_or_cta_mismatch="
+            << m_tma_launch_or_cta_mismatch
+            << " duplicate_completion=" << m_tma_duplicate_completion
+            << " orphan_cleanup=" << m_tma_orphan_cleanup << std::endl;
 }
 
 void SM::debug_dump_sync_counters() const {
@@ -520,6 +988,141 @@ void SM::increment_sm_stat_by_integer(std::string stat_name, int val_to_incremen
   m_sm_stats.m_stats_map[stat_name]->increment_with_integer(val_to_increment);
 }
 
+void SM::gather_stall_reason_align_stats(Subcore::StallPopulationTotals &dst) const {
+  for (auto subcore : m_subcores) {
+    subcore->gather_stall_reason_align_stats(dst);
+  }
+}
+
+void SM::reset_stall_reason_align_stats() {
+  for (auto subcore : m_subcores) {
+    subcore->reset_stall_reason_align_stats();
+  }
+}
+
+void SM::record_wait_block_timing_issue(unsigned int warp_id,
+                                        const warp_inst_t *inst) {
+  if (!m_config->wait_block_late_arrival_instrument_enable ||
+      inst == nullptr ||
+      warp_id >= m_wait_block_last_semantic_anchor_by_warp.size() ||
+      !inst->has_extra_trace_instruction_info()) {
+    return;
+  }
+  const std::string opcode =
+      inst->get_extra_trace_instruction_info().get_op_code();
+  if (!is_wait_block_timing_semantic_opcode(opcode)) {
+    return;
+  }
+
+  WaitBlockSemanticAnchor &anchor =
+      m_wait_block_last_semantic_anchor_by_warp[warp_id];
+  anchor.valid = true;
+  anchor.cycle = get_current_gpu_cycle();
+  anchor.trace_kernel_id = inst->trace_kernel_id;
+  anchor.unique_function_id = inst->unique_function_id;
+  anchor.cta_warp_id = inst->trace_cta_warp_id;
+  anchor.pc = inst->pc;
+  anchor.source_index = inst->trace_instruction_index;
+  anchor.opcode = opcode;
+}
+
+void SM::accumulate_wait_block_stall_progress(
+    unsigned int warp_id, const WaitBlockWarpProgress &delta) {
+  if (!m_config->wait_block_late_arrival_instrument_enable ||
+      !m_config->stall_reason_align_instrument_enable ||
+      warp_id >= m_wait_block_stall_progress_by_warp.size()) {
+    return;
+  }
+  add_wait_block_progress(m_wait_block_stall_progress_by_warp[warp_id],
+                          delta);
+}
+
+void SM::service_wait_block_releases_for_cycle() {
+  if (!m_config->wait_block_enable) {
+    return;
+  }
+
+  const uint64_t now = get_current_gpu_cycle();
+  if (m_wait_block_release_snapshot_valid ||
+      m_wait_block_release_snapshot_cycle == now) {
+    std::cerr << "[WAITBLOCK][abort][SM" << m_sm_id << "] cyc=" << now
+              << " reason=duplicate-sm-release-phase action=abort"
+              << std::endl;
+    abort();
+  }
+
+  for (auto &entry : m_hopper_mbarriers) {
+    entry.second.wait_block_release_snapshot_cycle = now;
+    entry.second.wait_block_release_snapshot_generation = entry.second.gen;
+    entry.second.wait_block_release_snapshot_phase = entry.second.phase;
+  }
+  m_wait_block_release_snapshot_valid = true;
+  m_wait_block_release_snapshot_cycle = now;
+  ++m_wait_block_release_phase_cycles_total;
+
+  struct ReleasedWait {
+    unsigned int warp_id = 0;
+    HopperMBarrierKey key;
+    uint64_t target_generation = 0;
+  };
+  std::vector<ReleasedWait> released;
+  unsigned int visits = 0;
+  for (unsigned int warp_id = 0;
+       warp_id < m_pending_sync_waits.size(); ++warp_id) {
+    if (m_wait_block_last_service_cycle_by_warp[warp_id] == now) {
+      std::cerr << "[WAITBLOCK][abort][SM" << m_sm_id << "] cyc=" << now
+                << " reason=duplicate-warp-release-service"
+                << " warp=" << warp_id << " action=abort" << std::endl;
+      abort();
+    }
+    m_wait_block_last_service_cycle_by_warp[warp_id] = now;
+    ++visits;
+
+    const bool was_pending = m_pending_sync_waits[warp_id].valid;
+    HopperMBarrierKey released_key;
+    uint64_t released_target_generation = 0;
+    if (was_pending) {
+      released_key = m_pending_sync_waits[warp_id].key;
+      released_target_generation =
+          m_pending_sync_waits[warp_id].expected_gen;
+    }
+    service_wait_block_release(warp_id);
+    if (was_pending && !m_pending_sync_waits[warp_id].valid) {
+      ReleasedWait event;
+      event.warp_id = warp_id;
+      event.key = released_key;
+      event.target_generation = released_target_generation;
+      released.push_back(event);
+    }
+  }
+  if (visits != m_pending_sync_waits.size()) {
+    std::cerr << "[WAITBLOCK][abort][SM" << m_sm_id << "] cyc=" << now
+              << " reason=incomplete-sm-release-phase"
+              << " visits=" << visits
+              << " hardware_warps=" << m_pending_sync_waits.size()
+              << " action=abort" << std::endl;
+    abort();
+  }
+  m_wait_block_release_service_visits_total += visits;
+
+  if (m_config->wait_block_debug) {
+    for (const ReleasedWait &event : released) {
+      std::ostringstream fingerprint;
+      fingerprint << "[WAITBLOCK][release-fingerprint]"
+                  << " sm=" << m_sm_id << " cycle=" << now
+                  << " warp=" << event.warp_id
+                  << " trace_kernel=" << event.key.trace_kernel_id
+                  << " cta_slot=" << event.key.cta_id
+                  << " global_cta="
+                  << m_local_to_global_cta_id[event.key.cta_id]
+                  << " barrier=0x"
+                  << format_hex_u64(event.key.barrier_addr)
+                  << " target_generation=" << event.target_generation;
+      fprintf(stderr, "%s\n", fingerprint.str().c_str());
+    }
+  }
+}
+
 void SM::cycle() {
   if (!isactive() && get_not_completed() == 0) return;
 
@@ -549,6 +1152,7 @@ void SM::cycle() {
 
   m_ldst_unit_shared_of_sm->cycle();
   m_tma_unit_shared_of_sm->cycle();
+  service_wait_block_releases_for_cycle();
 
   if(m_config->is_interwarp_coalescing_enabled && 
         ((m_config->interwarp_coalescing_selection_policy == DEP_COUNT_WAIT_OLDEST_INST_IBUFFER_GENERIC) ||
@@ -559,7 +1163,33 @@ void SM::cycle() {
   for (auto subcore : m_subcores) {
     subcore->cycle();
   }
+  if (m_config->wait_block_enable) {
+    m_wait_block_release_snapshot_valid = false;
+  }
 
+  if (m_config->producer_tail_instrument_enable) {
+    account_producer_tail_cycle();
+  }
+
+  // [overlap probe] SM-level tensor-vs-SFU pipe overlap this cycle (read-only, gated). OR the busy flags
+  // across the 4 subcores, then classify the cycle into both / tensor-only / sfu-only / neither. HW
+  // overlaps tensor(46%)+MUFU(48%) so 'both' should be large on HW; if the sim shows mostly tensor-only
+  // + sfu-only, the pipes are being run SERIALLY (the suspected root of the 1.56x issue-density gap).
+  // Compare 'both' fraction against HW min(tensor%,xu%) which is the max possible overlap.
+  if (m_config->overlap_instrument_enable) {
+    bool any_tensor_busy = false, any_sfu_busy = false;
+    for (auto subcore : m_subcores) {
+      if (subcore->is_tensor_pipe_busy_this_cycle()) any_tensor_busy = true;
+      if (subcore->is_sfu_pipe_busy_this_cycle())    any_sfu_busy = true;
+    }
+    const char *key;
+    if (any_tensor_busy && any_sfu_busy)      key = "total_num_cycles_overlap_tensor_and_sfu";
+    else if (any_tensor_busy)                 key = "total_num_cycles_overlap_tensor_only";
+    else if (any_sfu_busy)                    key = "total_num_cycles_overlap_sfu_only";
+    else                                      key = "total_num_cycles_overlap_neither";
+    auto it = m_sm_stats.m_stats_map.find(key);
+    if (it != m_sm_stats.m_stats_map.end()) it->second->increment_with_integer(1);
+  }
   // [WGMMA Opt6 Step-0] (V) SM-level idle accounting. A subcore being blocked on the
   // tensor pipe is only a real cycle loss if NO subcore on this SM issued this cycle.
   if(m_config->wgmma_step0_instrument_enable || m_config->l1i_frontend_step0_instrument_enable) {
@@ -719,6 +1349,361 @@ void SM::set_num_cycles_to_wait_to_dispatch_another_inst_from_subcore_to_sm_shar
   m_num_cycles_to_wait_to_dispatch_another_inst_from_subcore_to_sm_shared_pipeline = num_cycles;
 }
 
+bool SM::producer_tail_active_for_warp(unsigned wid) const {
+  if (!m_config->producer_tail_instrument_enable ||
+      wid >= MAX_WARP_PER_SHADER || m_physical_warp[wid] == nullptr ||
+      !m_warp_is_producer[wid] || m_warp_drain_cycle[wid] != 0) {
+    return false;
+  }
+
+  const unsigned cta_slot = m_physical_warp[wid]->get_cta_id();
+  if (cta_slot >= MAX_CTA_PER_SHADER || m_cta_status[cta_slot] == 0) {
+    return false;
+  }
+
+  bool saw_consumer = false;
+  for (unsigned w = 0; w < MAX_WARP_PER_SHADER; ++w) {
+    if (m_physical_warp[w] == nullptr ||
+        m_physical_warp[w]->get_cta_id() != cta_slot ||
+        !m_warp_is_consumer[w]) {
+      continue;
+    }
+    saw_consumer = true;
+    if (m_warp_drain_cycle[w] == 0) {
+      return false;
+    }
+  }
+  return saw_consumer;
+}
+
+void SM::record_producer_tail_issue(unsigned wid, const warp_inst_t *inst) {
+  if (!producer_tail_active_for_warp(wid) || inst == nullptr) {
+    return;
+  }
+  const unsigned cta_slot = m_physical_warp[wid]->get_cta_id();
+  ProducerTailCounters &tail = m_producer_tail_by_cta_slot[cta_slot];
+  tail.issued++;
+  tail.last_producer_issue_cycle = get_current_gpu_cycle();
+
+  const bool is_phasechk =
+      inst->sync_kind == SyncInstructionKind::PHASECHK ||
+      inst->sync_kind == SyncInstructionKind::TRYWAIT;
+  std::string opcode;
+  if (inst->has_extra_trace_instruction_info()) {
+    opcode = inst->get_extra_trace_instruction_info().get_op_code();
+  }
+  if (is_phasechk) {
+    tail.issued_phasechk++;
+  } else if (opcode.rfind("NANOSLEEP", 0) == 0) {
+    tail.issued_nanosleep++;
+  } else if (inst->op == BRANCH_OP) {
+    tail.issued_branch++;
+  } else if (inst->is_tma_op()) {
+    tail.issued_tma++;
+  } else {
+    tail.issued_other++;
+  }
+}
+
+void SM::record_producer_tail_phasechk_result(unsigned wid, bool ready) {
+  if (!producer_tail_active_for_warp(wid)) {
+    return;
+  }
+  const unsigned cta_slot = m_physical_warp[wid]->get_cta_id();
+  ProducerTailCounters &tail = m_producer_tail_by_cta_slot[cta_slot];
+  if (ready) {
+    tail.phasechk_ready++;
+  } else {
+    tail.phasechk_not_ready++;
+  }
+}
+
+// [Producer-spin ready-retry probe] whole-producer-lifetime opcode accounting.
+// Unlike the tail probe, this fires for every producer-role warp instruction
+// regardless of consumer-drain state, so it captures bwd main-loop spin too.
+void SM::record_producer_spin_issue(unsigned wid, const warp_inst_t *inst) {
+  if (!m_config->producer_spin_ready_instrument_enable || inst == nullptr ||
+      wid >= MAX_WARP_PER_SHADER || m_physical_warp[wid] == nullptr ||
+      !m_warp_is_producer[wid]) {
+    return;
+  }
+  const unsigned cta_slot = m_physical_warp[wid]->get_cta_id();
+  if (cta_slot >= MAX_CTA_PER_SHADER) {
+    return;
+  }
+  ProducerSpinCounters &spin = m_producer_spin_by_cta_slot[cta_slot];
+  const bool is_phasechk =
+      inst->sync_kind == SyncInstructionKind::PHASECHK ||
+      inst->sync_kind == SyncInstructionKind::TRYWAIT;
+  std::string opcode;
+  if (inst->has_extra_trace_instruction_info()) {
+    opcode = inst->get_extra_trace_instruction_info().get_op_code();
+  }
+  if (is_phasechk) {
+    spin.issued_phasechk++;
+  } else if (opcode.rfind("NANOSLEEP", 0) == 0) {
+    spin.issued_nanosleep++;
+  } else if (inst->op == BRANCH_OP) {
+    spin.issued_branch++;
+  } else {
+    spin.issued_other++;
+  }
+}
+
+// [Producer-spin ready-retry probe] sample the existing mbarrier result at each
+// producer PHASECHK/TRYWAIT. "ready" means the modeled Hopper mbarrier is already
+// satisfied yet the captured trace still issued this poll. Consecutive ready
+// tests on the same warp (a ready-run) beyond the first are redundant re-polls.
+void SM::record_producer_spin_phasechk_result(unsigned wid, bool ready) {
+  if (!m_config->producer_spin_ready_instrument_enable ||
+      wid >= MAX_WARP_PER_SHADER || m_physical_warp[wid] == nullptr ||
+      !m_warp_is_producer[wid]) {
+    return;
+  }
+  const unsigned cta_slot = m_physical_warp[wid]->get_cta_id();
+  if (cta_slot >= MAX_CTA_PER_SHADER) {
+    return;
+  }
+  ProducerSpinCounters &spin = m_producer_spin_by_cta_slot[cta_slot];
+  spin.phasechk_total++;
+  if (ready) {
+    spin.phasechk_ready++;
+    // A ready test that continues an already-open ready-run is a redundant
+    // re-poll (the barrier was already satisfied on the prior test).
+    if (m_producer_spin_in_ready_run[wid]) {
+      spin.ready_run_retries++;
+    }
+    m_producer_spin_in_ready_run[wid] = true;
+  } else {
+    spin.phasechk_not_ready++;
+    m_producer_spin_in_ready_run[wid] = false;
+  }
+  m_producer_spin_prev_ready[wid] = ready;
+}
+
+// [Spin-wait observe] Observe-only. Called on every PHASECHK/TRYWAIT that maps to
+// a spin_wait_sidecar primary_wait_pc. Measures, PER REGION, how long the modeled
+// mbarrier stays not-ready after the first not-ready poll of an episode (= the
+// cycles the warp WOULD be parked under fold), buckets them, and runs a
+// deadlock watchdog: if a single would-be park crosses the threshold, it emits a
+// [SPINWAITDEADLOCK] line immediately (once per episode) with the barrier state so
+// a never-flipping / pathologically-long wait is caught in the SAME 12h run.
+// It never blocks, never advances the trace, and never touches
+// m_pending_sync_waits. See .plan/SPIN_WAIT_POSTPROCESS.md.
+void SM::record_spin_wait_observe(unsigned wid, uint64_t wait_pc,
+                                  uint64_t barrier_addr, unsigned cta_id,
+                                  bool ready) {
+  if (!m_config->spin_wait_observe_enable || wid >= MAX_WARP_PER_SHADER) {
+    return;
+  }
+  SpinWaitObserveState &st = m_spin_wait_observe_by_warp[wid];
+  SpinWaitRegionObserve &reg = m_spin_wait_observe_by_region[wait_pc];
+  reg.primary_wait_pc = wait_pc;
+  const unsigned long long now = get_current_gpu_cycle();
+  const unsigned long long threshold = kSpinWaitObserveWatchdogCycles;
+  if (!ready) {
+    // Open a new episode on the first not-ready poll for this warp+region, or
+    // keep the earliest not-ready cycle if an episode for this region is open.
+    if (!st.episode_open || st.active_wait_pc != wait_pc) {
+      st.episode_open = true;
+      st.active_wait_pc = wait_pc;
+      st.active_barrier_addr = barrier_addr;
+      st.active_cta = cta_id;
+      st.first_not_ready_cycle = now;
+      st.watchdog_fired = false;
+    } else {
+      // Episode continues: check the deadlock watchdog once per episode.
+      const unsigned long long parked = now - st.first_not_ready_cycle;
+      if (!st.watchdog_fired && parked >= threshold) {
+        st.watchdog_fired = true;
+        reg.watchdog_hits++;
+        fprintf(stdout,
+                "[SPINWAITDEADLOCK] sm=%u cta=%u warp=%u wait_pc=0x%llx "
+                "barrier=0x%llx parked_cyc=%llu first_not_ready_cyc=%llu "
+                "now=%llu threshold=%llu (would-be fold park exceeded "
+                "threshold: deadlock candidate)\n",
+                m_sm_id, st.active_cta, wid,
+                (unsigned long long)wait_pc,
+                (unsigned long long)st.active_barrier_addr, parked,
+                st.first_not_ready_cycle, now, threshold);
+      }
+    }
+    return;
+  }
+  // ready: close the open episode iff it is waiting on THIS barrier (the barrier
+  // flip is the real spin-loop exit). Keying close on the BARRIER, not the
+  // wait_pc/wait_state, is essential: a producer leaves its spin loop as soon as
+  // the barrier flips, and on the next poll the phase parity has changed, so the
+  // same wait_pc is re-polled with a DIFFERENT wait_state and never matched the
+  // open episode -- leaving it falsely "open" even though the barrier flipped
+  // normally (K5 SM27 barrier 0x16c00 flips at cyc 10049/30658 yet produced 1371
+  // false [SPINWAITOPEN] under the old wait_pc-keyed close). Closing on
+  // "same barrier observed ready" tracks the real exit and equals the would-be
+  // fold park (park ends when the barrier is ready).
+  if (st.episode_open && st.active_barrier_addr == barrier_addr) {
+    SpinWaitRegionObserve &open_reg =
+        m_spin_wait_observe_by_region[st.active_wait_pc];
+    open_reg.primary_wait_pc = st.active_wait_pc;
+    const unsigned long long delta =
+        now >= st.first_not_ready_cycle ? now - st.first_not_ready_cycle : 0;
+    open_reg.episodes++;
+    open_reg.park_cycles_total += delta;
+    if (delta > open_reg.park_cycles_max) {
+      open_reg.park_cycles_max = delta;
+    }
+    const unsigned b = (delta == 0)     ? 0
+                     : (delta <= 16)    ? 1
+                     : (delta <= 64)    ? 2
+                     : (delta <= 256)   ? 3
+                     : (delta <= 1024)  ? 4
+                                        : 5;
+    open_reg.park_hist[b]++;
+    st.episode_open = false;
+    st.watchdog_fired = false;
+  } else if (!st.episode_open) {
+    // ready with no open episode: the barrier was already satisfied at the first
+    // poll of this region (would-be park = 0).
+    reg.immediate_ready_polls++;
+  }
+  // (ready while an episode is open on a DIFFERENT barrier: leave that episode
+  // open; it closes when its own barrier flips.)
+}
+
+void SM::print_spin_wait_observe_summary() const {
+  if (!m_config->spin_wait_observe_enable) {
+    return;
+  }
+  // Per-region would-be-park summary: attributes park latency to a specific spin
+  // region so fold can be applied/diagnosed region by region.
+  for (const auto &kv : m_spin_wait_observe_by_region) {
+    const SpinWaitRegionObserve &r = kv.second;
+    const double avg = r.episodes ? (double)r.park_cycles_total / r.episodes : 0.0;
+    fprintf(stdout,
+            "[SPINWAITOBS] sm=%u wait_pc=0x%llx episodes=%llu avg_park=%.1f "
+            "max_park=%llu total_park=%llu immediate_ready=%llu watchdog_hits=%llu "
+            "hist[0/1-16/17-64/65-256/257-1024/>1024]=%llu/%llu/%llu/%llu/%llu/%llu\n",
+            m_sm_id, (unsigned long long)r.primary_wait_pc, r.episodes, avg,
+            r.park_cycles_max, r.park_cycles_total, r.immediate_ready_polls,
+            r.watchdog_hits, r.park_hist[0], r.park_hist[1], r.park_hist[2],
+            r.park_hist[3], r.park_hist[4], r.park_hist[5]);
+  }
+  // Residual open episodes at print time: a producer wait whose modeled barrier
+  // never flipped for the remainder of the run -- the strongest deadlock signal.
+  for (unsigned w = 0; w < MAX_WARP_PER_SHADER; ++w) {
+    const SpinWaitObserveState &st = m_spin_wait_observe_by_warp[w];
+    if (st.episode_open) {
+      fprintf(stdout,
+              "[SPINWAITOPEN] sm=%u cta=%u warp=%u wait_pc=0x%llx barrier=0x%llx "
+              "first_not_ready_cyc=%llu (episode never released: never-flip "
+              "deadlock candidate)\n",
+              m_sm_id, st.active_cta, w, (unsigned long long)st.active_wait_pc,
+              (unsigned long long)st.active_barrier_addr,
+              st.first_not_ready_cycle);
+    }
+  }
+}
+
+void SM::account_producer_tail_cycle() {
+  const unsigned long long now = get_current_gpu_cycle();
+  for (unsigned cta_slot = 0; cta_slot < MAX_CTA_PER_SHADER; ++cta_slot) {
+    if (m_cta_status[cta_slot] == 0) {
+      continue;
+    }
+
+    bool active_tail = false;
+    bool producer_subcore_issued = false;
+    unsigned int producer_reason_mask = 0;
+    for (unsigned w = 0; w < MAX_WARP_PER_SHADER; ++w) {
+      if (!producer_tail_active_for_warp(w)) {
+        continue;
+      }
+      if (m_physical_warp[w]->get_cta_id() != cta_slot) {
+        continue;
+      }
+      active_tail = true;
+      const unsigned subcore_id =
+          translate_warp_id_of_sm_to_subcore(w, get_num_subcores());
+      assert(subcore_id < m_subcores.size());
+      producer_subcore_issued |=
+          m_subcores[subcore_id]->step0_issued_this_cycle();
+      producer_reason_mask |=
+          m_subcores[subcore_id]->step0_reason_mask_this_cycle();
+    }
+    if (!active_tail) {
+      continue;
+    }
+
+    ProducerTailCounters &tail = m_producer_tail_by_cta_slot[cta_slot];
+    if (tail.start_cycle == 0) {
+      tail.start_cycle = now;
+    }
+    tail.cycles++;
+    if (tail.last_producer_issue_cycle == now) {
+      continue;
+    }
+
+    tail.stall_cycles++;
+    bool attributed = false;
+    if (producer_subcore_issued) {
+      tail.stall_not_selected++;
+      attributed = true;
+    }
+    if (producer_reason_mask & Subcore::STEP0_R_NEXT_STAGE) {
+      tail.stall_next_stage++;
+      attributed = true;
+    }
+    if (producer_reason_mask & Subcore::STEP0_R_ISSUE_PORT_BUSY) {
+      tail.stall_issue_port++;
+      attributed = true;
+    }
+    if (producer_reason_mask &
+        (Subcore::STEP0_R_NO_VALID_FRONTEND |
+         Subcore::STEP0_R_NO_VALID_OTHER)) {
+      tail.stall_no_valid++;
+      attributed = true;
+    }
+    if (producer_reason_mask & Subcore::STEP0_R_WAIT_BARRIER) {
+      tail.stall_wait_barrier++;
+      attributed = true;
+    }
+    if (producer_reason_mask & Subcore::STEP0_R_STALL_COUNT) {
+      tail.stall_stall_count++;
+      attributed = true;
+    }
+    if (producer_reason_mask & Subcore::STEP0_R_FU_OCCUPIED) {
+      tail.stall_fu_occupied++;
+      attributed = true;
+    }
+    if (producer_reason_mask & Subcore::STEP0_R_INST_BARRIER) {
+      tail.stall_inst_barrier++;
+      attributed = true;
+    }
+    if (producer_reason_mask & Subcore::STEP0_R_TMA_FLUSH) {
+      tail.stall_tma_flush++;
+      attributed = true;
+    }
+    if (producer_reason_mask & Subcore::STEP0_R_SCOREBOARD) {
+      tail.stall_scoreboard++;
+      attributed = true;
+    }
+    if (producer_reason_mask & Subcore::STEP0_R_L1C) {
+      tail.stall_l1c++;
+      attributed = true;
+    }
+    if (producer_reason_mask & Subcore::STEP0_R_RESULT_QUEUE_FULL) {
+      tail.stall_result_queue++;
+      attributed = true;
+    }
+    if (producer_reason_mask & Subcore::STEP0_R_YIELD) {
+      tail.stall_yield++;
+      attributed = true;
+    }
+    if (!attributed) {
+      tail.stall_unattributed++;
+    }
+  }
+}
+
 bool SM::can_send_inst_from_subcore_to_sm_shared_pipeline() const {
   return (m_num_cycles_to_wait_to_dispatch_another_inst_from_subcore_to_sm_shared_pipeline == 0);
 }
@@ -739,8 +1724,13 @@ void SM::add_pending_wait_barrier_decrement(warp_inst_t *inst,
 
 void SM::add_pending_wait_barrier_increment(warp_inst_t *inst,
                                             Wait_Barrier_Type barrier_type, unsigned int barrier_id) {                                    
+  // [wait_barrier-kind probe] tag the SB with the op-class arming it, so a later stall on this SB can
+  // be attributed to WGMMA-result (recoverable by de-phasing) vs TMA (producer floor) vs other.
+  Wait_Barrier_Armed_Op armed_op = WB_ARM_OTHER;
+  if (inst->is_tensor_core_op())      armed_op = WB_ARM_TENSOR;
+  else if (inst->is_tma_op())         armed_op = WB_ARM_TMA;
   m_pending_wait_barrier_increments.push(Wait_Barrier_Entry_Modifier(
-    inst->warp_id(), barrier_id, barrier_type, Wait_Barrier_Action::INCREASE_COUNTER, inst->pc));
+    inst->warp_id(), barrier_id, barrier_type, Wait_Barrier_Action::INCREASE_COUNTER, inst->pc, armed_op));
 }
 
 
@@ -796,7 +1786,61 @@ void SM::issue_warp(register_set_uniptr &pipe_reg_set, warp_inst_t *next_inst,
   std::unique_ptr<warp_inst_t> inst_smart(next_inst);
   move_warp_uniptr(pipe_reg, inst_smart);
 
+  trace_warp_inst_t *trace_inst = nullptr;
+  trace_shd_warp_t *trace_warp = nullptr;
+  if (m_config->is_trace_mode) {
+    trace_inst = static_cast<trace_warp_inst_t *>(pipe_reg.get());
+    trace_warp =
+        static_cast<trace_shd_warp_t *>(m_physical_warp[warp_id]);
+    if (m_config->wait_block_enable &&
+        trace_inst->wait_block_trace_origin ==
+            WaitBlockTraceOrigin::SYNTHETIC &&
+        (trace_warp->partial_capsule_active() ||
+         m_partial_replay_progress[warp_id].valid)) {
+      std::cerr << "[WAITBLOCK][abort][SM" << m_sm_id << "] cyc="
+                << get_current_gpu_cycle()
+                << " reason=partial-replay-synthetic-issued"
+                << " trace_kernel=" << trace_inst->trace_kernel_id
+                << " function=" << trace_inst->unique_function_id
+                << " cta=" << m_physical_warp[warp_id]->get_cta_id()
+                << " warp=" << warp_id
+                << " requested_pc=0x" << format_hex_u64(trace_inst->pc)
+                << " expected_pc=0x" << format_hex_u64(trace_warp->get_pc())
+                << " action=abort" << std::endl;
+      abort();
+    }
+  }
+
   m_physical_warp[warp_id]->get_IBuffer_remodeled()->issued();
+  if (m_config->is_trace_mode) {
+    const unsigned int replay_remaining_before =
+        trace_inst->wait_block_trace_origin ==
+                WaitBlockTraceOrigin::PARTIAL_BLOCKED_REPLAY
+            ? trace_warp->partial_replay_remaining()
+            : 0;
+    trace_warp->commit_trace_inst(trace_inst);
+    if (trace_inst->wait_block_trace_origin ==
+        WaitBlockTraceOrigin::PARTIAL_BLOCKED_REPLAY) {
+      m_partial_replayed_occurrences_total++;
+      note_partial_replay_progress(
+          warp_id, trace_warp->partial_replay_remaining(),
+          trace_inst->pc, 1);
+      if (replay_remaining_before == 1) {
+        debug_log_wait_block_event(
+            "partial-replay-drained",
+            "trace_kernel=" +
+                std::to_string(trace_inst->trace_kernel_id) +
+                " function=" +
+                std::to_string(trace_inst->unique_function_id) +
+                " cta=" +
+                std::to_string(m_physical_warp[warp_id]->get_cta_id()) +
+                " warp=" + std::to_string(warp_id) +
+                " last_pc=0x" + format_hex_u64(trace_inst->pc) +
+                " expected_post_join_pc=0x" +
+                format_hex_u64(trace_inst->next_traced_pc));
+      }
+    }
+  }
 
   pipe_reg->issue(active_mask, warp_id,
                      m_gpu->gpu_tot_sim_cycle + m_gpu->gpu_sim_cycle,
@@ -824,15 +1868,47 @@ void SM::issue_warp(register_set_uniptr &pipe_reg_set, warp_inst_t *next_inst,
                                              [warp_id]++;  // MOD. Custom
                                                            // powermodel stats
 
+  // [TRIMCHK] Always-on producer-spin issue accounting (no flag). Count the
+  // spin-loop ops the simulator actually issues so a trimmed vs full run is
+  // distinguishable in the log without re-running: PHASECHK/TRYWAIT (mbarrier
+  // poll), NANOSLEEP (spin sleep), and the loop-back BRA. A trimmed trace issues
+  // ~48-86x fewer of these. Emitted per kernel in gpu_print_stat.
+  {
+    if (pipe_reg->sync_kind == SyncInstructionKind::PHASECHK ||
+        pipe_reg->sync_kind == SyncInstructionKind::TRYWAIT) {
+      m_gpu->trimchk_spin_phasechk_issued++;
+    } else if (pipe_reg->has_extra_trace_instruction_info() &&
+               pipe_reg->get_extra_trace_instruction_info()
+                       .get_op_code()
+                       .rfind("NANOSLEEP", 0) == 0) {
+      m_gpu->trimchk_spin_nanosleep_issued++;
+    } else if (pipe_reg->op == BRANCH_OP) {
+      m_gpu->trimchk_spin_branch_issued++;
+    }
+  }
+
   if (pipe_reg->op == MBARRIER_OP) {
     handle_sync_instruction(*pipe_reg, warp_id);
   } else if (pipe_reg->op == BARRIER_OP) {
+    PartialWaitRegionRecord replay_join_region;
+    const WaitBlockTraceOrigin trace_origin =
+        m_config->is_trace_mode
+            ? static_cast<trace_warp_inst_t *>(pipe_reg.get())
+                  ->wait_block_trace_origin
+            : WaitBlockTraceOrigin::CANONICAL;
+    const bool is_partial_replay_join =
+        m_config->is_trace_mode &&
+        (trace_origin == WaitBlockTraceOrigin::PARTIAL_SIBLING_JOIN ||
+         trace_origin == WaitBlockTraceOrigin::PARTIAL_BLOCKED_REPLAY) &&
+        m_gpu->lookup_partial_wait_join(
+            pipe_reg->trace_kernel_id, pipe_reg->unique_function_id,
+            pipe_reg->pc, replay_join_region);
     // A predicated-off BAR (active_count()==0, e.g. a warp-specialized BAR.ARV/BAR.SYNC
     // executed only by a subset of warps) is a no-op for this warp: the warp does not
     // actually arrive at the barrier on hardware. Skip the barrier-set update entirely;
     // otherwise it would (a) register a spurious arrival and (b) decode to a fallback
     // bar_id=0 since no register operand value was captured for the inactive lanes.
-    if (pipe_reg->active_count() == 0) {
+    if (pipe_reg->active_count() == 0 || is_partial_replay_join) {
       // nothing to do for this warp
     } else {
       debug_print_sm_barrier_issue(*pipe_reg, warp_id, m_sm_id,
@@ -856,7 +1932,8 @@ void SM::issue_warp(register_set_uniptr &pipe_reg_set, warp_inst_t *next_inst,
       // FA3 bwd, where MEMBAR.ALL.CTA executes 55k+ times.
       membar_scope_t scope = fence_scope_of(*pipe_reg);
       m_physical_warp[warp_id]->set_membar(scope);
-      if (m_config->bar_debug_enable) {
+      if (m_config->bar_debug_enable &&
+          m_config->bar_debug_issue_budget > 0) {
         const std::string fop =
             pipe_reg->has_extra_trace_instruction_info()
                 ? pipe_reg->get_extra_trace_instruction_info().get_op_code()
@@ -952,6 +2029,9 @@ void SM::issue_warp(register_set_uniptr &pipe_reg_set, warp_inst_t *next_inst,
             pipe_reg->get_active_mask());
       }
     }
+    if (m_config->wait_block_enable) {
+      handle_partial_wait_instruction_issue(*pipe_reg, warp_id);
+    }
   }
 }
 
@@ -978,7 +2058,8 @@ void SM::func_exec_inst(warp_inst_t &inst) {
       m_trace_warp->get_IBuffer_remodeled()->flush(true);
       m_barriers.warp_exit(inst.warp_id());
       // [FWD drain-idle 축2] stamp the cycle this warp's trace drained (first time only).
-      if (m_config->wgmma_step0_instrument_enable) {
+      if (m_config->wgmma_step0_instrument_enable ||
+          m_config->producer_tail_instrument_enable) {
         unsigned wid = inst.warp_id();
         if (wid < MAX_WARP_PER_SHADER && m_warp_drain_cycle[wid] == 0) {
           m_warp_drain_cycle[wid] = get_current_gpu_cycle();
@@ -1050,6 +2131,8 @@ void SM::init_warps(unsigned cta_id, unsigned start_thread, unsigned end_thread,
     m_drained_cyc_by_cta_slot[cta_id] = 0;
     m_wait_pending_by_cta_slot[cta_id] = 0;
     m_wait_released_by_cta_slot[cta_id] = 0;
+    m_producer_tail_by_cta_slot[cta_id] = ProducerTailCounters();
+    m_wait_block_first_late_reported_by_cta_slot[cta_id] = false;
   }
   if (m_config->model == POST_DOMINATOR) {
     unsigned start_warp = start_thread / m_config->warp_size;
@@ -1080,6 +2163,14 @@ void SM::init_warps(unsigned cta_id, unsigned start_thread, unsigned end_thread,
         m_warp_drain_cycle[i] = 0;
         m_sync_first_miss_barrier[i] = 0;
         m_sync_first_miss_cycle[i] = 0;
+        if (i < m_wait_block_last_semantic_anchor_by_warp.size()) {
+          m_wait_block_last_semantic_anchor_by_warp[i] =
+              WaitBlockSemanticAnchor();
+        }
+        if (i < m_wait_block_stall_progress_by_warp.size()) {
+          m_wait_block_stall_progress_by_warp[i] =
+              WaitBlockWarpProgress();
+        }
       }
       if (m_gpu->resume_option == 1 && kernel_id == m_gpu->resume_kernel &&
           ctaid >= m_gpu->resume_CTA && ctaid < m_gpu->checkpoint_CTA_t) {
@@ -1411,7 +2502,92 @@ unsigned int SM::sim_init_thread(kernel_info_t &kernel,
 
 void SM::reinit(unsigned start_thread, unsigned end_thread,
                 bool reset_not_completed) {
+  const unsigned first_warp = start_thread / m_config->warp_size;
+  const unsigned end_warp = end_thread / m_config->warp_size;
+  if (m_config->wait_block_enable) {
+    for (unsigned i = first_warp; i < end_warp; ++i) {
+      const bool pending_hold =
+          i < m_pending_sync_waits.size() &&
+          m_pending_sync_waits[i].valid;
+      const bool partial_arm =
+          i < m_partial_wait_arms.size() &&
+          m_partial_wait_arms[i].valid;
+      const bool replay_progress =
+          i < m_partial_replay_progress.size() &&
+          m_partial_replay_progress[i].valid;
+      const bool joined_region =
+          i < m_partial_joined_regions.size() &&
+          !m_partial_joined_regions[i].empty();
+      const bool trace_capsule =
+          m_config->is_trace_mode &&
+          static_cast<trace_shd_warp_t *>(m_physical_warp[i])
+              ->partial_capsule_active();
+      if (!pending_hold && !partial_arm && !replay_progress &&
+          !joined_region && !trace_capsule) {
+        continue;
+      }
+      const HopperMBarrierPendingWait &pending = m_pending_sync_waits[i];
+      std::cerr << "[WAITBLOCK][abort][SM" << m_sm_id << "] cyc="
+                << get_current_gpu_cycle()
+                << " reason=warp-slot-reuse-with-active-wait-block-state"
+                << " pending_hold=" << pending_hold
+                << " partial_arm=" << partial_arm
+                << " replay_progress=" << replay_progress
+                << " joined_regions=" << joined_region
+                << " trace_capsule=" << trace_capsule
+                << " strategy="
+                << wait_block_mode_to_string(pending.mode)
+                << " warp=" << i
+                << " action=abort" << std::endl;
+      abort();
+    }
+  }
+  for (unsigned i = first_warp;
+       i < end_warp && i < m_tma_open_contracts_per_warp.size(); ++i) {
+    const uint32_t open_contracts = m_tma_open_contracts_per_warp[i];
+    const uint32_t outstanding =
+        i < m_tma_outstanding_bindings_per_warp.size()
+            ? m_tma_outstanding_bindings_per_warp[i]
+            : 0;
+    if (open_contracts == 0 && outstanding == 0) {
+      continue;
+    }
+    ++m_tma_orphan_cleanup;
+    std::cerr << "[TMABIND][abort][SM" << m_sm_id << "] cyc="
+              << get_current_gpu_cycle()
+              << " reason=warp-slot-reuse-with-active-ownership"
+              << " warp=" << i
+              << " open_contracts=" << open_contracts
+              << " outstanding=" << outstanding << std::endl;
+    debug_dump_tma_binding_snapshot("warp-slot-reuse");
+    abort();
+  }
   if (reset_not_completed) {
+    for (const auto &entry : m_hopper_mbarriers) {
+      const HopperMBarrierObject &barrier = entry.second;
+      if (barrier.assignment_open ||
+          barrier.expected_tx_bytes != barrier.assigned_tx_bytes ||
+          barrier.assigned_tx_bytes != barrier.completed_tx_bytes ||
+          barrier.outstanding_tma_bindings != 0) {
+        ++m_tma_orphan_cleanup;
+        std::cerr << "[TMABIND][abort][SM" << m_sm_id << "] cyc="
+                  << get_current_gpu_cycle()
+                  << " reason=sm-reset-with-active-ownership"
+                  << " trace_kernel=" << entry.first.trace_kernel_id
+                  << " cta_slot=" << entry.first.cta_id << " barrier=0x"
+                  << format_hex_u64(entry.first.barrier_addr)
+                  << " generation=" << barrier.gen
+                  << " contract_id=" << barrier.tx_contract_id
+                  << " assignment_open=" << barrier.assignment_open
+                  << " expected=" << barrier.expected_tx_bytes
+                  << " assigned=" << barrier.assigned_tx_bytes
+                  << " completed=" << barrier.completed_tx_bytes
+                  << " outstanding=" << barrier.outstanding_tma_bindings
+                  << std::endl;
+        debug_dump_tma_binding_snapshot("sm-reset-active-ownership");
+        abort();
+      }
+    }
     m_not_completed = 0;
     m_active_threads.reset();
 
@@ -1424,23 +2600,34 @@ void SM::reinit(unsigned start_thread, unsigned end_thread,
     m_occupied_cta_to_hwtid.clear();
     m_active_warps = 0;
     m_hopper_mbarriers.clear();
-    for (auto &bindings : m_pending_tma_barrier_binds_per_warp) {
-      bindings.clear();
-    }
   }
   for (unsigned i = start_thread; i < end_thread; i++) {
     m_threadState[i].n_insn = 0;
     m_threadState[i].m_cta_id = -1;
   }
-  for (unsigned i = start_thread / m_config->warp_size;
-       i < end_thread / m_config->warp_size; ++i) {
+  for (unsigned i = first_warp; i < end_warp; ++i) {
     m_physical_warp[i]->reset();
     m_simt_stack[i]->reset();
     if (i < m_pending_sync_waits.size()) {
       m_pending_sync_waits[i] = HopperMBarrierPendingWait();
     }
-    if (i < m_pending_tma_barrier_binds_per_warp.size()) {
-      m_pending_tma_barrier_binds_per_warp[i].clear();
+    if (i < m_partial_wait_arms.size()) {
+      m_partial_wait_arms[i] = HopperPartialWaitArm();
+    }
+    if (i < m_partial_replay_progress.size()) {
+      m_partial_replay_progress[i] = HopperPartialReplayProgress();
+    }
+    if (i < m_partial_joined_regions.size()) {
+      m_partial_joined_regions[i].clear();
+    }
+    if (i < m_tma_open_contracts_per_warp.size()) {
+      m_tma_open_contracts_per_warp[i] = 0;
+    }
+    if (i < m_tma_outstanding_bindings_per_warp.size()) {
+      m_tma_outstanding_bindings_per_warp[i] = 0;
+    }
+    if (i < m_tma_max_completed_transfer_uid_per_warp.size()) {
+      m_tma_max_completed_transfer_uid_per_warp[i] = 0;
     }
   }
 }
@@ -1449,9 +2636,145 @@ void SM::register_cta_thread_exit(unsigned cta_num, kernel_info_t *kernel) {
   assert(m_cta_status[cta_num] > 0);
   m_cta_status[cta_num]--;
   if (!m_cta_status[cta_num]) {
+    if (m_config->wait_block_enable) {
+      for (unsigned warp_id = 0; warp_id < m_pending_sync_waits.size();
+           ++warp_id) {
+        const HopperMBarrierPendingWait &pending =
+            m_pending_sync_waits[warp_id];
+        if (!pending.valid || pending.key.cta_id != cta_num) {
+          continue;
+        }
+        std::cerr << "[WAITBLOCK][abort][SM" << m_sm_id << "] cyc="
+                  << get_current_gpu_cycle()
+                  << " reason=cta-exit-with-active-hold"
+                  << " strategy=" << wait_block_mode_to_string(pending.mode)
+                  << " trace_kernel=" << pending.key.trace_kernel_id
+                  << " cta=" << cta_num << " warp=" << warp_id
+                  << " action_pc=0x" << format_hex_u64(pending.action_pc)
+                  << " action=abort" << std::endl;
+        abort();
+      }
+      for (unsigned warp_id = 0; warp_id < m_partial_wait_arms.size();
+           ++warp_id) {
+        if (m_physical_warp[warp_id]->get_cta_id() != cta_num) {
+          continue;
+        }
+        const bool partial_arm = m_partial_wait_arms[warp_id].valid;
+        const bool replay_progress =
+            m_partial_replay_progress[warp_id].valid;
+        const bool joined_region =
+            !m_partial_joined_regions[warp_id].empty();
+        const bool trace_capsule =
+            m_config->is_trace_mode &&
+            static_cast<trace_shd_warp_t *>(m_physical_warp[warp_id])
+                ->partial_capsule_active();
+        if (!partial_arm && !replay_progress && !joined_region &&
+            !trace_capsule) {
+          continue;
+        }
+        std::cerr << "[WAITBLOCK][abort][SM" << m_sm_id << "] cyc="
+                  << get_current_gpu_cycle()
+                  << " reason=cta-exit-with-active-partial-state"
+                  << " cta=" << cta_num << " warp=" << warp_id
+                  << " partial_arm=" << partial_arm
+                  << " replay_progress=" << replay_progress
+                  << " joined_regions=" << joined_region
+                  << " trace_capsule=" << trace_capsule
+                  << " action=abort" << std::endl;
+        abort();
+      }
+    }
     // Record first completed CTA for ground truth validation
     unsigned global_cta_id = m_local_to_global_cta_id[cta_num];
     m_gpu->record_first_completed_cta(global_cta_id, m_sm_id);
+
+    if (m_config->producer_tail_instrument_enable) {
+      unsigned producer_warps = 0, consumer_warps = 0;
+      unsigned long long producer_last_drain = 0;
+      unsigned long long consumer_last_drain = 0;
+      for (unsigned w = 0; w < MAX_WARP_PER_SHADER; ++w) {
+        if (m_physical_warp[w] == nullptr ||
+            m_physical_warp[w]->get_cta_id() != cta_num) {
+          continue;
+        }
+        if (m_warp_is_producer[w]) {
+          producer_warps++;
+          producer_last_drain =
+              std::max(producer_last_drain, m_warp_drain_cycle[w]);
+        }
+        if (m_warp_is_consumer[w]) {
+          consumer_warps++;
+          consumer_last_drain =
+              std::max(consumer_last_drain, m_warp_drain_cycle[w]);
+        }
+      }
+      const ProducerTailCounters &tail =
+          m_producer_tail_by_cta_slot[cta_num];
+      printf(
+          "[PRODTAIL] sm=%u cta_slot=%u global_cta=%u "
+          "producer_warps=%u consumer_warps=%u "
+          "producer_last_drain=%llu consumer_last_drain=%llu "
+          "tail_start=%llu tail_cycles=%llu issued=%llu "
+          "issued_phasechk=%llu issued_nanosleep=%llu "
+          "issued_branch=%llu issued_tma=%llu issued_other=%llu "
+          "phasechk_ready=%llu phasechk_not_ready=%llu "
+          "stall_cycles=%llu stall_not_selected=%llu "
+          "stall_next_stage=%llu stall_issue_port=%llu "
+          "stall_no_valid=%llu stall_wait_barrier=%llu "
+          "stall_stall_count=%llu stall_fu_occupied=%llu "
+          "stall_inst_barrier=%llu stall_tma_flush=%llu "
+          "stall_scoreboard=%llu stall_l1c=%llu "
+          "stall_result_queue=%llu stall_yield=%llu "
+          "stall_unattributed=%llu\n",
+          m_sm_id, cta_num, global_cta_id, producer_warps,
+          consumer_warps, producer_last_drain, consumer_last_drain,
+          tail.start_cycle, tail.cycles, tail.issued,
+          tail.issued_phasechk, tail.issued_nanosleep,
+          tail.issued_branch, tail.issued_tma, tail.issued_other,
+          tail.phasechk_ready, tail.phasechk_not_ready,
+          tail.stall_cycles, tail.stall_not_selected,
+          tail.stall_next_stage, tail.stall_issue_port,
+          tail.stall_no_valid, tail.stall_wait_barrier,
+          tail.stall_stall_count, tail.stall_fu_occupied,
+          tail.stall_inst_barrier, tail.stall_tma_flush,
+          tail.stall_scoreboard, tail.stall_l1c,
+          tail.stall_result_queue, tail.stall_yield,
+          tail.stall_unattributed);
+      m_producer_tail_by_cta_slot[cta_num] = ProducerTailCounters();
+    }
+
+    if (m_config->producer_spin_ready_instrument_enable) {
+      const ProducerSpinCounters &spin = m_producer_spin_by_cta_slot[cta_num];
+      printf(
+          "[PRODSPIN] sm=%u cta_slot=%u global_cta=%u "
+          "phasechk_total=%llu phasechk_ready=%llu phasechk_not_ready=%llu "
+          "ready_run_retries=%llu issued_phasechk=%llu issued_nanosleep=%llu "
+          "issued_branch=%llu issued_other=%llu\n",
+          m_sm_id, cta_num, m_local_to_global_cta_id[cta_num],
+          spin.phasechk_total, spin.phasechk_ready, spin.phasechk_not_ready,
+          spin.ready_run_retries, spin.issued_phasechk, spin.issued_nanosleep,
+          spin.issued_branch, spin.issued_other);
+      m_producer_spin_by_cta_slot[cta_num] = ProducerSpinCounters();
+      // Reset per-warp ready-run trackers for warps owned by this CTA slot so a
+      // reused slot (bwd multi-wave) starts clean.
+      for (unsigned w = 0; w < MAX_WARP_PER_SHADER; ++w) {
+        if (m_physical_warp[w] != nullptr &&
+            m_physical_warp[w]->get_cta_id() == cta_num) {
+          m_producer_spin_prev_ready[w] = false;
+          m_producer_spin_in_ready_run[w] = false;
+        }
+      }
+    }
+
+    // [Spin-wait observe] Emit the SM-global cumulative would-be-park summary.
+    // Counters accumulate across the whole SM, so the final CTA-exit print holds
+    // the complete totals; a post-processing pass takes the last/max per SM.
+    if (m_config->spin_wait_observe_enable) {
+      print_spin_wait_observe_summary();
+    }
+    if (m_config->wait_block_enable) {
+      print_wait_block_summary();
+    }
 
     // [CTA-imbalance diag] Emit this CTA's finish cycle, elapsed cycles, and raw
     // tensor-op (WGMMA) count so tail-drain can be correlated with tensor density
@@ -1515,6 +2838,34 @@ void SM::register_cta_thread_exit(unsigned cta_num, kernel_info_t *kernel) {
     m_n_active_cta--;
     m_barriers.deallocate_barrier(cta_num);
     clear_sync_barrier_state_for_cta(cta_num);
+    if (m_config->wait_block_enable && m_n_active_cta == 0 &&
+        (m_missing_wait_holds_total != m_missing_wait_releases_total ||
+         m_fold_parks_total != m_fold_releases_total ||
+         m_fold_aux_holds_total != m_fold_aux_releases_total ||
+         m_partial_join_holds_total != m_partial_join_releases_total ||
+         m_partial_deferred_occurrences_total !=
+             m_partial_replayed_occurrences_total +
+                 m_partial_folded_occurrences_total)) {
+      std::cerr << "[WAITBLOCK][abort][SM" << m_sm_id << "] cyc="
+                << get_current_gpu_cycle()
+                << " reason=terminal-hold-release-imbalance"
+                << " missing_holds=" << m_missing_wait_holds_total
+                << " missing_releases=" << m_missing_wait_releases_total
+                << " poll_holds=" << m_fold_parks_total
+                << " poll_releases=" << m_fold_releases_total
+                << " poll_aux_holds=" << m_fold_aux_holds_total
+                << " poll_aux_releases=" << m_fold_aux_releases_total
+                << " partial_holds=" << m_partial_join_holds_total
+                << " partial_releases=" << m_partial_join_releases_total
+                << " partial_deferred="
+                << m_partial_deferred_occurrences_total
+                << " partial_replayed="
+                << m_partial_replayed_occurrences_total
+                << " partial_folded="
+                << m_partial_folded_occurrences_total
+                << " action=abort" << std::endl;
+      abort();
+    }
     shader_CTA_count_unlog(m_sm_id, 1);
 
     SHADER_DPRINTF(
@@ -1570,6 +2921,76 @@ address_type SM::next_pc(int tid) const {
 
 void SM::set_kernel(kernel_info_t *k) {
   assert(k);
+  const uint64_t next_launch_uid = k->get_uid();
+  reset_wait_block_launch_state(next_launch_uid);
+  if (m_tma_binding_launch_uid != 0 &&
+      m_tma_binding_launch_uid != next_launch_uid) {
+    for (unsigned int warp_id = 0;
+         warp_id < m_tma_open_contracts_per_warp.size(); ++warp_id) {
+      const uint32_t open_contracts =
+          m_tma_open_contracts_per_warp[warp_id];
+      const uint32_t outstanding =
+          m_tma_outstanding_bindings_per_warp[warp_id];
+      if (open_contracts != 0 || outstanding != 0) {
+        ++m_tma_orphan_cleanup;
+        std::cerr << "[TMABIND][abort][SM" << m_sm_id << "] cyc="
+                  << get_current_gpu_cycle()
+                  << " reason=kernel-switch-with-active-warp-ownership"
+                  << " old_launch=" << m_tma_binding_launch_uid
+                  << " next_launch=" << next_launch_uid
+                  << " warp=" << warp_id
+                  << " open_contracts=" << open_contracts
+                  << " outstanding=" << outstanding << std::endl;
+        debug_dump_tma_binding_snapshot(
+            "kernel-switch-active-warp-ownership");
+        abort();
+      }
+    }
+    for (const auto &entry : m_hopper_mbarriers) {
+      const HopperMBarrierObject &barrier = entry.second;
+      if (barrier.assignment_open ||
+          barrier.expected_tx_bytes != barrier.assigned_tx_bytes ||
+          barrier.assigned_tx_bytes != barrier.completed_tx_bytes ||
+          barrier.outstanding_tma_bindings != 0) {
+        ++m_tma_orphan_cleanup;
+        std::cerr << "[TMABIND][abort][SM" << m_sm_id << "] cyc="
+                  << get_current_gpu_cycle()
+                  << " reason=kernel-switch-with-active-ownership"
+                  << " old_launch=" << m_tma_binding_launch_uid
+                  << " next_launch=" << next_launch_uid
+                  << " contract_id=" << barrier.tx_contract_id
+                  << " expected=" << barrier.expected_tx_bytes
+                  << " assigned=" << barrier.assigned_tx_bytes
+                  << " completed=" << barrier.completed_tx_bytes
+                  << " outstanding=" << barrier.outstanding_tma_bindings
+                  << std::endl;
+        debug_dump_tma_binding_snapshot("kernel-switch-active-ownership");
+        abort();
+      }
+    }
+    debug_dump_tma_binding_counters();
+    m_tma_contracts_opened = 0;
+    m_tma_contracts_fully_assigned = 0;
+    m_tma_max_open_contracts_per_warp = 0;
+    m_tma_bindings_created = 0;
+    m_tma_bindings_completed = 0;
+    m_tma_assigned_credit_bytes = 0;
+    m_tma_completed_credit_bytes = 0;
+    m_tma_uid_reorders = 0;
+    m_tma_cross_barrier_applications = 0;
+    m_tma_contract_mismatches = 0;
+    m_tma_stale_generation = 0;
+    m_tma_launch_or_cta_mismatch = 0;
+    m_tma_duplicate_completion = 0;
+    m_tma_orphan_cleanup = 0;
+    std::fill(m_tma_open_contracts_per_warp.begin(),
+              m_tma_open_contracts_per_warp.end(), 0);
+    std::fill(m_tma_outstanding_bindings_per_warp.begin(),
+              m_tma_outstanding_bindings_per_warp.end(), 0);
+    std::fill(m_tma_max_completed_transfer_uid_per_warp.begin(),
+              m_tma_max_completed_transfer_uid_per_warp.end(), 0);
+  }
+  m_tma_binding_launch_uid = next_launch_uid;
   m_kernel = k;
   //        k->inc_running();
   printf(
@@ -1740,28 +3161,1263 @@ bool SM::check_if_non_released_reduction_barrier(warp_inst_t &inst) {
 }
 
 bool SM::warp_waiting_at_barrier(unsigned warp_id) const {
-  if (m_barriers.warp_waiting_at_barrier(warp_id)) {
-    return true;
+  return m_barriers.warp_waiting_at_barrier(warp_id) ||
+         peek_wait_block_hold_mode(warp_id) != WaitBlockPendingMode::NONE;
+}
+
+// WaitBlock-only non-mutating alias used by legacy stall metrics. Named BAR
+// state is intentionally excluded so the two domains cannot be double-counted.
+bool SM::warp_held_on_mbarrier_wait(unsigned warp_id) const {
+  return peek_wait_block_hold_mode(warp_id) !=
+         WaitBlockPendingMode::NONE;
+}
+
+// [Stage 1] Common cursor-skip shared by the parked-release and immediate-ready
+// fold paths. Flushes younger prefetched IBuffer entries, builds the allowed
+// skip-PC set from the region (body_pcs + loopback_bra_pc), and advances the
+// trace cursor to region.exit_pc. All generation/counter/pending-wait/park
+// bookkeeping is intentionally left to the caller so the two paths cannot
+// diverge in their skip mechanics again. See plan Stage 1.
+unsigned SM::fold_cursor_skip_to_exit(unsigned warp_id,
+                                      const SpinWaitRegionRecord &region,
+                                      FoldSkipStats &out_stats) {
+  trace_shd_warp_t *tw =
+      static_cast<trace_shd_warp_t *>(m_physical_warp[warp_id]);
+  const bool in_partial_replay =
+      tw->partial_replay_active() &&
+      tw->partial_replay_origin() ==
+          WaitBlockTraceOrigin::PARTIAL_BLOCKED_REPLAY;
+  const unsigned int cursor_before_flush = tw->used_insts;
+  tw->get_IBuffer_remodeled()->flush(false);
+  const unsigned int cursor_after_flush = tw->used_insts;
+  if (cursor_after_flush > cursor_before_flush) {
+    std::cerr << "[WAITBLOCK][abort][SM" << m_sm_id
+              << "] cyc=" << get_current_gpu_cycle()
+              << " reason=poll-prefetch-rollback-direction"
+              << " block=" << region.block_id << " warp=" << warp_id
+              << " cursor_before_flush=" << cursor_before_flush
+              << " cursor_after_flush=" << cursor_after_flush
+              << " action=abort" << std::endl;
+    abort();
   }
-  if (warp_id >= m_pending_sync_waits.size()) {
-    return false;
+  std::set<address_type> allowed_skip_pcs;
+  for (uint64_t bp : region.body_pcs) {
+    allowed_skip_pcs.insert(static_cast<address_type>(bp));
+  }
+  // body_pcs deliberately excludes the loopback BRA; add it so the guard lets
+  // the cursor advance over the loop-closing branch on its way to exit_pc.
+  allowed_skip_pcs.insert(static_cast<address_type>(region.loopback_bra_pc));
+  const unsigned int skipped =
+      in_partial_replay
+          ? tw->skip_partial_replay_to_exit(
+                static_cast<address_type>(region.exit_pc),
+                static_cast<address_type>(region.loopback_bra_pc),
+                allowed_skip_pcs, &out_stats)
+          : tw->skip_spin_to_exit(
+                static_cast<address_type>(region.exit_pc),
+                static_cast<address_type>(region.loopback_bra_pc),
+                allowed_skip_pcs, &out_stats);
+  const unsigned int cursor_after_skip = tw->used_insts;
+  if (in_partial_replay) {
+    m_partial_folded_occurrences_total += skipped;
+  }
+  if (!in_partial_replay) {
+    out_stats.cursor_before_flush = cursor_before_flush;
+    out_stats.cursor_after_flush = cursor_after_flush;
+    out_stats.cursor_after_skip = cursor_after_skip;
+    out_stats.prefetched_rollback = cursor_before_flush - cursor_after_flush;
+  }
+  const bool cursor_accounting_ok =
+      in_partial_replay
+          ? (out_stats.cursor_after_skip >= out_stats.cursor_after_flush &&
+             out_stats.cursor_after_skip - out_stats.cursor_after_flush ==
+                 skipped)
+          : (cursor_after_skip >= cursor_after_flush &&
+             cursor_after_skip - cursor_after_flush == skipped);
+  if (!cursor_accounting_ok ||
+      out_stats.warp_insts != skipped ||
+      tw->get_pc() != region.exit_pc) {
+    std::cerr << "[WAITBLOCK][abort][SM" << m_sm_id
+              << "] cyc=" << get_current_gpu_cycle()
+              << " reason=poll-cursor-accounting"
+              << " block=" << region.block_id << " warp=" << warp_id
+              << " expected_exit_pc=0x" << format_hex_u64(region.exit_pc)
+              << " actual_landing_pc=0x" << format_hex_u64(tw->get_pc())
+              << " cursor_before_flush=" << cursor_before_flush
+              << " cursor_after_flush=" << cursor_after_flush
+              << " prefetched_rollback=" << out_stats.prefetched_rollback
+              << " cursor_after_skip=" << cursor_after_skip
+              << " replay_cursor_after_skip="
+              << out_stats.cursor_after_skip
+              << " source="
+              << (in_partial_replay ? "partial-replay" : "canonical")
+              << " skipped=" << skipped << " action=abort" << std::endl;
+    abort();
+  }
+  if (in_partial_replay && skipped != 0) {
+    note_partial_replay_progress(
+        warp_id, tw->partial_replay_remaining(), tw->get_pc(), skipped);
+  }
+  return skipped;
+}
+
+void SM::note_partial_replay_progress(
+    unsigned int warp_id, unsigned int remaining, uint64_t pc,
+    unsigned int advanced_occurrences) {
+  if (warp_id >= m_partial_replay_progress.size()) {
+    std::cerr << "[WAITBLOCK][abort][SM" << m_sm_id << "] cyc="
+              << get_current_gpu_cycle()
+              << " reason=partial-replay-progress-warp-range"
+              << " warp=" << warp_id << " action=abort" << std::endl;
+    abort();
+  }
+  HopperPartialReplayProgress &progress =
+      m_partial_replay_progress[warp_id];
+  if (advanced_occurrences == 0 || !progress.valid ||
+      remaining > progress.last_remaining ||
+      progress.last_remaining - remaining != advanced_occurrences ||
+      progress.progressed_occurrences + advanced_occurrences >
+          progress.initial_remaining) {
+    std::cerr << "[WAITBLOCK][abort][SM" << m_sm_id << "] cyc="
+              << get_current_gpu_cycle()
+              << " reason=partial-replay-progress-accounting"
+              << " warp=" << warp_id
+              << " valid=" << progress.valid
+              << " previous_remaining=" << progress.last_remaining
+              << " remaining=" << remaining
+              << " advanced=" << advanced_occurrences
+              << " pc=0x" << format_hex_u64(pc)
+              << " action=abort" << std::endl;
+    abort();
+  }
+  progress.last_remaining = remaining;
+  progress.last_pc = pc;
+  progress.progressed_occurrences += advanced_occurrences;
+  progress.last_progress_cycle = get_current_gpu_cycle();
+  progress.last_heartbeat_cycle = progress.last_progress_cycle;
+}
+
+void SM::service_partial_replay_progress(unsigned int warp_id) {
+  if (warp_id >= m_partial_replay_progress.size()) {
+    return;
+  }
+  HopperPartialReplayProgress &progress =
+      m_partial_replay_progress[warp_id];
+  if (!progress.valid) {
+    return;
+  }
+
+  const uint64_t now = get_current_gpu_cycle();
+  if (m_physical_warp[warp_id]->get_cta_id() != progress.cta_id) {
+    std::cerr << "[WAITBLOCK][abort][SM" << m_sm_id << "] cyc=" << now
+              << " reason=partial-replay-progress-cta-mismatch"
+              << " trace_kernel=" << progress.trace_kernel_id
+              << " cta=" << progress.cta_id
+              << " actual_cta="
+              << m_physical_warp[warp_id]->get_cta_id()
+              << " warp=" << warp_id << " action=abort" << std::endl;
+    abort();
+  }
+
+  HopperPartialWaitArm &arm = m_partial_wait_arms[warp_id];
+  HopperMBarrierPendingWait &pending_wait =
+      m_pending_sync_waits[warp_id];
+  if (arm.valid || pending_wait.valid) {
+    if (arm.valid && !arm.source_was_deferred_replay) {
+      std::cerr << "[WAITBLOCK][abort][SM" << m_sm_id << "] cyc=" << now
+                << " reason=partial-replay-overlapped-by-canonical-arm"
+                << " owner_region=" << progress.region_id
+                << " nested_region=" << arm.record.partial_region_id
+                << " warp=" << warp_id << " action=abort" << std::endl;
+      abort();
+    }
+    // The nested partial or mbarrier hold owns forward-progress checking until
+    // it releases. Its transition/hold watchdog remains active independently.
+    progress.last_progress_cycle = now;
+    progress.last_heartbeat_cycle = now;
+    return;
+  }
+
+  trace_shd_warp_t *tw =
+      static_cast<trace_shd_warp_t *>(m_physical_warp[warp_id]);
+  const unsigned int remaining = tw->partial_replay_remaining();
+  const bool replay_active = tw->partial_replay_active();
+  if (remaining != progress.last_remaining ||
+      progress.progressed_occurrences + remaining !=
+          progress.initial_remaining ||
+      (replay_active &&
+       tw->partial_replay_origin() !=
+           WaitBlockTraceOrigin::PARTIAL_BLOCKED_REPLAY) ||
+      (!replay_active && remaining != 0)) {
+    std::cerr << "[WAITBLOCK][abort][SM" << m_sm_id << "] cyc=" << now
+              << " reason=partial-replay-progress-state-drift"
+              << " block=" << progress.block_id
+              << " region=" << progress.region_id
+              << " warp=" << warp_id
+              << " replay_active=" << replay_active
+              << " expected_remaining=" << progress.last_remaining
+              << " actual_remaining=" << remaining
+              << " initial=" << progress.initial_remaining
+              << " progressed=" << progress.progressed_occurrences
+              << " action=abort" << std::endl;
+    abort();
+  }
+
+  const uint64_t no_progress_cycles = now - progress.last_progress_cycle;
+  if (now - progress.last_heartbeat_cycle >=
+      m_config->wait_block_heartbeat_cycles) {
+    debug_log_wait_block_event(
+        "partial-replay-heartbeat",
+        "block=" + progress.block_id +
+            " region=" + progress.region_id +
+            " trace_kernel=" +
+            std::to_string(progress.trace_kernel_id) +
+            " function=" +
+            std::to_string(progress.unique_function_id) +
+            " cta=" + std::to_string(progress.cta_id) +
+            " warp=" + std::to_string(warp_id) +
+            " remaining=" + std::to_string(remaining) +
+            " progressed=" +
+            std::to_string(progress.progressed_occurrences) +
+            " last_pc=0x" + format_hex_u64(progress.last_pc) +
+            " expected_post_join_pc=0x" +
+            format_hex_u64(progress.post_join_pc) +
+            " age=" + std::to_string(now - progress.start_cycle) +
+            " no_progress_cycles=" +
+            std::to_string(no_progress_cycles));
+    progress.last_heartbeat_cycle = now;
+  }
+  if (no_progress_cycles > m_config->wait_block_hold_watchdog_cycles) {
+    m_partial_replay_watchdog_aborts_total++;
+    m_wait_block_watchdog_aborts_total++;
+    std::cerr << "[WAITBLOCK][abort][SM" << m_sm_id << "] cyc=" << now
+              << " reason=partial-replay-watchdog"
+              << " block=" << progress.block_id
+              << " region=" << progress.region_id
+              << " trace_kernel=" << progress.trace_kernel_id
+              << " function=" << progress.unique_function_id
+              << " cta=" << progress.cta_id
+              << " global_cta="
+              << m_local_to_global_cta_id[progress.cta_id]
+              << " warp=" << warp_id
+              << " remaining=" << remaining
+              << " initial=" << progress.initial_remaining
+              << " progressed=" << progress.progressed_occurrences
+              << " last_pc=0x" << format_hex_u64(progress.last_pc)
+              << " expected_post_join_pc=0x"
+              << format_hex_u64(progress.post_join_pc)
+              << " age=" << now - progress.start_cycle
+              << " no_progress_cycles=" << no_progress_cycles
+              << " threshold=" << m_config->wait_block_hold_watchdog_cycles
+              << " action=abort" << std::endl;
+    abort();
+  }
+}
+
+void SM::start_partial_wait_hold(unsigned int warp_id,
+                                 HopperPartialWaitArm &arm) {
+  if (!arm.valid || arm.mode == PartialWaitArmMode::NONE ||
+      warp_id >= m_pending_sync_waits.size() ||
+      m_pending_sync_waits[warp_id].valid ||
+      m_partial_joined_regions[warp_id].count(
+          arm.record.partial_region_id) == 0) {
+    std::cerr << "[WAITBLOCK][abort][SM" << m_sm_id << "] cyc="
+              << get_current_gpu_cycle()
+              << " reason=invalid-partial-hold-transition"
+              << " warp=" << warp_id
+              << " block=" << arm.record.block_id
+              << " region=" << arm.record.partial_region_id
+              << " action=abort" << std::endl;
+    abort();
+  }
+
+  trace_shd_warp_t *tw =
+      static_cast<trace_shd_warp_t *>(m_physical_warp[warp_id]);
+  tw->get_IBuffer_remodeled()->flush(false);
+
+  HopperMBarrierPendingWait held;
+  held.valid = true;
+  held.is_trywait =
+      arm.record.entry_probe_kind == SyncInstructionKind::TRYWAIT;
+  held.key = arm.key;
+  held.wait_state_raw = arm.wait_state_raw;
+  held.mode = WaitBlockPendingMode::PARTIAL_MISSING_WAIT_HOLD;
+  held.block_id = arm.record.block_id;
+  held.action_pc = arm.record.entry_probe_pc;
+  held.unique_function_id = arm.unique_function_id;
+  held.expected_gen = arm.expected_gen;
+  held.uses_exact_generation_ticket =
+      arm.uses_exact_generation_ticket;
+  held.hold_start_cycle = get_current_gpu_cycle();
+  held.last_heartbeat_cycle = held.hold_start_cycle;
+  m_pending_sync_waits[warp_id] = held;
+  arm.mode = PartialWaitArmMode::HOLDING;
+  m_missing_wait_holds_total++;
+  m_partial_join_holds_total++;
+  debug_log_wait_block_event(
+      "partial-join-hold",
+      "block=" + arm.record.block_id +
+          " region=" + arm.record.partial_region_id +
+          " trace_kernel=" + std::to_string(arm.key.trace_kernel_id) +
+          " function=" + std::to_string(held.unique_function_id) +
+          " cta=" + std::to_string(arm.key.cta_id) +
+          " warp=" + std::to_string(warp_id) +
+          " entry_pc=0x" + format_hex_u64(arm.record.entry_probe_pc) +
+          " join_pc=0x" + format_hex_u64(arm.record.join_pc) +
+          " blocked_mask=0x" + format_hex_u64(arm.blocked_mask) +
+          " sibling_mask=0x" + format_hex_u64(arm.sibling_mask) +
+          " expected_gen=" + std::to_string(arm.expected_gen) +
+          " current_gen=" + std::to_string(sync_barrier_gen(arm.key)) +
+          " deferred=" +
+          std::to_string(tw->partial_deferred_size()));
+}
+
+void SM::handle_partial_wait_instruction_issue(const warp_inst_t &inst,
+                                               unsigned int warp_id) {
+  if (!m_config->is_trace_mode ||
+      warp_id >= m_partial_wait_arms.size() ||
+      warp_id >= m_partial_joined_regions.size()) {
+    return;
+  }
+
+  PartialWaitRegionRecord join_region;
+  if (m_gpu->lookup_partial_wait_join(
+          inst.trace_kernel_id, inst.unique_function_id, inst.pc,
+          join_region)) {
+    const uint64_t issued_mask = inst.get_active_mask().to_ullong();
+    if (join_region.sibling_masks.count(issued_mask) != 0) {
+      if (!m_partial_joined_regions[warp_id]
+               .insert(join_region.region_id)
+               .second) {
+        std::cerr << "[WAITBLOCK][abort][SM" << m_sm_id << "] cyc="
+                  << get_current_gpu_cycle()
+                  << " reason=duplicate-partial-sibling-join"
+                  << " region=" << join_region.region_id
+                  << " warp=" << warp_id << " action=abort" << std::endl;
+        abort();
+      }
+      debug_log_wait_block_event(
+          "partial-sibling-join",
+          "region=" + join_region.region_id +
+              " trace_kernel=" + std::to_string(inst.trace_kernel_id) +
+              " function=" + std::to_string(inst.unique_function_id) +
+              " cta=" +
+              std::to_string(m_physical_warp[warp_id]->get_cta_id()) +
+              " warp=" + std::to_string(warp_id) +
+              " join_pc=0x" + format_hex_u64(inst.pc) +
+              " sibling_mask=0x" + format_hex_u64(issued_mask));
+    }
+  }
+
+  HopperPartialWaitArm &arm = m_partial_wait_arms[warp_id];
+  if (arm.valid) {
+    if (inst.trace_kernel_id != arm.key.trace_kernel_id ||
+        inst.unique_function_id != arm.unique_function_id) {
+      std::cerr << "[WAITBLOCK][abort][SM" << m_sm_id << "] cyc="
+                << get_current_gpu_cycle()
+                << " reason=partial-arm-identity-mismatch"
+                << " block=" << arm.record.block_id
+                << " warp=" << warp_id
+                << " trace_kernel=" << inst.trace_kernel_id
+                << " function=" << inst.unique_function_id
+                << " action=abort" << std::endl;
+      abort();
+    }
+    if (arm.mode == PartialWaitArmMode::ARMED) {
+      if (inst.pc == arm.record.entry_probe_pc) {
+        return;
+      }
+      const uint64_t arming_owner =
+          static_cast<uint64_t>(inst.trace_active_mask) &
+          (arm.blocked_mask | arm.sibling_mask);
+      if (!inst.trace_masks_valid ||
+          (arming_owner != 0 &&
+           (arming_owner & ~arm.blocked_mask) != 0)) {
+        std::cerr << "[WAITBLOCK][abort][SM" << m_sm_id << "] cyc="
+                  << get_current_gpu_cycle()
+                  << " reason=partial-arming-mask-escape"
+                  << " block=" << arm.record.block_id
+                  << " warp=" << warp_id << " pc=0x"
+                  << format_hex_u64(inst.pc)
+                  << " trace_active_mask=0x"
+                  << format_hex_u64(inst.trace_active_mask)
+                  << " blocked_mask=0x"
+                  << format_hex_u64(arm.blocked_mask)
+                  << " action=abort" << std::endl;
+        abort();
+      }
+      if (inst.pc != arm.record.entry_branch_pc) {
+        if (std::find(arm.record.entry_arming_pcs.begin(),
+                      arm.record.entry_arming_pcs.end(),
+                      static_cast<uint64_t>(inst.pc)) ==
+            arm.record.entry_arming_pcs.end()) {
+          std::cerr << "[WAITBLOCK][abort][SM" << m_sm_id << "] cyc="
+                    << get_current_gpu_cycle()
+                    << " reason=partial-arming-path-escape"
+                    << " block=" << arm.record.block_id
+                    << " warp=" << warp_id << " pc=0x"
+                    << format_hex_u64(inst.pc)
+                    << " expected_branch_pc=0x"
+                    << format_hex_u64(arm.record.entry_branch_pc)
+                    << " action=abort" << std::endl;
+          abort();
+        }
+        return;
+      }
+
+      if (m_partial_joined_regions[warp_id].count(
+              arm.record.partial_region_id) != 0) {
+        m_partial_join_already_issued_total++;
+        start_partial_wait_hold(warp_id, arm);
+        return;
+      }
+
+      trace_shd_warp_t *tw =
+          static_cast<trace_shd_warp_t *>(m_physical_warp[warp_id]);
+      const unsigned int cursor_before_flush = tw->used_insts;
+      tw->get_IBuffer_remodeled()->flush(false);
+      const unsigned int cursor_after_flush = tw->used_insts;
+      if (cursor_after_flush > cursor_before_flush) {
+        std::cerr << "[WAITBLOCK][abort][SM" << m_sm_id << "] cyc="
+                  << get_current_gpu_cycle()
+                  << " reason=partial-prefetch-rollback-direction"
+                  << " block=" << arm.record.block_id
+                  << " warp=" << warp_id
+                  << " cursor_before_flush=" << cursor_before_flush
+                  << " cursor_after_flush=" << cursor_after_flush
+                  << " action=abort" << std::endl;
+        abort();
+      }
+      PartialTraceExtractStats stats;
+      std::string failure;
+      if (!tw->extract_partial_wait_capsule(
+              arm.blocked_mask, arm.sibling_mask,
+              arm.blocked_mask | arm.sibling_mask,
+              arm.unique_function_id,
+              static_cast<address_type>(arm.record.captured_ready_pc),
+              static_cast<address_type>(arm.record.join_pc),
+              static_cast<address_type>(arm.record.post_join_pc),
+              &stats, &failure)) {
+        std::cerr << "[WAITBLOCK][abort][SM" << m_sm_id << "] cyc="
+                  << get_current_gpu_cycle()
+                  << " reason=partial-capsule-extraction-failed"
+                  << " detail=" << failure
+                  << " block=" << arm.record.block_id
+                  << " region=" << arm.record.partial_region_id
+                  << " warp=" << warp_id
+                  << " source_pc=0x"
+                  << format_hex_u64(tw->canonical_trace_pc())
+                  << " expected_ready_pc=0x"
+                  << format_hex_u64(arm.record.captured_ready_pc)
+                  << " action=abort" << std::endl;
+        abort();
+      }
+      if (stats.cursor_before != cursor_after_flush ||
+          stats.cursor_after < stats.cursor_before ||
+          stats.cursor_after - stats.cursor_before !=
+              stats.blocked_occurrences + stats.sibling_join_occurrences) {
+        std::cerr << "[WAITBLOCK][abort][SM" << m_sm_id << "] cyc="
+                  << get_current_gpu_cycle()
+                  << " reason=partial-extraction-cursor-accounting"
+                  << " block=" << arm.record.block_id
+                  << " warp=" << warp_id
+                  << " cursor_before_flush=" << cursor_before_flush
+                  << " cursor_after_flush=" << cursor_after_flush
+                  << " cursor_after_extract=" << stats.cursor_after
+                  << " blocked_occurrences=" << stats.blocked_occurrences
+                  << " sibling_join_occurrences="
+                  << stats.sibling_join_occurrences
+                  << " action=abort" << std::endl;
+        abort();
+      }
+      arm.mode = PartialWaitArmMode::WAITING_FOR_SIBLING_JOIN;
+      arm.extracted_capsule = true;
+      m_partial_capsules_total++;
+      m_partial_deferred_occurrences_total += stats.blocked_occurrences;
+      debug_log_wait_block_event(
+          "partial-extract",
+          "block=" + arm.record.block_id +
+              " region=" + arm.record.partial_region_id +
+              " warp=" + std::to_string(warp_id) +
+              " cursor_before_flush=" +
+              std::to_string(cursor_before_flush) +
+              " cursor_after_flush=" +
+              std::to_string(cursor_after_flush) +
+              " prefetched_rollback=" +
+              std::to_string(cursor_before_flush - cursor_after_flush) +
+              " cursor_after_extract=" +
+              std::to_string(stats.cursor_after) +
+              " blocked_occurrences=" +
+              std::to_string(stats.blocked_occurrences) +
+              " sibling_join_occurrences=" +
+              std::to_string(stats.sibling_join_occurrences) +
+              " landing_pc=0x" +
+              format_hex_u64(tw->canonical_trace_pc()));
+      return;
+    }
+
+    if (arm.mode == PartialWaitArmMode::WAITING_FOR_SIBLING_JOIN &&
+        inst.pc == arm.record.join_pc &&
+        inst.get_active_mask().to_ullong() == arm.sibling_mask) {
+      if (m_partial_joined_regions[warp_id].count(
+              arm.record.partial_region_id) == 0) {
+        std::cerr << "[WAITBLOCK][abort][SM" << m_sm_id << "] cyc="
+                  << get_current_gpu_cycle()
+                  << " reason=partial-join-issue-not-recorded"
+                  << " block=" << arm.record.block_id
+                  << " warp=" << warp_id << " action=abort" << std::endl;
+        abort();
+      }
+      start_partial_wait_hold(warp_id, arm);
+      return;
+    }
+  }
+
+  PartialWaitRegionRecord post_region;
+  if (m_gpu->lookup_partial_wait_post_join(
+          inst.trace_kernel_id, inst.unique_function_id, inst.pc,
+          post_region)) {
+    const uint64_t issued_mask = inst.get_active_mask().to_ullong();
+    if (post_region.live_masks.count(issued_mask) == 0) {
+      std::cerr << "[WAITBLOCK][abort][SM" << m_sm_id << "] cyc="
+                << get_current_gpu_cycle()
+                << " reason=partial-post-join-mask-mismatch"
+                << " region=" << post_region.region_id
+                << " warp=" << warp_id
+                << " mask=0x" << format_hex_u64(issued_mask)
+                << " action=abort" << std::endl;
+      abort();
+    }
+    trace_shd_warp_t *tw =
+        static_cast<trace_shd_warp_t *>(m_physical_warp[warp_id]);
+    if (tw->partial_capsule_active()) {
+      std::cerr << "[WAITBLOCK][abort][SM" << m_sm_id << "] cyc="
+                << get_current_gpu_cycle()
+                << " reason=post-join-with-active-partial-capsule"
+                << " region=" << post_region.region_id
+                << " warp=" << warp_id << " action=abort" << std::endl;
+      abort();
+    }
+    HopperPartialReplayProgress &progress =
+        m_partial_replay_progress[warp_id];
+    const bool replay_region_matches =
+        progress.valid && progress.region_id == post_region.region_id;
+    const bool replay_pc_matches =
+        progress.valid && progress.post_join_pc == inst.pc;
+    const bool closes_replay_progress =
+        replay_region_matches && replay_pc_matches;
+    if (progress.valid &&
+        (replay_region_matches != replay_pc_matches ||
+         (closes_replay_progress &&
+          (progress.trace_kernel_id != inst.trace_kernel_id ||
+           progress.unique_function_id != inst.unique_function_id ||
+           progress.cta_id !=
+               m_physical_warp[warp_id]->get_cta_id() ||
+           progress.last_remaining != 0 ||
+           progress.progressed_occurrences !=
+               progress.initial_remaining)))) {
+      std::cerr << "[WAITBLOCK][abort][SM" << m_sm_id << "] cyc="
+                << get_current_gpu_cycle()
+                << " reason=partial-replay-post-join-accounting"
+                << " owner_region=" << progress.region_id
+                << " observed_region=" << post_region.region_id
+                << " warp=" << warp_id
+                << " expected_post_join_pc=0x"
+                << format_hex_u64(progress.post_join_pc)
+                << " actual_post_join_pc=0x"
+                << format_hex_u64(inst.pc)
+                << " initial=" << progress.initial_remaining
+                << " remaining=" << progress.last_remaining
+                << " progressed=" << progress.progressed_occurrences
+                << " action=abort" << std::endl;
+      abort();
+    }
+    if (m_partial_joined_regions[warp_id].erase(post_region.region_id) != 1) {
+      std::cerr << "[WAITBLOCK][abort][SM" << m_sm_id << "] cyc="
+                << get_current_gpu_cycle()
+                << " reason=post-join-without-sibling-join"
+                << " region=" << post_region.region_id
+                << " warp=" << warp_id << " action=abort" << std::endl;
+      abort();
+    }
+    debug_log_wait_block_event(
+        "partial-region-close",
+        "region=" + post_region.region_id +
+            " trace_kernel=" + std::to_string(inst.trace_kernel_id) +
+            " function=" + std::to_string(inst.unique_function_id) +
+            " cta=" +
+            std::to_string(m_physical_warp[warp_id]->get_cta_id()) +
+            " warp=" + std::to_string(warp_id) +
+            " post_join_pc=0x" + format_hex_u64(inst.pc) +
+            " replay_progress_closed=" +
+            std::to_string(closes_replay_progress) +
+            " replay_occurrences=" +
+            std::to_string(closes_replay_progress
+                               ? progress.progressed_occurrences
+                               : 0));
+    if (closes_replay_progress) {
+      progress = HopperPartialReplayProgress();
+    }
+  }
+}
+
+void SM::service_wait_block_release(unsigned warp_id) {
+  if (!m_config->wait_block_enable ||
+      warp_id >= m_pending_sync_waits.size()) {
+    return;
+  }
+  if (!m_wait_block_release_snapshot_valid ||
+      m_wait_block_release_snapshot_cycle != get_current_gpu_cycle()) {
+    std::cerr << "[WAITBLOCK][abort][SM" << m_sm_id << "] cyc="
+              << get_current_gpu_cycle()
+              << " reason=release-service-outside-sm-phase"
+              << " warp=" << warp_id << " action=abort" << std::endl;
+    abort();
+  }
+  service_partial_replay_progress(warp_id);
+  HopperPartialWaitArm &partial_arm = m_partial_wait_arms[warp_id];
+  if (partial_arm.valid &&
+      partial_arm.mode != PartialWaitArmMode::HOLDING) {
+    const uint64_t now = get_current_gpu_cycle();
+    const uint64_t age = now - partial_arm.arm_start_cycle;
+    if (now - partial_arm.last_heartbeat_cycle >=
+        m_config->wait_block_heartbeat_cycles) {
+      debug_log_wait_block_event(
+          "partial-transition-heartbeat",
+          "block=" + partial_arm.record.block_id +
+              " region=" + partial_arm.record.partial_region_id +
+              " warp=" + std::to_string(warp_id) +
+              " mode=" +
+              std::to_string(static_cast<int>(partial_arm.mode)) +
+              " age=" + std::to_string(age));
+      partial_arm.last_heartbeat_cycle = now;
+    }
+    if (age > m_config->wait_block_hold_watchdog_cycles) {
+      m_wait_block_watchdog_aborts_total++;
+      std::cerr << "[WAITBLOCK][abort][SM" << m_sm_id << "] cyc=" << now
+                << " reason=partial-transition-watchdog"
+                << " block=" << partial_arm.record.block_id
+                << " region=" << partial_arm.record.partial_region_id
+                << " warp=" << warp_id
+                << " mode=" << static_cast<int>(partial_arm.mode)
+                << " age=" << age << " action=abort" << std::endl;
+      abort();
+    }
   }
   HopperMBarrierPendingWait &pending_wait = m_pending_sync_waits[warp_id];
+  if (partial_arm.valid &&
+      partial_arm.mode == PartialWaitArmMode::HOLDING &&
+      !pending_wait.valid) {
+    std::cerr << "[WAITBLOCK][abort][SM" << m_sm_id << "] cyc="
+              << get_current_gpu_cycle()
+              << " reason=partial-hold-lost-pending-state"
+              << " block=" << partial_arm.record.block_id
+              << " warp=" << warp_id << " action=abort" << std::endl;
+    abort();
+  }
   if (!pending_wait.valid) {
-    return false;
+    return;
   }
-  if (is_sync_wait_satisfied(pending_wait)) {
-    const_cast<SM *>(this)->m_sync_debug_wait_released++;
-    const_cast<SM *>(this)->debug_log_sync_event(
-        "wait released warp=" + std::to_string(warp_id) + " cta=" +
-        std::to_string(pending_wait.key.cta_id) + " barrier=0x" +
-        format_hex_u64(pending_wait.key.barrier_addr) + " wait_state=" +
-        std::to_string(pending_wait.wait_state_raw));
+  if (pending_wait.mode == WaitBlockPendingMode::PARTIAL_MISSING_WAIT_HOLD &&
+      (!partial_arm.valid ||
+       partial_arm.mode != PartialWaitArmMode::HOLDING)) {
+    std::cerr << "[WAITBLOCK][abort][SM" << m_sm_id << "] cyc="
+              << get_current_gpu_cycle()
+              << " reason=partial-pending-hold-lost-arm-state"
+              << " warp=" << warp_id << " action=abort" << std::endl;
+    abort();
+  }
+  if (pending_wait.mode == WaitBlockPendingMode::NONE ||
+      pending_wait.block_id.empty()) {
+    std::cerr << "[WAITBLOCK][abort][SM" << m_sm_id << "] cyc="
+              << get_current_gpu_cycle() << " warp=" << warp_id
+              << " reason=invalid-pending-hold-state" << std::endl;
+    abort();
+  }
+
+  const uint64_t now = get_current_gpu_cycle();
+  const uint64_t cur_gen = sync_barrier_gen(pending_wait.key);
+  const uint64_t exp_gen = pending_wait.expected_gen;
+  const uint64_t held_cycles = now - pending_wait.hold_start_cycle;
+  const std::string &block = pending_wait.block_id;
+  std::ostringstream barrier_detail_stream;
+  auto barrier_it = m_hopper_mbarriers.find(pending_wait.key);
+  if (barrier_it == m_hopper_mbarriers.end()) {
+    barrier_detail_stream << " barrier_state=unseen";
+  } else {
+    const HopperMBarrierObject &barrier = barrier_it->second;
+    barrier_detail_stream
+        << " barrier_state=present phase=" << barrier.phase
+        << " arrive=" << barrier.arrive_count << "/"
+        << barrier.expected_arrive_count << " tx="
+        << barrier.completed_tx_bytes << "/" << barrier.expected_tx_bytes
+        << " assigned=" << barrier.assigned_tx_bytes
+        << " outstanding=" << barrier.outstanding_tma_bindings
+        << " contract_id=" << barrier.tx_contract_id
+        << " prev_flip_cycle=" << barrier.prev_flip_cycle
+        << " last_flip_cycle=" << barrier.last_flip_cycle;
+  }
+  const std::string barrier_detail = barrier_detail_stream.str();
+
+  // Once an exact target has completed, the live barrier object may already
+  // describe a later generation. Its contract cannot invalidate the completed
+  // dependency represented by this ticket.
+  if (barrier_it != m_hopper_mbarriers.end() &&
+      (!pending_wait.uses_exact_generation_ticket ||
+       cur_gen < exp_gen)) {
+    const HopperMBarrierObject &barrier = barrier_it->second;
+    const bool missing_assignment =
+        barrier.expected_tx_bytes > barrier.completed_tx_bytes &&
+        barrier.assigned_tx_bytes < barrier.expected_tx_bytes &&
+        !barrier.assignment_open;
+    const bool missing_in_flight_binding =
+        barrier.expected_tx_bytes > barrier.completed_tx_bytes &&
+        barrier.assigned_tx_bytes == barrier.expected_tx_bytes &&
+        barrier.outstanding_tma_bindings == 0;
+    if (missing_assignment || missing_in_flight_binding) {
+      ++m_tma_contract_mismatches;
+      std::cerr << "[TMABIND][abort][SM" << m_sm_id << "] cyc=" << now
+                << " reason=unfulfillable-tx-contract"
+                << " trace_kernel=" << pending_wait.key.trace_kernel_id
+                << " cta_slot=" << pending_wait.key.cta_id
+                << " warp=" << warp_id << " barrier=0x"
+                << format_hex_u64(pending_wait.key.barrier_addr)
+                << " generation=" << barrier.gen
+                << " contract_id=" << barrier.tx_contract_id
+                << " assignment_open=" << barrier.assignment_open
+                << " expected=" << barrier.expected_tx_bytes
+                << " assigned=" << barrier.assigned_tx_bytes
+                << " completed=" << barrier.completed_tx_bytes
+                << " outstanding=" << barrier.outstanding_tma_bindings
+                << std::endl;
+      debug_dump_tma_binding_snapshot("unfulfillable-tx-contract");
+      abort();
+    }
+  }
+
+  if (cur_gen > exp_gen) {
+    if (pending_wait.uses_exact_generation_ticket) {
+      m_wait_block_late_arrivals_total++;
+      debug_log_wait_block_event(
+          "exact-generation-late-release",
+          "strategy=" +
+              std::string(wait_block_mode_to_string(pending_wait.mode)) +
+              " block=" + block +
+              " trace_kernel=" +
+              std::to_string(pending_wait.key.trace_kernel_id) +
+              " function=" +
+              std::to_string(pending_wait.unique_function_id) +
+              " cta=" + std::to_string(pending_wait.key.cta_id) +
+              " warp=" + std::to_string(warp_id) +
+              " action_pc=0x" +
+              format_hex_u64(pending_wait.action_pc) +
+              " barrier=0x" +
+              format_hex_u64(pending_wait.key.barrier_addr) +
+              " target_gen=" + std::to_string(exp_gen) +
+              " current_gen=" + std::to_string(cur_gen) +
+              " held_cycles=" + std::to_string(held_cycles));
+    } else {
+      m_wait_block_generation_overshoots_total++;
+      std::cerr << "[WAITBLOCK][abort][SM" << m_sm_id << "] cyc=" << now
+                << " reason=generation-overshoot"
+                << " strategy="
+                << wait_block_mode_to_string(pending_wait.mode)
+                << " block=" << block
+                << " trace_kernel=" << pending_wait.key.trace_kernel_id
+                << " function=" << pending_wait.unique_function_id
+                << " cta=" << pending_wait.key.cta_id
+                << " global_cta="
+                << m_local_to_global_cta_id[pending_wait.key.cta_id]
+                << " warp=" << warp_id << " action_pc=0x"
+                << format_hex_u64(pending_wait.action_pc)
+                << " barrier=0x"
+                << format_hex_u64(pending_wait.key.barrier_addr)
+                << " expected_gen=" << exp_gen
+                << " current_gen=" << cur_gen
+                << " held_cycles=" << held_cycles
+                << barrier_detail
+                << " action=abort" << std::endl;
+      debug_dump_tma_binding_snapshot("waitblock-generation-overshoot");
+      abort();
+    }
+  }
+
+  if (cur_gen < exp_gen) {
+    if (m_config->wait_block_enable &&
+        now - pending_wait.last_heartbeat_cycle >=
+            m_config->wait_block_heartbeat_cycles) {
+      debug_log_wait_block_event(
+          "heartbeat",
+          "strategy=" +
+              std::string(wait_block_mode_to_string(pending_wait.mode)) +
+              " block=" + block +
+              " trace_kernel=" +
+              std::to_string(pending_wait.key.trace_kernel_id) +
+              " function=" +
+              std::to_string(pending_wait.unique_function_id) +
+              " cta=" + std::to_string(pending_wait.key.cta_id) +
+              " warp=" + std::to_string(warp_id) + " action_pc=0x" +
+              format_hex_u64(pending_wait.action_pc) + " barrier=0x" +
+              format_hex_u64(pending_wait.key.barrier_addr) +
+              " expected_gen=" + std::to_string(exp_gen) +
+              " current_gen=" + std::to_string(cur_gen) +
+              " held_cycles=" + std::to_string(held_cycles) +
+              barrier_detail);
+      pending_wait.last_heartbeat_cycle = now;
+    }
+    const uint64_t threshold = m_config->wait_block_hold_watchdog_cycles;
+    if (held_cycles > threshold) {
+      m_wait_block_watchdog_aborts_total++;
+      if (pending_wait.mode == WaitBlockPendingMode::CAPTURED_POLL_HOLD ||
+          pending_wait.mode == WaitBlockPendingMode::FOLD_AUX_WAIT_HOLD) {
+        m_fold_watchdog_hits++;
+      }
+      std::cerr << "[WAITBLOCK][abort][SM" << m_sm_id << "] cyc=" << now
+                << " reason=hold-watchdog"
+                << " strategy=" << wait_block_mode_to_string(pending_wait.mode)
+                << " block=" << block
+                << " trace_kernel=" << pending_wait.key.trace_kernel_id
+                << " function=" << pending_wait.unique_function_id
+                << " cta=" << pending_wait.key.cta_id
+                << " global_cta="
+                << m_local_to_global_cta_id[pending_wait.key.cta_id]
+                << " warp=" << warp_id << " action_pc=0x"
+                << format_hex_u64(pending_wait.action_pc)
+                << " barrier=0x"
+                << format_hex_u64(pending_wait.key.barrier_addr)
+                << " wait_state=0x"
+                << format_hex_u64(pending_wait.wait_state_raw)
+                << " expected_gen=" << exp_gen
+                << " current_gen=" << cur_gen
+                << " held_cycles=" << held_cycles
+                << " threshold=" << threshold << barrier_detail
+                << " action=abort"
+                << std::endl;
+      debug_dump_tma_binding_snapshot("waitblock-hold-watchdog");
+      abort();
+    }
+    return;
+  }
+
+  if (!is_wait_block_pending_satisfied_at_cycle_start(pending_wait)) {
+    std::cerr << "[WAITBLOCK][abort][SM" << m_sm_id << "] cyc=" << now
+              << " reason=generation-ready-state-mismatch"
+              << " strategy=" << wait_block_mode_to_string(pending_wait.mode)
+              << " block=" << block << " warp=" << warp_id
+              << " expected_gen=" << exp_gen << " current_gen=" << cur_gen
+              << " wait_state=0x"
+              << format_hex_u64(pending_wait.wait_state_raw)
+              << " action=abort" << std::endl;
+    abort();
+  }
+
+  m_sync_debug_wait_released++;
+  if (pending_wait.mode == WaitBlockPendingMode::PARTIAL_MISSING_WAIT_HOLD) {
+    HopperPartialWaitArm &arm = m_partial_wait_arms[warp_id];
+    if (!arm.valid || arm.mode != PartialWaitArmMode::HOLDING ||
+        arm.record.block_id != pending_wait.block_id ||
+        arm.expected_gen != pending_wait.expected_gen) {
+      std::cerr << "[WAITBLOCK][abort][SM" << m_sm_id << "] cyc=" << now
+                << " reason=partial-release-state-mismatch"
+                << " block=" << block << " warp=" << warp_id
+                << " action=abort" << std::endl;
+      abort();
+    }
+
+    trace_shd_warp_t *tw =
+        static_cast<trace_shd_warp_t *>(m_physical_warp[warp_id]);
+    HopperPartialReplayProgress &replay_progress =
+        m_partial_replay_progress[warp_id];
+    tw->get_IBuffer_remodeled()->flush(false);
+    if (arm.extracted_capsule) {
+      if (replay_progress.valid) {
+        std::cerr << "[WAITBLOCK][abort][SM" << m_sm_id << "] cyc=" << now
+                  << " reason=partial-replay-owner-already-active"
+                  << " owner_region=" << replay_progress.region_id
+                  << " new_region=" << arm.record.partial_region_id
+                  << " block=" << block << " warp=" << warp_id
+                  << " action=abort" << std::endl;
+        abort();
+      }
+      if (!tw->activate_partial_blocked_replay()) {
+        std::cerr << "[WAITBLOCK][abort][SM" << m_sm_id << "] cyc=" << now
+                  << " reason=partial-deferred-replay-activation-failed"
+                  << " block=" << block << " warp=" << warp_id
+                  << " deferred=" << tw->partial_deferred_size()
+                  << " action=abort" << std::endl;
+        abort();
+      }
+      const unsigned int replay_remaining =
+          tw->partial_replay_remaining();
+      if (replay_remaining == 0) {
+        std::cerr << "[WAITBLOCK][abort][SM" << m_sm_id << "] cyc=" << now
+                  << " reason=partial-replay-activated-empty"
+                  << " block=" << block << " warp=" << warp_id
+                  << " action=abort" << std::endl;
+        abort();
+      }
+      replay_progress.valid = true;
+      replay_progress.block_id = arm.record.block_id;
+      replay_progress.region_id = arm.record.partial_region_id;
+      replay_progress.trace_kernel_id =
+          pending_wait.key.trace_kernel_id;
+      replay_progress.unique_function_id =
+          pending_wait.unique_function_id;
+      replay_progress.cta_id = pending_wait.key.cta_id;
+      replay_progress.start_cycle = now;
+      replay_progress.last_heartbeat_cycle = now;
+      replay_progress.last_progress_cycle = now;
+      replay_progress.last_pc = arm.record.join_pc;
+      replay_progress.post_join_pc = arm.record.post_join_pc;
+      replay_progress.initial_remaining = replay_remaining;
+      replay_progress.last_remaining = replay_remaining;
+    } else if (arm.source_was_deferred_replay) {
+      if (!replay_progress.valid ||
+          replay_progress.trace_kernel_id !=
+              pending_wait.key.trace_kernel_id ||
+          replay_progress.unique_function_id !=
+              pending_wait.unique_function_id ||
+          replay_progress.cta_id != pending_wait.key.cta_id ||
+          !tw->partial_replay_active() ||
+          tw->partial_replay_origin() !=
+              WaitBlockTraceOrigin::PARTIAL_BLOCKED_REPLAY ||
+          replay_progress.last_remaining !=
+              tw->partial_replay_remaining()) {
+        std::cerr << "[WAITBLOCK][abort][SM" << m_sm_id << "] cyc=" << now
+                  << " reason=partial-nested-replay-state-lost"
+                  << " block=" << block << " warp=" << warp_id
+                  << " action=abort" << std::endl;
+        abort();
+      }
+      replay_progress.last_progress_cycle = now;
+      replay_progress.last_heartbeat_cycle = now;
+    } else if (tw->partial_capsule_active()) {
+      std::cerr << "[WAITBLOCK][abort][SM" << m_sm_id << "] cyc=" << now
+                << " reason=unexpected-partial-capsule-on-direct-release"
+                << " block=" << block << " warp=" << warp_id
+                << " action=abort" << std::endl;
+      abort();
+    } else if (replay_progress.valid) {
+      std::cerr << "[WAITBLOCK][abort][SM" << m_sm_id << "] cyc=" << now
+                << " reason=canonical-partial-release-with-replay-owner"
+                << " owner_region=" << replay_progress.region_id
+                << " block=" << block << " warp=" << warp_id
+                << " action=abort" << std::endl;
+      abort();
+    }
+
+    m_missing_wait_releases_total++;
+    m_partial_join_releases_total++;
+    debug_log_wait_block_event(
+        "partial-join-release",
+        "block=" + block +
+            " region=" + arm.record.partial_region_id +
+            " trace_kernel=" +
+            std::to_string(pending_wait.key.trace_kernel_id) +
+            " function=" + std::to_string(pending_wait.unique_function_id) +
+            " cta=" + std::to_string(pending_wait.key.cta_id) +
+            " warp=" + std::to_string(warp_id) +
+            " entry_pc=0x" + format_hex_u64(pending_wait.action_pc) +
+            " expected_gen=" + std::to_string(exp_gen) +
+            " current_gen=" + std::to_string(cur_gen) +
+            " held_cycles=" + std::to_string(held_cycles) +
+            " replay_remaining=" +
+            std::to_string(tw->partial_replay_remaining()));
+    arm = HopperPartialWaitArm();
     pending_wait = HopperMBarrierPendingWait();
-    return false;
+    return;
   }
-  return true;
+
+  if (pending_wait.mode == WaitBlockPendingMode::MISSING_WAIT_HOLD) {
+    m_missing_wait_releases_total++;
+    debug_log_wait_block_event(
+        "missing-wait-release",
+        "block=" + block +
+            " trace_kernel=" +
+            std::to_string(pending_wait.key.trace_kernel_id) +
+            " function=" + std::to_string(pending_wait.unique_function_id) +
+            " cta=" + std::to_string(pending_wait.key.cta_id) +
+            " warp=" + std::to_string(warp_id) + " entry_pc=0x" +
+            format_hex_u64(pending_wait.action_pc) + " barrier=0x" +
+            format_hex_u64(pending_wait.key.barrier_addr) +
+            " expected_gen=" + std::to_string(exp_gen) +
+            " current_gen=" + std::to_string(cur_gen) +
+            " held_cycles=" + std::to_string(held_cycles) +
+            " cursor_action=none");
+    pending_wait = HopperMBarrierPendingWait();
+    return;
+  }
+
+  if (pending_wait.mode == WaitBlockPendingMode::FOLD_AUX_WAIT_HOLD) {
+    m_fold_aux_releases_total++;
+    debug_log_wait_block_event(
+        "fold-aux-wait-release",
+        "block=" + block +
+            " trace_kernel=" +
+            std::to_string(pending_wait.key.trace_kernel_id) +
+            " function=" + std::to_string(pending_wait.unique_function_id) +
+            " cta=" + std::to_string(pending_wait.key.cta_id) +
+            " warp=" + std::to_string(warp_id) + " wait_pc=0x" +
+            format_hex_u64(pending_wait.action_pc) + " barrier=0x" +
+            format_hex_u64(pending_wait.key.barrier_addr) +
+            " target_gen=" + std::to_string(exp_gen) +
+            " current_gen=" + std::to_string(cur_gen) +
+            " held_cycles=" + std::to_string(held_cycles) +
+            " cursor_action=none");
+    pending_wait = HopperMBarrierPendingWait();
+    return;
+  }
+
+  if (pending_wait.mode != WaitBlockPendingMode::CAPTURED_POLL_HOLD) {
+    std::cerr << "[WAITBLOCK][abort][SM" << m_sm_id << "] cyc=" << now
+              << " reason=unknown-pending-mode warp=" << warp_id
+              << " action=abort" << std::endl;
+    abort();
+  }
+
+  SpinWaitRegionRecord region;
+  if (!m_gpu->lookup_spin_wait_region(
+          pending_wait.key.trace_kernel_id, pending_wait.unique_function_id,
+          pending_wait.action_pc, region) ||
+      !region.foldable || region.exit_pc != pending_wait.poll_loop_exit_pc ||
+      (m_config->wait_block_enable &&
+       region.block_id != pending_wait.block_id)) {
+    std::cerr << "[WAITBLOCK][abort][SM" << m_sm_id << "] cyc=" << now
+              << " reason=captured-poll-sidecar-runtime-drift"
+              << " block=" << block << " warp=" << warp_id
+              << " poll_pc=0x" << format_hex_u64(pending_wait.action_pc)
+              << " expected_exit_pc=0x"
+              << format_hex_u64(pending_wait.poll_loop_exit_pc)
+              << " action=abort" << std::endl;
+    abort();
+  }
+
+  trace_shd_warp_t *tw =
+      static_cast<trace_shd_warp_t *>(m_physical_warp[warp_id]);
+  FoldSkipStats skip_stats;
+  const unsigned skipped =
+      fold_cursor_skip_to_exit(warp_id, region, skip_stats);
+
+  if (m_fold_pace_by_warp.size() <= warp_id) {
+    m_fold_pace_by_warp.resize(MAX_WARP_PER_SHADER);
+  }
+  FoldPaceStats &pace =
+      m_fold_pace_by_warp[warp_id]
+                         [FoldPaceKey(pending_wait.key,
+                                      pending_wait.action_pc)];
+  pace.releases++;
+  pace.park_cycles_total += held_cycles;
+  if (held_cycles > pace.park_cycles_max) {
+    pace.park_cycles_max = held_cycles;
+  }
+  pace.last_end_cycle = now;
+  pace.last_expected_gen = exp_gen;
+  pace.last_barrier_gen = cur_gen;
+  m_fold_releases_total++;
+  m_fold_skipped_insts_total += skipped;
+  m_fold_park_cycles_total += held_cycles;
+  if (held_cycles > m_fold_park_cycles_max) {
+    m_fold_park_cycles_max = held_cycles;
+  }
+
+  std::ostringstream per_pc;
+  bool first_pc = true;
+  for (const auto &entry : skip_stats.pc_occurrences) {
+    if (!first_pc) {
+      per_pc << ",";
+    }
+    first_pc = false;
+    per_pc << "0x" << format_hex_u64(entry.first) << ":" << entry.second;
+  }
+  debug_log_wait_block_event(
+      "poll-advance",
+      "block=" + block +
+          " trace_kernel=" +
+          std::to_string(pending_wait.key.trace_kernel_id) +
+          " function=" + std::to_string(pending_wait.unique_function_id) +
+          " cta=" + std::to_string(pending_wait.key.cta_id) +
+          " warp=" + std::to_string(warp_id) + " poll_pc=0x" +
+          format_hex_u64(pending_wait.action_pc) +
+          " cursor_before_flush=" +
+          std::to_string(skip_stats.cursor_before_flush) +
+          " cursor_after_flush=" +
+          std::to_string(skip_stats.cursor_after_flush) +
+          " prefetched_rollback=" +
+          std::to_string(skip_stats.prefetched_rollback) +
+          " cursor_after_skip=" +
+          std::to_string(skip_stats.cursor_after_skip) +
+          " skipped=" + std::to_string(skipped) +
+          " per_pc=" + (first_pc ? std::string("<none>") : per_pc.str()) +
+          " phasechk_trywait=" +
+          std::to_string(skip_stats.phasechk_trywait) +
+          " nanosleep=" + std::to_string(skip_stats.nanosleep) +
+          " imad_scratch=" + std::to_string(skip_stats.imad_scratch) +
+          " loopback_bra=" + std::to_string(skip_stats.loopback_bra) +
+          " other=" + std::to_string(skip_stats.other) +
+          " expected_exit_pc=0x" + format_hex_u64(region.exit_pc) +
+          " actual_landing_pc=0x" + format_hex_u64(tw->get_pc()));
+  debug_log_wait_block_event(
+      "poll-release",
+      "block=" + block +
+          " trace_kernel=" +
+          std::to_string(pending_wait.key.trace_kernel_id) +
+          " function=" + std::to_string(pending_wait.unique_function_id) +
+          " cta=" + std::to_string(pending_wait.key.cta_id) +
+          " warp=" + std::to_string(warp_id) + " poll_pc=0x" +
+          format_hex_u64(pending_wait.action_pc) + " exit_pc=0x" +
+          format_hex_u64(region.exit_pc) +
+          " expected_gen=" + std::to_string(exp_gen) +
+          " current_gen=" + std::to_string(cur_gen) +
+          " held_cycles=" + std::to_string(held_cycles));
+  pending_wait = HopperMBarrierPendingWait();
 }
+
+void SM::print_wait_block_summary() const {
+  if (!m_config->wait_block_enable) {
+    return;
+  }
+  unsigned long long active_holds = 0;
+  for (const HopperMBarrierPendingWait &pending : m_pending_sync_waits) {
+    if (pending.valid) {
+      active_holds++;
+    }
+  }
+  unsigned long long active_partial_arms = 0;
+  unsigned long long active_partial_replay_progress = 0;
+  unsigned long long active_partial_regions = 0;
+  unsigned long long active_partial_capsules = 0;
+  for (unsigned warp_id = 0; warp_id < m_partial_wait_arms.size();
+       ++warp_id) {
+    active_partial_arms += m_partial_wait_arms[warp_id].valid;
+    active_partial_replay_progress +=
+        m_partial_replay_progress[warp_id].valid;
+    active_partial_regions += m_partial_joined_regions[warp_id].size();
+    if (m_config->is_trace_mode &&
+        static_cast<trace_shd_warp_t *>(m_physical_warp[warp_id])
+            ->partial_capsule_active()) {
+      active_partial_capsules++;
+    }
+  }
+  const bool balanced =
+      active_holds == 0 &&
+      active_partial_arms == 0 &&
+      active_partial_replay_progress == 0 &&
+      active_partial_regions == 0 &&
+      active_partial_capsules == 0 &&
+      m_missing_wait_holds_total == m_missing_wait_releases_total &&
+      m_fold_parks_total == m_fold_releases_total &&
+      m_fold_aux_holds_total == m_fold_aux_releases_total &&
+      m_partial_join_holds_total == m_partial_join_releases_total &&
+      m_partial_deferred_occurrences_total ==
+          m_partial_replayed_occurrences_total +
+              m_partial_folded_occurrences_total &&
+      m_wait_block_release_service_visits_total ==
+          m_wait_block_release_phase_cycles_total *
+              m_pending_sync_waits.size();
+  const double captured_poll_avg_hold =
+      m_fold_releases_total
+          ? static_cast<double>(m_fold_park_cycles_total) /
+                m_fold_releases_total
+          : 0.0;
+  fprintf(
+      stdout,
+      "[WAITBLOCK][summary] status=%s sm=%u missing_wait_ready=%llu "
+      "missing_wait_holds=%llu missing_wait_releases=%llu "
+      "partial_missing_wait_model_misses=%llu "
+      "partial_capsules=%llu partial_join_already_issued=%llu "
+      "partial_deferred_occurrences=%llu partial_replayed_occurrences=%llu "
+      "partial_folded_occurrences=%llu "
+      "partial_join_holds=%llu partial_join_releases=%llu "
+      "captured_poll_immediate_folds=%llu captured_poll_holds=%llu "
+      "captured_poll_releases=%llu "
+      "captured_poll_aux_holds=%llu captured_poll_aux_releases=%llu "
+      "captured_poll_advanced_occurrences=%llu "
+      "captured_poll_immediate_advanced_occurrences=%llu "
+      "captured_poll_hold_cycles_total=%llu "
+      "captured_poll_hold_cycles_avg=%.1f captured_poll_hold_cycles_max=%llu "
+      "captured_poll_watchdog_aborts=%llu active_holds=%llu "
+      "active_partial_arms=%llu active_partial_replay_progress=%llu "
+      "active_partial_regions=%llu "
+      "active_partial_capsules=%llu "
+      "partial_replay_watchdog_aborts=%llu "
+      "generation_overshoots=%llu exact_generation_targets=%llu "
+      "generation_fallbacks=%llu late_arrival_divergences=%llu "
+      "first_late_timing_reports=%llu "
+      "release_phase_cycles=%llu release_service_visits=%llu "
+      "release_service_expected_visits=%llu "
+      "retired_warp_instructions=%llu "
+      "watchdog_aborts=%llu\n",
+      balanced ? "PASS" : "ACTIVE", m_sm_id, m_missing_wait_ready_total,
+      m_missing_wait_holds_total,
+      m_missing_wait_releases_total, m_partial_missing_wait_misses_total,
+      m_partial_capsules_total, m_partial_join_already_issued_total,
+      m_partial_deferred_occurrences_total,
+      m_partial_replayed_occurrences_total,
+      m_partial_folded_occurrences_total, m_partial_join_holds_total,
+      m_partial_join_releases_total,
+      m_fold_immediate_folds_total, m_fold_parks_total,
+      m_fold_releases_total, m_fold_aux_holds_total,
+      m_fold_aux_releases_total, m_fold_skipped_insts_total,
+      m_fold_immediate_skipped_insts_total, m_fold_park_cycles_total,
+      captured_poll_avg_hold, m_fold_park_cycles_max, m_fold_watchdog_hits,
+      active_holds,
+      active_partial_arms, active_partial_replay_progress,
+      active_partial_regions, active_partial_capsules,
+      m_partial_replay_watchdog_aborts_total,
+      m_wait_block_generation_overshoots_total,
+      m_wait_block_exact_targets_total,
+      m_wait_block_generation_fallbacks_total,
+      m_wait_block_late_arrivals_total,
+      m_wait_block_first_late_reports_total,
+      m_wait_block_release_phase_cycles_total,
+      m_wait_block_release_service_visits_total,
+      m_wait_block_release_phase_cycles_total *
+          m_pending_sync_waits.size(),
+      m_wait_block_retired_warp_instructions_total,
+      m_wait_block_watchdog_aborts_total);
+
+  if (!m_config->wait_block_debug) {
+    return;
+  }
+  for (unsigned warp_id = 0; warp_id < m_fold_pace_by_warp.size();
+       ++warp_id) {
+    const char *role =
+        warp_id < MAX_WARP_PER_SHADER && m_warp_is_producer[warp_id]
+            ? "producer"
+            : (warp_id < MAX_WARP_PER_SHADER &&
+                       m_warp_is_consumer[warp_id]
+                   ? "consumer"
+                   : "unknown");
+    for (const auto &entry : m_fold_pace_by_warp[warp_id]) {
+      const HopperMBarrierKey &barrier = entry.first.first;
+      const uint64_t wait_pc = entry.first.second;
+      const FoldPaceStats &pace = entry.second;
+      const double avg_hold =
+          pace.releases
+              ? static_cast<double>(pace.park_cycles_total) / pace.releases
+              : 0.0;
+      fprintf(
+          stdout,
+          "[WAITBLOCK][poll-pace] sm=%u warp=%u role=%s trace_kernel=%u "
+          "cta=%u global_cta=%u barrier=0x%s poll_pc=0x%s "
+          "holds=%llu releases=%llu immediate_folds=%llu "
+          "immediate_advanced_occurrences=%llu total_hold_cycles=%llu "
+          "avg_hold_cycles=%.1f max_hold_cycles=%llu "
+          "first_hold_cycle=%llu last_end_cycle=%llu "
+          "last_expected_gen=%llu last_barrier_gen=%llu\n",
+          m_sm_id, warp_id, role, barrier.trace_kernel_id, barrier.cta_id,
+          m_local_to_global_cta_id[barrier.cta_id],
+          format_hex_u64(barrier.barrier_addr).c_str(),
+          format_hex_u64(wait_pc).c_str(), pace.parks, pace.releases,
+          pace.immediate_folds, pace.immediate_skipped_insts,
+          pace.park_cycles_total, avg_hold, pace.park_cycles_max,
+          pace.first_park_cycle, pace.last_end_cycle,
+          static_cast<unsigned long long>(pace.last_expected_gen),
+          static_cast<unsigned long long>(pace.last_barrier_gen));
+    }
+  }
+}
+
 
 HopperMBarrierKey SM::build_sync_barrier_key(const warp_inst_t &inst,
                                              unsigned int warp_id) const {
@@ -1778,7 +4434,7 @@ HopperMBarrierObject &SM::get_or_create_sync_barrier(
 }
 
 void SM::recompute_sync_barrier_ready_and_maybe_flip_phase(
-    HopperMBarrierObject &barrier, uint64_t barrier_addr) {
+    const HopperMBarrierKey &key, HopperMBarrierObject &barrier) {
   const bool arrive_ready =
       barrier.arrive_count >= barrier.expected_arrive_count;
   const bool tx_ready =
@@ -1787,16 +4443,68 @@ void SM::recompute_sync_barrier_ready_and_maybe_flip_phase(
   if (!barrier.ready) {
     return;
   }
+  if (barrier.expected_tx_bytes > 0 &&
+      (barrier.assignment_open ||
+       barrier.assigned_tx_bytes != barrier.expected_tx_bytes ||
+       barrier.completed_tx_bytes != barrier.assigned_tx_bytes ||
+       barrier.outstanding_tma_bindings != 0 ||
+       barrier.tx_contract_id == 0 ||
+       barrier.assignment_owner_warp_id == ~0u ||
+       barrier.assignment_generation != barrier.gen ||
+       barrier.assignment_kernel_launch_uid == 0 ||
+       barrier.assignment_global_cta_id == ~0u)) {
+    ++m_tma_contract_mismatches;
+    std::cerr << "[TMABIND][abort][SM" << m_sm_id << "] cyc="
+              << get_current_gpu_cycle()
+              << " reason=phase-flip-with-incomplete-contract"
+              << " barrier=0x" << format_hex_u64(key.barrier_addr)
+              << " generation=" << barrier.gen
+              << " contract_id=" << barrier.tx_contract_id
+              << " assignment_open=" << barrier.assignment_open
+              << " owner_warp=" << barrier.assignment_owner_warp_id
+              << " assignment_generation="
+              << barrier.assignment_generation
+              << " expected=" << barrier.expected_tx_bytes
+              << " assigned=" << barrier.assigned_tx_bytes
+              << " completed=" << barrier.completed_tx_bytes
+              << " outstanding=" << barrier.outstanding_tma_bindings
+              << std::endl;
+    debug_dump_tma_binding_snapshot("phase-flip-incomplete-contract");
+    abort();
+  }
   m_sync_debug_phase_flip++;
   debug_log_sync_event(
-      "phase flip barrier=0x" + format_hex_u64(barrier_addr) + " phase=" +
+      "phase flip barrier=0x" + format_hex_u64(key.barrier_addr) + " phase=" +
       std::to_string(barrier.phase) + "->" +
       std::to_string(barrier.phase ^ 1) + " arrive=" +
       std::to_string(barrier.arrive_count) + "/" +
       std::to_string(barrier.expected_arrive_count) + " tx=" +
       std::to_string(barrier.completed_tx_bytes) + "/" +
-      std::to_string(barrier.expected_tx_bytes));
+      std::to_string(barrier.expected_tx_bytes) + " assigned=" +
+      std::to_string(barrier.assigned_tx_bytes) + " outstanding=" +
+      std::to_string(barrier.outstanding_tma_bindings) + " contract_id=" +
+      std::to_string(barrier.tx_contract_id) + " gen=" +
+      std::to_string(barrier.gen) + "->" + std::to_string(barrier.gen + 1) +
+      " prev_flip_cyc=" + std::to_string(barrier.last_flip_cycle));
+  if (m_config->wait_block_late_arrival_instrument_enable) {
+    WaitBlockGenerationTiming &timing =
+        barrier.wait_block_timing[barrier.gen + 1];
+    timing.completion_valid = true;
+    timing.completion_cycle = get_current_gpu_cycle();
+    if (m_config->stall_reason_align_instrument_enable &&
+        barrier.expected_tx_bytes > 0) {
+      timing.completion_progress_valid = true;
+      timing.completion_progress = m_wait_block_stall_progress_by_warp;
+    }
+  }
+  barrier.prev_flip_cycle = barrier.last_flip_cycle;
+  barrier.last_flip_cycle = get_current_gpu_cycle();
   barrier.phase ^= 1;
+  // [Spin-wait fold audit] Monotonic generation, incremented on every flip
+  // in lockstep with `phase`, never reset. Read only by the fold-path gen
+  // audit; the 1-bit `phase` remains the sole driver of non-fold issue logic
+  // so feature-off stays bit-identical. See .plan/SPIN_WAIT_SIM_MODELING.md 13.4.
+  barrier.gen++;
   // Reset only the per-phase accumulators. expected_arrive_count is set once by
   // EXCH (mbarrier.init) and reused on every phase: EXCH runs exactly once per
   // barrier (validated in FA3 traces: 1 EXCH vs many PHASECHK/arrive phases),
@@ -1805,12 +4513,30 @@ void SM::recompute_sync_barrier_ready_and_maybe_flip_phase(
   // phase.
   barrier.arrive_count = 0;
   barrier.expected_tx_bytes = 0;
+  barrier.assigned_tx_bytes = 0;
   barrier.completed_tx_bytes = 0;
+  barrier.outstanding_tma_bindings = 0;
+  barrier.tx_contract_id = 0;
+  barrier.assignment_open = false;
+  barrier.assignment_owner_warp_id = ~0u;
+  barrier.assignment_generation = ~0ull;
+  barrier.assignment_kernel_launch_uid = 0;
+  barrier.assignment_global_cta_id = ~0u;
   barrier.ready = false;
 }
 
 bool SM::is_sync_wait_satisfied(
     const HopperMBarrierPendingWait &pending_wait) const {
+  if (m_wait_block_release_snapshot_valid) {
+    auto snapshot_it = m_hopper_mbarriers.find(pending_wait.key);
+    if (snapshot_it == m_hopper_mbarriers.end() ||
+        snapshot_it->second.wait_block_release_snapshot_cycle !=
+            m_wait_block_release_snapshot_cycle) {
+      return false;
+    }
+    return snapshot_it->second.wait_block_release_snapshot_phase !=
+           decode_sync_wait_phase(pending_wait.wait_state_raw);
+  }
   auto it = m_hopper_mbarriers.find(pending_wait.key);
   if (it == m_hopper_mbarriers.end()) {
     return false;
@@ -1823,8 +4549,423 @@ bool SM::is_sync_wait_satisfied(
   return it->second.phase != decode_sync_wait_phase(pending_wait.wait_state_raw);
 }
 
+bool SM::is_wait_block_pending_satisfied(
+    const HopperMBarrierPendingWait &pending_wait) const {
+  if (pending_wait.uses_exact_generation_ticket) {
+    return sync_barrier_gen(pending_wait.key) >= pending_wait.expected_gen;
+  }
+  return is_sync_wait_satisfied(pending_wait);
+}
+
+bool SM::is_wait_block_pending_satisfied_at_cycle_start(
+    const HopperMBarrierPendingWait &pending_wait) const {
+  if (!m_wait_block_release_snapshot_valid) {
+    std::cerr << "[WAITBLOCK][abort][SM" << m_sm_id
+              << "] snapshot_cyc=" << m_wait_block_release_snapshot_cycle
+              << " reason=release-query-without-cycle-snapshot"
+              << " action=abort" << std::endl;
+    abort();
+  }
+  return is_wait_block_pending_satisfied(pending_wait);
+}
+
+uint64_t SM::sync_barrier_gen(const HopperMBarrierKey &key) const {
+  if (m_wait_block_release_snapshot_valid) {
+    auto snapshot_it = m_hopper_mbarriers.find(key);
+    return snapshot_it == m_hopper_mbarriers.end() ||
+                   snapshot_it->second.wait_block_release_snapshot_cycle !=
+                       m_wait_block_release_snapshot_cycle
+               ? 0
+               : snapshot_it->second.wait_block_release_snapshot_generation;
+  }
+  auto it = m_hopper_mbarriers.find(key);
+  return it == m_hopper_mbarriers.end() ? 0 : it->second.gen;
+}
+
+void SM::record_wait_block_first_late_arrival(
+    const warp_inst_t &inst, unsigned int warp_id,
+    const HopperMBarrierKey &key, uint64_t target_generation,
+    uint64_t current_generation, WaitBlockPendingMode mode) {
+  if (!m_config->wait_block_late_arrival_instrument_enable ||
+      key.cta_id >= MAX_CTA_PER_SHADER ||
+      m_wait_block_first_late_reported_by_cta_slot[key.cta_id]) {
+    return;
+  }
+  m_wait_block_first_late_reported_by_cta_slot[key.cta_id] = true;
+  ++m_wait_block_first_late_reports_total;
+
+  WaitBlockGenerationTiming target_timing;
+  WaitBlockGenerationTiming next_timing;
+  auto barrier_it = m_hopper_mbarriers.find(key);
+  if (barrier_it != m_hopper_mbarriers.end()) {
+    auto target_it =
+        barrier_it->second.wait_block_timing.find(target_generation);
+    if (target_it != barrier_it->second.wait_block_timing.end()) {
+      target_timing = target_it->second;
+    }
+    auto next_it =
+        barrier_it->second.wait_block_timing.find(target_generation + 1);
+    if (next_it != barrier_it->second.wait_block_timing.end()) {
+      next_timing = next_it->second;
+    }
+  }
+
+  const WaitBlockSemanticAnchor *consumer_anchor = nullptr;
+  if (warp_id < m_wait_block_last_semantic_anchor_by_warp.size() &&
+      m_wait_block_last_semantic_anchor_by_warp[warp_id].valid) {
+    consumer_anchor = &m_wait_block_last_semantic_anchor_by_warp[warp_id];
+  }
+  const uint32_t producer_warp =
+      next_timing.contract_open_valid
+          ? next_timing.contract_owner_warp_id
+          : target_timing.contract_owner_warp_id;
+  const WaitBlockSemanticAnchor *producer_anchor = nullptr;
+  if (producer_warp < m_wait_block_last_semantic_anchor_by_warp.size() &&
+      m_wait_block_last_semantic_anchor_by_warp[producer_warp].valid) {
+    producer_anchor =
+        &m_wait_block_last_semantic_anchor_by_warp[producer_warp];
+  }
+
+  const uint64_t now = get_current_gpu_cycle();
+  std::ostringstream line;
+  line << "[WAITBLOCK][late-timing-first]"
+       << " sm=" << m_sm_id << " cycle=" << now
+       << " trace_kernel=" << inst.trace_kernel_id
+       << " cta=" << inst.trace_block_idx_x << ","
+       << inst.trace_block_idx_y << "," << inst.trace_block_idx_z
+       << " cta_slot=" << key.cta_id
+       << " global_cta=" << m_local_to_global_cta_id[key.cta_id]
+       << " cta_warp=" << inst.trace_cta_warp_id
+       << " hardware_warp=" << warp_id
+       << " function=" << inst.unique_function_id
+       << " action_pc=0x" << format_hex_u64(inst.pc)
+       << " source_index=" << inst.wait_block_ticket_source_index
+       << " barrier=0x" << format_hex_u64(key.barrier_addr)
+       << " strategy=" << wait_block_mode_to_string(mode)
+       << " target_gen=" << target_generation
+       << " current_gen=" << current_generation
+       << " generation_distance="
+       << current_generation - target_generation;
+
+  const auto append_generation =
+      [&line](const char *name, uint64_t generation,
+              const WaitBlockGenerationTiming &timing) {
+        line << " " << name << "_gen=" << generation
+             << " " << name << "_open_valid="
+             << timing.contract_open_valid
+             << " " << name << "_open_cycle="
+             << timing.contract_open_cycle
+             << " " << name << "_producer_hardware_warp="
+             << timing.contract_owner_warp_id
+             << " " << name << "_producer_cta_warp="
+             << timing.contract_owner_cta_warp_id
+             << " " << name << "_open_function="
+             << timing.contract_open_function_id
+             << " " << name << "_open_pc=0x"
+             << format_hex_u64(timing.contract_open_pc)
+             << " " << name << "_open_source_index="
+             << timing.contract_open_source_index
+             << " " << name << "_tma_issue_valid="
+             << timing.tma_issue_valid
+             << " " << name << "_first_tma_issue_cycle="
+             << timing.first_tma_issue_cycle
+             << " " << name << "_last_tma_issue_cycle="
+             << timing.last_tma_issue_cycle
+             << " " << name << "_tma_commands="
+             << timing.tma_commands_issued
+             << " " << name << "_completion_valid="
+             << timing.completion_valid
+             << " " << name << "_completion_cycle="
+             << timing.completion_cycle;
+      };
+  append_generation("target", target_generation, target_timing);
+  append_generation("next", target_generation + 1, next_timing);
+
+  const auto append_anchor =
+      [&line, now](const char *name,
+                   const WaitBlockSemanticAnchor *anchor) {
+        line << " " << name << "_valid=" << (anchor != nullptr);
+        if (anchor != nullptr) {
+          line << " " << name << "_cycle=" << anchor->cycle
+               << " " << name << "_age=" << now - anchor->cycle
+               << " " << name << "_cta_warp=" << anchor->cta_warp_id
+               << " " << name << "_function="
+               << anchor->unique_function_id
+               << " " << name << "_pc=0x"
+               << format_hex_u64(anchor->pc)
+               << " " << name << "_source_index="
+               << anchor->source_index
+               << " " << name << "_opcode=" << anchor->opcode;
+        }
+      };
+  append_anchor("producer_anchor", producer_anchor);
+  append_anchor("consumer_anchor", consumer_anchor);
+
+  if (target_timing.completion_valid) {
+    line << " target_complete_to_consumer="
+         << now - target_timing.completion_cycle;
+  }
+  if (next_timing.contract_open_valid) {
+    line << " next_open_to_consumer="
+         << now - next_timing.contract_open_cycle;
+  }
+  if (next_timing.completion_valid) {
+    line << " next_complete_to_consumer="
+         << now - next_timing.completion_cycle;
+  }
+  std::fprintf(stderr, "%s\n", line.str().c_str());
+
+  if (!m_config->stall_reason_align_instrument_enable) {
+    return;
+  }
+
+  const auto emit_window =
+      [this, &inst, &key, target_generation, warp_id, producer_warp](
+          const char *name, uint64_t start_cycle,
+          bool start_progress_valid,
+          const std::vector<WaitBlockWarpProgress> &start_progress,
+          uint64_t end_cycle, bool end_progress_valid,
+          const std::vector<WaitBlockWarpProgress> &end_progress) {
+        std::ostringstream window;
+        window << "[WAITBLOCK][late-stall-window]"
+               << " sm=" << m_sm_id
+               << " trace_kernel=" << inst.trace_kernel_id
+               << " global_cta=" << m_local_to_global_cta_id[key.cta_id]
+               << " barrier=0x" << format_hex_u64(key.barrier_addr)
+               << " target_gen=" << target_generation
+               << " action_pc=0x" << format_hex_u64(inst.pc)
+               << " window=" << name
+               << " start_cycle=" << start_cycle
+               << " end_cycle=" << end_cycle
+               << " cycles="
+               << (end_cycle >= start_cycle ? end_cycle - start_cycle : 0);
+
+        const auto append_role =
+            [&window, &start_progress, &end_progress,
+             start_progress_valid, end_progress_valid](
+                const char *role, unsigned int role_warp) {
+              WaitBlockWarpProgress delta;
+              const bool snapshots_valid =
+                  start_progress_valid && end_progress_valid &&
+                  role_warp < start_progress.size() &&
+                  role_warp < end_progress.size();
+              const bool valid =
+                  snapshots_valid &&
+                  subtract_wait_block_progress(
+                      end_progress[role_warp],
+                      start_progress[role_warp], delta);
+              window << " " << role << "_warp=" << role_warp
+                     << " " << role << "_valid=" << valid;
+              if (!valid) {
+                if (snapshots_valid) {
+                  window << " " << role << "_counter_reset=1";
+                }
+                return;
+              }
+              const uint64_t population =
+                  wait_block_progress_population(delta);
+              window << " " << role << "_active=" << delta.active
+                     << " " << role << "_population=" << population
+                     << " " << role << "_population_delta="
+                     << static_cast<int64_t>(population) -
+                            static_cast<int64_t>(delta.active)
+                     << " " << role << "_selected=" << delta.selected
+                     << " " << role << "_selected_tensor="
+                     << delta.selected_tensor
+                     << " " << role << "_selected_sfu="
+                     << delta.selected_sfu
+                     << " " << role << "_selected_other="
+                     << delta.selected_other
+                     << " " << role << "_eligible_not_selected="
+                     << delta.eligible_not_selected
+                     << " " << role << "_blocked_valid="
+                     << delta.blocked_valid
+                     << " " << role << "_no_valid=" << delta.no_valid
+                     << " " << role << "_wait_block_hold="
+                     << delta.wait_block_hold
+                     << " " << role << "_drain=" << delta.drain
+                     << " " << role << "_no_head_hold="
+                     << delta.no_head_hold
+                     << " " << role << "_unknown_valid="
+                     << delta.unknown_valid
+                     << " " << role << "_sole_yield="
+                     << delta.sole_yield
+                     << " " << role << "_sole_wait_barrier="
+                     << delta.sole_wait_barrier
+                     << " " << role << "_sole_stall_count="
+                     << delta.sole_stall_count
+                     << " " << role << "_sole_fu_tensor="
+                     << delta.sole_fu_tensor
+                     << " " << role << "_sole_fu_sfu="
+                     << delta.sole_fu_sfu
+                     << " " << role << "_sole_fu_other="
+                     << delta.sole_fu_other
+                     << " " << role << "_sole_issue_port="
+                     << delta.sole_issue_port
+                     << " " << role << "_sole_issue_control="
+                     << delta.sole_issue_control
+                     << " " << role << "_sole_named_barrier="
+                     << delta.sole_named_barrier
+                     << " " << role << "_sole_membar="
+                     << delta.sole_membar
+                     << " " << role << "_sole_grid_barrier="
+                     << delta.sole_grid_barrier
+                     << " " << role << "_sole_ldgdepbar="
+                     << delta.sole_ldgdepbar
+                     << " " << role << "_sole_tma_flush="
+                     << delta.sole_tma_flush
+                     << " " << role << "_sole_scoreboard="
+                     << delta.sole_scoreboard
+                     << " " << role << "_sole_result_queue="
+                     << delta.sole_result_queue
+                     << " " << role << "_sole_l1c="
+                     << delta.sole_l1c
+                     << " " << role << "_blocked_multi="
+                     << delta.blocked_multi;
+            };
+        append_role("consumer", warp_id);
+        append_role("producer", producer_warp);
+        std::fprintf(stderr, "%s\n", window.str().c_str());
+      };
+
+  emit_window(
+      "target_complete_to_next_open", target_timing.completion_cycle,
+      target_timing.completion_progress_valid,
+      target_timing.completion_progress, next_timing.contract_open_cycle,
+      next_timing.contract_open_progress_valid,
+      next_timing.contract_open_progress);
+  emit_window(
+      "next_open_to_next_complete", next_timing.contract_open_cycle,
+      next_timing.contract_open_progress_valid,
+      next_timing.contract_open_progress, next_timing.completion_cycle,
+      next_timing.completion_progress_valid,
+      next_timing.completion_progress);
+  emit_window(
+      "next_complete_to_action", next_timing.completion_cycle,
+      next_timing.completion_progress_valid,
+      next_timing.completion_progress, now, true,
+      m_wait_block_stall_progress_by_warp);
+}
+
+uint64_t SM::expected_gen_for_wait(unsigned int warp_id,
+                                   const HopperMBarrierKey &key,
+                                   uint64_t wait_state_raw) const {
+  // [gen audit v3] Pin the generation this wait pairs with from the CURRENT
+  // barrier state at first observation — NOT from a per-(warp,barrier) consumed
+  // history. gen advances only on a real flip and is independent of expected.
+  //
+  //   parity = waited-on phase bit.  phase == (gen & 1).
+  //   ready now (phase != parity)     -> expected = cur_gen       (this flip)
+  //   not-ready (phase == parity)     -> expected = cur_gen + 1   (next flip)
+  //
+  // Rationale: the old "last_consumed + 1" forced every satisfied wait onto a
+  // strictly newer gen, which double-counted a single flip observed by several
+  // waits sharing one runtime barrier address and could over/under-count on
+  // shared barriers. Anchoring to the live barrier gen makes immediate and held
+  // waits use one identical rule and removes both false-audit directions while
+  // still catching a genuine double-flip: a held wait pins expected=cur_gen+1
+  // and, if the barrier
+  // over-flips past it, release sees cur_gen > expected and aborts.
+  (void)warp_id;
+  if (m_wait_block_release_snapshot_valid) {
+    auto snapshot_it = m_hopper_mbarriers.find(key);
+    if (snapshot_it == m_hopper_mbarriers.end() ||
+        snapshot_it->second.wait_block_release_snapshot_cycle !=
+            m_wait_block_release_snapshot_cycle) {
+      return 1;
+    }
+    const unsigned parity = decode_sync_wait_phase(wait_state_raw);
+    const uint64_t cur_gen =
+        snapshot_it->second.wait_block_release_snapshot_generation;
+    return cur_gen +
+           (snapshot_it->second.wait_block_release_snapshot_phase ==
+                    static_cast<uint32_t>(parity)
+                ? 1ULL
+                : 0ULL);
+  }
+  auto barrier_it = m_hopper_mbarriers.find(key);
+  if (barrier_it == m_hopper_mbarriers.end()) {
+    // An unseen barrier is modeled not-ready by is_sync_wait_satisfied().
+    // Pair such a hold with its first real flip instead of treating gen=0
+    // parity as a completed wait on an object that does not yet exist.
+    return 1;
+  }
+  const unsigned parity = decode_sync_wait_phase(wait_state_raw);
+  const uint64_t cur_gen = barrier_it->second.gen;
+  return cur_gen + (((cur_gen & 1ULL) == (uint64_t)parity) ? 1ULL : 0ULL);
+}
+
 void SM::handle_sync_instruction(warp_inst_t &inst, unsigned int warp_id) {
+  if (inst.active_count() == 0) {
+    if (m_config->wait_block_enable && m_config->wait_block_debug) {
+      MissingWaitRecord missing_record;
+      SpinWaitRegionRecord poll_record;
+      const bool has_missing_action = m_gpu->lookup_missing_wait(
+          inst.trace_kernel_id, inst.unique_function_id, inst.pc,
+          missing_record);
+      const bool has_poll_action = m_gpu->lookup_spin_wait_region(
+          inst.trace_kernel_id, inst.unique_function_id, inst.pc, poll_record);
+      if (has_missing_action || has_poll_action) {
+        debug_log_wait_block_event(
+            "predicated-off-noop",
+            "strategy=" +
+                std::string(has_missing_action ? "INJECT_MISSING_WAIT"
+                                               : "FOLD_CAPTURED_POLL") +
+                " block=" +
+                (has_missing_action ? missing_record.block_id
+                                    : poll_record.block_id) +
+                " trace_kernel=" + std::to_string(inst.trace_kernel_id) +
+                " function=" + std::to_string(inst.unique_function_id) +
+                " cta=" +
+                std::to_string(m_physical_warp[warp_id]->get_cta_id()) +
+                " warp=" + std::to_string(warp_id) + " action_pc=0x" +
+                format_hex_u64(inst.pc) + " effective_mask=0x" +
+                format_hex_u64(inst.get_active_mask().to_ullong()) +
+                " trace_active_mask=0x" +
+                format_hex_u64(inst.trace_active_mask) +
+                " trace_predicate_mask=0x" +
+                format_hex_u64(inst.trace_predicate_mask) +
+                " sync_runtime_valid=" +
+                std::to_string(inst.sync_runtime_valid));
+      }
+    }
+    return;
+  }
   if (!inst.sync_site_valid || !inst.sync_runtime_valid) {
+    if (m_config->wait_block_enable) {
+      MissingWaitRecord missing_record;
+      SpinWaitRegionRecord poll_record;
+      const bool is_runtime_action =
+          m_gpu->lookup_missing_wait(inst.trace_kernel_id,
+                                     inst.unique_function_id, inst.pc,
+                                     missing_record) ||
+          m_gpu->lookup_spin_wait_region(inst.trace_kernel_id,
+                                         inst.unique_function_id, inst.pc,
+                                         poll_record);
+      if (is_runtime_action) {
+        std::cerr << "[WAITBLOCK][abort][SM" << m_sm_id << "] cyc="
+                  << get_current_gpu_cycle()
+                  << " reason=runtime-action-payload-missing"
+                  << " trace_kernel=" << inst.trace_kernel_id
+                  << " function=" << inst.unique_function_id
+                  << " cta=" << m_physical_warp[warp_id]->get_cta_id()
+                  << " warp=" << warp_id << " action_pc=0x"
+                  << format_hex_u64(inst.pc)
+                  << " sync_site_valid=" << inst.sync_site_valid
+                  << " sync_runtime_valid=" << inst.sync_runtime_valid
+                  // #region debug-point F:runtime-action-mask
+                  << " effective_mask=0x"
+                  << format_hex_u64(inst.get_active_mask().to_ullong())
+                  << " trace_masks_valid=" << inst.trace_masks_valid
+                  << " trace_active_mask=0x"
+                  << format_hex_u64(inst.trace_active_mask)
+                  << " trace_predicate_mask=0x"
+                  << format_hex_u64(inst.trace_predicate_mask)
+                  // #endregion
+                  << " action=abort" << std::endl;
+        abort();
+      }
+    }
     m_sync_debug_missing_runtime++;
     if (m_sync_debug_skip_runtime_budget > 0) {
       const std::string opcode =
@@ -1847,15 +4988,258 @@ void SM::handle_sync_instruction(warp_inst_t &inst, unsigned int warp_id) {
 
   m_sync_debug_sync_insts++;
   HopperMBarrierKey key = build_sync_barrier_key(inst, warp_id);
-  if (inst.sync_kind == SyncInstructionKind::PHASECHK ||
-      inst.sync_kind == SyncInstructionKind::TRYWAIT) {
+  MissingWaitRecord missing_record;
+  const bool has_missing_action = m_gpu->lookup_missing_wait(
+      inst.trace_kernel_id, inst.unique_function_id, inst.pc, missing_record);
+  SpinWaitRegionRecord poll_region;
+  const bool has_poll_record = m_gpu->lookup_spin_wait_region(
+      inst.trace_kernel_id, inst.unique_function_id, inst.pc, poll_region);
+  const bool has_fold_wait_action =
+      has_poll_record && poll_region.foldable;
+  const bool is_primary_fold_wait =
+      has_fold_wait_action && poll_region.primary_wait_pc == inst.pc;
+  const bool is_auxiliary_fold_wait =
+      has_fold_wait_action && !is_primary_fold_wait;
+  if (has_missing_action && has_fold_wait_action) {
+    std::cerr << "[WAITBLOCK][abort][SM" << m_sm_id << "] cyc="
+              << get_current_gpu_cycle()
+              << " reason=conflicting-runtime-actions"
+              << " trace_kernel=" << inst.trace_kernel_id
+              << " function=" << inst.unique_function_id
+              << " pc=0x" << format_hex_u64(inst.pc)
+              << " action=abort" << std::endl;
+    abort();
+  }
+  const bool is_wait_probe =
+      inst.sync_kind == SyncInstructionKind::PHASECHK ||
+      inst.sync_kind == SyncInstructionKind::TRYWAIT;
+  if ((has_missing_action || has_fold_wait_action) && !is_wait_probe) {
+    std::cerr << "[WAITBLOCK][abort][SM" << m_sm_id << "] cyc="
+              << get_current_gpu_cycle()
+              << " reason=runtime-action-kind-mismatch"
+              << " trace_kernel=" << inst.trace_kernel_id
+              << " function=" << inst.unique_function_id
+              << " pc=0x" << format_hex_u64(inst.pc)
+              << " runtime_kind=" << sync_kind_to_string(inst.sync_kind)
+              << " action=abort" << std::endl;
+    abort();
+  }
+  if (is_wait_probe) {
     if (warp_id < m_pending_sync_waits.size()) {
-      const bool is_trywait =
-          inst.sync_kind == SyncInstructionKind::TRYWAIT;
-      if (is_sync_wait_satisfied(
-              HopperMBarrierPendingWait{true, is_trywait, key,
-                                        inst.sync_semantic_raw})) {
+      if (m_pending_sync_waits[warp_id].valid) {
+        std::cerr << "[WAITBLOCK][abort][SM" << m_sm_id << "] cyc="
+                  << get_current_gpu_cycle()
+                  << " reason=held-warp-issued-another-sync"
+                  << " trace_kernel=" << inst.trace_kernel_id
+                  << " function=" << inst.unique_function_id
+                  << " cta=" << key.cta_id << " warp=" << warp_id
+                  << " pc=0x" << format_hex_u64(inst.pc)
+                  << " action=abort" << std::endl;
+        abort();
+      }
+      const bool is_trywait = inst.sync_kind == SyncInstructionKind::TRYWAIT;
+      HopperMBarrierPendingWait probe;
+      probe.valid = true;
+      probe.is_trywait = is_trywait;
+      probe.key = key;
+      probe.wait_state_raw = inst.sync_semantic_raw;
+      const bool parity_wait_ready = is_sync_wait_satisfied(probe);
+
+      if ((has_missing_action &&
+           (missing_record.entry_probe_pc != inst.pc ||
+            missing_record.entry_probe_kind != inst.sync_kind ||
+            (!missing_record.partial_modeled_miss_aborts &&
+             !missing_record.partial_deferred_replay) ||
+            !inst.sync_has_semantic_raw || !inst.trace_masks_valid)) ||
+          (has_fold_wait_action &&
+           (std::find(
+                poll_region.wait_pcs.begin(), poll_region.wait_pcs.end(),
+                static_cast<uint64_t>(inst.pc)) ==
+                poll_region.wait_pcs.end() ||
+            (is_primary_fold_wait &&
+             poll_region.primary_wait_kind != inst.sync_kind) ||
+            !inst.sync_has_semantic_raw))) {
+        std::cerr << "[WAITBLOCK][abort][SM" << m_sm_id << "] cyc="
+                  << get_current_gpu_cycle()
+                  << " reason=action-kind-or-proof-mismatch"
+                  << " trace_kernel=" << inst.trace_kernel_id
+                  << " function=" << inst.unique_function_id
+                  << " pc=0x" << format_hex_u64(inst.pc)
+                  << " runtime_kind=" << sync_kind_to_string(inst.sync_kind)
+                  << " action=abort" << std::endl;
+        abort();
+      }
+
+      bool wait_ready = parity_wait_ready;
+      bool action_uses_exact_generation = false;
+      uint64_t action_expected_gen = 0;
+      if (m_config->wait_block_enable &&
+          (has_missing_action || has_fold_wait_action)) {
+        const std::string &action_block_id =
+            has_missing_action ? missing_record.block_id
+                               : poll_region.block_id;
+        if (m_config->wait_block_exact_generation_enable) {
+          if (!inst.wait_block_generation_ticket_present) {
+            std::cerr << "[WAITBLOCK][abort][SM" << m_sm_id << "] cyc="
+                      << get_current_gpu_cycle()
+                      << " reason=missing-generation-ticket"
+                      << " block=" << action_block_id
+                      << " trace_kernel=" << inst.trace_kernel_id
+                      << " function=" << inst.unique_function_id
+                      << " cta=" << key.cta_id << " warp=" << warp_id
+                      << " action_pc=0x" << format_hex_u64(inst.pc)
+                      << " action=abort" << std::endl;
+            abort();
+          }
+          if (inst.wait_block_exact_target_valid) {
+            action_uses_exact_generation = true;
+            action_expected_gen =
+                inst.wait_block_target_release_generation;
+            m_wait_block_exact_targets_total++;
+            const uint64_t cur_gen = sync_barrier_gen(key);
+            wait_ready = cur_gen >= action_expected_gen;
+            if (cur_gen > action_expected_gen) {
+              m_wait_block_late_arrivals_total++;
+              const WaitBlockPendingMode late_mode =
+                  has_missing_action
+                      ? WaitBlockPendingMode::MISSING_WAIT_HOLD
+                      : (is_primary_fold_wait
+                             ? WaitBlockPendingMode::CAPTURED_POLL_HOLD
+                             : WaitBlockPendingMode::FOLD_AUX_WAIT_HOLD);
+              if (has_missing_action) {
+                record_wait_block_first_late_arrival(
+                    inst, warp_id, key, action_expected_gen, cur_gen,
+                    late_mode);
+              }
+              debug_log_wait_block_event(
+                  "exact-generation-late-immediate",
+                  "strategy=" +
+                      std::string(wait_block_mode_to_string(late_mode)) +
+                      " block=" + action_block_id +
+                      " trace_kernel=" +
+                      std::to_string(inst.trace_kernel_id) +
+                      " function=" +
+                      std::to_string(inst.unique_function_id) +
+                      " cta=" + std::to_string(key.cta_id) +
+                      " warp=" + std::to_string(warp_id) +
+                      " action_pc=0x" + format_hex_u64(inst.pc) +
+                      " source_index=" +
+                      std::to_string(
+                          inst.wait_block_ticket_source_index) +
+                      " barrier=0x" + format_hex_u64(key.barrier_addr) +
+                      " target_gen=" +
+                      std::to_string(action_expected_gen) +
+                      " current_gen=" + std::to_string(cur_gen));
+            }
+          } else {
+            m_wait_block_generation_fallbacks_total++;
+            action_expected_gen = expected_gen_for_wait(
+                warp_id, key, inst.sync_semantic_raw);
+          }
+        } else {
+          action_expected_gen = expected_gen_for_wait(
+              warp_id, key, inst.sync_semantic_raw);
+        }
+      }
+
+      if (m_config->producer_tail_instrument_enable) {
+        record_producer_tail_phasechk_result(warp_id, wait_ready);
+      }
+      if (m_config->producer_spin_ready_instrument_enable) {
+        record_producer_spin_phasechk_result(warp_id, wait_ready);
+      }
+      // [Spin-wait observe] observe-only would-be-park measurement: only for
+      // polls that are the primary_wait_pc of a detected foldable spin loop.
+      if (m_config->spin_wait_observe_enable && is_primary_fold_wait &&
+          poll_region.semantic_free_body && poll_region.is_spin_loop) {
+        record_spin_wait_observe(warp_id, inst.pc, key.barrier_addr, key.cta_id,
+                                 wait_ready);
+      }
+
+      if (wait_ready) {
         m_sync_debug_wait_released++;
+        if (has_missing_action) {
+          m_missing_wait_ready_total++;
+        }
+        if (m_config->wait_block_enable && is_primary_fold_wait) {
+          const uint64_t expected_gen = action_expected_gen;
+          const uint64_t cur_gen = sync_barrier_gen(key);
+          if (!action_uses_exact_generation &&
+              expected_gen != cur_gen) {
+            std::cerr << "[WAITBLOCK][abort][SM" << m_sm_id << "] cyc="
+                      << get_current_gpu_cycle()
+                      << " reason=immediate-generation-mismatch"
+                      << " block=" << poll_region.block_id
+                      << " warp=" << warp_id
+                      << " expected_gen=" << expected_gen
+                      << " current_gen=" << cur_gen
+                      << " action=abort" << std::endl;
+            abort();
+          }
+          FoldSkipStats skip_stats;
+          const unsigned skipped =
+              fold_cursor_skip_to_exit(warp_id, poll_region, skip_stats);
+          m_fold_immediate_folds_total++;
+          m_fold_immediate_skipped_insts_total += skipped;
+          m_fold_skipped_insts_total += skipped;
+          if (m_fold_pace_by_warp.size() <= warp_id) {
+            m_fold_pace_by_warp.resize(MAX_WARP_PER_SHADER);
+          }
+          FoldPaceStats &pace =
+              m_fold_pace_by_warp[warp_id][FoldPaceKey(key, inst.pc)];
+          pace.immediate_folds++;
+          pace.immediate_skipped_insts += skipped;
+          pace.last_expected_gen = expected_gen;
+          pace.last_barrier_gen = cur_gen;
+          pace.last_end_cycle = get_current_gpu_cycle();
+          if (m_config->wait_block_enable) {
+            std::ostringstream per_pc;
+            bool first_pc = true;
+            for (const auto &entry : skip_stats.pc_occurrences) {
+              if (!first_pc) {
+                per_pc << ",";
+              }
+              first_pc = false;
+              per_pc << "0x" << format_hex_u64(entry.first) << ":"
+                     << entry.second;
+            }
+            debug_log_wait_block_event(
+                "poll-advance",
+                "mode=immediate block=" + poll_region.block_id +
+                    " trace_kernel=" + std::to_string(inst.trace_kernel_id) +
+                    " function=" + std::to_string(inst.unique_function_id) +
+                    " cta=" + std::to_string(key.cta_id) +
+                    " warp=" + std::to_string(warp_id) + " poll_pc=0x" +
+                    format_hex_u64(inst.pc) +
+                    " cursor_before_flush=" +
+                    std::to_string(skip_stats.cursor_before_flush) +
+                    " cursor_after_flush=" +
+                    std::to_string(skip_stats.cursor_after_flush) +
+                    " prefetched_rollback=" +
+                    std::to_string(skip_stats.prefetched_rollback) +
+                    " cursor_after_skip=" +
+                    std::to_string(skip_stats.cursor_after_skip) +
+                    " skipped=" + std::to_string(skipped) +
+                    " per_pc=" +
+                    (first_pc ? std::string("<none>") : per_pc.str()) +
+                    " phasechk_trywait=" +
+                    std::to_string(skip_stats.phasechk_trywait) +
+                    " nanosleep=" + std::to_string(skip_stats.nanosleep) +
+                    " imad_scratch=" +
+                    std::to_string(skip_stats.imad_scratch) +
+                    " loopback_bra=" +
+                    std::to_string(skip_stats.loopback_bra) +
+                    " other=" + std::to_string(skip_stats.other) +
+                    " expected_exit_pc=0x" +
+                    format_hex_u64(poll_region.exit_pc) +
+                    " actual_landing_pc=0x" +
+                    format_hex_u64(
+                        static_cast<trace_shd_warp_t *>(
+                            m_physical_warp[warp_id])
+                            ->get_pc()));
+          }
+        }
+
         // [FWD drain-idle 축4] per-CTA mbarrier test count (released = immediate hit).
         if (m_config->cta_stall_breakdown_instrument_enable &&
             key.cta_id < MAX_CTA_PER_SHADER) {
@@ -1888,12 +5272,13 @@ void SM::handle_sync_instruction(warp_inst_t &inst, unsigned int warp_id) {
         debug_log_sync_event(
             "wait immediate-hit warp=" + std::to_string(warp_id) + " cta=" +
             std::to_string(key.cta_id) + " barrier=0x" +
-            format_hex_u64(key.barrier_addr) + " wait_state=" +
+            format_hex_u64(key.barrier_addr) + " wait_pc=0x" +
+            format_hex_u64(inst.pc) + " wait_state=" +
             std::to_string(inst.sync_semantic_raw) + hit_phase_state);
         m_pending_sync_waits[warp_id] = HopperMBarrierPendingWait();
       } else {
-        // PHASECHK / TRYWAIT are modeled as nonblocking predicate tests.
-        // The traced control flow performs any retry or fallback sequencing.
+        // Unselected probes remain nonblocking predicate tests. Runtime actions
+        // below create a hold only for a sidecar-owned strategy.
         m_sync_debug_wait_pending++;
         // [FWD drain-idle 축4] per-CTA mbarrier test count (pending = found not-ready).
         if (m_config->cta_stall_breakdown_instrument_enable &&
@@ -1909,7 +5294,238 @@ void SM::handle_sync_instruction(warp_inst_t &inst, unsigned int warp_id) {
             m_sync_first_miss_cycle[warp_id] = get_current_gpu_cycle();
           }
         }
-        m_pending_sync_waits[warp_id] = HopperMBarrierPendingWait();
+        bool hold_created = false;
+        if (m_config->wait_block_enable && has_missing_action) {
+          const active_mask_t effective_mask = inst.get_active_mask();
+          const active_mask_t live_mask =
+              m_physical_warp[warp_id]->get_active_mask();
+          if ((effective_mask & ~live_mask).any() || live_mask.none()) {
+            std::cerr << "[WAITBLOCK][abort][SM" << m_sm_id << "] cyc="
+                      << get_current_gpu_cycle()
+                      << " reason=invalid-entry-mask-state"
+                      << " block=" << missing_record.block_id
+                      << " trace_kernel=" << inst.trace_kernel_id
+                      << " function=" << inst.unique_function_id
+                      << " cta=" << key.cta_id << " warp=" << warp_id
+                      << " entry_pc=0x" << format_hex_u64(inst.pc)
+                      << " effective_mask=0x"
+                      << format_hex_u64(effective_mask.to_ullong())
+                      << " live_mask=0x"
+                      << format_hex_u64(live_mask.to_ullong())
+                      << " action=abort" << std::endl;
+            abort();
+          }
+          const uint64_t expected_gen = action_expected_gen;
+          if (effective_mask != live_mask) {
+            m_partial_missing_wait_misses_total++;
+            const uint64_t effective_bits = effective_mask.to_ullong();
+            const uint64_t live_bits = live_mask.to_ullong();
+            const uint64_t sibling_bits = live_bits & ~effective_bits;
+            if (!missing_record.partial_deferred_replay ||
+                missing_record.partial_modeled_miss_aborts ||
+                missing_record.partial_region_id.empty() ||
+                missing_record.observed_entry_masks.count(effective_bits) == 0 ||
+                missing_record.observed_sibling_masks.count(sibling_bits) == 0 ||
+                missing_record.observed_live_masks.count(live_bits) == 0 ||
+                sibling_bits == 0 ||
+                m_partial_wait_arms[warp_id].valid) {
+              std::cerr
+                  << "[WAITBLOCK][UNSUPPORTED_PARTIAL_MISSING_WAIT][SM"
+                  << m_sm_id << "] cyc=" << get_current_gpu_cycle()
+                  << " block=" << missing_record.block_id
+                  << " trace_kernel=" << inst.trace_kernel_id
+                  << " function=" << inst.unique_function_id
+                  << " cta=" << key.cta_id
+                  << " global_cta="
+                  << m_local_to_global_cta_id[key.cta_id]
+                  << " warp=" << warp_id << " entry_probe_pc=0x"
+                  << format_hex_u64(inst.pc)
+                  << " effective_mask=0x"
+                  << format_hex_u64(effective_bits)
+                  << " live_mask=0x" << format_hex_u64(live_bits)
+                  << " sibling_mask=0x"
+                  << format_hex_u64(sibling_bits)
+                  << " partial_deferred_replay="
+                  << missing_record.partial_deferred_replay
+                  << " arm_already_valid="
+                  << m_partial_wait_arms[warp_id].valid
+                  << " action=abort" << std::endl;
+              abort();
+            }
+
+            HopperPartialWaitArm arm;
+            arm.valid = true;
+            arm.mode = PartialWaitArmMode::ARMED;
+            arm.record = missing_record;
+            arm.key = key;
+            arm.wait_state_raw = inst.sync_semantic_raw;
+            arm.expected_gen = expected_gen;
+            arm.uses_exact_generation_ticket =
+                action_uses_exact_generation;
+            arm.blocked_mask = effective_bits;
+            arm.sibling_mask = sibling_bits;
+            arm.unique_function_id = inst.unique_function_id;
+            arm.arm_start_cycle = get_current_gpu_cycle();
+            arm.last_heartbeat_cycle = arm.arm_start_cycle;
+            arm.source_was_deferred_replay =
+                static_cast<const trace_warp_inst_t &>(inst)
+                    .wait_block_trace_origin ==
+                WaitBlockTraceOrigin::PARTIAL_BLOCKED_REPLAY;
+            m_partial_wait_arms[warp_id] = arm;
+            hold_created = true;
+            debug_log_wait_block_event(
+                "partial-arm",
+                "block=" + missing_record.block_id +
+                    " region=" + missing_record.partial_region_id +
+                    " trace_kernel=" +
+                    std::to_string(inst.trace_kernel_id) +
+                    " function=" +
+                    std::to_string(inst.unique_function_id) +
+                    " cta=" + std::to_string(key.cta_id) +
+                    " warp=" + std::to_string(warp_id) +
+                    " entry_pc=0x" + format_hex_u64(inst.pc) +
+                    " branch_pc=0x" +
+                    format_hex_u64(missing_record.entry_branch_pc) +
+                    " blocked_mask=0x" +
+                    format_hex_u64(effective_bits) +
+                    " sibling_mask=0x" +
+                    format_hex_u64(sibling_bits) +
+                    " join_already_issued=" +
+                    std::to_string(
+                        m_partial_joined_regions[warp_id].count(
+                            missing_record.partial_region_id) != 0) +
+                    " source_is_deferred_replay=" +
+                    std::to_string(arm.source_was_deferred_replay));
+          } else {
+            HopperMBarrierPendingWait held;
+            held.valid = true;
+            held.is_trywait = is_trywait;
+            held.key = key;
+            held.wait_state_raw = inst.sync_semantic_raw;
+            held.mode = WaitBlockPendingMode::MISSING_WAIT_HOLD;
+            held.block_id = missing_record.block_id;
+            held.action_pc = inst.pc;
+            held.unique_function_id = inst.unique_function_id;
+            held.expected_gen = expected_gen;
+            held.uses_exact_generation_ticket =
+                action_uses_exact_generation;
+            held.hold_start_cycle = get_current_gpu_cycle();
+            held.last_heartbeat_cycle = held.hold_start_cycle;
+            m_pending_sync_waits[warp_id] = held;
+            m_missing_wait_holds_total++;
+            hold_created = true;
+            debug_log_wait_block_event(
+                "missing-wait-hold",
+                "block=" + missing_record.block_id +
+                    " trace_kernel=" + std::to_string(inst.trace_kernel_id) +
+                    " function=" + std::to_string(inst.unique_function_id) +
+                    " cta=" + std::to_string(key.cta_id) +
+                    " warp=" + std::to_string(warp_id) + " entry_pc=0x" +
+                    format_hex_u64(inst.pc) + " effective_mask=0x" +
+                    format_hex_u64(effective_mask.to_ullong()) +
+                    " live_mask=0x" +
+                    format_hex_u64(live_mask.to_ullong()) + " barrier=0x" +
+                    format_hex_u64(key.barrier_addr) +
+                    " wait_state=0x" +
+                    format_hex_u64(inst.sync_semantic_raw) +
+                    " expected_gen=" + std::to_string(expected_gen) +
+                    " exact_target=" +
+                    std::to_string(
+                        action_uses_exact_generation) +
+                    " current_gen=" +
+                    std::to_string(sync_barrier_gen(key)));
+          }
+        } else if (m_config->wait_block_enable &&
+                   is_primary_fold_wait) {
+          HopperMBarrierPendingWait held;
+          held.valid = true;
+          held.is_trywait = is_trywait;
+          held.key = key;
+          held.wait_state_raw = inst.sync_semantic_raw;
+          held.mode = WaitBlockPendingMode::CAPTURED_POLL_HOLD;
+          held.block_id = poll_region.block_id;
+          held.action_pc = inst.pc;
+          held.poll_loop_exit_pc = poll_region.exit_pc;
+          held.unique_function_id = inst.unique_function_id;
+          held.expected_gen = action_expected_gen;
+          held.uses_exact_generation_ticket =
+              action_uses_exact_generation;
+          held.hold_start_cycle = get_current_gpu_cycle();
+          held.last_heartbeat_cycle = held.hold_start_cycle;
+          m_pending_sync_waits[warp_id] = held;
+          hold_created = true;
+          m_fold_parks_total++;
+          if (m_fold_pace_by_warp.size() <= warp_id) {
+            m_fold_pace_by_warp.resize(MAX_WARP_PER_SHADER);
+          }
+          FoldPaceStats &pace =
+              m_fold_pace_by_warp[warp_id][FoldPaceKey(key, inst.pc)];
+          pace.parks++;
+          if (pace.first_park_cycle == 0) {
+            pace.first_park_cycle = get_current_gpu_cycle();
+          }
+          pace.last_expected_gen = held.expected_gen;
+          pace.last_barrier_gen = sync_barrier_gen(key);
+          if (m_config->wait_block_enable) {
+            debug_log_wait_block_event(
+                "poll-hold",
+                "block=" + poll_region.block_id +
+                    " trace_kernel=" + std::to_string(inst.trace_kernel_id) +
+                    " function=" + std::to_string(inst.unique_function_id) +
+                    " cta=" + std::to_string(key.cta_id) +
+                    " warp=" + std::to_string(warp_id) + " poll_pc=0x" +
+                    format_hex_u64(inst.pc) + " exit_pc=0x" +
+                    format_hex_u64(poll_region.exit_pc) + " barrier=0x" +
+                    format_hex_u64(key.barrier_addr) +
+                    " expected_gen=" + std::to_string(held.expected_gen) +
+                    " exact_target=" +
+                    std::to_string(action_uses_exact_generation) +
+                    " current_gen=" +
+                    std::to_string(sync_barrier_gen(key)));
+          }
+        } else if (
+            m_config->wait_block_enable &&
+            is_auxiliary_fold_wait &&
+            action_uses_exact_generation) {
+          HopperMBarrierPendingWait held;
+          held.valid = true;
+          held.is_trywait = is_trywait;
+          held.key = key;
+          held.wait_state_raw = inst.sync_semantic_raw;
+          held.mode = WaitBlockPendingMode::FOLD_AUX_WAIT_HOLD;
+          held.block_id = poll_region.block_id;
+          held.action_pc = inst.pc;
+          held.unique_function_id = inst.unique_function_id;
+          held.expected_gen = action_expected_gen;
+          held.uses_exact_generation_ticket = true;
+          held.hold_start_cycle = get_current_gpu_cycle();
+          held.last_heartbeat_cycle = held.hold_start_cycle;
+          m_pending_sync_waits[warp_id] = held;
+          hold_created = true;
+          m_fold_aux_holds_total++;
+          debug_log_wait_block_event(
+              "fold-aux-wait-hold",
+              "block=" + poll_region.block_id +
+                  " trace_kernel=" +
+                  std::to_string(inst.trace_kernel_id) +
+                  " function=" +
+                  std::to_string(inst.unique_function_id) +
+                  " cta=" + std::to_string(key.cta_id) +
+                  " warp=" + std::to_string(warp_id) +
+                  " wait_pc=0x" + format_hex_u64(inst.pc) +
+                  " primary_pc=0x" +
+                  format_hex_u64(poll_region.primary_wait_pc) +
+                  " barrier=0x" + format_hex_u64(key.barrier_addr) +
+                  " target_gen=" +
+                  std::to_string(action_expected_gen) +
+                  " current_gen=" +
+                  std::to_string(sync_barrier_gen(key)) +
+                  " cursor_action=none");
+        }
+        if (!hold_created) {
+          m_pending_sync_waits[warp_id] = HopperMBarrierPendingWait();
+        }
+
         // Deadlock diagnosis: dump the current barrier counters so a barrier
         // that never becomes ready (arrive_count < expected, or tx bytes short)
         // is visible even late in a long run.
@@ -1921,7 +5537,11 @@ void SM::handle_sync_instruction(warp_inst_t &inst, unsigned int warp_id) {
               " arrive=" + std::to_string(b.arrive_count) + "/" +
               std::to_string(b.expected_arrive_count) + " tx=" +
               std::to_string(b.completed_tx_bytes) + "/" +
-              std::to_string(b.expected_tx_bytes) + " phase=" +
+              std::to_string(b.expected_tx_bytes) + " assigned=" +
+              std::to_string(b.assigned_tx_bytes) + " outstanding=" +
+              std::to_string(b.outstanding_tma_bindings) +
+              " contract_id=" + std::to_string(b.tx_contract_id) +
+              " phase=" +
               std::to_string(b.phase) + " ready=" +
               std::to_string(b.ready ? 1 : 0);
         }
@@ -1972,14 +5592,49 @@ void SM::handle_sync_instruction(warp_inst_t &inst, unsigned int warp_id) {
   switch (inst.sync_kind) {
     case SyncInstructionKind::EXCH:
       m_sync_debug_exch++;
+      if (barrier.assignment_open || barrier.tx_contract_id != 0 ||
+          barrier.expected_tx_bytes != 0 ||
+          barrier.assigned_tx_bytes != 0 ||
+          barrier.completed_tx_bytes != 0 ||
+          barrier.outstanding_tma_bindings != 0) {
+        ++m_tma_orphan_cleanup;
+        std::cerr << "[TMABIND][abort][SM" << m_sm_id << "] cyc="
+                  << get_current_gpu_cycle()
+                  << " reason=barrier-reinit-with-active-contract"
+                  << " trace_kernel=" << key.trace_kernel_id
+                  << " cta=" << key.cta_id << " barrier=0x"
+                  << format_hex_u64(key.barrier_addr)
+                  << " generation=" << barrier.gen
+                  << " contract_id=" << barrier.tx_contract_id
+                  << " assignment_open=" << barrier.assignment_open
+                  << " expected=" << barrier.expected_tx_bytes
+                  << " assigned=" << barrier.assigned_tx_bytes
+                  << " completed=" << barrier.completed_tx_bytes
+                  << " outstanding=" << barrier.outstanding_tma_bindings
+                  << std::endl;
+        debug_dump_tma_binding_snapshot(
+            "barrier-reinit-with-active-contract");
+        abort();
+      }
       barrier.expected_arrive_count = inst.sync_has_semantic_raw
                                           ? decode_sync_exch_expected_arrive_count(
                                                 inst.sync_semantic_raw)
                                           : 0;
       barrier.arrive_count = 0;
       barrier.expected_tx_bytes = 0;
+      barrier.assigned_tx_bytes = 0;
       barrier.completed_tx_bytes = 0;
+      barrier.outstanding_tma_bindings = 0;
+      barrier.tx_contract_id = 0;
+      barrier.assignment_open = false;
+      barrier.assignment_owner_warp_id = ~0u;
+      barrier.assignment_generation = ~0ull;
+      barrier.assignment_kernel_launch_uid = 0;
+      barrier.assignment_global_cta_id = ~0u;
       barrier.ready = false;
+      if (m_config->wait_block_late_arrival_instrument_enable) {
+        barrier.wait_block_timing.clear();
+      }
       debug_log_sync_event(
           "exch warp=" + std::to_string(warp_id) + " cta=" +
           std::to_string(key.cta_id) + " barrier=0x" +
@@ -1995,12 +5650,13 @@ void SM::handle_sync_instruction(warp_inst_t &inst, unsigned int warp_id) {
       debug_log_sync_event(
           "arrive warp=" + std::to_string(warp_id) + " cta=" +
           std::to_string(key.cta_id) + " barrier=0x" +
-          format_hex_u64(key.barrier_addr) + " +active=" +
+          format_hex_u64(key.barrier_addr) + " pc=0x" +
+          format_hex_u64(inst.pc) + " gen=" + std::to_string(barrier.gen) +
+          " phase=" + std::to_string(barrier.phase) + " +active=" +
           std::to_string(active_threads) + "(mask=0x" + active_mask_hex +
           ") arrive=" + std::to_string(barrier.arrive_count) + "/" +
           std::to_string(barrier.expected_arrive_count));
-      recompute_sync_barrier_ready_and_maybe_flip_phase(barrier,
-                                                        key.barrier_addr);
+      recompute_sync_barrier_ready_and_maybe_flip_phase(key, barrier);
       break;
     case SyncInstructionKind::ARRIVE_COUNTED:
       m_sync_debug_arrive++;
@@ -2011,12 +5667,13 @@ void SM::handle_sync_instruction(warp_inst_t &inst, unsigned int warp_id) {
       debug_log_sync_event(
           "arrive_counted warp=" + std::to_string(warp_id) + " cta=" +
           std::to_string(key.cta_id) + " barrier=0x" +
-          format_hex_u64(key.barrier_addr) + " +active=" +
+          format_hex_u64(key.barrier_addr) + " pc=0x" +
+          format_hex_u64(inst.pc) + " gen=" + std::to_string(barrier.gen) +
+          " phase=" + std::to_string(barrier.phase) + " +active=" +
           std::to_string(active_threads) + "(mask=0x" + active_mask_hex +
           ") arrive=" + std::to_string(barrier.arrive_count) + "/" +
           std::to_string(barrier.expected_arrive_count));
-      recompute_sync_barrier_ready_and_maybe_flip_phase(barrier,
-                                                        key.barrier_addr);
+      recompute_sync_barrier_ready_and_maybe_flip_phase(key, barrier);
       break;
     case SyncInstructionKind::ARRIVE_EXPECT_TX: {
       // The resolver labels every arrive ARRIVE_EXPECT_TX; the real behavior is
@@ -2032,12 +5689,13 @@ void SM::handle_sync_instruction(warp_inst_t &inst, unsigned int warp_id) {
         mark_producer_warp(warp_id);
         barrier.arrive_count += active_threads;
         uint32_t tx_bytes = static_cast<uint32_t>(inst.sync_semantic_raw);
-        barrier.expected_tx_bytes += tx_bytes;
-        bind_tma_completion_to_sync_barrier(warp_id, key, tx_bytes);
+        open_tma_assignment_contract(inst, warp_id, key, tx_bytes);
         debug_log_sync_event(
             "arrive_expect_tx warp=" + std::to_string(warp_id) + " cta=" +
             std::to_string(key.cta_id) + " barrier=0x" +
-            format_hex_u64(key.barrier_addr) + " +active=" +
+            format_hex_u64(key.barrier_addr) + " pc=0x" +
+            format_hex_u64(inst.pc) + " gen=" + std::to_string(barrier.gen) +
+            " phase=" + std::to_string(barrier.phase) + " +active=" +
             std::to_string(active_threads) + "(mask=0x" + active_mask_hex +
             ") arrive=" + std::to_string(barrier.arrive_count) + "/" +
             std::to_string(barrier.expected_arrive_count) + " +tx=" +
@@ -2049,13 +5707,14 @@ void SM::handle_sync_instruction(warp_inst_t &inst, unsigned int warp_id) {
         debug_log_sync_event(
             "arrive warp=" + std::to_string(warp_id) + " cta=" +
             std::to_string(key.cta_id) + " barrier=0x" +
-            format_hex_u64(key.barrier_addr) + " +active=" +
+            format_hex_u64(key.barrier_addr) + " pc=0x" +
+            format_hex_u64(inst.pc) + " gen=" + std::to_string(barrier.gen) +
+            " phase=" + std::to_string(barrier.phase) + " +active=" +
             std::to_string(active_threads) + "(mask=0x" + active_mask_hex +
             ") arrive=" + std::to_string(barrier.arrive_count) + "/" +
             std::to_string(barrier.expected_arrive_count));
       }
-      recompute_sync_barrier_ready_and_maybe_flip_phase(barrier,
-                                                        key.barrier_addr);
+      recompute_sync_barrier_ready_and_maybe_flip_phase(key, barrier);
       break;
     }
     case SyncInstructionKind::NONE:
@@ -2066,82 +5725,608 @@ void SM::handle_sync_instruction(warp_inst_t &inst, unsigned int warp_id) {
 }
 
 void SM::clear_sync_barrier_state_for_cta(unsigned int cta_id) {
+  for (unsigned warp_id = 0; warp_id < m_pending_sync_waits.size();
+       ++warp_id) {
+    HopperMBarrierPendingWait &pending_wait =
+        m_pending_sync_waits[warp_id];
+    if (pending_wait.valid && pending_wait.key.cta_id == cta_id) {
+      if (m_config->wait_block_enable) {
+        std::cerr << "[WAITBLOCK][abort][SM" << m_sm_id << "] cyc="
+                  << get_current_gpu_cycle()
+                  << " reason=cta-cleanup-with-active-hold"
+                  << " strategy="
+                  << wait_block_mode_to_string(pending_wait.mode)
+                  << " trace_kernel=" << pending_wait.key.trace_kernel_id
+                  << " cta=" << cta_id << " warp=" << warp_id
+                  << " action_pc=0x"
+                  << format_hex_u64(pending_wait.action_pc)
+                  << " action=abort" << std::endl;
+        abort();
+      }
+      pending_wait = HopperMBarrierPendingWait();
+    }
+  }
+  for (unsigned warp_id = 0; warp_id < m_partial_wait_arms.size();
+       ++warp_id) {
+    if (m_physical_warp[warp_id]->get_cta_id() != cta_id) {
+      continue;
+    }
+    if (m_config->wait_block_enable &&
+        (m_partial_wait_arms[warp_id].valid ||
+         m_partial_replay_progress[warp_id].valid ||
+         !m_partial_joined_regions[warp_id].empty() ||
+         (m_config->is_trace_mode &&
+          static_cast<trace_shd_warp_t *>(m_physical_warp[warp_id])
+              ->partial_capsule_active()))) {
+      std::cerr << "[WAITBLOCK][abort][SM" << m_sm_id << "] cyc="
+                << get_current_gpu_cycle()
+                << " reason=cta-cleanup-with-active-partial-state"
+                << " cta=" << cta_id << " warp=" << warp_id
+                << " partial_arm="
+                << m_partial_wait_arms[warp_id].valid
+                << " replay_progress="
+                << m_partial_replay_progress[warp_id].valid
+                << " joined_regions="
+                << m_partial_joined_regions[warp_id].size()
+                << " action=abort" << std::endl;
+      abort();
+    }
+    m_partial_wait_arms[warp_id] = HopperPartialWaitArm();
+    m_partial_replay_progress[warp_id] =
+        HopperPartialReplayProgress();
+    m_partial_joined_regions[warp_id].clear();
+  }
   for (auto it = m_hopper_mbarriers.begin(); it != m_hopper_mbarriers.end();) {
     if (it->first.cta_id == cta_id) {
+      const HopperMBarrierObject &barrier = it->second;
+      if (barrier.assignment_open ||
+          barrier.expected_tx_bytes != barrier.assigned_tx_bytes ||
+          barrier.assigned_tx_bytes != barrier.completed_tx_bytes ||
+          barrier.outstanding_tma_bindings != 0) {
+        ++m_tma_orphan_cleanup;
+        std::cerr << "[TMABIND][abort][SM" << m_sm_id << "] cyc="
+                  << get_current_gpu_cycle()
+                  << " reason=cta-cleanup-with-inflight-completion"
+                  << " trace_kernel=" << it->first.trace_kernel_id
+                  << " cta_slot=" << it->first.cta_id << " barrier=0x"
+                  << format_hex_u64(it->first.barrier_addr)
+                  << " generation=" << barrier.gen
+                  << " contract_id=" << barrier.tx_contract_id
+                  << " assignment_open=" << barrier.assignment_open
+                  << " expected=" << barrier.expected_tx_bytes
+                  << " assigned=" << barrier.assigned_tx_bytes
+                  << " completed=" << barrier.completed_tx_bytes
+                  << " outstanding=" << barrier.outstanding_tma_bindings
+                  << std::endl;
+        debug_dump_tma_binding_snapshot(
+            "cta-cleanup-with-inflight-completion");
+        abort();
+      }
       it = m_hopper_mbarriers.erase(it);
     } else {
       ++it;
     }
   }
-  for (HopperMBarrierPendingWait &pending_wait : m_pending_sync_waits) {
-    if (pending_wait.valid && pending_wait.key.cta_id == cta_id) {
-      pending_wait = HopperMBarrierPendingWait();
-    }
-  }
-  for (auto &bindings : m_pending_tma_barrier_binds_per_warp) {
-    while (!bindings.empty() && bindings.front().key.cta_id == cta_id) {
-      bindings.pop_front();
-    }
-    if (!bindings.empty()) {
-      std::deque<HopperMBarrierPendingTxBinding> filtered;
-      for (const auto &binding : bindings) {
-        if (binding.key.cta_id != cta_id) {
-          filtered.push_back(binding);
-        }
+  // Poll pace is emitted immediately before this cleanup at CTA exit. Drop the
+  // just-printed CTA-slot entries so a later CTA reusing the slot gets an
+  // independent pacing record rather than a cross-wave aggregate.
+  for (auto &per_warp : m_fold_pace_by_warp) {
+    for (auto it = per_warp.begin(); it != per_warp.end();) {
+      if (it->first.first.cta_id == cta_id) {
+        it = per_warp.erase(it);
+      } else {
+        ++it;
       }
-      bindings.swap(filtered);
     }
   }
 }
 
-void SM::bind_tma_completion_to_sync_barrier(unsigned int warp_id,
-                                             const HopperMBarrierKey &key,
-                                             uint32_t tx_bytes) {
-  if (warp_id >= m_pending_tma_barrier_binds_per_warp.size() || tx_bytes == 0) {
-    return;
+void SM::open_tma_assignment_contract(const warp_inst_t &inst,
+                                      unsigned int warp_id,
+                                      const HopperMBarrierKey &key,
+                                      uint32_t expected_tx_bytes) {
+  if (warp_id >= m_tma_open_contracts_per_warp.size() ||
+      key.cta_id >= MAX_CTA_PER_SHADER || expected_tx_bytes == 0) {
+    ++m_tma_contract_mismatches;
+    std::cerr << "[TMABIND][abort][SM" << m_sm_id << "] cyc="
+              << get_current_gpu_cycle()
+              << " reason=invalid-contract-open"
+              << " warp=" << warp_id << " trace_kernel="
+              << key.trace_kernel_id << " cta=" << key.cta_id
+              << " barrier=0x" << format_hex_u64(key.barrier_addr)
+              << " expected=" << expected_tx_bytes << std::endl;
+    debug_dump_tma_binding_snapshot("invalid-contract-open");
+    abort();
   }
-  HopperMBarrierPendingTxBinding binding;
-  binding.key = key;
-  binding.pending_tx_bytes = tx_bytes;
-  m_pending_tma_barrier_binds_per_warp[warp_id].push_back(binding);
-  debug_log_sync_event("bind_tma warp=" + std::to_string(warp_id) + " cta=" +
-                       std::to_string(key.cta_id) + " barrier=0x" +
-                       format_hex_u64(key.barrier_addr) + " tx=" +
-                       std::to_string(tx_bytes) + " queued_binds=" +
-                       std::to_string(
-                           m_pending_tma_barrier_binds_per_warp[warp_id].size()));
-}
 
-void SM::notify_tma_completion(unsigned int warp_id,
-                               uint32_t completed_tx_bytes) {
-  if (warp_id >= m_pending_tma_barrier_binds_per_warp.size() ||
-      completed_tx_bytes == 0) {
-    return;
+  auto barrier_it = m_hopper_mbarriers.find(key);
+  if (barrier_it == m_hopper_mbarriers.end()) {
+    ++m_tma_contract_mismatches;
+    std::cerr << "[TMABIND][abort][SM" << m_sm_id << "] cyc="
+              << get_current_gpu_cycle()
+              << " reason=contract-barrier-missing"
+              << " warp=" << warp_id << " trace_kernel="
+              << key.trace_kernel_id << " cta=" << key.cta_id
+              << " barrier=0x" << format_hex_u64(key.barrier_addr)
+              << std::endl;
+    debug_dump_tma_binding_snapshot("contract-open");
+    abort();
   }
-  m_sync_debug_tma_completions++;
-  uint32_t remaining_bytes = completed_tx_bytes;
-  std::deque<HopperMBarrierPendingTxBinding> &bindings =
-      m_pending_tma_barrier_binds_per_warp[warp_id];
-  while (remaining_bytes > 0 && !bindings.empty()) {
-    HopperMBarrierPendingTxBinding &binding = bindings.front();
-    HopperMBarrierObject &barrier = get_or_create_sync_barrier(binding.key);
-    uint32_t applied_bytes = std::min(remaining_bytes, binding.pending_tx_bytes);
-    barrier.completed_tx_bytes += applied_bytes;
-    debug_log_sync_event(
-        "tma_complete warp=" + std::to_string(warp_id) + " cta=" +
-        std::to_string(binding.key.cta_id) + " barrier=0x" +
-        format_hex_u64(binding.key.barrier_addr) + " applied=" +
-        std::to_string(applied_bytes) + " completed_tx=" +
-        std::to_string(barrier.completed_tx_bytes) + "/" +
-        std::to_string(barrier.expected_tx_bytes));
-    recompute_sync_barrier_ready_and_maybe_flip_phase(barrier,
-                                                      binding.key.barrier_addr);
-    remaining_bytes -= applied_bytes;
-    binding.pending_tx_bytes -= applied_bytes;
-    if (binding.pending_tx_bytes == 0) {
-      bindings.pop_front();
+
+  HopperMBarrierObject &barrier = barrier_it->second;
+  if (barrier.assignment_open || barrier.tx_contract_id != 0 ||
+      barrier.expected_tx_bytes != 0 || barrier.assigned_tx_bytes != 0 ||
+      barrier.completed_tx_bytes != 0 ||
+      barrier.outstanding_tma_bindings != 0 ||
+      barrier.assignment_owner_warp_id != ~0u ||
+      barrier.assignment_generation != ~0ull ||
+      barrier.assignment_kernel_launch_uid != 0 ||
+      barrier.assignment_global_cta_id != ~0u) {
+    ++m_tma_contract_mismatches;
+    std::cerr << "[TMABIND][abort][SM" << m_sm_id << "] cyc="
+              << get_current_gpu_cycle()
+              << " reason=contract-generation-not-empty"
+              << " warp=" << warp_id << " trace_kernel="
+              << key.trace_kernel_id << " cta=" << key.cta_id
+              << " barrier=0x" << format_hex_u64(key.barrier_addr)
+              << " generation=" << barrier.gen
+              << " owner_warp=" << barrier.assignment_owner_warp_id
+              << " expected=" << barrier.expected_tx_bytes
+              << " assigned=" << barrier.assigned_tx_bytes
+              << " completed=" << barrier.completed_tx_bytes
+              << " outstanding=" << barrier.outstanding_tma_bindings
+              << std::endl;
+    debug_dump_tma_binding_snapshot("contract-generation-not-empty");
+    abort();
+  }
+
+  const uint64_t launch_uid = m_physical_warp[warp_id]->m_kernel_id;
+  const uint32_t global_cta_id = get_global_cta_id(key.cta_id);
+  if (launch_uid == 0) {
+    ++m_tma_launch_or_cta_mismatch;
+    std::cerr << "[TMABIND][abort][SM" << m_sm_id << "] cyc="
+              << get_current_gpu_cycle()
+              << " reason=contract-owner-launch-missing"
+              << " warp=" << warp_id << " cta_slot=" << key.cta_id
+              << std::endl;
+    debug_dump_tma_binding_snapshot("contract-owner-launch-missing");
+    abort();
+  }
+  if (m_tma_binding_launch_uid == 0) {
+    m_tma_binding_launch_uid = launch_uid;
+  }
+  if (m_tma_binding_launch_uid != launch_uid) {
+    ++m_tma_launch_or_cta_mismatch;
+    std::cerr << "[TMABIND][abort][SM" << m_sm_id << "] cyc="
+              << get_current_gpu_cycle()
+              << " reason=contract-launch-mismatch"
+              << " stats_launch=" << m_tma_binding_launch_uid
+              << " current_launch=" << launch_uid << std::endl;
+    debug_dump_tma_binding_snapshot("contract-launch-mismatch");
+    abort();
+  }
+
+  const uint64_t contract_id = m_next_tma_contract_id++;
+  barrier.tx_contract_id = contract_id;
+  barrier.assignment_open = true;
+  barrier.assignment_owner_warp_id = warp_id;
+  barrier.assignment_generation = barrier.gen;
+  barrier.assignment_kernel_launch_uid = launch_uid;
+  barrier.assignment_global_cta_id = global_cta_id;
+  barrier.expected_tx_bytes = expected_tx_bytes;
+  barrier.assigned_tx_bytes = 0;
+  barrier.completed_tx_bytes = 0;
+  barrier.outstanding_tma_bindings = 0;
+  ++m_tma_open_contracts_per_warp[warp_id];
+  m_tma_max_open_contracts_per_warp =
+      std::max(m_tma_max_open_contracts_per_warp,
+               m_tma_open_contracts_per_warp[warp_id]);
+  ++m_tma_contracts_opened;
+
+  if (m_config->wait_block_late_arrival_instrument_enable) {
+    WaitBlockGenerationTiming &timing =
+        barrier.wait_block_timing[barrier.gen + 1];
+    timing.contract_open_valid = true;
+    timing.contract_open_cycle = get_current_gpu_cycle();
+    timing.contract_owner_warp_id = warp_id;
+    timing.contract_owner_cta_warp_id = inst.trace_cta_warp_id;
+    timing.contract_open_function_id = inst.unique_function_id;
+    timing.contract_open_pc = inst.pc;
+    timing.contract_open_source_index = inst.trace_instruction_index;
+    if (m_config->stall_reason_align_instrument_enable) {
+      timing.contract_open_progress_valid = true;
+      timing.contract_open_progress = m_wait_block_stall_progress_by_warp;
     }
   }
+
+  debug_log_tma_binding_event(
+      "contract-open",
+      "kernel_launch_uid=" + std::to_string(launch_uid) +
+          " trace_kernel=" + std::to_string(key.trace_kernel_id) +
+          " global_cta=" + std::to_string(global_cta_id) +
+          " cta_slot=" + std::to_string(key.cta_id) +
+          " warp=" + std::to_string(warp_id) + " barrier=0x" +
+          format_hex_u64(key.barrier_addr) +
+          " generation=" + std::to_string(barrier.gen) +
+          " contract_id=" + std::to_string(contract_id) +
+          " expected=" + std::to_string(expected_tx_bytes) +
+          " warp_open_contracts=" +
+          std::to_string(m_tma_open_contracts_per_warp[warp_id]));
+}
+
+void SM::claim_tma_completion_target(const warp_inst_t &inst,
+                                     TMACommand &cmd) {
+  if (cmd.transfer_type != TMATransferType::LOAD) {
+    if (inst.tma_completion_runtime_valid) {
+      ++m_tma_contract_mismatches;
+      std::cerr << "[TMABIND][abort][SM" << m_sm_id << "] cyc="
+                << get_current_gpu_cycle()
+                << " reason=nonload-has-completion-target"
+                << " trace_kernel=" << inst.trace_kernel_id
+                << " warp=" << inst.warp_id() << " pc=0x"
+                << format_hex_u64(inst.pc) << std::endl;
+      debug_dump_tma_binding_snapshot("nonload-has-completion-target");
+      abort();
+    }
+    return;
+  }
+
+  const unsigned int warp_id = inst.warp_id();
+  if (!inst.tma_completion_runtime_valid ||
+      inst.tma_completion_barrier_addr == 0 ||
+      (inst.tma_completion_barrier_addr & 0x7) != 0 ||
+      inst.tma_completion_barrier_ureg_id == 0 ||
+      warp_id >= m_tma_open_contracts_per_warp.size() ||
+      cmd.total_bytes == 0 ||
+      cmd.warp_id != warp_id || cmd.sm_id != m_sm_id ||
+      cmd.trace_kernel_id != inst.trace_kernel_id ||
+      cmd.unique_function_id != inst.unique_function_id ||
+      cmd.tma_pc != inst.pc || cmd.cta_id >= MAX_CTA_PER_SHADER ||
+      cmd.cta_id != m_physical_warp[warp_id]->get_cta_id()) {
+    ++m_tma_contract_mismatches;
+    std::cerr << "[TMABIND][abort][SM" << m_sm_id << "] cyc="
+              << get_current_gpu_cycle()
+              << " reason=missing-or-invalid-completion-target"
+              << " trace_kernel=" << inst.trace_kernel_id
+              << " warp=" << warp_id << " pc=0x"
+              << format_hex_u64(inst.pc)
+              << " payload_valid=" << inst.tma_completion_runtime_valid
+              << " barrier=0x"
+              << format_hex_u64(inst.tma_completion_barrier_addr)
+              << " barrier_ureg=" << inst.tma_completion_barrier_ureg_id
+              << " memory_bytes=" << cmd.total_bytes
+              << " cmd_warp=" << cmd.warp_id
+              << " cmd_sm=" << cmd.sm_id
+              << " cmd_trace_kernel=" << cmd.trace_kernel_id
+              << " cmd_function=" << cmd.unique_function_id
+              << " cmd_pc=0x" << format_hex_u64(cmd.tma_pc)
+              << " cmd_cta=" << cmd.cta_id << std::endl;
+    debug_dump_tma_binding_snapshot("missing-completion-target");
+    abort();
+  }
+
+  HopperMBarrierKey key;
+  key.trace_kernel_id = inst.trace_kernel_id;
+  key.cta_id = cmd.cta_id;
+  key.barrier_addr = inst.tma_completion_barrier_addr;
+  const uint64_t launch_uid = m_physical_warp[warp_id]->m_kernel_id;
+  const uint32_t global_cta_id = get_global_cta_id(cmd.cta_id);
+
+  auto barrier_it = m_hopper_mbarriers.find(key);
+  if (barrier_it == m_hopper_mbarriers.end()) {
+    ++m_tma_contract_mismatches;
+    std::cerr << "[TMABIND][abort][SM" << m_sm_id << "] cyc="
+              << get_current_gpu_cycle()
+              << " reason=claim-barrier-missing"
+              << " trace_kernel=" << inst.trace_kernel_id
+              << " global_cta=" << global_cta_id
+              << " cta_slot=" << cmd.cta_id << " warp=" << warp_id
+              << " pc=0x" << format_hex_u64(inst.pc)
+              << " payload_barrier=0x"
+              << format_hex_u64(key.barrier_addr) << std::endl;
+    debug_dump_tma_binding_snapshot("claim-barrier-missing");
+    abort();
+  }
+
+  HopperMBarrierObject &barrier = barrier_it->second;
+  if (launch_uid == 0 || !barrier.assignment_open ||
+      barrier.assignment_owner_warp_id != warp_id ||
+      barrier.assignment_kernel_launch_uid != launch_uid ||
+      barrier.assignment_global_cta_id != global_cta_id ||
+      m_tma_open_contracts_per_warp[warp_id] == 0) {
+    ++m_tma_contract_mismatches;
+    if (barrier.assignment_kernel_launch_uid != launch_uid ||
+        barrier.assignment_global_cta_id != global_cta_id) {
+      ++m_tma_launch_or_cta_mismatch;
+    }
+    std::cerr << "[TMABIND][abort][SM" << m_sm_id << "] cyc="
+              << get_current_gpu_cycle()
+              << " reason=tx-contract-unresolved"
+              << " trace_kernel=" << inst.trace_kernel_id
+              << " global_cta=" << global_cta_id
+              << " cta_slot=" << cmd.cta_id << " warp=" << warp_id
+              << " pc=0x" << format_hex_u64(inst.pc)
+              << " payload_barrier=0x"
+              << format_hex_u64(key.barrier_addr)
+              << " assignment_open=" << barrier.assignment_open
+              << " owner_warp=" << barrier.assignment_owner_warp_id
+              << " assignment_launch="
+              << barrier.assignment_kernel_launch_uid
+              << " assignment_global_cta="
+              << barrier.assignment_global_cta_id
+              << " contract_id=" << barrier.tx_contract_id
+              << " warp_open_contracts="
+              << m_tma_open_contracts_per_warp[warp_id]
+              << std::endl;
+    debug_dump_tma_binding_snapshot("tx-contract-unresolved");
+    abort();
+  }
+
+  if (barrier.assignment_generation != barrier.gen ||
+      barrier.tx_contract_id == 0) {
+    ++m_tma_contract_mismatches;
+    if (barrier.assignment_generation != barrier.gen) {
+      ++m_tma_stale_generation;
+    }
+    std::cerr << "[TMABIND][abort][SM" << m_sm_id << "] cyc="
+              << get_current_gpu_cycle()
+              << " reason=claim-contract-state-mismatch"
+              << " contract_id=" << barrier.tx_contract_id
+              << " contract_generation=" << barrier.assignment_generation
+              << " barrier_generation=" << barrier.gen
+              << " assignment_open=" << barrier.assignment_open << std::endl;
+    debug_dump_tma_binding_snapshot("claim-contract-state-mismatch");
+    abort();
+  }
+
+  const uint64_t assigned_after =
+      static_cast<uint64_t>(barrier.assigned_tx_bytes) + cmd.total_bytes;
+  if (assigned_after > barrier.expected_tx_bytes) {
+    ++m_tma_contract_mismatches;
+    std::cerr << "[TMABIND][abort][SM" << m_sm_id << "] cyc="
+              << get_current_gpu_cycle()
+              << " reason=tx-contract-overassigned"
+              << " contract_id=" << barrier.tx_contract_id
+              << " expected=" << barrier.expected_tx_bytes
+              << " assigned_before=" << barrier.assigned_tx_bytes
+              << " credit=" << cmd.total_bytes << std::endl;
+    debug_dump_tma_binding_snapshot("tx-contract-overassigned");
+    abort();
+  }
+
+  TmaCompletionTarget target;
+  target.valid = true;
+  target.key = key;
+  target.barrier_generation = barrier.gen;
+  target.kernel_launch_uid = launch_uid;
+  target.global_cta_id = global_cta_id;
+  target.owner_warp_id = warp_id;
+  target.source_barrier_ureg_id = inst.tma_completion_barrier_ureg_id;
+  target.contract_id = barrier.tx_contract_id;
+  target.binding_id = m_next_tma_binding_id++;
+  target.credit_bytes = cmd.total_bytes;
+  cmd.completion = target;
+
+  barrier.assigned_tx_bytes = static_cast<uint32_t>(assigned_after);
+  ++barrier.outstanding_tma_bindings;
+  ++m_tma_outstanding_bindings_per_warp[warp_id];
+  ++m_tma_bindings_created;
+  m_tma_assigned_credit_bytes += target.credit_bytes;
+  if (m_config->wait_block_late_arrival_instrument_enable) {
+    WaitBlockGenerationTiming &timing =
+        barrier.wait_block_timing[barrier.gen + 1];
+    const uint64_t now = get_current_gpu_cycle();
+    if (!timing.tma_issue_valid) {
+      timing.tma_issue_valid = true;
+      timing.first_tma_issue_cycle = now;
+    }
+    timing.last_tma_issue_cycle = now;
+    ++timing.tma_commands_issued;
+  }
+
+  if (barrier.assigned_tx_bytes == barrier.expected_tx_bytes) {
+    if (m_tma_open_contracts_per_warp[warp_id] == 0) {
+      ++m_tma_contract_mismatches;
+      std::cerr << "[TMABIND][abort][SM" << m_sm_id << "] cyc="
+                << get_current_gpu_cycle()
+                << " reason=open-contract-counter-underflow"
+                << " warp=" << warp_id
+                << " contract_id=" << barrier.tx_contract_id << std::endl;
+      debug_dump_tma_binding_snapshot("open-contract-counter-underflow");
+      abort();
+    }
+    barrier.assignment_open = false;
+    --m_tma_open_contracts_per_warp[warp_id];
+    ++m_tma_contracts_fully_assigned;
+  }
+
+  debug_log_tma_binding_event(
+      "assign",
+      "kernel_launch_uid=" + std::to_string(launch_uid) +
+          " trace_kernel=" + std::to_string(key.trace_kernel_id) +
+          " global_cta=" + std::to_string(global_cta_id) +
+          " cta_slot=" + std::to_string(key.cta_id) +
+          " warp=" + std::to_string(warp_id) + " tma_pc=0x" +
+          format_hex_u64(inst.pc) + " opcode=" +
+          std::to_string(static_cast<int>(cmd.opcode_family)) +
+          " barrier=0x" + format_hex_u64(key.barrier_addr) +
+          " generation=" + std::to_string(target.barrier_generation) +
+          " contract_id=" + std::to_string(target.contract_id) +
+          " binding_id=" + std::to_string(target.binding_id) +
+          " memory_bytes=" + std::to_string(cmd.total_bytes) +
+          " credit_bytes=" + std::to_string(target.credit_bytes) +
+          " expected=" + std::to_string(barrier.expected_tx_bytes) +
+          " assigned=" + std::to_string(barrier.assigned_tx_bytes) +
+          " outstanding=" +
+          std::to_string(barrier.outstanding_tma_bindings) +
+          " warp_open_contracts=" +
+          std::to_string(m_tma_open_contracts_per_warp[warp_id]));
+}
+
+void SM::complete_tma_load(TmaCompletionTarget &target,
+                           uint32_t memory_bytes, uint64_t transfer_uid) {
+  if (!target.valid || target.completed || target.credit_bytes == 0 ||
+      target.binding_id == 0 || target.contract_id == 0 ||
+      target.key.barrier_addr == 0 ||
+      target.key.cta_id >= MAX_CTA_PER_SHADER ||
+      target.owner_warp_id >=
+          m_tma_max_completed_transfer_uid_per_warp.size()) {
+    if (target.completed) {
+      ++m_tma_duplicate_completion;
+    } else {
+      ++m_tma_contract_mismatches;
+    }
+    std::cerr << "[TMABIND][abort][SM" << m_sm_id << "] cyc="
+              << get_current_gpu_cycle()
+              << " reason="
+              << (target.completed ? "duplicate-binding-completion"
+                                   : "invalid-completion-target")
+              << " transfer_uid=" << transfer_uid
+              << " binding_id=" << target.binding_id
+              << " credit_bytes=" << target.credit_bytes << std::endl;
+    debug_dump_tma_binding_snapshot("invalid-completion");
+    abort();
+  }
+
+  const uint64_t live_launch_uid =
+      m_physical_warp[target.owner_warp_id]->m_kernel_id;
+  const uint32_t live_cta_id =
+      m_physical_warp[target.owner_warp_id]->get_cta_id();
+  const uint32_t live_global_cta = get_global_cta_id(target.key.cta_id);
+  if (live_launch_uid == 0 ||
+      target.kernel_launch_uid != live_launch_uid ||
+      target.key.cta_id != live_cta_id ||
+      target.global_cta_id != live_global_cta) {
+    ++m_tma_launch_or_cta_mismatch;
+    std::cerr << "[TMABIND][abort][SM" << m_sm_id << "] cyc="
+              << get_current_gpu_cycle()
+              << " reason=completion-launch-or-cta-mismatch"
+              << " transfer_uid=" << transfer_uid
+              << " binding_id=" << target.binding_id
+              << " target_launch=" << target.kernel_launch_uid
+              << " live_launch=" << live_launch_uid
+              << " target_cta_slot=" << target.key.cta_id
+              << " live_cta_slot=" << live_cta_id
+              << " target_global_cta=" << target.global_cta_id
+              << " live_global_cta=" << live_global_cta << std::endl;
+    debug_dump_tma_binding_snapshot("completion-identity-mismatch");
+    abort();
+  }
+
+  auto barrier_it = m_hopper_mbarriers.find(target.key);
+  if (barrier_it == m_hopper_mbarriers.end()) {
+    ++m_tma_orphan_cleanup;
+    std::cerr << "[TMABIND][abort][SM" << m_sm_id << "] cyc="
+              << get_current_gpu_cycle()
+              << " reason=completion-barrier-missing"
+              << " transfer_uid=" << transfer_uid
+              << " binding_id=" << target.binding_id << " barrier=0x"
+              << format_hex_u64(target.key.barrier_addr) << std::endl;
+    debug_dump_tma_binding_snapshot("completion-barrier-missing");
+    abort();
+  }
+
+  HopperMBarrierObject &barrier = barrier_it->second;
+  if (target.barrier_generation != barrier.gen ||
+      target.barrier_generation != barrier.assignment_generation) {
+    ++m_tma_stale_generation;
+    std::cerr << "[TMABIND][abort][SM" << m_sm_id << "] cyc="
+              << get_current_gpu_cycle()
+              << " reason=stale-barrier-generation"
+              << " transfer_uid=" << transfer_uid
+              << " binding_id=" << target.binding_id
+              << " target_generation=" << target.barrier_generation
+              << " barrier_generation=" << barrier.gen
+              << " assignment_generation="
+              << barrier.assignment_generation << std::endl;
+    debug_dump_tma_binding_snapshot("stale-barrier-generation");
+    abort();
+  }
+
+  const uint64_t completed_after =
+      static_cast<uint64_t>(barrier.completed_tx_bytes) +
+      target.credit_bytes;
+  if (target.contract_id == 0 ||
+      target.contract_id != barrier.tx_contract_id ||
+      target.owner_warp_id != barrier.assignment_owner_warp_id ||
+      target.kernel_launch_uid !=
+          barrier.assignment_kernel_launch_uid ||
+      target.global_cta_id != barrier.assignment_global_cta_id ||
+      memory_bytes != target.credit_bytes ||
+      completed_after > barrier.assigned_tx_bytes ||
+      barrier.assigned_tx_bytes > barrier.expected_tx_bytes ||
+      barrier.outstanding_tma_bindings == 0 ||
+      m_tma_outstanding_bindings_per_warp[target.owner_warp_id] == 0) {
+    ++m_tma_contract_mismatches;
+    std::cerr << "[TMABIND][abort][SM" << m_sm_id << "] cyc="
+              << get_current_gpu_cycle()
+              << " reason=completion-contract-mismatch"
+              << " transfer_uid=" << transfer_uid
+              << " binding_id=" << target.binding_id
+              << " target_contract=" << target.contract_id
+              << " barrier_contract=" << barrier.tx_contract_id
+              << " target_warp=" << target.owner_warp_id
+              << " barrier_owner_warp="
+              << barrier.assignment_owner_warp_id
+              << " memory_bytes=" << memory_bytes
+              << " credit_bytes=" << target.credit_bytes
+              << " expected=" << barrier.expected_tx_bytes
+              << " assigned=" << barrier.assigned_tx_bytes
+              << " completed_before=" << barrier.completed_tx_bytes
+              << " outstanding=" << barrier.outstanding_tma_bindings
+              << " warp_outstanding="
+              << m_tma_outstanding_bindings_per_warp[target.owner_warp_id]
+              << std::endl;
+    debug_dump_tma_binding_snapshot("completion-contract-mismatch");
+    abort();
+  }
+
+  const uint32_t completed_before = barrier.completed_tx_bytes;
+  target.completed = true;
+  --barrier.outstanding_tma_bindings;
+  --m_tma_outstanding_bindings_per_warp[target.owner_warp_id];
+  barrier.completed_tx_bytes = static_cast<uint32_t>(completed_after);
+  ++m_tma_bindings_completed;
+  m_tma_completed_credit_bytes += target.credit_bytes;
+  uint64_t &max_completed_uid =
+      m_tma_max_completed_transfer_uid_per_warp[target.owner_warp_id];
+  if (max_completed_uid != 0 && transfer_uid < max_completed_uid) {
+    ++m_tma_uid_reorders;
+  }
+  max_completed_uid = std::max(max_completed_uid, transfer_uid);
+  ++m_sync_debug_tma_completions;
+
+  debug_log_tma_binding_event(
+      "complete",
+      "kernel_launch_uid=" + std::to_string(target.kernel_launch_uid) +
+          " trace_kernel=" +
+          std::to_string(target.key.trace_kernel_id) +
+          " global_cta=" + std::to_string(target.global_cta_id) +
+          " cta_slot=" + std::to_string(target.key.cta_id) +
+          " warp=" + std::to_string(target.owner_warp_id) +
+          " transfer_uid=" + std::to_string(transfer_uid) +
+          " barrier=0x" + format_hex_u64(target.key.barrier_addr) +
+          " generation=" + std::to_string(target.barrier_generation) +
+          " contract_id=" + std::to_string(target.contract_id) +
+          " binding_id=" + std::to_string(target.binding_id) +
+          " credit_bytes=" + std::to_string(target.credit_bytes) +
+          " completed_before=" + std::to_string(completed_before) +
+          " completed_after=" +
+          std::to_string(barrier.completed_tx_bytes) +
+          " expected=" + std::to_string(barrier.expected_tx_bytes) +
+          " outstanding=" +
+          std::to_string(barrier.outstanding_tma_bindings));
+  debug_log_sync_event(
+      "tma_complete warp=" + std::to_string(target.owner_warp_id) +
+      " cta=" + std::to_string(target.key.cta_id) + " barrier=0x" +
+      format_hex_u64(target.key.barrier_addr) + " gen=" +
+      std::to_string(barrier.gen) + " phase=" +
+      std::to_string(barrier.phase) + " applied=" +
+      std::to_string(target.credit_bytes) + " completed_tx=" +
+      std::to_string(barrier.completed_tx_bytes) + "/" +
+      std::to_string(barrier.expected_tx_bytes) + " binding_id=" +
+      std::to_string(target.binding_id));
+  recompute_sync_barrier_ready_and_maybe_flip_phase(target.key, barrier);
 }
 
 bool SM::are_all_wait_barrier_ready(unsigned int warp_id) {
@@ -2177,7 +6362,8 @@ bool SM::warp_waiting_at_mem_barrier(unsigned warp_id) {
     }
   }
   if(clear_membar) {
-    if (m_config->bar_debug_enable) {
+    if (m_config->bar_debug_enable &&
+        m_config->bar_debug_issue_budget > 0) {
       std::ostringstream oss;
       oss << "[MEMBARDBG][fence-release] sm=" << m_sm_id
           << " warp=" << warp_id
@@ -2235,6 +6421,64 @@ bool SM::warp_waiting_at_mem_barrier(unsigned warp_id) {
 
 bool SM::warp_waiting_grid_barrier(unsigned warp_id) {
   return m_physical_warp[warp_id]->get_gridbar();
+}
+
+// [SR-M0A] Pure, non-mutating wait-state peeks. See STALL_REASON_ALIGN.md SR-M0A.6.
+// These reproduce the readiness predicates used by the authoritative issue path
+// WITHOUT any of its side effects (no clear, no wait-set insert/erase, no cache
+// invalidate, no watchdog-map update, no log emission).
+
+WaitBlockPendingMode SM::peek_wait_block_hold_mode(unsigned warp_id) const {
+  // Inspect ONLY the pending WaitBlock state, never the programmer/named-barrier
+  // set (that is peek_named_barrier_wait's job). Returns NONE when there is no
+  // unresolved WaitBlock hold.
+  if (warp_id >= m_pending_sync_waits.size()) {
+    return WaitBlockPendingMode::NONE;
+  }
+  const HopperMBarrierPendingWait &pending_wait = m_pending_sync_waits[warp_id];
+  if (!pending_wait.valid ||
+      is_wait_block_pending_satisfied(pending_wait)) {
+    return WaitBlockPendingMode::NONE;
+  }
+  return pending_wait.mode;
+}
+
+bool SM::peek_named_barrier_wait(unsigned warp_id) const {
+  return m_barriers.warp_waiting_at_barrier(warp_id);
+}
+
+bool SM::peek_membar_wait(unsigned warp_id) const {
+  // Mirror warp_waiting_at_mem_barrier()'s drain predicate with no clear/log/
+  // watchdog/L1-invalidate side effects.
+  if (!m_physical_warp[warp_id]->get_membar()) return false;
+  bool use_traditional_scoreboarding =
+      !m_physical_warp[warp_id]->get_kernel_info()->is_captured_from_binary ||
+      m_config->is_remodeling_scoreboarding_enabled || !m_config->is_trace_mode;
+  bool clear_membar = false;
+  if (use_traditional_scoreboarding) {
+    clear_membar = (!m_scoreboard->pendingWrites(warp_id) &&
+                    !m_scoreboard_WAR->pendingReads(warp_id));
+  } else {
+    membar_scope_t scope = m_physical_warp[warp_id]->get_membar_scope();
+    if (scope == MEMBAR_SCOPE_NONE) {
+      clear_membar = true;
+    } else {
+      clear_membar = !warp_has_pending_fence_stores(warp_id, (int)scope);
+    }
+  }
+  return !clear_membar;
+}
+
+bool SM::peek_grid_barrier_wait(unsigned warp_id) const {
+  return m_physical_warp[warp_id]->get_gridbar();
+}
+
+bool SM::peek_tma_flush_wait(unsigned warp_id, const warp_inst_t *inst) const {
+  if (inst == nullptr ||
+      inst->tma_opcode_family != TMAOpcodeFamily::UTMACMDFLUSH) {
+    return false;
+  }
+  return m_tma_unit_shared_of_sm->warp_has_outstanding_stores(warp_id);
 }
 
 bool SM::warp_waiting_at_tma_flush(unsigned warp_id, const warp_inst_t *pI) {
@@ -2578,6 +6822,9 @@ void SM::warp_inst_complete(const warp_inst_t &inst) {
 
   m_sm_stats.m_stats_map["gpu_sim_insn"]->increment_with_integer(inst.active_count());
   m_sm_stats.m_stats_map["total_num_warp_instructions"]->increment_with_integer(1);
+  if (m_config->wait_block_enable) {
+    m_wait_block_retired_warp_instructions_total++;
+  }
 
   if(inst.is_load() || inst.is_store()) {
     m_sm_stats.m_stats_map["total_num_ldst_unit_instructions"]->increment_with_integer(1);
@@ -2624,7 +6871,8 @@ void SM::inc_fence_store(unsigned warp_id, int fence_vis_level, unsigned n) {
   } else if (fence_vis_level == mem_fetch::FENCE_VIS_GPU) {
     m_physical_warp[warp_id]->inc_pending_stores_gpu_visible(n);
   }
-  if (m_config->bar_debug_enable) {
+  if (m_config->bar_debug_enable &&
+      m_config->bar_debug_issue_budget > 0) {
     std::ostringstream oss;
     oss << "[MEMBARDBG][store++] sm=" << m_sm_id << " warp=" << warp_id
         << " level=" << fence_vis_level << " n=" << n
@@ -2641,7 +6889,8 @@ void SM::dec_fence_store(unsigned warp_id, int fence_vis_level, unsigned n) {
   } else if (fence_vis_level == mem_fetch::FENCE_VIS_GPU) {
     m_physical_warp[warp_id]->dec_pending_stores_gpu_visible(n);
   }
-  if (m_config->bar_debug_enable) {
+  if (m_config->bar_debug_enable &&
+      m_config->bar_debug_issue_budget > 0) {
     std::ostringstream oss;
     oss << "[MEMBARDBG][store--] sm=" << m_sm_id << " warp=" << warp_id
         << " level=" << fence_vis_level << " n=" << n

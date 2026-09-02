@@ -1,5 +1,20 @@
 # TMA Real Base Address + Real Coords (Arch TODO-2, "same as HW")
 
+> **Post-`.e83` correction (2026-08-24).** The historical `23/23 exact`
+> conclusion below proved deterministic lookup coverage, not semantic
+> descriptor identity. The old `direct` path equates a runtime TMA-state
+> offset with a numerically equal parameter-struct descriptor offset even
+> though those are different coordinate spaces. The regenerated K5/K10 trace
+> exposes 10 sites where direct and the UTMACCTL-derived candidate coexist,
+> zero where they agree, and 10 where they select different descriptors.
+> Moreover, the current chain builder merges trace-kernel variants under
+> `(unique_function_id, pc)` and overwrites multiple candidates. The production
+> repair must key the relation by
+> `(trace_kernel_id, unique_function_id, pc)`, preserve each UTMACCTL
+> source/destination edge, reject ambiguity, and remove direct/pool selection
+> as an identity authority. The complete staged plan is
+> [`WAIT_BLOCK_TMA_OWNERSHIP.md`](WAIT_BLOCK_TMA_OWNERSHIP.md).
+
 > **Goal.** Make the TMA unit resolve the *actual* per-transfer GMEM address the
 > way real Hopper HW does — `addr = global_base + Σ coord[d]·global_stride[d]` —
 > instead of the synthetic `agu_base = (transfer_uid<<20) + agu_index*128`
@@ -1215,7 +1230,13 @@ Local self-test (descriptor hidden at 0x2a0 while SASS said 0x1f0) correctly rec
   The 0xc0-spaced bases we saw earlier would then be a separate CUTLASS base array, joined
   by index, not by descriptor identity.
 
-## 2.27 SPIKE 10 — SOLVED: exact (uid,pc)→base via the UTMACCTL prefetch chain (Rosetta stone)
+## 2.27 SPIKE 10 — Historical UTMACCTL prefetch-chain result
+
+> **Current interpretation:** this spike established the correct kind of
+> data-flow relation, but its implementation key was incomplete. The results
+> in this section predate `trace_kernel_id` keying and direct-vs-chain conflict
+> checks. Treat the examples as historical evidence for the chain, not as a
+> completed identity proof.
 
 Exact per-pc base mapping **is** achievable. The three coordinate systems (host struct
 offset, SASS param offset, device SMEM offset) finally link through **UTMACCTL.PF**, which
@@ -1289,7 +1310,7 @@ Note: the LOCAL trace is still the OLD 16-qword CSV (no `blob_path` column, empt
 is the source of truth. Re-run the builder on the server with the diagnostic to see the
 `smem_by_pc` count.
 
-## 2.29 SPIKE 10 build FIXED — 23/23 exact base mappings, zero pool fallback
+## 2.29 SPIKE 10 build FIXED — historical 23/23 resolution coverage
 
 Copied the server trace locally and reproduced `mapped 0`, then found **two bugs** (both
 environmental, not logic):
@@ -1312,13 +1333,32 @@ runtime SMEM offsets: 23 (uid,pc) across uid3, uid8
   uid8: direct=4 chain=8 pool=0 unresolved=0
 locality check (one base per SMEM offset): OK
 ```
-**Every descriptor-op pc resolves to an exact real base — direct + prefetch-chain cover
-100%, no pool fallback needed.** 23 entries, 5 distinct bases, source = 10 direct + 13
-chain. Answers the user's "can we do exact mapping for all?": **yes, 23/23.**
-`tma_pc_base_map.json` = `{ "uid:pc": {base_hex, smem_offset_hex, source} }`.
+**Correction:** these numbers prove that all 23 sites received a deterministic
+mapping and that the pool path was unused. They do not prove that the selected
+descriptor was the one consumed by the instruction. The implementation checked
+`direct` before `chain`, discarded the unselected candidate, and validated only
+the final map. Therefore the reported `10 direct + 13 chain` split masked
+cross-source conflicts.
 
-Locality is guaranteed: each SMEM offset (tensor ID) maps to exactly one base, so pcs
-reading the same tensor share a base — the property L2-hit modeling needs.
+The regenerated trace exposes:
+
+```text
+descriptor-family sites examined = 23
+at least one chain candidate      = 23
+direct candidate present         = 10
+direct-only sites                = 0
+selected direct/chain agreement  = 0
+selected direct/chain conflicts  = 10
+pre-overwrite candidates/state   = 2 or 3
+```
+
+For K5 `0x96b0`, the direct shortcut chooses encode 8
+(`64x128`, 16,384 bytes), while the UTMACCTL relation contains encode 0
+(`64x192`, 24,576 bytes), which matches the independent expect-tx contract.
+Encode 0 is not accepted merely because it appears in the current overwritten
+chain output: kernel-aware reconstruction must leave it as the sole candidate,
+and otherwise abort. Exactness requires that proof before emitting
+`tma_pc_base_map.json`.
 
 **Next (sim wiring, Phase 4):** load `tma_pc_base_map.json` and replace the synthetic
 `agu_base = (transfer_uid<<20) + agu_index*128` (tma_unit_sm.cc:637) with
@@ -1582,17 +1622,31 @@ place.
 
 # FINAL PLAN — exact 매핑 통합 & 휴리스틱 제거 (SPIKE 10 이후)
 
-> 상세본: [.trae/documents/TMA_exact_base_mapping_integration.md](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/.trae/documents/TMA_exact_base_mapping_integration.md). 여기는 이 문서만으로 실행 가능한 요약 + 구현 전 감사 결과.
+> 상세본: [.plan/TMA_exact_base_mapping_integration.md](file:///Users/bytedance/Documents/github/modern-gpu-simulator-micro-2025/.plan/TMA_exact_base_mapping_integration.md). 여기는 이 문서만으로 실행 가능한 요약 + 구현 전 감사 결과.
 
 ## F.0 확정 사실
-`build_tma_pc_base_map.py`가 `(uid,pc) → exact real base`를 준다. 서버 재검증(M0): **23/23, direct+chain 100%, pool=0, unresolved=0, locality OK**. base는 pool 근사가 아니라 128B descriptor를 바이트 단위로 특정해 얻은 exact 값(qword0). 같은 128B에서 나머지 descriptor 필드도 전부 exact.
+
+`build_tma_pc_base_map.py`의 기존 `(uid,pc)` 출력은 **23/23 deterministic
+coverage**를 제공하지만 아직 exact identity가 아니다. `direct`는 서로 다른
+coordinate space의 offset 숫자 일치일 뿐이며, current retrace에서 10개
+direct/chain overlap이 모두 충돌한다. 기존 chain도 trace-kernel variant를
+합쳐 overwrite하므로 다음 조건을 만족할 때만 exact로 승격한다:
+
+```text
+key = (trace_kernel_id, unique_function_id, pc)
+one executed site -> one preserved UTMACCTL data-flow chain
+ambiguous chains = 0
+unresolved descriptor sites = 0
+direct/pool authority = 0
+selected descriptor bytes == independent expect-tx contract bytes
+```
 
 ## F.1 opcode별 처리 (실제 FA3 트레이스 + SASS로 확정)
 | opcode | base | size | 비고 |
 |---|---|---|---|
-| UTMALDG/UTMASTG | **exact**(런타임 SMEM-window offset→direct/chain→128B qword0) | box_dim×element_size (같은 128B) | M1 대상, 23/23 |
-| UTMACCTL.PF | **exact**(prologue `param_base+off`, `off−0x30`=struct slot) | n/a(control) | **prefetch 모델링용 매핑**(어느 텐서 warm하는지). 6→6 clean. per-pc emit 추가 |
-| UTMAREDG | exact(있으면, UTMALDG 동형) | 동일 | 이 트레이스엔 없음 |
+| UTMALDG/UTMASTG | **교정 필요**(kernel-aware UTMACCTL chain→128B qword0) | box_dim×element_size (같은 128B) | 기존 23/23은 coverage 결과; direct authority 제거 필요 |
+| UTMACCTL.PF | **kernel-aware 교정 필요**(prologue source→runtime destination edge) | n/a(control) | prefetch 및 descriptor-chain evidence |
+| UTMAREDG | UTMALDG와 같은 kernel-aware chain 필요 | 동일 | 이 트레이스엔 없음 |
 | **UBLKRED** | **합성 유지**(tensormap 아님) | covered_bytes(operand-3, **정확**) | 실행 사이트 desc=`UMOV`{0,0x14f00000} bare handle, base=raw dQaccum GMEM ptr(`c[0x0][0x280]/0x2a0`)+동적 offset. extractor offset은 UMOV 미모델 false-positive. base 정확화=M2.5 |
 | UBLKCP | 합성/operand | covered_bytes | desc_valid=false, tensormap 미참조 |
 | UTMAPF | — | — | **bwd 커널에 없음(count=0)**. 3단계 체인 아님 |
@@ -1601,11 +1655,26 @@ place.
 **통일 규칙:** base map 대상 = struct 128B tensormap에 닿는 site(UTMALDG/UTMASTG/UTMACCTL.PF)만 exact. UBLKRED/UBLKCP는 tensormap이 아니라 raw GMEM ptr → base 합성, size(covered_bytes)만 정확. **extractor는 `UMOV` 모델링 + struct-bounds 가드를 추가**해 UBLKRED 가짜 offset(0x30d96, struct 0x700 밖)을 제거.
 
 ## F.2 handle_hi가 공급하던 **전 필드**를 exact로 교체
-handle_hi→config_id가 붙이던 `TMADescriptorConfigMetadata` 11필드(rank,dtype,global_dim,global_strides,box_dim,element_strides,interleave,swizzle,l2_promotion,oob_fill,element_size)는 전부 128B descriptor 안 → `tensor_map_encode_dump.csv`에 이미 컬럼으로 존재(검증). struct discovery가 (uid,pc)→매칭 encode row를 특정하므로 그 row에서 11필드를 그대로 읽어 base map 엔트리에 동봉. handle_hi/config_id 불필요.
+handle_hi→config_id가 붙이던 `TMADescriptorConfigMetadata`
+11필드(rank,dtype,global_dim,global_strides,box_dim,element_strides,
+interleave,swizzle,l2_promotion,oob_fill,element_size)는 전부 128B descriptor
+안에 있고 `tensor_map_encode_dump.csv`에 이미 존재한다. Kernel-aware
+UTMACCTL chain이 `(trace_kernel_id,uid,pc)`에 대해 매칭 encode row를 하나로
+특정한 뒤에만 그 row의 11필드를 base-map entry에 동봉한다.
+handle_hi/config_id와 direct numeric offset은 identity source로 사용하지 않는다.
 
 ## F.3 마일스톤
-- **M0**(완료): 23/23 재검증 + UBLKRED/UTMACCTL SASS 규명.
-- **M1**: (Python) `extract_tma_descriptor_offsets.py`에 UMOV 모델링+struct-bounds 가드; `build_tma_pc_base_map.py`에 UTMACCTL.PF per-pc emit + 전 descriptor 필드 동봉 + strict gate. (C++) `TMABaseRecord`/loader/`build_tma_command` lookup/`mover` 주입 + flag `-tma_real_base_addr_enable`. **UTMALDG/UTMASTG/UTMACCTL.PF만 real base**, UBLKRED/UBLKCP 합성. size는 base map 값과 기존 config_id 값 **교차검증(requests_total 동일)**.
+- **M0**(재개): 기존 23/23은 coverage로 재분류. TMA metadata key에
+  `trace_kernel_id`를 추가하고, UTMACCTL edge를 variant별로 보존하며,
+  direct/pool authority를 제거한다. ambiguity/unresolved가 하나라도 있으면
+  sidecar 생성을 중단한다.
+- **M1**: (Python) `extract_tma_descriptor_offsets.py`에 UMOV
+  모델링+struct-bounds 가드; `build_tma_pc_base_map.py`에 kernel-aware
+  UTMACCTL.PF edge와 전 descriptor 필드를 동봉한 strict output을 추가.
+  (C++) `TMABaseRecord`/loader/`build_tma_command` lookup을 kernel-aware하게
+  변경하고 `mover`에 주입한다. **UTMALDG/UTMASTG/UTMACCTL.PF만
+  descriptor chain을 사용**하고, UBLKRED/UBLKCP는 operand-addressed 경로를
+  유지한다. Descriptor size는 독립 expect-tx contract와 교차검증한다.
 - **M2**: coords 캡처(tracer 미니-스파이크) → `addr=base+Σcoord·stride`.
 - **M2.5**: UBLKRED base 정확화 — **tensormap 아님**이 확정됐으므로 `desc handle→struct` 경로가 아니라 **raw-pointer 1-level deref**(`c[0x0][0x280]/0x2a0`의 dQaccum base) + 동적 tile coords 필요. 정적 매핑 불가(증명됨).
 - **M3**: 교차검증 통과 후 handle_hi/resolver 제거.

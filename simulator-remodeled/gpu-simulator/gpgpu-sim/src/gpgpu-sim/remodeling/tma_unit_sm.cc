@@ -3,6 +3,7 @@
 #include <cassert>
 #include <iostream>
 #include <set>
+#include <sstream>
 #include <tuple>
 
 #include "../../abstract_hardware_model.h"
@@ -11,6 +12,12 @@
 #include "sm.h"
 
 namespace {
+
+std::string format_tma_hex(uint64_t value) {
+  std::ostringstream stream;
+  stream << std::hex << value;
+  return stream.str();
+}
 
 TMADirection classify_tma_direction(const warp_inst_t &inst) {
   if (inst.op == TMA_LOAD_OP) {
@@ -162,13 +169,15 @@ void log_tma_phase2_binding_once(const warp_inst_t &inst,
   if (!enable) {
     return;
   }
-  static std::set<std::tuple<unsigned int, uint64_t, uint32_t>> logged_sites;
-  auto key = std::make_tuple(inst.unique_function_id, static_cast<uint64_t>(inst.pc),
-                             0u);
+  static std::set<std::tuple<unsigned int, unsigned int, uint64_t>>
+      logged_sites;
+  auto key = std::make_tuple(inst.trace_kernel_id, inst.unique_function_id,
+                             static_cast<uint64_t>(inst.pc));
   if (!logged_sites.insert(key).second) {
     return;
   }
-  std::cerr << "[TMA][Phase2] ufid=" << inst.unique_function_id
+  std::cerr << "[TMA][Phase2] trace_kernel=" << inst.trace_kernel_id
+            << " ufid=" << inst.unique_function_id
             << " pc=0x" << std::hex << static_cast<uint64_t>(inst.pc)
             << std::dec
             << " family=" << static_cast<int>(cmd.opcode_family)
@@ -199,11 +208,14 @@ const char *tma_phase2_family_label(TMAOpcodeFamily family) {
   }
 }
 
+using TMAPhase2SiteKey =
+    std::tuple<unsigned int, unsigned int, uint64_t>;
+
 struct TMAPhase2FamilyStats {
-  std::set<std::tuple<unsigned int, uint64_t, uint32_t>> descriptor_key_sites;
-  std::set<std::tuple<unsigned int, uint64_t, uint32_t>> operand_only_sites;
-  std::set<std::tuple<unsigned int, uint64_t, uint32_t>> mixed_sites;
-  std::set<std::tuple<unsigned int, uint64_t, uint32_t>> unresolved_sites;
+  std::set<TMAPhase2SiteKey> descriptor_key_sites;
+  std::set<TMAPhase2SiteKey> operand_only_sites;
+  std::set<TMAPhase2SiteKey> mixed_sites;
+  std::set<TMAPhase2SiteKey> unresolved_sites;
   uint64_t descriptor_key_commands = 0;
   uint64_t operand_only_commands = 0;
   uint64_t mixed_commands = 0;
@@ -211,12 +223,12 @@ struct TMAPhase2FamilyStats {
   // Real-base coverage (only meaningful when -tma_real_base_addr_enable is on):
   // real_base_* = a static base was applied; synthetic_* = fell back to the
   // transfer_uid scheme (operand_addressed sites like UBLKRED/UBLKCP, or flag off).
-  std::set<std::tuple<unsigned int, uint64_t, uint32_t>> real_base_sites;
-  std::set<std::tuple<unsigned int, uint64_t, uint32_t>> synthetic_sites;
+  std::set<TMAPhase2SiteKey> real_base_sites;
+  std::set<TMAPhase2SiteKey> synthetic_sites;
   uint64_t real_base_commands = 0;
   uint64_t synthetic_commands = 0;
 
-  void record(const std::tuple<unsigned int, uint64_t, uint32_t> &key,
+  void record(const TMAPhase2SiteKey &key,
               const TMAResolvedSiteMetadata &metadata, bool has_real_base) {
     if (has_real_base) {
       real_base_sites.insert(key);
@@ -279,9 +291,8 @@ struct TMAPhase2BindingStats {
 
   void record(const warp_inst_t &inst, const TMAResolvedSiteMetadata &metadata,
               bool has_real_base) {
-    auto key = std::make_tuple(inst.unique_function_id,
-                               static_cast<uint64_t>(inst.pc),
-                               0u);
+    auto key = std::make_tuple(inst.trace_kernel_id, inst.unique_function_id,
+                               static_cast<uint64_t>(inst.pc));
     overall.record(key, metadata, has_real_base);
     TMAPhase2FamilyStats *family_stats = select_family_stats(inst.tma_opcode_family);
     if (family_stats != nullptr) {
@@ -367,6 +378,7 @@ void tma_unit_sm::issue(register_set_uniptr &source_reg) {
   if (ready_inst != nullptr) {
     if (ready_inst->active_count() > 0) {
       TMACommand cmd = build_tma_command(*ready_inst);
+      m_sm->claim_tma_completion_target(*ready_inst, cmd);
       m_command_queue.push(cmd);
       ++m_stat_commands_issued;
     }
@@ -398,6 +410,9 @@ TMACommand tma_unit_sm::build_tma_command(const warp_inst_t &inst) const {
   cmd.warp_id = inst.warp_id();
   cmd.sm_id = m_sm->get_sid();
   cmd.subcore_id = inst.get_subcore_id();
+  cmd.trace_kernel_id = inst.trace_kernel_id;
+  cmd.unique_function_id = inst.unique_function_id;
+  cmd.tma_pc = inst.pc;
   if (m_sm->get_shd_warp(inst.warp_id()) != nullptr) {
     cmd.cta_id = m_sm->get_shd_warp(inst.warp_id())->get_cta_id();
   }
@@ -406,8 +421,8 @@ TMACommand tma_unit_sm::build_tma_command(const warp_inst_t &inst) const {
   cmd.transfer_type = classify_tma_transfer_type(inst, cmd.opcode_family);
   cmd.operand_form = classify_tma_operand_form(cmd.opcode_family);
   cmd.meta_source = TMAMetadataSource::NONE;
-  if (m_sm->get_gpu()->lookup_tma_site_metadata(inst.unique_function_id, inst.pc,
-                                                metadata)) {
+  if (m_sm->get_gpu()->lookup_tma_site_metadata(
+          inst.trace_kernel_id, inst.unique_function_id, inst.pc, metadata)) {
     if (metadata.has_descriptor_metadata) {
       cmd.config_id = metadata.config_id;
       cmd.mapping_method = metadata.mapping_method;
@@ -450,8 +465,9 @@ TMACommand tma_unit_sm::build_tma_command(const warp_inst_t &inst) const {
       }
     }
   }
-  // Real per-site GMEM base (tma_pc_base_map.json), looked up here because (uid,pc) is
-  // still available — the mover only sees TMATransferEntry and cannot re-derive it.
+  // Real per-site GMEM base (tma_pc_base_map.json), looked up here because
+  // (trace_kernel_id,uid,pc) is still available. The mover only sees
+  // TMATransferEntry and cannot re-derive it.
   // Gated by -tma_real_base_addr_enable (on by default, M4). Base-map load failure is
   // already a FATAL assert at load time, so if the flag is on the base map is present.
   // Only tensormap-addressed sites carry a static
@@ -459,7 +475,7 @@ TMACommand tma_unit_sm::build_tma_command(const warp_inst_t &inst) const {
   if (m_config->tma_real_base_addr_enable) {
     TMABaseRecord base_record;
     bool base_hit = m_sm->get_gpu()->lookup_tma_base_record(
-        inst.unique_function_id, inst.pc, base_record);
+        inst.trace_kernel_id, inst.unique_function_id, inst.pc, base_record);
     if (base_hit && base_record.has_static_base) {
       cmd.global_base = base_record.global_base;
       cmd.has_real_base = true;
@@ -544,8 +560,20 @@ TMACommand tma_unit_sm::build_tma_command(const warp_inst_t &inst) const {
       // and num_tiles comes from the base map (region / tile_bytes).
       cmd.global_base = base_record.global_base;
       cmd.has_real_base = true;
+      if (base_record.tile_bytes_operand == 0 || cmd.covered_bytes == 0 ||
+          base_record.tile_bytes_operand != cmd.covered_bytes) {
+        std::cerr << "[TMA][OperandBase][FATAL] tile-size mismatch "
+                  << "trace_kernel=" << inst.trace_kernel_id
+                  << " uid=" << inst.unique_function_id << " pc=0x"
+                  << std::hex << static_cast<uint64_t>(inst.pc) << std::dec
+                  << " base_map=" << base_record.tile_bytes_operand
+                  << " operand=" << cmd.covered_bytes << std::endl;
+      }
+      assert(base_record.tile_bytes_operand > 0 &&
+             cmd.covered_bytes > 0 &&
+             base_record.tile_bytes_operand == cmd.covered_bytes &&
+             "raw-pointer tile bytes must equal operand-derived command bytes");
       uint64_t tile_bytes = base_record.tile_bytes_operand;
-      if (tile_bytes == 0) tile_bytes = cmd.covered_bytes;  // fallback to live operand
       uint64_t num_tiles = base_record.num_tiles;
       if (num_tiles == 0) num_tiles = 1;
       if (tile_bytes > 0) {
@@ -570,7 +598,9 @@ TMACommand tma_unit_sm::build_tma_command(const warp_inst_t &inst) const {
                 << static_cast<uint64_t>(inst.pc) << std::dec
                 << " family=" << tma_phase2_family_label(cmd.opcode_family)
                 << " base_hit=" << (base_hit ? 1 : 0)
-                << " (tma_pc_base_map.json missing this (uid,pc) or operand_addressed)"
+                << " trace_kernel=" << inst.trace_kernel_id
+                << " (tma_pc_base_map.json missing this "
+                   "(trace_kernel_id,uid,pc) or operand_addressed)"
                 << std::endl;
       assert(false &&
              "descriptor-required TMA site missing real base (base-map coverage gap)");
@@ -674,7 +704,22 @@ void tma_unit_sm::enqueue_issued_commands() {
       " dir=" + std::to_string(static_cast<int>(entry.cmd.direction)) +
       " ttype=" + std::to_string(static_cast<int>(entry.cmd.transfer_type)) +
       " requests_total=" + std::to_string(entry.cmd.requests_total) +
-      " total_bytes=" + std::to_string(entry.cmd.total_bytes));
+      " total_bytes=" + std::to_string(entry.cmd.total_bytes) +
+      " binding_id=" +
+      std::to_string(entry.cmd.completion.binding_id));
+  if (entry.cmd.completion.valid) {
+    m_sm->debug_log_tma_binding_event(
+        "enqueue",
+        "transfer_uid=" + std::to_string(entry.transfer_uid) +
+            " contract_id=" +
+            std::to_string(entry.cmd.completion.contract_id) +
+            " binding_id=" +
+            std::to_string(entry.cmd.completion.binding_id) +
+            " barrier=0x" +
+            format_tma_hex(entry.cmd.completion.key.barrier_addr) +
+            " generation=" +
+            std::to_string(entry.cmd.completion.barrier_generation));
+  }
 }
 
 void tma_unit_sm::advance_in_flight_transfers() {
@@ -1029,7 +1074,8 @@ void tma_unit_sm::mover_on_response(TMATransferEntry &entry, mem_fetch *mf,
     // completion uses the bulk async-group (commit-group / wait-group)
     // mechanism, modeled separately by the UTMACMDFLUSH warp-stall.
     if (entry.cmd.transfer_type == TMATransferType::LOAD) {
-      m_sm->notify_tma_completion(entry.cmd.warp_id, entry.cmd.total_bytes);
+      m_sm->complete_tma_load(entry.cmd.completion, entry.cmd.total_bytes,
+                              entry.transfer_uid);
       // Symmetric with the prefetch branch's "mbarrier_credited=0": make the
       // producer->consumer handshake observable. A real load credits the
       // consumer mbarrier's transaction-count (complete_tx) with total_bytes,
@@ -1038,14 +1084,16 @@ void tma_unit_sm::mover_on_response(TMATransferEntry &entry, mem_fetch *mf,
           "load-mbarrier-credit uid=" + std::to_string(entry.transfer_uid) +
           " warp=" + std::to_string(entry.cmd.warp_id) +
           " bytes=" + std::to_string(entry.cmd.total_bytes) +
+          " binding_id=" +
+          std::to_string(entry.cmd.completion.binding_id) +
           " mbarrier_credited=1"
           " cycle=" + std::to_string(current_cycle));
     } else if (entry.cmd.transfer_type == TMATransferType::PREFETCH) {
       // Fire-and-forget prefetch: data has landed in L2/SMEM-staging but there
       // is no consumer barrier to signal. Just log and retire silently.
       // ttype is logged so the trace can prove this transfer took the PREFETCH
-      // branch and therefore did NOT call notify_tma_completion (the latent bug
-      // this branch closes).
+      // branch and therefore did not apply a command-owned mbarrier completion
+      // target.
       m_sm->debug_log_tma_event(
           "prefetch-complete uid=" + std::to_string(entry.transfer_uid) +
           " warp=" + std::to_string(entry.cmd.warp_id) +

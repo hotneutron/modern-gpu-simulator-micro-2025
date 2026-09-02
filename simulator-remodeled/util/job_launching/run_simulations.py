@@ -220,7 +220,21 @@ class ConfigurationSpec:
             ### This code handles the case where you pass a directory a few levels up from the
             ### directory where the traces are laid out.
             benchmark_trace_dir = None
-            paths_to_try = [os.path.join(options.trace_dir, appargs_subdir, "traces")] + \
+            paths_to_try = []
+            trace_run_dir = os.path.normpath(options.trace_dir)
+            trace_run_name = os.path.basename(trace_run_dir)
+            trace_benchmark_name = os.path.basename(os.path.dirname(trace_run_dir))
+            expected_benchmark_name = os.path.dirname(appargs_subdir)
+            expected_args_name = os.path.basename(appargs_subdir)
+            if (
+                trace_benchmark_name == expected_benchmark_name
+                and (
+                    trace_run_name == expected_args_name
+                    or trace_run_name.startswith(expected_args_name + "_")
+                )
+            ):
+                paths_to_try.append(os.path.join(trace_run_dir, "traces"))
+            paths_to_try += [os.path.join(options.trace_dir, appargs_subdir, "traces")] + \
                 glob.glob(os.path.join(options.trace_dir, "**", "**", appargs_subdir, "traces")) +\
                 glob.glob(os.path.join(options.trace_dir, "**", appargs_subdir, "traces"))
             for path in paths_to_try:

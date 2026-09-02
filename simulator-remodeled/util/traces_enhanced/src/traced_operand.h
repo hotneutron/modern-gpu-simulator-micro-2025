@@ -54,6 +54,9 @@ class traced_operand : public JSONBase {
         bool get_is_type_using_only_gathered_registers() const;
         bool get_has_inmediate() const;
         std::vector<double> get_operands_inmediates() const;
+        const std::vector<double>& get_operands_inmediates_ref() const {
+            return m_operands_inmediates;
+        }
         bool is_reuse_bit_set() const;
         bool is_destination() const;
 

@@ -46,7 +46,7 @@ unsigned int Wait_Barrier::get_barrier_id(){
     return m_barrier_id;
 }
 
-bool Wait_Barrier::is_ready(unsigned int min_val){
+bool Wait_Barrier::is_ready(unsigned int min_val) const {
     return m_counter <= min_val;
 }
 
@@ -103,12 +103,31 @@ void Dependency_State::set_stall_counter(unsigned int stall_counter) {
 void Dependency_State::action_over_wait_barrier(Wait_Barrier_Entry_Modifier *wait_barrier_entry_modifier) {
     if(wait_barrier_entry_modifier->barrier_action == Wait_Barrier_Action::INCREASE_COUNTER){
         m_wait_barriers[wait_barrier_entry_modifier->barrier_id].increase_counter();
+        // [wait_barrier-kind probe] tag which op-class armed this SB (read-only diagnostic).
+        if(wait_barrier_entry_modifier->armed_op != WB_ARM_UNKNOWN){
+            m_wait_barriers[wait_barrier_entry_modifier->barrier_id].set_armed_op(wait_barrier_entry_modifier->armed_op);
+        }
     }else if(wait_barrier_entry_modifier->barrier_action == Wait_Barrier_Action::DECREASE_COUNTER){
         m_wait_barriers[wait_barrier_entry_modifier->barrier_id].decrease_counter();
     }else{
         std::cout << "Error: Wait barrier action not recognized" << std::endl;
         abort();
     }
+}
+
+// [wait_barrier-kind probe] of the SBs this warp is checking, return the armed op-class of the ones
+// that are NOT ready (actually blocking). Precedence TENSOR > TMA > OTHER (so a blocking WGMMA wins).
+Wait_Barrier_Armed_Op Dependency_State::blocking_wait_barrier_armed_op(const std::vector<Wait_Barrier_Checking> &wait_barriers_checking) {
+    Wait_Barrier_Armed_Op best = WB_ARM_UNKNOWN;
+    for(const auto &wbc : wait_barriers_checking){
+        if(!m_wait_barriers[wbc.barrier_id].is_ready(wbc.min_val)){
+            Wait_Barrier_Armed_Op a = m_wait_barriers[wbc.barrier_id].get_armed_op();
+            // precedence: TENSOR(2) > TMA(1) > OTHER(0) > UNKNOWN; map to a rank.
+            auto rank=[](Wait_Barrier_Armed_Op o){ switch(o){case WB_ARM_TENSOR:return 3;case WB_ARM_TMA:return 2;case WB_ARM_OTHER:return 1;default:return 0;} };
+            if(rank(a) > rank(best)) best = a;
+        }
+    }
+    return best;
 }
 
 bool Dependency_State::is_yield_ready() {
@@ -119,13 +138,20 @@ bool Dependency_State::is_stall_counter_0() {
     return m_stall_counter == 0;
 }
 
-bool Dependency_State::are_wait_barriers_ready(std::vector<Wait_Barrier_Checking> wait_barriers_checking) {
-    for(auto &wait_barrier_checking : wait_barriers_checking){
+bool Dependency_State::are_wait_barriers_ready(
+    const std::vector<Wait_Barrier_Checking> &wait_barriers_checking) const {
+    for(const auto &wait_barrier_checking : wait_barriers_checking){
         if(!m_wait_barriers[wait_barrier_checking.barrier_id].is_ready(wait_barrier_checking.min_val)){
             return false;
         }
     }
     return true;
+}
+
+bool Dependency_State::peek_wait_barrier_ready(unsigned int barrier_id,
+                                               unsigned int min_val) const {
+    assert(barrier_id < m_wait_barriers.size());
+    return m_wait_barriers[barrier_id].is_ready(min_val);
 }
 
 void Dependency_State::increase_num_pending_ldgsts() {

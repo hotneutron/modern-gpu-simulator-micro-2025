@@ -153,6 +153,16 @@ class traced_instruction : public JSONBase{
         bool get_contains_setp();
 
         std::string get_op_code();
+        bool get_is_predicated() const { return m_is_predicated; }
+        bool get_is_uniform_predicate() const {
+            return m_is_uniform_predicate;
+        }
+        bool get_is_predicate_negate() const {
+            return m_is_predicate_negate;
+        }
+        unsigned int get_predicate_register() const {
+            return m_predicate_register;
+        }
 
         void set_op_code(std::string op_code);
 
