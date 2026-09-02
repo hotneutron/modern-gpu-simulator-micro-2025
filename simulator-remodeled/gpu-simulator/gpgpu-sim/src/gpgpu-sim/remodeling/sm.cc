@@ -253,6 +253,88 @@ bool is_wait_block_timing_semantic_opcode(const std::string &opcode) {
   return false;
 }
 
+void add_wait_block_progress(WaitBlockWarpProgress &dst,
+                             const WaitBlockWarpProgress &src) {
+  dst.active += src.active;
+  dst.selected += src.selected;
+  dst.selected_tensor += src.selected_tensor;
+  dst.selected_sfu += src.selected_sfu;
+  dst.selected_other += src.selected_other;
+  dst.eligible_not_selected += src.eligible_not_selected;
+  dst.no_valid += src.no_valid;
+  dst.drain += src.drain;
+  dst.wait_block_hold += src.wait_block_hold;
+  dst.blocked_valid += src.blocked_valid;
+  dst.no_head_hold += src.no_head_hold;
+  dst.unknown_valid += src.unknown_valid;
+  dst.sole_yield += src.sole_yield;
+  dst.sole_stall_count += src.sole_stall_count;
+  dst.sole_wait_barrier += src.sole_wait_barrier;
+  dst.sole_named_barrier += src.sole_named_barrier;
+  dst.sole_membar += src.sole_membar;
+  dst.sole_grid_barrier += src.sole_grid_barrier;
+  dst.sole_ldgdepbar += src.sole_ldgdepbar;
+  dst.sole_tma_flush += src.sole_tma_flush;
+  dst.sole_fu_tensor += src.sole_fu_tensor;
+  dst.sole_fu_sfu += src.sole_fu_sfu;
+  dst.sole_fu_other += src.sole_fu_other;
+  dst.sole_scoreboard += src.sole_scoreboard;
+  dst.sole_result_queue += src.sole_result_queue;
+  dst.sole_l1c += src.sole_l1c;
+  dst.sole_issue_port += src.sole_issue_port;
+  dst.sole_issue_control += src.sole_issue_control;
+  dst.blocked_multi += src.blocked_multi;
+}
+
+bool subtract_wait_block_progress(const WaitBlockWarpProgress &end,
+                                  const WaitBlockWarpProgress &begin,
+                                  WaitBlockWarpProgress &delta) {
+#define SUBTRACT_PROGRESS_FIELD(field)                 \
+  do {                                                 \
+    if (end.field < begin.field) return false;         \
+    delta.field = end.field - begin.field;             \
+  } while (0)
+  SUBTRACT_PROGRESS_FIELD(active);
+  SUBTRACT_PROGRESS_FIELD(selected);
+  SUBTRACT_PROGRESS_FIELD(selected_tensor);
+  SUBTRACT_PROGRESS_FIELD(selected_sfu);
+  SUBTRACT_PROGRESS_FIELD(selected_other);
+  SUBTRACT_PROGRESS_FIELD(eligible_not_selected);
+  SUBTRACT_PROGRESS_FIELD(no_valid);
+  SUBTRACT_PROGRESS_FIELD(drain);
+  SUBTRACT_PROGRESS_FIELD(wait_block_hold);
+  SUBTRACT_PROGRESS_FIELD(blocked_valid);
+  SUBTRACT_PROGRESS_FIELD(no_head_hold);
+  SUBTRACT_PROGRESS_FIELD(unknown_valid);
+  SUBTRACT_PROGRESS_FIELD(sole_yield);
+  SUBTRACT_PROGRESS_FIELD(sole_stall_count);
+  SUBTRACT_PROGRESS_FIELD(sole_wait_barrier);
+  SUBTRACT_PROGRESS_FIELD(sole_named_barrier);
+  SUBTRACT_PROGRESS_FIELD(sole_membar);
+  SUBTRACT_PROGRESS_FIELD(sole_grid_barrier);
+  SUBTRACT_PROGRESS_FIELD(sole_ldgdepbar);
+  SUBTRACT_PROGRESS_FIELD(sole_tma_flush);
+  SUBTRACT_PROGRESS_FIELD(sole_fu_tensor);
+  SUBTRACT_PROGRESS_FIELD(sole_fu_sfu);
+  SUBTRACT_PROGRESS_FIELD(sole_fu_other);
+  SUBTRACT_PROGRESS_FIELD(sole_scoreboard);
+  SUBTRACT_PROGRESS_FIELD(sole_result_queue);
+  SUBTRACT_PROGRESS_FIELD(sole_l1c);
+  SUBTRACT_PROGRESS_FIELD(sole_issue_port);
+  SUBTRACT_PROGRESS_FIELD(sole_issue_control);
+  SUBTRACT_PROGRESS_FIELD(blocked_multi);
+#undef SUBTRACT_PROGRESS_FIELD
+  return true;
+}
+
+uint64_t wait_block_progress_population(
+    const WaitBlockWarpProgress &progress) {
+  return progress.selected + progress.eligible_not_selected +
+         progress.no_valid + progress.drain + progress.wait_block_hold +
+         progress.blocked_valid + progress.no_head_hold +
+         progress.unknown_valid;
+}
+
 void debug_print_sm_barrier_issue(const warp_inst_t &inst,
                                   unsigned int warp_id,
                                   unsigned int sm_id,
@@ -327,6 +409,8 @@ SM::SM(unsigned int num_subcores, gpgpu_sim *gpu, simt_core_cluster *cluster,
   m_partial_replay_progress.resize(config->max_warps_per_shader);
   m_partial_joined_regions.resize(config->max_warps_per_shader);
   m_wait_block_last_semantic_anchor_by_warp.resize(
+      config->max_warps_per_shader);
+  m_wait_block_stall_progress_by_warp.resize(
       config->max_warps_per_shader);
   m_wait_block_last_service_cycle_by_warp.resize(
       config->max_warps_per_shader, ~0ull);
@@ -651,6 +735,10 @@ void SM::reset_wait_block_launch_state(uint64_t launch_uid) {
        m_wait_block_last_semantic_anchor_by_warp) {
     anchor = WaitBlockSemanticAnchor();
   }
+  for (WaitBlockWarpProgress &progress :
+       m_wait_block_stall_progress_by_warp) {
+    progress = WaitBlockWarpProgress();
+  }
 
   m_fold_parks_total = 0;
   m_fold_releases_total = 0;
@@ -936,6 +1024,17 @@ void SM::record_wait_block_timing_issue(unsigned int warp_id,
   anchor.pc = inst->pc;
   anchor.source_index = inst->trace_instruction_index;
   anchor.opcode = opcode;
+}
+
+void SM::accumulate_wait_block_stall_progress(
+    unsigned int warp_id, const WaitBlockWarpProgress &delta) {
+  if (!m_config->wait_block_late_arrival_instrument_enable ||
+      !m_config->stall_reason_align_instrument_enable ||
+      warp_id >= m_wait_block_stall_progress_by_warp.size()) {
+    return;
+  }
+  add_wait_block_progress(m_wait_block_stall_progress_by_warp[warp_id],
+                          delta);
 }
 
 void SM::service_wait_block_releases_for_cycle() {
@@ -2067,6 +2166,10 @@ void SM::init_warps(unsigned cta_id, unsigned start_thread, unsigned end_thread,
         if (i < m_wait_block_last_semantic_anchor_by_warp.size()) {
           m_wait_block_last_semantic_anchor_by_warp[i] =
               WaitBlockSemanticAnchor();
+        }
+        if (i < m_wait_block_stall_progress_by_warp.size()) {
+          m_wait_block_stall_progress_by_warp[i] =
+              WaitBlockWarpProgress();
         }
       }
       if (m_gpu->resume_option == 1 && kernel_id == m_gpu->resume_kernel &&
@@ -4388,6 +4491,11 @@ void SM::recompute_sync_barrier_ready_and_maybe_flip_phase(
         barrier.wait_block_timing[barrier.gen + 1];
     timing.completion_valid = true;
     timing.completion_cycle = get_current_gpu_cycle();
+    if (m_config->stall_reason_align_instrument_enable &&
+        barrier.expected_tx_bytes > 0) {
+      timing.completion_progress_valid = true;
+      timing.completion_progress = m_wait_block_stall_progress_by_warp;
+    }
   }
   barrier.prev_flip_cycle = barrier.last_flip_cycle;
   barrier.last_flip_cycle = get_current_gpu_cycle();
@@ -4605,7 +4713,138 @@ void SM::record_wait_block_first_late_arrival(
     line << " next_complete_to_consumer="
          << now - next_timing.completion_cycle;
   }
-  std::cerr << line.str() << std::endl;
+  std::fprintf(stderr, "%s\n", line.str().c_str());
+
+  if (!m_config->stall_reason_align_instrument_enable) {
+    return;
+  }
+
+  const auto emit_window =
+      [this, &inst, &key, target_generation, warp_id, producer_warp](
+          const char *name, uint64_t start_cycle,
+          bool start_progress_valid,
+          const std::vector<WaitBlockWarpProgress> &start_progress,
+          uint64_t end_cycle, bool end_progress_valid,
+          const std::vector<WaitBlockWarpProgress> &end_progress) {
+        std::ostringstream window;
+        window << "[WAITBLOCK][late-stall-window]"
+               << " sm=" << m_sm_id
+               << " trace_kernel=" << inst.trace_kernel_id
+               << " global_cta=" << m_local_to_global_cta_id[key.cta_id]
+               << " barrier=0x" << format_hex_u64(key.barrier_addr)
+               << " target_gen=" << target_generation
+               << " action_pc=0x" << format_hex_u64(inst.pc)
+               << " window=" << name
+               << " start_cycle=" << start_cycle
+               << " end_cycle=" << end_cycle
+               << " cycles="
+               << (end_cycle >= start_cycle ? end_cycle - start_cycle : 0);
+
+        const auto append_role =
+            [&window, &start_progress, &end_progress,
+             start_progress_valid, end_progress_valid](
+                const char *role, unsigned int role_warp) {
+              WaitBlockWarpProgress delta;
+              const bool snapshots_valid =
+                  start_progress_valid && end_progress_valid &&
+                  role_warp < start_progress.size() &&
+                  role_warp < end_progress.size();
+              const bool valid =
+                  snapshots_valid &&
+                  subtract_wait_block_progress(
+                      end_progress[role_warp],
+                      start_progress[role_warp], delta);
+              window << " " << role << "_warp=" << role_warp
+                     << " " << role << "_valid=" << valid;
+              if (!valid) {
+                if (snapshots_valid) {
+                  window << " " << role << "_counter_reset=1";
+                }
+                return;
+              }
+              const uint64_t population =
+                  wait_block_progress_population(delta);
+              window << " " << role << "_active=" << delta.active
+                     << " " << role << "_population=" << population
+                     << " " << role << "_population_delta="
+                     << static_cast<int64_t>(population) -
+                            static_cast<int64_t>(delta.active)
+                     << " " << role << "_selected=" << delta.selected
+                     << " " << role << "_selected_tensor="
+                     << delta.selected_tensor
+                     << " " << role << "_selected_sfu="
+                     << delta.selected_sfu
+                     << " " << role << "_selected_other="
+                     << delta.selected_other
+                     << " " << role << "_eligible_not_selected="
+                     << delta.eligible_not_selected
+                     << " " << role << "_blocked_valid="
+                     << delta.blocked_valid
+                     << " " << role << "_no_valid=" << delta.no_valid
+                     << " " << role << "_wait_block_hold="
+                     << delta.wait_block_hold
+                     << " " << role << "_drain=" << delta.drain
+                     << " " << role << "_no_head_hold="
+                     << delta.no_head_hold
+                     << " " << role << "_unknown_valid="
+                     << delta.unknown_valid
+                     << " " << role << "_sole_yield="
+                     << delta.sole_yield
+                     << " " << role << "_sole_wait_barrier="
+                     << delta.sole_wait_barrier
+                     << " " << role << "_sole_stall_count="
+                     << delta.sole_stall_count
+                     << " " << role << "_sole_fu_tensor="
+                     << delta.sole_fu_tensor
+                     << " " << role << "_sole_fu_sfu="
+                     << delta.sole_fu_sfu
+                     << " " << role << "_sole_fu_other="
+                     << delta.sole_fu_other
+                     << " " << role << "_sole_issue_port="
+                     << delta.sole_issue_port
+                     << " " << role << "_sole_issue_control="
+                     << delta.sole_issue_control
+                     << " " << role << "_sole_named_barrier="
+                     << delta.sole_named_barrier
+                     << " " << role << "_sole_membar="
+                     << delta.sole_membar
+                     << " " << role << "_sole_grid_barrier="
+                     << delta.sole_grid_barrier
+                     << " " << role << "_sole_ldgdepbar="
+                     << delta.sole_ldgdepbar
+                     << " " << role << "_sole_tma_flush="
+                     << delta.sole_tma_flush
+                     << " " << role << "_sole_scoreboard="
+                     << delta.sole_scoreboard
+                     << " " << role << "_sole_result_queue="
+                     << delta.sole_result_queue
+                     << " " << role << "_sole_l1c="
+                     << delta.sole_l1c
+                     << " " << role << "_blocked_multi="
+                     << delta.blocked_multi;
+            };
+        append_role("consumer", warp_id);
+        append_role("producer", producer_warp);
+        std::fprintf(stderr, "%s\n", window.str().c_str());
+      };
+
+  emit_window(
+      "target_complete_to_next_open", target_timing.completion_cycle,
+      target_timing.completion_progress_valid,
+      target_timing.completion_progress, next_timing.contract_open_cycle,
+      next_timing.contract_open_progress_valid,
+      next_timing.contract_open_progress);
+  emit_window(
+      "next_open_to_next_complete", next_timing.contract_open_cycle,
+      next_timing.contract_open_progress_valid,
+      next_timing.contract_open_progress, next_timing.completion_cycle,
+      next_timing.completion_progress_valid,
+      next_timing.completion_progress);
+  emit_window(
+      "next_complete_to_action", next_timing.completion_cycle,
+      next_timing.completion_progress_valid,
+      next_timing.completion_progress, now, true,
+      m_wait_block_stall_progress_by_warp);
 }
 
 uint64_t SM::expected_gen_for_wait(unsigned int warp_id,
@@ -5694,6 +5933,10 @@ void SM::open_tma_assignment_contract(const warp_inst_t &inst,
     timing.contract_open_function_id = inst.unique_function_id;
     timing.contract_open_pc = inst.pc;
     timing.contract_open_source_index = inst.trace_instruction_index;
+    if (m_config->stall_reason_align_instrument_enable) {
+      timing.contract_open_progress_valid = true;
+      timing.contract_open_progress = m_wait_block_stall_progress_by_warp;
+    }
   }
 
   debug_log_tma_binding_event(

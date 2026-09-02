@@ -199,6 +199,8 @@ class Subcore {
     unsigned int sm_warp_id = 0;
     address_type head_pc = 0;
     uint32_t blocker_mask = 0;
+    bool head_is_tensor = false;
+    bool head_is_sfu = false;
     PeekReady l1c_ready = PeekReady::READY;
   };
 

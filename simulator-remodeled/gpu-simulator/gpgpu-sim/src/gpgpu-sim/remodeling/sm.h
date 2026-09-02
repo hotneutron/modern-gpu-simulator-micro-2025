@@ -39,6 +39,7 @@
 #include <stack>
 #include <memory>
 #include "ldst_unit_sm.h"
+#include "tma_types.h"
 
 #include "../shader_core_wrapper.h"
 #include "../shader.h"
@@ -458,6 +459,8 @@ class SM : public core_t, public shader_core_ctx_wrapper {
   void reset_wait_block_launch_state(uint64_t launch_uid);
   void record_wait_block_timing_issue(unsigned int warp_id,
                                       const warp_inst_t *inst);
+  void accumulate_wait_block_stall_progress(
+      unsigned int warp_id, const WaitBlockWarpProgress &delta);
 
   InterWarp_Coalescing_Waiting_Dep_Counters *m_interwarp_coal_warps_waiting_dep_counter;
 
@@ -538,6 +541,8 @@ class SM : public core_t, public shader_core_ctx_wrapper {
   };
   std::vector<WaitBlockSemanticAnchor>
       m_wait_block_last_semantic_anchor_by_warp;
+  std::vector<WaitBlockWarpProgress>
+      m_wait_block_stall_progress_by_warp;
   bool m_wait_block_first_late_reported_by_cta_slot[MAX_CTA_PER_SHADER] = {
       false};
   uint64_t m_next_tma_contract_id = 1;

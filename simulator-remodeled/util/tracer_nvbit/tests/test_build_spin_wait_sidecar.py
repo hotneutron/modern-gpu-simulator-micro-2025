@@ -1288,6 +1288,78 @@ class ContractOrdinalCaptureTest(unittest.TestCase):
             'fprintf(stderr, "%s\\n", abort_message.c_str());',
             teardown)
 
+    def test_simulator_late_stall_windows_are_bounded_and_launch_scoped(self):
+        simulator_root = MODULE_PATH.parents[2] / "gpu-simulator"
+        sm_source = (
+            simulator_root /
+            "gpgpu-sim/src/gpgpu-sim/remodeling/sm.cc"
+        ).read_text()
+        subcore_source = (
+            simulator_root /
+            "gpgpu-sim/src/gpgpu-sim/remodeling/subcore.cc"
+        ).read_text()
+
+        accumulator = sm_source.split(
+            "void SM::accumulate_wait_block_stall_progress", 1)[1].split(
+                "\n}", 1)[0]
+        self.assertIn(
+            "!m_config->wait_block_late_arrival_instrument_enable",
+            accumulator)
+        self.assertIn(
+            "!m_config->stall_reason_align_instrument_enable",
+            accumulator)
+        self.assertIn(
+            "add_wait_block_progress("
+            "m_wait_block_stall_progress_by_warp[warp_id]",
+            accumulator)
+
+        self.assertIn(
+            "timing.contract_open_progress = "
+            "m_wait_block_stall_progress_by_warp",
+            sm_source)
+        self.assertIn(
+            "timing.completion_progress = "
+            "m_wait_block_stall_progress_by_warp",
+            sm_source)
+        self.assertEqual(
+            sm_source.count(
+                'std::fprintf(stderr, "%s\\n", window.str().c_str());'),
+            1)
+        for window in (
+                "target_complete_to_next_open",
+                "next_open_to_next_complete",
+                "next_complete_to_action"):
+            self.assertIn('"' + window + '"', sm_source)
+
+        self.assertIn(
+            "wait_block_progress_population(delta)", sm_source)
+        self.assertIn(
+            "population) -\n"
+            "                            static_cast<int64_t>(delta.active)",
+            sm_source)
+        self.assertIn(
+            "m_wait_block_stall_progress_by_warp[i] =\n"
+            "              WaitBlockWarpProgress()",
+            sm_source)
+        self.assertIn(
+            "for (WaitBlockWarpProgress &progress :\n"
+            "       m_wait_block_stall_progress_by_warp)",
+            sm_source)
+
+        self.assertIn(
+            "Reuse the validated SR-M0A cycle-start classification",
+            subcore_source)
+        self.assertIn(
+            "m_sm->accumulate_wait_block_stall_progress("
+            "sample.sm_warp_id, delta)",
+            subcore_source)
+        self.assertIn(
+            "delta.selected_tensor = 1", subcore_source)
+        self.assertIn(
+            "delta.eligible_not_selected = 1", subcore_source)
+        self.assertIn(
+            "delta.blocked_multi = 1", subcore_source)
+
 
 class WaitBlockFoldProofTest(unittest.TestCase):
     def test_control_requires_primary_wait_predicate(self):

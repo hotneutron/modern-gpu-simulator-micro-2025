@@ -1646,6 +1646,8 @@ void Subcore::capture_pre_issue_snapshot(SM *shared_sm, StallCycleSnapshot &snap
     // Valid head: reconstruct the warp-local readiness predicates purely.
     warp_inst_t *pI = ibuffer->next_inst();
     s.head_pc = pI->pc;
+    s.head_is_tensor = pI->op == TENSOR_CORE_OP;
+    s.head_is_sfu = pI->op == SFU_OP;
 
     const bool use_traditional_scoreboarding =
         !c_warp->get_kernel_info()->is_captured_from_binary ||
@@ -1829,6 +1831,121 @@ void Subcore::finalize_stall_snapshot(StallCycleSnapshot &snap,
   }
   m_stall_totals.active_warp_cycles += snap.active_count;
   m_stall_totals.eligible_warp_cycles += snap.eligible_count;
+
+  // Reuse the validated SR-M0A cycle-start classification as a cumulative
+  // per-warp clock. WaitBlock's first-late probe snapshots this clock at TMA
+  // generation boundaries, so it can partition a bounded causal window
+  // without logging every cycle.
+  if (m_config->wait_block_late_arrival_instrument_enable) {
+    for (size_t i = 0; i < snap.samples.size(); ++i) {
+      const StallWarpSample &sample = snap.samples[i];
+      if (sample.state == StallPreIssueClass::INACTIVE) {
+        continue;
+      }
+
+      WaitBlockWarpProgress delta;
+      delta.active = 1;
+      const bool is_selected =
+          issued && static_cast<int>(i) == issued_subcore_warp_id;
+      if (is_selected) {
+        delta.selected = 1;
+        if (sample.head_is_tensor) {
+          delta.selected_tensor = 1;
+        } else if (sample.head_is_sfu) {
+          delta.selected_sfu = 1;
+        } else {
+          delta.selected_other = 1;
+        }
+      } else {
+        switch (sample.state) {
+          case StallPreIssueClass::WAIT_BLOCK_HOLD:
+            delta.wait_block_hold = 1;
+            break;
+          case StallPreIssueClass::NON_FRONTEND_HOLD_NO_HEAD:
+            delta.no_head_hold = 1;
+            break;
+          case StallPreIssueClass::DRAIN:
+            delta.drain = 1;
+            break;
+          case StallPreIssueClass::NO_VALID:
+            delta.no_valid = 1;
+            break;
+          case StallPreIssueClass::ELIGIBLE_CANDIDATE:
+            delta.eligible_not_selected = 1;
+            break;
+          case StallPreIssueClass::UNKNOWN_VALID:
+            delta.unknown_valid = 1;
+            break;
+          case StallPreIssueClass::BLOCKED_VALID: {
+            delta.blocked_valid = 1;
+            const uint32_t known_mask =
+                sample.blocker_mask & ~SB_BIT_L1C_UNKNOWN;
+            if (known_mask == 0 || (known_mask & (known_mask - 1)) != 0) {
+              delta.blocked_multi = 1;
+              break;
+            }
+            switch (known_mask) {
+              case SB_BIT_YIELD:
+                delta.sole_yield = 1;
+                break;
+              case SB_BIT_STALL_COUNT:
+                delta.sole_stall_count = 1;
+                break;
+              case SB_BIT_WAIT_BARRIER:
+                delta.sole_wait_barrier = 1;
+                break;
+              case SB_BIT_NAMED_BARRIER:
+                delta.sole_named_barrier = 1;
+                break;
+              case SB_BIT_MEMBAR:
+                delta.sole_membar = 1;
+                break;
+              case SB_BIT_GRID_BARRIER:
+                delta.sole_grid_barrier = 1;
+                break;
+              case SB_BIT_LDGDEPBAR:
+                delta.sole_ldgdepbar = 1;
+                break;
+              case SB_BIT_TMA_FLUSH:
+                delta.sole_tma_flush = 1;
+                break;
+              case SB_BIT_FU:
+                if (sample.head_is_tensor) {
+                  delta.sole_fu_tensor = 1;
+                } else if (sample.head_is_sfu) {
+                  delta.sole_fu_sfu = 1;
+                } else {
+                  delta.sole_fu_other = 1;
+                }
+                break;
+              case SB_BIT_SCOREBOARD:
+                delta.sole_scoreboard = 1;
+                break;
+              case SB_BIT_RESULT_QUEUE:
+                delta.sole_result_queue = 1;
+                break;
+              case SB_BIT_L1C:
+                delta.sole_l1c = 1;
+                break;
+              case SB_BIT_ISSUE_PORT:
+                delta.sole_issue_port = 1;
+                break;
+              case SB_BIT_ISSUE_CONTROL:
+                delta.sole_issue_control = 1;
+                break;
+              default:
+                delta.blocked_multi = 1;
+                break;
+            }
+            break;
+          }
+          case StallPreIssueClass::INACTIVE:
+            break;
+        }
+      }
+      m_sm->accumulate_wait_block_stall_progress(sample.sm_warp_id, delta);
+    }
+  }
 }
 
 void Subcore::gather_stall_reason_align_stats(StallPopulationTotals &dst) const {

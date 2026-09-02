@@ -486,6 +486,38 @@ struct HopperMBarrierKey {
   }
 };
 
+struct WaitBlockWarpProgress {
+  uint64_t active = 0;
+  uint64_t selected = 0;
+  uint64_t selected_tensor = 0;
+  uint64_t selected_sfu = 0;
+  uint64_t selected_other = 0;
+  uint64_t eligible_not_selected = 0;
+  uint64_t no_valid = 0;
+  uint64_t drain = 0;
+  uint64_t wait_block_hold = 0;
+  uint64_t blocked_valid = 0;
+  uint64_t no_head_hold = 0;
+  uint64_t unknown_valid = 0;
+  uint64_t sole_yield = 0;
+  uint64_t sole_stall_count = 0;
+  uint64_t sole_wait_barrier = 0;
+  uint64_t sole_named_barrier = 0;
+  uint64_t sole_membar = 0;
+  uint64_t sole_grid_barrier = 0;
+  uint64_t sole_ldgdepbar = 0;
+  uint64_t sole_tma_flush = 0;
+  uint64_t sole_fu_tensor = 0;
+  uint64_t sole_fu_sfu = 0;
+  uint64_t sole_fu_other = 0;
+  uint64_t sole_scoreboard = 0;
+  uint64_t sole_result_queue = 0;
+  uint64_t sole_l1c = 0;
+  uint64_t sole_issue_port = 0;
+  uint64_t sole_issue_control = 0;
+  uint64_t blocked_multi = 0;
+};
+
 struct WaitBlockGenerationTiming {
   bool contract_open_valid = false;
   uint64_t contract_open_cycle = 0;
@@ -500,6 +532,10 @@ struct WaitBlockGenerationTiming {
   uint32_t tma_commands_issued = 0;
   bool completion_valid = false;
   uint64_t completion_cycle = 0;
+  bool contract_open_progress_valid = false;
+  std::vector<WaitBlockWarpProgress> contract_open_progress;
+  bool completion_progress_valid = false;
+  std::vector<WaitBlockWarpProgress> completion_progress;
 };
 
 struct HopperMBarrierObject {
