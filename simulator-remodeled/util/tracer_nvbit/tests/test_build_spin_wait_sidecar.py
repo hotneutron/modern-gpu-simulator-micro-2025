@@ -1116,6 +1116,49 @@ class ContractOrdinalCaptureTest(unittest.TestCase):
             "-wait_block_exact_generation_enable 1",
             h100_config)
 
+    def test_simulator_wait_block_startup_is_fail_closed(self):
+        simulator_root = MODULE_PATH.parents[2] / "gpu-simulator"
+        loader_source = (
+            simulator_root /
+            "gpgpu-sim/src/gpgpu-sim/gpu-sim.cc"
+        ).read_text()
+
+        required_guards = [
+            "validated sidecar contains no runtime WaitBlock actions",
+            "duplicate kernel identity trace_kernel=",
+            "duplicate or conflicting runtime action key ",
+            "-spin_wait_observe_enable are mutually exclusive",
+            "required sync operand metadata is empty",
+            "exact-generation mode requires validated TMA descriptor",
+            "loaded_exact_targets != db.exact_generation_targets",
+            "loaded_fallbacks != db.exact_generation_fallbacks",
+        ]
+        for guard in required_guards:
+            with self.subTest(guard=guard):
+                self.assertIn(guard, loader_source)
+
+    def test_simulator_wait_block_cleanup_is_assert_before_clear(self):
+        simulator_root = MODULE_PATH.parents[2] / "gpu-simulator"
+        sm_source = (
+            simulator_root /
+            "gpgpu-sim/src/gpgpu-sim/remodeling/sm.cc"
+        ).read_text()
+
+        self.assertIn(
+            'assert_wait_block_lifecycle_drained("kernel-switch")',
+            sm_source)
+        self.assertIn(
+            'assert_wait_block_lifecycle_drained("simulator-teardown")',
+            sm_source)
+        self.assertIn(
+            "warp-slot-reuse-with-active-wait-block-state",
+            sm_source)
+        self.assertIn("cta-exit-with-active-partial-state", sm_source)
+        self.assertIn("cta-cleanup-with-inflight-completion", sm_source)
+        self.assertIn(
+            "m_fold_aux_holds_total != m_fold_aux_releases_total",
+            sm_source)
+
 
 class WaitBlockFoldProofTest(unittest.TestCase):
     def test_control_requires_primary_wait_predicate(self):

@@ -185,6 +185,14 @@ malformed input must abort before kernel execution with the violated identity
 field in the diagnostic. A valid K5/K10 sidecar must still load without
 weakening the current exact/fallback barrier-manifest checks.
 
+**Implementation checkpoint.** Startup now rejects an empty runtime-action
+set, duplicate `(trace_kernel_id, unique_function_id)` records, conflicting
+runtime action keys with their kernel/function/PC identity, simultaneous
+WaitBlock/FOLD-observe modes, empty sync metadata, and incomplete exact-mode
+TMA metadata. Existing exact-target/fallback summary checks remain
+authoritative. Local source-contract tests pass; executing the malformed-input
+matrix against a simulator binary remains a server validation item.
+
 ### 4. B3 assert-before-clear lifecycle audit
 
 WaitBlock and B0-D TMA ownership already assert their primary conservation
@@ -203,6 +211,14 @@ no leaked named-BAR participant or deferred-sync credit
 
 Acceptance requires clean K5/K10 teardown and a targeted negative test showing
 that each residual-state class aborts rather than being silently discarded.
+
+**Implementation checkpoint.** CTA finish, warp-slot reuse, kernel switch, and
+simulator teardown now all reject active WaitBlock holds, partial arms/replay
+state/capsules, open TMA ownership, and unbalanced hold/release counters before
+state can be cleared. Terminal conservation now includes auxiliary FOLD holds.
+Named-BAR deallocation already asserts participant and deferred-credit state.
+Local source-contract tests pass; runtime residual-state fault injection remains
+a server validation item.
 
 ### 5. B5 configurable watchdogs and launch-scoped diagnostics
 
@@ -472,8 +488,8 @@ sidecar generation; unified metadata does not require unified runtime behavior.
 | B0-D | Exact TMA-command-to-barrier completion ownership | **COMPLETE / VALIDATED** at `39abefb`; `.e85` validates ownership-clean out-of-order completion, and K10 `.e62` completes 384/384 CTAs with 132/132 clean SM-level TMABIND final records after exercising two simultaneous open contracts per warp |
 | B0-E | K5 all-live cross-warp WaitBlock cycle (`0xb370`/`0x16c60`) | **COMPLETE / VALIDATED** at `087b53f`; K5 `.e90` completes 132/132 CTAs without forced release and K10 `.e66` completes 384/384. All WaitBlock/TMABIND summaries pass. K5's 9,542 late-arrival divergences remain a cycle-accuracy diagnostic |
 | B1 | One SM-level WaitBlock release phase per cycle | **NORMAL TRAVERSAL PASS / REVERSED PENDING**; K5 `.e91` and K10 `.e67` complete with exact release-service accounting |
-| B2 | WaitBlock startup and provenance fail-fast checks | **MOSTLY IMPLEMENTED** |
-| B3 | Assert-before-clear lifecycle checks | **IMPLEMENTED for WaitBlock and B0-D TMA ownership**; broader non-ownership cleanup audit remains partial |
+| B2 | WaitBlock startup and provenance fail-fast checks | **IMPLEMENTED / RUNTIME NEGATIVE MATRIX PENDING** |
+| B3 | Assert-before-clear lifecycle checks | **IMPLEMENTED / RUNTIME NEGATIVE MATRIX PENDING** |
 | B4 | Zero-active no-op and active required-payload checks | **IMPLEMENTED** |
 | B5 | Configurable watchdog/heartbeat and kernel-scoped counters | **REQUIRED / NOT IMPLEMENTED** |
 | B6 | WaitBlock-only non-mutating hold query | **PARTIAL**: SR-M0A path implemented; legacy metrics still need audit |

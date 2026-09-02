@@ -1652,9 +1652,17 @@ void load_wait_block_sidecar_v5(const std::filesystem::path &extra_info_dir,
   if (db.passed != expected_inject + expected_fold + db.metadata_only) {
     wait_block_sidecar_fatal(path, "report passed accounting mismatch");
   }
+  if (expected_inject + expected_fold == 0) {
+    wait_block_sidecar_fatal(
+        path, "validated sidecar contains no runtime WaitBlock actions");
+  }
 
   const rapidjson::Value &kernels =
       wait_block_require_array(doc, "kernels", path);
+  if (kernels.Empty()) {
+    wait_block_sidecar_fatal(path, "kernels array is empty");
+  }
+  std::set<std::pair<uint32_t, uint32_t>> loaded_kernel_keys;
   uint64_t loaded_metadata = 0;
   uint64_t loaded_all_live_visits = 0;
   uint64_t loaded_partial_visits = 0;
@@ -1670,6 +1678,14 @@ void load_wait_block_sidecar_v5(const std::filesystem::path &extra_info_dir,
         wait_block_require_uint32(kernel, "trace_kernel_id", path);
     const uint32_t unique_function_id =
         wait_block_require_uint32(kernel, "unique_function_id", path);
+    if (!loaded_kernel_keys
+             .emplace(trace_kernel_id, unique_function_id)
+             .second) {
+      wait_block_sidecar_fatal(
+          path, "duplicate kernel identity trace_kernel=" +
+                    std::to_string(trace_kernel_id) + " function=" +
+                    std::to_string(unique_function_id));
+    }
     const rapidjson::Value &blocks =
         wait_block_require_array(kernel, "wait_blocks", path);
     for (const rapidjson::Value &block : blocks.GetArray()) {
@@ -1929,8 +1945,12 @@ void load_wait_block_sidecar_v5(const std::filesystem::path &extra_info_dir,
                                      record.entry_probe_pc};
         if (db.captured_poll_by_probe.count(key) != 0 ||
             !db.missing_wait_by_entry.emplace(key, record).second) {
-          wait_block_sidecar_fatal(path,
-                                   "duplicate or conflicting runtime action key");
+          wait_block_sidecar_fatal(
+              path, "duplicate or conflicting runtime action key "
+                    "trace_kernel=" +
+                        std::to_string(trace_kernel_id) + " function=" +
+                        std::to_string(unique_function_id) + " action_pc=0x" +
+                        format_hex_u64(record.entry_probe_pc));
         }
       } else if (strategy == "FOLD_CAPTURED_POLL") {
         SpinWaitRegionRecord record;
@@ -2086,8 +2106,12 @@ void load_wait_block_sidecar_v5(const std::filesystem::path &extra_info_dir,
                                      record.primary_wait_pc};
         if (db.missing_wait_by_entry.count(key) != 0 ||
             !db.captured_poll_by_probe.emplace(key, record).second) {
-          wait_block_sidecar_fatal(path,
-                                   "duplicate or conflicting runtime action key");
+          wait_block_sidecar_fatal(
+              path, "duplicate or conflicting runtime action key "
+                    "trace_kernel=" +
+                        std::to_string(trace_kernel_id) + " function=" +
+                        std::to_string(unique_function_id) + " action_pc=0x" +
+                        format_hex_u64(record.primary_wait_pc));
         }
         for (uint64_t wait_pc : record.wait_pcs) {
           const WaitBlockLookupKey wait_key{
@@ -2529,6 +2553,13 @@ void gpgpu_sim::parse_extra_trace_info(std::string filepath, bool is_extra_trace
               << std::endl;
     abort();
   }
+  if (m_shader_config->wait_block_enable &&
+      m_shader_config->spin_wait_observe_enable) {
+    std::cerr << "[WAITBLOCK][CONFIG][FATAL] -wait_block_enable and "
+                 "-spin_wait_observe_enable are mutually exclusive"
+              << std::endl;
+    abort();
+  }
   if (m_shader_config->wait_block_enable && !is_extra_trace_enabled) {
     std::cerr << "[WAITBLOCK][CONFIG][FATAL] -wait_block_enable requires "
                  "extra trace metadata and a strict schema-v5 sidecar"
@@ -2547,6 +2578,21 @@ void gpgpu_sim::parse_extra_trace_info(std::string filepath, bool is_extra_trace
     load_sync_operand_resolver(extra_info_dir, m_sync_sidecar_db);
     load_tma_completion_contract_validation(extra_info_dir, m_tma_sidecar_db);
     if (m_shader_config->wait_block_enable) {
+      if (m_sync_sidecar_db.site_records.empty()) {
+        wait_block_sidecar_fatal(
+            extra_info_dir / "sync_operand_resolver.json",
+            "required sync operand metadata is empty");
+      }
+      if (m_shader_config->wait_block_exact_generation_enable &&
+          (m_tma_sidecar_db.descriptor_configs.empty() ||
+           m_tma_sidecar_db.operand_site_records.empty() ||
+           m_tma_sidecar_db.base_records.empty() ||
+           !m_tma_sidecar_db.completion_contracts_validated)) {
+        wait_block_sidecar_fatal(
+            extra_info_dir,
+            "exact-generation mode requires validated TMA descriptor, "
+            "operand, base-map, and completion-contract metadata");
+      }
       load_wait_block_sidecar_v5(
           extra_info_dir, m_extra_trace_info, m_wait_block_sidecar_db,
           m_shader_config->wait_block_exact_generation_enable);

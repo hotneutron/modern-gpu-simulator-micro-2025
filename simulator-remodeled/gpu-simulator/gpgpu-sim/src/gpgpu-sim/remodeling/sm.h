@@ -456,6 +456,7 @@ class SM : public core_t, public shader_core_ctx_wrapper {
   void debug_log_wait_block_event(const char *event,
                                   const std::string &message);
   void debug_dump_sync_counters() const;
+  void assert_wait_block_lifecycle_drained(const char *reason);
   void record_wait_block_timing_issue(unsigned int warp_id,
                                       const warp_inst_t *inst);
 

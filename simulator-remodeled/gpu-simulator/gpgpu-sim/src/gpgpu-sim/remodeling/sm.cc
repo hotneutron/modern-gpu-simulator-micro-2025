@@ -350,6 +350,7 @@ SM::SM(unsigned int num_subcores, gpgpu_sim *gpu, simt_core_cluster *cluster,
 }
 
 SM::~SM() {
+  assert_wait_block_lifecycle_drained("simulator-teardown");
   debug_dump_tma_binding_counters();
   debug_dump_sync_counters();
   for (auto warp : m_physical_warp) {
@@ -516,6 +517,96 @@ void SM::debug_log_wait_block_event(const char *event,
   std::cerr << "[WAITBLOCK][" << event << "][SM" << m_sm_id << "] cyc="
             << get_current_gpu_cycle() << " " << message << std::endl;
   --m_wait_block_debug_print_budget;
+}
+
+void SM::assert_wait_block_lifecycle_drained(const char *reason) {
+  if (!m_config->wait_block_enable) {
+    return;
+  }
+
+  uint64_t active_holds = 0;
+  uint64_t active_partial_arms = 0;
+  uint64_t active_replay_progress = 0;
+  uint64_t active_joined_regions = 0;
+  uint64_t active_partial_capsules = 0;
+  unsigned int first_active_warp = ~0u;
+  for (unsigned int warp_id = 0; warp_id < m_pending_sync_waits.size();
+       ++warp_id) {
+    const bool pending = m_pending_sync_waits[warp_id].valid;
+    const bool arm = m_partial_wait_arms[warp_id].valid;
+    const bool replay = m_partial_replay_progress[warp_id].valid;
+    const uint64_t joined = m_partial_joined_regions[warp_id].size();
+    const bool capsule =
+        m_config->is_trace_mode && m_physical_warp[warp_id] != nullptr &&
+        static_cast<trace_shd_warp_t *>(m_physical_warp[warp_id])
+            ->partial_capsule_active();
+    active_holds += pending;
+    active_partial_arms += arm;
+    active_replay_progress += replay;
+    active_joined_regions += joined;
+    active_partial_capsules += capsule;
+    if (first_active_warp == ~0u &&
+        (pending || arm || replay || joined != 0 || capsule)) {
+      first_active_warp = warp_id;
+    }
+  }
+
+  uint64_t open_contracts = 0;
+  uint64_t outstanding_bindings = 0;
+  uint64_t incomplete_barriers = 0;
+  for (const auto &entry : m_hopper_mbarriers) {
+    const HopperMBarrierObject &barrier = entry.second;
+    open_contracts += barrier.assignment_open;
+    outstanding_bindings += barrier.outstanding_tma_bindings;
+    incomplete_barriers +=
+        barrier.assignment_open ||
+        barrier.expected_tx_bytes != barrier.assigned_tx_bytes ||
+        barrier.assigned_tx_bytes != barrier.completed_tx_bytes ||
+        barrier.outstanding_tma_bindings != 0;
+  }
+
+  const bool balanced =
+      m_missing_wait_holds_total == m_missing_wait_releases_total &&
+      m_fold_parks_total == m_fold_releases_total &&
+      m_fold_aux_holds_total == m_fold_aux_releases_total &&
+      m_partial_join_holds_total == m_partial_join_releases_total &&
+      m_partial_deferred_occurrences_total ==
+          m_partial_replayed_occurrences_total +
+              m_partial_folded_occurrences_total;
+  if (active_holds == 0 && active_partial_arms == 0 &&
+      active_replay_progress == 0 && active_joined_regions == 0 &&
+      active_partial_capsules == 0 && open_contracts == 0 &&
+      outstanding_bindings == 0 && incomplete_barriers == 0 &&
+      m_warps_waiting_tma_flush.empty() && balanced) {
+    return;
+  }
+
+  std::cerr << "[WAITBLOCK][abort][SM" << m_sm_id << "] cyc="
+            << get_current_gpu_cycle() << " reason=" << reason
+            << "-with-active-state"
+            << " first_active_warp=" << first_active_warp
+            << " active_holds=" << active_holds
+            << " active_partial_arms=" << active_partial_arms
+            << " active_replay_progress=" << active_replay_progress
+            << " active_joined_regions=" << active_joined_regions
+            << " active_partial_capsules=" << active_partial_capsules
+            << " open_contracts=" << open_contracts
+            << " outstanding_bindings=" << outstanding_bindings
+            << " incomplete_barriers=" << incomplete_barriers
+            << " tma_flush_waiters=" << m_warps_waiting_tma_flush.size()
+            << " missing_holds=" << m_missing_wait_holds_total
+            << " missing_releases=" << m_missing_wait_releases_total
+            << " poll_holds=" << m_fold_parks_total
+            << " poll_releases=" << m_fold_releases_total
+            << " poll_aux_holds=" << m_fold_aux_holds_total
+            << " poll_aux_releases=" << m_fold_aux_releases_total
+            << " partial_holds=" << m_partial_join_holds_total
+            << " partial_releases=" << m_partial_join_releases_total
+            << " partial_deferred=" << m_partial_deferred_occurrences_total
+            << " partial_replayed=" << m_partial_replayed_occurrences_total
+            << " partial_folded=" << m_partial_folded_occurrences_total
+            << " action=abort" << std::endl;
+  abort();
 }
 
 void SM::debug_dump_tma_binding_snapshot(const char *reason) const {
@@ -2571,6 +2662,7 @@ void SM::register_cta_thread_exit(unsigned cta_num, kernel_info_t *kernel) {
     if (m_config->wait_block_enable && m_n_active_cta == 0 &&
         (m_missing_wait_holds_total != m_missing_wait_releases_total ||
          m_fold_parks_total != m_fold_releases_total ||
+         m_fold_aux_holds_total != m_fold_aux_releases_total ||
          m_partial_join_holds_total != m_partial_join_releases_total ||
          m_partial_deferred_occurrences_total !=
              m_partial_replayed_occurrences_total +
@@ -2582,6 +2674,8 @@ void SM::register_cta_thread_exit(unsigned cta_num, kernel_info_t *kernel) {
                 << " missing_releases=" << m_missing_wait_releases_total
                 << " poll_holds=" << m_fold_parks_total
                 << " poll_releases=" << m_fold_releases_total
+                << " poll_aux_holds=" << m_fold_aux_holds_total
+                << " poll_aux_releases=" << m_fold_aux_releases_total
                 << " partial_holds=" << m_partial_join_holds_total
                 << " partial_releases=" << m_partial_join_releases_total
                 << " partial_deferred="
@@ -2651,6 +2745,7 @@ void SM::set_kernel(kernel_info_t *k) {
   const uint64_t next_launch_uid = k->get_uid();
   if (m_tma_binding_launch_uid != 0 &&
       m_tma_binding_launch_uid != next_launch_uid) {
+    assert_wait_block_lifecycle_drained("kernel-switch");
     for (unsigned int warp_id = 0;
          warp_id < m_tma_open_contracts_per_warp.size(); ++warp_id) {
       const uint32_t open_contracts =
