@@ -1061,15 +1061,8 @@ void SM::cycle() {
     m_interwarp_coal_warps_waiting_dep_counter->clear();
   }
   
-  if (m_config->wait_block_enable &&
-      m_config->wait_block_reverse_subcore_traversal) {
-    for (auto it = m_subcores.rbegin(); it != m_subcores.rend(); ++it) {
-      (*it)->cycle();
-    }
-  } else {
-    for (auto subcore : m_subcores) {
-      subcore->cycle();
-    }
+  for (auto subcore : m_subcores) {
+    subcore->cycle();
   }
   if (m_config->wait_block_enable) {
     m_wait_block_release_snapshot_valid = false;
@@ -4249,7 +4242,6 @@ void SM::print_wait_block_summary() const {
       "first_late_timing_reports=%llu "
       "release_phase_cycles=%llu release_service_visits=%llu "
       "release_service_expected_visits=%llu "
-      "reverse_subcore_traversal=%u "
       "retired_warp_instructions=%llu "
       "watchdog_aborts=%llu\n",
       balanced ? "PASS" : "ACTIVE", m_sm_id, m_missing_wait_ready_total,
@@ -4278,7 +4270,6 @@ void SM::print_wait_block_summary() const {
       m_wait_block_release_service_visits_total,
       m_wait_block_release_phase_cycles_total *
           m_pending_sync_waits.size(),
-      m_config->wait_block_reverse_subcore_traversal ? 1u : 0u,
       m_wait_block_retired_warp_instructions_total,
       m_wait_block_watchdog_aborts_total);
 

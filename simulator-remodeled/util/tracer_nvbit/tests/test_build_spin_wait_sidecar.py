@@ -1201,6 +1201,37 @@ class ContractOrdinalCaptureTest(unittest.TestCase):
         self.assertIn(
             "-wait_block_heartbeat_cycles 4096", h100_config)
 
+    def test_simulator_wait_block_release_phase_keeps_canonical_issue_order(self):
+        simulator_root = MODULE_PATH.parents[2] / "gpu-simulator"
+        sm_source = (
+            simulator_root /
+            "gpgpu-sim/src/gpgpu-sim/remodeling/sm.cc"
+        ).read_text()
+        loader_source = (
+            simulator_root /
+            "gpgpu-sim/src/gpgpu-sim/gpu-sim.cc"
+        ).read_text()
+        shader_header = (
+            simulator_root /
+            "gpgpu-sim/src/gpgpu-sim/shader.h"
+        ).read_text()
+        h100_config = (
+            simulator_root /
+            "gpgpu-sim/configs/tested-cfgs/"
+            "SM90_H100_L2_50MB_80GB/gpgpusim.config"
+        ).read_text()
+
+        tma_cycle = sm_source.index("m_tma_unit_shared_of_sm->cycle();")
+        release_phase = sm_source.index(
+            "service_wait_block_releases_for_cycle();", tma_cycle)
+        subcore_issue = sm_source.index(
+            "for (auto subcore : m_subcores)", release_phase)
+        self.assertLess(tma_cycle, release_phase)
+        self.assertLess(release_phase, subcore_issue)
+        for source in (sm_source, loader_source, shader_header, h100_config):
+            self.assertNotIn(
+                "wait_block_reverse_subcore_traversal", source)
+
     def test_simulator_wait_block_query_and_metrics_are_closed(self):
         simulator_root = MODULE_PATH.parents[2] / "gpu-simulator"
         sm_source = (

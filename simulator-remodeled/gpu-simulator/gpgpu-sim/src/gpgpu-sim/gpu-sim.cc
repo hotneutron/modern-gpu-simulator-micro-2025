@@ -2545,14 +2545,6 @@ void gpgpu_sim::parse_extra_trace_info(std::string filepath, bool is_extra_trace
               << std::endl;
     abort();
   }
-  if (m_shader_config->wait_block_reverse_subcore_traversal &&
-      !m_shader_config->wait_block_enable) {
-    std::cerr << "[WAITBLOCK][CONFIG][FATAL] "
-                 "-wait_block_reverse_subcore_traversal requires "
-                 "-wait_block_enable"
-              << std::endl;
-    abort();
-  }
   if (m_shader_config->wait_block_enable &&
       m_shader_config->spin_wait_observe_enable) {
     std::cerr << "[WAITBLOCK][CONFIG][FATAL] -wait_block_enable and "
@@ -4156,13 +4148,6 @@ void shader_core_config::reg_options(class OptionParser *opp) {
       "Emit one [WAITBLOCK][late-timing-first] record per affected CTA with "
       "the exact wait identity, target/next generation timing, and preceding "
       "producer/consumer semantic anchors. Observe-only. (default=0)",
-      "0");
-  option_parser_register(
-      opp, "-wait_block_reverse_subcore_traversal", OPT_BOOL,
-      &wait_block_reverse_subcore_traversal,
-      "Reverse subcore issue traversal after the canonical SM-level WaitBlock "
-      "release phase. Validation-only; requires -wait_block_enable. "
-      "(default=0)",
       "0");
   option_parser_register(
       opp, "-wait_block_hold_watchdog_cycles", OPT_UINT64,

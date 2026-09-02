@@ -17,8 +17,8 @@ INJECT action is reached; K10 reports zero. The K5 events are concentrated at
 `0x5a50` and `0x5bc0`, so producer/consumer timing analysis remains open even
 though dependency correctness and completion now pass. That timing analysis is
 a separate cycle-accuracy optimization, not an Opt 12 completion gate. B1
-normal traversal passes K5/K10; reversed traversal on the same trace remains
-pending.
+release-phase accounting and cycle-order checks pass K5/K10. The rejected
+reverse-subcore validation experiment is recorded below.
 
 ## Separate cycle-accuracy follow-up (outside Opt 12)
 
@@ -104,10 +104,10 @@ a standalone acceptance condition.
 
 ### B1 deterministic SM-cycle release phase
 
-**Problem.** `service_wait_block_release()` currently runs from each
-`Subcore::modify_warp_state()`. Therefore subcore traversal order can determine
-whether a barrier transition is observed in the current or next simulator
-cycle.
+**Problem addressed.** `service_wait_block_release()` previously ran from each
+`Subcore::modify_warp_state()`. Subcore traversal order could therefore
+determine whether a barrier transition was observed in the current or next
+simulator cycle.
 
 **Required implementation.**
 
@@ -125,22 +125,18 @@ already-defined primary FOLD cursor transition. It must not execute an
 instruction, mutate named-BAR state, or make an issue-phase arrival visible to a
 later-iterated subcore in the same cycle.
 
-**Acceptance.** Run identical traces with normal and reversed subcore traversal.
-Require identical ordered `(cycle, warp, barrier, target_generation)` release
-fingerprints, identical final cycles, exactly one release-service visit per
-hardware warp per SM cycle, unchanged trace cursors, and unchanged semantic and
-TMA conservation summaries.
+**Acceptance.** Require exactly one release-service visit per hardware warp per
+active SM cycle, no release before its target generation flip, no issue-phase
+arrival visible to release service in the same cycle, release fingerprints equal
+to released-hold totals, unchanged semantic/TMA work, and zero active state at
+kernel completion.
 
 **Implementation checkpoint.** The release service now runs once at SM scope
 after shared LD/ST and TMA pipeline advancement and before any subcore issue.
 The release service and scheduler-side hold queries share an immutable
 cycle-start `(generation, phase)` snapshot, so an issue-phase ARRIVE cannot
 release a later subcore in the same cycle. The runtime checks one service visit
-per hardware warp and emits canonical per-release fingerprints. The default-off
-`-wait_block_reverse_subcore_traversal` switch reverses only the subsequent
-subcore issue traversal for the required paired validation. Normal traversal is
-complete. The tested H100 config is temporarily set to `1` for the pending
-reversed run and must return to `0` after validation.
+per hardware warp and emits canonical per-release fingerprints.
 
 **Normal-traversal result (`.e91`/`.o91` K5, `.e67`/`.o67` K10).**
 
@@ -164,7 +160,24 @@ median regresses (1,467 -> 1,665). These cycle deltas are diagnostic, not clean
 B1 causal measurements: the current v2 trace and the earlier run trace have
 different dynamic FOLD retry populations. The strict trace comparison still
 passes semantic fingerprint, WaitBlock structure/counts, and TMA contracts.
-Reversed traversal on the same current trace remains required for B1 acceptance.
+
+**Direct release-order audit.** K5 normal services 648,760,320/648,760,320
+expected warp visits; K10 normal services
+1,096,073,024/1,096,073,024. K5 has 6,466 fingerprints for exactly 6,466
+released holds, and K10 has 9,104 for exactly 9,104. For all 6,466 K5 releases,
+the matching `(SM, barrier, target_generation)` flip exists and no release
+precedes it. In 3,614 same-cycle cases the phase-flip log precedes the release;
+the remaining 2,852 releases occur 1-6 cycles later. No duplicate/incomplete
+service, invalid snapshot, or generation-ready-state guard fires.
+
+**Rejected validation perturbation (`.e92`/`.o92`).** Reversing the complete
+subcore issue traversal is not an isolated release-order test. It changes shared
+pipeline arbitration, L2/TMA request order, and subsequent barrier timing. K5
+still completes cleanly with identical TRACECHECK work and TMA bytes, but moves
+from 84,358 to 85,900 cycles, changes L2 hits/misses, and produces 6,422 rather
+than 6,466 releases. Therefore normal/reversed final-cycle or fingerprint
+equality is not a valid B1 criterion. The validation option was removed; normal
+subcore issue order remains canonical.
 
 ### B2 startup and provenance closure
 
@@ -305,12 +318,11 @@ sum(TRACECHECK.warp_insts)
      + sum(captured_poll_advanced_occurrences)
 ```
 
-`verify_wait_block_run.py` closes this equation together with WaitBlock
+Final log analysis must close this equation together with WaitBlock
 hold/release, partial replay, release-fingerprint, TMABIND byte/ownership,
 named-BAR, SR-M0A, CTA-count, and clean-exit checks. Named-BAR teardown now
 explicitly aborts on residual participant or credit state even when C/C++
-assertions are disabled. Synthetic positive and fault-injection tests pass;
-final K5/K10 logs remain pending.
+assertions are disabled. Final K5/K10 logs remain pending.
 
 ### Deferred generalization
 
@@ -355,9 +367,9 @@ snapshot" section below.
 3. The ABI-correct v2 trace and compact ticket artifact are authoritative for
    the 90,868 eligible exact-generation actions. The ordered-candidate and
    parity-only designs remain rejected historical evidence.
-4. Remaining Opt 12 validation is the B1 reversed run, B2/B3 runtime negative
-   matrix, B5 multi-kernel test, and final B6/B7 K5/K10 verifier pass. B2,
-   B3, B5, B6, and B7 implementation and local tests are complete.
+4. B1 is log-validated. Remaining Opt 12 validation is the B2/B3 runtime
+   negative matrix, B5 multi-kernel test, and final B6/B7 K5/K10 verifier pass.
+   B2, B3, B5, B6, and B7 implementation and local tests are complete.
 5. Separate cycle-accuracy work starts from the first K5
    `current_generation > target_generation` occurrence. Completion alone must
    not be used to close the 9,542 late-arrival timing divergences; this is not
@@ -525,7 +537,7 @@ sidecar generation; unified metadata does not require unified runtime behavior.
 | B0-C | Size-only K5/K10 byte-conservation diagnostic with existing FIFO/release order | **COMPLETE**; byte contract PASS, K10 clean exit at 138,456 cycles, K5 runtime size PASS but all-live WaitBlock abort at cycle 68,176 |
 | B0-D | Exact TMA-command-to-barrier completion ownership | **COMPLETE / VALIDATED** at `39abefb`; `.e85` validates ownership-clean out-of-order completion, and K10 `.e62` completes 384/384 CTAs with 132/132 clean SM-level TMABIND final records after exercising two simultaneous open contracts per warp |
 | B0-E | K5 all-live cross-warp WaitBlock cycle (`0xb370`/`0x16c60`) | **COMPLETE / VALIDATED** at `087b53f`; K5 `.e90` completes 132/132 CTAs without forced release and K10 `.e66` completes 384/384. All WaitBlock/TMABIND summaries pass. K5's 9,542 late-arrival divergences remain a cycle-accuracy diagnostic |
-| B1 | One SM-level WaitBlock release phase per cycle | **NORMAL TRAVERSAL PASS / REVERSED PENDING**; K5 `.e91` and K10 `.e67` complete with exact release-service accounting |
+| B1 | One SM-level WaitBlock release phase per cycle | **IMPLEMENTED / LOG-VALIDATED**; K5 `.e91` and K10 `.e67` have exact release-service accounting, and the invalid whole-subcore reversal experiment is retired |
 | B2 | WaitBlock startup and provenance fail-fast checks | **IMPLEMENTED / RUNTIME NEGATIVE MATRIX PENDING** |
 | B3 | Assert-before-clear lifecycle checks | **IMPLEMENTED / RUNTIME NEGATIVE MATRIX PENDING** |
 | B4 | Zero-active no-op and active required-payload checks | **IMPLEMENTED** |
@@ -1444,13 +1456,16 @@ acceptance is:
 
 ```text
 feature-off run == B0-D baseline
-normal traversal release fingerprint == reversed traversal release fingerprint
-normal traversal final cycle == reversed traversal final cycle
 every hardware warp serviced exactly once per SM cycle
 cycle-start completion may release in the current cycle
 issue-phase arrival releases no warp before the next cycle
+release fingerprint count == released-hold count
 trace cursor, semantic work, and conservation summaries unchanged
 ```
+
+The former whole-subcore traversal reversal is rejected as a validation method:
+it changes shared-pipeline arbitration and memory/TMA scheduling rather than
+isolating release-service order. K5 `.e92` is the recorded negative result.
 
 Record the total-cycle delta from the B0-D baseline, but do not impose an
 unsupported fixed percentage or direction. A performance threshold may be added

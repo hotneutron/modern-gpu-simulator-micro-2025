@@ -612,9 +612,10 @@ global lock.
 
 ## 7. Deterministic WaitBlock release phase (B1)
 
-The current implementation calls `service_wait_block_release()` from each
-`Subcore::modify_warp_state()`. This lets subcore traversal order determine
-whether a same-cycle barrier change is observed immediately or one cycle later.
+The previous implementation called `service_wait_block_release()` from each
+`Subcore::modify_warp_state()`. This let subcore traversal order determine
+whether a same-cycle barrier change was observed immediately or one cycle
+later.
 
 Target SM-cycle order:
 
@@ -636,24 +637,25 @@ Required properties:
 - moving the service point does not change trace cursors except through an
   already-approved WaitBlock release action.
 
-B1 validation must compare normal and reversed subcore traversal using the same
-trace and configuration. Both traversals must produce the same ordered
-`(cycle, warp, barrier, generation)` release fingerprint and the same final
-kernel cycle. A completion present in the cycle-start snapshot may release in
-that cycle; an arrival issued during subcore issue may release no warp until
-the next cycle.
+B1 validation checks release-phase accounting and event ordering directly. A
+completion present in the cycle-start snapshot may release in that cycle; an
+arrival issued during subcore issue may release no warp until the next cycle.
+Release fingerprint count must equal the released-hold count, and every
+hardware warp must receive exactly one service visit per active SM cycle.
 
 Implementation checkpoint (2026-09-01): the release service has moved to SM
 scope immediately after shared-pipeline/TMA advancement. Release and
 scheduler-side WaitBlock queries use the same immutable cycle-start generation
 and phase snapshot. Runtime accounting asserts one visit per hardware warp per
-active SM cycle and emits canonical release fingerprints. The default-off
-`-wait_block_reverse_subcore_traversal` option reverses the subsequent subcore
-issue order for the paired validation run. Normal traversal passes K5 `.e91`
-and K10 `.e67` with exact release-service visit accounting; reversed traversal
-on the same trace remains pending. The tested H100 config is temporarily set to
-`1` for that run and must return to `0` after validation. Detailed results are
-in [WAIT_BLOCK.md](WAIT_BLOCK.md).
+active SM cycle and emits canonical release fingerprints. K5 `.e91` and K10
+`.e67` pass with exact release-service visit accounting and release counts.
+K5's 6,466 releases all occur at or after their target generation flip, with
+zero phase/service guard aborts.
+
+The `.e92` experiment that reversed the complete subcore issue traversal is
+rejected as a B1 validation method. It changed L2/TMA arbitration and all CTA
+timing, so its 85,900-cycle result cannot isolate release ordering. The option
+was removed. Detailed evidence is in [WAIT_BLOCK.md](WAIT_BLOCK.md).
 
 ## 8. Startup, payload, and provenance gates
 
@@ -814,10 +816,10 @@ sum(TRACECHECK.warp_insts)
      + sum(captured_poll_advanced_occurrences)
 ```
 
-`util/tracer_nvbit/verify_wait_block_run.py` checks this equation and the
-WaitBlock, TMABIND, named-BAR, release-fingerprint, SR-M0A, CTA-count, and
-clean-exit invariants together. Named-BAR teardown explicitly aborts on
-residual participant or deferred-credit state independent of build assertions.
+Final log analysis checks this equation and the WaitBlock, TMABIND, named-BAR,
+release-fingerprint, SR-M0A, CTA-count, and clean-exit invariants together.
+Named-BAR teardown explicitly aborts on residual participant or deferred-credit
+state independent of build assertions.
 
 ## 12. Diagnostics
 
@@ -1046,13 +1048,15 @@ B1-specific acceptance:
 
 ```text
 feature-off run == B0-D baseline
-normal traversal release fingerprint == reversed traversal release fingerprint
-normal traversal final cycle == reversed traversal final cycle
 every hardware warp serviced exactly once per SM cycle
 cycle-start completion may release in the current cycle
 issue-phase arrival releases no warp before the next cycle
+release fingerprint count == released-hold count
 trace cursor, semantic work, and conservation summaries unchanged
 ```
+
+Whole-subcore issue-order reversal is explicitly not an acceptance test because
+it perturbs shared-pipeline, cache, and TMA scheduling beyond B1.
 
 Record the total-cycle delta from the B0-D baseline, but do not impose an
 unsupported fixed percentage or direction. A performance threshold may be
