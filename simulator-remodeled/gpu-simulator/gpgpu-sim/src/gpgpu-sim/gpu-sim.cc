@@ -64,6 +64,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <limits>
+#include <sstream>
 #include "zlib.h"
 
 #include "dram.h"
@@ -1014,6 +1015,12 @@ void load_legacy_spin_wait_sidecar(const std::filesystem::path &extra_info_dir,
   abort();
 }
 
+std::string wait_block_hex_u64(uint64_t value) {
+  std::ostringstream stream;
+  stream << std::hex << value;
+  return stream.str();
+}
+
 const rapidjson::Value &wait_block_require_member(
     const rapidjson::Value &object, const char *name,
     const std::filesystem::path &path) {
@@ -1950,7 +1957,7 @@ void load_wait_block_sidecar_v5(const std::filesystem::path &extra_info_dir,
                     "trace_kernel=" +
                         std::to_string(trace_kernel_id) + " function=" +
                         std::to_string(unique_function_id) + " action_pc=0x" +
-                        format_hex_u64(record.entry_probe_pc));
+                        wait_block_hex_u64(record.entry_probe_pc));
         }
       } else if (strategy == "FOLD_CAPTURED_POLL") {
         SpinWaitRegionRecord record;
@@ -2111,7 +2118,7 @@ void load_wait_block_sidecar_v5(const std::filesystem::path &extra_info_dir,
                     "trace_kernel=" +
                         std::to_string(trace_kernel_id) + " function=" +
                         std::to_string(unique_function_id) + " action_pc=0x" +
-                        format_hex_u64(record.primary_wait_pc));
+                        wait_block_hex_u64(record.primary_wait_pc));
         }
         for (uint64_t wait_pc : record.wait_pcs) {
           const WaitBlockLookupKey wait_key{
