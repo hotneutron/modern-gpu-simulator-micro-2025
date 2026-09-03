@@ -747,3 +747,452 @@ three atomic lines for the first late action in an affected CTA.
 Local source-contract checks pass. A simulator build cannot be performed on
 the current macOS host because CUDA/nvcc is unavailable; compile and runtime
 validation remain for the server.
+
+## 14. Bounded stall-window result (`.e94/.o94`)
+
+The server run built from `5f1495b` completed and emitted the bounded window
+records.
+
+### 14.1 Run integrity
+
+```text
+completed CTAs                         132/132
+WAITBLOCK summaries                    132 PASS
+TMABIND final summaries                132 PASS
+BAR summaries                          132, zero leaked state
+STALLALIGN FINAL                       PASS
+hard failure / abort / deadlock        0
+gpu_sim_insn                           447,608,792
+gpu_sim_cycle                          85,393
+H100 cycle reference                   67,696
+cycle error                            +17,697 (+26.14%)
+```
+
+The semantic work is unchanged from `.o93`: every per-CTA TRACECHECK field and
+every CTA tensor-op count match. All WaitBlock hold/release, partial replay,
+release-service, TMA ownership/byte, named-BAR, and retired-plus-skipped
+conservation checks pass.
+
+The cycle count is 487 cycles above `.o93` (+0.57%). Historical K5 runs are
+schedule-sensitive, and adding observe-only work can perturb OpenMP host-thread
+ordering. Therefore `.o94` is the causal-classification run, not a replacement
+timing baseline for patch A/B comparisons.
+
+Late-event population also moved without a semantic-work change:
+
+```text
+late immediate events          9,929   (.e93: 10,221)
+first-late action 0x5a50         121   (.e93: 127)
+first-late action 0x5bc0          11   (.e93:   5)
+first-late generation distance    +1   for all 132 CTAs
+```
+
+This is additional evidence that late-event count and first-PC population are
+schedule-sensitive supporting metrics.
+
+### 14.2 Probe integrity
+
+```text
+late-stall-window records        396 = 132 CTAs * 3 windows
+consumer snapshots valid         396/396
+producer snapshots valid         396/396
+continuous window boundaries     132/132
+consumer population delta        0 for all records
+producer population delta        0 for all records
+counter-reset records             0
+```
+
+Every active warp-cycle is assigned to exactly one SR-M0A population before
+sole-blocker decomposition.
+
+### 14.3 Window decomposition
+
+Percentages below use the role's active warp-cycles in each window.
+
+| Window | Median cycles | Consumer selected | Eligible, not selected | Blocked valid | No valid head | Dominant consumer blocker | Producer WaitBlock hold |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| target complete -> next open | 10,459 | 6.32% | 10.51% | 68.80% | 14.30% | sole SFU 54.33% | 93.72% |
+| next open -> next complete | 372.5 | 4.56% | 12.25% | 83.14% | 0.01% | sole SFU 71.58% | 35.01% |
+| next complete -> action | 1,500 | 4.52% | 11.60% | 83.82% | 0% | sole SFU 77.53% | 92.70% |
+
+The critical final window has no frontend contribution. Its aggregate consumer
+population is:
+
+```text
+active warp-cycles              197,775
+selected                          8,933   4.52%
+eligible but not selected        22,948  11.60%
+blocked with valid head         165,772  83.82%
+no valid head                         0   0.00%
+
+sole SFU unavailable            153,330  77.53%
+multi-blocker                     6,338   3.20%
+sole non-SFU FU                   3,295   1.67%
+sole tensor FU                      977   0.49%
+sole wait barrier                   718   0.36%
+sole stall count                    721   0.36%
+```
+
+Thus the first-late consumer is usually not ready-but-unselected. It has a
+valid MUFU/SFU head and is blocked because the subcore SFU cannot accept it.
+
+### 14.4 Dominant and secondary cohorts
+
+Combining `next open -> next complete` and `next complete -> action`:
+
+```text
+0x5a50, 121 CTAs:
+  selected                         4.47%
+  eligible but not selected       11.86%
+  blocked valid                   83.62%
+  sole SFU unavailable            78.01%
+  multi-blocker                    3.03%
+
+0x5bc0, 11 CTAs:
+  selected                         6.79%
+  eligible but not selected        6.58%
+  blocked valid                   86.24%
+  sole tensor FU unavailable      61.37%
+  sole SFU unavailable             8.22%
+  multi-blocker                    7.15%
+```
+
+The dominant `0x5a50` path is specifically SFU-limited in this interval. The
+rarer `0x5bc0` first-late population is a different phase: its immediate
+pre-action delay is predominantly tensor-FU availability and must not be folded
+into the `0x5a50` diagnosis.
+
+The `0x5a50` next-completion-to-action delay remains broad:
+
+```text
+min / median / p95 / max = 18 / 1,605 / 2,887 / 4,834 cycles
+```
+
+All reporter warps show the same qualitative result. Sole-SFU fractions range
+from 76.56% to 79.98% across reporter warps 4-7, so this is not isolated to one
+subcore.
+
+### 14.5 Answers to questions 1-3
+
+1. The third consumer arrival on the paired empty barrier permits producer
+   progress.
+2. In the dominant `0x5a50` interval, the consumer is blocked by SFU
+   availability, not primarily ready-but-not-selected.
+3. Producer release-to-contract-open progress is effectively fixed relative to
+   the consumer delay:
+
+```text
+empty flip -> next contract open median       65 cycles
+correlation with 0x5a50 post-completion delay -0.107
+next TMA duration correlation with delay      +0.107
+```
+
+Producer warp 0 is held for 93.72% of the long target-complete-to-next-open
+window and 92.70% of the final next-complete-to-action window. It is not
+continuously winning scheduler slots and racing ahead.
+
+### 14.6 Cross-check with the completed SFU investigation
+
+The result above must be read together with Opt 10 and the later corrected
+analysis in `FA3_progress.md` and `HW_VS_SIM_SFU.md`.
+
+```text
+pre-Opt-10 defect:
+  busy MUFU entered the one-deep ISSUE_CONTROL latch
+  -> the whole SMSP stopped before it could select another warp
+
+Opt-10 correction:
+  test SFU can_issue() before the latch
+  -> skip only the blocked warp
+  -> continue scanning for another eligible warp
+```
+
+That old issue-latch defect remains closed in `.o94`:
+
+```text
+next_stage_not_available              0.0531%
+next_stage_blocked_by_sfu             0
+intra-SMSP SFU candidates filtered    19,193,949
+another warp issued after filtering    5,445,225  (28.37%)
+```
+
+Therefore `sole_fu_sfu` does not mean that a MUFU has clogged
+`ISSUE_CONTROL`. It means the exact opposite: the corrected pre-issue query
+found a valid SFU head, observed `fu->can_issue() == false`, and correctly
+excluded that warp while allowing the scheduler to continue scanning.
+
+The current full-kernel counters also reproduce the older `.o61` SFU
+concentration result on the Opt 12 trace:
+
+```text
+MUFU instructions                         1,926,144
+warp-cycles blocked on SFU               35,197,377
+blocked warp-cycles per MUFU                   18.27
+average queued warps over the II=8 window       2.28
+
+still-idle valid-head composition:
+  MUFU heads                                  63.79%
+  tensor + other heads                        36.21%
+```
+
+The older `.o61` result was `18.4` blocked warp-cycles per MUFU and `2.30`
+queued warps, so the phenomenon is unchanged. The new contribution of `.e94`
+is temporal localization: this known bursty SFU contention occupies 78.01% of
+the dominant exact-generation `next-open -> action` window. Static SASS also
+confirms that both action PCs `0x5a50` and `0x5bc0` are `MUFU.EX2`
+instructions.
+
+This refines H1 without reopening any closed SFU mechanism:
+
+```text
+dominant first-late local mechanism =
+  bursty, phase-concentrated consumer MUFU demand
+  -> target consumer is correctly rejected while its SMSP SFU is busy
+  -> other consumer groups provide the empty-barrier credits
+  -> producer completes the next TMA generation
+  -> lagging consumer reaches 0x5a50 late
+```
+
+The following are already ruled out and must not be repeated:
+
+- lowering SFU II or result latency: II=8 and total latency=16 are
+  hardware-faithful;
+- another SFU issue-gate fix: Opt 10 already removed the latch blockage;
+- launch-offset staggering: E1 changed K5 by +0.38% and was reverted;
+- GTO-to-GTLRR ordering: K5 improved only 1.6%, with lockstep and SM-idle
+  essentially unchanged;
+- treating `stall_count` as the inflator: its right-shift decay under-applies
+  the hardware delay and is in the wrong direction.
+
+The previously proposed same-subcore peer-count run is also unnecessary as a
+standalone experiment: the existing overlap probe has already shown about 2.3
+warps queued per MUFU, and the current run reproduces it.
+
+### 14.7 Correct scope of the remaining problem
+
+Exact-generation handling did not create this timing defect. Opt 11-A already
+ran K5 at 83,308 cycles with the producer ending about 37.9K cycles before the
+consumer, before exact-generation WaitBlock replay existed. Opt 12 narrowed
+that role-tail error while making the logical wait identity explicit.
+
+The rule
+
+```text
+current_generation >= target_generation -> continue or release
+```
+
+is required. A wait whose exact dependency has already completed must pass;
+holding it for a later phase would recreate the parity-alias deadlock. A
+`current > target` event is therefore an observation of pre-existing relative
+timing drift, not the cause of that drift.
+
+Likewise, plain mbarrier ARRIVE is count-based. Equal per-leader occurrence
+counts do not prove that the Nth ARRIVE from leaders 4, 8, and 12 must be grouped
+into one hardware generation, because the trace has no authoritative
+cross-warp timestamp/order. Duplicate leaders in one simulated phase are
+interesting schedule evidence, but not by themselves a contract violation.
+
+The strongest supported statement is narrower:
+
+```text
+K5 consumer relative progress differs from hardware
+  -> the dominant late consumer reaches a burst of MUFU work
+  -> its valid head is blocked on the busy SFU for most of the local window
+  -> another consumer path releases the producer
+  -> the next TMA generation completes before that consumer action
+```
+
+The exact source of the relative-progress mismatch remains unproven. The
+trace-driven simulator reconstructs cross-warp timing from per-warp instruction
+streams, scheduler policy, and deterministic resource latencies; the trace
+does not carry the hardware's cross-warp issue timeline. Existing evidence
+rules out SFU cost, the old SFU latch bug, launch staggering, GTLRR ordering,
+TMA latency, and generation forcing.
+
+## 15. Rejected empty-ARRIVE ordinal inference
+
+Status: **REJECTED AS A GENERATION CONTRACT.** This analysis is retained to
+prevent the same inference from being proposed again. It shows schedule mixing
+in the simulator, but it does not prove that the mixing is architecturally
+incorrect.
+
+### 15.1 Artifact provenance
+
+The workspace `mbarrier-contract-v2` protobuf and ticket artifact match the
+`.e90/.o90` run, not `.e91/.e93/.e94`:
+
+```text
+workspace / .e90 ticket slots      816,411
+.e91/.e93/.e94 ticket slots        817,848
+
+workspace / .o90 CTA instruction-count mismatches   0/132
+workspace vs .o94 CTA105 instructions:
+  workspace protobuf              105,675
+  .o94 TRIMCHK                    115,940
+```
+
+Therefore the provenance-matched source-index diagnostic below uses the
+`.e90/.o90 + workspace protobuf` pair. `.e94` is used only for a separate
+runtime-order comparison. The newer server-side trace/ticket artifact would
+need to be synced for an exact `.e94` source-index comparison, but doing so
+would not make the rejected ordinal grouping an architectural contract.
+
+### 15.2 Per-stream symmetry from the hardware trace
+
+The dependency-free protobuf parser and `sync_operand_resolver.json` were used
+to extract every active plain ARRIVE to the four K5 empty barriers:
+
+```text
+barriers                 0x16c40, 0x16c48, 0x16c60, 0x16c68
+consumer leaders         warp 4, 8, 12
+CTA/barrier tuples        528
+leader streams          1,584
+active ARRIVE records   14,544
+effective mask          0x1 for all records
+```
+
+For every one of the 528 CTA/barrier tuples:
+
+- leaders 4, 8, and 12 have exactly the same ARRIVE count;
+- their ordered static-PC sequences are identical;
+- preserving each leader's program order partitions the streams into one
+  three-leader tuple per ordinal with no missing member.
+
+Counts per leader are:
+
+```text
+376 CTA/barriers: 9 arrivals per leader
+124 CTA/barriers: 10 arrivals per leader
+ 28 CTA/barriers: 8 arrivals per leader
+```
+
+It is tempting to infer the following grouping:
+
+```text
+leader 4 ARRIVE ordinal N
+leader 8 ARRIVE ordinal N
+leader 12 ARRIVE ordinal N
+  -> the three credits for logical empty generation N
+```
+
+That inference is not valid. These facts prove only per-warp order and aggregate
+symmetry. Hopper mbarrier ARRIVE contributes a count to the current phase and
+does not carry a source-warp ordinal or generation identity. The trace has no
+cross-warp timestamp that says which three arrivals hardware grouped into one
+phase. Therefore equal counts and matching static PC sequences cannot establish
+the proposed cross-warp ordinal tuple.
+
+### 15.3 `.e90` ordinal regrouping diagnostic
+
+The matching `.e90` log contains exactly the same 14,544 runtime ARRIVEs, with
+zero per-stream count mismatch. Pairing each runtime event with its captured
+leader ordinal gives:
+
+```text
+Under the rejected same-ordinal grouping:
+  live gen equals ordinal-1           8,277 / 14,544   56.91%
+  live gen below ordinal-1            3,467 / 14,544   23.84%
+  live gen above ordinal-1            2,800 / 14,544   19.25%
+
+artificial three-leader ordinal tuples:
+  total                               4,848
+  all three share one live gen        1,166             24.05%
+  split across live generations       3,682             75.95%
+
+runtime three-credit phase groups:
+  three distinct leaders              2,008             41.42%
+  duplicate leader credit             2,840             58.58%
+  one shared logical ordinal           1,166             24.05%
+  mixed logical ordinals               3,682             75.95%
+```
+
+These numbers show that simulator scheduling does not preserve the artificial
+same-ordinal grouping. They do not establish "early" or "late" ARRIVE semantics
+because that grouping is not an architectural requirement.
+
+CTA 0, empty barrier `0x16c40`, illustrates the propagation:
+
+```text
+artificial ordinal 3:
+  warp 8  -> live gen 2
+  warp 12 -> live gen 2
+  warp 4  -> live gen 3
+
+artificial ordinal 4:
+  warp 8  -> live gen 3
+  warp 12 -> live gen 2
+  warp 4  -> live gen 4
+```
+
+### 15.4 `.e94` schedule-shape replication
+
+Although the exact `.e94` protobuf is not present locally, its runtime ARRIVE
+streams independently reproduce the same shape. Leader counts are equal for
+524/528 CTA/barrier tuples; the four exceptions differ by one event and require
+the missing server artifact or atomic SYNCDBG emission to distinguish trace
+difference from log loss.
+
+All 132 first-late paired empty phases have three visible credits:
+
+```text
+same leader ordinal for all three credits       27/132   20.45%
+mixed leader ordinals                          105/132   79.55%
+three distinct leaders                          32/132   24.24%
+duplicate leader credit                        100/132   75.76%
+```
+
+The dominant regrouped pattern is `(2,2,3)`, but it must be read only as
+cross-warp schedule shape. It does not prove generation rebinding.
+
+### 15.5 Why this is not the root cause
+
+The offline validator deliberately rejects the multi-arrival plain empty
+barriers with:
+
+```text
+CONTRACT_ARRIVAL_COUNT_UNSUPPORTED
+CONTRACT_EXPECT_TX_MISSING
+CONTRACT_PLAIN_ARRIVE_PRESENT
+```
+
+The current exact-generation implementation intentionally supports
+single-arrival TMA full barriers and rejects multi-arrival plain empty barriers
+from ticket generation. That is appropriate: an exact wait target names a
+completed dependency, while a plain ARRIVE has no architectural generation
+operand.
+
+Inventing empty-ARRIVE generation tickets from per-leader occurrence number
+would add an ordering constraint that is absent from both the ISA event and the
+captured trace. Holding such an ARRIVE could change valid hardware schedules
+and create new cross-warp cycles. Do not implement it.
+
+The SFU and producer/consumer timing problem also predates exact-generation
+replay:
+
+```text
+Opt 11-A K5 cycles                         83,308
+pre-exact producer-minus-consumer tail    about -37.9K cycles
+H100 producer-minus-consumer tail         about +8.0K cycles
+```
+
+Exact generation made the mismatch observable and deadlock-safe; it did not
+create it. The remaining root-cause scope stays consumer issue density and
+cross-warp timing reconstruction, with no proven mechanism-level correction
+yet.
+
+### 15.6 Correct next step
+
+Do not generate ARRIVE tickets or change barrier semantics. The next useful
+offline comparison is definition-matched hardware evidence for the affected
+softmax region:
+
+1. Export the existing NCU Source page for K5 without rerunning the kernel.
+2. Map function-relative PCs around `0x5a50`, `0x5bc0`, and their preceding
+   MUFU/HGMMA instructions.
+3. Compare per-PC hardware stall samples (`math_pipe_throttle`,
+   `mio_throttle`, `short_scoreboard`, `not_selected`) with bounded simulator
+   head-PC/blocker counts.
+4. Reopen a simulator mechanism only if that comparison identifies a
+   definition-matched excess. Otherwise retain the K5 residual as an unresolved
+   cross-warp timing limitation rather than manufacturing a generation or SFU
+   correction.
