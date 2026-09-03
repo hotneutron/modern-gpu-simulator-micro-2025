@@ -43,6 +43,7 @@ import glob
 import datetime
 import yaml
 import common
+import trace_config
 
 this_directory = os.path.dirname(os.path.realpath(__file__)) + "/"
 # This function will pull the SO name out of the shared object,
@@ -363,6 +364,12 @@ class ConfigurationSpec:
             accelsim_cfg = os.path.expandvars(os.path.join("$ACCELSIM_ROOT", cfgsubdir, "trace.config"))
             config_text += open(accelsim_cfg).read()
 
+            try:
+                config_text += trace_config.non_tma_config_override(
+                    config_text, os.path.join(this_run_dir, "traces")
+                )
+            except trace_config.TraceFeatureDetectionError as error:
+                sys.exit("ERROR - {0}".format(error))
 
         open(os.path.join(this_run_dir , "gpgpusim.config"), 'w').write(config_text)
 
