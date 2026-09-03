@@ -2583,7 +2583,11 @@ void gpgpu_sim::parse_extra_trace_info(std::string filepath, bool is_extra_trace
     std::filesystem::path metadata_path(filepath);
     std::filesystem::path extra_info_dir = metadata_path.parent_path();
     load_tma_descriptor_configs(extra_info_dir, m_tma_sidecar_db);
-    load_tma_pc_base_map(extra_info_dir, m_tma_sidecar_db);
+    // A disabled consumer must not validate a stale or intentionally empty TMA map.
+    if (m_shader_config->tma_real_base_addr_enable ||
+        m_shader_config->wait_block_exact_generation_enable) {
+      load_tma_pc_base_map(extra_info_dir, m_tma_sidecar_db);
+    }
     // Version-2 sidecars use the kernel-aware (trace_kernel_id,uid,pc) key.
     // Legacy version-1 records remain readable through a wildcard kernel ID.
     load_tma_operand_resolver(extra_info_dir, m_tma_sidecar_db);
@@ -4275,8 +4279,9 @@ void shader_core_config::reg_options(class OptionParser *opp) {
                          &tma_real_base_addr_enable,
                          "Use the exact per-site GMEM base (tma_pc_base_map.json) for TMA "
                          "transfer addresses instead of the synthetic transfer_uid scheme, "
-                         "so L2 locality matches HW. On by default (M4); auto-disabled if the "
-                         "trace has no base map (non-FA3). (default=1)",
+                         "so L2 locality matches HW. On by default (M4); the job launcher "
+                         "disables it only when no traced kernel contains a TMA-family "
+                         "instruction. (default=1)",
                          "1");
   option_parser_register(opp, "-tma_operand_addr_tiling_enable", OPT_BOOL,
                          &tma_operand_addr_tiling_enable,
