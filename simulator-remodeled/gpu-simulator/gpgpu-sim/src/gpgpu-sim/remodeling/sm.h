@@ -31,6 +31,7 @@
 #include "../../abstract_hardware_model.h"
 
 #include <stdio.h>
+#include <array>
 #include <queue>
 #include <set>
 #include <unordered_map>
@@ -405,6 +406,10 @@ class SM : public core_t, public shader_core_ctx_wrapper {
   void enqueue_instruction_region_prewarm(kernel_info_t &kernel);
   void issue_pending_instruction_region_prewarm();
   void handle_sync_instruction(warp_inst_t &inst, unsigned int warp_id);
+  void select_lane_group(unsigned warp_id);
+  void service_lane_group_waits(unsigned warp_id);
+  unsigned fold_lane_group(unsigned warp_id, unsigned group,
+                           const SpinWaitRegionRecord &region);
   void handle_partial_wait_instruction_issue(const warp_inst_t &inst,
                                               unsigned int warp_id);
   void start_partial_wait_hold(unsigned int warp_id,
@@ -518,6 +523,10 @@ class SM : public core_t, public shader_core_ctx_wrapper {
   barrier_set_t m_barriers;
   std::map<HopperMBarrierKey, HopperMBarrierObject> m_hopper_mbarriers;
   mutable std::vector<HopperMBarrierPendingWait> m_pending_sync_waits;
+  std::vector<std::array<HopperMBarrierPendingWait, 2>> m_lane_group_waits;
+  std::vector<uint64_t> m_lane_group_progress_cycle;
+  uint64_t m_lane_group_extracted = 0, m_lane_group_issued = 0;
+  uint64_t m_lane_group_folded = 0;
   std::vector<HopperPartialWaitArm> m_partial_wait_arms;
   std::vector<HopperPartialReplayProgress> m_partial_replay_progress;
   std::vector<std::set<std::string>> m_partial_joined_regions;

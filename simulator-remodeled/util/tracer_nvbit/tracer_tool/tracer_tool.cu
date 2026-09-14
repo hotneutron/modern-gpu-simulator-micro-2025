@@ -2298,7 +2298,8 @@ void instrument_function_if_needed(CUcontext ctx, CUfunction func, int device_id
       }
 
       std::shared_ptr<traced_instruction> inst_parsed = create_no_binay_instruction(vpc, inst_str);
-      inst_parsed->set_simulation_opcode(OpcodeMap, inst_parsed->get_op_code());
+      inst_parsed->set_simulation_opcode(
+          OpcodeMap, inst_parsed->get_op_code(), binary_version);
       instruction_text_by_pc[next_candidate_unique_function_id][vpc] = inst_str;
       if (inst_parsed->get_num_operands() > 0) {
         traced_operand &first_operand = inst_parsed->get_operand(0);

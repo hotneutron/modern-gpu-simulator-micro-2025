@@ -1069,8 +1069,50 @@ class ContractOrdinalCaptureTest(unittest.TestCase):
             '"--mbarrier-contract-capture"', runner_source)
         self.assertIn(
             'if mbarrier_contract_capture:', runner_source)
-        self.assertIn(
+        self.assertNotIn(
             '"-mbarrier-contract-v2"', runner_source)
+
+    def test_contract_capture_runner_is_single_pass(self):
+        runner_source = (
+            MODULE_PATH.parent / "run_hw_trace.py").read_text()
+        sidecar_source = MODULE_PATH.read_text()
+
+        self.assertNotIn("baseline_trace_folder", runner_source)
+        self.assertNotIn(
+            "contract capture baseline is missing", runner_source)
+        self.assertNotIn(
+            "contract capture requires an accepted baseline traces path",
+            runner_source)
+        self.assertNotIn("-mbarrier-contract-v2", runner_source)
+        self.assertIn(
+            "lighter_tracer_value = extra_env.get(", runner_source)
+        self.assertIn(
+            "mbarrier_contract_value = str(extra_env.get(", runner_source)
+        self.assertNotIn(
+            "benchmark environment cannot override tracer selection",
+            runner_source)
+        self.assertIn(
+            '"status": "NOT_REQUESTED"', sidecar_source)
+        self.assertNotIn(
+            'if args.strict:\n'
+            '                contract_report["status"] = "FAIL"',
+            sidecar_source)
+
+    def test_all_fa3_variants_enable_contract_capture(self):
+        definitions_path = (
+            MODULE_PATH.parents[1] /
+            "job_launching/apps/define-flashattn.yml"
+        )
+        sections = definitions_path.read_text().split("\n        - ")[1:]
+        fa3_sections = [
+            section for section in sections
+            if section.startswith("flashattn-fa3-")
+        ]
+
+        self.assertEqual(len(fa3_sections), 5)
+        for section in fa3_sections:
+            self.assertIn("LIGHTER_TRACER: all", section)
+            self.assertIn("MBARRIER_CONTRACT_CAPTURE: 1", section)
 
     def test_simulator_exact_generation_covers_inject_and_fold(self):
         simulator_root = MODULE_PATH.parents[2] / "gpu-simulator"

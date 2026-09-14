@@ -267,8 +267,11 @@ The generic option default is off. The validated SM90 H100 config enables it.
 With the option disabled, both strategies use the fallback and preserve the
 existing behavior.
 
-The shared wait-hold watchdog threshold is 32,000 cycles. At 32,001 cycles,
-emit a full diagnostic and abort.
+The shared watchdog threshold is 32,000 cycles. Ordinary whole-warp holds use
+total hold age. Bounded lane-group replay (section 13) instead uses cycles
+since the last replay issue, fold advance, or actual wait release: a sibling's
+finite work may legitimately outlast a single group's hold-age threshold.
+At 32,001 cycles without replay progress, emit a full diagnostic and abort.
 
 For long runs, print a low-rate heartbeat every 4,096 held cycles:
 
@@ -505,6 +508,20 @@ It does not prove that the corresponding dynamic join occurrence has already
 issued in the linear trace-driven simulator.
 
 #### Post-processing proof
+
+The direct-branch fields below describe partial hold proof version 1. Proof
+version 3 supports occurrence-specific join variants, described in
+[WAIT_BLOCK_POSTPROC.md](WAIT_BLOCK_POSTPROC.md#occurrence-specific-partial-joins).
+The loader validates every variant and binds the exact entry/join/post-join
+source indices. Runtime selects the variant using the instruction's original
+CTA/warp/source-index identity and checks its exact masks and barrier payload.
+An already-arrived WARPSYNC variant must find its sibling join already issued;
+otherwise it aborts before extraction. It uses the existing direct-hold path,
+without moving earlier sibling work or introducing a new trace cursor.
+Only variants proven by the direct-branch rule may use pending-join extraction.
+Repeated occurrences of a join PC do not share bookkeeping unless they are
+explicitly bound to the same dynamic rendezvous. Legacy version-1 behavior is
+unchanged; old loaders reject version 3.
 
 Post-processing combines static CFG/SASS proof with the existing full dynamic
 mask scan. It does not attempt to prove EXCH, ARRIVE, TMA, or transitive release
@@ -973,3 +990,94 @@ this implementation order, together with each K5/K10 server run
 [WAIT_BLOCK_HISTORY.md](WAIT_BLOCK_HISTORY.md). The current authoritative status
 and remaining work are tracked by the scope table in
 [WAIT_BLOCK.md](WAIT_BLOCK.md).
+
+## 13. Bounded Lane-Group Replay
+
+The noncausal interleaved-poll extension uses partial proof version 4 inside
+sidecar v5. Versions 1-3 keep the existing join-only runtime. Version 4 must
+not be interpreted as a join proof: its recorded full-mask boundary can be a
+PHASECHK, which is not a hardware synchronization instruction.
+
+### Ownership and Scheduling
+
+- Activate at the proven poll-head occurrence, before ordinary FOLD can cross
+  an interleaved lane stream. The already-issued trigger is excluded from replay.
+- Transfer the remaining occurrences into two disjoint raw-active-mask streams.
+  Preserve addresses, predicates, sync payloads, generation tickets, and source
+  indices. Only `next_traced_pc` is relinked to the selected stream.
+- The sibling's proven lane-private polling may pass main-stream work. A
+  similarly proven earlier main polling prefix may pass sibling work. Every
+  other occurrence keeps its global source order relative to the other group's
+  non-polling occurrences. This includes uniform-register operations and
+  collective setup/tails.
+- Each stream keeps FIFO reservations, a wait target, and a waiting bit. A
+  switch flushes unissued IBuffer reservations and invalidates old epochs.
+  Fetch is disabled when the selected group has no unreserved runnable item.
+- INJECT and primary FOLD create group-local holds. FOLD advances only that
+  group's queue to its local exit, or to the recorded common poll boundary.
+  It must abort on semantic instructions instead of folding them.
+- Auxiliary exact-generation waits retain their existing hold semantics.
+  A count-only auxiliary TRYWAIT also holds when its recorded following
+  NANOSLEEP/PHASECHK/BRA are all predicated off, proving a captured-ready exit.
+  Otherwise count-only auxiliary probes remain nonblocking.
+- Releases run in the existing SM cycle-start snapshot phase, in warp/group
+  order. Releasing one target never clears the other group's wait.
+- A group's cumulative hold age is accounting, not a progress timeout. Keep
+  `hold_start_cycle` and its target unchanged while the sibling progresses.
+  Use the existing replay progress timestamp and unchanged watchdog threshold
+  to detect no issue, fold advance, or release in either group. A heartbeat
+  does not reset that timestamp. A runnable flag without an actual issue is
+  not progress.
+- Check generation overshoot independently. Process snapshot-ready releases
+  before the replay progress timeout, so a ready dependency is not rejected
+  because of its previous age. This does not force readiness or release a
+  pending dependency.
+- Each pending group emits a low-rate heartbeat with SM, CTA, barrier,
+  target/current generation, total held cycles, replay idle cycles, and both
+  stream cursors. No application, PC, or barrier address is special-cased.
+- The first recorded full-mask occurrence stays in the canonical stream. It
+  issues once, after both replay streams drain and both waits are clear.
+
+The same warp scheduler, issue slots, SASS stall controls, and dependency
+scoreboards remain in use. This is not a complete independent-thread scheduling
+model. Global ordering of non-polling occurrences and the preserved full-mask
+grouping constrain timing; cycle fidelity requires server evidence.
+
+### Validation
+
+CPU fixtures compile the production extraction, queue folding, SM selection,
+and release functions, with minimal surrounding simulator stubs. They exercise
+both completion orders, reservation rollback, preserved payload/source identity,
+untouched canonical merge, invalid partitions, generation overshoot, and
+watchdog aborts. Long sibling waits cover pending-target preservation across
+the total-age threshold, readiness at expiry, exact-target late release,
+heartbeat-only inactivity, and timeout after the last real progress. They do
+not replace a Linux/CUDA build or a full simulator run.
+
+The reusable queue test also runs under AddressSanitizer/UndefinedBehaviorSanitizer
+and reuses the same object with smaller streams. Rebuild the complete
+next-semantic table (including its end sentinel) on every activation: resizing
+alone can retain a previous stream's sentinel and read beyond the new stream.
+Proof tests relocate PCs, function IDs, registers/predicates, barrier addresses,
+phase values, and non-lane-0 mask partitions without changing admission.
+
+Application independence is bounded by semantics, not names: the current
+extension proves two disjoint lane groups, the four-instruction lane-private
+poll pattern, and the documented poll/collective boundaries. It does not yet
+cover arbitrary polling bodies, nested multi-group reconvergence, indirect
+control, or all possible application traces. Unsupported proofs fail closed.
+The 16-byte instruction stride and 32-lane member mask are ISA constraints,
+not application-specific timing or address overrides.
+
+Additional runtime accounting:
+
+```text
+lane_group_extracted = lane_group_issued + lane_group_folded
+loaded warp occurrences = retired warp occurrences + all folded occurrences
+```
+
+The first equality participates in lifecycle and summary assertions. Group
+waits must drain before CTA cleanup. `[WAITBLOCK][lane-group-summary]` exposes
+the replay conservation counters; bounded debug events name start, hold,
+release, and merge transitions. Compare `gpu_sim_insn` separately in its
+active-lane units, never against warp-occurrence counters.

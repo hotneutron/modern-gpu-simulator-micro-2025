@@ -64,6 +64,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <limits>
+#include <regex>
 #include <sstream>
 #include "zlib.h"
 
@@ -1545,16 +1546,22 @@ void wait_block_validate_partial_static_proof(
         path, "partial wait-arm exit does not rejoin captured ready path");
   }
 
-  std::shared_ptr<traced_instruction> sibling_branch =
-      wait_block_require_static_instruction(
-          static_trace_info, unique_function_id,
-          record.sibling_branch_pc, path);
-  if (sibling_branch->get_op_code() != "BRA" ||
-      !sibling_branch->get_is_predicated() ||
-      wait_block_static_direct_target(
-          sibling_branch, path, "partial sibling branch") != record.join_pc) {
+  if (record.partial_hold_proof_version == 1) {
+    std::shared_ptr<traced_instruction> sibling_branch =
+        wait_block_require_static_instruction(
+            static_trace_info, unique_function_id,
+            record.sibling_branch_pc, path);
+    if (sibling_branch->get_op_code() != "BRA" ||
+        !sibling_branch->get_is_predicated() ||
+        wait_block_static_direct_target(
+            sibling_branch, path, "partial sibling branch") != record.join_pc) {
+      wait_block_sidecar_fatal(
+          path, "partial sibling branch does not target the declared join");
+    }
+  } else if (record.partial_hold_proof_version != 2 ||
+             record.join_kind != "WARPSYNC") {
     wait_block_sidecar_fatal(
-        path, "partial sibling branch does not target the declared join");
+        path, "already-arrived partial proof requires a proven WARPSYNC");
   }
 
   std::shared_ptr<traced_instruction> join =
@@ -1562,16 +1569,66 @@ void wait_block_validate_partial_static_proof(
           static_trace_info, unique_function_id, record.join_pc, path);
   wait_block_require_static_instruction(
       static_trace_info, unique_function_id, record.post_join_pc, path);
+  const bool collective_join =
+      join->get_op_code() == "WARPSYNC.COLLECTIVE" &&
+      record.partial_hold_proof_version == 2;
   if (join->get_is_predicated() ||
       record.join_pc >
           std::numeric_limits<uint64_t>::max() - instruction_size ||
       record.post_join_pc != record.join_pc + instruction_size ||
       (record.join_kind == "WARPSYNC" &&
-       join->get_op_code() != "WARPSYNC.ALL") ||
+       join->get_op_code() != "WARPSYNC.ALL" && !collective_join) ||
       (record.join_kind == "BSYNC" && join->get_op_code() != "BSYNC") ||
       (record.join_kind != "WARPSYNC" && record.join_kind != "BSYNC")) {
     wait_block_sidecar_fatal(
         path, "partial join opcode disagrees with static metadata");
+  }
+  if (collective_join) {
+    if (record.join_pc < instruction_size || join->get_num_operands() != 2 ||
+        join->get_operand(0).get_operand_type() != TraceEnhancedOperandType::REG) {
+      wait_block_sidecar_fatal(path, "collective join has no regular mask register");
+    }
+    auto mask_def = wait_block_require_static_instruction(
+        static_trace_info, unique_function_id, record.join_pc - instruction_size, path);
+    if (mask_def->get_op_code() != "IMAD.MOV.U32" ||
+        mask_def->get_is_predicated() || mask_def->get_num_operands() != 4 ||
+        wait_block_normalize_operand(mask_def->get_operand(0).get_operand_string()) !=
+            wait_block_normalize_operand(join->get_operand(0).get_operand_string()) ||
+        wait_block_normalize_operand(mask_def->get_operand(1).get_operand_string()) != "RZ" ||
+        wait_block_normalize_operand(mask_def->get_operand(2).get_operand_string()) != "RZ") {
+      wait_block_sidecar_fatal(path, "collective join lacks adjacent constant mask definition");
+    }
+    // The JSON double representation rounds uint64 -1; use the exact SASS token.
+    const std::string mask_text =
+        wait_block_normalize_operand(mask_def->get_operand(3).get_operand_string());
+    char *mask_end = nullptr;
+    const long long mask_value = std::strtoll(mask_text.c_str(), &mask_end, 0);
+    if (mask_text.empty() || mask_end == mask_text.c_str() || *mask_end != '\0' ||
+        (mask_value != -1 && mask_value != 0xffffffffLL)) {
+      wait_block_sidecar_fatal(path, "collective join mask is not full-warp");
+    }
+    const uint64_t resume_pc =
+        wait_block_static_direct_target(join, path, "collective join");
+    if (resume_pc < instruction_size || resume_pc % instruction_size != 0 ||
+        resume_pc - instruction_size <= record.post_join_pc) {
+      wait_block_sidecar_fatal(path, "collective join has invalid scope target");
+    }
+    wait_block_require_static_instruction(
+        static_trace_info, unique_function_id, resume_pc, path);
+    const uint64_t end_pc = resume_pc - instruction_size;
+    auto end = wait_block_require_static_instruction(
+        static_trace_info, unique_function_id, end_pc, path);
+    if (end->get_op_code() != "ENDCOLLECTIVE" || end->get_is_predicated() ||
+        end->get_num_operands() != 0) {
+      wait_block_sidecar_fatal(path, "collective join scope lacks ENDCOLLECTIVE");
+    }
+    for (uint64_t pc = record.post_join_pc; pc < end_pc; pc += instruction_size) {
+      auto body = wait_block_require_static_instruction(
+          static_trace_info, unique_function_id, pc, path);
+      if (body->get_op_code().rfind("SHFL.", 0) != 0 || body->get_is_predicated()) {
+        wait_block_sidecar_fatal(path, "collective join body is not a linear shuffle scope");
+      }
+    }
   }
 
   if (record.join_kind == "BSYNC") {
@@ -1593,6 +1650,310 @@ void wait_block_validate_partial_static_proof(
   } else if (bssy_pc != 0 || !join_token.empty()) {
     wait_block_sidecar_fatal(
         path, "WARPSYNC partial region unexpectedly declares BSSY metadata");
+  }
+}
+
+void load_lane_group_spans(
+    const rapidjson::Value &block, const MissingWaitRecord &base,
+    uint32_t kid, uint32_t fid, traced_execution &static_trace_info,
+    WaitBlockSidecarDB &db, const std::filesystem::path &path) {
+  auto key_for = [&](const rapidjson::Value &item, uint64_t pc, uint64_t index) {
+    const auto &cta = wait_block_require_array(item, "cta", path);
+    if (cta.Size() != 3 || !cta[0].IsUint() || !cta[1].IsUint() || !cta[2].IsUint()) {
+      wait_block_sidecar_fatal(path, "invalid lane-group CTA");
+    }
+    return WaitBlockGenerationTicketKey{
+        kid, cta[0].GetUint(), cta[1].GetUint(), cta[2].GetUint(),
+        wait_block_require_uint32(item, "warp_id", path), fid, pc, index};
+  };
+  std::map<WaitBlockGenerationTicketKey, LaneGroupSpanRecord> spans;
+  for (const auto &item : wait_block_require_array(block, "lane_group_spans", path).GetArray()) {
+    LaneGroupSpanRecord r;
+    r.start_index = wait_block_require_uint(item, "start_index", path);
+    r.poll_start_index = wait_block_require_uint(item, "poll_start_index", path);
+    r.start_pc = wait_block_require_uint(item, "start_pc", path);
+    r.start_mask = wait_block_require_uint32(item, "start_mask", path);
+    r.start_barrier_addr = wait_block_require_uint(item, "start_barrier_addr", path);
+    r.start_wait_state_raw = wait_block_require_uint(item, "start_wait_state_raw", path);
+    r.prefix_poll_pcs = wait_block_require_pc_array(item, "prefix_poll_pcs", path);
+    r.merge_index = wait_block_require_uint(item, "merge_index", path);
+    r.reorderable_until = wait_block_require_uint(item, "reorderable_until", path);
+    r.poll_head_pc = wait_block_require_uint(item, "poll_head_pc", path);
+    r.poll_probe_pc = wait_block_require_uint(item, "poll_probe_pc", path);
+    r.poll_loopback_pc = wait_block_require_uint(item, "poll_loopback_pc", path);
+    r.merge_pc = wait_block_require_uint(item, "merge_pc", path);
+    r.main_mask = wait_block_require_uint32(item, "main_mask", path);
+    r.polling_mask = wait_block_require_uint32(item, "polling_mask", path);
+    r.live_mask = wait_block_require_uint32(item, "live_mask", path);
+    r.main_count = wait_block_require_uint(item, "main_count", path);
+    r.polling_count = wait_block_require_uint(item, "polling_count", path);
+    r.reorderable_count = wait_block_require_uint(item, "reorderable_count", path);
+    r.barrier_addr = wait_block_require_uint(item, "barrier_addr", path);
+    r.wait_state_raw = wait_block_require_uint(item, "wait_state_raw", path);
+    r.merge_kind = wait_block_require_string(item, "merge_kind", path);
+    if (!r.main_mask || !r.polling_mask || (r.main_mask & r.polling_mask) ||
+        (r.main_mask | r.polling_mask) != r.live_mask ||
+        r.merge_index <= r.start_index || r.reorderable_until < r.start_index ||
+        r.poll_start_index < r.start_index || r.poll_start_index > r.reorderable_until ||
+        r.start_mask != (r.poll_start_index == r.start_index ? r.polling_mask : r.main_mask) ||
+        r.reorderable_until >= r.merge_index || !r.main_count || !r.polling_count ||
+        r.main_count > r.merge_index - r.start_index ||
+        r.polling_count != r.merge_index - r.start_index - r.main_count ||
+        !r.reorderable_count || r.reorderable_count > r.polling_count ||
+        r.poll_probe_pc != r.poll_head_pc + 32 ||
+        r.poll_loopback_pc != r.poll_head_pc + 48 ||
+        (r.merge_kind != "POLL" && r.merge_kind != "COLLECTIVE")) {
+      wait_block_sidecar_fatal(path, "invalid lane-group partition");
+    }
+    std::set<uint64_t> poll_heads{r.poll_head_pc};
+    if (r.start_index != r.poll_start_index) {
+      if (r.prefix_poll_pcs != std::vector<uint64_t>{
+              r.start_pc, r.start_pc + 16, r.start_pc + 32, r.start_pc + 48}) {
+        wait_block_sidecar_fatal(path, "invalid lane-group prefix poll");
+      }
+      poll_heads.insert(r.start_pc);
+    } else if (!r.prefix_poll_pcs.empty()) {
+      wait_block_sidecar_fatal(path, "unexpected lane-group prefix poll");
+    }
+    for (uint64_t poll_head : poll_heads) {
+      SpinWaitRegionRecord poll;
+      poll.loop_head_pc = poll_head;
+      poll.primary_wait_pc = poll_head + 32;
+      poll.loopback_bra_pc = poll_head + 48;
+      poll.exit_pc = poll_head + 64;
+      poll.body_pcs = {poll_head, poll_head + 16, poll_head + 32};
+      wait_block_validate_fold_static_proof(
+          static_trace_info, fid, poll, {poll_head, poll_head + 32}, 16, path);
+      auto head = wait_block_require_static_instruction(
+          static_trace_info, fid, poll_head, path);
+      if (head->get_is_predicated() ||
+          head->get_op_code() != "SYNCS.PHASECHK.TRANS64.TRYWAIT" ||
+          head->get_operand(0).get_operand_type() != TraceEnhancedOperandType::PRED) {
+        wait_block_sidecar_fatal(path, "lane-group poll head is not lane-private");
+      }
+      const long pred = head->get_operand(0).get_operand_reg_number();
+      for (uint64_t pc = poll_head; pc <= poll_head + 48; pc += 16) {
+        auto ins = wait_block_require_static_instruction(static_trace_info, fid, pc, path);
+        if (pc != poll_head &&
+            (!ins->get_is_predicated() || !ins->get_is_predicate_negate() ||
+             ins->get_is_uniform_predicate() ||
+             static_cast<long>(ins->get_predicate_register()) != pred)) {
+          wait_block_sidecar_fatal(path, "lane-group poll predicate mismatch");
+        }
+        for (size_t n = 0; n < ins->get_num_operands(); ++n) {
+          const auto text = ins->get_operand(n).get_operand_string();
+          if (std::regex_search(text, std::regex("\\bU(?:R|P)[0-9]+\\b"))) {
+            wait_block_sidecar_fatal(path, "lane-group poll uses a shared register");
+          }
+        }
+      }
+    }
+    if (r.merge_kind == "POLL") {
+      if (r.merge_pc != r.poll_head_pc && r.merge_pc != r.poll_probe_pc)
+        wait_block_sidecar_fatal(path, "lane-group poll boundary mismatch");
+    } else {
+      MissingWaitRecord join = base;
+      join.partial_hold_proof_version = 2;
+      join.join_pc = r.merge_pc - 16;
+      join.post_join_pc = r.merge_pc;
+      join.join_kind = "WARPSYNC";
+      wait_block_validate_partial_static_proof(
+          static_trace_info, fid, join, 0, "", 16, path);
+    }
+    auto trigger = wait_block_require_static_instruction(static_trace_info, fid, r.start_pc, path);
+    if (trigger->get_is_predicated() ||
+        trigger->get_op_code() != "SYNCS.PHASECHK.TRANS64.TRYWAIT") {
+      wait_block_sidecar_fatal(path, "invalid lane-group activation instruction");
+    }
+    const auto key = key_for(item, r.start_pc, r.start_index);
+    if (!spans.emplace(key, r).second)
+      wait_block_sidecar_fatal(path, "duplicate lane-group span");
+    auto inserted = db.lane_group_starts.emplace(key, r);
+    const auto &old = inserted.first->second;
+    if (old.merge_index != r.merge_index || old.main_mask != r.main_mask ||
+        old.polling_mask != r.polling_mask || old.reorderable_until != r.reorderable_until ||
+        old.barrier_addr != r.barrier_addr || old.wait_state_raw != r.wait_state_raw ||
+        old.main_count != r.main_count || old.polling_count != r.polling_count ||
+        old.reorderable_count != r.reorderable_count || old.merge_pc != r.merge_pc ||
+        old.merge_kind != r.merge_kind || old.poll_start_index != r.poll_start_index ||
+        old.start_mask != r.start_mask || old.start_barrier_addr != r.start_barrier_addr ||
+        old.prefix_poll_pcs != r.prefix_poll_pcs ||
+        old.start_wait_state_raw != r.start_wait_state_raw) {
+      wait_block_sidecar_fatal(path, "conflicting lane-group span");
+    }
+  }
+  std::set<WaitBlockGenerationTicketKey> used;
+  for (const auto &item : wait_block_require_array(block, "lane_group_occurrences", path).GetArray()) {
+    const auto index = wait_block_require_uint(item, "source_index", path);
+    const auto start = wait_block_require_uint(item, "start_index", path);
+    const auto key = key_for(item, base.entry_probe_pc, index);
+    auto span_key = key;
+    span_key.source_warp_instruction_index = start;
+    auto span = spans.end();
+    for (auto it = spans.begin(); it != spans.end(); ++it) {
+      span_key.action_pc = it->second.start_pc;
+      if (!(span_key < it->first) && !(it->first < span_key)) { span = it; break; }
+    }
+    PartialWaitOccurrence occurrence;
+    occurrence.active_mask = wait_block_require_uint32(item, "active_mask", path);
+    occurrence.predicate_mask = wait_block_require_uint32(item, "predicate_mask", path);
+    occurrence.barrier_addr = wait_block_require_uint(item, "barrier_addr", path);
+    occurrence.wait_state_raw = wait_block_require_uint(item, "wait_state_raw", path);
+    if (span == spans.end() || index <= start || index >= span->second.merge_index ||
+        occurrence.active_mask != span->second.main_mask ||
+        (occurrence.active_mask & occurrence.predicate_mask) != occurrence.active_mask ||
+        !db.lane_group_waits.emplace(key, occurrence).second) {
+      wait_block_sidecar_fatal(path, "invalid lane-group wait occurrence");
+    }
+    used.insert(span->first);
+  }
+  if (used.size() != spans.size() || spans.empty())
+    wait_block_sidecar_fatal(path, "unused or empty lane-group proof");
+}
+
+void load_partial_join_occurrences(
+    const rapidjson::Value &block, const MissingWaitRecord &base,
+    uint32_t kernel_id, uint32_t fid, uint64_t instruction_size,
+    traced_execution &static_trace_info, WaitBlockSidecarDB &db,
+    const std::filesystem::path &path) {
+  const auto &variants =
+      wait_block_require_array(block, "partial_join_variants", path);
+  const auto &occurrences =
+      wait_block_require_array(block, "partial_join_occurrences", path);
+  const uint64_t group_visits = base.partial_hold_proof_version == 4
+      ? wait_block_require_array(block, "lane_group_occurrences", path).Size() : 0;
+  if ((variants.Empty() && !group_visits) ||
+      occurrences.Size() + group_visits != base.partial_entry_visits) {
+    wait_block_sidecar_fatal(path, "partial occurrence coverage is incomplete");
+  }
+  std::vector<PartialWaitRegionRecord> regions;
+  for (const auto &variant : variants.GetArray()) {
+    MissingWaitRecord record = base;
+    record.partial_hold_proof_version =
+        wait_block_require_uint32(variant, "proof_version", path);
+    record.join_pc = wait_block_require_uint(variant, "join_pc", path);
+    record.post_join_pc = wait_block_require_uint(variant, "post_join_pc", path);
+    record.join_kind = wait_block_require_string(variant, "join_kind", path);
+    if (record.partial_hold_proof_version == 1) {
+      record.sibling_branch_pc =
+          wait_block_require_uint(variant, "sibling_branch_pc", path);
+    } else if (record.partial_hold_proof_version != 2 ||
+               !wait_block_require_member(variant, "sibling_branch_pc", path).IsNull()) {
+      wait_block_sidecar_fatal(path, "invalid partial occurrence proof version");
+    }
+    uint64_t bssy = 0;
+    std::string token;
+    if (record.join_kind == "BSYNC") {
+      bssy = wait_block_require_uint(variant, "bssy_pc", path);
+      token = wait_block_require_string(variant, "join_token", path);
+    } else if (!wait_block_require_member(variant, "bssy_pc", path).IsNull() ||
+               !wait_block_require_member(variant, "join_token", path).IsNull()) {
+      wait_block_sidecar_fatal(path, "WARPSYNC variant contains BSSY metadata");
+    }
+    wait_block_validate_partial_static_proof(
+        static_trace_info, fid, record, bssy, token, instruction_size, path);
+    PartialWaitRegionRecord region;
+    region.region_id = "pr_k" + std::to_string(kernel_id) + "_fid" +
+        std::to_string(fid) + "_v" + std::to_string(record.partial_hold_proof_version) +
+        "_b" + std::to_string(record.sibling_branch_pc) +
+        "_j" + std::to_string(record.join_pc);
+    region.trace_kernel_id = kernel_id;
+    region.unique_function_id = fid;
+    region.proof_version = record.partial_hold_proof_version;
+    region.sibling_branch_pc = record.sibling_branch_pc;
+    region.join_pc = record.join_pc;
+    region.post_join_pc = record.post_join_pc;
+    region.join_kind = record.join_kind;
+    region.bssy_pc = bssy;
+    region.join_token = token;
+    regions.push_back(region);
+    auto inserted = db.partial_regions_by_id.emplace(region.region_id, region);
+    const auto &old = inserted.first->second;
+    if (old.post_join_pc != region.post_join_pc ||
+        old.join_kind != region.join_kind ||
+        old.bssy_pc != region.bssy_pc || old.join_token != region.join_token) {
+      wait_block_sidecar_fatal(path, "conflicting occurrence join definition");
+    }
+  }
+
+  uint64_t pending = 0, already = 0;
+  std::set<uint32_t> used_variants;
+  for (const auto &item : occurrences.GetArray()) {
+    const uint32_t variant = wait_block_require_uint32(item, "variant", path);
+    if (variant >= regions.size()) {
+      wait_block_sidecar_fatal(path, "partial occurrence references unknown variant");
+    }
+    used_variants.insert(variant);
+    auto &region = db.partial_regions_by_id.at(regions[variant].region_id);
+    const auto &cta = wait_block_require_array(item, "cta", path);
+    if (cta.Size() != 3 || !cta[0].IsUint() || !cta[1].IsUint() || !cta[2].IsUint()) {
+      wait_block_sidecar_fatal(path, "invalid partial occurrence CTA");
+    }
+    WaitBlockGenerationTicketKey key;
+    key.trace_kernel_id = kernel_id;
+    key.unique_function_id = fid;
+    key.cta_x = cta[0].GetUint();
+    key.cta_y = cta[1].GetUint();
+    key.cta_z = cta[2].GetUint();
+    key.warp_id = wait_block_require_uint32(item, "warp_id", path);
+    key.action_pc = base.entry_probe_pc;
+    key.source_warp_instruction_index =
+        wait_block_require_uint(item, "source_index", path);
+    PartialWaitOccurrence occurrence;
+    occurrence.region_id = region.region_id;
+    occurrence.active_mask = wait_block_require_uint32(item, "active_mask", path);
+    occurrence.predicate_mask = wait_block_require_uint32(item, "predicate_mask", path);
+    occurrence.barrier_addr = wait_block_require_uint(item, "barrier_addr", path);
+    occurrence.wait_state_raw = wait_block_require_uint(item, "wait_state_raw", path);
+    const uint32_t blocked = occurrence.active_mask & occurrence.predicate_mask;
+    const uint32_t sibling = wait_block_require_uint32(item, "sibling_mask", path);
+    const uint32_t live = wait_block_require_uint32(item, "live_mask", path);
+    occurrence.sibling_mask = sibling;
+    occurrence.live_mask = live;
+    const uint64_t sibling_index =
+        wait_block_require_uint(item, "sibling_join_index", path);
+    const uint64_t blocked_index =
+        wait_block_require_uint(item, "blocked_join_index", path);
+    const uint64_t post_index = wait_block_require_uint(item, "post_join_index", path);
+    const uint64_t entry_index = key.source_warp_instruction_index;
+    if (!blocked || !sibling || (blocked & sibling) || (blocked | sibling) != live ||
+        blocked_index <= entry_index || sibling_index == entry_index ||
+        sibling_index == blocked_index ||
+        post_index <= std::max(sibling_index, blocked_index) ||
+        (region.proof_version == 2 && sibling_index >= entry_index) ||
+        base.observed_entry_masks.count(blocked) == 0 ||
+        base.observed_live_masks.count(live) == 0) {
+      wait_block_sidecar_fatal(path, "invalid partial occurrence masks or ordering");
+    }
+    pending += sibling_index > entry_index;
+    already += sibling_index < entry_index;
+    region.sibling_masks.insert(sibling);
+    region.live_masks.insert(live);
+    if (!db.partial_wait_occurrences.emplace(key, occurrence).second) {
+      wait_block_sidecar_fatal(path, "duplicate partial wait occurrence");
+    }
+    auto add_event = [&](auto &events, uint64_t pc, uint64_t index,
+                         uint32_t mask, bool sibling_join) {
+      auto event_key = key;
+      event_key.action_pc = pc;
+      event_key.source_warp_instruction_index = index;
+      auto inserted = events.emplace(
+          event_key, PartialJoinOccurrence{region.region_id, mask, sibling_join});
+      if (!inserted.second &&
+          (inserted.first->second.region_id != region.region_id ||
+           inserted.first->second.mask != mask ||
+           inserted.first->second.sibling_join != sibling_join)) {
+        wait_block_sidecar_fatal(path, "conflicting partial join occurrence");
+      }
+    };
+    add_event(db.partial_join_occurrences, region.join_pc, sibling_index, sibling, true);
+    add_event(db.partial_join_occurrences, region.join_pc, blocked_index, blocked, false);
+    add_event(db.partial_post_join_occurrences, region.post_join_pc, post_index, live, false);
+  }
+  if (used_variants.size() != regions.size() ||
+      pending != wait_block_require_uint(block, "partial_join_pending_visits", path) ||
+      already != wait_block_require_uint(block, "partial_join_already_issued_visits", path)) {
+    wait_block_sidecar_fatal(path, "partial occurrence census mismatch");
   }
 }
 
@@ -1822,125 +2183,148 @@ void load_wait_block_sidecar_v5(const std::filesystem::path &extra_info_dir,
             block, "observed_live_masks", path);
 
         if (record.partial_deferred_replay) {
-          if (record.partial_entry_visits == 0 ||
-              wait_block_require_uint(
-                  block, "partial_hold_proof_version", path) != 1 ||
-              !wait_block_require_bool(
-                  block, "complementary_masks_complete", path) ||
-              !wait_block_require_bool(block, "sibling_join_only", path) ||
-              !wait_block_require_bool(
-                  block, "blocked_path_reaches_same_join", path) ||
-              !wait_block_require_bool(block, "linear_capsule_safe", path)) {
-            wait_block_sidecar_fatal(
-                path, "partial deferred-replay proof is incomplete");
-          }
-          record.partial_region_id =
-              wait_block_require_string(block, "partial_region_id", path);
-          if (record.partial_region_id.empty()) {
-            wait_block_sidecar_fatal(path, "partial region id is empty");
-          }
-          record.sibling_branch_pc =
-              wait_block_require_uint(block, "sibling_branch_pc", path);
-          if (wait_block_require_uint(
-                  block, "sibling_branch_target_pc", path) !=
-              wait_block_require_uint(block, "join_pc", path)) {
-            wait_block_sidecar_fatal(
-                path, "partial sibling branch target disagrees with join");
-          }
-          record.join_pc =
-              wait_block_require_uint(block, "join_pc", path);
-          record.post_join_pc =
-              wait_block_require_uint(block, "post_join_pc", path);
-          record.join_kind =
-              wait_block_require_string(block, "join_kind", path);
-          record.observed_sibling_masks = wait_block_require_mask_key_set(
-              block, "observed_sibling_masks", path);
-          const uint64_t join_pending =
-              wait_block_require_uint(
-                  block, "partial_join_pending_visits", path);
-          const uint64_t join_already =
-              wait_block_require_uint(
-                  block, "partial_join_already_issued_visits", path);
-          if (join_pending + join_already != record.partial_entry_visits) {
-            wait_block_sidecar_fatal(
-                path, "partial join-state census disagrees with visits");
-          }
-
-          uint64_t bssy_pc = 0;
-          std::string join_token;
-          const rapidjson::Value &bssy =
-              wait_block_require_member(block, "join_bssy_pc", path);
-          const rapidjson::Value &token =
-              wait_block_require_member(block, "join_token", path);
-          if (record.join_kind == "BSYNC") {
-            if (!(bssy.IsUint64() || bssy.IsUint() ||
-                  (bssy.IsInt64() && bssy.GetInt64() >= 0) ||
-                  (bssy.IsInt() && bssy.GetInt() >= 0)) ||
-                !token.IsString() || token.GetStringLength() == 0) {
-              wait_block_sidecar_fatal(
-                  path, "BSYNC partial region lacks BSSY metadata");
+          record.partial_hold_proof_version = wait_block_require_uint32(
+              block, "partial_hold_proof_version", path);
+          if (record.partial_hold_proof_version == 3 ||
+              record.partial_hold_proof_version == 4) {
+            if (record.partial_hold_proof_version == 4) {
+              if (instruction_size != 16) {
+                wait_block_sidecar_fatal(
+                    path, "lane-group proof requires 16-byte SASS instructions");
+              }
+              load_lane_group_spans(block, record, trace_kernel_id,
+                                   unique_function_id, static_trace_info, db, path);
             }
-            bssy_pc = parse_tma_json_uint(bssy);
-            join_token = token.GetString();
-          } else if (!bssy.IsNull() || !token.IsNull()) {
-            wait_block_sidecar_fatal(
-                path, "WARPSYNC partial region has BSSY metadata");
-          }
-
-          wait_block_validate_partial_static_proof(
-              static_trace_info, unique_function_id, record, bssy_pc,
-              join_token, instruction_size, path);
-
-          PartialWaitRegionRecord region;
-          region.region_id = record.partial_region_id;
-          region.trace_kernel_id = trace_kernel_id;
-          region.unique_function_id = unique_function_id;
-          region.sibling_branch_pc = record.sibling_branch_pc;
-          region.join_pc = record.join_pc;
-          region.post_join_pc = record.post_join_pc;
-          region.join_kind = record.join_kind;
-          region.bssy_pc = bssy_pc;
-          region.join_token = join_token;
-          region.sibling_masks = record.observed_sibling_masks;
-          region.live_masks = record.observed_live_masks;
-          auto inserted =
-              db.partial_regions_by_id.emplace(region.region_id, region);
-          if (!inserted.second) {
-            const PartialWaitRegionRecord &existing = inserted.first->second;
-            if (existing.trace_kernel_id != region.trace_kernel_id ||
-                existing.unique_function_id != region.unique_function_id ||
-                existing.sibling_branch_pc != region.sibling_branch_pc ||
-                existing.join_pc != region.join_pc ||
-                existing.post_join_pc != region.post_join_pc ||
-                existing.join_kind != region.join_kind ||
-                existing.bssy_pc != region.bssy_pc ||
-                existing.join_token != region.join_token) {
+            load_partial_join_occurrences(
+                block, record, trace_kernel_id, unique_function_id,
+                instruction_size, static_trace_info, db, path);
+            loaded_partial_defer_records++;
+            loaded_partial_join_pending_visits +=
+                wait_block_require_uint(block, "partial_join_pending_visits", path);
+            loaded_partial_join_already_issued_visits +=
+                wait_block_require_uint(block, "partial_join_already_issued_visits", path);
+          } else {
+            if (record.partial_entry_visits == 0 ||
+                record.partial_hold_proof_version != 1 ||
+                !wait_block_require_bool(
+                    block, "complementary_masks_complete", path) ||
+                !wait_block_require_bool(block, "sibling_join_only", path) ||
+                !wait_block_require_bool(
+                    block, "blocked_path_reaches_same_join", path) ||
+                !wait_block_require_bool(block, "linear_capsule_safe", path)) {
               wait_block_sidecar_fatal(
-                  path, "partial region id has conflicting definitions");
+                  path, "partial deferred-replay proof is incomplete");
             }
-            inserted.first->second.sibling_masks.insert(
-                region.sibling_masks.begin(), region.sibling_masks.end());
-            inserted.first->second.live_masks.insert(
-                region.live_masks.begin(), region.live_masks.end());
+            record.partial_region_id =
+                wait_block_require_string(block, "partial_region_id", path);
+            if (record.partial_region_id.empty()) {
+              wait_block_sidecar_fatal(path, "partial region id is empty");
+            }
+            record.sibling_branch_pc =
+                wait_block_require_uint(block, "sibling_branch_pc", path);
+            if (wait_block_require_uint(
+                    block, "sibling_branch_target_pc", path) !=
+                wait_block_require_uint(block, "join_pc", path)) {
+              wait_block_sidecar_fatal(
+                  path, "partial sibling branch target disagrees with join");
+            }
+            record.join_pc =
+                wait_block_require_uint(block, "join_pc", path);
+            record.post_join_pc =
+                wait_block_require_uint(block, "post_join_pc", path);
+            record.join_kind =
+                wait_block_require_string(block, "join_kind", path);
+            record.observed_sibling_masks = wait_block_require_mask_key_set(
+                block, "observed_sibling_masks", path);
+            const uint64_t join_pending =
+                wait_block_require_uint(
+                    block, "partial_join_pending_visits", path);
+            const uint64_t join_already =
+                wait_block_require_uint(
+                    block, "partial_join_already_issued_visits", path);
+            if (join_pending + join_already != record.partial_entry_visits) {
+              wait_block_sidecar_fatal(
+                  path, "partial join-state census disagrees with visits");
+            }
+
+            uint64_t bssy_pc = 0;
+            std::string join_token;
+            const rapidjson::Value &bssy =
+                wait_block_require_member(block, "join_bssy_pc", path);
+            const rapidjson::Value &token =
+                wait_block_require_member(block, "join_token", path);
+            if (record.join_kind == "BSYNC") {
+              if (!(bssy.IsUint64() || bssy.IsUint() ||
+                    (bssy.IsInt64() && bssy.GetInt64() >= 0) ||
+                    (bssy.IsInt() && bssy.GetInt() >= 0)) ||
+                  !token.IsString() || token.GetStringLength() == 0) {
+                wait_block_sidecar_fatal(
+                    path, "BSYNC partial region lacks BSSY metadata");
+              }
+              bssy_pc = parse_tma_json_uint(bssy);
+              join_token = token.GetString();
+            } else if (!bssy.IsNull() || !token.IsNull()) {
+              wait_block_sidecar_fatal(
+                  path, "WARPSYNC partial region has BSSY metadata");
+            }
+
+            wait_block_validate_partial_static_proof(
+                static_trace_info, unique_function_id, record, bssy_pc,
+                join_token, instruction_size, path);
+
+            PartialWaitRegionRecord region;
+            region.region_id = record.partial_region_id;
+            region.trace_kernel_id = trace_kernel_id;
+            region.unique_function_id = unique_function_id;
+            region.proof_version = record.partial_hold_proof_version;
+            region.sibling_branch_pc = record.sibling_branch_pc;
+            region.join_pc = record.join_pc;
+            region.post_join_pc = record.post_join_pc;
+            region.join_kind = record.join_kind;
+            region.bssy_pc = bssy_pc;
+            region.join_token = join_token;
+            region.sibling_masks = record.observed_sibling_masks;
+            region.live_masks = record.observed_live_masks;
+            auto inserted =
+                db.partial_regions_by_id.emplace(region.region_id, region);
+            if (!inserted.second) {
+              const PartialWaitRegionRecord &existing = inserted.first->second;
+              if (existing.trace_kernel_id != region.trace_kernel_id ||
+                  existing.unique_function_id != region.unique_function_id ||
+                  existing.proof_version != region.proof_version ||
+                  existing.sibling_branch_pc != region.sibling_branch_pc ||
+                  existing.join_pc != region.join_pc ||
+                  existing.post_join_pc != region.post_join_pc ||
+                  existing.join_kind != region.join_kind ||
+                  existing.bssy_pc != region.bssy_pc ||
+                  existing.join_token != region.join_token) {
+                wait_block_sidecar_fatal(
+                    path, "partial region id has conflicting definitions");
+              }
+              inserted.first->second.sibling_masks.insert(
+                  region.sibling_masks.begin(), region.sibling_masks.end());
+              inserted.first->second.live_masks.insert(
+                  region.live_masks.begin(), region.live_masks.end());
+            }
+            const WaitBlockLookupKey join_key{
+                trace_kernel_id, unique_function_id, region.join_pc};
+            const WaitBlockLookupKey post_key{
+                trace_kernel_id, unique_function_id, region.post_join_pc};
+            auto join_inserted = db.partial_region_id_by_join.emplace(
+                join_key, region.region_id);
+            auto post_inserted = db.partial_region_id_by_post_join.emplace(
+                post_key, region.region_id);
+            if ((!join_inserted.second &&
+                 join_inserted.first->second != region.region_id) ||
+                (!post_inserted.second &&
+                 post_inserted.first->second != region.region_id)) {
+              wait_block_sidecar_fatal(
+                  path, "partial region lookup key is ambiguous");
+            }
+            loaded_partial_defer_records++;
+            loaded_partial_join_pending_visits += join_pending;
+            loaded_partial_join_already_issued_visits += join_already;
           }
-          const WaitBlockLookupKey join_key{
-              trace_kernel_id, unique_function_id, region.join_pc};
-          const WaitBlockLookupKey post_key{
-              trace_kernel_id, unique_function_id, region.post_join_pc};
-          auto join_inserted = db.partial_region_id_by_join.emplace(
-              join_key, region.region_id);
-          auto post_inserted = db.partial_region_id_by_post_join.emplace(
-              post_key, region.region_id);
-          if ((!join_inserted.second &&
-               join_inserted.first->second != region.region_id) ||
-              (!post_inserted.second &&
-               post_inserted.first->second != region.region_id)) {
-            wait_block_sidecar_fatal(
-                path, "partial region lookup key is ambiguous");
-          }
-          loaded_partial_defer_records++;
-          loaded_partial_join_pending_visits += join_pending;
-          loaded_partial_join_already_issued_visits += join_already;
         } else if (record.partial_entry_visits != 0) {
           wait_block_sidecar_fatal(
               path, "v5 partial visits require deferred-replay proof");
@@ -2136,6 +2520,41 @@ void load_wait_block_sidecar_v5(const std::filesystem::path &extra_info_dir,
     }
   }
 
+  for (const auto *events : {&db.partial_join_occurrences,
+                             &db.partial_post_join_occurrences}) {
+    for (const auto &event : *events) {
+      const WaitBlockLookupKey key{
+          event.first.trace_kernel_id, event.first.unique_function_id,
+          event.first.action_pc};
+      if (db.partial_region_id_by_join.count(key) ||
+          db.partial_region_id_by_post_join.count(key)) {
+        wait_block_sidecar_fatal(
+            path, "partial join PC mixes legacy and occurrence bindings");
+      }
+    }
+  }
+  using LaneOwner = std::tuple<uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t>;
+  std::map<LaneOwner, std::map<uint64_t, uint64_t>> group_intervals;
+  for (const auto &entry : db.lane_group_starts) {
+    const auto &key = entry.first;
+    const auto &span = entry.second;
+    auto &intervals = group_intervals[{key.trace_kernel_id, key.cta_x, key.cta_y,
+                                      key.cta_z, key.warp_id, key.unique_function_id}];
+    auto next = intervals.lower_bound(span.start_index);
+    if ((next != intervals.end() && next->first < span.merge_index) ||
+        (next != intervals.begin() && std::prev(next)->second > span.start_index) ||
+        !intervals.emplace(span.start_index, span.merge_index).second) {
+      wait_block_sidecar_fatal(path, "overlapping lane-group spans");
+    }
+    auto poll = db.captured_poll_by_wait.find(
+        {key.trace_kernel_id, key.unique_function_id, span.poll_head_pc});
+    auto start = db.captured_poll_by_wait.find(
+        {key.trace_kernel_id, key.unique_function_id, span.start_pc});
+    if (poll == db.captured_poll_by_wait.end() ||
+        start == db.captured_poll_by_wait.end()) {
+      wait_block_sidecar_fatal(path, "lane-group activation has no captured-poll owner");
+    }
+  }
   if (db.missing_wait_by_entry.size() != expected_inject ||
       db.captured_poll_by_probe.size() != expected_fold ||
       loaded_metadata != db.metadata_only ||
@@ -2149,7 +2568,8 @@ void load_wait_block_sidecar_v5(const std::filesystem::path &extra_info_dir,
       loaded_partial_join_already_issued_visits !=
           db.partial_join_already_issued_visits ||
       loaded_partial_join_pending_visits +
-              loaded_partial_join_already_issued_visits !=
+              loaded_partial_join_already_issued_visits +
+              db.lane_group_waits.size() !=
           loaded_partial_visits) {
     wait_block_sidecar_fatal(path,
                              "strategy or mask accounting disagrees with report");
@@ -2205,6 +2625,10 @@ void load_wait_block_sidecar_v5(const std::filesystem::path &extra_info_dir,
       capture_summary, "eligible_action_occurrences", path);
   const uint64_t unsupported_actions = wait_block_require_uint(
       capture_summary, "unsupported_action_occurrences", path);
+  if (capture_summary.HasMember("wait_outcome_conflicts") &&
+      wait_block_require_uint(capture_summary, "wait_outcome_conflicts", path) != 0) {
+    wait_block_sidecar_fatal(path, "independent wait outcomes conflict with runtime actions");
+  }
   if (wait_block_require_uint(
           capture_summary, "missing_snapshots", path) != 0 ||
       wait_block_require_uint(
@@ -2813,6 +3237,95 @@ bool gpgpu_sim::lookup_missing_wait(unsigned int trace_kernel_id,
   return true;
 }
 
+static WaitBlockGenerationTicketKey partial_occurrence_key(const warp_inst_t &inst) {
+  return {inst.trace_kernel_id, inst.trace_block_idx_x,
+          inst.trace_block_idx_y, inst.trace_block_idx_z,
+          inst.trace_cta_warp_id, inst.unique_function_id,
+          inst.pc, inst.trace_instruction_index};
+}
+
+void gpgpu_sim::resolve_partial_wait_occurrence(
+    const warp_inst_t &inst, MissingWaitRecord &record) const {
+  if ((record.partial_hold_proof_version != 3 && record.partial_hold_proof_version != 4) ||
+      (inst.trace_active_mask & inst.trace_predicate_mask) == 0) {
+    return;
+  }
+  const auto it = m_wait_block_sidecar_db.partial_wait_occurrences.find(
+      partial_occurrence_key(inst));
+  if (!inst.trace_masks_valid ||
+      it == m_wait_block_sidecar_db.partial_wait_occurrences.end() ||
+      it->second.active_mask != inst.trace_active_mask ||
+      it->second.predicate_mask != inst.trace_predicate_mask ||
+      it->second.barrier_addr != inst.sync_barrier_addr ||
+      it->second.wait_state_raw != inst.sync_semantic_raw) {
+    std::cerr << "[WAITBLOCK][abort] missing or mismatched partial occurrence"
+              << " kernel=" << inst.trace_kernel_id
+              << " pc=" << inst.pc << " index=" << inst.trace_instruction_index
+              << std::endl;
+    abort();
+  }
+  const auto &region = m_wait_block_sidecar_db.partial_regions_by_id.at(
+      it->second.region_id);
+  record.partial_region_id = region.region_id;
+  record.partial_hold_proof_version = region.proof_version;
+  record.sibling_branch_pc = region.sibling_branch_pc;
+  record.join_pc = region.join_pc;
+  record.post_join_pc = region.post_join_pc;
+  record.join_kind = region.join_kind;
+  record.observed_entry_masks = {
+      it->second.active_mask & it->second.predicate_mask};
+  record.observed_sibling_masks = {it->second.sibling_mask};
+  record.observed_live_masks = {it->second.live_mask};
+}
+
+bool gpgpu_sim::lookup_lane_group_start(
+    const warp_inst_t &inst, LaneGroupSpanRecord &span) const {
+  auto found = m_wait_block_sidecar_db.lane_group_starts.find(partial_occurrence_key(inst));
+  if (found == m_wait_block_sidecar_db.lane_group_starts.end()) return false;
+  span = found->second;
+  if (!inst.trace_masks_valid || inst.trace_active_mask != span.start_mask ||
+      (inst.trace_active_mask & inst.trace_predicate_mask) != span.start_mask ||
+      !inst.sync_runtime_valid || !inst.sync_has_semantic_raw ||
+      inst.sync_barrier_addr != span.start_barrier_addr ||
+      inst.sync_semantic_raw != span.start_wait_state_raw) {
+    std::cerr << "[WAITBLOCK][abort] lane-group start mismatch" << std::endl;
+    abort();
+  }
+  return true;
+}
+
+void gpgpu_sim::validate_lane_group_wait(const warp_inst_t &inst) const {
+  auto found = m_wait_block_sidecar_db.lane_group_waits.find(partial_occurrence_key(inst));
+  if (found == m_wait_block_sidecar_db.lane_group_waits.end() ||
+      found->second.active_mask != inst.trace_active_mask ||
+      found->second.predicate_mask != inst.trace_predicate_mask ||
+      found->second.barrier_addr != inst.sync_barrier_addr ||
+      found->second.wait_state_raw != inst.sync_semantic_raw) {
+    std::cerr << "[WAITBLOCK][abort] lane-group wait mismatch" << std::endl;
+    abort();
+  }
+}
+
+static bool lookup_partial_occurrence_event(
+    const std::map<WaitBlockGenerationTicketKey, PartialJoinOccurrence> &events,
+    const WaitBlockSidecarDB &db, const warp_inst_t *inst,
+    PartialWaitRegionRecord &region) {
+  if (!inst) return false;
+  const auto it = events.find(partial_occurrence_key(*inst));
+  if (it == events.end()) return false;
+  if (!inst->trace_masks_valid ||
+      inst->trace_active_mask != it->second.mask ||
+      (inst->trace_active_mask & inst->trace_predicate_mask) != it->second.mask) {
+    std::cerr << "[WAITBLOCK][abort] partial join occurrence mask mismatch"
+              << std::endl;
+    abort();
+  }
+  region = db.partial_regions_by_id.at(it->second.region_id);
+  region.sibling_masks.clear();
+  if (it->second.sibling_join) region.sibling_masks.insert(it->second.mask);
+  return true;
+}
+
 bool gpgpu_sim::lookup_wait_block_generation_ticket(
     const WaitBlockGenerationTicketKey &key,
     WaitBlockGenerationTicket &ticket) const {
@@ -2850,7 +3363,11 @@ bool gpgpu_sim::lookup_wait_block_generation_ticket(
 
 bool gpgpu_sim::lookup_partial_wait_join(
     unsigned int trace_kernel_id, unsigned int unique_function_id,
-    address_type pc, PartialWaitRegionRecord &region) const {
+    address_type pc, PartialWaitRegionRecord &region,
+    const warp_inst_t *inst) const {
+  if (lookup_partial_occurrence_event(
+          m_wait_block_sidecar_db.partial_join_occurrences,
+          m_wait_block_sidecar_db, inst, region)) return true;
   const WaitBlockLookupKey key{
       trace_kernel_id, unique_function_id, static_cast<uint64_t>(pc)};
   auto id_it = m_wait_block_sidecar_db.partial_region_id_by_join.find(key);
@@ -2868,7 +3385,11 @@ bool gpgpu_sim::lookup_partial_wait_join(
 
 bool gpgpu_sim::lookup_partial_wait_post_join(
     unsigned int trace_kernel_id, unsigned int unique_function_id,
-    address_type pc, PartialWaitRegionRecord &region) const {
+    address_type pc, PartialWaitRegionRecord &region,
+    const warp_inst_t *inst) const {
+  if (lookup_partial_occurrence_event(
+          m_wait_block_sidecar_db.partial_post_join_occurrences,
+          m_wait_block_sidecar_db, inst, region)) return true;
   const WaitBlockLookupKey key{
       trace_kernel_id, unique_function_id, static_cast<uint64_t>(pc)};
   auto id_it =

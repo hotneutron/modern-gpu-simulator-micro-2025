@@ -173,6 +173,17 @@ void get_opcode_map(const std::unordered_map<std::string, OpcodeChar> *&OpcodeMa
   }
 }
 
+op_type resolve_trace_execution_category(unsigned int binary_version,
+                                        const std::string &opcode,
+                                        op_type base_category) {
+  // This SM90 BF16 pack uses ALU capacity; other conversion forms keep their map.
+  if (binary_version == HOPPER_BINART_VERSION && base_category == SFU_OP &&
+      opcode == "F2FP.BF16.F32.PACK_AB") {
+    return INTP_OP;
+  }
+  return base_category;
+}
+
 bool is_reserved_reg(unsigned int reg_id, TraceEnhancedOperandType reg_type) {
   bool res = false;
   if(reg_type == TraceEnhancedOperandType::REG) {
@@ -571,7 +582,9 @@ void traced_instruction::set_tensor_core_instruction_info() {
   }
 }
 
-void traced_instruction::set_simulation_opcode(const std::unordered_map<std::string, OpcodeChar> *OpcodeMap, std::string str_op) {
+void traced_instruction::set_simulation_opcode(
+    const std::unordered_map<std::string, OpcodeChar> *OpcodeMap,
+    std::string str_op, unsigned int architecture_version) {
     std::vector<std::string> opcode_tokens = get_opcode_tokens(str_op);
     if(opcode_tokens.empty()) {
         return;
@@ -594,7 +607,9 @@ void traced_instruction::set_simulation_opcode(const std::unordered_map<std::str
     std::unordered_map<std::string, OpcodeChar>::const_iterator it =
     OpcodeMap->find(opcode1);
     if (it != OpcodeMap->end()) {
-        m_simulation_opcode = (op_type)(it->second.opcode_category);
+        m_simulation_opcode = resolve_trace_execution_category(
+            architecture_version, str_op,
+            (op_type)(it->second.opcode_category));
         return;
     }
 

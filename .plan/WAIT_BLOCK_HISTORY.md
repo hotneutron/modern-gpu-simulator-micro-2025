@@ -1677,3 +1677,188 @@ fail-closed policy.
 
 The concrete next step is the first-divergence and park-safety analysis
 described in [WAIT_BLOCK.md](WAIT_BLOCK.md), not a new trace schema.
+
+## 2026-09-10 Partial Replay Log Audit
+
+The downloaded causal runs exercise the existing join-only runtime; they are
+not server validation of the new noncausal lane-group extension.
+
+| Run | Partial holds/releases | Capsules | Deferred/replayed/folded |
+|---|---:|---:|---:|
+| s1024-hd64 K5 e97/o97 | 200/200 | 102 | 912/912/0 |
+| s2048-hd64-nh8 K5 e98/o98 | 112/112 | 57 | 509/509/0 |
+| s2048-hd128 K5 e99/o99 | 561/561 | 4 | 53/53/0 |
+
+All 873 holds release, all 1,474 deferred occurrences replay, and completed
+runs have zero residual partial state. The successful s1024/nh8 K10 runs have
+zero partial modeled misses, so they are not positive hold/replay coverage.
+The five completed runs satisfy loaded warp occurrences = retired + folded.
+Only the last cumulative summary per SM is counted.
+
+HD128 K10 e74 first aborts at cycle 24,320, SM66, on
+`contract-generation-not-empty`: expected/assigned=16,640, completed=256,
+outstanding=2, barrier 0x30c30, generation 1. No partial hold preceded it.
+Server e99/e74 loaded 12 FOLD records and 36,339 targets versus the then-local
+11 and 36,210. K5 CTA0 server/local raw warp counts were 116,547/112,421.
+These artifact differences prevent treating the logs as a matched local
+baseline regression. Older comparison logs were absent, so cross-run
+`gpu_sim_insn` equality and cycle accuracy were not established.
+
+Noncausal K4's 2,640 investigated visits split into 1,452 join-compatible
+visits and 1,188 requiring independent polling-group progress. Its runtime
+implementation and local acceptance are documented in
+[WAIT_BLOCK_SIMULATOR.md](WAIT_BLOCK_SIMULATOR.md#13-bounded-lane-group-replay)
+and [WAIT_BLOCK_POSTPROC.md](WAIT_BLOCK_POSTPROC.md#noncausal-interleaved-poll-proof).
+The one-off audit scripts, capture fixtures, and HTTP instrumentation were
+removed after local validation at the user's request; reusable tests remain.
+
+## 2026-09-10 Noncausal K4 Tensor Capacity Abort
+
+The first e101/o101 failure is not a lane-group transition: e101:73298 aborts
+in `functional_unit::cycle` on `start_stage < m_pipeline_depth`, before any
+lane-group start/hold event. The following signal 11 is secondary.
+e101:73234 reports `HGMMA m64n192k16`, BF16, `II=48 latency=48`, while
+o101:460 reports `tensor_latency_cfg=32`. The shape-based latency requires
+array index 47 in storage initially allocated for indices 0..31.
+
+`functional_unit::issue` now appends empty stages for shape-derived Tensor
+latencies larger than the initial allocation. It does not change MNK timing,
+initiation intervals, in-flight indices, registers, addresses, source
+occurrences, configuration values, or WaitBlock behavior. Other execution-unit
+configuration errors and the reservation-capacity limit remain fail-closed.
+
+CPU tests execute the production constructor, issue/cycle, dispatch delay, and
+tensor timing calculation under ASan/UBSan. Before the fix, depth 32 reproduces
+the same assert for m64n192k16; after it, retirement occurs at fixture tick 95
+with latency 48, identical to a preallocated reference. Existing m64n128k16
+retirement remains tick 63; an overlapping older instruction is unaffected.
+Dense/sparse, wider operand, extra-latency, and invalid-capacity cases are
+covered. The full tracer/test suite passes 146 tests.
+The fixture replaces RF writeback and scoreboard retirement with stubs; its
+completion-time comparison is FU-local, not full-pipeline acceptance. The
+existing power active-lane scan omits the final storage stage and needs separate
+accounting review when power simulation is enabled (disabled in e101).
+
+Full Linux/CUDA K4 execution still needs server verification. Rebuild the
+simulator and rerun with the same trace and configuration; neither retracing
+nor sidecar regeneration is needed for this storage-capacity fix. This does
+not establish whole-run `gpu_sim_insn` identity or hardware cycle accuracy.
+
+## 2026-09-11 Noncausal K4 Lane-Group Watchdog
+
+e105/o105 advances beyond the Tensor capacity failure. Its first abort is
+e105:1243274, `lane-group wait generation/watchdog`, warp 0 group 1, target 2,
+current 1, age 32001. The message lacks SM/cycle, but the earliest group-1 hold
+is SM83 at cycle 61796 (line 715351), yielding expiry at 93797. No earlier
+group-1 hold or release is present. The later FFMA decode error follows signal
+6 and is not the primary failure.
+
+The total hold age is not a replay-stall duration:
+
+- SM83 group 0 continues separate holds/releases from generation 6 through 10.
+  Its last recorded hold begins at 90368 (line 1193502), at most 3429 cycles
+  before the abort, not 32001.
+- Group 1 waits on count-only barrier `0x30c20`. Its first flip is 0->1 at 58799
+  after warp 15's ARRIVE at `0x7560` (lines 672935-672936). The later phase-1
+  wait correctly needs the next flip, generation 2, rather than a TMA ticket.
+- Warp 15 is still waiting for TMA barrier `0x30c58`, target 11/current 10 at
+  93678 (line 1241864). Other consumer warps continue stores and arrivals
+  through 93779. No completion of the second `0x30c20` ARRIVE was recorded.
+- Across 132 SMs, 132 lane-group starts and group-1 holds coexist with 1397
+  group-0 holds and 1270 releases. No group-1 release or merge occurred before
+  the first accumulated-age expiry.
+
+The production SM release fixture reproduced both false aborts: a sibling
+issued one cycle before the old hold-age limit, and a target became ready on
+the expiry cycle. `service_lane_group_waits` now retains only the existing
+replay inactivity timeout; the numeric threshold, pinned targets, phase checks,
+overshoot rejection, and total-hold accounting remain unchanged. Snapshot-ready
+targets release before the progress check; unresolved targets stay held.
+Heartbeats now distinguish `held_cycles` from `replay_idle_cycles`, and aborts
+include SM/cycle plus pending-group and TMA diagnostics.
+
+CPU regression tests retain no-progress and generation-overshoot rejection,
+including when a group is runnable but never issues, when heartbeats continue,
+and after one real progress event followed by inactivity. All 146 tests pass.
+The server and local
+capture differ (CTA0 warp instructions 183257 vs 183092); local trace evidence
+supports the producer path, not exact server occurrence identity. Full K4
+completion, instruction conservation, and cycle accuracy remain unverified.
+Rebuild the simulator and rerun the same trace/configuration; no retracing,
+sidecar regeneration, watchdog increase, or forced release is required.
+
+## 2026-09-14 Noncausal K4 Server Verification
+
+Status: CLOSED for the lane-group watchdog failure after user confirmation
+of the e107/o107 audit. Session-local debug notes, collector logs, and env
+files are removed; regression tests and original simulator logs are retained.
+The separate timing-fidelity and cross-run identity limitations below remain.
+
+The e107/o107 rerun completes normally and supplies final kernel statistics
+(`o107:4201-4215`, normal exit at `o107:8651-8652`). Performance results belong
+in `.result/FA3_multi.md`; the evidence below closes the runtime-completion
+and within-run accounting gates left open by the watchdog fix.
+
+All 132 SMs enter and merge one lane-group replay. Group 0 records 1510
+holds/releases; group 1 records 132 holds/releases. Every group-1 release
+has target=current=2 and occurs exactly one cycle after its own count-only
+barrier's generation-1-to-2 flip. Group-1 hold ages range from 31801 to 38376
+cycles; 131 of 132 exceed the unchanged 32000-cycle watchdog threshold.
+This demonstrates that elapsed hold time does not force release.
+
+SM83 provides a direct continuation of the earlier diagnostic:
+
+- `e107:733320`: group 1 starts holding at cycle 62795.
+- `e107:1276002`: at cycle 95563, held_cycles=32768 but
+  replay_idle_cycles=3766; target=2/current=1 remains held.
+- `e107:1317976-1317977`: warp 15 ARRIVE flips barrier `0x30c20`
+  from generation 1 to 2 at cycle 99250.
+- `e107:1317991-1317993`: both groups release and the canonical source
+  boundary 7740 merges at cycle 99251. Group 1's full hold age is 36456.
+
+The final per-SM summaries pass all of the following checks, individually
+and in aggregate. Each SM hosts one CTA in this run, so there are exactly
+132 TRACECHECK, CTAFIN, WaitBlock, and lane-group summary records.
+
+| Check | Aggregate |
+|---|---|
+| Lane-group extracted = issued + folded | 553812 = 95580 + 458232 |
+| Loaded warp occurrences = retired + folded polling | 24167901 = 23394795 + 773106 |
+| INJECT holds/releases | 3274 / 3274 |
+| FOLD holds/releases | 3001 / 3001 |
+| Auxiliary holds/releases | 1584 / 1584 |
+| Partial-join holds/releases | 460 / 460 |
+| Partial deferred = replayed + folded | 2030 = 2030 + 0 |
+| WaitBlock residual states, watchdog aborts, generation overshoots | All zero |
+| TMA bindings created/completed | 6072 / 6072 |
+| TMA assigned/completed credit bytes | 149225472 / 149225472 |
+
+All 132 TMA final audits pass (`e107:1364584` onward), with no outstanding
+binding/contract, wrong-barrier application, stale generation, duplicate
+completion, or orphan cleanup. The 32 UID reorders are not identity errors:
+all completion-identity checks pass. STALLALIGN also passes with zero
+population, issue-winner, or snapshot discrepancies.
+
+Remaining limitations are distinct from the fixed abort:
+
+- The 132 CTA TRACECHECK records and printed configuration values match
+  e105, including the 32000/4096 watchdog/heartbeat settings. These counts
+  are not byte hashes; builds still identify themselves as `*_modified_0.0`.
+  Pre-timeout event cycles differ between runs, so this is not a
+  patch-isolated timing A/B experiment.
+- No previous completed K4 control exists locally. The within-run warp
+  occurrence identities do not establish cross-run `gpu_sim_insn` identity
+  or verify every instruction payload from aggregate counters.
+- There are 12029 exact-target late-arrival diagnostics across all 132 SMs.
+  The first occurs at cycle 35331, before lane-group replay starts:
+  `e107:291260` has target=2/current=3, with the target completed 11782
+  cycles before the consumer reaches its wait. This diagnostic also exists
+  before the abort in e105 (`e105:319498`). It remains a producer/consumer
+  timing-fidelity concern, not a generation-overshoot abort or proof of
+  transaction misrouting.
+- `Throughput_ComputeTensor_pct=128.4808` is not a bounded NCU-equivalent
+  utilization. The current counter sums busy cycles from individual Tensor
+  FUs while its denominator is SM count times kernel cycles; the metric
+  needs separate normalization review before hardware comparison.
+
+This audit changes no simulator code, trace, sidecar, or configuration.

@@ -139,6 +139,10 @@ bool functional_unit::can_issue(const warp_inst_t *inst) const {
   return m_dispatch_pending_reserved_cycles == 0 && m_dispatch_reg->empty();
 }
 
+bool functional_unit::can_issue_at_next_control(const warp_inst_t *inst) const {
+  return can_issue(inst);
+}
+
 unsigned int functional_unit::get_rf_read_width_per_operand() const {
   return m_rf_read_width_per_operand;
 }
@@ -150,6 +154,24 @@ unsigned int functional_unit::get_rf_num_read_cycles() const {
 void functional_unit::issue(register_set_uniptr &source_reg) {
   warp_inst_t *ready_reg = source_reg.get_ready();
   if (ready_reg) {
+    // Tensor latency is derived from the decoded shape, not tensor_latency's
+    // initial storage size. Append empty stages without moving in-flight work
+    // or changing the instruction's latency/initiation interval.
+    if (ready_reg->is_tensor_core_op() && is_fixed_latency_unit() &&
+        ready_reg->latency > m_pipeline_depth) {
+      if (ready_reg->latency >= MAX_ALU_LATENCY) {
+        std::fprintf(stderr,
+                     "[FU][abort] tensor latency exceeds reservation capacity "
+                     "unit=%s latency=%u capacity=%u\n",
+                     m_name.c_str(), ready_reg->latency, MAX_ALU_LATENCY);
+        abort();
+      }
+      m_pipeline_reg.resize(ready_reg->latency);
+      for (unsigned stage = m_pipeline_depth; stage < ready_reg->latency; ++stage) {
+        m_pipeline_reg[stage] = std::make_unique<warp_inst_t>(m_config);
+      }
+      m_pipeline_depth = ready_reg->latency;
+    }
     ready_reg->op_pipe = m_type_of_pipeline;
     switch (m_type_of_pipeline) {
       case SP__OP:
@@ -537,6 +559,26 @@ functional_unit_sfu::functional_unit_sfu(
 
 bool functional_unit_sfu::can_issue(const warp_inst_t *inst) const {
   return m_dispatch_reg->empty();
+}
+
+bool functional_unit_sfu::can_issue_at_next_control(const warp_inst_t *inst) const {
+  if (can_issue(inst)) return true;
+  if (m_dispatch_reg->get_num_cycles() > 1) return false;
+
+  const unsigned int latency = m_dispatch_reg->latency;
+  if (latency == 0 || latency > m_pipeline_depth) return false;
+  const unsigned int target_stage = latency - 1;
+
+  // Assume no output/predicate drain. An existing vacancy propagates upward
+  // during cycle()'s ascending shift, but a higher-stage instruction refills
+  // the target if present. No output-port or RF prediction is needed.
+  bool vacancy_at_or_below_target = false;
+  for (unsigned int stage = 0; stage <= target_stage; ++stage) {
+    vacancy_at_or_below_target |= m_pipeline_reg[stage]->empty();
+  }
+  return vacancy_at_or_below_target &&
+         (target_stage + 1 == m_pipeline_depth ||
+          m_pipeline_reg[target_stage + 1]->empty());
 }
 
 

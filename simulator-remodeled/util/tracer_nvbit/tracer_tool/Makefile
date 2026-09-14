@@ -73,6 +73,8 @@ TRACE_PRINTER = trace_printer
 
 all: traces_enhanced $(NVBIT_TOOL) trace_printer
 
+$(OBJECTS): $(NVBIT_PATH)/nvbit.h
+
 $(NVBIT_TOOL): $(OBJECTS) $(NVBIT_PATH)/libnvbit.a traces_enhanced
 	$(NVCC) -arch=$(ARCH) $(OPTFLAGS) $(OBJECTS) $(TRACES_ENHANCED_OBJ) $(TRACES_ENHANCED_PROTOCOL_BUFFER_OBJ) $(LIBS) $(NVCC_PATH) -lcuda -lcudart_static -lprotobuf -shared -o $@
 

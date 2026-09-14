@@ -372,6 +372,7 @@ struct MissingWaitRecord {
   SyncInstructionKind entry_probe_kind = SyncInstructionKind::NONE;
   bool partial_modeled_miss_aborts = false;
   bool partial_deferred_replay = false;
+  uint32_t partial_hold_proof_version = 0;
   std::vector<uint64_t> entry_arming_pcs;
   uint64_t miss_arm_entry_pc = 0;
   std::vector<uint64_t> miss_arm_wait_pcs;
@@ -398,6 +399,7 @@ struct PartialWaitRegionRecord {
   std::string region_id;
   uint32_t trace_kernel_id = 0;
   uint32_t unique_function_id = 0;
+  uint32_t proof_version = 0;
   uint64_t sibling_branch_pc = 0;
   uint64_t join_pc = 0;
   uint64_t post_join_pc = 0;
@@ -408,6 +410,37 @@ struct PartialWaitRegionRecord {
   std::set<uint64_t> live_masks;
 };
 
+// These keys identify trace occurrences only; join selection is independent
+// of the mbarrier generation-ticket stream.
+struct PartialWaitOccurrence {
+  std::string region_id;
+  uint32_t active_mask = 0;
+  uint32_t predicate_mask = 0;
+  uint32_t sibling_mask = 0;
+  uint32_t live_mask = 0;
+  uint64_t barrier_addr = 0;
+  uint64_t wait_state_raw = 0;
+};
+
+struct PartialJoinOccurrence {
+  std::string region_id;
+  uint32_t mask = 0;
+  bool sibling_join = false;
+};
+
+struct LaneGroupSpanRecord {
+  uint64_t start_index = 0, merge_index = 0, reorderable_until = 0;
+  uint64_t poll_start_index = 0, start_pc = 0;
+  uint64_t start_barrier_addr = 0, start_wait_state_raw = 0;
+  uint32_t start_mask = 0;
+  std::vector<uint64_t> prefix_poll_pcs;
+  uint64_t poll_head_pc = 0, poll_probe_pc = 0, poll_loopback_pc = 0;
+  uint64_t merge_pc = 0, barrier_addr = 0, wait_state_raw = 0;
+  uint32_t main_mask = 0, polling_mask = 0, live_mask = 0;
+  uint64_t main_count = 0, polling_count = 0, reorderable_count = 0;
+  std::string merge_kind;
+};
+
 struct WaitBlockSidecarDB {
   std::map<WaitBlockLookupKey, MissingWaitRecord> missing_wait_by_entry;
   std::map<WaitBlockLookupKey, SpinWaitRegionRecord> captured_poll_by_probe;
@@ -415,6 +448,14 @@ struct WaitBlockSidecarDB {
   std::map<std::string, PartialWaitRegionRecord> partial_regions_by_id;
   std::map<WaitBlockLookupKey, std::string> partial_region_id_by_join;
   std::map<WaitBlockLookupKey, std::string> partial_region_id_by_post_join;
+  std::map<WaitBlockGenerationTicketKey, PartialWaitOccurrence>
+      partial_wait_occurrences;
+  std::map<WaitBlockGenerationTicketKey, PartialJoinOccurrence>
+      partial_join_occurrences;
+  std::map<WaitBlockGenerationTicketKey, PartialJoinOccurrence>
+      partial_post_join_occurrences;
+  std::map<WaitBlockGenerationTicketKey, LaneGroupSpanRecord> lane_group_starts;
+  std::map<WaitBlockGenerationTicketKey, PartialWaitOccurrence> lane_group_waits;
   std::map<WaitBlockGenerationTicketStreamKey,
            std::vector<WaitBlockGenerationTicket>>
       exact_generation_ticket_streams;
@@ -443,6 +484,11 @@ struct WaitBlockSidecarDB {
     partial_regions_by_id.clear();
     partial_region_id_by_join.clear();
     partial_region_id_by_post_join.clear();
+    partial_wait_occurrences.clear();
+    partial_join_occurrences.clear();
+    partial_post_join_occurrences.clear();
+    lane_group_starts.clear();
+    lane_group_waits.clear();
     exact_generation_ticket_streams.clear();
     discovered = 0;
     passed = 0;

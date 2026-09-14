@@ -73,6 +73,10 @@ void advance_operand_idx(unsigned int &operand_idx, traced_instruction &static_i
 
 void get_opcode_map(const std::unordered_map<std::string, OpcodeChar> *&OpcodeMap, int binary_verion);
 
+op_type resolve_trace_execution_category(unsigned int binary_version,
+                                        const std::string &opcode,
+                                        op_type base_category);
+
 s2r_operand_type get_s2r_operand_type(std::string operand_string);
 
 unsigned int get_number_of_uses_per_operand(traced_instruction &trace_inst, unsigned int reg_id,  unsigned int operand_pos, TraceEnhancedOperandType reg_type);
@@ -172,7 +176,9 @@ class traced_instruction : public JSONBase{
 
         void set_tensor_core_instruction_info();
 
-        void set_simulation_opcode(const std::unordered_map<std::string, OpcodeChar> *OpcodeMap, std::string str_op);
+        void set_simulation_opcode(
+            const std::unordered_map<std::string, OpcodeChar> *OpcodeMap,
+            std::string str_op, unsigned int architecture_version);
         op_type get_simulation_opcode();
         bool is_dp_op();
         bool is_load_op();

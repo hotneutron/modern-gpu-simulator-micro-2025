@@ -321,3 +321,11 @@ OnlyKernel5:
 OnlyKernel10:
     extra_params: "-filter_first_kernel_id 10
     \n-filter_last_kernel_id 10"
+
+OnlyKernel4:
+    extra_params: "-filter_first_kernel_id 4
+    \n-filter_last_kernel_id 4"
+
+OnlyKernel9:
+    extra_params: "-filter_first_kernel_id 9
+    \n-filter_last_kernel_id 9"

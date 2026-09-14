@@ -7,6 +7,8 @@ This document tracks the current optimization status for FA3 using the existing 
 - `.plan/BAR_OP_H100.md`
 - `.plan/MEMBAR_SCOPE_AWARE_H100.md`
 - `.plan/L1I_prefetch_redesign.md`
+- `.plan/FA3_FORWARD_CAUSAL_ANALYSIS.md` (consolidated opcode investigation, implementation, and experiment evidence)
+- `.result/FA3_multi.md` (multi-shape results and newer NCU references)
 
 To keep this file easy to extend, use the following update pattern whenever a new optimization is added:
 
@@ -39,42 +41,51 @@ To keep this file easy to extend, use the following update pattern whenever a ne
 | Opt 10 | intra-SMSP warp-switch (SFU issue-gating) | `-intra_smsp_warpswitch_enable 1` (code + config). At issue time, also check `fu->can_issue()` for no-queue FUs (SFU), so a busy-SFU MUFU (deterministic II=8) is filtered BEFORE the 1-deep `ISSUE_CONTROL` latch and GTO warp-switches to a ready warp instead of stalling the whole subcore. Queue FUs (MEM/TMA/MISC) keep the deferred path. II/latency unchanged; timing-only (work invariant). | 105,464 cycles (**55.8% error**, **-44.7% vs Opt 9**). fwd `.o58`. `gpu_sim_insn` **bit-identical** to baseline (455,565,060); `issue_stage_issuing` bit-identical (16,064,281). Head-of-line `next_stage` 25.1%→**0.06%**, `blocked_by_sfu` 11.48M→**0**. | 178,856 cycles (**34.6% error**, **-44.6% vs Opt 9**). bwd `.o33`. `gpu_sim_insn` bit-identical (629,211,348). `next_stage` 21.3%→**1.6%**, `blocked_by_sfu` 15.36M→**0**. Warp-switch recovered slot (`other_warp_issued/sfu_filtered`) fwd 31.7% / bwd 26.3%. | Done. The compute-path issue-pipeline defect (SFU head-of-line) fixed; residual (fwd 1.56x) is **SFU-throughput bound** (`still_idle` ≡ `fu_occupied_sfu`, warps queue on the one HW-faithful SFU), not an occupancy floor — next candidate axis is warp-stagger/overlap. See [CONSUMER_COMPUTE_BOUND.md](file:///home/jihyun/modern-gpu-simulator-micro-2025/.plan/CONSUMER_COMPUTE_BOUND.md). |
 | Opt 11-A | Lightweight NVBit full trace (Option 1B) | One untrimmed full capture with compact 104B/360B wire records and semantic callback pruning (`LIGHTER_TRACER="compact_wire,prune_operands"`, `TRIM_SPIN=0`). Transport falls from the original 136.55GB equivalent to 7.41GB (**-94.6%, 18.4x smaller**) and callback records fall 191.79M→64.78M (**-66.2%**), while all replay-visible memory/sync/BAR/TMA payload is retained. | **83,308 cycles (23.1% error, -62.1% vs first measured fwd baseline, -21.0% vs Opt 10)**. fwd `.o68`. `gpgpu_n_tot_w_icount=14,847,194`, `gpu_sim_insn=450,627,804`; both exactly equal the loaded Option 1B trace contract. | **136,898 cycles (3.0% error, -63.7% vs Init, -23.5% vs Opt 10)**. bwd `.o42`. `gpgpu_n_tot_w_icount=21,007,397`, `gpu_sim_insn=624,799,542`; both exactly equal the trace contract. | **Payload/functional gate PASS; timing-fidelity gate FAIL.** Clean exit, TMA unresolved=0, BAR leaks=0, and all HGMMA/MUFU/TMA/memory/sync/BAR totals match. However Producer ends 37.9K/12.0K cycles before Consumer (K5/K10), while K5 HW has a +8.0K Producer tail. K10's 3.0% aggregate error is therefore not proof of correct role timing. |
 | Opt 12 | Producer-consumer mbarrier WaitBlock/spin-fold modeling | Give every synchronization wait its exact logical mbarrier generation so the simulator holds each consumer against the specific producer completion it observed on hardware, instead of a one-bit phase that aliases after two flips. It couples four things that ship together: corrected tracer/sidecar metadata (TMA callback role, kernel-aware descriptor identity, restored K5 transfer size); binding each asynchronous TMA transfer to the exact barrier generation it completes, so completion order no longer matters; folding captured poll-loops and replaying partial-lane waits without parking the whole warp; and enforcing `current_generation >= target_generation` at every classified wait. | **85,172 cycles (25.82% error, +2.24% vs Opt 11-A)**. K5 completes 132/132 CTAs without forced release; all WaitBlock/TMABIND/BAR summaries pass. 9,542 late-arrival divergences remain. fwd `.o90/.e90`. | **137,348 cycles (3.35% error, +0.33% vs Opt 11-A)**. K10 completes 384/384 CTAs; all summaries pass, with zero late-arrival divergences. bwd `.o66/.e66`. | **Dependency-correctness PASS; cycle-accuracy PARTIAL.** The K5 all-live WaitBlock deadlock from phase aliasing is resolved. K5 timing remains open at the first exact wait reached after its target generation; K10 aggregate timing remains close to HW. |
+| Opt 13 | SM90 BF16 F2FP pipeline correction | Route only `F2FP.BF16.F32.PACK_AB` from `SFU_OP` to `INTP_OP` through one shared static/dynamic decoder rule. Reuse `m_int_pipeline` and existing INT latency/II `2,2`; preserve raw opcode/operand classification. No other opcode, SFU handshake, or WGMMA change. Source commit `d726a9f`. | **71,800 cycles (+6.06% signed error, -15.70% vs Opt 12)**. K5 completes 132/132 CTAs; SFU-blocked warp-cycles fall 64.80%. fwd `.o102/.e102`. | **128,702 cycles (-3.16% signed error, -6.29% vs Opt 12)**. K10 completes 384/384 CTAs; SFU-blocked warp-cycles fall 90.43%. bwd `.o77/.e77`. | **Done (F2FP scope, accepted 2026-09-11).** Normal exit and WaitBlock/TMABIND/STALLALIGN audits PASS. Historical trace inputs and `gpu_sim_insn` differ; strict same-input A/B attribution is not established. Other opcodes are separate TODO-3. |
+
+Opt 13 is the completed, current tracked optimization. Errors in this progress
+table retain the historical Target HW values (K5 67,696 / K10 132,901).
+The newer NCU campaign in `FA3_multi.md` uses 67,838 / 130,641, giving
+Opt 13 errors of +5.84% / -1.48%; do not mix these denominators.
+Opt-to-opt cycle changes are observed run comparisons, not automatically
+patch-isolated effects. The Opt 13 result note preserves its input differences.
 
 ### Simulator Cycle Breakdown
 
 > **Opt 11-B is deferred and intentionally excluded from the progression
 > tables.** Its affected-run measurements and defer rationale remain in the
-> historical Opt 11-B section below. **Opt 12 is the current dependency-correct
-> exact-generation result.**
+> historical Opt 11-B section below. Opt 12 is retained as the historical
+> exact-generation control; **Opt 13 is the latest completed F2FP result**.
+> Each column describes its own run, with the Opt 13 comparison caveat in [5].
 
 #### FA3 fwd - top-level simulator breakdown
 
-| Class | Init | Opt 1 (`rop=100`) | Opt 2 (BAR impl) | Opt 3 (MEMBAR) | Opt 4 (prefetch, sb=4) | Opt 5 (eager-promote) | Opt 6 (TMA real base) | Opt 7 (queue calib) | Opt 8 (slice parallelism) | Opt 9 (drain widening) | Opt 10 (warp-switch) | Opt 11-A (light full trace) | Opt 12 (mbarrier WaitBlock/fold) | Note |
-|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| `sim_cycle` | — | 220,024 | 162,582 | 158,990 | 155,765 | 149,727 | 145,855 | 138,021 | 137,053 | 135,999 | 105,464 | **83,308** | **85,172** | Opt 12 = `.o90`; current exact-generation result. |
-| `no_warps_ready` | — | 64.02% | 23.83% | 20.98% | 26.81% | 27.32% | 27.93% | 29.51% | 29.14% | 29.22% | 51.22% | 51.20% | **55.21%** | Opt 12 includes explicit WaitBlock-held warps. |
-| `issuing` | — | 14.56% | 21.17% | 24.05% | 31.18% | 31.19% | 32.30% | 34.75% | 34.77% | 34.96% | 38.00% | 37.63% | **36.18%** | |
-| `next_stage_not_available` | — | 11.40% | 15.25% | 17.26% | 22.45% | 22.46% | 23.23% | 24.90% | 24.96% | 25.07% | 0.06% | 0.06% | **0.05%** | Head-of-line stays folded. |
-| `no_valid_instruction` | — | 9.52% | 39.12% | 37.01% | 18.63% | 18.11% | 15.59% | 9.81% | 10.10% | 9.72% | 9.60% | 9.91% | **7.37%** | |
-| `issue_port_busy` | — | 0.50% | 0.63% | 0.71% | 0.92% | 0.92% | 0.95% | 1.02% | 1.02% | 1.03% | 1.12% | 1.20% | **1.18%** | |
-| `sum` | — | 100.00% | 100.00% | 100.00% | 100.00% | 100.00% | 100.00% | 100.00% | 100.00% | 100.00% | 100.00% | 100.00% | **100.00%** | Rounding. |
+| Class | Init | Opt 1 (`rop=100`) | Opt 2 (BAR impl) | Opt 3 (MEMBAR) | Opt 4 (prefetch, sb=4) | Opt 5 (eager-promote) | Opt 6 (TMA real base) | Opt 7 (queue calib) | Opt 8 (slice parallelism) | Opt 9 (drain widening) | Opt 10 (warp-switch) | Opt 11-A (light full trace) | Opt 12 (mbarrier WaitBlock/fold) | Opt 13 (F2FP to INT) | Note |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| `sim_cycle` | — | 220,024 | 162,582 | 158,990 | 155,765 | 149,727 | 145,855 | 138,021 | 137,053 | 135,999 | 105,464 | **83,308** | **85,172** | **71,800** | Opt 12 = `.o90`; Opt 13 = `.o102`. See [5]. |
+| `no_warps_ready` | — | 64.02% | 23.83% | 20.98% | 26.81% | 27.32% | 27.93% | 29.51% | 29.14% | 29.22% | 51.22% | 51.20% | **55.21%** | **45.62%** | Opt 12/13 include explicit WaitBlock-held warps. |
+| `issuing` | — | 14.56% | 21.17% | 24.05% | 31.18% | 31.19% | 32.30% | 34.75% | 34.77% | 34.96% | 38.00% | 37.63% | **36.18%** | **42.23%** | |
+| `next_stage_not_available` | — | 11.40% | 15.25% | 17.26% | 22.45% | 22.46% | 23.23% | 24.90% | 24.96% | 25.07% | 0.06% | 0.06% | **0.05%** | **0.07%** | SFU head-of-line counter remains zero. |
+| `no_valid_instruction` | — | 9.52% | 39.12% | 37.01% | 18.63% | 18.11% | 15.59% | 9.81% | 10.10% | 9.72% | 9.60% | 9.91% | **7.37%** | **10.70%** | |
+| `issue_port_busy` | — | 0.50% | 0.63% | 0.71% | 0.92% | 0.92% | 0.95% | 1.02% | 1.02% | 1.03% | 1.12% | 1.20% | **1.18%** | **1.38%** | |
+| `sum` | — | 100.00% | 100.00% | 100.00% | 100.00% | 100.00% | 100.00% | 100.00% | 100.00% | 100.00% | 100.00% | 100.00% | **100.00%** | **100.00%** | Rounding. |
 
 #### FA3 fwd - inner stall / wait breakdown
 
-| Wait reason | Init | Opt 1 (`rop=100`) | Opt 2 (BAR impl) | Opt 3 (MEMBAR) | Opt 4 (prefetch, sb=4) | Opt 5 (eager-promote) | Opt 6 (TMA real base) | Opt 7 (queue calib) | Opt 8 (slice parallelism) | Opt 9 (drain widening) | Opt 10 (warp-switch) | Opt 11-A (light full trace) | Opt 12 (mbarrier WaitBlock/fold) | Note |
-|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| `inst_barrier` | — | 56.09% | 9.09% | 0.05% | 0.07% | 0.07% | 0.07% | 0.08% | 0.08% | 0.08% | 0.13% | 0.14% | **0.12%** | Negligible. |
-| `wait_barrier` | — | 6.64% | 8.07% | 9.01% | 11.98% | 12.58% | 12.66% | 13.18% | 12.69% | 12.74% | 12.93% | 6.29% | **3.84%** | Generic wait-barrier bucket. |
-| `mbarrier_spin` | — | — | — | — | — | — | — | — | — | — | — | — | **25.09%** | Opt 12 separately accounts WaitBlock/mbarrier-spin holds. |
-| `tma_axis` | — | 62.73% | 17.16% | 9.06% | 12.05% | 12.65% | 12.73% | 13.25% | 12.77% | 12.82% | 13.06% | 6.43% | **29.05%** | Opt 12 includes `mbarrier_spin`; see note [1]. |
-| `non_tma_axis` | — | 17.80% | 17.34% | 19.07% | 24.10% | 24.07% | 24.90% | 26.59% | 26.93% | 26.84% | 63.58% | 67.64% | **66.28%** | Overlap counter, sums can exceed `no_warps_ready`. |
-| `fu_occupied` | — | 11.83% | 9.91% | 10.91% | 13.53% | 13.50% | 13.99% | 14.98% | 15.13% | 15.10% | 42.89% | 47.20% | **46.46%** | |
-| `stall_count` | — | 5.00% | 5.97% | 6.56% | 8.47% | 8.48% | 8.75% | 9.31% | 9.45% | 9.42% | 15.59% | 14.75% | **14.11%** | |
-| `tma_flush` | — | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | **0.00%** | fwd is load-only. |
-| `yield` | — | 0.92% | 1.21% | 1.30% | 1.69% | 1.69% | 1.74% | 1.83% | 1.89% | 1.85% | 4.70% | 5.30% | **5.35%** | |
-| `result_queue_full` | — | 0.05% | 0.25% | 0.29% | 0.40% | 0.40% | 0.41% | 0.45% | 0.45% | 0.46% | 0.40% | 0.39% | **0.35%** | |
-| `l1c` | — | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | 0.03% | 0.02% | 0.00% | 0.00% | 0.00% | **0.00%** | |
-| `scoreboard (memory)` | — | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | **0.00%** | |
+| Wait reason | Init | Opt 1 (`rop=100`) | Opt 2 (BAR impl) | Opt 3 (MEMBAR) | Opt 4 (prefetch, sb=4) | Opt 5 (eager-promote) | Opt 6 (TMA real base) | Opt 7 (queue calib) | Opt 8 (slice parallelism) | Opt 9 (drain widening) | Opt 10 (warp-switch) | Opt 11-A (light full trace) | Opt 12 (mbarrier WaitBlock/fold) | Opt 13 (F2FP to INT) | Note |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| `inst_barrier` | — | 56.09% | 9.09% | 0.05% | 0.07% | 0.07% | 0.07% | 0.08% | 0.08% | 0.08% | 0.13% | 0.14% | **0.12%** | **0.14%** | Negligible. |
+| `wait_barrier` | — | 6.64% | 8.07% | 9.01% | 11.98% | 12.58% | 12.66% | 13.18% | 12.69% | 12.74% | 12.93% | 6.29% | **3.84%** | **3.85%** | Generic wait-barrier bucket. |
+| `mbarrier_spin` | — | — | — | — | — | — | — | — | — | — | — | — | **25.09%** | **20.06%** | Opt 12/13 separately account WaitBlock/mbarrier-spin holds. |
+| `tma_axis` | — | 62.73% | 17.16% | 9.06% | 12.05% | 12.65% | 12.73% | 13.25% | 12.77% | 12.82% | 13.06% | 6.43% | **29.05%** | **24.06%** | Opt 12/13 include `mbarrier_spin`; see notes [1] and [5]. |
+| `non_tma_axis` | — | 17.80% | 17.34% | 19.07% | 24.10% | 24.07% | 24.90% | 26.59% | 26.93% | 26.84% | 63.58% | 67.64% | **66.28%** | **56.31%** | Overlap counter, sums can exceed `no_warps_ready`. |
+| `fu_occupied` | — | 11.83% | 9.91% | 10.91% | 13.53% | 13.50% | 13.99% | 14.98% | 15.13% | 15.10% | 42.89% | 47.20% | **46.46%** | **35.87%** | |
+| `stall_count` | — | 5.00% | 5.97% | 6.56% | 8.47% | 8.48% | 8.75% | 9.31% | 9.45% | 9.42% | 15.59% | 14.75% | **14.11%** | **14.26%** | |
+| `tma_flush` | — | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | **0.00%** | **0.00%** | fwd is load-only. |
+| `yield` | — | 0.92% | 1.21% | 1.30% | 1.69% | 1.69% | 1.74% | 1.83% | 1.89% | 1.85% | 4.70% | 5.30% | **5.35%** | **5.59%** | |
+| `result_queue_full` | — | 0.05% | 0.25% | 0.29% | 0.40% | 0.40% | 0.41% | 0.45% | 0.45% | 0.46% | 0.40% | 0.39% | **0.35%** | **0.58%** | |
+| `l1c` | — | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | 0.03% | 0.02% | 0.00% | 0.00% | 0.00% | **0.00%** | **0.00%** | |
+| `scoreboard (memory)` | — | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | **0.00%** | **0.00%** | |
 
 > **[1] On `tma_axis`.** Through Opt 11-A in this table it is
 > `wait_barrier + inst_barrier + tma_flush`. Opt 12 adds the newly separated
@@ -85,32 +96,32 @@ To keep this file easy to extend, use the following update pattern whenever a ne
 
 #### FA3 bwd - top-level simulator breakdown
 
-| Class | Init | Opt 1 (`rop=100`) | Opt 2 (BAR impl) | Opt 3 (MEMBAR) | Opt 4 (prefetch, sb=4) | Opt 5 (eager-promote) | Opt 6 (TMA real base) | Opt 7 (queue calib) | Opt 8 (slice parallelism) | Opt 9 (drain widening) | Opt 10 (warp-switch) | Opt 11-A (light full trace) | Opt 12 (mbarrier WaitBlock/fold) | Note |
-|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| `sim_cycle` | 376,735 | 361,760 | 328,643 | 259,456 | 241,528 | 241,425 | 290,572 | 250,026 | 234,665 | 215,895 | 178,856 | **136,898** | **137,348** | Opt 12 = `.o66`; current exact-generation result. |
-| `no_warps_ready` | 66.40% | 66.64% | 58.27% | 29.80% | 36.56% | 36.45% | 41.51% | 34.00% | 34.35% | 36.49% | 52.45% | 51.19% | **59.68%** | Opt 12 includes explicit WaitBlock-held warps. |
-| `issuing` | 12.12% | 12.71% | 14.06% | 20.93% | 26.18% | 25.70% | 17.76% | 21.94% | 23.63% | 29.49% | 32.32% | 32.04% | **29.70%** | |
-| `next_stage_not_available` | 10.17% | 10.69% | 11.41% | 15.11% | 18.96% | 18.52% | 12.88% | 15.83% | 17.11% | 21.35% | 1.63% | 1.72% | **1.84%** | Head-of-line stays folded. |
-| `no_valid_instruction` | 10.37% | 8.96% | 15.02% | 33.59% | 17.59% | 18.63% | 27.37% | 27.63% | 24.28% | 11.87% | 12.73% | 14.15% | **7.89%** | |
-| `issue_port_busy` | 0.95% | 1.01% | 1.24% | 0.57% | 0.71% | 0.70% | 0.48% | 0.59% | 0.64% | 0.80% | 0.87% | 0.91% | **0.89%** | |
-| `sum` | 100.00% | 100.00% | 100.00% | 100.00% | 100.00% | 100.00% | 100.00% | 100.00% | 100.00% | 100.00% | 100.00% | 100.00% | **100.00%** | Rounding. |
+| Class | Init | Opt 1 (`rop=100`) | Opt 2 (BAR impl) | Opt 3 (MEMBAR) | Opt 4 (prefetch, sb=4) | Opt 5 (eager-promote) | Opt 6 (TMA real base) | Opt 7 (queue calib) | Opt 8 (slice parallelism) | Opt 9 (drain widening) | Opt 10 (warp-switch) | Opt 11-A (light full trace) | Opt 12 (mbarrier WaitBlock/fold) | Opt 13 (F2FP to INT) | Note |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| `sim_cycle` | 376,735 | 361,760 | 328,643 | 259,456 | 241,528 | 241,425 | 290,572 | 250,026 | 234,665 | 215,895 | 178,856 | **136,898** | **137,348** | **128,702** | Opt 12 = `.o66`; Opt 13 = `.o77`. See [5]. |
+| `no_warps_ready` | 66.40% | 66.64% | 58.27% | 29.80% | 36.56% | 36.45% | 41.51% | 34.00% | 34.35% | 36.49% | 52.45% | 51.19% | **59.68%** | **55.03%** | Opt 12/13 include explicit WaitBlock-held warps. |
+| `issuing` | 12.12% | 12.71% | 14.06% | 20.93% | 26.18% | 25.70% | 17.76% | 21.94% | 23.63% | 29.49% | 32.32% | 32.04% | **29.70%** | **31.82%** | |
+| `next_stage_not_available` | 10.17% | 10.69% | 11.41% | 15.11% | 18.96% | 18.52% | 12.88% | 15.83% | 17.11% | 21.35% | 1.63% | 1.72% | **1.84%** | **2.44%** | SFU head-of-line counter remains zero. |
+| `no_valid_instruction` | 10.37% | 8.96% | 15.02% | 33.59% | 17.59% | 18.63% | 27.37% | 27.63% | 24.28% | 11.87% | 12.73% | 14.15% | **7.89%** | **9.76%** | |
+| `issue_port_busy` | 0.95% | 1.01% | 1.24% | 0.57% | 0.71% | 0.70% | 0.48% | 0.59% | 0.64% | 0.80% | 0.87% | 0.91% | **0.89%** | **0.95%** | |
+| `sum` | 100.00% | 100.00% | 100.00% | 100.00% | 100.00% | 100.00% | 100.00% | 100.00% | 100.00% | 100.00% | 100.00% | 100.00% | **100.00%** | **100.00%** | Rounding. |
 
 #### FA3 bwd - inner stall / wait breakdown
 
-| Wait reason | Init | Opt 1 (`rop=100`) | Opt 2 (BAR impl) | Opt 3 (MEMBAR) | Opt 4 (prefetch, sb=4) | Opt 5 (eager-promote) | Opt 6 (TMA real base) | Opt 7 (queue calib) | Opt 8 (slice parallelism) | Opt 9 (drain widening) | Opt 10 (warp-switch) | Opt 11-A (light full trace) | Opt 12 (mbarrier WaitBlock/fold) | Note |
-|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| `inst_barrier` | — | 58.47% / 87.70% of `no_warps_ready` | 44.78% / 76.84% of `no_warps_ready` | 1.01% / 3.40% of `no_warps_ready` | 1.30% / 3.57% of `no_warps_ready` | 1.26% | 0.89% | 1.09% | 1.09% | 1.34% | 1.43% | 1.47% | **1.71%** | |
-| `wait_barrier` | — | 7.98% / 12.00% of `no_warps_ready` | 8.62% | 11.76% / 39.46% of `no_warps_ready` | 14.66% / 40.12% of `no_warps_ready` | 14.71% | 11.80% | 12.09% | 11.82% | 13.82% | 14.81% | 8.89% | **5.15%** | Generic wait-barrier bucket. |
-| `mbarrier_spin` | — | — | — | — | — | — | — | — | — | — | — | — | **22.40%** | Opt 12 separately accounts WaitBlock/mbarrier-spin holds. |
-| `tma_axis` | — | 67.28% / 90.90% of `no_warps_ready` | 58.09% | 17.13% / 57.49% of `no_warps_ready` | 21.96% / 60.06% of `no_warps_ready` | 22.17% | 31.91% | 21.60% | 21.02% | 19.74% | 22.11% | 18.30% | **36.90%** | Includes `mbarrier_spin` in Opt 12. |
-| `non_tma_axis` | — | 16.40% / 24.50% of `no_warps_ready` | 18.08% | 21.99% / 73.79% of `no_warps_ready` | 27.15% / 74.25% of `no_warps_ready` | 26.66% | 18.94% | 22.79% | 24.37% | 30.17% | 64.58% | 53.70% | **53.01%** | Overlap counter. |
-| `fu_occupied` | — | 11.55% / 17.30% of `no_warps_ready` | 12.63% | 14.67% / 49.21% of `no_warps_ready` | 18.09% / 49.47% of `no_warps_ready` | 17.75% | 12.58% | 15.18% | 16.25% | 20.21% | 38.26% | 41.69% | **42.35%** | |
-| `stall_count` | — | 4.11% / 6.20% of `no_warps_ready` | 4.63% | 6.18% / 20.73% of `no_warps_ready` | 7.55% / 20.65% of `no_warps_ready` | 7.40% | 5.30% | 6.33% | 6.74% | 8.31% | 10.73% | 9.23% | **7.93%** | explicit stall cycles |
-| `tma_flush` | — | 0.83% / 1.20% of `no_warps_ready` | 4.69% | 4.36% / 14.62% of `no_warps_ready` | 5.99% / 16.38% of `no_warps_ready` | 6.20% | 19.22% | 8.42% | 8.11% | 4.58% | 5.87% | 7.95% | **7.65%** | `UTMACMDFLUSH` store-drain. |
-| `yield` | — | 0.68% / 1.00% of `no_warps_ready` | 0.76% | 1.02% / 3.41% of `no_warps_ready` | 1.26% / 3.45% of `no_warps_ready` | 1.23% | 0.87% | 1.06% | 1.13% | 1.39% | 2.20% | 2.41% | **2.46%** | `YIELD` |
-| `result_queue_full` | — | 0.03% / — | 0.03% | 0.09% / 0.30% of `no_warps_ready` | 0.12% / 0.33% of `no_warps_ready` | 0.12% | 0.08% | 0.10% | 0.11% | 0.14% | 0.16% | 0.16% | **0.15%** | fixed-latency result queue |
-| `l1c` | — | 0.03% / — | 0.03% | 0.04% / 0.14% of `no_warps_ready` | 0.13% / 0.36% of `no_warps_ready` | 0.16% | 0.11% | 0.13% | 0.14% | 0.12% | 0.12% | 0.21% | **0.13%** | L1 constant |
-| `scoreboard (memory)` | — | 0.00% / 0.00% of `no_warps_ready` | 0.00% | 0.00% / 0.00% of `no_warps_ready` | 0.00% / 0.00% of `no_warps_ready` | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | **0.00%** | traditional scoreboard (unused here) |
+| Wait reason | Init | Opt 1 (`rop=100`) | Opt 2 (BAR impl) | Opt 3 (MEMBAR) | Opt 4 (prefetch, sb=4) | Opt 5 (eager-promote) | Opt 6 (TMA real base) | Opt 7 (queue calib) | Opt 8 (slice parallelism) | Opt 9 (drain widening) | Opt 10 (warp-switch) | Opt 11-A (light full trace) | Opt 12 (mbarrier WaitBlock/fold) | Opt 13 (F2FP to INT) | Note |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| `inst_barrier` | — | 58.47% / 87.70% of `no_warps_ready` | 44.78% / 76.84% of `no_warps_ready` | 1.01% / 3.40% of `no_warps_ready` | 1.30% / 3.57% of `no_warps_ready` | 1.26% | 0.89% | 1.09% | 1.09% | 1.34% | 1.43% | 1.47% | **1.71%** | **1.76%** | |
+| `wait_barrier` | — | 7.98% / 12.00% of `no_warps_ready` | 8.62% | 11.76% / 39.46% of `no_warps_ready` | 14.66% / 40.12% of `no_warps_ready` | 14.71% | 11.80% | 12.09% | 11.82% | 13.82% | 14.81% | 8.89% | **5.15%** | **5.53%** | Generic wait-barrier bucket. |
+| `mbarrier_spin` | — | — | — | — | — | — | — | — | — | — | — | — | **22.40%** | **24.38%** | Opt 12/13 separately account WaitBlock/mbarrier-spin holds. |
+| `tma_axis` | — | 67.28% / 90.90% of `no_warps_ready` | 58.09% | 17.13% / 57.49% of `no_warps_ready` | 21.96% / 60.06% of `no_warps_ready` | 22.17% | 31.91% | 21.60% | 21.02% | 19.74% | 22.11% | 18.30% | **36.90%** | **39.85%** | Includes `mbarrier_spin` in Opt 12/13; see [5]. |
+| `non_tma_axis` | — | 16.40% / 24.50% of `no_warps_ready` | 18.08% | 21.99% / 73.79% of `no_warps_ready` | 27.15% / 74.25% of `no_warps_ready` | 26.66% | 18.94% | 22.79% | 24.37% | 30.17% | 64.58% | 53.70% | **53.01%** | **45.47%** | Overlap counter. |
+| `fu_occupied` | — | 11.55% / 17.30% of `no_warps_ready` | 12.63% | 14.67% / 49.21% of `no_warps_ready` | 18.09% / 49.47% of `no_warps_ready` | 17.75% | 12.58% | 15.18% | 16.25% | 20.21% | 38.26% | 41.69% | **42.35%** | **33.87%** | |
+| `stall_count` | — | 4.11% / 6.20% of `no_warps_ready` | 4.63% | 6.18% / 20.73% of `no_warps_ready` | 7.55% / 20.65% of `no_warps_ready` | 7.40% | 5.30% | 6.33% | 6.74% | 8.31% | 10.73% | 9.23% | **7.93%** | **8.60%** | explicit stall cycles |
+| `tma_flush` | — | 0.83% / 1.20% of `no_warps_ready` | 4.69% | 4.36% / 14.62% of `no_warps_ready` | 5.99% / 16.38% of `no_warps_ready` | 6.20% | 19.22% | 8.42% | 8.11% | 4.58% | 5.87% | 7.95% | **7.65%** | **8.17%** | `UTMACMDFLUSH` store-drain. |
+| `yield` | — | 0.68% / 1.00% of `no_warps_ready` | 0.76% | 1.02% / 3.41% of `no_warps_ready` | 1.26% / 3.45% of `no_warps_ready` | 1.23% | 0.87% | 1.06% | 1.13% | 1.39% | 2.20% | 2.41% | **2.46%** | **2.72%** | `YIELD` |
+| `result_queue_full` | — | 0.03% / — | 0.03% | 0.09% / 0.30% of `no_warps_ready` | 0.12% / 0.33% of `no_warps_ready` | 0.12% | 0.08% | 0.10% | 0.11% | 0.14% | 0.16% | 0.16% | **0.15%** | **0.15%** | fixed-latency result queue |
+| `l1c` | — | 0.03% / — | 0.03% | 0.04% / 0.14% of `no_warps_ready` | 0.13% / 0.36% of `no_warps_ready` | 0.16% | 0.11% | 0.13% | 0.14% | 0.12% | 0.12% | 0.21% | **0.13%** | **0.13%** | L1 constant |
+| `scoreboard (memory)` | — | 0.00% / 0.00% of `no_warps_ready` | 0.00% | 0.00% / 0.00% of `no_warps_ready` | 0.00% / 0.00% of `no_warps_ready` | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | **0.00%** | **0.00%** | traditional scoreboard (unused here) |
 
 > **[2] On the bwd Opt 1 `tma_axis` / `non_tma_axis`.** These were not emitted as single grouped counters in the Opt 1 run (`.o307`), so the cells are **computed** from the per-reason rows in the same column (the later runs emit them directly):
 > - `tma_axis` = `wait_barrier + inst_barrier + tma_flush` = 7.98+58.47+0.83 = **67.28%** (of `no_warps_ready`: 12.00+87.70+1.20 = 90.90%).
@@ -120,11 +131,27 @@ To keep this file easy to extend, use the following update pattern whenever a ne
 >
 > **[4] On the bwd Opt 5 column (`.o3`, clean-exit Step-0 run).** The run is sb=4 + eager-promote. It **exits cleanly** (`exit code 0`, no teardown SIGSEGV — the earlier `.o320` run's destructor heap-corruption crash is gone), so the cycle (241,425) and breakdown are fully trustworthy and this supersedes the preliminary 242,270. eager-promote counters: `eager_promote_to_cache=994,032`, `demand_hit_later=366,329`, `skipped_fill_port_busy=31,254`, `skipped_has_waiter=0`, `demand_miss_after_promote=0` (the prior `.o320` showed 2,224 here — the teardown fix also cleared the promote-then-miss artifact); L1I miss rate 0.1977. Step-0 instrumentation counters are timing-neutral, so this is a valid Opt-5 baseline.
 
+> **[5] On Opt 13.** All four columns use the final raw counters in K5
+> `.o102` / K10 `.o77`, divided by `total_num_cycles_issue_stage_evaluated`
+> (34,212,392 / 62,588,802) and rounded once to two decimals. Inner reasons
+> overlap and are not a partition of `no_warps_ready`; grouped sums are
+> calculated before rounding. In particular K10 `mbarrier_spin` is
+> `15,262,266 / 62,588,802 * 100 = 24.384979...%`, hence 24.38%, not a
+> second rounding of the log's 24.3850%. Opt 12 and Opt 13 consumed different
+> trace/ticket populations; these are per-run results, not a strict same-input
+> A/B. Completion of Opt 13 does not assert cross-run instruction bit-identity.
+
 ### Deferred Opts
 
 Optimizations that were investigated and consciously **parked** because, although they fix a real
 modeling inaccuracy, the measured cycle leverage is too small to matter for the 1.8–2.2x sim-vs-HW
 gap. Kept here so they are not re-attempted blindly.
+
+These are historical decisions at their stated versions, not current exclusion
+rules. In particular, the SFU-only contention explanation and the assertion
+that GSB completion was already modeled were revisited in
+`FA3_FORWARD_CAUSAL_ANALYSIS.md`. Current follow-ups are listed in the Opt 13
+result and Arch TODO-3; historical measurements below are retained unchanged.
 
 **Shared-mem bank-conflict model.** This was a swizzle / vector-width-aware shared bank-conflict model plus a counter-semantics fix, motivated by the sim over-counting `gpgpu_n_shmem_bkconflict` (fwd 38,016 vs HW 281, bwd 1,327,104 vs HW 35,493). See [SHMEM_BANK_CONFLICT_H100.md](file:///home/jihyun/modern-gpu-simulator-micro-2025/.plan/SHMEM_BANK_CONFLICT_H100.md). It was deferred because the NCU raw data shows the per-instruction over-charge is only ~3 cyc and HW shared stores are 98.5–99.5% conflict-free; HW's real store serialization is width-based, which the sim under-states. Fixing the counter therefore improves a metric, not the cycle gap.
 
@@ -235,6 +262,11 @@ FA3 fwd
     (**25.82% error**). All 132 WaitBlock/TMABIND/BAR summaries pass with zero
     active holds or watchdog aborts. K5 records 9,542 late-arrival divergences.
 
+- Opt 13 (SM90 BF16 F2FP pipeline correction)
+  - Stats run: `H100_80GB-OnlyKernel5/flashattn-fa3-bf16-bwd-causal-b1-s2048-hd64-nh24-flashattn_fa3_bf16_bwd_causal_b1_s2048_hd64_nh24___warmup_-63a73d452237.o102`
+  - Event / debug run: `H100_80GB-OnlyKernel5/flashattn-fa3-bf16-bwd-causal-b1-s2048-hd64-nh24-flashattn_fa3_bf16_bwd_causal_b1_s2048_hd64_nh24___warmup_-63a73d452237.e102`
+  - Note: **Done**. Final cycle **71,800**, **+6.06% signed error** against this report's HW reference; raw INT `2,2` / SFU `8,8` unchanged. `gpu_sim_insn=447,604,920`; all 132 CTAs complete and WaitBlock/TMABIND/STALLALIGN audits pass. Historical `.o90` input differs; see Opt 13 Result.
+
 FA3 bwd
 
 - Init
@@ -316,13 +348,19 @@ FA3 bwd
     cycles** (**3.35% error**). All 384 WaitBlock summaries and all 132
     TMABIND/BAR summaries pass. Late-arrival divergences are zero.
 
+- Opt 13 (SM90 BF16 F2FP pipeline correction)
+  - Stats run: `H100_80GB-OnlyKernel10/flashattn-fa3-bf16-bwd-causal-b1-s2048-hd64-nh24-flashattn_fa3_bf16_bwd_causal_b1_s2048_hd64_nh24___warmup_-63a73d452237.o77`
+  - Event / debug run: `H100_80GB-OnlyKernel10/flashattn-fa3-bf16-bwd-causal-b1-s2048-hd64-nh24-flashattn_fa3_bf16_bwd_causal_b1_s2048_hd64_nh24___warmup_-63a73d452237.e77`
+  - Note: **Done**. Final cycle **128,702**, **-3.16% signed error** against this report's HW reference; raw INT `2,2` / SFU `8,8` unchanged. `gpu_sim_insn=623,703,264`; all 384 CTAs complete and WaitBlock/TMABIND/STALLALIGN audits pass. Historical `.o66` input differs; see Opt 13 Result.
+
 ### Secondary / historical — post-Opt-10 issue-density gap
 
 > This section records the pre-Opt-11-A/B compute-path investigation and remains
 > useful as architectural background. Opt 11-B cannot be used to reprioritize
 > this work because sparse reconstruction was later found to change opcode
-> order. Current dependency and timing analysis must use the Opt 12 ABI-correct
-> v2 trace and exact-generation ticket artifact.
+> order. Subsequent dependency and timing comparisons must freeze the current
+> trace and exact-generation sidecars; the Opt 12 and Opt 13 historical
+> inputs are not identical.
 
 The dominant post-Opt-10 compute-path residual. **No cycle claim.** Multiple leads were investigated and
 closed (stagger dead; `stall_count`-latency refuted; tensor over-model refuted by raw-count re-profile —
@@ -1103,19 +1141,111 @@ Cycle-accuracy result:
 - **Aggregate:** two-kernel MAPE is **14.58%**. Reporting only the combined or
   K10 error would hide the K5 timing defect.
 
-Opt 12 therefore closes dependency correctness, not cycle accuracy. The
-next timing investigation starts at K5's first
+Opt 12 therefore closes its mbarrier dependency scope, not cycle accuracy.
+At that stage, the next timing investigation started at K5's first
 `current_generation > target_generation` occurrence and must explain why the
 simulator completes one to three later generations before the hardware-mapped
 consumer wait reaches its action PC. The deterministic once-per-SM-cycle release
 service and the remaining WaitBlock accounting/audit items are tracked
 separately in `WAIT_BLOCK.md`.
 
+### Opt 13 - SM90 BF16 F2FP pipeline correction
+
+> **Status: Done.** The user accepted the F2FP-only optimization as complete
+> on 2026-09-11. Source change: `d726a9f`.
+> Consolidated evidence, full opcode audit, implementation, and server results:
+> [FA3_FORWARD_CAUSAL_ANALYSIS.md](../.plan/FA3_FORWARD_CAUSAL_ANALYSIS.md)
+> sections 1 and 6.1-6.9. Shape results remain in
+> [FA3_multi.md](FA3_multi.md). Other opcode changes are not part of Opt 13.
+
+#### Why this optimization
+
+The old Hopper classification put `F2FP.BF16.F32.PACK_AB` on the same
+`SFU_OP` path as `MUFU`, inheriting SFU latency/II `8,8`. BF16 packing
+therefore consumed SFU capacity and competed with softmax exponentiation.
+Baseline NCU executes 981,504 F2FP warp instructions in K5 and 1,769,472
+in K10, but reconstructed XU work is almost entirely explained by MUFU
+alone. The opcode/PC evidence supports separating BF16 packing from SFU;
+it does not justify moving all conversions or tuning a new latency.
+
+#### How to implement
+
+- Use `resolve_trace_execution_category()` for both static metadata
+  (`traced_instruction::set_simulation_opcode()`) and dynamic replay
+  (`trace_warp_inst_t::parse_from_trace_struct()`).
+- Override only architecture 90, base category `SFU_OP`, and exact opcode
+  `F2FP.BF16.F32.PACK_AB`; every other form retains its existing mapping.
+- Select `INTP_OP -> Subcore::get_fu() -> m_int_pipeline` under the existing
+  H100 configuration. Reuse INT latency/II `2,2` and its ordinary allocation,
+  register-read, result-queue, and writeback path. No new FU or timing knob.
+- Preserve `OP_F2FP`, raw operand/power classification, and trace payload.
+  Pass architecture at the metadata-loader and tracer classifier call sites.
+  The base opcode map, other operators, SFU acceptance, and WGMMA are unchanged.
+- Rebuild the simulator and shared trace library on the server. Existing
+  traces are sufficient; F2FP routing does not require trace regeneration.
+
+#### Result
+
+| Metric | K5 fwd `.o102` | K10 bwd `.o77` |
+|---|---:|---:|
+| Final `gpu_sim_cycle` | **71,800** | **128,702** |
+| Historical Opt 12 cycle | 85,172 | 137,348 |
+| Observed cycle change vs Opt 12 | -13,372 (-15.70%) | -8,646 (-6.29%) |
+| This report's HW reference | 67,696 | 132,901 |
+| Signed error / absolute error | +6.06% / 6.06% | -3.16% / 3.16% |
+| Newer multi-shape HW reference | 67,838 | 130,641 |
+| Signed error against newer reference | +5.84% | -1.48% |
+| Completed CTAs | 132/132 | 384/384 |
+| `gpu_sim_insn` | 447,604,920 | 623,703,264 |
+| Retired warp instructions = issue-stage issuing count | 14,447,843 | 19,912,645 |
+| SFU-blocked warp-cycles, Opt 12 -> Opt 13 | 35,372,161 -> 12,452,184 (-64.80%) | 31,312,865 -> 2,997,352 (-90.43%) |
+| Other-FU-blocked warp-cycles, Opt 12 -> Opt 13 | 17,569,946 -> 27,886,681 | 18,017,466 -> 30,904,658 |
+| `next_stage_blocked_by_sfu` | 0 | 0 |
+| Exact-generation late-arrival divergences | 9,042 | 0 |
+
+Two-kernel descriptive MAPE against this report's historical HW reference
+falls from **14.58% to 4.61%**. Against the newer multi-shape reference it
+falls from 15.34% to 3.66%. The additional completed HD64 forward runs
+are s1024 `.o103` at 39,460 cycles (+3.43%) and nh8 `.o104` at 60,967
+cycles (+5.87%), using their own NCU references in `FA3_multi.md`.
+
+Validation and interpretation:
+
+- Both baseline runs exit normally. All 132/384 WaitBlock summaries and
+  132/132 TMABIND final audits pass, with zero live holds, watchdog aborts,
+  generation overshoots, or TMA ownership mismatches. STALLALIGN final
+  population and issue-accounting checks also pass.
+- Input occurrence conservation holds: K5
+  `14,818,470 = 14,447,843 retired + 370,627 folded`; K10
+  `20,997,218 = 19,912,645 retired + 1,084,573 folded`.
+  These are within-run warp-occurrence identities, not cross-run lane counts.
+- **Historical comparison caveat:** `.o90/.o66` and `.o102/.o77` have
+  different loaded trace/ticket populations. Input warp counts change
+  `14,818,156 -> 14,818,470` (K5) and `20,995,973 -> 20,997,218` (K10);
+  `gpu_sim_insn` changes by -7,584 / +3,072. K5 also changes per-CTA compute
+  allocation. Binary headers contain only `*_modified_0.0`, not a source SHA.
+  Do not label this a strict same-input A/B or claim instruction bit-identity.
+  Opt 13 is complete as an accepted implementation/experiment milestone;
+  isolated effect attribution remains a documented validation limitation.
+- SFU-blocked counts include the instructions classified to SFU in each run;
+  their reduction is not a MUFU-only stall measurement. Other-FU pressure
+  increases, consistent with work moving to the existing INT path.
+  Warp-cycle sums are not additive kernel-cycle savings.
+
+Next investigation: problem 3, the SFU issue-stage acceptance interval.
+First verify whether the source-derived II=8 / observed-gap=9 hypothesis
+appears in the actual pipeline. Do not change SFU timing merely to remove
+the remaining positive forward error: backward is already slightly below
+HW. Keep F2FP and other opcodes fixed, and freeze identical inputs for future
+paired experiments. WGMMA group-completion dependencies remain the following
+separate problem. Additional opcode corrections stay in TODO-3.
+
 ## 3. Arch TODO
 
-Known modeling gaps that are **out of scope** for the current optimization pass but should be
-implemented later for higher fidelity. These are architectural model limitations, not tuning
-knobs.
+Known modeling gaps and unvalidated routing candidates that are **out of scope**
+for the completed optimization pass. Evidence-backed gaps need later correction;
+unvalidated candidates need qualification before implementation. These are
+architectural fidelity tasks, not tuning knobs.
 
 ### TODO-1: TMA shared-memory swizzle is not modeled
 
@@ -1188,3 +1318,30 @@ knobs.
   keeps short stalls short while collapsing large ones), and untangling that is a fidelity task with no
   expected FA3 speedup. Left as a known modeling gap; revisit only if a future workload is shown to be
   genuinely stall-latency-bound (linear-countdown A/B behind a gate) rather than lockstep-bound.
+
+### TODO-3: Additional opcode routing qualification and corrections
+
+- **Status**: deferred; no additional opcode change is included in the completed
+  Opt 13. Proceed with the separate SFU acceptance investigation first.
+- **Evidence**: the consolidated Hopper audit is in
+  [FA3_FORWARD_CAUSAL_ANALYSIS.md](../.plan/FA3_FORWARD_CAUSAL_ANALYSIS.md),
+  sections 6.3-6.4 and 6.7. This is not a blanket list of proven wrong mappings.
+- **Why defer**: the strongest additional observations are in initialization
+  kernels, while the main-kernel candidates still need resource qualification.
+  A bulk remap would mix new execution models with the next SFU timing change.
+
+| Opcode group | Evidence / FA3 scope | Follow-up and revisit condition |
+|---|---|---|
+| `I2FP.F32.U32/S32` | Measured non-XU behavior; ALU candidate. Absent from baseline K5/K10, observed in initialization. | Validate exact-form ALU sharing/timing, then a separate patch. Revisit when initialization or a workload containing these forms is targeted. |
+| `HFMA2.MMA` | Hardware tensor-path evidence in initialization; absent from baseline K5/K10. | Qualify modifier-specific operand/operation/service handling before routing to tensor. Keep ordinary HFMA2 separate. |
+| `FMNMX`, `FSEL`, `FSETP`, `VIADD` | Present in main kernels. ALU-only candidates for the first three; FMA candidate for VIADD. Isolated destination proof is missing. | Highest-priority main-kernel follow-up within this TODO. Revisit if post-SFU residuals point to these PCs/resources or isolated HW evidence confirms a mismatch. Test one opcode/form at a time. |
+| `DMMA`, `MOVM` | Source operation-class mismatch; correct service/operand modeling is not established by changing an enum. | Separate tensor/matrix-data-movement model work when a target workload exercises the form; no assumed FA3 improvement. |
+| Other F2FP forms, `F2F`, `I2I/I2IP/F2IP`, `FRND`, `UF2FP`, `IMUL/IDP` families | Form-specific routing/timing evidence remains incomplete. | Retain current behavior until architecture/form-specific evidence is available; do not generalize the BF16 F2FP result. |
+
+- **Implementation rule**: separate commits and frozen-input experiments;
+  reuse an existing qualified FU/timing where appropriate, preserve opcode
+  and instruction work, and never use lower aggregate FA3 error alone as
+  proof of a correct pipeline assignment.
+- **Scope boundary**: WGMMA group-completion semantics are the separate
+  problem 2 in the agreed F2FP -> SFU acceptance -> WGMMA sequence, not an
+  additional conversion-routing fix.

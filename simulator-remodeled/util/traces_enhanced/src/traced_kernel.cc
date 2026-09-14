@@ -297,7 +297,8 @@ bool traced_kernel::Deserialize(const rapidjson::Value & obj) {
     {
         std::shared_ptr<traced_instruction> instruction = std::make_shared<traced_instruction>();
         instruction->Deserialize(instructions[i]);
-        instruction->set_simulation_opcode(m_OpcodeMap, instruction->get_op_code());
+        instruction->set_simulation_opcode(
+            m_OpcodeMap, instruction->get_op_code(), m_architecture_version);
         unsigned pc_num = std::stoul(instruction->get_pc_string(), nullptr, 16);
         m_instructions[pc_num] = std::move(instruction);
     }

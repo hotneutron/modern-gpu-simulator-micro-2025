@@ -63,6 +63,10 @@ unsigned int IBuffer_Remodeled::get_num_entries() {
 }
 
 bool IBuffer_Remodeled::can_fetch() {
+    if (m_config->is_trace_mode &&
+        !static_cast<trace_shd_warp_t *>(m_shd_warp)->lane_group_can_fetch()) {
+        return false;
+    }
     return ((m_num_max_entries - m_num_entries) >= m_fetch_decode_width) && !m_is_ret_reached;
 }
 

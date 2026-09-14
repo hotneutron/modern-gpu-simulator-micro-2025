@@ -65,6 +65,7 @@
 
 #include "../ISA_Def/trace_opcode.h"
 #include "../trace-parser/trace_parser.h"
+#include "lane_group_replay.h"
 #include "../gpgpu-sim/src/abstract_hardware_model.h"
 #include "../gpgpu-sim/src/gpgpu-sim/gpu-sim.h"
 #include "../gpgpu-sim/src/gpgpu-sim/shader.h"
@@ -96,6 +97,7 @@ enum class WaitBlockTraceOrigin {
   CANONICAL,
   PARTIAL_SIBLING_JOIN,
   PARTIAL_BLOCKED_REPLAY,
+  LANE_GROUP_REPLAY,
   SYNTHETIC,
 };
 
@@ -318,6 +320,14 @@ class trace_shd_warp_t : public shd_warp_t {
   void unreserve_last_partial_replay();
   uint64_t partial_replay_epoch() const;
   void clear_partial_wait_capsule();
+  LaneGroupReplay<inst_trace_t> &lane_groups() { return m_lane_groups; }
+  const LaneGroupReplay<inst_trace_t> &lane_groups() const { return m_lane_groups; }
+  const LaneGroupSpanRecord &lane_group_span() const { return m_lane_group_span; }
+  void begin_lane_group_replay(const LaneGroupSpanRecord &span, unsigned fid);
+  unsigned fold_lane_group_poll(unsigned group,
+                               const SpinWaitRegionRecord &region,
+                               FoldSkipStats *out_stats);
+  bool lane_group_can_fetch() const;
   // [Spin-wait fold] Forward analogue of get_next_trace_inst's cursor
   // bookkeeping: advance both used_insts and each skipped pc's per-occurrence
   // counter until traced_pcs[used_insts] == exit_pc, WITHOUT issuing the skipped
@@ -345,6 +355,8 @@ class trace_shd_warp_t : public shd_warp_t {
   }
 
  private:
+  LaneGroupReplay<inst_trace_t> m_lane_groups;
+  LaneGroupSpanRecord m_lane_group_span;
   std::vector<inst_trace_t> m_partial_replay;
   std::vector<inst_trace_t> m_partial_deferred;
   unsigned int m_partial_replay_issued = 0;

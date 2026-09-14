@@ -1061,8 +1061,11 @@ validation work.
 
 - `--mbarrier-contract-capture` enables the tracer environment option
   `MBARRIER_CONTRACT_CAPTURE=1`. The default is zero.
-- Enabled runs use the separate `-mbarrier-contract-v2` output-directory suffix,
-  so `-f` cannot delete the unsuffixed `9e92fe9` baseline.
+- Per-run benchmark YAML may set `LIGHTER_TRACER` and
+  `MBARRIER_CONTRACT_CAPTURE`; the runner resolves those values before choosing
+  the output path, manifest, generated environment, and sidecar validation mode.
+- Enabled runs write the full trace and contract sidecars to the standard
+  argument directory. The manifest records that contract capture was enabled.
 - The v2 capture path adds no instruction callbacks and no channel pushes. The
   existing compact barrier-address callback updates bounded `(CTA, barrier)`
   state and appends a 72-byte contract payload to that callback's existing wire
@@ -1088,10 +1091,12 @@ validation work.
   Reusing a barrier for contract `j+1` additionally requires a captured READY
   wait at the exact opened count `j`; absence of that witness rejects the
   barrier as `CONTRACT_SERIAL_LIFECYCLE_UNPROVEN`.
-- Strict enabled runs also compare the new and unsuffixed baseline traces over
-  semantic `(kernel, function, PC, opcode, active_mask, predicate_mask)`
-  histograms, WaitBlock action structure/ready-only counts, and B0-D
-  contract/load/byte totals. FOLD dynamics are emitted separately.
+- Strict enabled runs validate the captured contract snapshots and generated
+  sidecars from the same trace. `--contract-baseline-traces` remains available
+  as an optional qualification audit over semantic
+  `(kernel, function, PC, opcode, active_mask, predicate_mask)` histograms,
+  WaitBlock action structure/ready-only counts, and B0-D contract/load/byte
+  totals. FOLD dynamics are emitted separately.
 
 Local validation:
 
@@ -1217,15 +1222,16 @@ after E0 implementation is:
 
 ```bash
 nohup ./util/tracer_nvbit/run_hw_trace.py \
-  --mbarrier-contract-capture \
   -f \
   -B flashattn:flashattn-fa3-bf16-bwd-causal-b1-s2048-hd64-nh24 \
   -D 0 \
   > /tmp/flashattn.log 2>&1 &
 ```
 
-This command is valid only after the old run directory has been preserved under
-a different name; `-f` intentionally deletes the selected run directory.
+This command performs one GPU trace execution and writes both the full trace and
+its strict contract/WaitBlock sidecars under the standard argument directory. No
+baseline trace is required. `-f` intentionally deletes that selected run
+directory before regeneration.
 
 Expected Stage E0 files:
 
