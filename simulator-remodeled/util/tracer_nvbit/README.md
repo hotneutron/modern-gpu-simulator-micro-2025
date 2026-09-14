@@ -1,13 +1,31 @@
 # Instructions on using tracer tool for Accel-sim
 
-* First insall the nvbit tool:
+* Install or update the SDK explicitly from `simulator-remodeled/util/tracer_nvbit`:
 
   ```bash
-  # Insall the nvbit
   ./install_nvbit.sh
-  # compile the tools
-  ./make
   ```
+
+  Run this step for initial setup or an SDK update, not for every build.
+  The installer pins NVBit 1.7.6, which fixes `WARPSYNC.COLLECTIVE` handling
+  used by SM90 FlashAttention kernels. A matching SDK is reused without
+  downloading. The installer validates the downloaded SDK before replacing
+  the old one and prints the previous SDK's temporary backup path.
+
+  NVBit 1.7.6 documents a driver support bound of `<=575.xx`. A successful
+  workload test on a newer driver does not establish general compatibility.
+
+* Build the tracer from the `simulator-remodeled` directory:
+
+  ```bash
+  make -j -C ./util/tracer_nvbit/ clean &&
+  make -j -C ./util/tracer_nvbit/
+  ```
+
+  `make` builds against the installed SDK; it never invokes the installer or
+  downloads an SDK. `clean` does not remove the SDK. SDK header changes trigger
+  recompilation because NVBit is linked statically into `tracer_tool.so`.
+
 * To generate traces for benchamrk suite, run the following command:
 
   ```bash
@@ -92,3 +110,57 @@
   mask=ffffffff (hexa) `<br />`
   unique_function_id = 3 `<br />`
   mem_width = 0 (if mem_width>0, then there will be some addresses listed afterwards) `<br />`
+
+## Offline WaitBlock Validation
+
+For an existing enhanced trace, run these commands from `simulator-remodeled`
+with `T` set to its `traces` directory:
+
+```bash
+python3 util/tracer_nvbit/build_tma_operand_mapping.py "$T/extra_info" &&
+python3 util/tracer_nvbit/build_sync_operand_mapping.py "$T/extra_info" &&
+python3 util/tracer_nvbit/validate_tma_completion_contracts.py --traces "$T" --strict &&
+python3 util/tracer_nvbit/build_spin_wait_sidecar.py \
+  --traces "$T" --validate-ctas all --strict --require-contract-capture
+```
+
+These steps regenerate metadata only. They do not rewrite instruction payloads.
+The last step requires mbarrier contract snapshots in the original capture.
+`--out` changes only the spin-sidecar destination; contract diagnostic artifacts
+are still written inside `extra_info`. Use a separate trace directory when
+validating an accepted baseline.
+
+Lifecycle witnesses are collected from statically proven wait-predicate/branch
+pairs independently of FOLD/INJECT selection. Unknown opcodes, predicate
+references between the wait and branch, incomplete lane coverage, missing
+branch occurrences, and inconsistent branch edges cannot establish a result.
+Witness-only sites do not become simulator hold sites.
+
+Partial hold proof version 1 retains the existing direct-branch, single-join
+contract. Version 3 adds `partial_join_variants` and `partial_join_occurrences`
+for sites whose proven join depends on the dynamic occurrence. Each occurrence
+binds CTA coordinates, warp, source instruction index, masks, and barrier/state
+to one variant and its sibling/blocked/post-join source indices:
+
+- Variant proof 1 uses the existing direct branch and BSYNC/WARPSYNC proof.
+- Variant proof 2 requires the sibling's last occurrence before the wait to be
+  an active `WARPSYNC.ALL`. No sibling work may execute afterward until the
+  full-warp continuation. Earlier sibling work stays in the original trace.
+- Runtime resolves the exact occurrence, not a PC-only or nearest-join guess.
+  An already-arrived variant aborts if its sibling join has not actually issued.
+- Join/post-join bookkeeping for version 3 is occurrence-specific, so an
+  unrelated visit to the same PC cannot open or close the partial region.
+
+New proof versions require rebuilding the simulator; an older loader rejects
+them. Generation tickets retain their existing schema and are separate from
+partial-join selection. Missing or ambiguous proof remains a strict failure.
+
+Run CPU regression tests from the repository root:
+
+```bash
+python3 -m unittest discover -s simulator-remodeled/util/tracer_nvbit/tests
+```
+
+The occurrence-loader tests compile the production JSON validation and lookup
+functions with a small CPU fixture. They do not replace a full Linux/CUDA build
+or simulator instruction-count and cycle-accuracy regression.

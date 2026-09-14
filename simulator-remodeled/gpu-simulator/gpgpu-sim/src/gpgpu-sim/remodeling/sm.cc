@@ -406,6 +406,8 @@ SM::SM(unsigned int num_subcores, gpgpu_sim *gpu, simt_core_cluster *cluster,
   m_num_cycles_to_wait_to_dispatch_another_inst_from_subcore_to_sm_shared_pipeline = 0;
   m_pending_sync_waits.resize(config->max_warps_per_shader);
   m_partial_wait_arms.resize(config->max_warps_per_shader);
+  m_lane_group_waits.resize(config->max_warps_per_shader);
+  m_lane_group_progress_cycle.resize(config->max_warps_per_shader);
   m_partial_replay_progress.resize(config->max_warps_per_shader);
   m_partial_joined_regions.resize(config->max_warps_per_shader);
   m_wait_block_last_semantic_anchor_by_warp.resize(
@@ -614,7 +616,8 @@ void SM::assert_wait_block_lifecycle_drained(const char *reason) {
   unsigned int first_active_warp = ~0u;
   for (unsigned int warp_id = 0; warp_id < m_pending_sync_waits.size();
        ++warp_id) {
-    const bool pending = m_pending_sync_waits[warp_id].valid;
+    const bool pending = m_pending_sync_waits[warp_id].valid ||
+        m_lane_group_waits[warp_id][0].valid || m_lane_group_waits[warp_id][1].valid;
     const bool arm = m_partial_wait_arms[warp_id].valid;
     const bool replay = m_partial_replay_progress[warp_id].valid;
     const uint64_t joined = m_partial_joined_regions[warp_id].size();
@@ -648,6 +651,7 @@ void SM::assert_wait_block_lifecycle_drained(const char *reason) {
   }
 
   const bool balanced =
+      m_lane_group_extracted == m_lane_group_issued + m_lane_group_folded &&
       m_missing_wait_holds_total == m_missing_wait_releases_total &&
       m_fold_parks_total == m_fold_releases_total &&
       m_fold_aux_holds_total == m_fold_aux_releases_total &&
@@ -751,6 +755,8 @@ void SM::reset_wait_block_launch_state(uint64_t launch_uid) {
   m_fold_aux_holds_total = 0;
   m_fold_aux_releases_total = 0;
   m_missing_wait_ready_total = 0;
+  assert(m_lane_group_extracted == m_lane_group_issued + m_lane_group_folded);
+  m_lane_group_extracted = m_lane_group_issued = m_lane_group_folded = 0;
   m_missing_wait_holds_total = 0;
   m_missing_wait_releases_total = 0;
   m_partial_missing_wait_misses_total = 0;
@@ -1819,6 +1825,24 @@ void SM::issue_warp(register_set_uniptr &pipe_reg_set, warp_inst_t *next_inst,
             ? trace_warp->partial_replay_remaining()
             : 0;
     trace_warp->commit_trace_inst(trace_inst);
+    if (trace_inst->wait_block_trace_origin == WaitBlockTraceOrigin::LANE_GROUP_REPLAY) {
+      ++m_lane_group_issued;
+      m_lane_group_progress_cycle[warp_id] = get_current_gpu_cycle();
+    }
+    LaneGroupSpanRecord span;
+    if (m_config->wait_block_enable &&
+        m_gpu->lookup_lane_group_start(*trace_inst, span)) {
+      trace_warp->get_IBuffer_remodeled()->flush(false);
+      trace_warp->begin_lane_group_replay(span, trace_inst->unique_function_id);
+      // The triggering head already issued. Only the suffix enters replay.
+      m_lane_group_extracted += span.merge_index - span.start_index - 1;
+      m_lane_group_progress_cycle[warp_id] = get_current_gpu_cycle();
+      trace_warp->lane_groups().select(span.start_mask == span.main_mask ? 0 : 1);
+      debug_log_wait_block_event("lane-group-start",
+          "warp=" + std::to_string(warp_id) +
+          " start=" + std::to_string(span.start_index) +
+          " merge=" + std::to_string(span.merge_index));
+    }
     if (trace_inst->wait_block_trace_origin ==
         WaitBlockTraceOrigin::PARTIAL_BLOCKED_REPLAY) {
       m_partial_replayed_occurrences_total++;
@@ -1902,7 +1926,7 @@ void SM::issue_warp(register_set_uniptr &pipe_reg_set, warp_inst_t *next_inst,
          trace_origin == WaitBlockTraceOrigin::PARTIAL_BLOCKED_REPLAY) &&
         m_gpu->lookup_partial_wait_join(
             pipe_reg->trace_kernel_id, pipe_reg->unique_function_id,
-            pipe_reg->pc, replay_join_region);
+            pipe_reg->pc, replay_join_region, pipe_reg.get());
     // A predicated-off BAR (active_count()==0, e.g. a warp-specialized BAR.ARV/BAR.SYNC
     // executed only by a subset of warps) is a no-op for this warp: the warp does not
     // actually arrive at the barrier on hardware. Skip the barrier-set update entirely;
@@ -2031,6 +2055,7 @@ void SM::issue_warp(register_set_uniptr &pipe_reg_set, warp_inst_t *next_inst,
     }
     if (m_config->wait_block_enable) {
       handle_partial_wait_instruction_issue(*pipe_reg, warp_id);
+      select_lane_group(warp_id);
     }
   }
 }
@@ -2609,6 +2634,7 @@ void SM::reinit(unsigned start_thread, unsigned end_thread,
     m_physical_warp[i]->reset();
     m_simt_stack[i]->reset();
     if (i < m_pending_sync_waits.size()) {
+      assert(!m_lane_group_waits[i][0].valid && !m_lane_group_waits[i][1].valid);
       m_pending_sync_waits[i] = HopperMBarrierPendingWait();
     }
     if (i < m_partial_wait_arms.size()) {
@@ -2839,7 +2865,8 @@ void SM::register_cta_thread_exit(unsigned cta_num, kernel_info_t *kernel) {
     m_barriers.deallocate_barrier(cta_num);
     clear_sync_barrier_state_for_cta(cta_num);
     if (m_config->wait_block_enable && m_n_active_cta == 0 &&
-        (m_missing_wait_holds_total != m_missing_wait_releases_total ||
+        (m_lane_group_extracted != m_lane_group_issued + m_lane_group_folded ||
+         m_missing_wait_holds_total != m_missing_wait_releases_total ||
          m_fold_parks_total != m_fold_releases_total ||
          m_fold_aux_holds_total != m_fold_aux_releases_total ||
          m_partial_join_holds_total != m_partial_join_releases_total ||
@@ -3183,6 +3210,7 @@ unsigned SM::fold_cursor_skip_to_exit(unsigned warp_id,
                                       FoldSkipStats &out_stats) {
   trace_shd_warp_t *tw =
       static_cast<trace_shd_warp_t *>(m_physical_warp[warp_id]);
+  assert(!tw->lane_groups().active() && "lane-group FOLD must use its own cursor");
   const bool in_partial_replay =
       tw->partial_replay_active() &&
       tw->partial_replay_origin() ==
@@ -3483,7 +3511,7 @@ void SM::handle_partial_wait_instruction_issue(const warp_inst_t &inst,
   PartialWaitRegionRecord join_region;
   if (m_gpu->lookup_partial_wait_join(
           inst.trace_kernel_id, inst.unique_function_id, inst.pc,
-          join_region)) {
+          join_region, &inst)) {
     const uint64_t issued_mask = inst.get_active_mask().to_ullong();
     if (join_region.sibling_masks.count(issued_mask) != 0) {
       if (!m_partial_joined_regions[warp_id]
@@ -3570,6 +3598,15 @@ void SM::handle_partial_wait_instruction_issue(const warp_inst_t &inst,
         m_partial_join_already_issued_total++;
         start_partial_wait_hold(warp_id, arm);
         return;
+      }
+      if (arm.record.partial_hold_proof_version == 2) {
+        std::cerr << "[WAITBLOCK][abort][SM" << m_sm_id << "] cyc="
+                  << get_current_gpu_cycle()
+                  << " reason=partial-already-arrived-join-not-issued"
+                  << " block=" << arm.record.block_id
+                  << " region=" << arm.record.partial_region_id
+                  << " warp=" << warp_id << " action=abort" << std::endl;
+        abort();
       }
 
       trace_shd_warp_t *tw =
@@ -3676,7 +3713,7 @@ void SM::handle_partial_wait_instruction_issue(const warp_inst_t &inst,
   PartialWaitRegionRecord post_region;
   if (m_gpu->lookup_partial_wait_post_join(
           inst.trace_kernel_id, inst.unique_function_id, inst.pc,
-          post_region)) {
+          post_region, &inst)) {
     const uint64_t issued_mask = inst.get_active_mask().to_ullong();
     if (post_region.live_masks.count(issued_mask) == 0) {
       std::cerr << "[WAITBLOCK][abort][SM" << m_sm_id << "] cyc="
@@ -3761,6 +3798,166 @@ void SM::handle_partial_wait_instruction_issue(const warp_inst_t &inst,
   }
 }
 
+void SM::select_lane_group(unsigned warp_id) {
+  if (!m_config->is_trace_mode) return;
+  auto *tw = static_cast<trace_shd_warp_t *>(m_physical_warp[warp_id]);
+  auto &groups = tw->lane_groups();
+  if (!groups.active()) return;
+  const int next = groups.next_group();
+  if (groups.at_merge()) {
+    tw->get_IBuffer_remodeled()->flush(false);
+    assert(!m_lane_group_waits[warp_id][0].valid &&
+           !m_lane_group_waits[warp_id][1].valid);
+    debug_log_wait_block_event("lane-group-merge",
+        "warp=" + std::to_string(warp_id) +
+        " source_index=" + std::to_string(groups.merge_index()));
+    groups.finish();
+    tw->get_IBuffer_remodeled()->flush(false);
+  } else if (next != groups.selected()) {
+    tw->get_IBuffer_remodeled()->flush(false);
+    groups.select(next);
+    tw->get_IBuffer_remodeled()->flush(false);
+  }
+}
+
+unsigned SM::fold_lane_group(unsigned warp_id, unsigned group,
+                            const SpinWaitRegionRecord &region) {
+  auto *tw = static_cast<trace_shd_warp_t *>(m_physical_warp[warp_id]);
+  tw->get_IBuffer_remodeled()->flush(false);
+  FoldSkipStats stats;
+  const auto skipped = tw->fold_lane_group_poll(group, region, &stats);
+  m_lane_group_folded += skipped;
+  m_lane_group_progress_cycle[warp_id] = get_current_gpu_cycle();
+  return skipped;
+}
+
+void SM::service_lane_group_waits(unsigned warp_id) {
+  if (!m_config->is_trace_mode) return;
+  auto *tw = static_cast<trace_shd_warp_t *>(m_physical_warp[warp_id]);
+  auto &groups = tw->lane_groups();
+  if (!groups.active()) {
+    assert(!m_lane_group_waits[warp_id][0].valid &&
+           !m_lane_group_waits[warp_id][1].valid);
+    return;
+  }
+  const uint64_t now = get_current_gpu_cycle();
+  const auto wait_detail = [&](unsigned group) {
+    const auto &held = m_lane_group_waits[warp_id][group];
+    std::ostringstream detail;
+    detail << "warp=" << warp_id << " group=" << group
+           << " trace_kernel=" << held.key.trace_kernel_id
+           << " function=" << held.unique_function_id
+           << " cta_slot=" << held.key.cta_id
+           << " global_cta=" << m_local_to_global_cta_id[held.key.cta_id]
+           << " block=" << held.block_id
+           << " action_pc=0x" << std::hex << held.action_pc
+           << " barrier=0x" << held.key.barrier_addr
+           << " wait_state=0x" << held.wait_state_raw << std::dec
+           << " exact_target=" << held.uses_exact_generation_ticket
+           << " target=" << held.expected_gen
+           << " current=" << sync_barrier_gen(held.key)
+           << " held_cycles=" << now - held.hold_start_cycle
+           << " replay_idle_cycles=" << now - m_lane_group_progress_cycle[warp_id]
+           << " merge_index=" << groups.merge_index();
+    for (unsigned g = 0; g < 2; ++g) {
+      detail << " group" << g << "_remaining=" << groups.remaining(g)
+             << " group" << g << "_waiting=" << groups.waiting(g);
+      if (groups.remaining(g)) {
+        detail << " group" << g << "_next_source=" << groups.head(g).source_index;
+      }
+    }
+    auto barrier_it = m_hopper_mbarriers.find(held.key);
+    if (barrier_it != m_hopper_mbarriers.end()) {
+      const auto &barrier = barrier_it->second;
+      detail << " phase=" << barrier.phase
+             << " arrive=" << barrier.arrive_count << "/" << barrier.expected_arrive_count
+             << " tx=" << barrier.completed_tx_bytes << "/" << barrier.expected_tx_bytes
+             << " assigned=" << barrier.assigned_tx_bytes
+             << " outstanding=" << barrier.outstanding_tma_bindings
+             << " last_flip_cycle=" << barrier.last_flip_cycle;
+    } else {
+      detail << " barrier_state=unseen";
+    }
+    return detail.str();
+  };
+  for (unsigned group = 0; group < 2; ++group) {
+    auto &held = m_lane_group_waits[warp_id][group];
+    assert(held.valid == groups.waiting(group));
+    if (!held.valid) continue;
+    const uint64_t age = now - held.hold_start_cycle;
+    const auto generation = sync_barrier_gen(held.key);
+    if (!held.uses_exact_generation_ticket && generation > held.expected_gen) {
+      ++m_wait_block_generation_overshoots_total;
+      std::fprintf(stderr,
+                   "[WAITBLOCK][abort][SM%u] cyc=%llu "
+                   "reason=lane-group-generation-overshoot %s action=abort\n",
+                   m_sm_id, static_cast<unsigned long long>(now),
+                   wait_detail(group).c_str());
+      abort();
+    }
+    if (!is_wait_block_pending_satisfied_at_cycle_start(held)) {
+      if (now - held.last_heartbeat_cycle >= m_config->wait_block_heartbeat_cycles) {
+        debug_log_wait_block_event("lane-group-heartbeat", wait_detail(group));
+        held.last_heartbeat_cycle = now;
+      }
+      continue;
+    }
+    if (held.mode == WaitBlockPendingMode::CAPTURED_POLL_HOLD) {
+      SpinWaitRegionRecord region;
+      if (!m_gpu->lookup_spin_wait_region(
+              held.key.trace_kernel_id, held.unique_function_id, held.action_pc, region) ||
+          !region.foldable || region.block_id != held.block_id) {
+        std::cerr << "[WAITBLOCK][abort] lane-group poll release mismatch" << std::endl;
+        abort();
+      }
+      const auto skipped = fold_lane_group(warp_id, group, region);
+      m_fold_skipped_insts_total += skipped;
+      m_fold_park_cycles_total += age;
+      if (age > m_fold_park_cycles_max) m_fold_park_cycles_max = age;
+      ++m_fold_releases_total;
+    } else if (held.mode == WaitBlockPendingMode::MISSING_WAIT_HOLD) {
+      ++m_missing_wait_releases_total;
+    } else if (held.mode == WaitBlockPendingMode::FOLD_AUX_WAIT_HOLD) {
+      ++m_fold_aux_releases_total;
+    } else {
+      std::cerr << "[WAITBLOCK][abort] invalid lane-group wait mode" << std::endl;
+      abort();
+    }
+    ++m_sync_debug_wait_released;
+    debug_log_wait_block_event("lane-group-release",
+        "warp=" + std::to_string(warp_id) + " group=" + std::to_string(group) +
+        " block=" + held.block_id + " expected_gen=" + std::to_string(held.expected_gen) +
+        " current_gen=" + std::to_string(generation) + " held_cycles=" + std::to_string(age));
+    held = HopperMBarrierPendingWait();
+    groups.set_waiting(group, false);
+    m_lane_group_progress_cycle[warp_id] = now;
+  }
+  // One group may wait while its sibling performs a bounded stream of useful
+  // work. Age the replay's lack of progress, not each group's total hold time.
+  // Actual releases above also count as progress; heartbeats never do.
+  const uint64_t idle = now - m_lane_group_progress_cycle[warp_id];
+  if (idle > m_config->wait_block_hold_watchdog_cycles) {
+    ++m_wait_block_watchdog_aborts_total;
+    std::fprintf(stderr,
+                 "[WAITBLOCK][abort][SM%u] cyc=%llu "
+                 "reason=lane-group-progress-watchdog warp=%u "
+                 "replay_idle_cycles=%llu threshold=%llu action=abort\n",
+                 m_sm_id, static_cast<unsigned long long>(now), warp_id,
+                 static_cast<unsigned long long>(idle),
+                 static_cast<unsigned long long>(m_config->wait_block_hold_watchdog_cycles));
+    for (unsigned group = 0; group < 2; ++group) {
+      if (m_lane_group_waits[warp_id][group].valid) {
+        std::fprintf(stderr, "[WAITBLOCK][lane-group-pending][SM%u] cyc=%llu %s\n",
+                     m_sm_id, static_cast<unsigned long long>(now),
+                     wait_detail(group).c_str());
+      }
+    }
+    debug_dump_tma_binding_snapshot("lane-group-progress-watchdog");
+    abort();
+  }
+  select_lane_group(warp_id);
+}
+
 void SM::service_wait_block_release(unsigned warp_id) {
   if (!m_config->wait_block_enable ||
       warp_id >= m_pending_sync_waits.size()) {
@@ -3774,6 +3971,7 @@ void SM::service_wait_block_release(unsigned warp_id) {
               << " warp=" << warp_id << " action=abort" << std::endl;
     abort();
   }
+  service_lane_group_waits(warp_id);
   service_partial_replay_progress(warp_id);
   HopperPartialWaitArm &partial_arm = m_partial_wait_arms[warp_id];
   if (partial_arm.valid &&
@@ -4277,6 +4475,9 @@ void SM::print_wait_block_summary() const {
     return;
   }
   unsigned long long active_holds = 0;
+  for (const auto &groups : m_lane_group_waits) {
+    active_holds += groups[0].valid + groups[1].valid;
+  }
   for (const HopperMBarrierPendingWait &pending : m_pending_sync_waits) {
     if (pending.valid) {
       active_holds++;
@@ -4299,6 +4500,7 @@ void SM::print_wait_block_summary() const {
     }
   }
   const bool balanced =
+      m_lane_group_extracted == m_lane_group_issued + m_lane_group_folded &&
       active_holds == 0 &&
       active_partial_arms == 0 &&
       active_partial_replay_progress == 0 &&
@@ -4314,6 +4516,13 @@ void SM::print_wait_block_summary() const {
       m_wait_block_release_service_visits_total ==
           m_wait_block_release_phase_cycles_total *
               m_pending_sync_waits.size();
+  if (m_lane_group_extracted) {
+    fprintf(stdout,
+            "[WAITBLOCK][lane-group-summary] sm=%u extracted=%llu issued=%llu folded=%llu\n",
+            m_sm_id, static_cast<unsigned long long>(m_lane_group_extracted),
+            static_cast<unsigned long long>(m_lane_group_issued),
+            static_cast<unsigned long long>(m_lane_group_folded));
+  }
   const double captured_poll_avg_hold =
       m_fold_releases_total
           ? static_cast<double>(m_fold_park_cycles_total) /
@@ -5156,6 +5365,72 @@ void SM::handle_sync_instruction(warp_inst_t &inst, unsigned int warp_id) {
                                  wait_ready);
       }
 
+      auto *group_warp = m_config->is_trace_mode
+          ? static_cast<trace_shd_warp_t *>(m_physical_warp[warp_id]) : nullptr;
+      if (m_config->wait_block_enable && group_warp && group_warp->lane_groups().active() &&
+          (has_missing_action || has_fold_wait_action)) {
+        auto &groups = group_warp->lane_groups();
+        const int group = groups.selected();
+        if (group < 0 || !inst.trace_masks_valid ||
+            inst.trace_active_mask != groups.mask(group) ||
+            inst.get_active_mask().to_ullong() != groups.mask(group) ||
+            m_lane_group_waits[warp_id][group].valid) {
+          std::cerr << "[WAITBLOCK][abort] lane-group wait owner mismatch" << std::endl;
+          abort();
+        }
+        if (has_missing_action) m_gpu->validate_lane_group_wait(inst);
+        bool captured_ready_aux = false;
+        if (is_auxiliary_fold_wait && inst.pc == poll_region.loop_head_pc &&
+            groups.remaining(group) >= 3) {
+          const auto first = groups.issued(group);
+          const auto &sleep = groups.item(group, first).instruction;
+          const auto &check = groups.item(group, first + 1).instruction;
+          const auto &branch = groups.item(group, first + 2).instruction;
+          captured_ready_aux =
+              sleep.m_pc == inst.pc + 16 && sleep.opcode == "NANOSLEEP.SYNCS" &&
+              check.m_pc == poll_region.primary_wait_pc &&
+              branch.m_pc == poll_region.loopback_bra_pc &&
+              sleep.active_mask == groups.mask(group) &&
+              check.active_mask == groups.mask(group) &&
+              branch.active_mask == groups.mask(group) &&
+              !sleep.mask && !check.mask && !branch.mask;
+        }
+        if (wait_ready) {
+          ++m_sync_debug_wait_released;
+          if (has_missing_action) ++m_missing_wait_ready_total;
+          if (is_primary_fold_wait) {
+            const auto skipped = fold_lane_group(warp_id, group, poll_region);
+            ++m_fold_immediate_folds_total;
+            m_fold_immediate_skipped_insts_total += skipped;
+            m_fold_skipped_insts_total += skipped;
+          }
+        } else if (has_missing_action || is_primary_fold_wait ||
+                   (is_auxiliary_fold_wait &&
+                    (action_uses_exact_generation || captured_ready_aux))) {
+          ++m_sync_debug_wait_pending;
+          auto &held = m_lane_group_waits[warp_id][group];
+          held = probe;
+          held.mode = has_missing_action ? WaitBlockPendingMode::MISSING_WAIT_HOLD
+              : is_primary_fold_wait ? WaitBlockPendingMode::CAPTURED_POLL_HOLD
+                                     : WaitBlockPendingMode::FOLD_AUX_WAIT_HOLD;
+          held.block_id = has_missing_action ? missing_record.block_id : poll_region.block_id;
+          held.action_pc = inst.pc;
+          held.unique_function_id = inst.unique_function_id;
+          held.expected_gen = action_expected_gen;
+          held.uses_exact_generation_ticket = action_uses_exact_generation;
+          held.hold_start_cycle = held.last_heartbeat_cycle = get_current_gpu_cycle();
+          groups.set_waiting(group, true);
+          if (has_missing_action) ++m_missing_wait_holds_total;
+          else if (is_primary_fold_wait) ++m_fold_parks_total;
+          else ++m_fold_aux_holds_total;
+          debug_log_wait_block_event("lane-group-hold",
+              "warp=" + std::to_string(warp_id) + " group=" + std::to_string(group) +
+              " block=" + held.block_id + " expected_gen=" + std::to_string(action_expected_gen) +
+              " barrier=" + std::to_string(key.barrier_addr));
+        }
+        return;
+      }
+
       if (wait_ready) {
         m_sync_debug_wait_released++;
         if (has_missing_action) {
@@ -5317,6 +5592,7 @@ void SM::handle_sync_instruction(warp_inst_t &inst, unsigned int warp_id) {
           }
           const uint64_t expected_gen = action_expected_gen;
           if (effective_mask != live_mask) {
+            m_gpu->resolve_partial_wait_occurrence(inst, missing_record);
             m_partial_missing_wait_misses_total++;
             const uint64_t effective_bits = effective_mask.to_ullong();
             const uint64_t live_bits = live_mask.to_ullong();
@@ -5752,7 +6028,9 @@ void SM::clear_sync_barrier_state_for_cta(unsigned int cta_id) {
       continue;
     }
     if (m_config->wait_block_enable &&
-        (m_partial_wait_arms[warp_id].valid ||
+        (m_lane_group_waits[warp_id][0].valid ||
+         m_lane_group_waits[warp_id][1].valid ||
+         m_partial_wait_arms[warp_id].valid ||
          m_partial_replay_progress[warp_id].valid ||
          !m_partial_joined_regions[warp_id].empty() ||
          (m_config->is_trace_mode &&
@@ -6434,6 +6712,15 @@ WaitBlockPendingMode SM::peek_wait_block_hold_mode(unsigned warp_id) const {
   // unresolved WaitBlock hold.
   if (warp_id >= m_pending_sync_waits.size()) {
     return WaitBlockPendingMode::NONE;
+  }
+  if (m_config->is_trace_mode) {
+    const auto &groups =
+        static_cast<const trace_shd_warp_t *>(m_physical_warp[warp_id])->lane_groups();
+    if (groups.active() && groups.next_group() < 0) {
+      for (const auto &held : m_lane_group_waits[warp_id]) {
+        if (held.valid) return held.mode;
+      }
+    }
   }
   const HopperMBarrierPendingWait &pending_wait = m_pending_sync_waits[warp_id];
   if (!pending_wait.valid ||

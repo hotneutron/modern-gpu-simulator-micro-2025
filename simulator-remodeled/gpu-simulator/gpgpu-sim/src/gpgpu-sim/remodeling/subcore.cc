@@ -392,7 +392,11 @@ void Subcore::control_stage(SM *shared_sm) {
         move_warp_between_reg_sets(m_CONTROL_ALLOCATE_latch, 0, m_ISSUE_CONTROL_latch, 0);
       }else {
         // If it is not a fixed_latency_instruction, it is direclty issued to its functional unit
-        if(fu->can_issue(current_ins)) {
+        const bool can_accept_now = fu->can_issue(current_ins);
+        // The one-entry ISSUE_CONTROL latch owns the promised next-control slot.
+        assert(can_accept_now || !m_config->intra_smsp_warpswitch_enable ||
+               fu->get_has_queue());
+        if(can_accept_now) {
           fu->issue(m_ISSUE_CONTROL_latch);
         } else if(m_config->headofline_instrument_enable) {
           // [Head-of-line lever] non-fixed op stuck: target FU cannot accept it (queue full) -> the
@@ -772,14 +776,10 @@ void Subcore::issue(SM *shared_sm) {
         if(is_fixed_latency_inst) {
           is_fu_available = fu->can_issue(pI);
         } else if(m_config->intra_smsp_warpswitch_enable && !fu->get_has_queue()) {
-          // [intra-SMSP warp-switch] A no-queue FU (SFU) holds its dispatch reg for a DETERMINISTIC
-          // II (dispatch_delay counts initiation_interval down), so — like a fixed-latency unit — we
-          // know at issue time whether it can accept an op. Checking can_issue() here filters a busy
-          // SFU MUFU BEFORE it enters the 1-deep ISSUE_CONTROL latch, so the warp-scan continues and
-          // GTO picks another ready warp instead of the whole subcore stalling. Queue-based FUs are
-          // excluded (their drain is non-deterministic; deferred check is correct for them). II is
-          // untouched. Gated; default off = baseline bit-identical. See .plan/CONSUMER_COMPUTE_BOUND.md.
-          is_fu_available = fu->can_issue(pI);
+          // Selection reaches control next cycle, after one more FU execute.
+          // Only admit SFU work when that transfer is guaranteed; otherwise
+          // keep warp-switching without occupying the shared issue latch.
+          is_fu_available = fu->can_issue_at_next_control(pI);
           // record that the fix actually filtered a busy-SFU head this cycle (for the effect counters).
           if(!is_fu_available) intra_ws_sfu_filtered_this_cycle = true;
         }
@@ -1678,7 +1678,7 @@ void Subcore::capture_pre_issue_snapshot(SM *shared_sm, StallCycleSnapshot &snap
     if (is_fixed_latency_inst) {
       fu_available = fu->can_issue(pI);
     } else if (m_config->intra_smsp_warpswitch_enable && !fu->get_has_queue()) {
-      fu_available = fu->can_issue(pI);
+      fu_available = fu->can_issue_at_next_control(pI);
     }
 
     bool result_queue_ok = true;

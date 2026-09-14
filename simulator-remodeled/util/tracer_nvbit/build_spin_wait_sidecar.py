@@ -529,7 +529,8 @@ def _fold_wait_site_result(insts, index, spec):
         & int(insts[index]["predicate_mask"])
     )
     current_pc = int(insts[index]["pc"])
-    for following in insts[index + 1:]:
+    for cursor in range(index + 1, len(insts)):
+        following = insts[cursor]
         if int(following["function_unique_id"]) != int(
                 insts[index]["function_unique_id"]):
             continue
@@ -547,6 +548,98 @@ def _fold_wait_site_result(insts, index, spec):
             return False
         if pc == int(spec["poll_loop_exit_pc"]):
             return True
+    return None
+
+
+# These instructions have explicit predicate operands and no implicit P/UP
+# writes. Unknown opcodes stop the witness search rather than guessing def/use.
+_WAIT_WITNESS_PASSTHROUGH = frozenset((
+    "NOP", "NANOSLEEP", "MOV", "UMOV", "R2UR", "UR2R",
+    "LDC", "ULDC", "IMAD", "UIMAD", "IADD3", "UIADD3",
+    "LEA", "ULEA", "LOP3", "ULOP3", "SHF", "USHF",
+    "ISETP", "UISETP", "SEL", "USEL",
+))
+
+
+def build_wait_outcome_specs(kernels, sync_sites):
+    """Prove a direct predicate consumer independently of runtime selection."""
+    specs = {}
+    for (fid, pc), site in sync_sites.items():
+        if site.get("sync_kind") not in WAIT_KINDS:
+            continue
+        byp = kernels.get(fid, {})
+        predicate = _wait_destination_predicate(byp.get(pc, {}))
+        if predicate is None:
+            continue
+        sequence = []
+        following = pc + ISIZE
+        while following in byp:
+            inst = byp[following]
+            opcode = _opcode_base(inst)
+            sequence.append(following)
+            if opcode == "BRA":
+                guard = _pred_of(inst)
+                target = bra_target(inst)
+                if (guard is not None
+                        and guard[0] == predicate["register"]
+                        and guard[2] == predicate["uniform"]
+                        and target in byp and following + ISIZE in byp
+                        and target != following + ISIZE):
+                    specs[(fid, pc)] = {
+                        "wait_pc": pc,
+                        "predicate": predicate["name"],
+                        "sequence_pcs": sequence,
+                        "branch_pc": following,
+                        "branch_negated": guard[1],
+                        "taken_pc": target,
+                        "fallthrough_pc": following + ISIZE,
+                    }
+                break
+            if opcode not in _WAIT_WITNESS_PASSTHROUGH:
+                break
+            # Reject any reference to the result predicate, including secondary
+            # destinations of IADD3/LEA and predicates on intervening operations.
+            regs = set()
+            for operand in inst.get("operands", []):
+                regs.update(_regs_in(operand.get("operand_string", "")))
+            guard = _pred_of(inst)
+            if guard is not None:
+                regs.add(("UP" if guard[2] else "P") + str(guard[0]))
+            if predicate["name"] in regs:
+                break
+            following += ISIZE
+    return specs
+
+
+def captured_wait_outcome(insts, index, spec):
+    """Return ready/miss only when the same lanes reach the proven branch edge."""
+    wait = insts[index]
+    fid = wait["function_unique_id"]
+    owner = int(wait["active_mask"]) & int(wait["predicate_mask"])
+    if not owner:
+        return None
+    expected = iter(spec["sequence_pcs"])
+    next_pc = next(expected)
+    result = None
+    for cursor in range(index + 1, len(insts)):
+        inst = insts[cursor]
+        active = int(inst["active_mask"]) & owner
+        if not active:
+            continue
+        if (inst["function_unique_id"] != fid
+                or active != owner or inst["pc"] != next_pc):
+            return None
+        if result is not None:
+            return result
+        if inst["pc"] == spec["branch_pc"]:
+            taken_mask = active & int(inst["predicate_mask"])
+            if taken_mask not in (0, owner):
+                return None
+            taken = taken_mask == owner
+            result = not taken if spec["branch_negated"] else taken
+            next_pc = spec["taken_pc"] if taken else spec["fallthrough_pc"]
+        else:
+            next_pc = next(expected)
     return None
 
 
@@ -634,7 +727,9 @@ def compact_runtime_generation_tickets(runtime_tickets):
 
 def analyze_mbarrier_contract_capture(traces, kdirs, kid_to_fid,
                                       sync_sites, sidecar_kernels,
-                                      max_ctas):
+                                      max_ctas, static_kernels=None):
+    outcome_specs = build_wait_outcome_specs(
+        static_kernels or {}, sync_sites)
     action_specs = {}
     for kernel in sidecar_kernels:
         kid = int(kernel["trace_kernel_id"])
@@ -666,7 +761,9 @@ def analyze_mbarrier_contract_capture(traces, kdirs, kid_to_fid,
             "unsupported_action_occurrences",
             "rejected_tma_action_occurrences", "unique_assignments",
             "ambiguous_assignments", "inconsistent_assignments",
-            "unique_streams", "ambiguous_or_invalid_streams"):
+            "unique_streams", "ambiguous_or_invalid_streams",
+            "independent_ready_witnesses", "independent_miss_witnesses",
+            "independent_unknown_waits", "wait_outcome_conflicts"):
         report[field] = 0
     tickets = []
     runtime_tickets = []
@@ -806,6 +903,21 @@ def analyze_mbarrier_contract_capture(traces, kdirs, kid_to_fid,
                                 else:
                                     result = _fold_wait_site_result(
                                         insts, index, direct_spec)
+                            outcome_spec = outcome_specs.get(site)
+                            if outcome_spec is not None:
+                                observed = captured_wait_outcome(
+                                    insts, index, outcome_spec)
+                                if observed is None:
+                                    report["independent_unknown_waits"] += 1
+                                else:
+                                    report[
+                                        "independent_ready_witnesses"
+                                        if observed else
+                                        "independent_miss_witnesses"
+                                    ] += 1
+                                    if result is not None and result != observed:
+                                        report["wait_outcome_conflicts"] += 1
+                                    result = observed
                             if result is not None:
                                 captured_wait_results[
                                     int(inst[
@@ -1026,6 +1138,7 @@ def analyze_mbarrier_contract_capture(traces, kdirs, kid_to_fid,
         "inconsistent_assignments",
         "ambiguous_assignments",
         "ambiguous_or_invalid_streams",
+        "wait_outcome_conflicts",
     )
     status = (
         "PASS"
@@ -1053,6 +1166,10 @@ def analyze_mbarrier_contract_capture(traces, kdirs, kid_to_fid,
         "model": "ONE_ARRIVAL_ONE_EXPECT_TX_CONTRACT_PER_GENERATION",
         "reject_reason_taxonomy": list(CONTRACT_REJECT_REASONS),
         "summary": dict(report),
+        "wait_outcome_proofs": [
+            {"unique_function_id": fid, **spec}
+            for (fid, _), spec in sorted(outcome_specs.items())
+        ],
         "tickets": tickets,
         "runtime_tickets": runtime_tickets,
         "runtime_ticket_streams": runtime_ticket_streams,
@@ -1753,6 +1870,136 @@ def _find_pred_branch(fid, entry, predreg, byp, sync_sites, max_span=0x120):
     return None, CFG_UNRESOLVED
 
 
+def _scan_second_wait_gate(fid, branch_pc, ready_pc, byp, sync_sites):
+    """Allow only unconditional register copies before the second probe."""
+    setup = []
+    for pc in range(branch_pc + ISIZE, branch_pc + 0x120, ISIZE):
+        if pc not in byp or pc == ready_pc:
+            break
+        inst = byp[pc]
+        if _is_wait(fid, pc, byp, sync_sites):
+            return pc, setup
+        copy = _reviewed_idempotent_copy(inst)
+        if (copy is None or inst.get("is_predicated")
+                or any(re.fullmatch(r"U?R\d+", copy[key]) is None
+                       for key in ("destination", "source"))):
+            break
+        setup.append(pc)
+    return None, setup
+
+
+def _gate_setup_preserves_registers(inst, registers):
+    """Conservative clobber check for the history of a reloaded wait state."""
+    operands = [
+        _normalized_operand(o.get("operand_string", ""))
+        for o in inst.get("operands", [])
+    ]
+    if inst.get("is_predicated") or any(
+            registers & set(_regs_in(text)) for text in operands):
+        return False
+    opcode = inst.get("op_code", "")
+    if opcode == "NOP":
+        return True
+    if not operands:
+        return False
+    destination = re.fullmatch(r"(U?R)(\d+)", operands[0])
+    if destination is None:
+        return False
+    prefix, base = destination.group(1), int(destination.group(2))
+    if opcode.startswith("HGMMA.") and prefix == "R":
+        # Accumulators extend upwards from the explicit destination. Reject
+        # every potentially overlapping register without guessing tile width.
+        return all(not reg.startswith("R") or int(reg[1:]) < base
+                   for reg in registers)
+    if opcode in ("LDS", "LDS.64", "LDS.128"):
+        width = {"LDS": 1, "LDS.64": 2, "LDS.128": 4}[opcode]
+        return not registers.intersection(
+            "%s%d" % (prefix, base + i) for i in range(width))
+    return opcode in (
+        "IMAD", "IMAD.U32", "IMAD.MOV.U32", "LEA",
+        "UIADD3", "ULEA", "USHF.L.U32", "USHF.R.U32.HI",
+        "ULOP3.LUT", "UMOV",
+    )
+
+
+def _prove_second_gate_setup(fid, cand, second_pc, setup, byp):
+    """Prove an idempotent reload, not merely equal register spellings."""
+    entry = cand["entry_wait_pc"]
+    first = byp[entry]
+    second = byp[second_pc]
+    first_ops = [_normalized_operand(o.get("operand_string", ""))
+                 for o in first.get("operands", [])]
+    second_ops = [_normalized_operand(o.get("operand_string", ""))
+                  for o in second.get("operands", [])]
+    if (len(first_ops) != 3 or first_ops != second_ops
+            or first.get("is_predicated") or second.get("is_predicated")):
+        return None
+    specs = build_wait_outcome_specs(
+        {fid: byp},
+        {(fid, pc): {"sync_kind": "TRYWAIT"} for pc in (entry, second_pc)})
+    first_proof = specs.get((fid, entry))
+    second_proof = specs.get((fid, second_pc))
+    if (first_proof is None or second_proof is None
+            or first_proof["branch_pc"] != cand["entry_branch_pc"]
+            or first_proof["branch_negated"]
+            or not second_proof["branch_negated"]
+            or second_proof["branch_pc"] != second_pc + ISIZE
+            or first_proof["taken_pc"] != second_proof["fallthrough_pc"]):
+        return None
+    copies = [_reviewed_idempotent_copy(byp[pc]) for pc in setup]
+    barrier_regs = set(_regs_in(first_ops[1]))
+    if any(c["destination"] in barrier_regs
+           and c["destination"] != c["source"] for c in copies):
+        return None
+    reloads = [c for c in copies
+               if c["destination"] == first_ops[2]
+               and c["source"] != c["destination"]]
+    sources = {c["source"] for c in reloads}
+    if len(sources) > 1 or any(c["destination"] in sources for c in copies):
+        return None
+    protected = barrier_regs | set(_regs_in(first_ops[2])) | sources
+    if any(not _gate_setup_preserves_registers(byp[pc], protected)
+           for pc in cand["mainline_setup_pcs"]):
+        return None
+    prefix = []
+    if reloads:
+        reload = reloads[0]
+        protected = {reload["destination"], reload["source"]}
+        for pc in range(entry - ISIZE, max(-1, entry - 0x1000), -ISIZE):
+            inst = byp.get(pc)
+            if inst is None:
+                return None
+            if (_reviewed_idempotent_copy(inst) == reload
+                    and not inst.get("is_predicated")):
+                prefix = list(range(pc, entry, ISIZE))
+                break
+            if not _gate_setup_preserves_registers(inst, protected):
+                return None
+        if not prefix:
+            return None
+    return {
+        "reload_prefix_pcs": prefix,
+        "first_outcome": first_proof,
+        "second_outcome": second_proof,
+    }
+
+
+def _gate_reload_was_issued(insts, index, prefix, fid, owner):
+    # Do not skip sibling work: it could redefine a warp-uniform source.
+    cursor = index - 1
+    for pc in reversed(prefix):
+        if cursor < 0:
+            return False
+        inst = insts[cursor]
+        if (inst["function_unique_id"] != fid or inst["pc"] != pc
+                or int(inst["active_mask"]) & owner != owner
+                or int(inst["active_mask"]) & int(inst["predicate_mask"]) & owner
+                != owner):
+            return False
+        cursor -= 1
+    return True
+
+
 def detect_wait_block_candidates(fid, byp, sync_sites):
     """Discover compound wait-block candidates for one kernel with NO application/
     kernel/PC filters, using ONE general rule for Type-1 and Type-2 (plan §1.7.6).
@@ -1797,14 +2044,13 @@ def detect_wait_block_candidates(fid, byp, sync_sites):
         gate_wait_pcs = [pc] + [p for p in between if _is_wait(fid, p, byp, sync_sites)]
 
         if prb[1] is False:
-            # @P BRA ready  => Type-1: ready arm is the branch target; the miss
-            # path (@!P) is the NEXT gate/branch. Require the classic 2nd-gate
-            # form: [2nd wait] then `@!P BRA fallback`.
+            # Type-1: an optional proven reload precedes the second gate.
             ready_arm = tgt
-            w2 = byp.get(br_pc + ISIZE)
-            b2 = byp.get(br_pc + 2 * ISIZE)
+            second_pc, gate_setup = _scan_second_wait_gate(
+                fid, br_pc, ready_arm, byp, sync_sites)
+            w2 = byp.get(second_pc)
+            b2 = byp.get(second_pc + ISIZE) if second_pc is not None else None
             if (w2 is None or b2 is None
-                    or not _is_wait(fid, br_pc + ISIZE, byp, sync_sites)
                     or b2["op_code"].split(".")[0] != "BRA"):
                 cand["cfg_ok"] = False
                 cand["reason"] = CFG_UNRESOLVED
@@ -1816,10 +2062,20 @@ def detect_wait_block_candidates(fid, byp, sync_sites):
                 cand["reason"] = CFG_UNRESOLVED
                 cands.append(cand)
                 continue
+            if gate_setup:
+                proof = _prove_second_gate_setup(
+                    fid, cand, second_pc, gate_setup, byp)
+                if proof is None:
+                    cand["cfg_ok"] = False
+                    cand["reason"] = CFG_UNRESOLVED
+                    cands.append(cand)
+                    continue
+                cand["gate_setup_pcs"] = gate_setup
+                cand["gate_setup_proof"] = proof
             fb_entry = bra_target(b2)
-            gate_wait_pcs.append(br_pc + ISIZE)
-            gate_poll_pcs = [pc, br_pc, br_pc + ISIZE, br_pc + 2 * ISIZE]
-            not_ready_branch_pc = br_pc + 2 * ISIZE
+            gate_wait_pcs.append(second_pc)
+            gate_poll_pcs = [pc, br_pc, second_pc, second_pc + ISIZE]
+            not_ready_branch_pc = second_pc + ISIZE
             resume_expected = ready_arm
         else:
             # @!P BRA fallback  => Type-2: miss goes to the fallback loop; ready
@@ -1849,7 +2105,8 @@ def detect_wait_block_candidates(fid, byp, sync_sites):
         cand["all_gate_wait_pcs"] = gate_wait_pcs
         cand["not_ready_branch_pc"] = not_ready_branch_pc
         cand["entry_arming_pcs"] = sorted(
-            (set(gate_poll_pcs) | set(cand["mainline_setup_pcs"])) - {pc}
+            (set(gate_poll_pcs) | set(cand["mainline_setup_pcs"])
+             | set(cand.get("gate_setup_pcs", []))) - {pc}
         )
         cand["captured_next_pc"] = resume_expected
         cand["fallback_entry_pc"] = fb_entry
@@ -1863,7 +2120,7 @@ def detect_wait_block_candidates(fid, byp, sync_sites):
         allowed = set(gate_poll_pcs)
         allowed.update(info["fallback_body_pcs"])
         cand["allowed_block_pcs"] = sorted(allowed)
-        for p in allowed:
+        for p in allowed | set(cand.get("gate_setup_pcs", [])):
             claimed.add(p)
         cands.append(cand)
     return cands
@@ -2214,6 +2471,17 @@ def make_inject_missing_wait_record(kid, c, sync_sites, byp):
         "sync_payload_missing": st.get("entry_sync_payload_missing", 0),
     }
     if partial is not None:
+        if partial.get("occurrence_regions") or partial.get("lane_group_spans"):
+            record["partial_hold_proof_version"] = (
+                4 if partial.get("lane_group_spans") else 3)
+            record["partial_join_variants"] = partial["occurrence_regions"]
+            record["partial_join_occurrences"] = partial["occurrences"]
+            record["partial_join_pending_visits"] = partial["join_pending_visits"]
+            record["partial_join_already_issued_visits"] = partial["join_already_issued_visits"]
+            if partial.get("lane_group_spans"):
+                record["lane_group_spans"] = partial["lane_group_spans"]
+                record["lane_group_occurrences"] = partial["lane_group_occurrences"]
+            return record
         region = partial["region"]
         record["partial_hold_proof_version"] = 1
         record["partial_region_id"] = "pr_k%d_fid%d_b0x%x_j0x%x" % (
@@ -2296,6 +2564,43 @@ def make_fold_captured_poll_record(kid, fid, region):
         "scoreboard_proof": region["barrier_reason"],
         "dynamic": region["dynamic"],
     }
+
+
+def validate_partial_occurrence_bindings(kernels):
+    legacy_pcs = set()
+    events = {}
+    for kernel in kernels:
+        kid = kernel["trace_kernel_id"]
+        fid = kernel["unique_function_id"]
+        for block in kernel.get("wait_blocks", []):
+            version = block.get("partial_hold_proof_version")
+            if version == 1:
+                legacy_pcs.update((kid, fid, block[name])
+                                  for name in ("join_pc", "post_join_pc"))
+            if version not in (3, 4):
+                continue
+            variants = block["partial_join_variants"]
+            for occurrence in block["partial_join_occurrences"]:
+                region = variants[occurrence["variant"]]
+                identity = (
+                    region["proof_version"], region["sibling_branch_pc"],
+                    region["join_pc"], region["post_join_pc"],
+                    region["join_kind"], region["bssy_pc"], region["join_token"])
+                for name, pc, mask in (
+                        ("sibling_join_index", region["join_pc"],
+                         occurrence["sibling_mask"]),
+                        ("blocked_join_index", region["join_pc"],
+                         occurrence["active_mask"] & occurrence["predicate_mask"]),
+                        ("post_join_index", region["post_join_pc"],
+                         occurrence["live_mask"])):
+                    key = (kid, fid, pc, *occurrence["cta"],
+                           occurrence["warp_id"], occurrence[name])
+                    value = (identity, mask, name)
+                    if key in events and events[key] != value:
+                        raise ValueError("conflicting partial join occurrence: %r" % (key,))
+                    events[key] = value
+    if any(key[:3] in legacy_pcs for key in events):
+        raise ValueError("partial join PC mixes legacy and occurrence bindings")
 
 
 
@@ -2492,7 +2797,8 @@ def prove_partial_join_static(byp, sibling_branch_pc, join_pc, post_join_pc):
 
     join_kind = _opcode_base(join)
     if (join_kind not in ("WARPSYNC", "BSYNC")
-            or join.get("is_predicated")):
+            or join.get("is_predicated")
+            or (join_kind == "WARPSYNC" and join["op_code"] != "WARPSYNC.ALL")):
         return False, PARTIAL_JOIN_STATIC_UNSAFE, None
 
     proof = {
@@ -2526,8 +2832,8 @@ def prove_partial_join_static(byp, sibling_branch_pc, join_pc, post_join_pc):
     return False, PARTIAL_JOIN_STATIC_UNSAFE, None
 
 
-def prove_partial_join_visit(cand, insts, byp, expected_fid, entry_index,
-                             live_before):
+def _prove_direct_partial_join_visit(cand, insts, byp, expected_fid, entry_index,
+                                     live_before, effective=None):
     """Prove one dynamic partial entry belongs to a join-only divergence region.
 
     The proof uses the raw active mask for lane-group ownership. Predicate masks
@@ -2547,10 +2853,11 @@ def prove_partial_join_visit(cand, insts, byp, expected_fid, entry_index,
             or (entry_mask | sibling_mask) != live_mask):
         return False, PARTIAL_MASK_PARTITION_INVALID, None
 
-    effective = [
-        int(inst["active_mask"]) & int(inst["predicate_mask"])
-        for inst in insts
-    ]
+    if effective is None:
+        effective = [
+            int(inst["active_mask"]) & int(inst["predicate_mask"])
+            for inst in insts
+        ]
 
     sibling_branch_index = None
     static_proof = None
@@ -2687,7 +2994,442 @@ def prove_partial_join_visit(cand, insts, byp, expected_fid, entry_index,
     }
 
 
-def validate_partial_join_dynamic(kdir, cands, byp, max_ctas, expected_fid):
+def prove_lane_private_poll_layout(byp, fid, head):
+    primary, branch_pc = head + 2 * ISIZE, head + 3 * ISIZE
+    pcs = list(range(head, head + 4 * ISIZE, ISIZE))
+    if any(pc not in byp for pc in pcs):
+        return False, "GROUP_POLL_STATIC_UNPROVEN", None
+    ops = [byp[pc]["op_code"] for pc in pcs]
+    if ops != ["SYNCS.PHASECHK.TRANS64.TRYWAIT", "NANOSLEEP.SYNCS",
+               "SYNCS.PHASECHK.TRANS64", "BRA"]:
+        return False, "GROUP_POLL_STATIC_UNPROVEN", None
+    pred = _wait_destination_predicate(byp[head])
+    if pred is None or pred["uniform"] or byp[head].get("is_predicated"):
+        return False, "GROUP_POLL_PREDICATE_UNPROVEN", None
+    for pc in pcs[1:]:
+        if _pred_of(byp[pc]) != (pred["register"], True, False):
+            return False, "GROUP_POLL_PREDICATE_UNPROVEN", None
+    region = {"primary_wait_pc": primary, "wait_pcs": [head, primary],
+              "loopback_bra_pc": branch_pc, "loop_head_pc": head,
+              "exit_pc": head + 4 * ISIZE}
+    if (not prove_poll_loop_control(region, byp)[0]
+            or not prove_poll_wait_condition(region, byp)[0]
+            or not compute_barrier_self_tied(pcs, byp)[0]):
+        return False, "GROUP_POLL_STATIC_UNPROVEN", None
+    effect = {"allowed_block_pcs": pcs, "loopback_bra_pc": branch_pc}
+    if not prove_effects(fid, effect, byp)[0]:
+        return False, "GROUP_POLL_EFFECT_UNSAFE", None
+    # Uniform registers/predicates would introduce shared dependencies between
+    # the two disjoint lane streams.
+    for pc in pcs:
+        for operand in _operand_texts(byp[pc]):
+            if re.search(r"\bU(?:R|P)\d+\b", operand):
+                return False, "GROUP_POLL_SHARED_REGISTER", None
+    return True, None, pcs
+
+
+def prove_lane_group_poll_span(insts, byp, fid, start_index, live_mask):
+    """Prove a replay partition, never a WARPSYNC/BSYNC substitute."""
+    if not 0 <= start_index < len(insts):
+        return False, "GROUP_POLL_START_INVALID", None
+    start = insts[start_index]
+    head = start["pc"]
+    primary, branch_pc = head + 2 * ISIZE, head + 3 * ISIZE
+    ok, reason, pcs = prove_lane_private_poll_layout(byp, fid, head)
+    if not ok:
+        return False, reason, None
+    polling = int(start["active_mask"])
+    main = live_mask & ~polling
+    if (not polling or not main or polling & ~live_mask
+            or polling & int(start["predicate_mask"]) != polling):
+        return False, "GROUP_POLL_MASK_INVALID", None
+    if (not start["sync_valid"] or start["barrier_addr"] is None
+            or start["semantic_raw"] is None):
+        return False, "GROUP_POLL_PAYLOAD_MISSING", None
+    condition = (start["barrier_addr"], start["semantic_raw"])
+    expected_pc = head
+    projected = [[], []]
+    polling_indices = []
+    poll_exited = False
+    skipped_probe = False
+    sibling_tail_pc = None
+    main_tail_index = None
+    sibling_tail_index = None
+    latest_main_wait = None
+    main_tail_pc = None
+    for idx in range(start_index, len(insts)):
+        inst = insts[idx]
+        pc = inst["pc"]
+        active = int(inst["active_mask"])
+        effective = active & int(inst["predicate_mask"])
+        if inst["function_unique_id"] != fid or pc not in byp:
+            return False, "GROUP_POLL_IDENTITY_MISMATCH", None
+        if active == live_mask:
+            wait_merge = (
+                not poll_exited and inst["sync_valid"] and effective == live_mask
+                and pc in (head, primary) and pc == expected_pc
+                and latest_main_wait == condition
+                and (main_tail_pc == pc - ISIZE
+                     or pc == head and main_tail_pc == branch_pc)
+                and (inst["barrier_addr"], inst["semantic_raw"]) == condition)
+            collective = collective_join_layout(byp, pc - ISIZE)
+            collective_merge = (
+                poll_exited and effective == live_mask and collective is not None
+                and main_tail_pc == pc - ISIZE and sibling_tail_pc == pc - ISIZE
+                and _collective_mask_was_issued(
+                    insts, main_tail_index, collective["mask_pc"], fid, main)
+                and _collective_mask_was_issued(
+                    insts, sibling_tail_index, collective["mask_pc"], fid, polling))
+            if not wait_merge and not collective_merge:
+                return False, "GROUP_POLL_MERGE_UNPROVEN", None
+            if collective_merge:
+                for offset, body_pc in enumerate(
+                        range(pc, collective["end_pc"] + ISIZE, ISIZE)):
+                    if idx + offset >= len(insts):
+                        return False, "GROUP_POLL_MERGE_UNPROVEN", None
+                    body = insts[idx + offset]
+                    if (body["function_unique_id"] != fid or body["pc"] != body_pc
+                            or int(body["active_mask"]) != live_mask
+                            or int(body["predicate_mask"]) & live_mask != live_mask):
+                        return False, "GROUP_POLL_MERGE_UNPROVEN", None
+            if not projected[0] or not projected[1]:
+                return False, "GROUP_POLL_EMPTY_STREAM", None
+            return True, None, {
+                "start_index": start_index, "merge_index": idx,
+                "poll_head_pc": head, "poll_probe_pc": primary,
+                "poll_loopback_pc": branch_pc, "merge_pc": pc,
+                "main_mask": main, "polling_mask": polling, "live_mask": live_mask,
+                "barrier_addr": condition[0], "wait_state_raw": condition[1],
+                "main_indices": projected[0], "polling_indices": projected[1],
+                "reorderable_indices": polling_indices,
+                "merge_kind": "COLLECTIVE" if collective_merge else "POLL",
+            }
+        if active == polling:
+            if not poll_exited:
+                if (pc != expected_pc or
+                        effective not in (0, polling) or
+                        pc == head and effective != polling or
+                        pc == primary and (effective == 0) != skipped_probe or
+                        pc == branch_pc and skipped_probe and effective):
+                    return False, "GROUP_POLL_CONTROL_ESCAPE", None
+                if pc == head + ISIZE:
+                    skipped_probe = effective == 0
+                if pc in (head, primary) and effective:
+                    if (not inst["sync_valid"] or
+                            (inst["barrier_addr"], inst["semantic_raw"]) != condition):
+                        return False, "GROUP_POLL_CONDITION_CHANGED", None
+                polling_indices.append(idx)
+                poll_exited = pc == branch_pc and effective == 0
+                expected_pc = head if pc == branch_pc else pc + ISIZE
+            elif _opcode_base(byp[pc]) in (
+                    "CALL", "RET", "EXIT", "BRX", "JMP", "JMX", "RTT"):
+                return False, "GROUP_POLL_TAIL_CONTROL_UNSAFE", None
+            sibling_tail_pc, sibling_tail_index = pc, idx
+            projected[1].append(idx)
+        elif active == main or active == 0:
+            if _opcode_base(byp[pc]) in (
+                    "CALL", "RET", "EXIT", "BRX", "JMP", "JMX", "RTT"):
+                return False, "GROUP_MAIN_CONTROL_UNSAFE", None
+            if active:
+                main_tail_pc = pc
+                main_tail_index = idx
+                if pc in (head, primary):
+                    if effective and (not inst["sync_valid"] or effective != main):
+                        return False, "GROUP_MAIN_WAIT_UNPROVEN", None
+                    if effective:
+                        latest_main_wait = (inst["barrier_addr"], inst["semantic_raw"])
+            projected[0].append(idx)
+        else:
+            return False, "GROUP_POLL_MASK_ESCAPE", None
+    return False, "GROUP_POLL_MERGE_MISSING", None
+
+
+def find_lane_group_poll_spans(insts, byp, fid, live_before, entry_pcs=None):
+    """Discover nonoverlapping replay partitions without PC-specific rules."""
+    spans = []
+    entry_masks = ({int(inst["active_mask"]) for inst in insts
+                    if inst["pc"] in entry_pcs and
+                    int(inst["active_mask"]) & int(inst["predicate_mask"])}
+                   if entry_pcs is not None else None)
+    idx = 0
+    while idx < len(insts):
+        inst = insts[idx]
+        if (inst["function_unique_id"] == fid
+                and 0 < int(inst["active_mask"]) < live_before[idx]
+                and (entry_masks is None or
+                     live_before[idx] & ~int(inst["active_mask"]) in entry_masks)
+                and byp.get(inst["pc"], {}).get("op_code") ==
+                "SYNCS.PHASECHK.TRANS64.TRYWAIT"
+                and byp.get(inst["pc"] + ISIZE, {}).get("op_code") ==
+                "NANOSLEEP.SYNCS"):
+            ok, _, proof = prove_lane_group_poll_span(
+                insts, byp, fid, idx, live_before[idx])
+            if ok and entry_pcs is not None:
+                visits = [i for i in range(idx + 1, proof["merge_index"])
+                          if insts[i]["pc"] in entry_pcs
+                          and int(insts[i]["active_mask"]) & int(insts[i]["predicate_mask"])]
+                ok = bool(visits) and all(
+                    int(insts[i]["active_mask"]) == proof["main_mask"] for i in visits)
+            if ok:
+                proof["poll_start_index"] = idx
+                first = idx
+                for prev in range(idx - 1, -1, -1):
+                    prior = insts[prev]
+                    if (prior["function_unique_id"] != fid or
+                            int(prior["active_mask"]) not in (
+                                0, proof["main_mask"], proof["polling_mask"])):
+                        break
+                    if (int(prior["active_mask"]) == proof["main_mask"]
+                            and byp.get(prior["pc"], {}).get("op_code") ==
+                            "SYNCS.PHASECHK.TRANS64.TRYWAIT"
+                            and byp.get(prior["pc"] + ISIZE, {}).get("op_code") ==
+                            "NANOSLEEP.SYNCS"
+                            and prior["sync_valid"]
+                            and int(prior["predicate_mask"]) & proof["main_mask"] ==
+                            proof["main_mask"]):
+                        first = prev
+                proof["start_index"] = first
+                if any(_opcode_base(byp.get(insts[i]["pc"], {})) in (
+                        "CALL", "RET", "EXIT", "BRX", "JMP", "JMX", "RTT")
+                       for i in range(first, idx)):
+                    idx += 1
+                    continue
+                if spans and first < spans[-1]["merge_index"]:
+                    idx += 1
+                    continue
+                prefix_pcs = []
+                if first != idx:
+                    prefix_ok, _, prefix_pcs = prove_lane_private_poll_layout(
+                        byp, fid, insts[first]["pc"])
+                    if not prefix_ok:
+                        idx += 1
+                        continue
+                proof["prefix_poll_pcs"] = prefix_pcs
+                proof["main_indices"] = [
+                    i for i in range(first, idx)
+                    if int(insts[i]["active_mask"]) in (0, proof["main_mask"])
+                ] + proof["main_indices"]
+                proof["polling_indices"] = [
+                    i for i in range(first, idx)
+                    if int(insts[i]["active_mask"]) == proof["polling_mask"]
+                ] + proof["polling_indices"]
+                trigger = insts[first]
+                proof.update(
+                    start_pc=trigger["pc"], start_mask=int(trigger["active_mask"]),
+                    start_barrier_addr=trigger["barrier_addr"],
+                    start_wait_state_raw=trigger["semantic_raw"])
+                spans.append(proof)
+                idx = proof["merge_index"]
+                continue
+        idx += 1
+    return spans
+
+
+def collective_join_layout(byp, join_pc):
+    """Recognize a full-mask collective with a bounded, linear shuffle body."""
+    join = byp.get(join_pc, {})
+    operands = _operand_texts(join)
+    if (join.get("op_code") != "WARPSYNC.COLLECTIVE"
+            or join.get("is_predicated") or len(operands) != 2
+            or re.fullmatch(r"R\d+", operands[0]) is None):
+        return None
+    mask_pc = join_pc - ISIZE
+    mask_inst = byp.get(mask_pc, {})
+    mask_ops = _operand_texts(mask_inst)
+    if (mask_inst.get("op_code") != "IMAD.MOV.U32"
+            or mask_inst.get("is_predicated") or len(mask_ops) != 4
+            or mask_ops[:3] != [operands[0], "RZ", "RZ"]):
+        return None
+    # Enhanced JSON stores immediates as doubles; uint64 -1 rounds to 2**64.
+    # The original SASS token retains the exact U32 constant.
+    try:
+        mask_value = int(mask_ops[3], 0)
+    except ValueError:
+        return None
+    if mask_value not in (-1, 0xffffffff):
+        return None
+    resume_pc = _direct_target(join)
+    if resume_pc is None or resume_pc not in byp or resume_pc % ISIZE:
+        return None
+    end_pc = resume_pc - ISIZE
+    if end_pc <= join_pc + ISIZE:
+        return None
+    end = byp.get(end_pc, {})
+    if (end.get("op_code") != "ENDCOLLECTIVE"
+            or end.get("is_predicated") or end.get("operands")):
+        return None
+    for pc in range(join_pc + ISIZE, end_pc, ISIZE):
+        inst = byp.get(pc, {})
+        if (not inst.get("op_code", "").startswith("SHFL.")
+                or inst.get("is_predicated")):
+            return None
+    return {"mask_pc": mask_pc, "end_pc": end_pc}
+
+
+def _collective_mask_was_issued(insts, join_index, mask_pc, fid, owner):
+    for idx in range(join_index - 1, -1, -1):
+        inst = insts[idx]
+        if inst["function_unique_id"] != fid:
+            return False
+        active = int(inst["active_mask"])
+        if active & owner:
+            return (inst["pc"] == mask_pc and active == owner
+                    and active & int(inst["predicate_mask"]) == owner)
+    return False
+
+
+def _prove_arrived_warpsync_visit(cand, insts, byp, expected_fid, entry_index,
+                                 live_before):
+    """Prove an already-arrived sibling without moving its earlier work.
+
+    The last sibling-owned occurrence must be WARPSYNC.ALL or a proven
+    full-mask WARPSYNC.COLLECTIVE.
+    From that occurrence until the full-warp continuation, only the blocked
+    lanes may issue. Source indices, not repeated PCs alone, delimit the visit.
+    """
+    live = int(live_before[entry_index])
+    entry = insts[entry_index]
+    blocked = int(entry["active_mask"]) & int(entry["predicate_mask"])
+    sibling = live & ~blocked
+    if (not blocked or not sibling or blocked & ~live
+            or int(entry["active_mask"]) != blocked):
+        return False, PARTIAL_MASK_PARTITION_INVALID, None
+
+    sibling_index = None
+    collective = None
+    for idx in range(entry_index - 1, -1, -1):
+        inst = insts[idx]
+        if inst["function_unique_id"] != expected_fid:
+            return False, CTA_IDENTITY_MISMATCH, None
+        active = int(inst["active_mask"])
+        if active & sibling:
+            static = byp.get(inst["pc"], {})
+            if static.get("op_code") == "WARPSYNC.COLLECTIVE":
+                collective = collective_join_layout(byp, inst["pc"])
+            if (active != sibling
+                    or active & int(inst["predicate_mask"]) != sibling
+                    or (static.get("op_code") != "WARPSYNC.ALL"
+                        and collective is None)
+                    or static.get("is_predicated")):
+                return False, PARTIAL_SIBLING_NOT_QUIESCENT, None
+            sibling_index = idx
+            break
+    if sibling_index is None:
+        return False, PARTIAL_JOIN_OCCURRENCE_MISSING, None
+    join_pc = insts[sibling_index]["pc"]
+    post_pc = join_pc + ISIZE
+    if post_pc not in byp:
+        return False, PARTIAL_JOIN_STATIC_UNSAFE, None
+    for idx in range(sibling_index - 1, -1, -1):
+        inst = insts[idx]
+        if inst["function_unique_id"] != expected_fid:
+            return False, CTA_IDENTITY_MISMATCH, None
+        if int(inst["active_mask"]) == live:
+            break
+        if inst["pc"] == join_pc and int(inst["active_mask"]) & sibling:
+            return False, PARTIAL_JOIN_OCCURRENCE_MISSING, None
+
+    blocked_index = None
+    post_index = None
+    for idx in range(sibling_index + 1, len(insts)):
+        inst = insts[idx]
+        active = int(inst["active_mask"])
+        static = byp.get(inst["pc"])
+        if inst["function_unique_id"] != expected_fid:
+            return False, CTA_IDENTITY_MISMATCH, None
+        if static is None or _opcode_base(static) in (
+                "CALL", "RET", "EXIT", "BRX", "JMP", "JMX", "RTT"):
+            return False, PARTIAL_CAPSULE_CONTROL_UNSAFE, None
+        if not active:
+            continue
+        if blocked_index is not None:
+            if (inst["pc"] != post_pc or active != live
+                    or active & int(inst["predicate_mask"]) != live):
+                return False, PARTIAL_POST_JOIN_UNRESOLVED, None
+            post_index = idx
+            break
+        if active & sibling:
+            return False, PARTIAL_SIBLING_NOT_QUIESCENT, None
+        if active & ~blocked:
+            return False, PARTIAL_CAPSULE_MASK_ESCAPE, None
+        if inst["pc"] == post_pc:
+            return False, PARTIAL_POST_JOIN_UNRESOLVED, None
+        if inst["pc"] == join_pc:
+            if (idx <= entry_index or active != blocked
+                    or active & int(inst["predicate_mask"]) != blocked):
+                return False, PARTIAL_JOIN_OCCURRENCE_MISSING, None
+            blocked_index = idx
+    if blocked_index is None or post_index is None:
+        return False, PARTIAL_JOIN_OCCURRENCE_MISSING, None
+    if collective is not None:
+        for index, owner in ((sibling_index, sibling), (blocked_index, blocked)):
+            if not _collective_mask_was_issued(
+                    insts, index, collective["mask_pc"], expected_fid, owner):
+                return False, PARTIAL_JOIN_STATIC_UNSAFE, None
+        # The full-warp collective is replayed unchanged. It is not an
+        # effect-free poll capsule and must not be skipped or duplicated.
+        for offset, pc in enumerate(range(post_pc, collective["end_pc"] + ISIZE, ISIZE)):
+            idx = post_index + offset
+            if idx >= len(insts):
+                return False, PARTIAL_POST_JOIN_UNRESOLVED, None
+            inst = insts[idx]
+            if (inst["function_unique_id"] != expected_fid
+                    or inst["pc"] != pc or int(inst["active_mask"]) != live
+                    or int(inst["active_mask"]) & int(inst["predicate_mask"]) != live):
+                return False, PARTIAL_POST_JOIN_UNRESOLVED, None
+
+    resume_index = None
+    branch_index = None
+    for idx in range(entry_index + 1, blocked_index + 1):
+        inst = insts[idx]
+        if int(inst["active_mask"]) != blocked:
+            continue
+        if inst["pc"] == cand["resume_pc"]:
+            resume_index = idx
+            break
+        if inst["pc"] == cand["not_ready_branch_pc"]:
+            branch_index = idx
+    if branch_index is None:
+        return False, PARTIAL_ENTRY_BRANCH_OCCURRENCE_MISSING, None
+    if resume_index is None:
+        return False, PARTIAL_JOIN_OCCURRENCE_MISSING, None
+    return True, None, {
+        "entry_mask": blocked,
+        "sibling_mask": sibling,
+        "live_mask": live,
+        "sibling_branch_index": None,
+        "sibling_join_index": sibling_index,
+        "blocked_join_index": blocked_index,
+        "entry_branch_index": branch_index,
+        "resume_index": resume_index,
+        "post_join_index": post_index,
+        "join_pending_at_entry": False,
+        "static": {
+            "proof_version": 2,
+            "sibling_branch_pc": None,
+            "sibling_branch_target_pc": None,
+            "join_pc": join_pc,
+            "post_join_pc": post_pc,
+            "join_kind": "WARPSYNC",
+            "bssy_pc": None,
+            "join_token": None,
+        },
+    }
+
+
+def prove_partial_join_visit(cand, insts, byp, expected_fid, entry_index,
+                             live_before, effective=None):
+    direct = _prove_direct_partial_join_visit(
+        cand, insts, byp, expected_fid, entry_index, live_before, effective)
+    if direct[0]:
+        return direct
+    arrived = _prove_arrived_warpsync_visit(
+        cand, insts, byp, expected_fid, entry_index, live_before)
+    return arrived if arrived[0] else direct
+
+
+def validate_partial_join_dynamic(kdir, cands, byp, max_ctas, expected_fid,
+                                  lane_group_enabled=False):
     """Validate the partial deferred-suffix contract over every selected CTA."""
     files = sorted(glob.glob(os.path.join(kdir, "*.pb")))
     if max_ctas != "all":
@@ -2704,11 +3446,15 @@ def validate_partial_join_dynamic(kdir, cands, byp, max_ctas, expected_fid):
             "sibling_masks": Counter(),
             "live_masks": Counter(),
             "regions": {},
+            "occurrences": [],
+            "lane_group_spans": {},
+            "lane_group_occurrences": [],
         }
 
     for path in files:
-        warps = vpb_parse_full(open(path, "rb").read())
-        for _, insts in warps:
+        with open(path, "rb") as handle:
+            warps = vpb_parse_full(handle.read())
+        for warp_id, insts in warps:
             effective = [
                 int(inst["active_mask"]) & int(inst["predicate_mask"])
                 for inst in insts
@@ -2725,6 +3471,21 @@ def validate_partial_join_dynamic(kdir, cands, byp, max_ctas, expected_fid):
                         and effective[idx]):
                     live &= ~effective[idx]
 
+            joins = {
+                idx: prove_partial_join_visit(
+                    cand, insts, byp, expected_fid, idx, live_before, effective)
+                for cand in cands for idx, inst in enumerate(insts)
+                if inst["function_unique_id"] == expected_fid
+                and inst["pc"] == cand["entry_wait_pc"]
+                and effective[idx] and effective[idx] != live_before[idx]
+            }
+            failed_indices = [idx for idx, proof in joins.items() if not proof[0]]
+            spans = (find_lane_group_poll_spans(
+                insts, byp, expected_fid, live_before,
+                {c["entry_wait_pc"] for c in cands})
+                if lane_group_enabled and failed_indices else [])
+            spans = [span for span in spans if any(
+                span["start_index"] < idx < span["merge_index"] for idx in failed_indices)]
             for cand in cands:
                 st = stats[cand["block_id"]]
                 if not st["dynamic_ok"]:
@@ -2735,8 +3496,34 @@ def validate_partial_join_dynamic(kdir, cands, byp, max_ctas, expected_fid):
                             or effective[idx] == 0
                             or effective[idx] == live_before[idx]):
                         continue
-                    ok, reason, proof = prove_partial_join_visit(
-                        cand, insts, byp, expected_fid, idx, live_before)
+                    ok, reason, proof = joins[idx]
+                    group = next((s for s in spans
+                                  if s["start_index"] < idx < s["merge_index"]
+                                  and int(inst["active_mask"]) == s["main_mask"]
+                                  and effective[idx] == s["main_mask"]), None)
+                    if group is not None:
+                        cta = list(_parse_cta_file_coordinates(os.path.basename(path)))
+                        span_key = (*cta, warp_id, group["start_index"])
+                        if span_key not in st["lane_group_spans"]:
+                            serialized = {k: v for k, v in group.items()
+                                          if not k.endswith("_indices")}
+                            serialized.update(
+                                cta=cta, warp_id=warp_id,
+                                main_count=len(group["main_indices"]),
+                                polling_count=len(group["polling_indices"]),
+                                reorderable_count=len(group["reorderable_indices"]),
+                                reorderable_until=group["reorderable_indices"][-1])
+                            st["lane_group_spans"][span_key] = serialized
+                        st["lane_group_occurrences"].append({
+                            "cta": cta, "warp_id": warp_id, "source_index": idx,
+                            "start_index": group["start_index"],
+                            "active_mask": int(inst["active_mask"]),
+                            "predicate_mask": int(inst["predicate_mask"]),
+                            "barrier_addr": inst["barrier_addr"],
+                            "wait_state_raw": inst["semantic_raw"],
+                        })
+                        st["partial_visits"] += 1
+                        continue
                     if not ok:
                         st["dynamic_ok"] = False
                         st["reason"] = reason
@@ -2765,9 +3552,25 @@ def validate_partial_join_dynamic(kdir, cands, byp, max_ctas, expected_fid):
                         static["join_kind"],
                         static["bssy_pc"],
                         static["join_token"],
+                        static.get("proof_version", 1),
                     )
                     st["regions"].setdefault(region_key, 0)
                     st["regions"][region_key] += 1
+                    st["occurrences"].append({
+                        "cta": list(_parse_cta_file_coordinates(os.path.basename(path))),
+                        "warp_id": warp_id,
+                        "source_index": idx,
+                        "active_mask": int(inst["active_mask"]),
+                        "predicate_mask": int(inst["predicate_mask"]),
+                        "barrier_addr": inst["barrier_addr"],
+                        "wait_state_raw": inst["semantic_raw"],
+                        "sibling_join_index": proof["sibling_join_index"],
+                        "blocked_join_index": proof["blocked_join_index"],
+                        "post_join_index": proof["post_join_index"],
+                        "sibling_mask": proof["sibling_mask"],
+                        "live_mask": proof["live_mask"],
+                        "region_key": region_key,
+                    })
 
     for cand in cands:
         st = stats[cand["block_id"]]
@@ -2775,22 +3578,42 @@ def validate_partial_join_dynamic(kdir, cands, byp, max_ctas, expected_fid):
         if st["dynamic_ok"] and st["partial_visits"] != expected_visits:
             st["dynamic_ok"] = False
             st["reason"] = PARTIAL_REGION_INCONSISTENT
-        if st["dynamic_ok"] and len(st["regions"]) != 1:
+        if st["dynamic_ok"] and not st["regions"] and not st["lane_group_spans"]:
             st["dynamic_ok"] = False
             st["reason"] = PARTIAL_REGION_INCONSISTENT
-        if st["dynamic_ok"]:
+        if st["dynamic_ok"] and (
+                st["lane_group_spans"] or len(st["regions"]) > 1
+                or next(iter(st["regions"]))[6] == 2):
+            keys = list(st["regions"])
+            st["occurrence_regions"] = [{
+                "proof_version": key[6],
+                "sibling_branch_pc": key[0],
+                "join_pc": key[1],
+                "post_join_pc": key[2],
+                "join_kind": key[3],
+                "bssy_pc": key[4],
+                "join_token": key[5],
+            } for key in keys]
+            for occurrence in st["occurrences"]:
+                occurrence["variant"] = keys.index(occurrence.pop("region_key"))
+        if st["dynamic_ok"] and st["regions"]:
             region_key, region_visits = next(iter(st["regions"].items()))
             st["region"] = {
                 "sibling_branch_pc": region_key[0],
-                "sibling_branch_target_pc": region_key[1],
+                "sibling_branch_target_pc":
+                    region_key[1] if region_key[6] == 1 else None,
                 "join_pc": region_key[1],
                 "post_join_pc": region_key[2],
                 "join_kind": region_key[3],
                 "bssy_pc": region_key[4],
                 "join_token": region_key[5],
+                "proof_version": region_key[6],
                 "validated_visits": region_visits,
             }
         del st["regions"]
+        st["lane_group_spans"] = list(st["lane_group_spans"].values())
+        if "occurrence_regions" not in st:
+            del st["occurrences"]
         for key in ("entry_masks", "sibling_masks", "live_masks"):
             st[key] = dict(sorted(st[key].items()))
     return stats, len(files)
@@ -2831,7 +3654,8 @@ def validate_wait_blocks_dynamic(kdir, cands, byp, all_byp, max_ctas,
             "reason": None,
         }
     for f in files:
-        warps = vpb_parse_full(open(f, "rb").read())
+        with open(f, "rb") as handle:
+            warps = vpb_parse_full(handle.read())
         for wid, insts in warps:
             pcs = [i["pc"] for i in insts]
             fids = [i["function_unique_id"] for i in insts]
@@ -2871,6 +3695,8 @@ def validate_wait_blocks_dynamic(kdir, cands, byp, all_byp, max_ctas,
                 # allowed_block_pcs (never skipped), so treat it as pass-through
                 # here rather than a path escape.
                 mainline = set(c.get("mainline_setup_pcs", []))
+                mainline.update(c.get("gate_setup_pcs", []))
+                gate_proof = c.get("gate_setup_proof")
                 fb_entry = c["fallback_entry_pc"]
                 j = 0
                 while j < n:
@@ -2885,6 +3711,15 @@ def validate_wait_blocks_dynamic(kdir, cands, byp, all_byp, max_ctas,
                     st["active_entry_visits"] += 1
                     entry_mask = effective[j]
                     entry_live = live_before[j]
+                    if gate_proof is not None:
+                        first_outcome = captured_wait_outcome(
+                            insts, j, gate_proof["first_outcome"])
+                        if (first_outcome is None or not _gate_reload_was_issued(
+                                insts, j, gate_proof["reload_prefix_pcs"],
+                                expected_fid, entry_mask)):
+                            st["dynamic_ok"] = False
+                            st["reason"] = DYNAMIC_PATH_ESCAPE
+                            break
                     st["entry_effective_masks"]["0x%x" % entry_mask] += 1
                     st["entry_live_masks"]["0x%x" % entry_live] += 1
                     if entry_mask == entry_live:
@@ -2934,10 +3769,25 @@ def validate_wait_blocks_dynamic(kdir, cands, byp, all_byp, max_ctas,
                             break
                         if p == g2:
                             saw_g2 = True
+                            if (gate_proof is not None
+                                    and (not _gate_reload_was_issued(
+                                        insts, k, c["gate_setup_pcs"],
+                                        expected_fid, entry_mask)
+                                    or captured_wait_outcome(
+                                        insts, k, gate_proof["second_outcome"])
+                                    is None)):
+                                st["dynamic_ok"] = False
+                                st["reason"] = DYNAMIC_PATH_ESCAPE
+                                break
                         if p == fb_entry:
                             saw_fb = True
                         k += 1
                     if not st["dynamic_ok"]:
+                        break
+                    if (gate_proof is not None
+                            and first_outcome != (not saw_g2 and not saw_fb)):
+                        st["dynamic_ok"] = False
+                        st["reason"] = DYNAMIC_PATH_ESCAPE
                         break
                     if not landed:
                         # ran off the end of the recorded stream without resuming:
@@ -2977,8 +3827,8 @@ def main():
              "capture-only feasibility report")
     ap.add_argument(
         "--contract-baseline-traces", default=None,
-        help="accepted baseline traces directory used for the mandatory "
-             "semantic, WaitBlock, and TMA comparison")
+        help="optional accepted baseline traces directory used for an "
+             "independent semantic, WaitBlock, and TMA comparison")
     args = ap.parse_args()
 
     traces = args.traces
@@ -3131,7 +3981,11 @@ def main():
             c["canonical_wait_condition"] = canonical
             st = wb_dyn.get(c["block_id"], {})
             if not st.get("dynamic_ok", False):
-                _bucket(c, st.get("reason", DYNAMIC_PATH_ESCAPE))
+                reason = st.get("reason", DYNAMIC_PATH_ESCAPE)
+                if c.get("gate_setup_proof") is not None:
+                    wb_fail.append((c, reason))
+                else:
+                    _bucket(c, reason)
                 continue
             c["dynamic"] = st
             wb_pass.append(c)
@@ -3166,7 +4020,7 @@ def main():
         if partial_candidates:
             partial_proofs, _ = validate_partial_join_dynamic(
                 kdirs[kid], partial_candidates, byp,
-                args.validate_ctas, fid)
+                args.validate_ctas, fid, lane_group_enabled=True)
         for c in ready_only_candidates:
             if c["dynamic"]["partial_entry_visits"] == 0:
                 inject_candidates.append(c)
@@ -3256,8 +4110,9 @@ def main():
                    st["entry_effective_masks"], st["entry_barrier_addrs"],
                    st["entry_wait_states"],
                    (" partial_action=DEFER_BLOCKED_SUFFIX_THEN_HOLD "
-                    "join=0x%x pending=%d already_issued=%d"
-                    % (proof["region"]["join_pc"],
+                    "joins=%s pending=%d already_issued=%d"
+                    % ([hex(r["join_pc"]) for r in
+                        proof.get("occurrence_regions", [proof.get("region", {})])],
                        proof["join_pending_visits"],
                        proof["join_already_issued_visits"]))
                    if proof is not None else ""))
@@ -3374,6 +4229,7 @@ def main():
     for line in report_lines:
         print(line)
 
+    validate_partial_occurrence_bindings(out_kernels)
     sidecar = {
         "version": 5,
         "schema": "wait_block_sidecar",
@@ -3417,7 +4273,7 @@ def main():
     if args.require_contract_capture:
         contract_report = analyze_mbarrier_contract_capture(
             traces, kdirs, kid_to_fid, sync_sites, out_kernels,
-            args.validate_ctas)
+            args.validate_ctas, static_kernels=kernels)
         if args.contract_baseline_traces:
             baseline = os.path.abspath(args.contract_baseline_traces)
             contract_report["baseline_comparison"] = \
@@ -3429,8 +4285,6 @@ def main():
             contract_report["baseline_comparison"] = {
                 "status": "NOT_REQUESTED",
             }
-            if args.strict:
-                contract_report["status"] = "FAIL"
         contract_path = os.path.join(
             extra, "mbarrier_contract_ordinal_feasibility.json")
         contract_tmp = contract_path + ".tmp"

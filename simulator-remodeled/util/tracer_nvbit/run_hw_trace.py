@@ -198,27 +198,6 @@ if warp_lifetime_only and warp_lifetime_sidecar:
 trim_spin_enabled = os.getenv("TRIM_SPIN") == "1"
 trim_spin_ncu_rep = os.getenv("TRIM_SPIN_NCU_REP")
 trim_spin_ncu_bin = os.getenv("TRIM_SPIN_NCU_BIN", "ncu")
-try:
-    lighter_tracer_config = resolve_lighter_tracer(os.getenv("LIGHTER_TRACER"))
-except ValueError as error:
-    raise RuntimeError(str(error))
-compact_full_capture_enabled = (
-    lighter_tracer_config.compact_wire_enabled
-)
-print(
-    "[LIGHTER-TRACER] requested={0} canonical={1} config_hash={2} "
-    "artifact_suffix={3}".format(
-        lighter_tracer_config.requested,
-        lighter_tracer_config.canonical,
-        lighter_tracer_config.config_hash,
-        lighter_tracer_config.artifact_suffix or "<none>",
-    )
-)
-if trim_spin_enabled and compact_full_capture_enabled:
-    raise RuntimeError(
-        "TRIM_SPIN=1 and LIGHTER_TRACER compact capture are mutually exclusive: "
-        "use compact full capture for Option 1, or trim/reorganization for Option 2"
-    )
 if trim_spin_enabled and not trim_spin_ncu_rep:
     raise RuntimeError(
         "TRIM_SPIN=1 requires TRIM_SPIN_NCU_REP=<path to matching .ncu-rep>"
@@ -261,39 +240,9 @@ parser.add_option("-C", "--compressed", dest="compressed", action="store_true",
 
 (options, args) = parser.parse_args()
 
-mbarrier_contract_env = os.getenv("MBARRIER_CONTRACT_CAPTURE", "0")
-if mbarrier_contract_env not in ("0", "1"):
-    raise RuntimeError(
-        "MBARRIER_CONTRACT_CAPTURE must be exactly 0 or 1"
-    )
-mbarrier_contract_capture = (
-    options.mbarrier_contract_capture or mbarrier_contract_env == "1"
-)
-if mbarrier_contract_capture and (
-        trim_spin_enabled or warp_lifetime_only or warp_lifetime_sidecar):
-    raise RuntimeError(
-        "mbarrier contract capture is incompatible with TRIM_SPIN and "
-        "warp-lifetime modes"
-    )
-contract_capture_bounds = {
+contract_capture_bound_defaults = {
     "MBARRIER_CONTRACT_BARRIERS_PER_CTA": 64,
 }
-if mbarrier_contract_capture:
-    for contract_name, contract_default in tuple(
-            contract_capture_bounds.items()):
-        raw_value = os.getenv(contract_name, str(contract_default))
-        try:
-            parsed_value = int(raw_value, 10)
-        except ValueError:
-            raise RuntimeError(
-                "{0} must be a positive decimal integer".format(
-                    contract_name)
-            )
-        if parsed_value <= 0 or parsed_value > 0x7fffffff:
-            raise RuntimeError(
-                "{0} must be in [1,2147483647]".format(contract_name)
-            )
-        contract_capture_bounds[contract_name] = parsed_value
 
 common.load_defined_yamls()
 
@@ -396,8 +345,7 @@ def validate_tma_completion_contracts_if_available(trace_folder):
     )
 
 
-def build_spin_wait_sidecar(trace_folder, require_contract_capture=False,
-                            contract_baseline_traces=None):
+def build_spin_wait_sidecar(trace_folder, require_contract_capture=False):
     # WaitBlock v5 sidecar. It needs the sync resolver + disassembly, so it runs
     # after build_sync_operand_mapping. Production trace generation always
     # validates every CTA and fails closed if any intended runtime record fails
@@ -426,14 +374,6 @@ def build_spin_wait_sidecar(trace_folder, require_contract_capture=False,
     ]
     if require_contract_capture:
         command.append("--require-contract-capture")
-        if not contract_baseline_traces:
-            raise RuntimeError(
-                "contract capture requires an accepted baseline traces path"
-            )
-        command.extend([
-            "--contract-baseline-traces",
-            contract_baseline_traces,
-        ])
     subprocess.run(command, check=True)
 
 
@@ -523,17 +463,83 @@ for bench in benchmarks:
     for argpair in argslist:
         args = argpair["args"]
         extra_env = argpair.get("env", {})
-        conflicting_config_keys = {
-            "LIGHTER_TRACER", "MBARRIER_CONTRACT_CAPTURE",
-            "MBARRIER_CONTRACT_BARRIERS_PER_CTA",
-        } & set(extra_env)
-        if conflicting_config_keys:
+        benchmark_name = argpair.get("benchmark_name", exe)
+
+        lighter_tracer_value = extra_env.get(
+            "LIGHTER_TRACER", os.getenv("LIGHTER_TRACER")
+        )
+        if lighter_tracer_value is not None:
+            lighter_tracer_value = str(lighter_tracer_value)
+        try:
+            lighter_tracer_config = resolve_lighter_tracer(
+                lighter_tracer_value
+            )
+        except ValueError as error:
             raise RuntimeError(
-                "benchmark environment cannot override tracer selection: {0}".format(
-                    ",".join(sorted(conflicting_config_keys))
+                "{0}: {1}".format(benchmark_name, error)
+            )
+        print(
+            "[LIGHTER-TRACER] benchmark={0} requested={1} canonical={2} "
+            "config_hash={3} artifact_suffix={4}".format(
+                benchmark_name,
+                lighter_tracer_config.requested,
+                lighter_tracer_config.canonical,
+                lighter_tracer_config.config_hash,
+                lighter_tracer_config.artifact_suffix or "<none>",
+            )
+        )
+        if (trim_spin_enabled
+                and lighter_tracer_config.compact_wire_enabled):
+            raise RuntimeError(
+                "TRIM_SPIN=1 and LIGHTER_TRACER compact capture are mutually "
+                "exclusive: use compact full capture for Option 1, or "
+                "trim/reorganization for Option 2"
+            )
+
+        mbarrier_contract_value = str(extra_env.get(
+            "MBARRIER_CONTRACT_CAPTURE",
+            os.getenv("MBARRIER_CONTRACT_CAPTURE", "0"),
+        ))
+        if mbarrier_contract_value not in ("0", "1"):
+            raise RuntimeError(
+                "{0}: MBARRIER_CONTRACT_CAPTURE must be exactly 0 or 1".format(
+                    benchmark_name
                 )
             )
-        benchmark_name = argpair.get("benchmark_name", exe)
+        mbarrier_contract_capture = (
+            options.mbarrier_contract_capture
+            or mbarrier_contract_value == "1"
+        )
+        if mbarrier_contract_capture and (
+                trim_spin_enabled
+                or warp_lifetime_only
+                or warp_lifetime_sidecar):
+            raise RuntimeError(
+                "mbarrier contract capture is incompatible with TRIM_SPIN and "
+                "warp-lifetime modes"
+            )
+        contract_capture_bounds = {}
+        if mbarrier_contract_capture:
+            for contract_name, contract_default in (
+                    contract_capture_bound_defaults.items()):
+                raw_value = str(extra_env.get(
+                    contract_name,
+                    os.getenv(contract_name, str(contract_default)),
+                ))
+                try:
+                    parsed_value = int(raw_value, 10)
+                except ValueError:
+                    raise RuntimeError(
+                        "{0}: {1} must be a positive decimal integer".format(
+                            benchmark_name, contract_name)
+                    )
+                if parsed_value <= 0 or parsed_value > 0x7fffffff:
+                    raise RuntimeError(
+                        "{0}: {1} must be in [1,2147483647]".format(
+                            benchmark_name, contract_name)
+                    )
+                contract_capture_bounds[contract_name] = parsed_value
+
         argument_folder = common.get_argfoldername(args)
         if warp_lifetime_only:
             lifetime_kernel = os.getenv("DYNAMIC_KERNEL_LIMIT_START", "all")
@@ -542,9 +548,6 @@ for bench in benchmarks:
             lifetime_kernel = os.getenv("DYNAMIC_KERNEL_LIMIT_START", "all")
             argument_folder += "-fulltrace-lifetime-k" + lifetime_kernel
         argument_folder += lighter_tracer_config.artifact_suffix
-        baseline_argument_folder = argument_folder
-        if mbarrier_contract_capture:
-            argument_folder += "-mbarrier-contract-v2"
         run_name = os.path.join(benchmark_name, argument_folder)
 
         # MOD. Begin. Improved tracer
@@ -561,19 +564,6 @@ for bench in benchmarks:
         this_run_dir = os.path.abspath(
             os.path.expandvars(os.path.join(trace_version_root, run_name))
         )
-        baseline_trace_folder = os.path.abspath(os.path.expandvars(
-            os.path.join(
-                trace_version_root, benchmark_name,
-                baseline_argument_folder, "traces"
-            )
-        ))
-        if (mbarrier_contract_capture
-                and not os.path.isdir(baseline_trace_folder)):
-            raise RuntimeError(
-                "contract capture baseline is missing: {0}".format(
-                    baseline_trace_folder
-                )
-            )
         # MOD. End. Improved tracer
 
         this_trace_folder = os.path.join(this_run_dir, "traces")
@@ -722,8 +712,4 @@ for bench in benchmarks:
                 build_spin_wait_sidecar(
                     this_trace_folder,
                     require_contract_capture=mbarrier_contract_capture,
-                    contract_baseline_traces=(
-                        baseline_trace_folder
-                        if mbarrier_contract_capture else None
-                    ),
                 )

@@ -929,17 +929,24 @@ class gpgpu_sim : public gpgpu_t {
   bool lookup_missing_wait(unsigned int trace_kernel_id,
                            unsigned int unique_function_id, address_type pc,
                            MissingWaitRecord &record) const;
+  void resolve_partial_wait_occurrence(const warp_inst_t &inst,
+                                       MissingWaitRecord &record) const;
+  bool lookup_lane_group_start(const warp_inst_t &inst,
+                               LaneGroupSpanRecord &span) const;
+  void validate_lane_group_wait(const warp_inst_t &inst) const;
   bool lookup_wait_block_generation_ticket(
       const WaitBlockGenerationTicketKey &key,
       WaitBlockGenerationTicket &ticket) const;
   bool lookup_partial_wait_join(unsigned int trace_kernel_id,
                                 unsigned int unique_function_id,
                                 address_type pc,
-                                PartialWaitRegionRecord &region) const;
+                                PartialWaitRegionRecord &region,
+                                const warp_inst_t *inst = nullptr) const;
   bool lookup_partial_wait_post_join(unsigned int trace_kernel_id,
                                      unsigned int unique_function_id,
                                      address_type pc,
-                                     PartialWaitRegionRecord &region) const;
+                                     PartialWaitRegionRecord &region,
+                                     const warp_inst_t *inst = nullptr) const;
 
   void record_l1i_prefetch_miss_observation(new_addr_type block_addr,
                                             unsigned int unique_function_id,

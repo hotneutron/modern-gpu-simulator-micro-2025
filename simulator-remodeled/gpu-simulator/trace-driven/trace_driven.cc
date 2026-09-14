@@ -120,13 +120,15 @@ trace_warp_inst_t *trace_shd_warp_t::get_next_trace_inst(
     // The slot was reserved against a specific replay occurrence. Reject a
     // stale instruction-cache response from an older replay stream, and decode
     // exactly that occurrence rather than a moving global head.
-    assert(m_partial_replay_origin != WaitBlockTraceOrigin::CANONICAL &&
+    assert(partial_replay_active() &&
            "replay slot decoded while no replay stream is active");
-    assert(replay_epoch == m_partial_replay_epoch &&
+    assert(replay_epoch == partial_replay_epoch() &&
            "stale replay-epoch instruction-cache response");
-    assert(replay_index < m_partial_replay.size() &&
+    assert((m_lane_groups.active() || replay_index < m_partial_replay.size()) &&
            "replay reservation index out of range");
-    inst_trace_t &trace = m_partial_replay[replay_index];
+    inst_trace_t &trace = m_lane_groups.active()
+        ? m_lane_groups.reserved_instruction(replay_index, m_lane_groups.epoch())
+        : m_partial_replay[replay_index];
     trace_warp_inst_t *new_inst =
         new trace_warp_inst_t(get_shader()->get_config());
     if (pc != trace.m_pc) {
@@ -158,7 +160,7 @@ trace_warp_inst_t *trace_shd_warp_t::get_next_trace_inst(
         trc_exec
             .get_kernel_by_unique_function_id(new_inst->unique_function_id)
             .get_instruction_ptr(pc));
-    new_inst->wait_block_trace_origin = m_partial_replay_origin;
+    new_inst->wait_block_trace_origin = partial_replay_origin();
     // Record which reserved occurrence this decoded instruction represents so
     // FIFO issue can verify exact-once, in-order commit. Filling a slot does not
     // consume/commit the replay occurrence; that happens at issue in
@@ -223,7 +225,7 @@ void trace_shd_warp_t::rollback_trace_inst(
   // (unreserve_last_partial_replay), which covers both filled and never-filled
   // slots. A decoded-but-unissued replay slot holds no committed state, so this
   // per-instruction rollback hook is a no-op for replay origins.
-  assert(inst->wait_block_trace_origin == m_partial_replay_origin);
+  assert(inst->wait_block_trace_origin == partial_replay_origin());
 }
 
 void trace_shd_warp_t::commit_trace_inst(
@@ -231,6 +233,13 @@ void trace_shd_warp_t::commit_trace_inst(
   assert(inst != nullptr);
   if (inst->wait_block_trace_origin == WaitBlockTraceOrigin::CANONICAL ||
       inst->wait_block_trace_origin == WaitBlockTraceOrigin::SYNTHETIC) {
+    return;
+  }
+  if (inst->wait_block_trace_origin == WaitBlockTraceOrigin::LANE_GROUP_REPLAY) {
+    const auto &head = m_lane_groups.head(m_lane_groups.selected());
+    assert(head.source_index == inst->trace_instruction_index);
+    assert(head.instruction.m_pc == inst->pc);
+    m_lane_groups.commit(inst->replay_occurrence_index);
     return;
   }
   assert(inst->wait_block_trace_origin == m_partial_replay_origin);
@@ -468,8 +477,140 @@ unsigned int trace_shd_warp_t::skip_partial_replay_to_exit(
   return skipped;
 }
 
+void trace_shd_warp_t::begin_lane_group_replay(
+    const LaneGroupSpanRecord &span, unsigned fid) {
+  auto require = [](bool ok, const char *reason) {
+    if (!ok) {
+      std::cerr << "[WAITBLOCK][abort] lane-group extraction: " << reason << std::endl;
+      abort();
+    }
+  };
+  require(!partial_capsule_active(), "overlapping replay");
+  require(used_insts == span.start_index + 1 &&
+              span.merge_index < traced_pcs.size(), "source range");
+  using Replay = LaneGroupReplay<inst_trace_t>;
+  std::array<std::vector<Replay::Item>, 2> streams;
+  std::map<address_type, unsigned> consumed;
+  const bool trigger_is_polling = span.start_mask == span.polling_mask;
+  uint64_t poll_count = trigger_is_polling, pure_count = trigger_is_polling;
+  uint64_t expected_poll_pc = span.poll_head_pc + (trigger_is_polling ? 16 : 0);
+  bool skipped_probe = false;
+  for (uint64_t index = used_insts; index <= span.merge_index; ++index) {
+    const auto pc = traced_pcs[index];
+    const auto found = map_warp_traces.find(pc);
+    require(found != map_warp_traces.end(), "PC missing");
+    const auto &by_pc = found->second;
+    const auto occurrence = by_pc.num_used_instructions[0] + consumed[pc];
+    require(occurrence < by_pc.num_traced_instructions, "occurrence exhausted");
+    const auto &trace = by_pc.instructions[occurrence];
+    require(trace.m_unique_function_id == fid &&
+                trace.trace_instruction_index == index, "source identity");
+    if (index == span.merge_index) {
+      require(pc == span.merge_pc && trace.active_mask == span.live_mask &&
+                  trace.mask == span.live_mask, "recorded merge mismatch");
+      break;
+    }
+    const auto owner = trace.active_mask;
+    require(owner == span.main_mask || owner == span.polling_mask || owner == 0,
+            "mask escaped partition");
+    const unsigned group = owner == span.polling_mask ? 1 : 0;
+    const bool pure = group == 1 && index >= span.poll_start_index &&
+                      index <= span.reorderable_until;
+    const bool prefix_poll = group == 0 && index < span.poll_start_index &&
+        std::find(span.prefix_poll_pcs.begin(), span.prefix_poll_pcs.end(), pc) !=
+            span.prefix_poll_pcs.end();
+    const auto op = trace.opcode.substr(0, trace.opcode.find('.'));
+    require(op != "CALL" && op != "RET" && op != "EXIT" && op != "BRX" &&
+                op != "JMP" && op != "JMX" && op != "RTT", "unsafe control");
+    if (group == 1) ++poll_count;
+    if (pure) {
+      ++pure_count;
+      require(pc == expected_poll_pc &&
+                  (trace.mask == owner || trace.mask == 0) &&
+                  (pc != span.poll_head_pc || trace.mask == owner) &&
+                  (pc != span.poll_probe_pc || (trace.mask == 0) == skipped_probe) &&
+                  (pc != span.poll_loopback_pc || !skipped_probe || trace.mask == 0),
+              "poll sequence or predicate");
+      if (pc == span.poll_head_pc + 16) skipped_probe = trace.mask == 0;
+      if ((pc == span.poll_head_pc || pc == span.poll_probe_pc) && trace.mask) {
+        require(trace.sync_runtime_valid && trace.sync_has_semantic_raw &&
+                    trace.sync_barrier_addr == span.barrier_addr &&
+                    trace.sync_semantic_raw == span.wait_state_raw, "poll condition");
+      }
+      expected_poll_pc = pc == span.poll_loopback_pc ? span.poll_head_pc : pc + 16;
+      require(pc != span.poll_loopback_pc || trace.mask != 0 ||
+                  index == span.reorderable_until,
+              "poll continued after exit");
+    }
+    streams[group].push_back({index, trace, pure || prefix_poll});
+    ++consumed[pc];
+  }
+  require(streams[0].size() + !trigger_is_polling == span.main_count &&
+              poll_count == span.polling_count && pure_count == span.reorderable_count,
+          "partition conservation");
+  for (auto &stream : streams) {
+    for (size_t i = 0; i < stream.size(); ++i) {
+      stream[i].instruction.m_next_traced_pc =
+          i + 1 < stream.size() ? stream[i + 1].instruction.m_pc : span.merge_pc;
+    }
+  }
+  m_lane_groups.begin(std::move(streams), span.main_mask, span.polling_mask,
+                      span.live_mask, span.merge_index);
+  m_lane_group_span = span;
+  for (const auto &entry : consumed) {
+    map_warp_traces.at(entry.first).num_used_instructions[0] += entry.second;
+    used_insts += entry.second;
+  }
+  require(used_insts == span.merge_index, "canonical cursor conservation");
+}
+
+bool trace_shd_warp_t::lane_group_can_fetch() const {
+  if (!m_lane_groups.active()) return true;
+  const int group = m_lane_groups.selected();
+  return group >= 0 && m_lane_groups.runnable(group) &&
+         m_lane_groups.reserved() < m_lane_groups.remaining(group);
+}
+
+unsigned trace_shd_warp_t::fold_lane_group_poll(
+    unsigned group, const SpinWaitRegionRecord &region, FoldSkipStats *out_stats) {
+  assert(m_lane_groups.active() && !m_lane_groups.reserved());
+  FoldSkipStats stats;
+  unsigned skipped = 0;
+  const std::set<uint64_t> body(region.body_pcs.begin(), region.body_pcs.end());
+  while (m_lane_groups.remaining(group)) {
+    const auto &trace = m_lane_groups.head(group).instruction;
+    if (trace.m_pc == region.exit_pc) break;
+    const bool wait = trace.opcode == "SYNCS.PHASECHK.TRANS64" ||
+                      trace.opcode == "SYNCS.PHASECHK.TRANS64.TRYWAIT";
+    const bool sleep = trace.opcode == "NANOSLEEP.SYNCS";
+    const bool copy = trace.opcode == "IMAD.U32" || trace.opcode == "IMAD.MOV.U32";
+    const bool branch = trace.opcode == "BRA" && trace.m_pc == region.loopback_bra_pc;
+    if ((!body.count(trace.m_pc) && !branch) || !(wait || sleep || copy || branch)) {
+      std::cerr << "[WAITBLOCK][abort] lane-group fold crossed semantic work" << std::endl;
+      abort();
+    }
+    ++stats.warp_insts;
+    ++stats.pc_occurrences[trace.m_pc];
+    if (wait) ++stats.phasechk_trywait;
+    else if (sleep) ++stats.nanosleep;
+    else if (copy) ++stats.imad_scratch;
+    else ++stats.loopback_bra;
+    m_lane_groups.fold_head(group);
+    ++skipped;
+  }
+  if (!m_lane_groups.remaining(group) &&
+      (region.loop_head_pc != m_lane_group_span.poll_head_pc ||
+       m_lane_group_span.merge_kind != "POLL")) {
+    std::cerr << "[WAITBLOCK][abort] lane-group fold has no exit or poll boundary" << std::endl;
+    abort();
+  }
+  if (out_stats) *out_stats = stats;
+  return skipped;
+}
+
 bool trace_shd_warp_t::partial_replay_active() const {
-  return m_partial_replay_origin != WaitBlockTraceOrigin::CANONICAL;
+  return m_lane_groups.active() ||
+         m_partial_replay_origin != WaitBlockTraceOrigin::CANONICAL;
 }
 
 bool trace_shd_warp_t::partial_blocked_replay_pending() const {
@@ -481,7 +622,8 @@ bool trace_shd_warp_t::partial_capsule_active() const {
 }
 
 WaitBlockTraceOrigin trace_shd_warp_t::partial_replay_origin() const {
-  return m_partial_replay_origin;
+  return m_lane_groups.active() ? WaitBlockTraceOrigin::LANE_GROUP_REPLAY
+                                : m_partial_replay_origin;
 }
 
 unsigned int trace_shd_warp_t::partial_replay_remaining() const {
@@ -501,6 +643,16 @@ address_type trace_shd_warp_t::canonical_trace_pc() const {
 bool trace_shd_warp_t::reserve_next_partial_replay(address_type *pc_out,
                                                    unsigned int *index_out,
                                                    uint64_t *epoch_out) {
+  if (m_lane_groups.active()) {
+    size_t index;
+    uint64_t epoch;
+    if (!m_lane_groups.reserve(index, epoch)) return false;
+    const auto &item = m_lane_groups.reserved_item(index, epoch);
+    if (pc_out) *pc_out = item.instruction.m_pc;
+    if (index_out) *index_out = index;
+    if (epoch_out) *epoch_out = partial_replay_epoch();
+    return true;
+  }
   if (m_partial_replay_origin == WaitBlockTraceOrigin::CANONICAL ||
       m_partial_replay_reserved >= m_partial_replay.size()) {
     return false;
@@ -513,13 +665,17 @@ bool trace_shd_warp_t::reserve_next_partial_replay(address_type *pc_out,
     *index_out = index;
   }
   if (epoch_out != nullptr) {
-    *epoch_out = m_partial_replay_epoch;
+    *epoch_out = partial_replay_epoch();
   }
   m_partial_replay_reserved++;
   return true;
 }
 
 void trace_shd_warp_t::unreserve_last_partial_replay() {
+  if (m_lane_groups.active()) {
+    m_lane_groups.unreserve();
+    return;
+  }
   // Give back exactly one replay reservation. Called per-removed-entry by the
   // IBuffer flush and once by remove_entry after a RESERVATION_FAIL, so an
   // un-fetched occurrence is re-reserved on the next fetch. Never drops below
@@ -529,10 +685,11 @@ void trace_shd_warp_t::unreserve_last_partial_replay() {
 }
 
 uint64_t trace_shd_warp_t::partial_replay_epoch() const {
-  return m_partial_replay_epoch;
+  return m_partial_replay_epoch + m_lane_groups.epoch();
 }
 
 void trace_shd_warp_t::clear_partial_wait_capsule() {
+  assert(!m_lane_groups.active() && "clearing undrained lane-group replay");
   m_partial_replay.clear();
   m_partial_deferred.clear();
   m_partial_replay_issued = 0;
@@ -680,6 +837,14 @@ address_type trace_shd_warp_t::get_start_trace_pc() {
 
 address_type trace_shd_warp_t::get_pc() {
   assert(traced_pcs.size() > 0);
+  if (m_lane_groups.active()) {
+    const int group = m_lane_groups.selected();
+    if (group >= 0 && m_lane_groups.remaining(group) > m_lane_groups.reserved()) {
+      return m_lane_groups.item(
+          group, m_lane_groups.issued(group) + m_lane_groups.reserved()).instruction.m_pc;
+    }
+    return m_lane_group_span.merge_pc;
+  }
   if (partial_replay_active() &&
       m_partial_replay_reserved < m_partial_replay.size()) {
     // Next fetch target within the replay stream is the next occurrence to be
@@ -874,6 +1039,9 @@ bool trace_warp_inst_t::parse_from_trace_struct(
       sp_op = (special_ops) (it2->second);
     }
     oprnd_type = get_oprnd_type(op, sp_op);
+    // Preserve raw operand/power classification while selecting the execution unit.
+    op = resolve_trace_execution_category(
+        kernel_trace_info->binary_verion, trace.opcode, op);
   } else {
     std::cout << "ERROR:  undefined instruction : " << trace.opcode
               << " Opcode: " << opcode1 << std::endl;

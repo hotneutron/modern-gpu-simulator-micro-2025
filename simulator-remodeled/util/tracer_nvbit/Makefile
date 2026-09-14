@@ -1,5 +1,6 @@
+.PHONY: all clean
 
-all: 
+all:
 	make -C tracer_tool
 	make all -C tracer_tool/traces-processing
 	#make -C silicon_checkpoint_tool

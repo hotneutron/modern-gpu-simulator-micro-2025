@@ -76,6 +76,8 @@ class functional_unit {
   void reserve_unit(register_set_uniptr &source_reg);
   void add_extra_cycle_initiation_interval();
   virtual bool can_issue(const warp_inst_t *inst) const;
+  // Scheduler query after execute/control; actual transfers use can_issue().
+  virtual bool can_issue_at_next_control(const warp_inst_t *inst) const;
   virtual void issue(register_set_uniptr &source_reg);
   virtual void cycle();
 
@@ -208,6 +210,7 @@ class functional_unit_sfu : public functional_unit {
     ~functional_unit_sfu() override = default;
 
     virtual bool can_issue(const warp_inst_t *inst) const override;
+    virtual bool can_issue_at_next_control(const warp_inst_t *inst) const override;
 };
 
 class functional_unit_shared_sm_part : public functional_unit {

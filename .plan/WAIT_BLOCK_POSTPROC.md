@@ -56,6 +56,45 @@ Every runtime-enabled record is keyed by:
 Records from different kernel launches must not overwrite each other even when
 they share a function ID and PC.
 
+### Occurrence-specific partial joins
+
+The HD128 capture demonstrates that a single ready-only entry PC can rejoin at
+different synchronization sites on different dynamic visits. Action selection
+keeps the existing key, but partial hold proof version 3 adds exact
+`(trace_kernel_id, CTA coordinates, warp_id, source instruction index)` bindings
+for the entry and its sibling, blocked, and post-join occurrences. It is separate
+from the mbarrier generation-ticket stream.
+
+Each visit must pass either the legacy direct-branch proof (variant 1), or the
+already-arrived `WARPSYNC.ALL` proof (variant 2). Variant 2 requires the last
+sibling-owned occurrence before the wait to be an active full-mask WARPSYNC
+for that sibling group, no later sibling work until reconvergence, and a
+matching blocked-group join followed by the live-warp continuation. Earlier
+sibling work is neither moved nor replayed. Repeated PCs are matched by dynamic
+source indices. Different visits may select different variants; a failed visit
+still rejects the record.
+
+Legacy single-join records remain proof version 1. Version 3 emits a variant
+table plus occurrence bindings, and requires the matching C++ loader. The
+loader checks static anchors, masks, occurrence ordering, uniqueness, and
+coverage. Runtime checks entry identity and requires an already-arrived
+sibling join to have actually issued before holding the warp. Join bookkeeping
+is occurrence-specific to avoid matching an unrelated visit to the same PC.
+
+### Independent lifecycle witnesses
+
+Lifecycle witness discovery is independent of INJECT/FOLD selection. Static
+analysis connects each supported wait predicate to a direct branch without
+intervening predicate references or unknown instructions. Dynamic analysis
+requires the same lane group to reach the recorded branch and matching edge.
+Predicated-off branches are evaluated using their raw active mask; an absent
+branch is not a ready result. Ambiguous or incomplete evidence stays unknown.
+
+These witness-only waits do not become runtime actions. Their ready outcomes
+feed the existing barrier epoch, ordinal, single-arrival, completion ownership,
+and generation uniqueness checks. A conflict with an existing runtime-action
+outcome fails validation.
+
 ## 3. Classification order
 
 Classification is deliberately ordered.
@@ -131,6 +170,34 @@ The detector proves:
 
 The detector does not need to make the uncaptured wait arm cursor-consumable.
 Runtime never enters or advances through that arm.
+
+#### Two-gate reload setup
+
+The Type-1 detector also accepts a bounded sequence of unconditional
+`IMAD.U32` / `IMAD.MOV.U32` zero-product register copies between the first
+ready branch and the second probe. This covers HD128 consumer gates such as
+`0x1640` and `0x1a40`; these PCs are examples, not discovery filters.
+
+- Both probes must have identical normalized predicate, barrier, and state
+  operands. Their direct branches must consume the same predicate namespace,
+  have opposite ready/miss polarity, and share one continuation.
+- A copied wait-state register must already contain the same source value at
+  the first probe. A bounded backwards proof finds its prior copy and rejects
+  clobbers, unknown instructions, control flow, and potentially overlapping
+  wide destinations. The dynamic trace must execute that exact prefix with
+  all entering lanes. Setup must not change the barrier address.
+- Existing first-gate setup stays on the mainline. Second-gate setup is
+  pass-through only on the captured miss path; it is not added to skippable
+  PCs. A ready-only capture executes neither that setup nor the fallback.
+- Each visit must reach a predicate-consistent branch edge. A dynamic proof
+  failure for a recognized reload gate is a strict failure, not a silent
+  skip. Mixed ready/second-gate/fallback captures retain the existing strategy
+  classification; they are not promoted to unconditional INJECT records.
+
+The emitted record still uses schema-v5 `INJECT_MISSING_WAIT` and schema-v2
+generation tickets. No new simulator mode or C++ hold logic is required.
+Regenerate both artifacts together from the actual simulation trace. A
+lifecycle-witness PASS alone does not guarantee runtime wait coverage.
 
 ### 4.3 Required dynamic proof
 
@@ -674,3 +741,131 @@ acceptance artifact until the v4 loader and runtime are implemented.
 This acceptance proves classification, payload extraction, mask census,
 strategy ownership, and strict report completeness. It does not prove simulator
 hold/release or cursor behavior.
+
+## 15. HD128 two-gate validation (2026-09-10)
+
+The post-processing fix admits the register-reload Type-1 gates without changing
+simulator production C++, schema-v5 records, or schema-v2 ticket format.
+
+| Check | Result |
+|---|---|
+| CPU tests, including compiled production loader | 120 PASS in the isolated staged snapshot (102 existing + 18 new) |
+| HD128 all-CTA strict generation with contract capture | PASS; INJECT 20, FOLD 11, metadata 3, failed 0 |
+| K10 `0x1640` / `0x1a40` | 52224 ready-only all-live visits each; no missing sync payload |
+| HD128 exact target slots | 36210 -> 140658; exactly 104448 new slots |
+| Existing HD128 tickets / eligible barriers | Unchanged |
+| HD128 K5 records / K10 FOLD records | Unchanged |
+| HD64 contract-v2 baseline | All kernel records, report counts, and entire ticket document unchanged |
+| Original `.pb` files and `stats.csv` | Before/after aggregate SHA-256 unchanged for both inputs |
+
+Validation used separate output directories without overwriting the source
+trace or its sidecars. The final dynamic guards additionally passed all 384
+K10 CTAs and produced the same records. Temporary output directories, logs,
+and validation helpers were removed after recording these results; the
+permanent regression tests remain under `util/tracer_nvbit/tests/`.
+
+The payload check hashed each sorted relative `.pb` path and its bytes,
+followed by `stats.csv` and its bytes. Before/after values were identical:
+
+| Input | Files | Aggregate SHA-256 |
+|---|---:|---|
+| HD128 device-2 capture | 18040 | `6cd57f6eb8fd2e279ffcbf1f67c66e63a29249c7e8f70a00654b7ff4ba8d53e9` |
+| HD64 device-0 contract-v2 baseline | 10984 | `0b0c0410791b9f2c4cedc62df5b832868b3fe6b303168400075e8cbe9e5a7fe9` |
+
+Local HD128 raw instruction counts and sidecar counts differ from `.e74/.o74`.
+These checks qualify the local capture, not a reproduction of that exact run.
+No new `gpu_sim_cycle` or cross-run `gpu_sim_insn` claim is made.
+
+### Server rerun
+
+Use the actual `traces` directory consumed by the failed K10 run. Preserve its
+existing `extra_info/spin_wait_sidecar.json`,
+`wait_block_exact_generation_tickets.json`, and
+`mbarrier_contract_ordinal_feasibility.json` before regeneration. From
+`simulator-remodeled`, with `T` set to that directory:
+
+```bash
+python3 util/tracer_nvbit/build_spin_wait_sidecar.py \
+  --traces "$T" --validate-ctas all --strict --require-contract-capture
+```
+
+Regenerate all three artifacts together; `--out` redirects only the sidecar,
+not the two contract/ticket artifacts. Do not use the local tickets with a
+different capture. No GPU retracing is required for this fix.
+
+Rerun K10 using the same trace, binary, and timing config with only these
+post-processing artifacts changed. A simulator already supporting `f1e7acc`
+does not need a rebuild for this detector-only fix. Required acceptance:
+new consumer holds resolve at their exact generations, the TMA reuse abort is
+gone, all lifecycle/conservation audits pass, and original instruction
+accounting is preserved. Then rerun K5/HD64 cycle regression. Full Linux/CUDA
+simulation remains pending; the local machine has no `nvcc`.
+
+## Noncausal Interleaved Poll Proof
+
+`partial_hold_proof_version=4` extends the v5 sidecar with
+`lane_group_spans` and `lane_group_occurrences`. It retains the variant table
+for ordinary join-only visits of the same entry PC. Older simulators reject
+version 4; rebuild the simulator before consuming these artifacts.
+
+- First try the existing direct/arrived join proofs, including a statically and
+  dynamically verified full-member `WARPSYNC.COLLECTIVE` with linear SHFL body.
+- Only a visit rejected by these proofs can cause discovery of a lane-group
+  span. Thus accepted causal traces do not acquire new replay paths.
+- Prove the sibling's four-instruction TRYWAIT/NANOSLEEP/PHASECHK/BRA loop,
+  lane-private operands, wait condition, predicates, and scoreboard closure.
+- Permit captured-ready TRYWAIT tails with predicated-off instructions, retaining
+  raw lane ownership. They are not missing occurrences.
+- Bind each span to exact kernel, function, CTA, warp, start/poll-start/merge
+  source indices, masks, poll condition, and occurrence counts.
+- A main-lane poll prefix may move the activation earlier, before interleaving
+  begins. Prove this prefix's poll shape separately. Ordinary sibling prefix
+  and tail instructions remain ordered and replayed, never folded as polling.
+- Accept a full-mask wait boundary or a proven collective continuation. Do not
+  label a full-mask PHASECHK as WARPSYNC. Reject calls, returns, exits, indirect
+  control, mask escapes, ambiguous boundaries, and overlapping spans.
+- Keep strict validation and exact-generation capture requirements unchanged.
+
+`--out` redirects only `spin_wait_sidecar.json`; contract and generation-ticket
+artifacts are still generated under the input's `extra_info`. Regenerate the
+three matching artifacts together for a server run. Raw protobufs and `stats.csv`
+are not rewritten.
+
+Local regression: causal HD64 contract-v2 and causal HD128 pass all-kernel,
+all-CTA strict validation (11 kernels each), with 36 and 34 passed records
+respectively and zero failures. Both emit zero proof-v4 records. HD64's complete
+kernel document and report equal its stored sidecar. HD128 K5 matches its stored
+sidecar; K10 equals a fresh run of pre-extension commit `ba556d6`, including
+that separate commit's two newly recognized two-gate waits. Its older stored
+sidecar predates that detector fix.
+
+Four additional HD64 captures (base, sync-order-v1, lighter-compact_wire, and
+lighter-compact_wire+prune_operands-69a20aed) pass before/after partial-proof
+comparison on all K5/K10 CTAs: 132/384 CTAs and 948/3,648 partial visits per
+capture. All proof results equal `ba556d6`, with no lane-group spans added.
+This comparison targets the changed partial-proof path; it is not an all-path
+simulator run or a claim that older v4 sidecars can be loaded unchanged.
+
+Noncausal HD64 all-kernel/all-CTA strict validation passes: 32 records, zero
+failures, 6 skips; contract capture has 1,795,127 active sync events with zero
+missing/mismatched snapshots and 205,202 uniquely assigned eligible actions.
+The 132 replay spans cover 1,188 previously rejected partial waits; 125 end at
+a common poll and 7 at a collective continuation. C++ loader fixtures accept
+these actual span/wait records. C++ extraction fixtures replay all 552,610
+extracted occurrences exactly once using actual PC/mask/sync/source fields.
+Memory payload preservation uses synthetic payload fixtures; full simulator
+execution and cycle accuracy remain unverified locally.
+
+The local non-FA3 `mbarrier-release-count-many` capture still fails strict
+validation with `POLL_EFFECT_UNSAFE / DEFUSE_UNDECODED`. The complete output
+and rejection match `ba556d6`; this is an existing unsupported shape, not an
+application-name exception or a regression. No sidecar is emitted for it.
+Consequently neither all applications nor every local experimental capture is
+claimed supported. The admissible lane-group pattern is application-independent.
+
+Reusable tests cover relocated PCs, function IDs, registers/predicates, barrier
+addresses, phases, and disjoint masks including non-lane-0 partitions. All 142
+tests pass after removal of the one-off capture harnesses and HTTP debug
+instrumentation. The replay queue reuse test runs with address/undefined
+sanitizers. Trace-specific temporary scripts and their generated fixtures were
+deleted; generic tests under `util/tracer_nvbit/tests` remain.

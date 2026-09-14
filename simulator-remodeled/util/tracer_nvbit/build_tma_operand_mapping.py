@@ -5,6 +5,8 @@ import json
 import re
 from pathlib import Path
 
+from validate_tma_completion_contracts import parse_kernel_aware_map
+
 
 def normalize_runtime_kernel_name(name):
     return re.sub(r"___[0-9]+$", "", name or "")
@@ -136,6 +138,9 @@ def load_descriptor_refs(extra_info_dir: Path):
 
 def _load_descriptor_refs_from_base_map(path: Path):
     data = json.loads(path.read_text())
+    kernel_aware = data.get("version") == 2
+    if kernel_aware:
+        data, _ = parse_kernel_aware_map(path)
     mapping = {}
     for key_str, entry in data.get("map", {}).items():
         if entry.get("operand_addressed"):
@@ -155,12 +160,15 @@ def _load_descriptor_refs_from_base_map(path: Path):
             uid = uid_str
         config_id = config_id_from_base_map_entry(entry)
         # opcode is unknown here; key on opcode=None and match by (uid, pc) downstream.
-        mapping[(kernel_id, uid, pc_hex, None)] = {
+        descriptor_ref = {
             "config_ids": [config_id],
             "desc_reg_ids": [],
             "base_hex": entry.get("base_hex"),
             "source": entry.get("source"),
         }
+        if kernel_aware:
+            descriptor_ref["validated_base_map_key"] = key_str
+        mapping[(kernel_id, uid, pc_hex, None)] = descriptor_ref
     return mapping
 
 
@@ -693,6 +701,29 @@ def operand_raw_samples(entry, operand_key):
 def build_utmapf_descriptor_link(entry, resolver_entries, function_descriptor_index):
     if not entry["opcode"].startswith("UTMAPF"):
         return None
+    descriptor_ref = entry.get("descriptor_ref") or {}
+    site_key = (
+        f"{entry.get('trace_kernel_id')}:"
+        f"{entry.get('unique_function_id')}:{entry.get('pc_hex')}"
+    )
+    # Schema-v2 chains bind the prefetch itself. A unique later load is not
+    # required: multiple load sites can consume the same runtime TMA state.
+    if (
+        descriptor_ref.get("validated_base_map_key") == site_key
+        and descriptor_ref.get("source") == "utmacctl_chain"
+    ):
+        if len(descriptor_ref.get("config_ids", [])) != 1:
+            return {
+                "status": "unresolved",
+                "match_rule": "kernel_aware_utmacctl_chain",
+                "reason": "chain_binding_requires_one_descriptor_config",
+            }
+        return {
+            "status": "matched",
+            "match_rule": "kernel_aware_utmacctl_chain",
+            "matched_descriptor": dict(descriptor_ref),
+        }
+
     prefetch_operand_1 = operand_raw_samples(entry, "operand_1")
     if not prefetch_operand_1:
         return {
@@ -985,6 +1016,7 @@ def format_missing_descriptor_binding(entry):
     return (
         "[TMA][OperandMapping][Error] descriptor-required runtime-observed site has no "
         "validated descriptor binding: "
+        f"trace_kernel={entry.get('trace_kernel_id')} "
         f"ufid={entry.get('unique_function_id')} "
         f"pc={entry.get('pc_hex')} "
         f"opcode={entry.get('opcode')} "
