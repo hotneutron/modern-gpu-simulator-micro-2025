@@ -183,6 +183,7 @@ const char *wait_block_mode_to_string(WaitBlockPendingMode mode) {
 // have been verified against the FA3 fwd/bwd traces:
 //   - FENCE.*            (e.g. FENCE.VIEW.ASYNC.S / .G)  async-proxy fences
 //   - MEMBAR.ALL.CTA / MEMBAR.ALL.GPU                    CTA/GPU-scope fences
+//   - MEMBAR.SC.GPU                                     GPU-scope fence
 // Any other MEMBAR form (e.g. MEMBAR.*.SYS) has not been characterized; rather
 // than silently mis-model it, abort so an unverified form is never treated as a
 // fence (mirrors the OP_BAR decode guard).
@@ -194,19 +195,20 @@ bool is_non_rendezvous_memory_barrier(const warp_inst_t &inst) {
       inst.get_extra_trace_instruction_info().get_op_code();
   if (opcode.rfind("FENCE", 0) == 0) return true;
   if (opcode.rfind("MEMBAR", 0) == 0) {
-    if (opcode == "MEMBAR.ALL.CTA" || opcode == "MEMBAR.ALL.GPU") {
+    if (opcode == "MEMBAR.ALL.CTA" || opcode == "MEMBAR.ALL.GPU" ||
+        opcode == "MEMBAR.SC.GPU") {
       return true;
     }
     assert(false &&
            "Unverified MEMBAR form reached the memory-barrier path (only "
-           "MEMBAR.ALL.CTA and MEMBAR.ALL.GPU have been characterized as "
+           "MEMBAR.ALL.CTA, MEMBAR.ALL.GPU and MEMBAR.SC.GPU are modeled as "
            "non-rendezvous fences); characterize it before modeling.");
   }
   return false;
 }
 
 // Determine the visibility scope a memory fence enforces, from the trace opcode.
-//   MEMBAR.ALL.GPU            -> GPU scope (drain to L2, all SMs)
+//   MEMBAR.ALL.GPU / SC.GPU  -> GPU scope (drain to L2, all SMs)
 //   MEMBAR.ALL.CTA           -> CTA scope (drain to shared/L1, same SM)
 //   FENCE.* (async proxy)    -> CTA scope (intra-SM ordering); its real SB wait is
 //                               enforced separately via wait_barrier_bits.
@@ -219,7 +221,8 @@ static membar_scope_t fence_scope_of(const warp_inst_t &inst) {
   }
   const std::string opcode =
       inst.get_extra_trace_instruction_info().get_op_code();
-  if (opcode == "MEMBAR.ALL.GPU") return MEMBAR_SCOPE_GPU;
+  if (opcode == "MEMBAR.ALL.GPU" || opcode == "MEMBAR.SC.GPU")
+    return MEMBAR_SCOPE_GPU;
   if (opcode == "MEMBAR.ALL.CTA") return MEMBAR_SCOPE_CTA;
   if (opcode.rfind("FENCE", 0) == 0) return MEMBAR_SCOPE_CTA;
   return MEMBAR_SCOPE_NONE;
@@ -7696,3 +7699,7 @@ address_type SM::from_global_pc_address_to_local_pc(address_type global_pc, unsi
   address_type res = global_pc - first_pc_of_kernel;
   return res;
 }
+
+// ## Revision History
+// 2026-09-19: route observed MEMBAR.SC.GPU through the existing per-warp
+// GPU-scope store drain; retain the guard for unmodeled fence forms.

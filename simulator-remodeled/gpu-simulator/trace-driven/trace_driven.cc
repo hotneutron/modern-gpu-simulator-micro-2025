@@ -1248,8 +1248,14 @@ bool trace_warp_inst_t::parse_from_trace_struct(
 
       break;
     case OP_CGAERRBAR:
+      // Error barrier, issued on Hopper's MISCELLANEOUS_QUEUE_OP path.
+      // The trace model does not inject asynchronous hardware errors or model
+      // cluster error propagation. This is NOT a MEMBAR or a CTA rendezvous:
+      // any memory ordering in a characterized sequence is provided by its
+      // explicit MEMBAR instructions. Keep the instruction in the issue stream.
+      break;
     case OP_MEMBAR:
-      // MEMBAR / CGAERRBAR are ordering/visibility fences, not CTA named
+      // MEMBAR instructions are ordering/visibility fences, not CTA named
       // barriers. They are handled on the MEMORY_BARRIER_OP path in sm.cc as a
       // per-warp memory-dependency wait (set_membar) and deliberately bypass the
       // CTA barrier engine, so these bar_id/bar_count/bar_type fields are dead
@@ -1767,3 +1773,7 @@ void trace_shader_core_ctx::issue_warp(register_set &warp,
   // after issue
     delete pI;
 }
+
+// ## Revision History
+// 2026-09-19: distinguish CGAERRBAR's existing misc issue path from MEMBAR;
+// document absent hardware-error/cluster modeling without inventing fence semantics.
