@@ -75,6 +75,8 @@ all: traces_enhanced $(NVBIT_TOOL) trace_printer
 
 $(OBJECTS): $(NVBIT_PATH)/nvbit.h
 
+tracer_tool.o: cubin_metadata.hpp
+
 $(NVBIT_TOOL): $(OBJECTS) $(NVBIT_PATH)/libnvbit.a traces_enhanced
 	$(NVCC) -arch=$(ARCH) $(OPTFLAGS) $(OBJECTS) $(TRACES_ENHANCED_OBJ) $(TRACES_ENHANCED_PROTOCOL_BUFFER_OBJ) $(LIBS) $(NVCC_PATH) -lcuda -lcudart_static -lprotobuf -shared -o $@
 
@@ -97,3 +99,6 @@ trace_printer: traces_enhanced
 clean:
 	rm -f *.so *.o trace_printer
 	$(MAKE) clean -C $(TRACES_ENHANCED_DIR)
+
+# ## Revision History
+# 2026-09-20: rebuild the tracer when cubin selection/capture helpers change.
