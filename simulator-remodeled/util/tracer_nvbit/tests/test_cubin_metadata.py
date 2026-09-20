@@ -76,6 +76,35 @@ int main(int argc, char **argv) {
   out.close();
   assert(capture.retain(different) == different);
   assert(std::filesystem::exists(input) && std::filesystem::exists(different));
+  // Pinned NVBit returns false after writing a valid ELF. Its return value
+  // cannot authorize stale/missing/empty output, nor reject a valid capture.
+  const auto fresh = root / "fresh.cubin";
+  bool called = false;
+  assert(capture.capture(fresh, [&](const char *path) {
+    called = true;
+    std::filesystem::copy_file(input, path);
+    return false;
+  }) == input);
+  assert(called && !std::filesystem::exists(fresh));
+  called = false;
+  rejected = false;
+  try { capture.capture(input, [&](const char *) { called = true; return true; }); }
+  catch (const std::runtime_error &) { rejected = true; }
+  assert(rejected && !called);
+  for (bool api_result : {false, true}) {
+    rejected = false;
+    try { capture.capture(fresh, [&](const char *) { return api_result; }); }
+    catch (const std::runtime_error &) { rejected = true; }
+    assert(rejected);
+  }
+  rejected = false;
+  try { capture.capture(fresh, [](const char *path) {
+    std::ofstream output(path);
+    output << "incomplete ELF";
+    return false;
+  }); }
+  catch (const std::runtime_error &) { rejected = true; }
+  assert(rejected);
   assert(c::shell_quote("x'y $z") == "'x'\\''y $z'");
 }
 '''
@@ -96,5 +125,7 @@ if __name__ == "__main__":
     unittest.main()
 
 # ## Revision History
+# 2026-09-20 00:51 UTC: exercise the real capture path with NVBit's observed
+# false return; reject stale, missing and malformed output independently.
 # 2026-09-20: cover exact scoped RFU indices, malformed/truncated ELF rejection,
 # and content-verified loaded cubin deduplication without CUDA dependencies.

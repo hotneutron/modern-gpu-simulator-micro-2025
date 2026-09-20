@@ -118,6 +118,16 @@ inline std::string shell_quote(const std::string &value) {
 class CapturedCubins {
   std::map<std::pair<uint64_t, uint64_t>, std::vector<std::filesystem::path>> paths_;
  public:
+  template <typename Dump>
+  std::filesystem::path capture(const std::filesystem::path &path, Dump dump) {
+    // NVBit 1.7.6 returns false even after a successful write. A fresh,
+    // structurally valid ELF is the capture contract; never reuse stale output.
+    if (std::filesystem::exists(path))
+      throw std::runtime_error("cubin capture destination already exists");
+    (void)dump(path.c_str());
+    return retain(path);
+  }
+
   std::filesystem::path retain(const std::filesystem::path &path) {
     const auto bytes = read(path);
     function_symbols(bytes);  // Reject incomplete/unsupported NVBit dumps.
@@ -138,5 +148,7 @@ class CapturedCubins {
 }  // namespace cubin_metadata
 
 // ## Revision History
+// 2026-09-20 00:51 UTC: validate fresh ELF output because pinned NVBit returns
+// false on successful dumps; reject missing, malformed and stale captures.
 // 2026-09-20: resolve exact CUDA ELF function indices for scoped RFU and retain
 // loaded code objects with full-byte duplicate verification.

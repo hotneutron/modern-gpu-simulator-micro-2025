@@ -2158,9 +2158,9 @@ static void capture_loaded_cubin(CUcontext ctx, CUfunction function, unsigned ui
     const std::filesystem::path directory = make_abs_path(cubin_path) + "/loaded";
     std::filesystem::create_directories(directory);
     const auto path = directory / ("loaded_" + std::to_string(uid) + ".cubin");
-    if (!nvbit_dump_cubin(ctx, function, path.c_str()))
-      throw std::runtime_error("nvbit_dump_cubin returned false");
-    loaded_cubin_files.insert(captured_cubins.retain(path).string());
+    loaded_cubin_files.insert(captured_cubins.capture(path, [&](const char *filename) {
+      return nvbit_dump_cubin(ctx, function, filename);
+    }).string());
   } catch (const std::exception &error) {
     loaded_cubin_capture_failed = true;
     fprintf(stderr, "Warning. Loaded cubin capture for function %u: %s\n",
@@ -5000,5 +5000,7 @@ void nvbit_at_ctx_term(CUcontext ctx) {
 }
 
 // ## Revision History
+// 2026-09-20 00:51 UTC: accept only fresh validated ELF output from the
+// NVBit dump API, whose boolean return is false even after successful writes.
 // 2026-09-20: prefer actual NVBit-loaded cubins, scope RFU to matched ELF
 // functions, and preserve parsed SASS when RFU fails without duplicate insertion.
