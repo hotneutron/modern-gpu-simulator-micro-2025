@@ -161,6 +161,15 @@ def write_single_warp_threadblock(path, instructions):
     path.write_bytes(message_field(2, map_entry))
 
 
+class KernelScopeTest(unittest.TestCase):
+    def test_explicit_kernel_scope_is_sorted_and_never_silently_widened(self):
+        self.assertIsNone(SIDECAR.requested_kernel_ids(None))
+        self.assertEqual(SIDECAR.requested_kernel_ids("18,13"), [13, 18])
+        for value in ("", "0", "-1", "13,", "13,13", "13, 18", "kernel_13"):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                SIDECAR.requested_kernel_ids(value)
+
+
 class ContractOrdinalCaptureTest(unittest.TestCase):
     def test_ready_snapshot_selects_one_completed_generation(self):
         targets, reason = SIDECAR.resolve_contract_generation(
@@ -1701,3 +1710,8 @@ class PartialJoinProofTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# Revision History
+# 2026-09-24: cover exact explicit WaitBlock kernel-scope parsing and rejection
+# of malformed, duplicate, or implicitly widened selections.

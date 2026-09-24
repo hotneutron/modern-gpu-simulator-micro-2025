@@ -3527,8 +3527,26 @@ def validate_partial_join_dynamic(kdir, cands, byp, max_ctas, expected_fid,
                     if not ok:
                         st["dynamic_ok"] = False
                         st["reason"] = reason
+                        st["failure_detail"] = {
+                            "cta": list(_parse_cta_file_coordinates(
+                                os.path.basename(path))),
+                            "warp_id": warp_id,
+                            "source_index": idx,
+                            "entry_pc": "0x%x" % int(inst["pc"]),
+                            "active_mask": "0x%x" % int(inst["active_mask"]),
+                            "predicate_mask":
+                                "0x%x" % int(inst["predicate_mask"]),
+                            "effective_mask": "0x%x" % effective[idx],
+                            "live_mask": "0x%x" % live_before[idx],
+                            "barrier_addr": (
+                                None if inst["barrier_addr"] is None
+                                else "0x%x" % int(inst["barrier_addr"])),
+                            "wait_state_raw": (
+                                None if inst["semantic_raw"] is None
+                                else "0x%x" % int(inst["semantic_raw"])),
+                        }
                         if proof:
-                            st["failure_detail"] = {
+                            st["failure_detail"]["proof"] = {
                                 key: ("0x%x" % value if key.endswith("_pc")
                                       or key.endswith("_mask") else value)
                                 for key, value in proof.items()
@@ -3811,6 +3829,20 @@ def validate_wait_blocks_dynamic(kdir, cands, byp, all_byp, max_ctas,
     return stats, len(files)
 
 
+def requested_kernel_ids(value):
+    """Parse an explicit kernel proof scope without silently widening it."""
+    if value is None:
+        return None
+    tokens = value.split(",")
+    if not tokens or any(not re.fullmatch(r"[1-9][0-9]*", token)
+                         for token in tokens):
+        raise ValueError("--kernels requires positive comma-separated IDs")
+    ids = [int(token) for token in tokens]
+    if len(ids) != len(set(ids)):
+        raise ValueError("--kernels contains duplicate IDs")
+    return sorted(ids)
+
+
 def main():
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -3859,7 +3891,10 @@ def main():
             )
         print("[spin-sidecar] no wait instructions; emitting empty v5 sidecar")
     kdirs = kernel_dir_map(traces)
-    want = set(int(x) for x in args.kernels.split(",")) if args.kernels else None
+    try:
+        requested = requested_kernel_ids(args.kernels)
+    except ValueError as exc:
+        sys.exit("[spin-sidecar] %s" % exc)
 
     # map kernel_id -> funcid via the first pb (peek), so we describe per kernel_id
     kid_to_fid = {}
@@ -3867,6 +3902,26 @@ def main():
         pbs = sorted(glob.glob(os.path.join(kdir, "*.pb")))
         if pbs:
             kid_to_fid[kid] = _ts._peek_funcid(pbs[0])
+    if requested is not None:
+        missing = [kid for kid in requested if kid not in kdirs]
+        unusable = [kid for kid in requested
+                    if kid in kdirs and (kid not in kid_to_fid
+                                         or kid_to_fid[kid] not in kernels)]
+        if missing or unusable:
+            sys.exit(
+                "[spin-sidecar] requested kernel scope is unavailable: "
+                "missing=%s unusable=%s" % (missing, unusable))
+        proof_kernel_ids = requested
+        scope_mode = "explicit_kernel_ids"
+    else:
+        proof_kernel_ids = sorted(kdirs)
+        scope_mode = "all_capture_kernels"
+    want = set(proof_kernel_ids)
+    proof_scope = {
+        "mode": scope_mode,
+        "kernel_ids": proof_kernel_ids,
+        "capture_kernel_ids": sorted(kdirs),
+    }
 
     out_kernels = []
     report = Counter()
@@ -4234,6 +4289,7 @@ def main():
         "version": 5,
         "schema": "wait_block_sidecar",
         "validation_complete": args.validate_ctas == "all",
+        "proof_scope": proof_scope,
         "source_traces_dir": os.path.abspath(traces),
         "isize_bytes": ISIZE,
         "note": (
@@ -4271,9 +4327,16 @@ def main():
     }
     contract_report = None
     if args.require_contract_capture:
+        proof_kdirs = {
+            kid: kdirs[kid] for kid in proof_kernel_ids
+        }
+        proof_kid_to_fid = {
+            kid: kid_to_fid[kid] for kid in proof_kernel_ids
+        }
         contract_report = analyze_mbarrier_contract_capture(
-            traces, kdirs, kid_to_fid, sync_sites, out_kernels,
+            traces, proof_kdirs, proof_kid_to_fid, sync_sites, out_kernels,
             args.validate_ctas, static_kernels=kernels)
+        contract_report["proof_scope"] = proof_scope
         if args.contract_baseline_traces:
             baseline = os.path.abspath(args.contract_baseline_traces)
             contract_report["baseline_comparison"] = \
@@ -4305,6 +4368,7 @@ def main():
             "version": 2,
             "schema": "wait_block_exact_generation_tickets",
             "status": contract_report["status"],
+            "proof_scope": proof_scope,
             "entry_fields": list(RUNTIME_TICKET_ENTRY_FIELDS),
             "eligible_barrier_fields": [
                 "trace_kernel_id",
@@ -4408,6 +4472,11 @@ def main():
             out_path,
         )
     )
+
+
+# Revision History
+# 2026-09-24: make explicit kernel scopes fail closed, bind WaitBlock and
+# contract-ordinal proofs to that scope, and retain exact failed occurrences.
 
 
 if __name__ == "__main__":
