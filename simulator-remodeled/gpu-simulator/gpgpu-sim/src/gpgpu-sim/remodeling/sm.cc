@@ -1768,14 +1768,19 @@ void SM::instruction_retirement(warp_inst_t *instruction) {
     }
 
   } else {
-    if (instruction->get_extra_trace_instruction_info()
+    if (instruction->op != LDGDEPBAR_OP &&
+        instruction->get_extra_trace_instruction_info()
             .get_control_bits()
             .get_is_new_write_barrier()) {
       add_pending_wait_barrier_decrement(instruction, Wait_Barrier_Type::WRITE_WAIT_BARRIER,
       instruction->get_extra_trace_instruction_info().get_control_bits().get_id_new_write_barrier());       
     }
     if(instruction->m_is_ldgsts) {
-      m_physical_warp[warp_id]->get_dependency_state()->decrease_num_pending_ldgsts();
+      assert(instruction->m_ldgsts_state == STORE_STAGE);
+      for (unsigned barrier : m_physical_warp[warp_id]->get_dependency_state()
+                                  ->decrease_num_pending_ldgsts(instruction->get_uid())) {
+        add_pending_wait_barrier_decrement(instruction, WRITE_WAIT_BARRIER, barrier);
+      }
     }
   }
   m_physical_warp[warp_id]->dec_inst_in_pipeline();
@@ -2030,7 +2035,7 @@ void SM::issue_warp(register_set_uniptr &pipe_reg_set, warp_inst_t *next_inst,
     m_physical_warp[warp_id]->get_dependency_state()->set_stall_counter(
         stall_count);
     if( pipe_reg->m_is_ldgsts ) {
-      m_physical_warp[warp_id]->get_dependency_state()->increase_num_pending_ldgsts();
+      m_physical_warp[warp_id]->get_dependency_state()->increase_num_pending_ldgsts(pipe_reg->get_uid());
     }
   }
 
@@ -7701,5 +7706,6 @@ address_type SM::from_global_pc_address_to_local_pc(address_type global_pc, unsi
 }
 
 // ## Revision History
+// 2026-09-22: Defer copy commit's SB decrement to shared-store group completion.
 // 2026-09-19: route observed MEMBAR.SC.GPU through the existing per-warp
 // GPU-scope store drain; retain the guard for unmodeled fence forms.

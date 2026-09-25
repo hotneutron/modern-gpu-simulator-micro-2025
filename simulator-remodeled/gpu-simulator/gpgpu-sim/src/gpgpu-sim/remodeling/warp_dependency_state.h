@@ -30,6 +30,8 @@
 
 #include <vector>
 #include <cstdio>
+#include <deque>
+#include <set>
 
 #include "../../abstract_hardware_model.h"
 
@@ -132,8 +134,9 @@ class Dependency_State {
         // that armed them. Precedence TENSOR > TMA > OTHER when several block. Read-only.
         Wait_Barrier_Armed_Op blocking_wait_barrier_armed_op(const std::vector<Wait_Barrier_Checking> &wait_barriers_checking);
         
-        void increase_num_pending_ldgsts();
-        void decrease_num_pending_ldgsts();
+        void increase_num_pending_ldgsts(unsigned int instruction_uid);
+        std::vector<unsigned int> decrease_num_pending_ldgsts(unsigned int instruction_uid);
+        std::vector<unsigned int> commit_ldgsts_group(unsigned int barrier_id);
         bool are_ldgsts_pending();
 
         bool are_pending_dependencies();
@@ -144,6 +147,16 @@ class Dependency_State {
         unsigned int m_yield;
         unsigned int m_stall_counter;
         unsigned int m_num_pending_ldgsts;
+        struct Ldgsts_Group {
+            unsigned int barrier_id;
+            std::set<unsigned int> pending;
+        };
+        std::set<unsigned int> m_uncommitted_ldgsts;
+        std::deque<Ldgsts_Group> m_ldgsts_groups;
+        std::vector<unsigned int> release_completed_ldgsts_groups();
         std::vector<Wait_Barrier> m_wait_barriers;//{0,1,2,3,4,5};
         shader_core_stats* m_stats;
 };
+
+// ## Revision History
+// 2026-09-22: Track copy tokens by committed group and ordered completion frontier.
