@@ -30,6 +30,7 @@
 
 #include <algorithm>
 #include <mutex>
+#include <shared_mutex>
 #include <sstream>
 #include <set>
 #include <unordered_set>
@@ -74,7 +75,7 @@ std::unordered_map<instruction_region_tracking_key,
                    instruction_region_tracking_entry,
                    instruction_region_tracking_key_hash>
     g_instruction_region_tracking;
-std::mutex g_instruction_region_tracking_mutex;
+std::shared_mutex g_instruction_region_tracking_mutex;
 std::unordered_set<new_addr_type> g_instruction_region_prewarm_resident_blocks;
 std::mutex g_instruction_region_prewarm_resident_blocks_mutex;
 
@@ -124,7 +125,8 @@ void record_instruction_region_l1i_miss_observation(
     unsigned int sm_id, unsigned int line_size, new_addr_type block_addr,
     unsigned int unique_function_id, unsigned int warp_id, bool is_prefetch,
     unsigned long long cycle) {
-    std::lock_guard<std::mutex> lock(g_instruction_region_tracking_mutex);
+    std::unique_lock<std::shared_mutex> lock(
+        g_instruction_region_tracking_mutex);
     instruction_region_tracking_key key{
         sm_id, unique_function_id,
         get_instruction_region_base(block_addr, line_size)};
@@ -143,7 +145,8 @@ void record_instruction_region_late_miss_observation(
     unsigned int sm_id, unsigned int line_size, new_addr_type block_addr,
     unsigned int unique_function_id, unsigned int warp_id,
     unsigned long long cycle) {
-    std::lock_guard<std::mutex> lock(g_instruction_region_tracking_mutex);
+    std::unique_lock<std::shared_mutex> lock(
+        g_instruction_region_tracking_mutex);
     instruction_region_tracking_key key{
         sm_id, unique_function_id,
         get_instruction_region_base(block_addr, line_size)};
@@ -157,7 +160,8 @@ std::string get_instruction_region_top_late_miss_regions(unsigned int top_n) {
     std::vector<std::pair<instruction_region_tracking_key,
                           instruction_region_tracking_entry>> entries;
     {
-        std::lock_guard<std::mutex> lock(g_instruction_region_tracking_mutex);
+        std::shared_lock<std::shared_mutex> lock(
+            g_instruction_region_tracking_mutex);
         if (g_instruction_region_tracking.empty()) {
             return "none";
         }
@@ -201,7 +205,8 @@ std::string get_instruction_region_top_miss_regions(unsigned int top_n) {
     std::vector<std::pair<instruction_region_tracking_key,
                           instruction_region_tracking_entry>> entries;
     {
-        std::lock_guard<std::mutex> lock(g_instruction_region_tracking_mutex);
+        std::shared_lock<std::shared_mutex> lock(
+            g_instruction_region_tracking_mutex);
         if (g_instruction_region_tracking.empty()) {
             return "none";
         }
@@ -253,7 +258,8 @@ std::vector<new_addr_type> get_instruction_regions_to_prewarm(
     std::unordered_map<new_addr_type, aggregated_instruction_region_entry>
         aggregated_entries;
     {
-        std::lock_guard<std::mutex> lock(g_instruction_region_tracking_mutex);
+        std::shared_lock<std::shared_mutex> lock(
+            g_instruction_region_tracking_mutex);
         for (const auto &entry : g_instruction_region_tracking) {
             if (entry.first.unique_function_id != unique_function_id) {
                 continue;

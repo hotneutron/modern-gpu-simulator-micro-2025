@@ -183,6 +183,7 @@ const char *wait_block_mode_to_string(WaitBlockPendingMode mode) {
 // have been verified against the FA3 fwd/bwd traces:
 //   - FENCE.*            (e.g. FENCE.VIEW.ASYNC.S / .G)  async-proxy fences
 //   - MEMBAR.ALL.CTA / MEMBAR.ALL.GPU                    CTA/GPU-scope fences
+//   - MEMBAR.SC.GPU                                     GPU-scope fence
 // Any other MEMBAR form (e.g. MEMBAR.*.SYS) has not been characterized; rather
 // than silently mis-model it, abort so an unverified form is never treated as a
 // fence (mirrors the OP_BAR decode guard).
@@ -194,19 +195,20 @@ bool is_non_rendezvous_memory_barrier(const warp_inst_t &inst) {
       inst.get_extra_trace_instruction_info().get_op_code();
   if (opcode.rfind("FENCE", 0) == 0) return true;
   if (opcode.rfind("MEMBAR", 0) == 0) {
-    if (opcode == "MEMBAR.ALL.CTA" || opcode == "MEMBAR.ALL.GPU") {
+    if (opcode == "MEMBAR.ALL.CTA" || opcode == "MEMBAR.ALL.GPU" ||
+        opcode == "MEMBAR.SC.GPU") {
       return true;
     }
     assert(false &&
            "Unverified MEMBAR form reached the memory-barrier path (only "
-           "MEMBAR.ALL.CTA and MEMBAR.ALL.GPU have been characterized as "
+           "MEMBAR.ALL.CTA, MEMBAR.ALL.GPU and MEMBAR.SC.GPU are modeled as "
            "non-rendezvous fences); characterize it before modeling.");
   }
   return false;
 }
 
 // Determine the visibility scope a memory fence enforces, from the trace opcode.
-//   MEMBAR.ALL.GPU            -> GPU scope (drain to L2, all SMs)
+//   MEMBAR.ALL.GPU / SC.GPU  -> GPU scope (drain to L2, all SMs)
 //   MEMBAR.ALL.CTA           -> CTA scope (drain to shared/L1, same SM)
 //   FENCE.* (async proxy)    -> CTA scope (intra-SM ordering); its real SB wait is
 //                               enforced separately via wait_barrier_bits.
@@ -219,7 +221,8 @@ static membar_scope_t fence_scope_of(const warp_inst_t &inst) {
   }
   const std::string opcode =
       inst.get_extra_trace_instruction_info().get_op_code();
-  if (opcode == "MEMBAR.ALL.GPU") return MEMBAR_SCOPE_GPU;
+  if (opcode == "MEMBAR.ALL.GPU" || opcode == "MEMBAR.SC.GPU")
+    return MEMBAR_SCOPE_GPU;
   if (opcode == "MEMBAR.ALL.CTA") return MEMBAR_SCOPE_CTA;
   if (opcode.rfind("FENCE", 0) == 0) return MEMBAR_SCOPE_CTA;
   return MEMBAR_SCOPE_NONE;
@@ -1765,14 +1768,19 @@ void SM::instruction_retirement(warp_inst_t *instruction) {
     }
 
   } else {
-    if (instruction->get_extra_trace_instruction_info()
+    if (instruction->op != LDGDEPBAR_OP &&
+        instruction->get_extra_trace_instruction_info()
             .get_control_bits()
             .get_is_new_write_barrier()) {
       add_pending_wait_barrier_decrement(instruction, Wait_Barrier_Type::WRITE_WAIT_BARRIER,
       instruction->get_extra_trace_instruction_info().get_control_bits().get_id_new_write_barrier());       
     }
     if(instruction->m_is_ldgsts) {
-      m_physical_warp[warp_id]->get_dependency_state()->decrease_num_pending_ldgsts();
+      assert(instruction->m_ldgsts_state == STORE_STAGE);
+      for (unsigned barrier : m_physical_warp[warp_id]->get_dependency_state()
+                                  ->decrease_num_pending_ldgsts(instruction->get_uid())) {
+        add_pending_wait_barrier_decrement(instruction, WRITE_WAIT_BARRIER, barrier);
+      }
     }
   }
   m_physical_warp[warp_id]->dec_inst_in_pipeline();
@@ -2027,7 +2035,7 @@ void SM::issue_warp(register_set_uniptr &pipe_reg_set, warp_inst_t *next_inst,
     m_physical_warp[warp_id]->get_dependency_state()->set_stall_counter(
         stall_count);
     if( pipe_reg->m_is_ldgsts ) {
-      m_physical_warp[warp_id]->get_dependency_state()->increase_num_pending_ldgsts();
+      m_physical_warp[warp_id]->get_dependency_state()->increase_num_pending_ldgsts(pipe_reg->get_uid());
     }
   }
 
@@ -7696,3 +7704,8 @@ address_type SM::from_global_pc_address_to_local_pc(address_type global_pc, unsi
   address_type res = global_pc - first_pc_of_kernel;
   return res;
 }
+
+// ## Revision History
+// 2026-09-22: Defer copy commit's SB decrement to shared-store group completion.
+// 2026-09-19: route observed MEMBAR.SC.GPU through the existing per-warp
+// GPU-scope store drain; retain the guard for unmodeled fence forms.

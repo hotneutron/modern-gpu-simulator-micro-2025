@@ -84,6 +84,7 @@
 
 /* contains definition of the inst_trace_t structure */
 #include "common.h"
+#include "cubin_metadata.hpp"
 
 #define TRACER_VERSION 4
 
@@ -1743,6 +1744,7 @@ bool has_the_kernel_been_traced(std::string kernel_name, std::map<int, std::stri
 struct parsed_sass_result {
   unsigned int matched_kernels = 0;
   std::unordered_set<std::string> matched_kernel_names;
+  std::unordered_set<std::string> matched_elf_symbols;
 };
 
 static bool kernel_name_selected_for_rfu(const std::string &kernel_name,
@@ -1809,6 +1811,7 @@ parsed_sass_result parse_sass(int binary_version, const std::filesystem::directo
           current_traced_kernel = nullptr;
           result.matched_kernels++;
           result.matched_kernel_names.insert(normalize_kernel_match_name(kernel_key));
+          result.matched_elf_symbols.insert(kernel_name);
         }else {
           delete current_traced_kernel;
         }
@@ -2146,6 +2149,24 @@ static bool sparse_semantic_anchor(const std::string &opcode) {
 
 /* Set used to avoid re-instrumenting the same functions multiple times */
 std::unordered_set<CUfunction> already_instrumented;
+static cubin_metadata::CapturedCubins captured_cubins;
+static bool loaded_cubin_capture_failed = false;
+static std::unordered_set<std::string> loaded_cubin_files;
+
+static void capture_loaded_cubin(CUcontext ctx, CUfunction function, unsigned uid) {
+  try {
+    const std::filesystem::path directory = make_abs_path(cubin_path) + "/loaded";
+    std::filesystem::create_directories(directory);
+    const auto path = directory / ("loaded_" + std::to_string(uid) + ".cubin");
+    loaded_cubin_files.insert(captured_cubins.capture(path, [&](const char *filename) {
+      return nvbit_dump_cubin(ctx, function, filename);
+    }).string());
+  } catch (const std::exception &error) {
+    loaded_cubin_capture_failed = true;
+    fprintf(stderr, "Warning. Loaded cubin capture for function %u: %s\n",
+            uid, error.what());
+  }
+}
 
 /* instrument each memory instruction adding a call to the above instrumentation
  * function */
@@ -2195,6 +2216,10 @@ void instrument_function_if_needed(CUcontext ctx, CUfunction func, int device_id
     next_candidate_unique_function_id++;
 
     const std::vector<Instr *> &instrs = nvbit_get_instrs(ctx, f);
+    // NVBit exposes the actual module, including dynamically loaded/JIT code.
+    // Save it before adding any instrumentation to this function.
+    if (!warp_lifetime_only)
+      capture_loaded_cubin(ctx, f, next_candidate_unique_function_id);
     const CFG_t &cfg = nvbit_get_CFG(ctx, f);
     std::unordered_set<Instr *> sparse_block_entries;
     std::unordered_set<Instr *> sparse_block_exits;
@@ -4728,6 +4753,8 @@ void enhanced_tracer() {
   }
 
   std::vector<std::string> extracted_cubin_dirs;
+  if (!loaded_cubin_files.empty())
+    extracted_cubin_dirs.push_back(cubin_path + "/loaded");
   std::unordered_set<std::string> attempted;
   int extracted = 0;
   int max_sources = 6;
@@ -4739,6 +4766,8 @@ void enhanced_tracer() {
     }
   }
   for (const auto &src : cubin_sources) {
+    // Complete direct capture makes the ranked file guesses unnecessary.
+    if (!loaded_cubin_files.empty() && !loaded_cubin_capture_failed) break;
     if (attempted.insert(src).second == false) {
       continue;
     }
@@ -4765,17 +4794,29 @@ void enhanced_tracer() {
       if (!entry.is_regular_file()) {
         continue;
       }
-      std::string aux_cubin = entry.path().filename().string();
+      if (cubin_dir == cubin_path + "/loaded" &&
+          loaded_cubin_files.count(entry.path().string()) == 0) continue;
       std::string base_name = entry.path().stem().string();
-      std::string command_get_sass = "cd " + sass_path + " && cuobjdump -sass " + absolute_cubin_path + "/" + aux_cubin + " > " + base_name + ".sass";
+      std::string command_get_sass = "cuobjdump -sass " +
+          cubin_metadata::shell_quote(entry.path().string()) + " > " +
+          cubin_metadata::shell_quote(make_abs_path(sass_path) + "/" + base_name + ".sass");
       int call_code_sass = check_system_call(system(command_get_sass.c_str()), command_get_sass.c_str());
       if(call_code_sass == 0) {
         parsed_sass_result sass_result = parse_sass(binary_version, entry);
         if(!skip_rfu && sass_result.matched_kernels > 0) {
-          std::string command_get_register_usage = "cd " + register_usage_path + " && nvdisasm -lrm count " + absolute_cubin_path + "/" + aux_cubin + " > " + base_name + ".rfu";
-          int call_code_rfu = check_system_call(system(command_get_register_usage.c_str()), command_get_register_usage.c_str());
-          if(call_code_rfu == 0) {
-            parse_rfu(entry, sass_result.matched_kernel_names);
+          try {
+            const std::string indices = cubin_metadata::function_indices(
+                entry.path(), sass_result.matched_elf_symbols);
+            std::string command_get_register_usage = "nvdisasm -lrm count -fun " +
+                indices + " " + cubin_metadata::shell_quote(entry.path().string()) +
+                " > " + cubin_metadata::shell_quote(
+                    make_abs_path(register_usage_path) + "/" + base_name + ".rfu");
+            int call_code_rfu = check_system_call(system(command_get_register_usage.c_str()), command_get_register_usage.c_str());
+            if(call_code_rfu == 0) {
+              parse_rfu(entry, sass_result.matched_kernel_names);
+            }
+          } catch (const std::exception &error) {
+            std::cerr << "Error. RFU function selection: " << error.what() << std::endl;
           }
         }
       }
@@ -4789,10 +4830,14 @@ void enhanced_tracer() {
         std::cout << "RFU parsed: " << variant.rfu_has_been_parsed << std::endl;
         std::cout << "Traced instructions: " << std::endl;
         print_map(variant.key_instructions_by_pc);
-        auto it_already_captured_instr = map_func_addr_to_pc_to_sass_instr.find(variant.func_addr);
-        assert(it_already_captured_instr != map_func_addr_to_pc_to_sass_instr.end());
-        std::string kernel_name_to_add = variant.original_kernel_name + variant_delimiter_str + std::to_string(variant.variant_id);
-        m_enhanced_traced_execution->add_no_binary_kernel(kernel_name_to_add, variant.unique_function_id, variant.func_addr, binary_version, it_already_captured_instr->second, false);
+        // RFU failure must not insert the already parsed SASS a second time.
+        // Keep the explicit error above so qualification still rejects missing RFU.
+        if (!variant.sass_has_been_parsed) {
+          auto it_already_captured_instr = map_func_addr_to_pc_to_sass_instr.find(variant.func_addr);
+          assert(it_already_captured_instr != map_func_addr_to_pc_to_sass_instr.end());
+          std::string kernel_name_to_add = variant.original_kernel_name + variant_delimiter_str + std::to_string(variant.variant_id);
+          m_enhanced_traced_execution->add_no_binary_kernel(kernel_name_to_add, variant.unique_function_id, variant.func_addr, binary_version, it_already_captured_instr->second, false);
+        }
       }
     }
   }
@@ -4953,3 +4998,9 @@ void nvbit_at_ctx_term(CUcontext ctx) {
   delete ctx_state;
   pthread_mutex_unlock(&mutex);
 }
+
+// ## Revision History
+// 2026-09-20 00:51 UTC: accept only fresh validated ELF output from the
+// NVBit dump API, whose boolean return is false even after successful writes.
+// 2026-09-20: prefer actual NVBit-loaded cubins, scope RFU to matched ELF
+// functions, and preserve parsed SASS when RFU fails without duplicate insertion.

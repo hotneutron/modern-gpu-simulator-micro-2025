@@ -286,6 +286,37 @@ class ArrivedWarpSyncProofTest(unittest.TestCase):
         self.assertEqual(
             [o["sibling_join_index"] for o in proof["occurrences"]], [3, 16])
 
+    def test_failed_partial_join_reports_exact_dynamic_occurrence(self):
+        self.insts.pop(9)
+        self.insts.pop(7)
+        candidate = {
+            **self.cand, "block_id": "missing-join", "entry_wait_pc": 0x100,
+            "dynamic": {"partial_entry_visits": 1},
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "d_0_s_0_k_5_0,0,0.pb"
+            path.touch()
+            with mock.patch.object(
+                    SIDECAR, "vpb_parse_full", return_value=[(0, self.insts)]):
+                stats, _ = SIDECAR.validate_partial_join_dynamic(
+                    directory, [candidate], self.byp, "all", 1)
+        failure = stats["missing-join"]
+        self.assertFalse(failure["dynamic_ok"])
+        self.assertEqual(failure["reason"],
+                         SIDECAR.PARTIAL_JOIN_OCCURRENCE_MISSING)
+        self.assertEqual(failure["failure_detail"], {
+            "cta": [0, 0, 0],
+            "warp_id": 0,
+            "source_index": 4,
+            "entry_pc": "0x100",
+            "active_mask": "0x1",
+            "predicate_mask": "0x1",
+            "effective_mask": "0x1",
+            "live_mask": "0xf",
+            "barrier_addr": None,
+            "wait_state_raw": None,
+        })
+
     def test_simulator_rejects_missing_required_join_before_extraction(self):
         root = Path(__file__).resolve().parents[3]
         source = (root / "gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/sm.cc").read_text()
@@ -428,3 +459,8 @@ class PartialBindingConsistencyTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# Revision History
+# 2026-09-24: require failed partial-join proofs to identify the exact dynamic
+# CTA, warp, source index, masks, and wait payload occurrence.

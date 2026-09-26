@@ -82,6 +82,8 @@ void Dependency_State::reset() {
     m_yield = 0;
     m_stall_counter = 0;
     m_num_pending_ldgsts = 0;
+    m_uncommitted_ldgsts.clear();
+    m_ldgsts_groups.clear();
     for(auto &wait_barrier : m_wait_barriers){
         wait_barrier.reset();
     }
@@ -154,12 +156,52 @@ bool Dependency_State::peek_wait_barrier_ready(unsigned int barrier_id,
     return m_wait_barriers[barrier_id].is_ready(min_val);
 }
 
-void Dependency_State::increase_num_pending_ldgsts() {
+void Dependency_State::increase_num_pending_ldgsts(unsigned int instruction_uid) {
+    const bool inserted = m_uncommitted_ldgsts.insert(instruction_uid).second;
+    assert(inserted);
     m_num_pending_ldgsts++;
 }
-void Dependency_State::decrease_num_pending_ldgsts() {
+std::vector<unsigned int> Dependency_State::decrease_num_pending_ldgsts(
+    unsigned int instruction_uid) {
     assert(m_num_pending_ldgsts > 0);
+    bool found = m_uncommitted_ldgsts.erase(instruction_uid) != 0;
+    if (!found) {
+        for (auto &group : m_ldgsts_groups) {
+            if (group.pending.erase(instruction_uid)) {
+                found = true;
+                break;
+            }
+        }
+    }
+    assert(found);
     m_num_pending_ldgsts--;
+    return release_completed_ldgsts_groups();
+}
+
+std::vector<unsigned int> Dependency_State::commit_ldgsts_group(
+    unsigned int barrier_id) {
+    assert(barrier_id < m_wait_barriers.size());
+    // The following DEPBAR can be evaluated later in this same SM cycle.
+    // Publish the credit now; the ordinary queued increment would be too late.
+    m_wait_barriers[barrier_id].increase_counter();
+    m_wait_barriers[barrier_id].set_armed_op(WB_ARM_OTHER);
+    Ldgsts_Group group;
+    group.barrier_id = barrier_id;
+    group.pending.swap(m_uncommitted_ldgsts);
+    m_ldgsts_groups.push_back(std::move(group));
+    // Empty groups pair this increment with a deferred same-cycle decrement.
+    return release_completed_ldgsts_groups();
+}
+
+std::vector<unsigned int> Dependency_State::release_completed_ldgsts_groups() {
+    std::vector<unsigned int> barriers;
+    // Retire the committed prefix, not arbitrary completed groups. A younger
+    // group completing early cannot make wait_group N release an older group.
+    while (!m_ldgsts_groups.empty() && m_ldgsts_groups.front().pending.empty()) {
+        barriers.push_back(m_ldgsts_groups.front().barrier_id);
+        m_ldgsts_groups.pop_front();
+    }
+    return barriers;
 }
 bool Dependency_State::are_ldgsts_pending() {
     return m_num_pending_ldgsts != 0;
@@ -182,3 +224,8 @@ void Dependency_State::print_state(FILE *out){
         wait_barrier.print_state(out);
     }
 }
+
+// ## Revision History
+// 2026-09-22: Publish commit credit before the same-cycle issue readiness check.
+// 2026-09-22: Seal groups at commit and release scoreboard credits only after
+// ordered shared-store completion, retaining copies that retire before commit.

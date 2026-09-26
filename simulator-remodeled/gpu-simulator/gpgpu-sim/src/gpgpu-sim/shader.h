@@ -230,7 +230,10 @@ class shd_warp_t {
 
   void pop_function_call(active_mask_t active_mask) {
     assert(!m_function_call_stack.empty());
-    m_function_call_stack.top().active_mask ^= active_mask;
+    // Returning lanes must belong to this invocation. XOR used to turn an
+    // invalid/duplicate return into newly active lanes, hiding a corrupt trace.
+    assert((active_mask & ~m_function_call_stack.top().active_mask).none());
+    m_function_call_stack.top().active_mask &= ~active_mask;
     if(m_function_call_stack.top().active_mask.none()) {
       m_function_call_stack.pop();
     }
@@ -3991,3 +3994,7 @@ class perfect_memory_interface : public mem_fetch_interface {
 inline unsigned int scheduler_unit::get_sid() const { return m_shader->get_sid(); }
 
 #endif /* SHADER_H */
+
+// ## Revision History
+// 2026-09-19: reject duplicate/foreign return lanes before removing them
+// from the current function invocation.

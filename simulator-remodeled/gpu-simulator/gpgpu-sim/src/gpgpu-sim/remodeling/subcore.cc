@@ -380,8 +380,17 @@ void Subcore::control_stage(SM *shared_sm) {
         if (current_ins->get_extra_trace_instruction_info().get_control_bits().get_is_new_read_barrier()) {
           m_sm->add_pending_wait_barrier_increment(current_ins, READ_WAIT_BARRIER, current_ins->get_extra_trace_instruction_info().get_control_bits().get_id_new_read_barrier());
         }
-        if (current_ins->get_extra_trace_instruction_info().get_control_bits().get_is_new_write_barrier()) {
+        if (current_ins->op != LDGDEPBAR_OP &&
+            current_ins->get_extra_trace_instruction_info().get_control_bits().get_is_new_write_barrier()) {
           m_sm->add_pending_wait_barrier_increment(current_ins, WRITE_WAIT_BARRIER, current_ins->get_extra_trace_instruction_info().get_control_bits().get_id_new_write_barrier());
+        }
+        if (current_ins->op == LDGDEPBAR_OP) {
+          auto &control = current_ins->get_extra_trace_instruction_info().get_control_bits();
+          assert(control.get_is_new_write_barrier());
+          auto *dependency = m_sm->get_shd_warp(current_ins->warp_id())->get_dependency_state();
+          for (unsigned barrier : dependency->commit_ldgsts_group(control.get_id_new_write_barrier())) {
+            m_sm->add_pending_wait_barrier_decrement(current_ins, WRITE_WAIT_BARRIER, barrier);
+          }
         }
       }
       current_ins->m_has_perform_control_stage = true;
@@ -1329,7 +1338,8 @@ void Subcore::set_num_pending_cycles_with_issue_port_busy(const warp_inst_t *pI)
 bool Subcore::is_waiting_ldgdepbar(const warp_inst_t *pI, unsigned int subcore_warp_id) {
   bool res = false;
   if(pI->op ==  LDGDEPBAR_OP) {
-    res = m_warps_of_subcore[subcore_warp_id]->get_dependency_state()->are_ldgsts_pending();
+    // LDGDEPBAR seals a cp.async group. Its SB credit is held until the
+    // group's shared stores retire; committing does not drain prior copies.
   }
   return res;
 }
@@ -2650,3 +2660,7 @@ void Subcore::inc_constant_cache_reads(unsigned int active_count, SM *shared_sm)
 void Subcore::incnon_rf_operands(unsigned int active_count, SM *shared_sm) { 
   get_sm()->incnon_rf_operands(active_count); 
 }
+
+// ## Revision History
+// 2026-09-22: Let copy commit publish its credit before same-cycle wait evaluation.
+// 2026-09-22: Nonblocking copy commit binds its scoreboard credit to group completion.

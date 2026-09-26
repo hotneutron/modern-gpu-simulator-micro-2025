@@ -432,10 +432,14 @@ void warp_inst_t::generate_tensor_core_latencies(gpgpu_sim *gpu) {
   assert(number_of_elements > 0);
   assert(get_extra_trace_instruction_info().get_tensor_core_instruction_info().operand_bit_size > 0);
   const shader_core_config &shader_config = gpu->get_config().get_gpgpu_sim_config();
-  unsigned int number_of_cycles = number_of_elements * get_extra_trace_instruction_info().get_tensor_core_instruction_info().operand_bit_size / shader_config.tensor_rate_per_cycle;
-  if(get_extra_trace_instruction_info().get_tensor_core_instruction_info().is_sparse) {
-    number_of_cycles = number_of_cycles / 2;
-  } 
+  // Quantize positive work to whole cycles, including sparse throughput.
+  // Flooring a subcycle HMMA shape produced zero latency and an invalid FU stage.
+  const unsigned long long work_bits = static_cast<unsigned long long>(number_of_elements) *
+      get_extra_trace_instruction_info().get_tensor_core_instruction_info().operand_bit_size;
+  const unsigned long long rate = static_cast<unsigned long long>(shader_config.tensor_rate_per_cycle) *
+      (get_extra_trace_instruction_info().get_tensor_core_instruction_info().is_sparse ? 2 : 1);
+  assert(rate > 0);
+  unsigned int number_of_cycles = work_bits / rate + (work_bits % rate != 0);
   initiation_interval = number_of_cycles / 2;
   latency = number_of_cycles - initiation_interval;
   if(get_extra_trace_instruction_info().get_tensor_core_instruction_info().is_16816_fp32_1688_fp32) {
@@ -1495,3 +1499,7 @@ void core_t::get_pdom_stack_top_info(unsigned warpId, unsigned *pc,
                                      unsigned *rpc) const {
   m_simt_stack[warpId]->get_pdom_stack_top_info(pc, rpc);
 }
+
+// ## Revision History
+// 2026-09-20 22:25 UTC: round fractional dense/sparse tensor service work up to
+// a whole cycle; preserve exact integer cycles and the existing phase split.

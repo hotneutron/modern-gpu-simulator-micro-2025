@@ -83,7 +83,11 @@ first_level_instruction_cache::first_level_instruction_cache(const char *name, c
 first_level_instruction_cache::~first_level_instruction_cache() {
     for(auto it = m_regular_access_status_without_IB_coalescing.begin(); it != m_regular_access_status_without_IB_coalescing.end(); it++) {
         for(auto it2 = it->second.begin(); it2 != it->second.end(); it2++) {
-            if(it2->second.mf != nullptr) {
+            // Subcore already deletes an IN_L0I_RESPONSE_QUEUE request.
+            // A stream-buffer fill replaces it with a live HIT response,
+            // while retaining mf_erased to describe the original request.
+            if(it2->second.mf != nullptr &&
+               (!it2->second.mf_erased || it2->second.cache_status == HIT)) {
                 delete it2->second.mf;
             }
         }
@@ -92,6 +96,10 @@ first_level_instruction_cache::~first_level_instruction_cache() {
     clear_cache();
     delete m_stream_buffers;
 }
+
+// ## Revision History
+// 2026-09-22: Avoid deleting an erased stream-wait request at forced teardown;
+// still reclaim replacement HIT responses and ordinary owned requests.
 
 void first_level_instruction_cache::initiate_stream_buffers() {
   m_stream_buffers = new multiple_stream_buffers(

@@ -144,10 +144,12 @@ struct Unit: functional_unit {
                      true,false,1,6,nullptr,1,false,TraceEnhancedOperandType::REG) {}
   unsigned depth() const {return m_pipeline_depth;}
   void submit(unsigned n, unsigned id, unsigned bits, bool sparse, unsigned extra,
-              bool tensor=true) {
+              bool tensor=true, unsigned m=64, unsigned k=16) {
     register_set_uniptr input;
     input.inst->vacant=false; input.inst->id=id; input.inst->tensor=tensor;
+    input.inst->extra.tensor.size_m=m;
     input.inst->extra.tensor.size_n=n;
+    input.inst->extra.tensor.size_k=k;
     input.inst->extra.tensor.operand_bit_size=bits;
     input.inst->extra.tensor.is_sparse=sparse;
     input.inst->extra.tensor.is_16816_fp32_1688_fp32=extra!=0;
@@ -163,20 +165,21 @@ struct Unit: functional_unit {
   bool drained() const {return m_active_insts_in_pipeline==0 && m_dispatch_reg->empty();}
 };
 int main(int argc,char **argv) {
-  assert(argc==7);
+  assert(argc==9);
   unsigned initial=std::stoul(argv[1]), n=std::stoul(argv[2]), bits=std::stoul(argv[3]);
   bool sparse=std::stoul(argv[4]);
   unsigned extra=std::stoul(argv[5]);
   std::string mode=argv[6];
+  unsigned m=std::stoul(argv[7]), k=std::stoul(argv[8]);
   SM sm;
   Unit unit(initial,sm,mode=="static"?"INT":"TENSOR");
   if(mode=="overlap") {
     unit.submit(128,1,16,false,0);
     for(tick=0;tick<32;++tick) unit.cycle();
     assert(unit.can_issue(nullptr));
-    unit.submit(n,2,bits,sparse,extra);
+    unit.submit(n,2,bits,sparse,extra,true,m,k);
   } else {
-    unit.submit(n,1,bits,sparse,extra,mode!="static");
+    unit.submit(n,1,bits,sparse,extra,mode!="static",m,k);
   }
   for(;tick<1024 && !unit.drained();++tick) unit.cycle();
   assert(unit.drained());
@@ -198,11 +201,27 @@ int main(int argc,char **argv) {
         if compiled.returncode:
             raise AssertionError(compiled.stderr)
 
-    def execute(self, depth, n, bits=16, sparse=False, extra=0, mode="single"):
+    def execute(self, depth, n, bits=16, sparse=False, extra=0, mode="single",
+                m=64, k=16):
         result = subprocess.run(
-            [self.binary, str(depth), str(n), str(bits), str(int(sparse)), str(extra), mode],
+            [self.binary, str(depth), str(n), str(bits), str(int(sparse)), str(extra),
+             mode, str(m), str(k)],
             capture_output=True, text=True)
         return result
+
+    def test_subcycle_hmma_and_sparse_work_retires(self):
+        # HMMA.1688.F16 is half a configured tensor cycle. Dense and sparse
+        # positive work must survive the real dispatch and retirement path.
+        for n, k, sparse, expected in [
+                (8, 8, False, [[1, 1, 1]]),
+                (8, 16, False, [[1, 1, 1]]),
+                (8, 16, True, [[1, 1, 1]]),
+                (40, 8, False, [[1, 2, 2]]),
+                (40, 16, True, [[1, 2, 2]])]:
+            with self.subTest(n=n, k=k, sparse=sparse):
+                result = self.execute(32, n, sparse=sparse, m=16, k=k)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(json.loads(result.stdout)["retired"], expected)
 
     def test_shape_latency_fits_without_changing_retirement_time(self):
         for n, bits, sparse, extra in [
@@ -246,3 +265,7 @@ int main(int argc,char **argv) {
 
 if __name__ == "__main__":
     unittest.main()
+
+# ## Revision History
+# 2026-09-20 22:24 UTC: exercise subcycle HMMA, sparse rounding and fractional
+# service work through production timing, dispatch and retirement code.
